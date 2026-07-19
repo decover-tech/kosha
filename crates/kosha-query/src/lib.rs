@@ -131,13 +131,6 @@ impl Searcher {
             });
         }
 
-        // Count query term frequency (how many times each term appears in the
-        // query — usually 1 for simple queries, but could be >1 for repeated).
-        let mut query_term_freqs: HashMap<String, u32> = HashMap::new();
-        for term in &query_terms {
-            *query_term_freqs.entry(term.clone()).or_default() += 1;
-        }
-
         let mut all_results: Vec<ScoredDocument> = Vec::new();
 
         for entry in &manifest.segments {
@@ -168,15 +161,11 @@ impl Searcher {
             }
 
             // Score each document that matches at least one query term.
-            // We track which documents we've already scored to avoid duplicates
-            // within this segment.
             let mut scored_in_segment: HashMap<u32, f64> = HashMap::new();
 
             for term in &query_terms {
                 if let Some(postings) = reader.postings(term) {
-                    let query_tf = query_term_freqs.get(term).copied().unwrap_or(1);
-                    let query_tf_map: HashMap<String, u32> =
-                        [(term.clone(), query_tf)].into_iter().collect();
+                    let df = doc_frequencies.get(term).copied().unwrap_or(0);
 
                     for posting in postings {
                         let doc_rec = match reader.doc_record(posting.doc_id) {
@@ -184,9 +173,9 @@ impl Searcher {
                             None => continue,
                         };
 
-                        let score = scorer.score(
-                            &query_tf_map,
-                            &doc_frequencies,
+                        let score = scorer.score_term(
+                            posting.term_frequency,
+                            df,
                             doc_rec.field_length,
                         );
 

@@ -119,6 +119,10 @@ fn route(
         return handle_search(request_line, state);
     }
 
+    if request_line.starts_with("POST /flush") {
+        return handle_flush(body, state);
+    }
+
     json_error(404, "not found")
 }
 
@@ -148,6 +152,33 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
         indexed_count: count,
         namespace: request.namespace,
     })
+}
+
+// ─── POST /flush ────────────────────────────────────────────────────────────
+
+fn handle_flush(body: &[u8], state: &AppState) -> String {
+    let req: std::collections::HashMap<String, String> =
+        serde_json::from_slice(body).unwrap_or_default();
+    let ns = req.get("namespace").cloned();
+
+    {
+        let mut indexer = state.indexer.lock().unwrap();
+        match ns {
+            Some(ref name) => {
+                let namespace = NamespaceId(name.clone());
+                if let Err(e) = indexer.flush_namespace(&namespace) {
+                    return json_error(500, &format!("flush error: {e}"));
+                }
+            }
+            None => {
+                if let Err(e) = indexer.flush_all() {
+                    return json_error(500, &format!("flush error: {e}"));
+                }
+            }
+        }
+    }
+
+    json_ok(&serde_json::json!({"status": "flushed"}))
 }
 
 // ─── GET /search ────────────────────────────────────────────────────────────
