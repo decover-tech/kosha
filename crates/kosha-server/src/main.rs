@@ -220,7 +220,7 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
         None => return json_error(400, "missing 'filter' or 'query'"),
     };
 
-    let (manifest, count) = {
+    let (_manifest, count) = {
         let mut indexer = state.indexer.lock().unwrap();
         let manifest = match indexer.manifest_cloned(&ns) {
             Some(m) => m,

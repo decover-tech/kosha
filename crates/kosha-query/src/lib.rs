@@ -118,11 +118,7 @@ pub fn match_phrase_score(
         for (i, positions) in postings_list[1..].iter().enumerate() {
             let expected = start_pos + (i as u32) + 1;
             let found = positions.iter().any(|&p| {
-                let dist = if p >= expected {
-                    p - expected
-                } else {
-                    expected - p
-                };
+                let dist = p.abs_diff(expected);
                 dist <= slop
             });
             if !found {
@@ -432,8 +428,8 @@ impl Searcher {
         let query_terms = tokenize(&query.query_text);
 
         let is_tombstoned = |seg_id: &kosha_core::SegmentId, doc_seq: u32| -> bool {
-            tombstones.map_or(false, |t| {
-                t.get(seg_id).map_or(false, |seqs| seqs.contains(&doc_seq))
+            tombstones.is_some_and(|t| {
+                t.get(seg_id).is_some_and(|seqs| seqs.contains(&doc_seq))
             })
         };
         let has_query =
@@ -480,8 +476,8 @@ impl Searcher {
 
             // ── BM25 scoring with positions for phrase ──
             if !effective_terms.is_empty() || phrase_tokenized.is_some() {
-                let terms_for_bm25 = if phrase_tokenized.is_some() {
-                    phrase_tokenized.unwrap()
+                let terms_for_bm25 = if let Some(ref pt) = phrase_tokenized {
+                    pt
                 } else {
                     &effective_terms
                 };
@@ -639,7 +635,7 @@ impl Searcher {
                         .iter()
                         .filter_map(|r| {
                             (0..total_docs).find(|&s| {
-                                reader.doc_record(s).map_or(false, |d| d.doc_id == r.doc_id)
+                                reader.doc_record(s).is_some_and(|d| d.doc_id == r.doc_id)
                             })
                         })
                         .collect();
@@ -648,7 +644,7 @@ impl Searcher {
                         (0..total_docs).any(|s| {
                             reader
                                 .doc_record(s)
-                                .map_or(false, |d| d.doc_id == r.doc_id && passed.contains(&s))
+                                .is_some_and(|d| d.doc_id == r.doc_id && passed.contains(&s))
                         })
                     });
                 }
@@ -855,6 +851,7 @@ mod tests {
     use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId};
     use kosha_segment::SegmentWriter;
 
+    #[expect(dead_code)]
     fn mk_query(text: &str, max: usize) -> SearchQuery {
         SearchQuery {
             query_text: text.into(),
