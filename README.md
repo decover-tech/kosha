@@ -7,21 +7,23 @@ is intended to be reusable as a general-purpose, schema-driven search service.
 
 See [DESIGN.md](DESIGN.md) for the full architecture.
 
-> **Status: early development (Phase 1 — BM25 lexical search only).**
-> The crate layout below is a skeleton; no query/index functionality exists
-> yet. Vector/ANN retrieval, RRF fusion, and rerank are Phase 2
+> **Status: Phase 1 — BM25 lexical search implemented.**
+> All seven crates have functional BM25 indexing and query code.
+> Vector/ANN retrieval, RRF fusion, and rerank are Phase 2
 > (DESIGN.md §3.1).
 
 ## Repository layout
 
     crates/
-      kosha-core      shared types (namespace/segment ids)
-      kosha-segment   segment file format (DESIGN.md §6.2)        — Epic 2
-      kosha-write     WAL, buffer, flush, compaction (§7)         — Epic 3
+      kosha-core      shared types and data model                 — Epic 2
+      kosha-segment   segment file format (r/w binary inverted    — Epic 2
+                     index, doc store, JSON footer)
+      kosha-write     document buffer + flush-to-segment          — Epic 3
       kosha-cache     NVMe SSD read-through cache (§9)            — Epic 4
-      kosha-query     BM25 read path (§8)                         — Epic 5
-      kosha-control   namespace registry + manifest store (§5)    — Epic 6
-      kosha-server    node binary: ingest/query/compaction + API  — Epic 8
+      kosha-query     BM25 scorer + multi-term top-K searcher     — Epic 5
+      kosha-control   in-memory namespace + manifest store        — Epic 6
+      kosha-server    HTTP API (GET /healthz, POST /index,        — Epic 8
+                     GET /search)
     proto/            protobuf definitions (dsearch.proto)        — Epic 1
     docs/             development and integration guides
     DESIGN.md         architecture document (v1 draft)
