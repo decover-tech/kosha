@@ -635,6 +635,81 @@ class KoshaClient:
             "failures": [],
         }
 
+    # ── Update by query ────────────────────────────────────────────────────
+
+    def update_by_query(self, index: str | None = None,
+                        body: dict | None = None, **params: Any) -> dict:
+        """Update documents matching a query.
+
+        Supports simple ``ctx._source.X = ctx._source.Y`` (field copy)
+        and ``ctx._source.X = 'value'`` (literal set) scripts.
+        """
+        ns = index or self._namespace
+        query = (body or {}).get("query", {})
+        script = (body or {}).get("script", {})
+        source = script.get("source", "").strip()
+
+        # Parse the script to extract target field and source expression.
+        target_field = None
+        source_expr = None
+        import re
+        m = re.match(r"ctx\._source\.(\w+)\s*=\s*(.+)", source)
+        if m:
+            target_field = m.group(1)
+            source_expr = m.group(2).strip().strip("'").strip('"')
+
+        if not target_field:
+            raise NotImplementedError(
+                f"Kosha does not support script: {source!r}. "
+                "Only simple 'ctx._source.X = ...' patterns work."
+            )
+
+        # Search for matching docs in pages.
+        page_size = 100
+        from_ = 0
+        total_updated = 0
+        while True:
+            search_body = {
+                "query": query,
+                "size": page_size,
+                "from": from_,
+                "_source": True,
+            }
+            try:
+                result = self.search(index=ns, body=search_body)
+            except KoshaRequestError:
+                break
+
+            hits = result.get("hits", {}).get("hits", [])
+            if not hits:
+                break
+
+            for hit in hits:
+                doc_id = hit["_id"]
+                source_fields = hit.get("_source", {})
+
+                # Evaluate the source expression.
+                if source_expr in source_fields:
+                    new_value = source_fields[source_expr]
+                else:
+                    new_value = source_expr
+
+                # Re-index with updated field.
+                source_fields[target_field] = new_value
+                self.index(index=ns, id=doc_id, body=source_fields)
+                total_updated += 1
+
+            from_ += page_size
+
+        # Flush to persist updated segments.
+        self._request("POST", "flush", {"namespace": ns})
+
+        return {
+            "updated": total_updated,
+            "total": total_updated,
+            "failures": [],
+        }
+
     # ── Scan / Scroll ──────────────────────────────────────────────────────
 
     def scroll(self, scroll_id: str = None, scroll: str = "5m", **params):
