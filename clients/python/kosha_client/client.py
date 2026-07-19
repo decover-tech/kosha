@@ -97,35 +97,27 @@ class KoshaClient:
     # ── Search ─────────────────────────────────────────────────────────────
 
     def search(self, index: str | None = None, body: dict | None = None, **params: Any) -> dict:
-        """Execute a search against Kosha.
-
-        Translates an OpenSearch-shaped ``body`` dict into a Kosha search
-        and returns an OpenSearch-shaped response dict.
-        """
         ns = index or self._namespace
         query_text = self._extract_query_text(body) if body else ""
         size = body.get("size", 10) if body else 10
         from_ = body.get("from", 0) if body else 0
-
-        # Extract filter clauses from ES query body.
         filter_clause = self._extract_filter(body)
+        aggs = self._extract_aggs(body)
+        wildcard = self._extract_wildcard(body)
+        match_phrase = self._extract_match_phrase(body)
 
-        # For simple queries without filters, use GET.
-        if not filter_clause:
+        # Determine if we need POST (agg/wildcard/phrase/filter present).
+        needs_post = bool(filter_clause or aggs or wildcard or match_phrase)
+
+        if not needs_post:
             bm25_params = {}
             q = body and (body.get("query") or {})
             if q:
                 bm25_params = self._extract_bm25_params(q)
-
-            query_params = {
-                "ns": ns,
-                "q": query_text,
-                "max_results": str(size + from_),
-            }
+            query_params = {"ns": ns, "q": query_text, "max_results": str(size + from_)}
             if bm25_params:
                 query_params.update(bm25_params)
             url = f"{self._kosha_url}/search?{urllib.parse.urlencode(query_params)}"
-
             try:
                 req = urllib.request.Request(url)
                 if self._auth:
@@ -147,24 +139,34 @@ class KoshaClient:
                 except json.JSONDecodeError:
                     err = {"error": body_bytes.decode()}
                 raise KoshaRequestError(e.code, err.get("error", str(e)), err) from e
-
             kosha_hits = result.get("results", [])
             total = result.get("total_hits", 0)
             return self._build_search_response(kosha_hits, from_, size, took_ms, total)
 
-        # For complex queries with filters, use POST with JSON body.
         kosha_body = {
             "namespace": ns,
             "query_text": query_text,
             "max_results": size + from_,
             "from": from_,
-            "filter": filter_clause,
         }
+        if filter_clause:
+            kosha_body["filter"] = filter_clause
+        if aggs:
+            kosha_body["aggs"] = aggs
+        if wildcard:
+            kosha_body["wildcard"] = wildcard
+        if match_phrase:
+            kosha_body["match_phrase"] = match_phrase
+
         result = self._request("POST", "search", body=kosha_body)
         kosha_hits = result.get("results", [])
         total = result.get("total_hits", 0)
+        kosha_aggs = result.get("aggregations")
 
-        return self._build_search_response(kosha_hits, 0, size, 0, total)
+        response = self._build_search_response(kosha_hits, 0, size, 0, total)
+        if kosha_aggs:
+            response["aggregations"] = kosha_aggs
+        return response
 
     def _build_search_response(
         self,
@@ -402,8 +404,69 @@ class KoshaClient:
     # ── Index ──────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _extract_aggs(body: dict | None) -> dict | None:
+        """Extract aggregations from an ES query body."""
+        if not body:
+            return None
+        aggs = body.get("aggs") or body.get("aggregations")
+        if aggs:
+            return aggs  # Kosha accepts the same format as ES
+        return None
+
+    @staticmethod
+    def _extract_wildcard(body: dict | None) -> dict | None:
+        """Extract wildcard query from an ES query body.
+        Converts ES format to Kosha format.
+        """
+        if not body:
+            return None
+        query = body.get("query") or {}
+        wc = query.get("wildcard")
+        if not wc:
+            return None
+        # ES: {"wildcard": {"field": {"value": "*Smith*", "case_insensitive": true}}}
+        for field, spec in wc.items():
+            if isinstance(spec, dict):
+                return {
+                    "field": field,
+                    "pattern": spec.get("value", spec.get("wildcard", "")),
+                    "case_insensitive": spec.get("case_insensitive", True),
+                }
+            return {
+                "field": field,
+                "pattern": spec,
+                "case_insensitive": True,
+            }
+        return None
+
+    @staticmethod
+    def _extract_match_phrase(body: dict | None) -> dict | None:
+        """Extract match_phrase query from an ES query body.
+        Converts ES format to Kosha format.
+        """
+        if not body:
+            return None
+        query = body.get("query") or {}
+        mp = query.get("match_phrase")
+        if not mp:
+            return None
+        # ES: {"match_phrase": {"field": {"query": "phrase text", "slop": 2}}}
+        for field, spec in mp.items():
+            if isinstance(spec, dict):
+                return {
+                    "field": field,
+                    "phrase": spec.get("query", ""),
+                    "slop": spec.get("slop", 0),
+                }
+            return {
+                "field": field,
+                "phrase": spec,
+                "slop": 0,
+            }
+        return None
+
+    @staticmethod
     def _field_to_kosha(name: str, value: str, field_type: str = "Text") -> dict:
-        """Convert a field to Kosha's Field format."""
         return {"name": name, "field_type": field_type, "value": value}
 
     def index(self, index: str | None = None, id: str | None = None,

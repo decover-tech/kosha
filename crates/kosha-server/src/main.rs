@@ -261,6 +261,9 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         filter: None,
         sort: vec![],
         highlight: None,
+        aggs: std::collections::HashMap::new(),
+        wildcard: None,
+        match_phrase: None,
     };
 
     // Get the manifest from the indexer (source of truth for segments).

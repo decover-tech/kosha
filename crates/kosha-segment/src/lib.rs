@@ -1,35 +1,21 @@
-//! Segment format — the immutable, self-contained unit of durable storage
-//! (DESIGN.md §6.2, implementation plan Epic 2).
-//!
-//! A segment is a directory on disk (or prefix in S3) containing:
-//! - `doc_store.bin`  — serialized [`DocRecord`] entries
-//! - `inverted.idx`   — binary inverted index (term → postings list)
-//! - `filters.bin`    — filter column data (keyword, integer, float values)
-//! - `footer.json`    — JSON [`Footer`] metadata
-//!
-//! All integer values are stored in little-endian format.
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use kosha_core::{
+    AggBucket, AggBucketResult, AggMetricResult, AggregationResults,
     Bm25Params, DocRecord, DocumentId, Field, FieldType, FilterStore, Footer,
     KoshaError, Posting, SegmentId,
 };
 
 // ─── Segment writer ─────────────────────────────────────────────────────────
 
-/// Builds a segment directory on disk.
 pub struct SegmentWriter {
     segment_id: SegmentId,
     output_dir: PathBuf,
-
     doc_records: Vec<DocRecord>,
     inverted_index: HashMap<String, Vec<Posting>>,
     total_field_length: u64,
-
-    /// Filter values indexed by field name.
     filter_string: HashMap<String, Vec<(u32, String)>>,
     filter_integer: HashMap<String, Vec<(u32, i64)>>,
     filter_float: HashMap<String, Vec<(u32, f64)>>,
@@ -38,93 +24,63 @@ pub struct SegmentWriter {
 impl SegmentWriter {
     pub fn new(segment_id: SegmentId, output_dir: PathBuf) -> Self {
         Self {
-            segment_id,
-            output_dir,
-            doc_records: Vec::new(),
-            inverted_index: HashMap::new(),
+            segment_id, output_dir,
+            doc_records: Vec::new(), inverted_index: HashMap::new(),
             total_field_length: 0,
-            filter_string: HashMap::new(),
-            filter_integer: HashMap::new(),
-            filter_float: HashMap::new(),
+            filter_string: HashMap::new(), filter_integer: HashMap::new(), filter_float: HashMap::new(),
         }
     }
 
     pub fn add_document(&mut self, doc_id: DocumentId, fields: Vec<Field>) {
         let doc_seq = self.doc_records.len() as u32;
-
         let mut field_length: u32 = 0;
 
         for field in &fields {
-            // Tokenize text fields for BM25.
             if field.field_type == FieldType::Text {
-                let tokens = tokenize(&field.value);
+                let tokens = tokenize_with_positions(&field.value);
                 field_length += tokens.len() as u32;
-
-                for token in tokens {
+                for (token, pos) in tokens {
                     let postings = self.inverted_index.entry(token).or_default();
                     if let Some(last) = postings.last_mut() {
                         if last.doc_id == doc_seq {
                             last.term_frequency += 1;
+                            last.positions.push(pos);
                             continue;
                         }
                     }
-                    postings.push(Posting { doc_id: doc_seq, term_frequency: 1 });
+                    postings.push(Posting { doc_id: doc_seq, term_frequency: 1, positions: vec![pos] });
                 }
             }
-
-            // Collect filter values for non-text fields.
             match field.field_type {
                 FieldType::Keyword | FieldType::Boolean | FieldType::Date => {
-                    self.filter_string
-                        .entry(field.name.clone())
-                        .or_default()
-                        .push((doc_seq, field.value.clone()));
+                    self.filter_string.entry(field.name.clone()).or_default().push((doc_seq, field.value.clone()));
                 }
                 FieldType::Integer => {
                     if let Ok(v) = field.value.parse::<i64>() {
-                        self.filter_integer
-                            .entry(field.name.clone())
-                            .or_default()
-                            .push((doc_seq, v));
+                        self.filter_integer.entry(field.name.clone()).or_default().push((doc_seq, v));
                     }
                 }
                 FieldType::Float => {
                     if let Ok(v) = field.value.parse::<f64>() {
-                        self.filter_float
-                            .entry(field.name.clone())
-                            .or_default()
-                            .push((doc_seq, v));
+                        self.filter_float.entry(field.name.clone()).or_default().push((doc_seq, v));
                     }
                 }
                 FieldType::Text => {
-                    // Text fields don't need special filter tracking —
-                    // BM25 handles them. But store the raw value for
-                    // potential filter use anyway.
-                    self.filter_string
-                        .entry(field.name.clone())
-                        .or_default()
-                        .push((doc_seq, field.value.clone()));
+                    self.filter_string.entry(field.name.clone()).or_default().push((doc_seq, field.value.clone()));
                 }
             }
         }
 
         self.total_field_length += field_length as u64;
-        self.doc_records.push(DocRecord {
-            doc_id,
-            doc_seq,
-            field_length,
-            fields,
-        });
+        self.doc_records.push(DocRecord { doc_id, doc_seq, field_length, fields });
     }
 
     pub fn finalize(self, bm25_params: Bm25Params) -> Result<Footer, KoshaError> {
         fs::create_dir_all(&self.output_dir)?;
-
         self.write_doc_store()?;
         self.write_inverted_index()?;
         self.write_filters()?;
         let footer = self.write_footer(bm25_params)?;
-
         Ok(footer)
     }
 
@@ -137,29 +93,23 @@ impl SegmentWriter {
         let mut buf = Vec::new();
         let doc_count = self.doc_records.len() as u32;
         buf.extend_from_slice(&doc_count.to_le_bytes());
-
         for rec in &self.doc_records {
             let id_bytes = rec.doc_id.0.as_bytes();
             buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(id_bytes);
             buf.extend_from_slice(&rec.field_length.to_le_bytes());
-
             let field_count = rec.fields.len() as u32;
             buf.extend_from_slice(&field_count.to_le_bytes());
-
             for field in &rec.fields {
                 let name_bytes = field.name.as_bytes();
                 buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(name_bytes);
-                // Store field type in doc_store for schema-free reading.
                 buf.push(field.field_type as u8);
-
                 let val_bytes = field.value.as_bytes();
                 buf.extend_from_slice(&(val_bytes.len() as u64).to_le_bytes());
                 buf.extend_from_slice(val_bytes);
             }
         }
-
         fs::write(self.doc_store_path(), &buf)?;
         Ok(())
     }
@@ -167,37 +117,33 @@ impl SegmentWriter {
     fn write_inverted_index(&self) -> Result<(), KoshaError> {
         let mut terms: Vec<&String> = self.inverted_index.keys().collect();
         terms.sort();
-
         let mut buf = Vec::new();
         buf.extend_from_slice(&(terms.len() as u32).to_le_bytes());
-
         for term_str in terms {
             let postings = &self.inverted_index[term_str];
             let term_bytes = term_str.as_bytes();
-
             buf.extend_from_slice(&(term_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(term_bytes);
             buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
             buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
-
             for posting in postings {
                 buf.extend_from_slice(&posting.doc_id.to_le_bytes());
                 buf.extend_from_slice(&posting.term_frequency.to_le_bytes());
+                buf.extend_from_slice(&(posting.positions.len() as u32).to_le_bytes());
+                for &pos in &posting.positions {
+                    buf.extend_from_slice(&pos.to_le_bytes());
+                }
             }
         }
-
         fs::write(self.inverted_index_path(), &buf)?;
         Ok(())
     }
 
     fn write_filters(&self) -> Result<(), KoshaError> {
         let mut buf = Vec::new();
-
-        // Count total fields with filter data.
         let total_fields = self.filter_string.len() + self.filter_integer.len() + self.filter_float.len();
         buf.extend_from_slice(&(total_fields as u32).to_le_bytes());
 
-        // Write string fields (Keyword, Boolean, Date, Text).
         let mut string_names: Vec<&String> = self.filter_string.keys().collect();
         string_names.sort();
         for name in string_names {
@@ -205,10 +151,8 @@ impl SegmentWriter {
             let name_bytes = name.as_bytes();
             buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(name_bytes);
-            buf.push(0); // type: string
-
-            let entry_count = entries.len() as u32;
-            buf.extend_from_slice(&entry_count.to_le_bytes());
+            buf.push(0);
+            buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
             for &(doc_seq, ref val) in entries {
                 buf.extend_from_slice(&doc_seq.to_le_bytes());
                 let val_bytes = val.as_bytes();
@@ -217,7 +161,6 @@ impl SegmentWriter {
             }
         }
 
-        // Write integer fields.
         let mut int_names: Vec<&String> = self.filter_integer.keys().collect();
         int_names.sort();
         for name in int_names {
@@ -225,17 +168,14 @@ impl SegmentWriter {
             let name_bytes = name.as_bytes();
             buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(name_bytes);
-            buf.push(1); // type: integer
-
-            let entry_count = entries.len() as u32;
-            buf.extend_from_slice(&entry_count.to_le_bytes());
+            buf.push(1);
+            buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
             for &(doc_seq, val) in entries {
                 buf.extend_from_slice(&doc_seq.to_le_bytes());
                 buf.extend_from_slice(&val.to_le_bytes());
             }
         }
 
-        // Write float fields.
         let mut float_names: Vec<&String> = self.filter_float.keys().collect();
         float_names.sort();
         for name in float_names {
@@ -243,10 +183,8 @@ impl SegmentWriter {
             let name_bytes = name.as_bytes();
             buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(name_bytes);
-            buf.push(2); // type: float
-
-            let entry_count = entries.len() as u32;
-            buf.extend_from_slice(&entry_count.to_le_bytes());
+            buf.push(2);
+            buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
             for &(doc_seq, val) in entries {
                 buf.extend_from_slice(&doc_seq.to_le_bytes());
                 buf.extend_from_slice(&val.to_le_bytes());
@@ -259,21 +197,12 @@ impl SegmentWriter {
 
     fn write_footer(&self, bm25_params: Bm25Params) -> Result<Footer, KoshaError> {
         let doc_count = self.doc_records.len() as u32;
-        let avg = if doc_count > 0 {
-            self.total_field_length as f64 / doc_count as f64
-        } else {
-            0.0
-        };
-
+        let avg = if doc_count > 0 { self.total_field_length as f64 / doc_count as f64 } else { 0.0 };
         let footer = Footer {
-            segment_id: self.segment_id.clone(),
-            doc_count,
-            total_field_length: self.total_field_length,
-            avg_field_length: avg,
-            bm25_params,
-            created_at: chrono_like_now(),
+            segment_id: self.segment_id.clone(), doc_count,
+            total_field_length: self.total_field_length, avg_field_length: avg,
+            bm25_params, created_at: chrono_like_now(),
         };
-
         let json = serde_json::to_string_pretty(&footer)?;
         fs::write(self.footer_path(), json.as_bytes())?;
         Ok(footer)
@@ -282,31 +211,29 @@ impl SegmentWriter {
 
 // ─── Segment reader ─────────────────────────────────────────────────────────
 
-/// Reads a segment directory from disk.
 pub struct SegmentReader {
-    #[allow(dead_code)]
-    segment_dir: PathBuf,
+    #[allow(dead_code)] segment_dir: PathBuf,
     footer: Footer,
-    doc_records: Vec<DocRecord>,
-    inverted_index: HashMap<String, Vec<Posting>>,
-    filter_store: FilterStore,
+    pub doc_records: Vec<DocRecord>,
+    pub inverted_index: HashMap<String, Vec<Posting>>,
+    pub filter_store: FilterStore,
 }
 
 impl SegmentReader {
     pub fn open(segment_dir: PathBuf) -> Result<Self, KoshaError> {
-        let footer = Self::read_footer(&segment_dir)?;
-        let doc_records = Self::read_doc_store(&segment_dir)?;
-        let inverted_index = Self::read_inverted_index(&segment_dir)?;
-        let filter_store = Self::read_filters(&segment_dir)?;
-
-        Ok(Self { segment_dir, footer, doc_records, inverted_index, filter_store })
+        Ok(Self {
+            segment_dir: segment_dir.clone(),
+            footer: Self::read_footer(&segment_dir)?,
+            doc_records: Self::read_doc_store(&segment_dir)?,
+            inverted_index: Self::read_inverted_index(&segment_dir)?,
+            filter_store: Self::read_filters(&segment_dir)?,
+        })
     }
 
     pub fn footer(&self) -> &Footer { &self.footer }
     pub fn doc_count(&self) -> u32 { self.footer.doc_count }
     pub fn avg_field_length(&self) -> f64 { self.footer.avg_field_length }
     pub fn bm25_params(&self) -> &Bm25Params { &self.footer.bm25_params }
-    pub fn filter_store(&self) -> &FilterStore { &self.filter_store }
 
     pub fn postings(&self, term: &str) -> Option<&[Posting]> {
         self.inverted_index.get(term).map(|v| v.as_slice())
@@ -320,10 +247,10 @@ impl SegmentReader {
         self.inverted_index.contains_key(term)
     }
 
-    pub fn terms(&self) -> impl Iterator<Item = &str> {
+    pub fn all_terms(&self) -> Vec<&str> {
         let mut terms: Vec<&String> = self.inverted_index.keys().collect();
         terms.sort();
-        terms.into_iter().map(|s| s.as_str())
+        terms.into_iter().map(|s| s.as_str()).collect()
     }
 
     fn read_footer(segment_dir: &Path) -> Result<Footer, KoshaError> {
@@ -335,44 +262,33 @@ impl SegmentReader {
         let data = fs::read(segment_dir.join("doc_store.bin"))?;
         let mut cursor = &data[..];
         let mut records = Vec::new();
-
         if cursor.len() < 4 { return Ok(records); }
-
         let doc_count = read_u32_le(&mut cursor);
         for doc_seq in 0..doc_count {
             let id_len = read_u32_le(&mut cursor) as usize;
             let id_bytes = read_bytes(&mut cursor, id_len);
             let doc_id = DocumentId(String::from_utf8_lossy(id_bytes).to_string());
             let field_length = read_u32_le(&mut cursor);
-
             let field_count = read_u32_le(&mut cursor);
             let mut fields = Vec::with_capacity(field_count as usize);
             for _ in 0..field_count {
                 let name_len = read_u32_le(&mut cursor) as usize;
                 let name_bytes = read_bytes(&mut cursor, name_len);
                 let name = String::from_utf8_lossy(name_bytes).to_string();
-
                 let field_type = match cursor[0] {
-                    0 => FieldType::Text,
-                    1 => FieldType::Keyword,
-                    2 => FieldType::Integer,
-                    3 => FieldType::Float,
-                    4 => FieldType::Date,
-                    5 => FieldType::Boolean,
+                    0 => FieldType::Text, 1 => FieldType::Keyword,
+                    2 => FieldType::Integer, 3 => FieldType::Float,
+                    4 => FieldType::Date, 5 => FieldType::Boolean,
                     _ => FieldType::Text,
                 };
                 cursor = &cursor[1..];
-
                 let val_len = read_u64_le(&mut cursor) as usize;
                 let val_bytes = read_bytes(&mut cursor, val_len);
                 let value = String::from_utf8_lossy(val_bytes).to_string();
-
                 fields.push(Field { name, field_type, value });
             }
-
             records.push(DocRecord { doc_id, doc_seq, field_length, fields });
         }
-
         Ok(records)
     }
 
@@ -380,128 +296,121 @@ impl SegmentReader {
         let data = fs::read(segment_dir.join("inverted.idx"))?;
         let mut cursor = &data[..];
         let mut index = HashMap::new();
-
         if cursor.len() < 4 { return Ok(index); }
-
         let term_count = read_u32_le(&mut cursor);
         for _ in 0..term_count {
             let term_len = read_u32_le(&mut cursor) as usize;
             let term_bytes = read_bytes(&mut cursor, term_len);
             let term = String::from_utf8_lossy(term_bytes).to_string();
-
             let _df = read_u32_le(&mut cursor);
             let postings_len = read_u32_le(&mut cursor) as usize;
             let mut postings = Vec::with_capacity(postings_len);
             for _ in 0..postings_len {
                 let doc_id = read_u32_le(&mut cursor);
                 let term_frequency = read_u32_le(&mut cursor);
-                postings.push(Posting { doc_id, term_frequency });
+                let positions_len = read_u32_le(&mut cursor) as usize;
+                let mut positions = Vec::with_capacity(positions_len);
+                for _ in 0..positions_len {
+                    positions.push(read_u32_le(&mut cursor));
+                }
+                postings.push(Posting { doc_id, term_frequency, positions });
             }
-
             index.insert(term, postings);
         }
-
         Ok(index)
     }
 
     fn read_filters(segment_dir: &Path) -> Result<FilterStore, KoshaError> {
         let path = segment_dir.join("filters.bin");
-        if !path.exists() {
-            return Ok(FilterStore::default());
-        }
-
+        if !path.exists() { return Ok(FilterStore::default()); }
         let data = fs::read(&path)?;
         let mut cursor = &data[..];
         let mut store = FilterStore::default();
-
         if cursor.len() < 4 { return Ok(store); }
-
         let field_count = read_u32_le(&mut cursor);
         for _ in 0..field_count {
             let name_len = read_u32_le(&mut cursor) as usize;
             let name_bytes = read_bytes(&mut cursor, name_len);
             let name = String::from_utf8_lossy(name_bytes).to_string();
-
-            let field_type = cursor[0];
-            cursor = &cursor[1..];
-
+            let field_type = cursor[0]; cursor = &cursor[1..];
             let entry_count = read_u32_le(&mut cursor) as usize;
-
             match field_type {
                 0 => {
-                    // String field.
                     let mut entries = Vec::with_capacity(entry_count);
                     for _ in 0..entry_count {
                         let doc_seq = read_u32_le(&mut cursor);
                         let val_len = read_u32_le(&mut cursor) as usize;
                         let val_bytes = read_bytes(&mut cursor, val_len);
-                        let val = String::from_utf8_lossy(val_bytes).to_string();
-                        entries.push((doc_seq, val));
+                        entries.push((doc_seq, String::from_utf8_lossy(val_bytes).to_string()));
                     }
                     store.string_fields.insert(name, entries);
                 }
                 1 => {
-                    // Integer field.
                     let mut entries = Vec::with_capacity(entry_count);
                     for _ in 0..entry_count {
-                        let doc_seq = read_u32_le(&mut cursor);
-                        let val = read_i64_le(&mut cursor);
-                        entries.push((doc_seq, val));
+                        entries.push((read_u32_le(&mut cursor), read_i64_le(&mut cursor)));
                     }
                     store.integer_fields.insert(name, entries);
                 }
                 2 => {
-                    // Float field.
                     let mut entries = Vec::with_capacity(entry_count);
                     for _ in 0..entry_count {
-                        let doc_seq = read_u32_le(&mut cursor);
-                        let val = read_f64_le(&mut cursor);
-                        entries.push((doc_seq, val));
+                        entries.push((read_u32_le(&mut cursor), read_f64_le(&mut cursor)));
                     }
                     store.float_fields.insert(name, entries);
                 }
                 _ => {}
             }
         }
-
         Ok(store)
     }
+}
+
+// ─── Aggregation helper ─────────────────────────────────────────────────────
+
+pub fn compute_aggregations(
+    store: &FilterStore,
+    _doc_count: u32,
+    field: &str,
+) -> AggregationResults {
+    let mut results = AggregationResults {
+        per_document: None, total_documents: None,
+        matched_docs: None, extra: HashMap::new(),
+    };
+
+    if let Some(entries) = store.string_fields.get(field) {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for (_, val) in entries {
+            *counts.entry(val.as_str()).or_default() += 1;
+        }
+        let mut buckets: Vec<AggBucket> = counts.into_iter()
+            .map(|(k, c)| AggBucket { key: k.to_string(), doc_count: c })
+            .collect();
+        buckets.sort_by(|a, b| b.doc_count.cmp(&a.doc_count));
+        let cardinality = buckets.len();
+        results.per_document = Some(AggBucketResult { buckets });
+        results.total_documents = Some(AggMetricResult { value: cardinality });
+    }
+
+    results
 }
 
 // ─── Binary read helpers ────────────────────────────────────────────────────
 
 fn read_u32_le(cursor: &mut &[u8]) -> u32 {
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(&cursor[..4]);
-    *cursor = &cursor[4..];
-    u32::from_le_bytes(buf)
+    let mut buf = [0u8; 4]; buf.copy_from_slice(&cursor[..4]); *cursor = &cursor[4..]; u32::from_le_bytes(buf)
 }
-
 fn read_u64_le(cursor: &mut &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&cursor[..8]);
-    *cursor = &cursor[8..];
-    u64::from_le_bytes(buf)
+    let mut buf = [0u8; 8]; buf.copy_from_slice(&cursor[..8]); *cursor = &cursor[8..]; u64::from_le_bytes(buf)
 }
-
 fn read_i64_le(cursor: &mut &[u8]) -> i64 {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&cursor[..8]);
-    *cursor = &cursor[8..];
-    i64::from_le_bytes(buf)
+    let mut buf = [0u8; 8]; buf.copy_from_slice(&cursor[..8]); *cursor = &cursor[8..]; i64::from_le_bytes(buf)
 }
-
 fn read_f64_le(cursor: &mut &[u8]) -> f64 {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&cursor[..8]);
-    *cursor = &cursor[8..];
-    f64::from_le_bytes(buf)
+    let mut buf = [0u8; 8]; buf.copy_from_slice(&cursor[..8]); *cursor = &cursor[8..]; f64::from_le_bytes(buf)
 }
-
 fn read_bytes<'a>(cursor: &mut &'a [u8], len: usize) -> &'a [u8] {
-    let result = &cursor[..len];
-    *cursor = &cursor[len..];
-    result
+    let result = &cursor[..len]; *cursor = &cursor[len..]; result
 }
 
 // ─── Tokenizer ──────────────────────────────────────────────────────────────
@@ -509,9 +418,22 @@ fn read_bytes<'a>(cursor: &mut &'a [u8], len: usize) -> &'a [u8] {
 pub fn tokenize(text: &str) -> Vec<String> {
     text.split_whitespace()
         .flat_map(|word| {
-            let word = word.trim_matches(|c: char| c.is_ascii_punctuation());
-            if word.is_empty() { None } else { Some(word.to_lowercase()) }
+            let w = word.trim_matches(|c: char| c.is_ascii_punctuation());
+            if w.is_empty() { None } else { Some(w.to_lowercase()) }
         })
+        .collect()
+}
+
+pub fn tokenize_with_positions(text: &str) -> Vec<(String, u32)> {
+    text.split_whitespace()
+        .scan(0u32, |pos, word| {
+            let w = word.trim_matches(|c: char| c.is_ascii_punctuation());
+            if w.is_empty() { Some(None) } else {
+                let p = *pos; *pos += 1;
+                Some(Some((w.to_lowercase(), p)))
+            }
+        })
+        .flatten()
         .collect()
 }
 
@@ -519,13 +441,11 @@ fn chrono_like_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = dur.as_secs();
-    let days_since_epoch = secs / 86400;
-    let time_secs = secs % 86400;
-    let hours = time_secs / 3600;
-    let minutes = (time_secs % 3600) / 60;
-    let seconds = time_secs % 60;
-    let (year, month, day) = days_to_date(days_since_epoch as i64);
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month, day, hours, minutes, seconds)
+    let (year, month, day) = days_to_date((secs / 86400) as i64);
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month, day, h, m, s)
 }
 
 fn days_to_date(mut days: i64) -> (i64, i64, i64) {
@@ -538,74 +458,55 @@ fn days_to_date(mut days: i64) -> (i64, i64, i64) {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
-
-// ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn tokenize_simple_text() {
-        let tokens = tokenize("Hello World! This is a test.");
-        assert_eq!(tokens, vec!["hello", "world", "this", "is", "a", "test"]);
+    fn tokenize_with_positions_works() {
+        let r = tokenize_with_positions("quick brown fox");
+        assert_eq!(r, vec![
+            ("quick".to_string(), 0),
+            ("brown".to_string(), 1),
+            ("fox".to_string(), 2),
+        ]);
     }
 
     #[test]
-    fn write_and_read_segment_with_filters() {
-        let dir = std::env::temp_dir().join("kosha-test-seg-filters");
+    fn write_and_read_segment_with_positions() {
+        let dir = std::env::temp_dir().join("kosha-test-seg-positions");
         let _ = fs::remove_dir_all(&dir);
+        let seg_id = SegmentId("test".into());
+        let mut w = SegmentWriter::new(seg_id.clone(), dir.clone());
+        w.add_document(DocumentId("d1".into()), vec![Field::text("t", "quick brown fox")]);
+        w.add_document(DocumentId("d2".into()), vec![Field::text("t", "quick fox is quick")]);
+        w.finalize(Bm25Params::default()).unwrap();
 
-        let seg_id = SegmentId("test-seg".into());
-        let mut writer = SegmentWriter::new(seg_id, dir.clone());
-
-        writer.add_document(
-            DocumentId("doc1".into()),
-            vec![
-                Field::text("title", "quick brown fox"),
-                Field::keyword("matterId", "matter-001"),
-                Field::integer("pageNumber", 1),
-            ],
-        );
-        writer.add_document(
-            DocumentId("doc2".into()),
-            vec![
-                Field::text("title", "lazy dog"),
-                Field::keyword("matterId", "matter-001"),
-                Field::integer("pageNumber", 5),
-            ],
-        );
-        writer.add_document(
-            DocumentId("doc3".into()),
-            vec![
-                Field::text("title", "quick rabbit"),
-                Field::keyword("matterId", "matter-002"),
-                Field::integer("pageNumber", 10),
-            ],
-        );
-
-        writer.finalize(Bm25Params::default()).unwrap();
-
-        let reader = SegmentReader::open(dir.clone()).unwrap();
-        let store = reader.filter_store();
-
-        // Check string (keyword) field
-        let matter_ids = store.string_fields.get("matterId").unwrap();
-        assert_eq!(matter_ids.len(), 3);
-        assert_eq!(matter_ids[0], (0, "matter-001".to_string()));
-        assert_eq!(matter_ids[1], (1, "matter-001".to_string()));
-        assert_eq!(matter_ids[2], (2, "matter-002".to_string()));
-
-        // Check integer field
-        let pages = store.integer_fields.get("pageNumber").unwrap();
-        assert_eq!(pages.len(), 3);
-        assert_eq!(pages[0], (0, 1));
-        assert_eq!(pages[1], (1, 5));
-        assert_eq!(pages[2], (2, 10));
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        // "quick" appears at positions 0 in d1 and positions 0,3 in d2
+        let p = r.postings("quick").unwrap();
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].positions, vec![0]);
+        assert_eq!(p[1].positions, vec![0, 3]);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compute_aggregations_works() {
+        let mut store = FilterStore::default();
+        store.string_fields.insert("documentId".to_string(), vec![
+            (0, "d1".into()), (1, "d2".into()), (2, "d1".into()),
+            (3, "d3".into()), (4, "d1".into()),
+        ]);
+        let result = compute_aggregations(&store, 5, "documentId");
+        let per_doc = result.per_document.unwrap();
+        assert_eq!(per_doc.buckets.len(), 3);
+        // d1 appears 3 times, d2 once, d3 once
+        assert_eq!(per_doc.buckets[0].key, "d1");
+        assert_eq!(per_doc.buckets[0].doc_count, 3);
     }
 }
