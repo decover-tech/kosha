@@ -428,9 +428,7 @@ impl Searcher {
         let query_terms = tokenize(&query.query_text);
 
         let is_tombstoned = |seg_id: &kosha_core::SegmentId, doc_seq: u32| -> bool {
-            tombstones.is_some_and(|t| {
-                t.get(seg_id).is_some_and(|seqs| seqs.contains(&doc_seq))
-            })
+            tombstones.is_some_and(|t| t.get(seg_id).is_some_and(|seqs| seqs.contains(&doc_seq)))
         };
         let has_query =
             !query_terms.is_empty() || query.wildcard.is_some() || query.match_phrase.is_some();

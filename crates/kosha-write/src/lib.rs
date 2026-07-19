@@ -157,14 +157,13 @@ impl Indexer {
 
     fn buffer_mut(&mut self, namespace: NamespaceId) -> &mut NamespaceBuffer {
         if !self.buffers.contains_key(&namespace) {
-            let counter = if self
-                .data_dir
-                .join(&namespace.0)
-                .exists() { {
-                    std::fs::read_dir(self.data_dir.join(&namespace.0))
-                        .map(|e| e.filter_map(|e| e.ok()).count() as u64)
-                        .unwrap_or(0)
-                } } else { 0 };
+            let counter = if self.data_dir.join(&namespace.0).exists() {
+                std::fs::read_dir(self.data_dir.join(&namespace.0))
+                    .map(|e| e.filter_map(|e| e.ok()).count() as u64)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             self.buffers.insert(
                 namespace.clone(),
                 NamespaceBuffer {
@@ -185,7 +184,6 @@ pub fn apply_filter_delete(
     store: &FilterStore,
     candidates: &HashSet<u32>,
 ) -> Result<HashSet<u32>, KoshaError> {
-    
     match filter {
         FilterClause::Term { term } => {
             let mut result = HashSet::new();
@@ -371,7 +369,6 @@ fn range_check_str(val: &str, bound: &RangeBound) -> bool {
 mod tests {
     use super::*;
     use kosha_core::{DocumentId, Field, FilterClause};
-    
 
     #[test]
     fn delete_by_query_tombstones() {
