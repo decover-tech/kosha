@@ -12,7 +12,15 @@ pub struct DocumentId(pub String);
 // ─── Document model ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FieldType { Text, Keyword, Integer, Float, Date, Boolean, Vector }
+pub enum FieldType {
+    Text,
+    Keyword,
+    Integer,
+    Float,
+    Date,
+    Boolean,
+    Vector,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Field {
@@ -23,25 +31,53 @@ pub struct Field {
 
 impl Field {
     pub fn text(n: impl Into<String>, v: impl Into<String>) -> Self {
-        Self { name: n.into(), field_type: FieldType::Text, value: v.into() }
+        Self {
+            name: n.into(),
+            field_type: FieldType::Text,
+            value: v.into(),
+        }
     }
     pub fn keyword(n: impl Into<String>, v: impl Into<String>) -> Self {
-        Self { name: n.into(), field_type: FieldType::Keyword, value: v.into() }
+        Self {
+            name: n.into(),
+            field_type: FieldType::Keyword,
+            value: v.into(),
+        }
     }
     pub fn integer(n: impl Into<String>, v: i64) -> Self {
-        Self { name: n.into(), field_type: FieldType::Integer, value: v.to_string() }
+        Self {
+            name: n.into(),
+            field_type: FieldType::Integer,
+            value: v.to_string(),
+        }
     }
     pub fn float_val(n: impl Into<String>, v: f64) -> Self {
-        Self { name: n.into(), field_type: FieldType::Float, value: v.to_string() }
+        Self {
+            name: n.into(),
+            field_type: FieldType::Float,
+            value: v.to_string(),
+        }
     }
     pub fn date_val(n: impl Into<String>, v: impl Into<String>) -> Self {
-        Self { name: n.into(), field_type: FieldType::Date, value: v.into() }
+        Self {
+            name: n.into(),
+            field_type: FieldType::Date,
+            value: v.into(),
+        }
     }
     pub fn boolean(n: impl Into<String>, v: bool) -> Self {
-        Self { name: n.into(), field_type: FieldType::Boolean, value: v.to_string() }
+        Self {
+            name: n.into(),
+            field_type: FieldType::Boolean,
+            value: v.to_string(),
+        }
     }
     pub fn vector(n: impl Into<String>, v: Vec<f32>) -> Self {
-        Self { name: n.into(), field_type: FieldType::Vector, value: serde_json::to_string(&v).unwrap_or_default() }
+        Self {
+            name: n.into(),
+            field_type: FieldType::Vector,
+            value: serde_json::to_string(&v).unwrap_or_default(),
+        }
     }
 }
 
@@ -70,7 +106,9 @@ pub struct Bm25Params {
 }
 
 impl Default for Bm25Params {
-    fn default() -> Self { Self { k1: 1.2, b: 0.75 } }
+    fn default() -> Self {
+        Self { k1: 1.2, b: 0.75 }
+    }
 }
 
 // ─── Filter types ──────────────────────────────────────────────────────────
@@ -78,32 +116,54 @@ impl Default for Bm25Params {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FilterClause {
-    Term { term: std::collections::HashMap<String, String> },
-    Terms { terms: std::collections::HashMap<String, Vec<String>> },
-    Range { range: std::collections::HashMap<String, RangeBound> },
-    Bool { bool: BoolFilter },
-    MatchAll { match_all: Option<serde_json::Value> },
+    Term {
+        term: std::collections::HashMap<String, String>,
+    },
+    Terms {
+        terms: std::collections::HashMap<String, Vec<String>>,
+    },
+    Range {
+        range: std::collections::HashMap<String, RangeBound>,
+    },
+    Bool {
+        bool: BoolFilter,
+    },
+    MatchAll {
+        match_all: Option<serde_json::Value>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeBound {
-    #[serde(skip_serializing_if = "Option::is_none")] pub gte: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub gt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub lte: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")] pub lt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gte: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lte: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoolFilter {
-    #[serde(default)] pub must: Vec<FilterClause>,
-    #[serde(default)] pub must_not: Vec<FilterClause>,
-    #[serde(default)] pub should: Vec<FilterClause>,
-    #[serde(default = "default_minimum_should_match")] pub minimum_should_match: usize,
+    #[serde(default)]
+    pub must: Vec<FilterClause>,
+    #[serde(default)]
+    pub must_not: Vec<FilterClause>,
+    #[serde(default)]
+    pub should: Vec<FilterClause>,
+    #[serde(default = "default_minimum_should_match")]
+    pub minimum_should_match: usize,
 }
-fn default_minimum_should_match() -> usize { 1 }
+fn default_minimum_should_match() -> usize {
+    1
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SortOrder { pub order: String }
+pub struct SortOrder {
+    pub order: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortSpec {
@@ -114,11 +174,17 @@ pub struct SortSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HighlightConfig {
     pub field: String,
-    #[serde(default = "default_pre_tag")] pub pre_tags: Vec<String>,
-    #[serde(default = "default_post_tag")] pub post_tags: Vec<String>,
+    #[serde(default = "default_pre_tag")]
+    pub pre_tags: Vec<String>,
+    #[serde(default = "default_post_tag")]
+    pub post_tags: Vec<String>,
 }
-fn default_pre_tag() -> Vec<String> { vec!["<b>".into()] }
-fn default_post_tag() -> Vec<String> { vec!["</b>".into()] }
+fn default_pre_tag() -> Vec<String> {
+    vec!["<b>".into()]
+}
+fn default_post_tag() -> Vec<String> {
+    vec!["</b>".into()]
+}
 
 // ─── Wildcard query ────────────────────────────────────────────────────────
 
@@ -129,7 +195,9 @@ pub struct WildcardQuery {
     #[serde(default = "default_case_insensitive")]
     pub case_insensitive: bool,
 }
-fn default_case_insensitive() -> bool { true }
+fn default_case_insensitive() -> bool {
+    true
+}
 
 // ─── Match phrase query ────────────────────────────────────────────────────
 
@@ -157,7 +225,9 @@ pub struct AggTerms {
     #[serde(default = "default_agg_size")]
     pub size: usize,
 }
-fn default_agg_size() -> usize { 10 }
+fn default_agg_size() -> usize {
+    10
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggCardinality {
@@ -165,7 +235,9 @@ pub struct AggCardinality {
     #[serde(default = "default_precision")]
     pub precision_threshold: usize,
 }
-fn default_precision() -> usize { 40000 }
+fn default_precision() -> usize {
+    40000
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggComposite {
@@ -256,9 +328,15 @@ pub struct Footer {
 // ─── Manifest ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestEntry { pub segment_id: SegmentId, pub doc_count: u32 }
+pub struct ManifestEntry {
+    pub segment_id: SegmentId,
+    pub doc_count: u32,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Manifest { pub version: u64, pub segments: Vec<ManifestEntry> }
+pub struct Manifest {
+    pub version: u64,
+    pub segments: Vec<ManifestEntry>,
+}
 
 // ─── kNN query ────────────────────────────────────────────────────────────
 
@@ -273,8 +351,12 @@ pub struct KnnQuery {
     #[serde(default)]
     pub filter: Option<FilterClause>,
 }
-fn default_knn_k() -> usize { 10 }
-fn default_knn_num_candidates() -> usize { 100 }
+fn default_knn_k() -> usize {
+    10
+}
+fn default_knn_num_candidates() -> usize {
+    100
+}
 
 /// Vector store for a segment: doc_seq → embedding vector.
 #[derive(Debug, Clone, Default)]
@@ -288,18 +370,30 @@ pub struct VectorStore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
     pub query_text: String,
-    #[serde(default = "default_max_results")] pub max_results: usize,
-    #[serde(default)] pub from: usize,
-    #[serde(default)] pub bm25_params: Bm25Params,
-    #[serde(default)] pub filter: Option<FilterClause>,
-    #[serde(default)] pub sort: Vec<SortSpec>,
-    #[serde(default)] pub highlight: Option<HighlightConfig>,
-    #[serde(default)] pub aggs: std::collections::HashMap<String, Aggregation>,
-    #[serde(default)] pub wildcard: Option<WildcardQuery>,
-    #[serde(default)] pub match_phrase: Option<MatchPhraseQuery>,
-    #[serde(default)] pub knn: Option<KnnQuery>,
+    #[serde(default = "default_max_results")]
+    pub max_results: usize,
+    #[serde(default)]
+    pub from: usize,
+    #[serde(default)]
+    pub bm25_params: Bm25Params,
+    #[serde(default)]
+    pub filter: Option<FilterClause>,
+    #[serde(default)]
+    pub sort: Vec<SortSpec>,
+    #[serde(default)]
+    pub highlight: Option<HighlightConfig>,
+    #[serde(default)]
+    pub aggs: std::collections::HashMap<String, Aggregation>,
+    #[serde(default)]
+    pub wildcard: Option<WildcardQuery>,
+    #[serde(default)]
+    pub match_phrase: Option<MatchPhraseQuery>,
+    #[serde(default)]
+    pub knn: Option<KnnQuery>,
 }
-fn default_max_results() -> usize { 10 }
+fn default_max_results() -> usize {
+    10
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredDocument {
@@ -321,17 +415,26 @@ pub struct SearchResult {
 // ─── Indexing types ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexRequest { pub namespace: NamespaceId, pub documents: Vec<Document> }
+pub struct IndexRequest {
+    pub namespace: NamespaceId,
+    pub documents: Vec<Document>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexResponse { pub indexed_count: usize, pub namespace: NamespaceId }
+pub struct IndexResponse {
+    pub indexed_count: usize,
+    pub namespace: NamespaceId,
+}
 
 // ─── Errors ────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub enum KoshaError {
-    NamespaceNotFound(NamespaceId), SegmentNotFound(SegmentId),
-    Io(std::io::Error), Serde(serde_json::Error),
-    NotFound(String), InvalidFilter(String),
+    NamespaceNotFound(NamespaceId),
+    SegmentNotFound(SegmentId),
+    Io(std::io::Error),
+    Serde(serde_json::Error),
+    NotFound(String),
+    InvalidFilter(String),
 }
 
 impl std::fmt::Display for KoshaError {
@@ -347,8 +450,16 @@ impl std::fmt::Display for KoshaError {
     }
 }
 impl std::error::Error for KoshaError {}
-impl From<std::io::Error> for KoshaError { fn from(e: std::io::Error) -> Self { Self::Io(e) } }
-impl From<serde_json::Error> for KoshaError { fn from(e: serde_json::Error) -> Self { Self::Serde(e) } }
+impl From<std::io::Error> for KoshaError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+impl From<serde_json::Error> for KoshaError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Serde(e)
+    }
+}
 
 // ─── Filter value store ─────────────────────────────────────────────────────
 
@@ -373,7 +484,11 @@ mod tests {
 
     #[test]
     fn posting_with_positions() {
-        let p = Posting { doc_id: 0, term_frequency: 2, positions: vec![0, 3] };
+        let p = Posting {
+            doc_id: 0,
+            term_frequency: 2,
+            positions: vec![0, 3],
+        };
         assert_eq!(p.positions.len(), 2);
         let json = serde_json::to_string(&p).unwrap();
         let back: Posting = serde_json::from_str(&json).unwrap();
@@ -383,11 +498,13 @@ mod tests {
     #[test]
     fn aggregation_serde() {
         let json = r#"{"per_document": {"terms": {"field": "documentId", "size": 1000}}}"#;
-        let aggs: std::collections::HashMap<String, Aggregation> = serde_json::from_str(json).unwrap();
+        let aggs: std::collections::HashMap<String, Aggregation> =
+            serde_json::from_str(json).unwrap();
         assert!(aggs.contains_key("per_document"));
 
         let json = r#"{"total_documents": {"cardinality": {"field": "documentId"}}}"#;
-        let aggs: std::collections::HashMap<String, Aggregation> = serde_json::from_str(json).unwrap();
+        let aggs: std::collections::HashMap<String, Aggregation> =
+            serde_json::from_str(json).unwrap();
         assert!(aggs.contains_key("total_documents"));
     }
 

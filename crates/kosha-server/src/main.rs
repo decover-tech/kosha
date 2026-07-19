@@ -43,8 +43,7 @@ impl AppState {
 fn main() {
     let role = std::env::var("KOSHA_ROLE").unwrap_or_else(|_| "query".into());
     let port = std::env::var("KOSHA_HTTP_PORT").unwrap_or_else(|_| "8080".into());
-    let data_dir = std::env::var("KOSHA_DATA_DIR")
-        .unwrap_or_else(|_| "/var/lib/kosha/data".into());
+    let data_dir = std::env::var("KOSHA_DATA_DIR").unwrap_or_else(|_| "/var/lib/kosha/data".into());
     let addr = format!("0.0.0.0:{port}");
 
     let state = AppState::new(PathBuf::from(data_dir.clone()));
@@ -66,9 +65,11 @@ fn main() {
 // ─── Request handling ───────────────────────────────────────────────────────
 
 fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| {
-        KoshaError::NotFound(format!("failed to clone stream: {e}"))
-    })?);
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|e| KoshaError::NotFound(format!("failed to clone stream: {e}")))?,
+    );
 
     let mut request_line = String::new();
     reader.read_line(&mut request_line).ok();
@@ -93,7 +94,10 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
 
     let mut body = Vec::new();
     if content_length > 0 {
-        reader.take(content_length as u64).read_to_end(&mut body).ok();
+        reader
+            .take(content_length as u64)
+            .read_to_end(&mut body)
+            .ok();
     }
 
     let response = route(&request_line, &headers, &body, state);
@@ -296,7 +300,10 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         (m, t)
     };
 
-    match state.searcher.search(&ns, &manifest, &query, tombstones.as_ref()) {
+    match state
+        .searcher
+        .search(&ns, &manifest, &query, tombstones.as_ref())
+    {
         Ok(result) => json_ok(&result),
         Err(e) => json_error(500, &format!("search error: {e}")),
     }
@@ -361,7 +368,10 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         (m, t)
     };
 
-    match state.searcher.search(&ns, &manifest, &query, tombstones.as_ref()) {
+    match state
+        .searcher
+        .search(&ns, &manifest, &query, tombstones.as_ref())
+    {
         Ok(result) => json_ok(&result),
         Err(e) => json_error(500, &format!("search error: {e}")),
     }
@@ -427,20 +437,35 @@ mod tests {
 
     #[test]
     fn healthz_returns_200_ok() {
-        let response = route("GET /healthz HTTP/1.1\r\n", &HashMap::new(), b"", &test_state());
+        let response = route(
+            "GET /healthz HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"",
+            &test_state(),
+        );
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"status\":\"ok\""));
     }
 
     #[test]
     fn unknown_path_returns_404() {
-        let response = route("GET /nope HTTP/1.1\r\n", &HashMap::new(), b"", &test_state());
+        let response = route(
+            "GET /nope HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"",
+            &test_state(),
+        );
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
     }
 
     #[test]
     fn response_is_well_formed_http11() {
-        let response = route("GET /healthz HTTP/1.1\r\n", &HashMap::new(), b"", &test_state());
+        let response = route(
+            "GET /healthz HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"",
+            &test_state(),
+        );
         let (status, headers, body) = parse(&response);
         assert!(status.starts_with("HTTP/1.1 "));
         assert!(headers.contains(&format!("content-length: {}", body.len())));
@@ -529,12 +554,7 @@ mod tests {
     #[test]
     fn search_missing_params_returns_400() {
         let state = test_state();
-        let response = route(
-            "GET /search HTTP/1.1\r\n",
-            &HashMap::new(),
-            b"",
-            &state,
-        );
+        let response = route("GET /search HTTP/1.1\r\n", &HashMap::new(), b"", &state);
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
     }
 
