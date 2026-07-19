@@ -1,0 +1,22 @@
+[
+  {"id": "q01", "text": "standard of care", "category": "legal_term"},
+  {"id": "q02", "text": "informed consent", "category": "legal_term"},
+  {"id": "q03", "text": "negligence", "category": "legal_term"},
+  {"id": "q04", "text": "malpractice", "category": "legal_term"},
+  {"id": "q05", "text": "proximate cause", "category": "legal_term"},
+  {"id": "q06", "text": "medical records", "category": "domain_term"},
+  {"id": "q07", "text": "emergency room", "category": "domain_term"},
+  {"id": "q08", "text": "nurse practitioner", "category": "domain_term"},
+  {"id": "q09", "text": "sepsis", "category": "domain_term"},
+  {"id": "q10", "text": "wound infection", "category": "domain_term"},
+  {"id": "q11", "text": "surgery complications", "category": "domain_term"},
+  {"id": "q12", "text": "discharge instructions", "category": "domain_term"},
+  {"id": "q13", "text": "Ruffino", "category": "person_name"},
+  {"id": "q14", "text": "Archer", "category": "person_name"},
+  {"id": "q15", "text": "Callahan", "category": "person_name"},
+  {"id": "q16", "text": "Criner", "category": "person_name"},
+  {"id": "q17", "text": "Rajat Dhar", "category": "person_name"},
+  {"id": "q18", "text": "McCulloch", "category": "person_name"},
+  {"id": "q19", "text": "Bromley", "category": "person_name"},
+  {"id": "q20", "text": "Stonecrest Medical Center", "category": "entity"}
+]

@@ -131,6 +131,10 @@ fn route(
         return handle_delete(body, state);
     }
 
+    if request_line.starts_with("GET /stats") {
+        return handle_stats(state);
+    }
+
     json_error(404, "not found")
 }
 
@@ -228,6 +232,38 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
     json_ok(&serde_json::json!({
         "deleted": count,
         "namespace": ns.0,
+    }))
+}
+
+// ─── GET /stats ──────────────────────────────────────────────────────────────
+
+fn handle_stats(state: &AppState) -> String {
+    let indexer = state.indexer.lock().unwrap();
+    let mut namespaces: Vec<serde_json::Value> = Vec::new();
+    let mut total_docs: u64 = 0;
+    let mut total_segments: usize = 0;
+
+    for ns in indexer.namespaces() {
+        let manifest = match indexer.manifest(ns) {
+            Some(m) => m,
+            None => continue,
+        };
+        let ns_docs: u64 = manifest.segments.iter().map(|s| s.doc_count as u64).sum();
+        total_docs += ns_docs;
+        total_segments += manifest.segments.len();
+
+        namespaces.push(serde_json::json!({
+            "namespace": ns.0,
+            "documents": ns_docs,
+            "segments": manifest.segments.len(),
+            "version": manifest.version,
+        }));
+    }
+
+    json_ok(&serde_json::json!({
+        "total_documents": total_docs,
+        "total_segments": total_segments,
+        "namespaces": namespaces,
     }))
 }
 
