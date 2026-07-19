@@ -567,7 +567,7 @@ pub fn compute_aggregations(
                 doc_count: c,
             })
             .collect();
-        buckets.sort_by(|a, b| b.doc_count.cmp(&a.doc_count));
+        buckets.sort_by_key(|b| std::cmp::Reverse(b.doc_count));
         let cardinality = buckets.len();
         results.per_document = Some(AggBucketResult { buckets });
         results.total_documents = Some(AggMetricResult { value: cardinality });
