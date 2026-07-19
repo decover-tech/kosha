@@ -12,3 +12,4 @@ workspace = true
 kosha-core = { path = "../kosha-core" }
 kosha-segment = { path = "../kosha-segment" }
 serde = { workspace = true }
+serde_json = { workspace = true }

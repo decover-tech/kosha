@@ -107,49 +107,64 @@ class KoshaClient:
         size = body.get("size", 10) if body else 10
         from_ = body.get("from", 0) if body else 0
 
-        # Parse optional BM25 params from the request body.
-        bm25_params = {}
-        q = body and (body.get("query") or {})
-        if q:
-            bm25_params = self._extract_bm25_params(q)
+        # Extract filter clauses from ES query body.
+        filter_clause = self._extract_filter(body)
 
-        # Build Kosha search URL.
-        query_params = {
-            "ns": ns,
-            "q": query_text,
-            "max_results": str(size + from_),
-        }
-        if bm25_params:
-            query_params.update(bm25_params)
-        url = f"{self._kosha_url}/search?{urllib.parse.urlencode(query_params)}"
+        # For simple queries without filters, use GET.
+        if not filter_clause:
+            bm25_params = {}
+            q = body and (body.get("query") or {})
+            if q:
+                bm25_params = self._extract_bm25_params(q)
 
-        try:
-            req = urllib.request.Request(url)
-            if self._auth:
-                import base64
-                user, pwd = self._auth
-                token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
-                req.add_header("Authorization", f"Basic {token}")
-            start = time.monotonic()
-            resp = urllib.request.urlopen(req, timeout=self._timeout)
-            took_ms = int((time.monotonic() - start) * 1000)
-            result = json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            took_ms = 0
-            if e.code == 404:
-                # Namespace not found → empty result set.
-                return self._build_search_response([], from_, size, took_ms)
-            body_bytes = e.read()
+            query_params = {
+                "ns": ns,
+                "q": query_text,
+                "max_results": str(size + from_),
+            }
+            if bm25_params:
+                query_params.update(bm25_params)
+            url = f"{self._kosha_url}/search?{urllib.parse.urlencode(query_params)}"
+
             try:
-                err = json.loads(body_bytes.decode())
-            except json.JSONDecodeError:
-                err = {"error": body_bytes.decode()}
-            raise KoshaRequestError(e.code, err.get("error", str(e)), err) from e
+                req = urllib.request.Request(url)
+                if self._auth:
+                    import base64
+                    user, pwd = self._auth
+                    token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+                    req.add_header("Authorization", f"Basic {token}")
+                start = time.monotonic()
+                resp = urllib.request.urlopen(req, timeout=self._timeout)
+                took_ms = int((time.monotonic() - start) * 1000)
+                result = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                took_ms = 0
+                if e.code == 404:
+                    return self._build_search_response([], from_, size, took_ms)
+                body_bytes = e.read()
+                try:
+                    err = json.loads(body_bytes.decode())
+                except json.JSONDecodeError:
+                    err = {"error": body_bytes.decode()}
+                raise KoshaRequestError(e.code, err.get("error", str(e)), err) from e
 
+            kosha_hits = result.get("results", [])
+            total = result.get("total_hits", 0)
+            return self._build_search_response(kosha_hits, from_, size, took_ms, total)
+
+        # For complex queries with filters, use POST with JSON body.
+        kosha_body = {
+            "namespace": ns,
+            "query_text": query_text,
+            "max_results": size + from_,
+            "from": from_,
+            "filter": filter_clause,
+        }
+        result = self._request("POST", "search", body=kosha_body)
         kosha_hits = result.get("results", [])
         total = result.get("total_hits", 0)
 
-        return self._build_search_response(kosha_hits, from_, size, took_ms, total)
+        return self._build_search_response(kosha_hits, 0, size, 0, total)
 
     def _build_search_response(
         self,
@@ -168,7 +183,10 @@ class KoshaClient:
             score = k_hit.get("score", 0.0)
             source = {}
             for field in k_hit.get("fields", []):
-                source[field["name"]] = field["text"]
+                source[field["name"]] = field.get("value", "")
+                # Store field type for filter-aware operations.
+                if field.get("field_type") not in ("Text", None):
+                    source[f"__type__{field['name']}"] = field["field_type"]
             hits.append({
                 "_index": self._namespace,
                 "_id": doc_id,
@@ -220,14 +238,17 @@ class KoshaClient:
             return multi_match.get("query", "")
 
         # bool: {"bool": {"must": [...], "should": [...], "filter": [...]}}
+        # Only extract text from must/should (full-text clauses).
+        # Filter clauses (term, terms, range) are not query text.
         bool_q = query.get("bool")
         if bool_q is not None:
             texts = []
-            for clause_key in ("must", "should", "filter"):
+            for clause_key in ("must", "should"):
                 for clause in bool_q.get(clause_key, []):
-                    t = KoshaClient._extract_from_query_dsl(clause)
-                    if t:
-                        texts.append(t)
+                    if not KoshaClient._is_filter_only_clause(clause):
+                        t = KoshaClient._extract_from_query_dsl(clause)
+                        if t:
+                            texts.append(t)
             return " ".join(texts)
 
         # term: {"term": {"field": "value"}} — exact match, not full-text.
@@ -263,16 +284,143 @@ class KoshaClient:
                 params["b"] = str(b)
         return params
 
+    @staticmethod
+    def _extract_filter(body: dict | None) -> dict | None:
+        """Extract a filter clause from an OpenSearch query body.
+
+        Handles:
+        - ``body["query"]["bool"]["filter"]`` — ES bool filter clauses
+        - ``body["post_filter"]`` — ES post_filter
+        - ``body["query"]["bool"]["must_not"]`` — ES bool must_not
+        """
+        if not body:
+            return None
+
+        # Collect filter clauses from various locations.
+        must_clauses: list = []
+        must_not_clauses: list = []
+        should_clauses: list = []
+        has_clauses = False
+
+        query = body.get("query") or {}
+
+        # bool.filter clauses
+        bool_q = query.get("bool")
+        if bool_q:
+            for clause in bool_q.get("filter", []):
+                translated = KoshaClient._translate_es_clause(clause)
+                if translated:
+                    must_clauses.append(translated)
+                    has_clauses = True
+            for clause in bool_q.get("must_not", []):
+                translated = KoshaClient._translate_es_clause(clause)
+                if translated:
+                    must_not_clauses.append(translated)
+                    has_clauses = True
+            for clause in bool_q.get("must", []):
+                # Only translate term/terms/range in must clauses
+                # (match clauses are handled by _extract_query_text).
+                translated = KoshaClient._translate_es_clause(clause)
+                if translated and KoshaClient._is_filter_only_clause(clause):
+                    must_clauses.append(translated)
+                    has_clauses = True
+
+        # post_filter
+        post_filter = body.get("post_filter")
+        if post_filter:
+            translated = KoshaClient._translate_es_clause(post_filter)
+            if translated:
+                must_clauses.append(translated)
+                has_clauses = True
+
+        if not has_clauses:
+            return None
+
+        result: dict = {}
+        if must_clauses:
+            result["bool"] = result.get("bool", {})
+            result["bool"]["must"] = must_clauses
+        if must_not_clauses:
+            result["bool"] = result.get("bool", {})
+            result["bool"]["must_not"] = must_not_clauses
+
+        return result if result else None
+
+    @staticmethod
+    def _is_filter_only_clause(clause: dict) -> bool:
+        """Check if a clause is a filter-only clause (not a match query)."""
+        if not clause:
+            return False
+        if "term" in clause or "terms" in clause or "range" in clause:
+            return True
+        if "exists" in clause or "prefix" in clause or "wildcard" in clause:
+            return True
+        if "match_all" in clause:
+            return True
+        return False
+
+    @staticmethod
+    def _translate_es_clause(clause: dict) -> dict | None:
+        """Translate a single ES filter clause to Kosha format."""
+        if not clause:
+            return None
+
+        # term: {"term": {"matterId": "value"}}
+        if "term" in clause:
+            return clause  # Kosha accepts the same format
+
+        # terms: {"terms": {"documentId": ["v1", "v2"]}}
+        if "terms" in clause:
+            return clause  # Kosha accepts the same format
+
+        # range: {"range": {"sentAt": {"gte": "...", "lte": "..."}}}
+        if "range" in clause:
+            # Normalize range values to strings for Kosha.
+            bounds = {}
+            for field, val in clause["range"].items():
+                if isinstance(val, dict):
+                    bounds[field] = {k: str(v) for k, v in val.items()}
+                else:
+                    bounds[field] = val
+            return {"range": bounds}
+
+        # bool: nested bool (recursive)
+        if "bool" in clause:
+            return clause  # Kosha accepts the same format
+
+        # match_all: {"match_all": {}}
+        if "match_all" in clause:
+            return clause
+
+        # exists: {"exists": {"field": "..."}}
+        if "exists" in clause:
+            # Phase 1: skip exists (not supported yet).
+            return None
+
+        return None
+
     # ── Index ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _field_to_kosha(name: str, value: str, field_type: str = "Text") -> dict:
+        """Convert a field to Kosha's Field format."""
+        return {"name": name, "field_type": field_type, "value": value}
 
     def index(self, index: str | None = None, id: str | None = None,
               body: dict | None = None, **params: Any) -> dict:
         """Index a single document."""
         ns = index or self._namespace
+        fields = []
+        for k, v in (body or {}).items():
+            if isinstance(v, str):
+                fields.append(self._field_to_kosha(k, v, "Text"))
+            elif isinstance(v, bool):
+                fields.append(self._field_to_kosha(k, str(v).lower(), "Boolean"))
+            elif isinstance(v, (int, float)):
+                fields.append(self._field_to_kosha(k, str(v), "Float"))
         doc = {
-            "id": id or body.pop("_id", None) or "",
-            "fields": [{"name": k, "text": v} for k, v in (body or {}).items()
-                       if isinstance(v, str)],
+            "id": id or "",
+            "fields": fields,
         }
         payload = {"namespace": ns, "documents": [doc]}
         result = self._request("POST", "index", body=payload)
@@ -334,10 +482,17 @@ class KoshaClient:
                 source = {}
             i += 2
 
+            fields = []
+            for k, v in source.items():
+                if isinstance(v, str):
+                    fields.append(self._field_to_kosha(k, v, "Text"))
+                elif isinstance(v, bool):
+                    fields.append(self._field_to_kosha(k, str(v).lower(), "Boolean"))
+                elif isinstance(v, (int, float)):
+                    fields.append(self._field_to_kosha(k, str(v), "Float"))
             doc = {
-                "id": doc_id or source.pop("_id", None) or "",
-                "fields": [{"name": k, "text": v} for k, v in source.items()
-                           if isinstance(v, str)],
+                "id": doc_id or "",
+                "fields": fields,
             }
             documents.append(doc)
 
@@ -378,8 +533,14 @@ class KoshaClient:
         """Update a document by re-indexing (tombstone-based in Phase 1)."""
         ns = index or self._namespace
         doc_body = (body or {}).get("doc", body or {})
-        fields = [{"name": k, "text": v} for k, v in doc_body.items()
-                  if isinstance(v, str)]
+        fields = []
+        for k, v in doc_body.items():
+            if isinstance(v, str):
+                fields.append(self._field_to_kosha(k, v, "Text"))
+            elif isinstance(v, bool):
+                fields.append(self._field_to_kosha(k, str(v).lower(), "Boolean"))
+            elif isinstance(v, (int, float)):
+                fields.append(self._field_to_kosha(k, str(v), "Float"))
         payload = {"namespace": ns, "documents": [{"id": id or "", "fields": fields}]}
         self._request("POST", "index", body=payload)
         return {

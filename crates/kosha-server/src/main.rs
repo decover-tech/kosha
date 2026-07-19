@@ -116,7 +116,11 @@ fn route(
     }
 
     if request_line.starts_with("GET /search") {
-        return handle_search(request_line, state);
+        return handle_search_get(request_line, state);
+    }
+
+    if request_line.starts_with("POST /search") {
+        return handle_search_post(body, state);
     }
 
     if request_line.starts_with("POST /flush") {
@@ -181,9 +185,42 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
     json_ok(&serde_json::json!({"status": "flushed"}))
 }
 
-// ─── GET /search ────────────────────────────────────────────────────────────
+// ─── POST /search (JSON body, supports filters) ─────────────────────────────
 
-fn handle_search(request_line: &str, state: &AppState) -> String {
+fn handle_search_post(body: &[u8], state: &AppState) -> String {
+    // Parse the full JSON body that includes namespace alongside SearchQuery fields.
+    let body_val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+    };
+
+    let ns = match body_val.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => NamespaceId(n.to_string()),
+        None => return json_error(400, "missing 'namespace' in search body"),
+    };
+
+    let query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
+        Ok(q) => q,
+        Err(e) => return json_error(400, &format!("invalid search query: {e}")),
+    };
+
+    let manifest = {
+        let indexer = state.indexer.lock().unwrap();
+        match indexer.manifest_cloned(&ns) {
+            Some(m) => m,
+            None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
+        }
+    };
+
+    match state.searcher.search(&ns, &manifest, &query) {
+        Ok(result) => json_ok(&result),
+        Err(e) => json_error(500, &format!("search error: {e}")),
+    }
+}
+
+// ─── GET /search (query params, simple queries) ─────────────────────────────
+
+fn handle_search_get(request_line: &str, state: &AppState) -> String {
     // Parse query string from the request line.
     // request_line looks like: "GET /search?ns=...&q=...&max_results=... HTTP/1.1"
     let query_string = request_line
@@ -220,6 +257,10 @@ fn handle_search(request_line: &str, state: &AppState) -> String {
         query_text,
         max_results,
         bm25_params: kosha_core::Bm25Params { k1, b },
+        from: 0,
+        filter: None,
+        sort: vec![],
+        highlight: None,
     };
 
     // Get the manifest from the indexer (source of truth for segments).
@@ -325,10 +366,7 @@ mod tests {
             namespace: NamespaceId("test-ns".into()),
             documents: vec![Document {
                 id: DocumentId("doc1".into()),
-                fields: vec![Field {
-                    name: "title".into(),
-                    text: "hello world".into(),
-                }],
+                fields: vec![Field::text("title", "hello world")],
             }],
         };
         let body = serde_json::to_vec(&req).unwrap();
@@ -348,17 +386,11 @@ mod tests {
             documents: vec![
                 Document {
                     id: DocumentId("d1".into()),
-                    fields: vec![Field {
-                        name: "title".into(),
-                        text: "quick brown fox".into(),
-                    }],
+                    fields: vec![Field::text("title", "quick brown fox")],
                 },
                 Document {
                     id: DocumentId("d2".into()),
-                    fields: vec![Field {
-                        name: "title".into(),
-                        text: "lazy dog".into(),
-                    }],
+                    fields: vec![Field::text("title", "lazy dog")],
                 },
             ],
         };

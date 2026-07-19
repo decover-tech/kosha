@@ -190,17 +190,11 @@ mod tests {
         let docs = vec![
             Document {
                 id: DocumentId("d1".into()),
-                fields: vec![Field {
-                    name: "title".into(),
-                    text: "hello world".into(),
-                }],
+                fields: vec![Field::text("title", "hello world")],
             },
             Document {
                 id: DocumentId("d2".into()),
-                fields: vec![Field {
-                    name: "title".into(),
-                    text: "goodbye world".into(),
-                }],
+                fields: vec![Field::text("title", "goodbye world")],
             },
         ];
 
@@ -231,10 +225,7 @@ mod tests {
 
         let doc = || Document {
             id: DocumentId("d".into()),
-            fields: vec![Field {
-                name: "t".into(),
-                text: "test".into(),
-            }],
+            fields: vec![Field::text("t", "test")],
         };
 
         // First batch: 2 docs, under threshold.
@@ -266,10 +257,7 @@ mod tests {
                 ns_a.clone(),
                 vec![Document {
                     id: DocumentId("d1".into()),
-                    fields: vec![Field {
-                        name: "t".into(),
-                        text: "alpha".into(),
-                    }],
+                    fields: vec![Field::text("t", "alpha")],
                 }],
             )
             .unwrap();
@@ -279,10 +267,7 @@ mod tests {
                 ns_b.clone(),
                 vec![Document {
                     id: DocumentId("d2".into()),
-                    fields: vec![Field {
-                        name: "t".into(),
-                        text: "beta".into(),
-                    }],
+                    fields: vec![Field::text("t", "beta")],
                 }],
             )
             .unwrap();
