@@ -1,0 +1,178 @@
+//! Control plane (DESIGN.md §5 and §6.3, implementation plan Epic 6): the
+//! namespace/schema registry and the manifest pointer store backing
+//! compare-and-swap manifest publishes.
+//!
+//! Phase 1 uses an in-memory store. Postgres persistence will follow.
+
+use std::collections::HashMap;
+
+use kosha_core::{KoshaError, Manifest, NamespaceId};
+
+/// In-memory namespace registry and manifest store.
+///
+/// Tracks namespaces and their current segment manifests. Thread-safe for
+/// single-threaded use; the server is currently single-threaded.
+pub struct Controller {
+    /// Maps namespace ID → current manifest.
+    manifests: HashMap<NamespaceId, Manifest>,
+    /// Track which namespaces have been created.
+    namespaces: Vec<NamespaceId>,
+}
+
+impl Controller {
+    pub fn new() -> Self {
+        Self {
+            manifests: HashMap::new(),
+            namespaces: Vec::new(),
+        }
+    }
+
+    /// Create a new namespace. Returns an error if it already exists.
+    pub fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
+        if self.namespaces.contains(&id) {
+            return Err(KoshaError::NamespaceNotFound(id));
+        }
+        self.namespaces.push(id.clone());
+        self.manifests.insert(
+            id,
+            Manifest {
+                version: 0,
+                segments: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Ensure a namespace exists, creating it if necessary.
+    pub fn ensure_namespace(&mut self, id: NamespaceId) {
+        if !self.namespaces.contains(&id) {
+            self.namespaces.push(id.clone());
+            self.manifests.insert(
+                id,
+                Manifest {
+                    version: 0,
+                    segments: Vec::new(),
+                },
+            );
+        }
+    }
+
+    /// Check if a namespace exists.
+    pub fn has_namespace(&self, id: &NamespaceId) -> bool {
+        self.namespaces.contains(id)
+    }
+
+    /// Get the current manifest for a namespace.
+    pub fn manifest(&self, id: &NamespaceId) -> Option<&Manifest> {
+        self.manifests.get(id)
+    }
+
+    /// Get a mutable reference to the manifest for a namespace.
+    pub fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut Manifest> {
+        self.manifests.get_mut(id)
+    }
+
+    /// Atomically update the manifest for a namespace (compare-and-swap style).
+    ///
+    /// Returns an error if the manifest version doesn't match, indicating a
+    /// concurrent modification.
+    pub fn compare_and_swap_manifest(
+        &mut self,
+        id: &NamespaceId,
+        expected_version: u64,
+        new_manifest: Manifest,
+    ) -> Result<(), KoshaError> {
+        let current = self
+            .manifests
+            .get_mut(id)
+            .ok_or_else(|| KoshaError::NamespaceNotFound(id.clone()))?;
+
+        if current.version != expected_version {
+            return Err(KoshaError::NotFound(format!(
+                "manifest version mismatch: expected {expected_version}, got {}",
+                current.version
+            )));
+        }
+
+        *current = new_manifest;
+        Ok(())
+    }
+
+    /// List all registered namespaces.
+    pub fn list_namespaces(&self) -> &[NamespaceId] {
+        &self.namespaces
+    }
+
+    /// Return the total number of namespaces.
+    pub fn namespace_count(&self) -> usize {
+        self.namespaces.len()
+    }
+}
+
+impl Default for Controller {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kosha_core::ManifestEntry;
+
+    #[test]
+    fn create_and_list_namespaces() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("org1/matter42".into());
+
+        ctrl.create_namespace(ns.clone()).unwrap();
+        assert!(ctrl.has_namespace(&ns));
+        assert_eq!(ctrl.namespace_count(), 1);
+
+        // Duplicate creation should fail.
+        assert!(ctrl.create_namespace(ns).is_err());
+    }
+
+    #[test]
+    fn ensure_namespace_idempotent() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("test".into());
+
+        ctrl.ensure_namespace(ns.clone());
+        assert_eq!(ctrl.namespace_count(), 1);
+
+        // Second ensure should be a no-op.
+        ctrl.ensure_namespace(ns);
+        assert_eq!(ctrl.namespace_count(), 1);
+    }
+
+    #[test]
+    fn manifest_cas() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("test".into());
+        ctrl.create_namespace(ns.clone()).unwrap();
+
+        let manifest_v1 = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: kosha_core::SegmentId("seg-001".into()),
+                doc_count: 10,
+            }],
+        };
+
+        // CAS with version 0 → should succeed (initial version is 0).
+        ctrl.compare_and_swap_manifest(&ns, 0, manifest_v1.clone())
+            .unwrap();
+
+        let stored = ctrl.manifest(&ns).unwrap();
+        assert_eq!(stored.version, 1);
+        assert_eq!(stored.segments.len(), 1);
+
+        // CAS with wrong version → should fail.
+        let manifest_v2 = Manifest {
+            version: 2,
+            segments: vec![],
+        };
+        assert!(ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2).is_err());
+    }
+}

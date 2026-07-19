@@ -1,0 +1,14 @@
+[package]
+name = "kosha-segment"
+description = "Segment file format: footer, inverted index, doc store, filter columns (DESIGN.md §6.2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kosha-core = { path = "../kosha-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }

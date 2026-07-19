@@ -1,0 +1,13 @@
+# Rust build artifacts. Cargo.lock is intentionally committed: this workspace
+# ships a binary and the lockfile is the reproducible-build contract.
+/target
+**/*.rs.bk
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local dev volumes (docker-compose)
+/volumes

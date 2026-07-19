@@ -1,0 +1,19 @@
+[package]
+name = "kosha-server"
+description = "Kosha node binary: ingest / query / compaction roles and API server (DESIGN.md §5, §12)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kosha-core = { path = "../kosha-core" }
+kosha-segment = { path = "../kosha-segment" }
+kosha-query = { path = "../kosha-query" }
+kosha-write = { path = "../kosha-write" }
+kosha-control = { path = "../kosha-control" }
+kosha-cache = { path = "../kosha-cache" }
+serde = { workspace = true }
+serde_json = { workspace = true }

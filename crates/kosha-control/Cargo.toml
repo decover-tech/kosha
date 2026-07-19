@@ -1,0 +1,14 @@
+[package]
+name = "kosha-control"
+description = "Control plane: namespace registry and manifest store (DESIGN.md §5, §6.3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kosha-core = { path = "../kosha-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
