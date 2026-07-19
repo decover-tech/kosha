@@ -6,8 +6,7 @@
 
 A storage-disaggregated search engine: **S3 is the source of truth, local NVMe
 SSD is a transparent cache, and compute nodes are disposable.** Kosha is being
-built to replace Elasticsearch/OpenSearch for Decover's search workloads, and
-is intended to be reusable as a general-purpose, schema-driven search service.
+built to replace Elasticsearch/OpenSearch and is intended to be reusable as a general-purpose, schema-driven search service.
 
 See [DESIGN.md](DESIGN.md) for the full architecture.
 
