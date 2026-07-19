@@ -9,5 +9,9 @@
 .vscode/
 *.swp
 
+# Python bytecode
+**/__pycache__/
+*.pyc
+
 # Local dev volumes (docker-compose)
 /volumes
