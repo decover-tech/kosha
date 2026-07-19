@@ -305,6 +305,66 @@ pub struct AggCompositeBucket {
     pub doc_count: usize,
 }
 
+// ─── Storage abstraction (local fs / S3 / etc.) ───────────────────────────
+
+/// Storage backends implement this to provide file I/O for segments.
+/// Kosha's core uses this instead of std::fs directly, so S3 / GCS / etc.
+/// can be plugged in without modifying core code.
+pub trait StorageBackend: std::fmt::Debug + Send + Sync {
+    fn read(&self, path: &str) -> Result<Vec<u8>, KoshaError>;
+    fn write(&self, path: &str, data: &[u8]) -> Result<(), KoshaError>;
+    fn exists(&self, path: &str) -> bool;
+    fn delete(&self, path: &str) -> Result<(), KoshaError>;
+    fn list(&self, path: &str) -> Result<Vec<String>, KoshaError>;
+    fn create_dir_all(&self, path: &str) -> Result<(), KoshaError>;
+}
+
+/// Local filesystem implementation of StorageBackend.
+#[derive(Debug, Clone)]
+pub struct LocalStorage {
+    pub root: std::path::PathBuf,
+}
+
+impl LocalStorage {
+    pub fn new(root: std::path::PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+impl StorageBackend for LocalStorage {
+    fn read(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
+        Ok(std::fs::read(self.root.join(path))?)
+    }
+    fn write(&self, path: &str, data: &[u8]) -> Result<(), KoshaError> {
+        Ok(std::fs::write(self.root.join(path), data)?)
+    }
+    fn exists(&self, path: &str) -> bool {
+        self.root.join(path).exists()
+    }
+    fn delete(&self, path: &str) -> Result<(), KoshaError> {
+        let p = self.root.join(path);
+        if p.is_dir() { std::fs::remove_dir_all(&p)?; }
+        else { std::fs::remove_file(&p)?; }
+        Ok(())
+    }
+    fn list(&self, path: &str) -> Result<Vec<String>, KoshaError> {
+        let dir = self.root.join(path);
+        let mut entries = Vec::new();
+        if dir.exists() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                if let Some(name) = entry.file_name().to_str() {
+                    entries.push(name.to_string());
+                }
+            }
+        }
+        Ok(entries)
+    }
+    fn create_dir_all(&self, path: &str) -> Result<(), KoshaError> {
+        Ok(std::fs::create_dir_all(self.root.join(path))?)
+    }
+}
+
 // ─── Segment metadata ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use instant_distance::{Builder, HnswMap, Point, Search};
 use kosha_core::{
     AggBucket, AggBucketResult, AggMetricResult, AggregationResults, Bm25Params, DocRecord,
-    DocumentId, Field, FieldType, FilterStore, Footer, KoshaError, Posting, SegmentId, VectorStore,
+    DocumentId, Field, FieldType, FilterStore, Footer, KoshaError, LocalStorage, Posting,
+    SegmentId, StorageBackend, VectorStore,
 };
 
 /// A point in HNSW space using cosine distance.
@@ -46,6 +47,7 @@ pub fn build_hnsw(vectors: &[(u32, Vec<f32>)]) -> Option<(HnswMap<CosinePoint, u
 pub struct SegmentWriter {
     segment_id: SegmentId,
     output_dir: PathBuf,
+    backend: Box<dyn StorageBackend>,
     doc_records: Vec<DocRecord>,
     inverted_index: HashMap<String, Vec<Posting>>,
     total_field_length: u64,
@@ -57,15 +59,21 @@ pub struct SegmentWriter {
 
 impl SegmentWriter {
     pub fn new(segment_id: SegmentId, output_dir: PathBuf) -> Self {
+        let backend = Box::new(LocalStorage::new(output_dir.clone()));
+        Self::new_with_backend(segment_id, output_dir, backend)
+    }
+
+    /// Create a writer with a custom storage backend (e.g., S3 via kosha-client).
+    pub fn new_with_backend(
+        segment_id: SegmentId,
+        output_dir: PathBuf,
+        backend: Box<dyn StorageBackend>,
+    ) -> Self {
         Self {
-            segment_id,
-            output_dir,
-            doc_records: Vec::new(),
-            inverted_index: HashMap::new(),
+            segment_id, output_dir, backend,
+            doc_records: Vec::new(), inverted_index: HashMap::new(),
             total_field_length: 0,
-            filter_string: HashMap::new(),
-            filter_integer: HashMap::new(),
-            filter_float: HashMap::new(),
+            filter_string: HashMap::new(), filter_integer: HashMap::new(), filter_float: HashMap::new(),
             vectors: Vec::new(),
         }
     }
@@ -141,29 +149,13 @@ impl SegmentWriter {
     }
 
     pub fn finalize(self, bm25_params: Bm25Params) -> Result<Footer, KoshaError> {
-        fs::create_dir_all(&self.output_dir)?;
+        self.backend.create_dir_all("")?;
         self.write_doc_store()?;
         self.write_inverted_index()?;
         self.write_filters()?;
         self.write_vectors()?;
         let footer = self.write_footer(bm25_params)?;
         Ok(footer)
-    }
-
-    fn doc_store_path(&self) -> PathBuf {
-        self.output_dir.join("doc_store.bin")
-    }
-    fn inverted_index_path(&self) -> PathBuf {
-        self.output_dir.join("inverted.idx")
-    }
-    fn filters_path(&self) -> PathBuf {
-        self.output_dir.join("filters.bin")
-    }
-    fn vectors_path(&self) -> PathBuf {
-        self.output_dir.join("vector.idx")
-    }
-    fn footer_path(&self) -> PathBuf {
-        self.output_dir.join("footer.json")
     }
 
     fn write_doc_store(&self) -> Result<(), KoshaError> {
@@ -187,7 +179,7 @@ impl SegmentWriter {
                 buf.extend_from_slice(val_bytes);
             }
         }
-        fs::write(self.doc_store_path(), &buf)?;
+        self.backend.write("doc_store.bin", &buf)?;
         Ok(())
     }
 
@@ -212,7 +204,7 @@ impl SegmentWriter {
                 }
             }
         }
-        fs::write(self.inverted_index_path(), &buf)?;
+        self.backend.write("inverted.idx", &buf)?;
         Ok(())
     }
 
@@ -269,7 +261,7 @@ impl SegmentWriter {
             }
         }
 
-        fs::write(self.filters_path(), &buf)?;
+        self.backend.write("filters.bin", &buf)?;
         Ok(())
     }
 
@@ -288,7 +280,7 @@ impl SegmentWriter {
                 buf.extend_from_slice(&val.to_le_bytes());
             }
         }
-        fs::write(self.vectors_path(), &buf)?;
+        self.backend.write("vector.idx", &buf)?;
 
         Ok(())
     }
@@ -309,7 +301,7 @@ impl SegmentWriter {
             created_at: chrono_like_now(),
         };
         let json = serde_json::to_string_pretty(&footer)?;
-        fs::write(self.footer_path(), json.as_bytes())?;
+        self.backend.write("footer.json", json.as_bytes())?;
         Ok(footer)
     }
 }
