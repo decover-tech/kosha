@@ -453,6 +453,7 @@ impl Searcher {
             );
 
             // ── Wildcard matching ──
+            let is_wildcard_mode = query.wildcard.is_some();
             let effective_terms = if let Some(ref wc) = query.wildcard {
                 let all_terms: Vec<&str> = reader.all_terms();
                 wildcard_terms(&all_terms, &wc.pattern, wc.case_insensitive)
@@ -490,27 +491,73 @@ impl Searcher {
                     doc_frequencies.insert(t, p.len() as u32);
                 }
 
-                // Score per doc.
+                // ── Postings AND/OR: AND for multi-term queries, OR for wildcard ──
                 let mut scored: HashMap<u32, f64> = HashMap::new();
-                let mut doc_phrase_positions: HashMap<u32, Vec<Vec<u32>>> = HashMap::new();
+                let use_and = term_postings.len() > 1 && !is_wildcard_mode && phrase_tokenized.is_none();
 
-                for (term, postings) in &term_postings {
-                    let df = doc_frequencies.get(term).copied().unwrap_or(0);
-                    for posting in *postings {
-                        let doc_rec = match reader.doc_record(posting.doc_id) {
-                            Some(d) => d,
-                            None => continue,
-                        };
-                        let score =
-                            scorer.score_term(posting.term_frequency, df, doc_rec.field_length);
-                        *scored.entry(posting.doc_id).or_insert(0.0) += score;
+                if !use_and {
+                    // OR mode (wildcard, phrase, or single term): score any matching doc.
+                    for (term, postings) in &term_postings {
+                        let df = doc_frequencies.get(term).copied().unwrap_or(0);
+                        for posting in *postings {
+                            if let Some(doc_rec) = reader.doc_record(posting.doc_id) {
+                                let score = scorer.score_term(
+                                    posting.term_frequency, df, doc_rec.field_length,
+                                );
+                                *scored.entry(posting.doc_id).or_insert(0.0) += score;
+                            }
+                        }
+                    }
+                } else {
+                    // Multi-term: intersect doc_ids, then score intersection.
+                    // Start with the shortest postings list for efficiency.
+                    let mut candidates: Vec<(u32, Vec<Vec<u32>>)> = {
+                        let shortest = term_postings
+                            .iter()
+                            .min_by_key(|(_, p)| p.len())
+                            .unwrap();
+                        shortest
+                            .1
+                            .iter()
+                            .map(|p| (p.doc_id, Vec::new()))
+                            .collect()
+                    };
+                    let mut doc_freqs: HashMap<u32, HashMap<&str, u32>> = HashMap::new();
 
-                        // Collect positions for phrase matching.
-                        if phrase_tokenized.is_some() {
-                            doc_phrase_positions
-                                .entry(posting.doc_id)
-                                .or_default()
-                                .push(posting.positions.clone());
+                    // For each candidate doc, verify it appears in ALL other postings lists.
+                    for (term, postings) in &term_postings {
+                        let term_docs: HashMap<u32, &kosha_core::Posting> = postings
+                            .iter()
+                            .map(|p| (p.doc_id, p))
+                            .collect();
+                        candidates.retain(|(doc_id, _)| term_docs.contains_key(doc_id));
+                        if candidates.is_empty() {
+                            break;
+                        }
+                        // Store positions for phrase matching.
+                        for (doc_id, positions) in &mut candidates {
+                            if let Some(posting) = term_docs.get(doc_id) {
+                                positions.push(posting.positions.clone());
+                            }
+                        }
+                    }
+
+                    // Score surviving candidates.
+                    for (doc_id, doc_positions) in &candidates {
+                        if let Some(doc_rec) = reader.doc_record(*doc_id) {
+                            let mut total_score = 0.0;
+                            for (term, postings) in &term_postings {
+                                let df = doc_frequencies.get(term).copied().unwrap_or(0);
+                                let posting = postings.iter().find(|p| p.doc_id == *doc_id);
+                                if let Some(p) = posting {
+                                    total_score += scorer.score_term(
+                                        p.term_frequency,
+                                        df,
+                                        doc_rec.field_length,
+                                    );
+                                }
+                            }
+                            scored.insert(*doc_id, total_score);
                         }
                     }
                 }

@@ -7,9 +7,37 @@ import logging
 import time
 import urllib.parse
 import urllib.request
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Sequence
+from uuid import UUID
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+def _json_default(data: Any) -> Any:
+    """Mirror opensearchpy.serializer.JSONSerializer.default so documents
+    carrying datetimes, UUIDs, Decimals or numpy scalars serialize exactly
+    as they would on the OpenSearch path."""
+    if isinstance(data, (date, datetime)):
+        return data.isoformat()
+    if isinstance(data, UUID):
+        return str(data)
+    if isinstance(data, Decimal):
+        return float(data)
+    if np is not None:
+        if isinstance(data, np.integer):
+            return int(data)
+        if isinstance(data, (np.floating, np.bool_)):
+            return data.item()
+        if isinstance(data, np.datetime64):
+            return data.item().isoformat()
+    raise TypeError(f"Unable to serialize {data!r} (type: {type(data)})")
 
 
 # ─── Transport shim ─────────────────────────────────────────────────────────
@@ -25,7 +53,7 @@ class _Serializer:
     def dumps(self, data: Any) -> str:
         if isinstance(data, str):
             return data
-        return json.dumps(data)
+        return json.dumps(data, default=_json_default)
 
 
 class _Transport:
@@ -99,7 +127,7 @@ class KoshaClient:
 
     def _request(self, method: str, path: str, body: Any = None) -> Any:
         url = f"{self._kosha_url}/{path.lstrip('/')}"
-        data = json.dumps(body).encode() if body is not None else None
+        data = json.dumps(body, default=_json_default).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Content-Type", "application/json")
         if self._auth:
@@ -558,8 +586,10 @@ class KoshaClient:
         as a list or newline-delimited string) and indexes each document via
         Kosha.
         """
-        ns = index or self._namespace
-        documents: list[dict] = []
+        default_ns = index or self._namespace
+        # (namespace, doc) pairs in original order — response items must stay
+        # aligned with the request actions for opensearchpy's success parsing.
+        indexed: list[tuple[str, dict]] = []
         errors: list[dict] = []
 
         # Parse the bulk body.
@@ -580,7 +610,7 @@ class KoshaClient:
                     op_type = key
                     meta = action[key] or {}
                     doc_id = meta.get("_id")
-                    doc_index = meta.get("_index", ns)
+                    doc_index = meta.get("_index")
                     break
 
             if op_type == "delete":
@@ -609,17 +639,23 @@ class KoshaClient:
                 "id": doc_id or "",
                 "fields": fields,
             }
-            documents.append(doc)
+            indexed.append((doc_index or default_ns, doc))
 
-        if documents:
-            payload = {"namespace": ns, "documents": documents}
-            self._request("POST", "index", body=payload)
+        # Route each document to the namespace named by its action's _index
+        # (writes must land where searches look), then flush so the docs are
+        # visible — Kosha only searches flushed segments.
+        docs_by_ns: dict[str, list[dict]] = {}
+        for doc_ns, doc in indexed:
+            docs_by_ns.setdefault(doc_ns, []).append(doc)
+        for doc_ns, docs in docs_by_ns.items():
+            self._request("POST", "index", body={"namespace": doc_ns, "documents": docs})
+            self._request("POST", "flush", {"namespace": doc_ns})
 
         return {
             "errors": bool(errors),
             "items": (
-                [{"index": {"_index": ns, "_id": d["id"], "status": 201}}
-                 for d in documents]
+                [{"index": {"_index": doc_ns, "_id": d["id"], "status": 201}}
+                 for doc_ns, d in indexed]
                 + errors
             ),
         }
