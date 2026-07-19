@@ -98,6 +98,11 @@ class KoshaClient:
 
     def search(self, index: str | None = None, body: dict | None = None, **params: Any) -> dict:
         ns = index or self._namespace
+
+        # kNN/semantic not supported in Phase 1 — return empty.
+        if body and ("knn" in body or "knn" in (body.get("query") or {})):
+            return self._build_search_response([], 0, body.get("size", 10), 0, 0)
+
         query_text = self._extract_query_text(body) if body else ""
         size = body.get("size", 10) if body else 10
         from_ = body.get("from", 0) if body else 0
@@ -617,11 +622,32 @@ class KoshaClient:
 
     def delete_by_query(self, index: str | None = None,
                         body: dict | None = None, **params: Any) -> dict:
-        """Delete documents matching a query (not yet implemented in Kosha)."""
+        """Delete documents matching a filter query."""
+        ns = index or self._namespace
+        query = body.get("query", {}) if body else {}
+        filter_clause = self._extract_filter(body) or query
+        kosha_body = {"namespace": ns, "filter": filter_clause}
+        result = self._request("POST", "delete", body=kosha_body)
+        deleted = result.get("deleted", 0)
+        return {
+            "deleted": deleted,
+            "total": deleted,
+            "failures": [],
+        }
+
+    # ── Scan / Scroll ──────────────────────────────────────────────────────
+
+    def scroll(self, scroll_id: str = None, scroll: str = "5m", **params):
+        """Compatibility stub — Kosha uses pagination, not scroll cursors."""
         raise NotImplementedError(
-            "Kosha does not yet support delete_by_query. "
-            "Phase 1 is append-only; deletes/updates are tombstone-based."
+            "Kosha does not support scroll cursors. "
+            "Use paginated search (from/size) instead."
         )
+
+    def clear_scroll(self, scroll_id: str, **params):
+        """No-op — Kosha has no scroll state to clear."""
+
+    # ── kNN no-op (Phase 2) ────────────────────────────────────────────────
 
     # ── Index exists / create ──────────────────────────────────────────────
 

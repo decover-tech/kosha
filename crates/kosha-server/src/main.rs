@@ -127,6 +127,10 @@ fn route(
         return handle_flush(body, state);
     }
 
+    if request_line.starts_with("POST /delete") {
+        return handle_delete(body, state);
+    }
+
     json_error(404, "not found")
 }
 
@@ -185,6 +189,48 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
     json_ok(&serde_json::json!({"status": "flushed"}))
 }
 
+// ─── POST /delete (delete by query) ──────────────────────────────────────────
+
+fn handle_delete(body: &[u8], state: &AppState) -> String {
+    let body_val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+    };
+
+    let ns = match body_val.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => NamespaceId(n.to_string()),
+        None => return json_error(400, "missing 'namespace'"),
+    };
+
+    // Extract filter from body — supports ES-style "query" field.
+    let filter_val = body_val.get("filter").or_else(|| body_val.get("query"));
+    let filter: kosha_core::FilterClause = match filter_val {
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(f) => f,
+            Err(e) => return json_error(400, &format!("invalid filter: {e}")),
+        },
+        None => return json_error(400, "missing 'filter' or 'query'"),
+    };
+
+    let (manifest, count) = {
+        let mut indexer = state.indexer.lock().unwrap();
+        let manifest = match indexer.manifest_cloned(&ns) {
+            Some(m) => m,
+            None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
+        };
+        let old_manifest = manifest.clone();
+        match indexer.delete_by_query(&ns, &old_manifest, &filter) {
+            Ok(c) => (old_manifest, c),
+            Err(e) => return json_error(500, &format!("delete error: {e}")),
+        }
+    };
+
+    json_ok(&serde_json::json!({
+        "deleted": count,
+        "namespace": ns.0,
+    }))
+}
+
 // ─── POST /search (JSON body, supports filters) ─────────────────────────────
 
 fn handle_search_post(body: &[u8], state: &AppState) -> String {
@@ -204,15 +250,17 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         Err(e) => return json_error(400, &format!("invalid search query: {e}")),
     };
 
-    let manifest = {
+    let (manifest, tombstones) = {
         let indexer = state.indexer.lock().unwrap();
-        match indexer.manifest_cloned(&ns) {
+        let m = match indexer.manifest_cloned(&ns) {
             Some(m) => m,
             None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
-        }
+        };
+        let t = indexer.get_tombstones(&ns).cloned();
+        (m, t)
     };
 
-    match state.searcher.search(&ns, &manifest, &query) {
+    match state.searcher.search(&ns, &manifest, &query, tombstones.as_ref()) {
         Ok(result) => json_ok(&result),
         Err(e) => json_error(500, &format!("search error: {e}")),
     }
@@ -266,16 +314,17 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         match_phrase: None,
     };
 
-    // Get the manifest from the indexer (source of truth for segments).
-    let manifest = {
+    let (manifest, tombstones) = {
         let indexer = state.indexer.lock().unwrap();
-        match indexer.manifest_cloned(&ns) {
+        let m = match indexer.manifest_cloned(&ns) {
             Some(m) => m,
             None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
-        }
+        };
+        let t = indexer.get_tombstones(&ns).cloned();
+        (m, t)
     };
 
-    match state.searcher.search(&ns, &manifest, &query) {
+    match state.searcher.search(&ns, &manifest, &query, tombstones.as_ref()) {
         Ok(result) => json_ok(&result),
         Err(e) => json_error(500, &format!("search error: {e}")),
     }

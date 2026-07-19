@@ -73,6 +73,7 @@ dependencies = [
  "kosha-core",
  "kosha-segment",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

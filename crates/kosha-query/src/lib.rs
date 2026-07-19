@@ -233,12 +233,24 @@ pub struct Searcher { data_dir: PathBuf }
 impl Searcher {
     pub fn new(data_dir: PathBuf) -> Self { Self { data_dir } }
 
-    pub fn search(&self, namespace: &NamespaceId, manifest: &Manifest, query: &SearchQuery) -> Result<SearchResult, KoshaError> {
+    pub fn search(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        tombstones: Option<&std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>>,
+    ) -> Result<SearchResult, KoshaError> {
         if manifest.segments.is_empty() {
             return Ok(SearchResult { results: Vec::new(), total_hits: 0, aggregations: None });
         }
 
         let query_terms = tokenize(&query.query_text);
+
+        let is_tombstoned = |seg_id: &kosha_core::SegmentId, doc_seq: u32| -> bool {
+            tombstones.map_or(false, |t| {
+                t.get(seg_id).map_or(false, |seqs| seqs.contains(&doc_seq))
+            })
+        };
         let has_query = !query_terms.is_empty() || query.wildcard.is_some() || query.match_phrase.is_some();
         let has_only_filter = !has_query && query.filter.is_some();
 
@@ -337,6 +349,7 @@ impl Searcher {
                 }
 
                 for (doc_seq, score) in scored {
+                    if is_tombstoned(&entry.segment_id, doc_seq) { continue; }
                     if let Some(doc_rec) = reader.doc_record(doc_seq) {
                         all_results.push(ScoredDocument {
                             doc_id: doc_rec.doc_id.clone(), score,
@@ -348,6 +361,7 @@ impl Searcher {
                 let all_candidates: HashSet<u32> = (0..total_docs).collect();
                 let passed = FilterApplier::apply(query.filter.as_ref().unwrap(), store, &all_candidates)?;
                 for doc_seq in passed {
+                    if is_tombstoned(&entry.segment_id, doc_seq) { continue; }
                     if let Some(doc_rec) = reader.doc_record(doc_seq) {
                         let score = scorer.score_term(1, total_docs, doc_rec.field_length);
                         all_results.push(ScoredDocument {
@@ -610,7 +624,7 @@ mod tests {
             wildcard: Some(kosha_core::WildcardQuery { field: "t".into(), pattern: "hel*".into(), case_insensitive: true }),
             match_phrase: None,
         };
-        let r = searcher.search(&ns, &manifest, &q).unwrap();
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
