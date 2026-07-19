@@ -348,6 +348,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         aggs: std::collections::HashMap::new(),
         wildcard: None,
         match_phrase: None,
+        knn: None,
     };
 
     let (manifest, tombstones) = {

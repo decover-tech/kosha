@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use kosha_core::{
     AggBucket, AggBucketResult, AggMetricResult, AggregationResults,
     Bm25Params, DocRecord, DocumentId, Field, FieldType, FilterStore, Footer,
-    KoshaError, Posting, SegmentId,
+    KoshaError, Posting, SegmentId, VectorStore,
 };
 
 // ─── Segment writer ─────────────────────────────────────────────────────────
@@ -19,6 +19,7 @@ pub struct SegmentWriter {
     filter_string: HashMap<String, Vec<(u32, String)>>,
     filter_integer: HashMap<String, Vec<(u32, i64)>>,
     filter_float: HashMap<String, Vec<(u32, f64)>>,
+    vectors: Vec<(u32, Vec<f32>)>,
 }
 
 impl SegmentWriter {
@@ -28,6 +29,7 @@ impl SegmentWriter {
             doc_records: Vec::new(), inverted_index: HashMap::new(),
             total_field_length: 0,
             filter_string: HashMap::new(), filter_integer: HashMap::new(), filter_float: HashMap::new(),
+            vectors: Vec::new(),
         }
     }
 
@@ -68,6 +70,11 @@ impl SegmentWriter {
                 FieldType::Text => {
                     self.filter_string.entry(field.name.clone()).or_default().push((doc_seq, field.value.clone()));
                 }
+                FieldType::Vector => {
+                    if let Ok(vec) = serde_json::from_str::<Vec<f32>>(&field.value) {
+                        self.vectors.push((doc_seq, vec));
+                    }
+                }
             }
         }
 
@@ -80,6 +87,7 @@ impl SegmentWriter {
         self.write_doc_store()?;
         self.write_inverted_index()?;
         self.write_filters()?;
+        self.write_vectors()?;
         let footer = self.write_footer(bm25_params)?;
         Ok(footer)
     }
@@ -87,6 +95,7 @@ impl SegmentWriter {
     fn doc_store_path(&self) -> PathBuf { self.output_dir.join("doc_store.bin") }
     fn inverted_index_path(&self) -> PathBuf { self.output_dir.join("inverted.idx") }
     fn filters_path(&self) -> PathBuf { self.output_dir.join("filters.bin") }
+    fn vectors_path(&self) -> PathBuf { self.output_dir.join("vector.idx") }
     fn footer_path(&self) -> PathBuf { self.output_dir.join("footer.json") }
 
     fn write_doc_store(&self) -> Result<(), KoshaError> {
@@ -195,6 +204,22 @@ impl SegmentWriter {
         Ok(())
     }
 
+    fn write_vectors(&self) -> Result<(), KoshaError> {
+        if self.vectors.is_empty() { return Ok(()); }
+        let mut buf = Vec::new();
+        let dim = self.vectors[0].1.len() as u32;
+        buf.extend_from_slice(&dim.to_le_bytes());
+        buf.extend_from_slice(&(self.vectors.len() as u32).to_le_bytes());
+        for &(doc_seq, ref v) in &self.vectors {
+            buf.extend_from_slice(&doc_seq.to_le_bytes());
+            for &val in v {
+                buf.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+        fs::write(self.vectors_path(), &buf)?;
+        Ok(())
+    }
+
     fn write_footer(&self, bm25_params: Bm25Params) -> Result<Footer, KoshaError> {
         let doc_count = self.doc_records.len() as u32;
         let avg = if doc_count > 0 { self.total_field_length as f64 / doc_count as f64 } else { 0.0 };
@@ -217,6 +242,7 @@ pub struct SegmentReader {
     pub doc_records: Vec<DocRecord>,
     pub inverted_index: HashMap<String, Vec<Posting>>,
     pub filter_store: FilterStore,
+    pub vector_store: VectorStore,
 }
 
 impl SegmentReader {
@@ -227,6 +253,7 @@ impl SegmentReader {
             doc_records: Self::read_doc_store(&segment_dir)?,
             inverted_index: Self::read_inverted_index(&segment_dir)?,
             filter_store: Self::read_filters(&segment_dir)?,
+            vector_store: Self::read_vectors(&segment_dir)?,
         })
     }
 
@@ -278,7 +305,7 @@ impl SegmentReader {
                 let field_type = match cursor[0] {
                     0 => FieldType::Text, 1 => FieldType::Keyword,
                     2 => FieldType::Integer, 3 => FieldType::Float,
-                    4 => FieldType::Date, 5 => FieldType::Boolean,
+                    4 => FieldType::Date, 5 => FieldType::Boolean, 6 => FieldType::Vector,
                     _ => FieldType::Text,
                 };
                 cursor = &cursor[1..];
@@ -318,6 +345,26 @@ impl SegmentReader {
             index.insert(term, postings);
         }
         Ok(index)
+    }
+
+    fn read_vectors(segment_dir: &Path) -> Result<VectorStore, KoshaError> {
+        let path = segment_dir.join("vector.idx");
+        if !path.exists() { return Ok(VectorStore::default()); }
+        let data = fs::read(&path)?;
+        let mut cursor = &data[..];
+        if cursor.len() < 8 { return Ok(VectorStore::default()); }
+        let dim = read_u32_le(&mut cursor) as usize;
+        let count = read_u32_le(&mut cursor) as usize;
+        let mut vectors = Vec::with_capacity(count);
+        for _ in 0..count {
+            let doc_seq = read_u32_le(&mut cursor);
+            let mut v = Vec::with_capacity(dim);
+            for _ in 0..dim {
+                v.push(read_f32_le(&mut cursor));
+            }
+            vectors.push((doc_seq, v));
+        }
+        Ok(VectorStore { vectors, dimensions: dim })
     }
 
     fn read_filters(segment_dir: &Path) -> Result<FilterStore, KoshaError> {
@@ -405,6 +452,9 @@ fn read_u64_le(cursor: &mut &[u8]) -> u64 {
 }
 fn read_i64_le(cursor: &mut &[u8]) -> i64 {
     let mut buf = [0u8; 8]; buf.copy_from_slice(&cursor[..8]); *cursor = &cursor[8..]; i64::from_le_bytes(buf)
+}
+fn read_f32_le(cursor: &mut &[u8]) -> f32 {
+    let mut buf = [0u8; 4]; buf.copy_from_slice(&cursor[..4]); *cursor = &cursor[4..]; f32::from_le_bytes(buf)
 }
 fn read_f64_le(cursor: &mut &[u8]) -> f64 {
     let mut buf = [0u8; 8]; buf.copy_from_slice(&cursor[..8]); *cursor = &cursor[8..]; f64::from_le_bytes(buf)

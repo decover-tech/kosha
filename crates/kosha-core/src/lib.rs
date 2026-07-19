@@ -12,7 +12,7 @@ pub struct DocumentId(pub String);
 // ─── Document model ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FieldType { Text, Keyword, Integer, Float, Date, Boolean }
+pub enum FieldType { Text, Keyword, Integer, Float, Date, Boolean, Vector }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Field {
@@ -39,6 +39,9 @@ impl Field {
     }
     pub fn boolean(n: impl Into<String>, v: bool) -> Self {
         Self { name: n.into(), field_type: FieldType::Boolean, value: v.to_string() }
+    }
+    pub fn vector(n: impl Into<String>, v: Vec<f32>) -> Self {
+        Self { name: n.into(), field_type: FieldType::Vector, value: serde_json::to_string(&v).unwrap_or_default() }
     }
 }
 
@@ -257,6 +260,29 @@ pub struct ManifestEntry { pub segment_id: SegmentId, pub doc_count: u32 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest { pub version: u64, pub segments: Vec<ManifestEntry> }
 
+// ─── kNN query ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnnQuery {
+    pub field: String,
+    pub vector: Vec<f32>,
+    #[serde(default = "default_knn_k")]
+    pub k: usize,
+    #[serde(default = "default_knn_num_candidates")]
+    pub num_candidates: usize,
+    #[serde(default)]
+    pub filter: Option<FilterClause>,
+}
+fn default_knn_k() -> usize { 10 }
+fn default_knn_num_candidates() -> usize { 100 }
+
+/// Vector store for a segment: doc_seq → embedding vector.
+#[derive(Debug, Clone, Default)]
+pub struct VectorStore {
+    pub vectors: Vec<(u32, Vec<f32>)>,
+    pub dimensions: usize,
+}
+
 // ─── Query / result types ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +297,7 @@ pub struct SearchQuery {
     #[serde(default)] pub aggs: std::collections::HashMap<String, Aggregation>,
     #[serde(default)] pub wildcard: Option<WildcardQuery>,
     #[serde(default)] pub match_phrase: Option<MatchPhraseQuery>,
+    #[serde(default)] pub knn: Option<KnnQuery>,
 }
 fn default_max_results() -> usize { 10 }
 

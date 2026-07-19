@@ -228,6 +228,32 @@ pub fn apply_highlight(text: &str, query_terms: &[String], pre_tag: &str, post_t
 
 // ─── Searcher ───────────────────────────────────────────────────────────────
 
+// ─── Cosine similarity ─────────────────────────────────────────────────────
+
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() { return 0.0; }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
+    (dot / (norm_a * norm_b)) as f64
+}
+
+/// Flat kNN search: compute cosine similarity against all stored vectors,
+/// return top-K (doc_seq, score) pairs.
+pub fn flat_knn(
+    query_vector: &[f32],
+    vectors: &[(u32, Vec<f32>)],
+    k: usize,
+) -> Vec<(u32, f64)> {
+    let mut scores: Vec<(u32, f64)> = vectors.iter()
+        .map(|(doc_seq, vec)| (*doc_seq, cosine_similarity(query_vector, vec)))
+        .collect();
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(k);
+    scores
+}
+
 pub struct Searcher { data_dir: PathBuf }
 
 impl Searcher {
@@ -368,6 +394,44 @@ impl Searcher {
                             doc_id: doc_rec.doc_id.clone(), score,
                             fields: doc_rec.fields.clone(), highlights: None,
                         });
+                    }
+                }
+            }
+
+            // ── kNN search ──
+            if let Some(ref knn) = query.knn {
+                if !reader.vector_store.vectors.is_empty() {
+                    let knn_results = flat_knn(&knn.vector, &reader.vector_store.vectors, knn.k);
+                    // Merge with existing BM25 results or use kNN results directly.
+                    let has_bm25 = !all_results.is_empty();
+                    if has_bm25 {
+                        // BM25 + kNN hybrid: add kNN score as a boost factor.
+                        let knn_scores: HashMap<u32, f64> = knn_results.into_iter().collect();
+                        for (doc_seq, knn_score) in &knn_scores {
+                            let doc_id = (0..total_docs)
+                                .filter_map(|s| reader.doc_record(s))
+                                .find(|d| d.doc_seq == *doc_seq)
+                                .map(|d| d.doc_id.clone());
+                            if let Some(ref did) = doc_id {
+                                if let Some(existing) = all_results.iter_mut().find(|r| r.doc_id.0 == did.0) {
+                                    // Boost existing BM25 score with kNN score.
+                                    existing.score = existing.score * 0.5 + knn_score * 0.5 * 100.0;
+                                }
+                            }
+                        }
+                    } else {
+                        // Pure kNN search.
+                        for (doc_seq, score) in knn_results {
+                            if is_tombstoned(&entry.segment_id, doc_seq) { continue; }
+                            if let Some(doc_rec) = reader.doc_record(doc_seq) {
+                                all_results.push(ScoredDocument {
+                                    doc_id: doc_rec.doc_id.clone(),
+                                    score: (score + 1.0) * 10.0, // scale to BM25-like range
+                                    fields: doc_rec.fields.clone(),
+                                    highlights: None,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -540,7 +604,7 @@ mod tests {
             query_text: text.into(), max_results: max, from: 0,
             bm25_params: Bm25Params::default(), filter: None,
             sort: vec![], highlight: None,
-            aggs: HashMap::new(), wildcard: None, match_phrase: None,
+            aggs: HashMap::new(), wildcard: None, match_phrase: None, knn: None,
         }
     }
 
@@ -622,7 +686,7 @@ mod tests {
             sort: vec![], highlight: None,
             aggs: HashMap::new(),
             wildcard: Some(kosha_core::WildcardQuery { field: "t".into(), pattern: "hel*".into(), case_insensitive: true }),
-            match_phrase: None,
+            match_phrase: None, knn: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);

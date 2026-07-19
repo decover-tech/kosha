@@ -99,10 +99,6 @@ class KoshaClient:
     def search(self, index: str | None = None, body: dict | None = None, **params: Any) -> dict:
         ns = index or self._namespace
 
-        # kNN/semantic not supported in Phase 1 — return empty.
-        if body and ("knn" in body or "knn" in (body.get("query") or {})):
-            return self._build_search_response([], 0, body.get("size", 10), 0, 0)
-
         query_text = self._extract_query_text(body) if body else ""
         size = body.get("size", 10) if body else 10
         from_ = body.get("from", 0) if body else 0
@@ -110,9 +106,10 @@ class KoshaClient:
         aggs = self._extract_aggs(body)
         wildcard = self._extract_wildcard(body)
         match_phrase = self._extract_match_phrase(body)
+        knn = self._extract_knn(body)
 
-        # Determine if we need POST (agg/wildcard/phrase/filter present).
-        needs_post = bool(filter_clause or aggs or wildcard or match_phrase)
+        # Determine if we need POST (agg/wildcard/phrase/filter/knn present).
+        needs_post = bool(filter_clause or aggs or wildcard or match_phrase or knn)
 
         if not needs_post:
             bm25_params = {}
@@ -162,6 +159,8 @@ class KoshaClient:
             kosha_body["wildcard"] = wildcard
         if match_phrase:
             kosha_body["match_phrase"] = match_phrase
+        if knn:
+            kosha_body["knn"] = knn
 
         result = self._request("POST", "search", body=kosha_body)
         kosha_hits = result.get("results", [])
@@ -471,6 +470,26 @@ class KoshaClient:
         return None
 
     @staticmethod
+    def _extract_knn(body: dict | None) -> dict | None:
+        """Extract kNN query from an ES query body."""
+        if not body:
+            return None
+        # ES: {"knn": {"field": {"vector": [...], "k": N}}}
+        # or embedded: {"query": {"knn": {...}}}
+        knn = body.get("knn") or (body.get("query") or {}).get("knn")
+        if not knn:
+            return None
+        for field, spec in knn.items():
+            if isinstance(spec, dict):
+                return {
+                    "field": field,
+                    "vector": spec.get("vector", []),
+                    "k": spec.get("k", 10),
+                    "num_candidates": spec.get("num_candidates", 100),
+                }
+        return None
+
+    @staticmethod
     def _field_to_kosha(name: str, value: str, field_type: str = "Text") -> dict:
         return {"name": name, "field_type": field_type, "value": value}
 
@@ -486,6 +505,8 @@ class KoshaClient:
                 fields.append(self._field_to_kosha(k, str(v).lower(), "Boolean"))
             elif isinstance(v, (int, float)):
                 fields.append(self._field_to_kosha(k, str(v), "Float"))
+            elif isinstance(v, (list, tuple)) and all(isinstance(x, (int, float)) for x in v):
+                fields.append(self._field_to_kosha(k, json.dumps(v), "Vector"))
         doc = {
             "id": id or "",
             "fields": fields,
