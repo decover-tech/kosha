@@ -11,6 +11,28 @@ from typing import Any, Sequence
 
 logger = logging.getLogger(__name__)
 
+
+# ─── Transport shim ─────────────────────────────────────────────────────────
+#
+# opensearchpy.helpers.bulk() (used by ParagraphRepository._bulk_insert_sources)
+# is a client-agnostic helper: it does NOT call client.bulk() directly. It
+# first reaches into client.transport.serializer to JSON-encode and chunk
+# actions by size (_ActionChunker.feed), then calls client.bulk(body=ndjson)
+# once per chunk — which is exactly the newline-delimited body KoshaClient.bulk()
+# already parses. Without this shim, chunking blows up with AttributeError
+# before KoshaClient.bulk() is ever reached.
+class _Serializer:
+    def dumps(self, data: Any) -> str:
+        if isinstance(data, str):
+            return data
+        return json.dumps(data)
+
+
+class _Transport:
+    def __init__(self) -> None:
+        self.serializer = _Serializer()
+
+
 # ─── Public interface ──────────────────────────────────────────────────────
 
 class KoshaClient:
@@ -66,6 +88,10 @@ class KoshaClient:
         # Kosha namespace → index name mapping.
         # In Phase 1, index name is used directly as the namespace.
         self._namespace = kwargs.get("namespace", "default")
+
+        # Duck-typed transport so opensearchpy.helpers.bulk() can chunk
+        # actions before delegating to self.bulk() — see _Transport above.
+        self.transport = _Transport()
 
         logger.info("KoshaClient targeting %s namespace=%s", self._kosha_url, self._namespace)
 
@@ -747,6 +773,7 @@ class KoshaClient:
 
     # ── Index exists / create ──────────────────────────────────────────────
 
+    @property
     def indices(self) -> "IndexOps":
         """Return an object that mimics ``opensearchpy.client.IndicesClient``."""
         return IndexOps(self)

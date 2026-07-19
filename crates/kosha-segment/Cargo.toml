@@ -12,3 +12,4 @@ workspace = true
 kosha-core = { path = "../kosha-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+instant-distance = "0.6"

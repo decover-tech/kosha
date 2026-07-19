@@ -1,5 +1,9 @@
 # Kosha
 
+[![CI](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml/badge.svg)](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml)
+[![rustfmt](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml/badge.svg?job=fmt)](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml)
+[![test](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml/badge.svg?job=test)](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml)
+
 A storage-disaggregated search engine: **S3 is the source of truth, local NVMe
 SSD is a transparent cache, and compute nodes are disposable.** Kosha is being
 built to replace Elasticsearch/OpenSearch for Decover's search workloads, and
@@ -7,23 +11,26 @@ is intended to be reusable as a general-purpose, schema-driven search service.
 
 See [DESIGN.md](DESIGN.md) for the full architecture.
 
-> **Status: Phase 1 — BM25 lexical search implemented.**
-> All seven crates have functional BM25 indexing and query code.
-> Vector/ANN retrieval, RRF fusion, and rerank are Phase 2
+> **Status: Phase 1 complete — BM25 lexical + kNN/ANN search implemented.**
+> All seven crates have functional BM25 indexing, query, filtering,
+> aggregation, and HNSW vector search. RRF fusion and rerank are Phase 2
 > (DESIGN.md §3.1).
 
 ## Repository layout
 
     crates/
-      kosha-core      shared types and data model                 — Epic 2
-      kosha-segment   segment file format (r/w binary inverted    — Epic 2
-                     index, doc store, JSON footer)
+      kosha-core      shared types, data model, filter/query DSL  — Epic 2
+      kosha-segment   segment format: inverted idx, doc store,    — Epic 2
+                     filter columns, vector store, HNSW graph
       kosha-write     document buffer + flush-to-segment          — Epic 3
       kosha-cache     NVMe SSD read-through cache (§9)            — Epic 4
-      kosha-query     BM25 scorer + multi-term top-K searcher     — Epic 5
+      kosha-query     BM25 scorer, kNN/ANN search, aggregations,  — Epic 5
+                     wildcard, match phrase, filtering
       kosha-control   in-memory namespace + manifest store        — Epic 6
-      kosha-server    HTTP API (GET /healthz, POST /index,        — Epic 8
-                     GET /search)
+      kosha-server    HTTP API (healthz, index, search, stats,    — Epic 8
+                     delete, flush)
+    clients/
+      python/kosha_client  OpenSearch-compatible Python client    — Epic 11
     proto/            protobuf definitions (dsearch.proto)        — Epic 1
     docs/             development and integration guides
     DESIGN.md         architecture document (v1 draft)

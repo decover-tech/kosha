@@ -2,11 +2,38 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use instant_distance::{Builder, HnswMap, Point, Search};
 use kosha_core::{
     AggBucket, AggBucketResult, AggMetricResult, AggregationResults,
     Bm25Params, DocRecord, DocumentId, Field, FieldType, FilterStore, Footer,
     KoshaError, Posting, SegmentId, VectorStore,
 };
+
+/// A point in HNSW space using cosine distance.
+#[derive(Clone)]
+pub struct CosinePoint(pub Vec<f32>);
+
+impl Point for CosinePoint {
+    fn distance(&self, other: &Self) -> f32 {
+        let dot: f32 = self.0.iter().zip(other.0.iter()).map(|(a, b)| a * b).sum();
+        let na: f32 = self.0.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = other.0.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 { return 1.0; }
+        // Cosine distance = 1 - cosine_similarity, clamped to [0, 2]
+        1.0 - (dot / (na * nb)).clamp(-1.0, 1.0)
+    }
+}
+
+/// Build an HNSW index from a set of vectors.
+/// Returns (HnswMap, Search) — map for searching, search for re-use.
+pub fn build_hnsw(vectors: &[(u32, Vec<f32>)]) -> Option<(HnswMap<CosinePoint, u32>, Search)> {
+    if vectors.is_empty() { return None; }
+    let points: Vec<CosinePoint> = vectors.iter().map(|(_, v)| CosinePoint(v.clone())).collect();
+    let values: Vec<u32> = vectors.iter().map(|(ds, _)| *ds).collect();
+    let map = Builder::default().build(points, values);
+    let search = Search::default();
+    Some((map, search))
+}
 
 // ─── Segment writer ─────────────────────────────────────────────────────────
 
@@ -206,6 +233,7 @@ impl SegmentWriter {
 
     fn write_vectors(&self) -> Result<(), KoshaError> {
         if self.vectors.is_empty() { return Ok(()); }
+        // Write vector.idx (raw vectors for flat kNN)
         let mut buf = Vec::new();
         let dim = self.vectors[0].1.len() as u32;
         buf.extend_from_slice(&dim.to_le_bytes());
@@ -217,6 +245,7 @@ impl SegmentWriter {
             }
         }
         fs::write(self.vectors_path(), &buf)?;
+
         Ok(())
     }
 
@@ -243,17 +272,21 @@ pub struct SegmentReader {
     pub inverted_index: HashMap<String, Vec<Posting>>,
     pub filter_store: FilterStore,
     pub vector_store: VectorStore,
+    pub hnsw_map: Option<HnswMap<CosinePoint, u32>>,
 }
 
 impl SegmentReader {
     pub fn open(segment_dir: PathBuf) -> Result<Self, KoshaError> {
+        let vs = Self::read_vectors(&segment_dir)?;
+        let hm = build_hnsw(&vs.vectors).map(|(m, _)| m);
         Ok(Self {
             segment_dir: segment_dir.clone(),
             footer: Self::read_footer(&segment_dir)?,
             doc_records: Self::read_doc_store(&segment_dir)?,
             inverted_index: Self::read_inverted_index(&segment_dir)?,
             filter_store: Self::read_filters(&segment_dir)?,
-            vector_store: Self::read_vectors(&segment_dir)?,
+            vector_store: vs,
+            hnsw_map: hm,
         })
     }
 

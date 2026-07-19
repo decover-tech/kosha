@@ -398,10 +398,19 @@ impl Searcher {
                 }
             }
 
-            // ── kNN search ──
+            // ── kNN search (HNSW when available, flat fallback) ──
             if let Some(ref knn) = query.knn {
                 if !reader.vector_store.vectors.is_empty() {
-                    let knn_results = flat_knn(&knn.vector, &reader.vector_store.vectors, knn.k);
+                    let knn_results: Vec<(u32, f64)> = if let Some(ref hnsw) = reader.hnsw_map {
+                        let query_point = kosha_segment::CosinePoint(knn.vector.clone());
+                        let mut search = instant_distance::Search::default();
+                        hnsw.search(&query_point, &mut search)
+                            .take(knn.k)
+                            .map(|item| (*item.value, (1.0 - item.distance as f64).max(0.0)))
+                            .collect()
+                    } else {
+                        flat_knn(&knn.vector, &reader.vector_store.vectors, knn.k)
+                    };
                     // Merge with existing BM25 results or use kNN results directly.
                     let has_bm25 = !all_results.is_empty();
                     if has_bm25 {
