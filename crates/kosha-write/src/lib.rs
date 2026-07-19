@@ -137,6 +137,91 @@ impl Indexer {
         Ok(())
     }
 
+    /// Compact segments for a namespace: merge small segments into one.
+    /// Reads all existing segments, rebuilds a single merged segment,
+    /// and garbage-collects the old segment directories.
+    pub fn compact_namespace(&mut self, namespace: &NamespaceId) -> Result<(), KoshaError> {
+        let manifest = match self.manifests.get(namespace) {
+            Some(m) => m.clone(),
+            None => return Ok(()),
+        };
+
+        if manifest.segments.len() <= 1 {
+            return Ok(()); // Nothing to compact
+        }
+
+        let data_dir = self.data_dir.clone();
+        let ns_dir = data_dir.join(&namespace.0);
+
+        // Collect all doc_records from all segments.
+        use kosha_core::DocRecord;
+        let mut all_docs: Vec<DocRecord> = Vec::new();
+        let mut old_segment_ids: Vec<SegmentId> = Vec::new();
+
+        for entry in &manifest.segments {
+            let seg_dir = ns_dir.join(&entry.segment_id.0);
+            if !seg_dir.exists() {
+                continue;
+            }
+            let reader = kosha_segment::SegmentReader::open(seg_dir)?;
+            let tombstones = self.tombstones.get(namespace)
+                .and_then(|t| t.get(&entry.segment_id));
+
+            for doc_rec in &reader.doc_records {
+                // Skip tombstoned docs.
+                if let Some(ref ts) = tombstones {
+                    if ts.contains(&doc_rec.doc_seq) {
+                        continue;
+                    }
+                }
+                all_docs.push(doc_rec.clone());
+            }
+            old_segment_ids.push(entry.segment_id.clone());
+        }
+
+        if all_docs.is_empty() {
+            return Ok(());
+        }
+
+        // Write a new merged segment.
+        let seg_id = SegmentId(format!("{}-compact-{:x}", namespace.0.replace('/', "_"), chrono_now()));
+        let seg_dir = data_dir.join(&namespace.0).join(seg_id.0.as_str());
+        let mut writer = kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir);
+
+        for doc in &all_docs {
+            writer.add_document(doc.doc_id.clone(), doc.fields.clone());
+        }
+
+        let bm25_params = self.buffer_mut(namespace.clone()).bm25_params.clone();
+        let footer = writer.finalize(bm25_params)?;
+
+        // Update manifest: remove old segments, add merged segment.
+        let manifest = self.manifests.get_mut(namespace).unwrap();
+        manifest.segments.retain(|e| !old_segment_ids.contains(&e.segment_id));
+        manifest.version += 1;
+        manifest.segments.push(kosha_core::ManifestEntry {
+            segment_id: seg_id,
+            doc_count: footer.doc_count,
+        });
+
+        // Garbage-collect old segment directories.
+        for seg_id in &old_segment_ids {
+            let seg_dir = ns_dir.join(&seg_id.0);
+            if seg_dir.exists() {
+                std::fs::remove_dir_all(&seg_dir).ok();
+            }
+        }
+
+        // Clear tombstones for compacted segments.
+        if let Some(ts) = self.tombstones.get_mut(namespace) {
+            for seg_id in &old_segment_ids {
+                ts.remove(seg_id);
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn flush_all(&mut self) -> Result<(), KoshaError> {
         let namespaces: Vec<NamespaceId> = self.buffers.keys().cloned().collect();
         for ns in namespaces {
@@ -179,6 +264,11 @@ impl Indexer {
 }
 
 /// Standalone filter applier for delete operations (no Searcher dependency).
+fn chrono_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+}
+
 pub fn apply_filter_delete(
     filter: &FilterClause,
     store: &FilterStore,
@@ -421,6 +511,46 @@ mod tests {
             // d2 has doc_seq=1
             assert!(seqs.contains(&1));
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_merges_segments() {
+        let dir = std::env::temp_dir().join("kosha-test-compact");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ns = NamespaceId("test".into());
+        let mut idx = Indexer::new(dir.clone()).with_flush_threshold(2);
+
+        // Index 4 docs in batches of 2 → creates 2 segments.
+        for i in 0..4 {
+            idx.index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId(format!("d{}", i + 1)),
+                    fields: vec![Field::text("title", format!("doc number {}", i + 1))],
+                }],
+            )
+            .unwrap();
+        }
+
+        // 2 flushes → 2 segments.
+        assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 2);
+
+        // Compact → should merge into 1 segment.
+        idx.compact_namespace(&ns).unwrap();
+        assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 1);
+
+        // Verify all 4 docs are in the merged segment.
+        let seg_id = &idx.manifest(&ns).unwrap().segments[0].segment_id;
+        let seg_dir = dir.join("test").join(&seg_id.0);
+        assert!(seg_dir.exists());
+        let reader = kosha_segment::SegmentReader::open(seg_dir).unwrap();
+        assert_eq!(reader.doc_count(), 4);
+
+        // Old segment directories should be deleted.
+        assert!(std::fs::read_dir(dir.join("test")).unwrap().count() == 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
