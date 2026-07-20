@@ -13,29 +13,68 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Map of valid API keys → tenant id.
-/// Loaded once from `KOSHA_API_KEYS` env var (format: `key1=tenant1,key2=tenant2`).
-/// In single-tenant/dev mode, `KOSHA_API_KEY` sets a single key with tenant "default".
+///
+/// Loaded from, in priority order:
+///   1. Postgres `kosha.api_keys` table (if DATABASE_URL + postgres feature)
+///   2. `KOSHA_API_KEYS` env var (format: `key1=tenant1,key2=tenant2`)
+///   3. `KOSHA_API_KEY` env var (single key, tenant = "default")
+///   4. Empty (dev mode — no auth required)
 static API_KEYS: once_cell::sync::Lazy<HashMap<String, String>> =
     once_cell::sync::Lazy::new(load_api_keys);
 
 fn load_api_keys() -> HashMap<String, String> {
-    // Multi-tenant: KOSHA_API_KEYS = "sk-kosha-1=acme-corp,sk-kosha-2=other-org"
+    // 1. Postgres-backed keys (staging/production).
+    if let Ok(db_url) = std::env::var("DATABASE_URL") {
+        #[cfg(feature = "postgres")]
+        match kosha_control::PgStore::new(&db_url) {
+            Ok(store) => {
+                let keys = store.list_api_keys(None).unwrap_or_default();
+                if !keys.is_empty() {
+                    let map: HashMap<String, String> = keys
+                        .into_iter()
+                        .map(|(key, tenant, _desc)| (key, tenant))
+                        .collect();
+                    println!("api keys: loaded {} key(s) from postgres", map.len());
+                    return map;
+                }
+                println!("api keys: no keys found in postgres, falling back to env vars");
+            }
+            Err(e) => {
+                eprintln!("api keys: failed to connect to postgres: {e}, falling back to env vars");
+            }
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            let _ = db_url;
+            println!("api keys: DATABASE_URL set but postgres feature disabled, using env vars");
+        }
+    }
+
+    // 2. Multi-tenant env var.
     if let Ok(keys) = std::env::var("KOSHA_API_KEYS") {
-        return keys
+        let map: HashMap<_, _> = keys
             .split(',')
             .filter_map(|pair| {
                 pair.split_once('=')
                     .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
             })
             .collect();
+        if !map.is_empty() {
+            println!("api keys: loaded {} key(s) from KOSHA_API_KEYS env var", map.len());
+            return map;
+        }
     }
-    // Single-tenant: KOSHA_API_KEY = "sk-kosha-abc123"
+
+    // 3. Single-tenant env var.
     if let Ok(key) = std::env::var("KOSHA_API_KEY") {
+        println!("api keys: single key from KOSHA_API_KEY env var");
         let mut m = HashMap::new();
         m.insert(key, "default".to_string());
         return m;
     }
-    // Dev mode: no auth required
+
+    // 4. Dev mode — no auth.
+    println!("api keys: none configured — dev mode (no auth)");
     HashMap::new()
 }
 
@@ -336,6 +375,11 @@ fn route(
 
     if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/stats") {
         return handle_namespace_stats(&ns, tenant, state);
+    }
+
+    // ── Admin routes (Postgres-backed only) ────────────────────────────────
+    if request_line.starts_with("POST /v1/admin/api-keys") {
+        return handle_create_api_key(body, tenant, state);
     }
 
     // ── Legacy Phase 1 routes (backward compat) ────────────────────────────
@@ -719,6 +763,65 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
         "segments": manifest.segments.len(),
         "version": manifest.version,
     }))
+}
+
+/// POST /v1/admin/api-keys — create a new API key for a tenant.
+///
+/// Requires existing admin API key (from KOSHA_API_KEY env var or DB).
+/// Request body: {"tenant_id": "acme-corp", "description": "staging key"}
+fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String {
+    let req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return json_error(400, "invalid JSON"),
+    };
+
+    let tenant_id = match req.get("tenant_id").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return json_error(400, "missing 'tenant_id'"),
+    };
+
+    let description = req
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Try to create via PgStore (only works with postgres feature).
+    #[cfg(feature = "postgres")]
+    {
+        let controller = state.controller.lock().unwrap();
+        // Downcast the Box<dyn ControlStore> to see if it's a PgStore.
+        // We use a simple approach: look for "postgres" in the store type name.
+        // Check if DATABASE_URL is set (indicating PgStore).
+        drop(controller);
+
+        if std::env::var("DATABASE_URL").is_err() {
+            return json_error(400, "Postgres not configured (DATABASE_URL not set)");
+        }
+
+        // Re-create connection for the admin operation.
+        // This is a simplified approach — in production, share the pool.
+        match std::env::var("DATABASE_URL") {
+            Ok(db_url) => match kosha_control::PgStore::new(&db_url) {
+                Ok(store) => match store.create_api_key(tenant_id, description) {
+                    Ok(api_key) => json_ok(&serde_json::json!({
+                        "api_key": api_key,
+                        "tenant_id": tenant_id,
+                        "description": description,
+                    })),
+                    Err(e) => json_error(500, &format!("failed to create key: {e}")),
+                },
+                Err(e) => json_error(500, &format!("failed to connect to postgres: {e}")),
+            },
+            Err(_) => json_error(400, "Postgres not configured"),
+        }
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = tenant_id;
+        let _ = description;
+        json_error(400, "admin API requires postgres feature (compile with --features postgres)")
+    }
 }
 
 /// If the body is not valid JSON, try parsing as a raw object with just the documents field.

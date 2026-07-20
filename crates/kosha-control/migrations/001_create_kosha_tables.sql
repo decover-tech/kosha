@@ -24,3 +24,18 @@ CREATE TABLE IF NOT EXISTS kosha.manifests (
 -- Index for listing recently-active namespaces.
 CREATE INDEX IF NOT EXISTS idx_manifests_updated_at
     ON kosha.manifests (updated_at DESC);
+
+-- ── API keys (customer/tenant auth) ─────────────────────────────────────────
+-- Each customer gets one or more API keys that map to a tenant id.
+-- The tenant id is used as a namespace prefix for isolation.
+CREATE TABLE IF NOT EXISTS kosha.api_keys (
+    api_key     TEXT PRIMARY KEY,          -- e.g. "sk-acme-corp-abc123"
+    tenant_id   TEXT NOT NULL,             -- e.g. "acme-corp"
+    description TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    revoked_at  TIMESTAMPTZ               -- NULL = active
+);
+
+-- Index for looking up keys by tenant (admin listings).
+CREATE INDEX IF NOT EXISTS idx_api_keys_tenant
+    ON kosha.api_keys (tenant_id);

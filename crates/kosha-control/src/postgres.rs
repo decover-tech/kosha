@@ -7,6 +7,7 @@
 
 use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Postgres-backed store.
 ///
@@ -43,6 +44,92 @@ impl PgStore {
             .map_err(|e| format!("migration failed: {e}"))?;
 
         Ok(Self { pool })
+    }
+
+    /// Validate an API key against the database.
+    /// Returns the tenant_id if the key is valid and not revoked.
+    pub fn validate_api_key(&self, api_key: &str) -> Option<String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+
+        let key = api_key.to_string();
+        rt.block_on(async move {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT tenant_id FROM kosha.api_keys \
+                 WHERE api_key = $1 AND revoked_at IS NULL"
+            )
+            .bind(&key)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()?;
+
+            row.map(|(tenant,)| tenant)
+        })
+    }
+
+    /// Create a new API key for a tenant.
+    /// The key is a random UUID prefixed with "sk-" (secret key).
+    pub fn create_api_key(&self, tenant_id: &str, description: &str) -> Result<String, KoshaError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+
+        let api_key = format!("sk-{}", Uuid::new_v4());
+        let tid = tenant_id.to_string();
+        let desc = description.to_string();
+        let key = api_key.clone();
+
+        let result: Result<(), KoshaError> = rt.block_on(async move {
+            sqlx::query(
+                "INSERT INTO kosha.api_keys (api_key, tenant_id, description) \
+                 VALUES ($1, $2, $3)"
+            )
+            .bind(&key)
+            .bind(&tid)
+            .bind(&desc)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+
+            Ok(())
+        });
+
+        result?;
+
+        Ok(api_key)
+    }
+
+    /// List all active (non-revoked) API keys, optionally filtered by tenant.
+    pub fn list_api_keys(&self, tenant_id: Option<&str>) -> Result<Vec<(String, String, String)>, KoshaError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+
+        let tid = tenant_id.map(|s| s.to_string());
+
+        rt.block_on(async move {
+            let query = if tid.is_some() {
+                "SELECT api_key, tenant_id, description FROM kosha.api_keys \
+                 WHERE revoked_at IS NULL AND tenant_id = $1 \
+                 ORDER BY created_at DESC"
+            } else {
+                "SELECT api_key, tenant_id, description FROM kosha.api_keys \
+                 WHERE revoked_at IS NULL \
+                 ORDER BY created_at DESC"
+            };
+
+            let rows: Vec<(String, String, String)> = sqlx::query_as(query)
+                .bind(&tid)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+
+            Ok(rows)
+        })
     }
 }
 

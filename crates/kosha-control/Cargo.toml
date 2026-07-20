@@ -14,9 +14,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Postgres persistence (optional — in-memory is the default).
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"], optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"], optional = true }
 tokio = { version = "1", features = ["rt", "macros"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 
 [features]
 default = []
-postgres = ["sqlx", "tokio"]
+postgres = ["sqlx", "tokio", "uuid"]
