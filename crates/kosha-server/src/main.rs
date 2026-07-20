@@ -24,7 +24,8 @@ fn load_api_keys() -> HashMap<String, String> {
         return keys
             .split(',')
             .filter_map(|pair| {
-                pair.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                pair.split_once('=')
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
             })
             .collect();
     }
@@ -47,6 +48,8 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 mod s3_storage;
 
 use kosha_control::Controller;
+#[cfg(feature = "s3")]
+use kosha_core::StorageBackend;
 use kosha_core::{IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::Searcher;
 use kosha_write::Indexer;
@@ -247,9 +250,7 @@ fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
         .get("authorization")
         .map(|v| v.as_str())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .or_else(|| {
-            headers.get("x-api-key").map(|v| v.as_str())
-        })
+        .or_else(|| headers.get("x-api-key").map(|v| v.as_str()))
         .or_else(|| {
             // Check case-insensitively for x-api-key (raw headers may preserve case)
             headers.iter().find_map(|(k, v)| {
@@ -266,7 +267,10 @@ fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
             Some(tenant) => Ok(tenant.clone()),
             None => Err(json_error_body(401, "invalid API key")),
         },
-        None => Err(json_error_body(401, "missing API key — use Authorization: Bearer <key> or X-Api-Key header")),
+        None => Err(json_error_body(
+            401,
+            "missing API key — use Authorization: Bearer <key> or X-Api-Key header",
+        )),
     }
 }
 
@@ -341,11 +345,7 @@ fn route(
 }
 
 /// Extract a namespace from a v1 path: `METHOD /v1/namespaces/{ns}/suffix ...`
-fn extract_namespace<'a>(
-    request_line: &'a str,
-    prefix: &str,
-    suffix: &str,
-) -> Option<String> {
+fn extract_namespace(request_line: &str, prefix: &str, suffix: &str) -> Option<String> {
     let after_method = request_line.split(' ').nth(1)?;
     let after_prefix = after_method.strip_prefix(prefix)?;
     let ns = after_prefix.strip_suffix(suffix)?;
@@ -634,7 +634,12 @@ fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppS
     handle_index(body, state)
 }
 
-fn handle_search_post_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
+fn handle_search_post_with_ns(
+    namespace: &str,
+    tenant: &str,
+    body: &[u8],
+    state: &AppState,
+) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
     let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -825,7 +830,13 @@ mod tests {
             }],
         };
         let body = serde_json::to_vec(&req).unwrap();
-        let response = route("POST /index HTTP/1.1\r\n", &HashMap::new(), &body, "test", &state);
+        let response = route(
+            "POST /index HTTP/1.1\r\n",
+            &HashMap::new(),
+            &body,
+            "test",
+            &state,
+        );
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"indexed_count\":1"));
     }
@@ -850,7 +861,13 @@ mod tests {
             ],
         };
         let body = serde_json::to_vec(&req).unwrap();
-        let index_resp = route("POST /index HTTP/1.1\r\n", &HashMap::new(), &body, "test", &state);
+        let index_resp = route(
+            "POST /index HTTP/1.1\r\n",
+            &HashMap::new(),
+            &body,
+            "test",
+            &state,
+        );
         assert!(index_resp.contains("\"indexed_count\":2"));
 
         // Trigger flush so search can read from disk.
@@ -898,7 +915,13 @@ mod tests {
     #[test]
     fn search_missing_params_returns_400() {
         let state = test_state();
-        let response = route("GET /search HTTP/1.1\r\n", &HashMap::new(), b"", "test", &state);
+        let response = route(
+            "GET /search HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"",
+            "test",
+            &state,
+        );
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
     }
 
