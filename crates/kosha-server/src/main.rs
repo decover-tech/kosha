@@ -60,7 +60,10 @@ fn load_api_keys() -> HashMap<String, String> {
             })
             .collect();
         if !map.is_empty() {
-            println!("api keys: loaded {} key(s) from KOSHA_API_KEYS env var", map.len());
+            println!(
+                "api keys: loaded {} key(s) from KOSHA_API_KEYS env var",
+                map.len()
+            );
             return map;
         }
     }
@@ -820,7 +823,10 @@ fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String
     {
         let _ = tenant_id;
         let _ = description;
-        json_error(400, "admin API requires postgres feature (compile with --features postgres)")
+        json_error(
+            400,
+            "admin API requires postgres feature (compile with --features postgres)",
+        )
     }
 }
 

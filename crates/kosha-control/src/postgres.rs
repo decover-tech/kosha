@@ -58,7 +58,7 @@ impl PgStore {
         rt.block_on(async move {
             let row: Option<(String,)> = sqlx::query_as(
                 "SELECT tenant_id FROM kosha.api_keys \
-                 WHERE api_key = $1 AND revoked_at IS NULL"
+                 WHERE api_key = $1 AND revoked_at IS NULL",
             )
             .bind(&key)
             .fetch_optional(&self.pool)
@@ -85,7 +85,7 @@ impl PgStore {
         let result: Result<(), KoshaError> = rt.block_on(async move {
             sqlx::query(
                 "INSERT INTO kosha.api_keys (api_key, tenant_id, description) \
-                 VALUES ($1, $2, $3)"
+                 VALUES ($1, $2, $3)",
             )
             .bind(&key)
             .bind(&tid)
@@ -103,7 +103,10 @@ impl PgStore {
     }
 
     /// List all active (non-revoked) API keys, optionally filtered by tenant.
-    pub fn list_api_keys(&self, tenant_id: Option<&str>) -> Result<Vec<(String, String, String)>, KoshaError> {
+    pub fn list_api_keys(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<(String, String, String)>, KoshaError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

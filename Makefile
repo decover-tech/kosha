@@ -58,12 +58,25 @@ rust-build:
 	cargo build --release
 
 # ── Database ──────────────────────────────────────────────────────────────
+#
+# Kosha gets its own `kosha` database + role on the shared RDS instance
+# (rather than just a schema) so it's isolated from the rest of the Decover
+# backend. DATABASE_URL should point at the instance's admin/maintenance
+# database (e.g. .../postgres); db-migrate derives the kosha-specific URL
+# from it after bootstrapping.
 
-.PHONY: db-migrate
+.PHONY: db-bootstrap db-migrate
 
-db-migrate:
-	@echo "Applying Kosha migrations to $$DATABASE_URL ..."
-	psql "$$DATABASE_URL" -f crates/kosha-control/migrations/001_create_kosha_tables.sql
+db-bootstrap:
+	@test -n "$$KOSHA_DB_PASSWORD" || (echo "KOSHA_DB_PASSWORD must be set" && exit 1)
+	@echo "Bootstrapping isolated kosha role + database on $$DATABASE_URL ..."
+	psql "$$DATABASE_URL" -v ON_ERROR_STOP=1 -v pass="$$KOSHA_DB_PASSWORD" \
+		-f crates/kosha-control/migrations/000_bootstrap_database.sql
+
+db-migrate: db-bootstrap
+	@echo "Applying Kosha migrations to the kosha database ..."
+	psql "$$(echo "$$DATABASE_URL" | sed -E 's#(/[^/?]+)(\?.*)?$$#/kosha\2#')" \
+		-v ON_ERROR_STOP=1 -f crates/kosha-control/migrations/001_create_kosha_tables.sql
 
 # ── All ────────────────────────────────────────────────────────────────────
 
