@@ -365,6 +365,32 @@ impl StorageBackend for LocalStorage {
     }
 }
 
+// ─── WAL (Write-Ahead Log) types ──────────────────────────────────────────
+
+/// A single WAL record: a batch of documents for one namespace at a point in time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalRecord {
+    pub namespace: NamespaceId,
+    pub documents: Vec<Document>,
+    pub timestamp: u64,
+}
+
+impl WalRecord {
+    pub fn new(namespace: NamespaceId, documents: Vec<Document>) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        Self { namespace, documents, timestamp }
+    }
+}
+
+/// Summary of a WAL file for recovery ordering.
+#[derive(Debug, Clone)]
+pub struct WalFileInfo {
+    pub path: String,
+    pub record_count: u32,
+    pub first_timestamp: u64,
+}
+
 // ─── Segment metadata ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

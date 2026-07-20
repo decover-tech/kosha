@@ -522,10 +522,10 @@ impl Searcher {
                             .map(|p| (p.doc_id, Vec::new()))
                             .collect()
                     };
-                    let mut doc_freqs: HashMap<u32, HashMap<&str, u32>> = HashMap::new();
+                    let _doc_freqs: HashMap<u32, HashMap<&str, u32>> = HashMap::new();
 
                     // For each candidate doc, verify it appears in ALL other postings lists.
-                    for (term, postings) in &term_postings {
+                    for (_term, postings) in &term_postings {
                         let term_docs: HashMap<u32, &kosha_core::Posting> = postings
                             .iter()
                             .map(|p| (p.doc_id, p))
@@ -543,7 +543,7 @@ impl Searcher {
                     }
 
                     // Score surviving candidates.
-                    for (doc_id, doc_positions) in &candidates {
+                    for (doc_id, _doc_positions) in &candidates {
                         if let Some(doc_rec) = reader.doc_record(*doc_id) {
                             let mut total_score = 0.0;
                             for (term, postings) in &term_postings {

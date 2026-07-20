@@ -1,3 +1,5 @@
+pub mod wal;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -23,18 +25,46 @@ pub struct Indexer {
     bm25_params: Bm25Params,
     /// Tombstoned docs: namespace → segment_id → set of doc_seqs
     tombstones: HashMap<NamespaceId, HashMap<SegmentId, HashSet<u32>>>,
+    /// Write-Ahead Log for durability
+    wal: std::sync::Mutex<crate::wal::WalWriter>,
+    /// Whether WAL is enabled
+    wal_enabled: bool,
 }
 
 impl Indexer {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self {
+        let wal_dir = data_dir.join("_wal");
+        std::fs::create_dir_all(&wal_dir).ok();
+        let backend = Box::new(kosha_core::LocalStorage::new(wal_dir.clone()));
+        let wal = crate::wal::WalWriter::new(backend, wal_dir.clone());
+
+        let mut idx = Self {
             data_dir,
             buffers: HashMap::new(),
             manifests: HashMap::new(),
             flush_threshold: 1000,
             bm25_params: Bm25Params::default(),
             tombstones: HashMap::new(),
+            wal: std::sync::Mutex::new(wal),
+            wal_enabled: true,
+        };
+
+        // Recover un-flushed documents from WAL on startup.
+        if let Ok(records) = crate::wal::WalWriter::recover(&wal_dir) {
+            for record in &records {
+                let ns = record.namespace.clone();
+                let buf = idx.buffer_mut(ns);
+                buf.documents.extend(record.documents.clone());
+            }
         }
+
+        idx
+    }
+
+    /// Enable or disable the WAL.
+    pub fn with_wal(mut self, enabled: bool) -> Self {
+        self.wal_enabled = enabled;
+        self
     }
 
     pub fn with_flush_threshold(mut self, threshold: usize) -> Self {
@@ -91,6 +121,13 @@ impl Indexer {
         namespace: NamespaceId,
         documents: Vec<Document>,
     ) -> Result<usize, KoshaError> {
+        // Write to WAL first for durability.
+        if self.wal_enabled {
+            if let Ok(mut wal) = self.wal.lock() {
+                wal.append(&namespace, &documents).ok();
+            }
+        }
+
         let buf = self.buffer_mut(namespace.clone());
         let count = documents.len();
         buf.documents.extend(documents);
@@ -124,6 +161,13 @@ impl Indexer {
             writer.add_document(doc.id.clone(), doc.fields.clone());
         }
         let footer = writer.finalize(bm25_params)?;
+
+        // WAL no longer needed for flushed data.
+        if self.wal_enabled {
+            if let Ok(mut wal) = self.wal.lock() {
+                wal.clear().ok();
+            }
+        }
 
         let manifest = self.manifests.entry(namespace.clone()).or_insert(Manifest {
             version: 0,
@@ -169,7 +213,7 @@ impl Indexer {
 
             for doc_rec in &reader.doc_records {
                 // Skip tombstoned docs.
-                if let Some(ref ts) = tombstones {
+                if let Some(ts) = tombstones {
                     if ts.contains(&doc_rec.doc_seq) {
                         continue;
                     }

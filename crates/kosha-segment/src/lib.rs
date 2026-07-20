@@ -46,6 +46,7 @@ pub fn build_hnsw(vectors: &[(u32, Vec<f32>)]) -> Option<(HnswMap<CosinePoint, u
 
 pub struct SegmentWriter {
     segment_id: SegmentId,
+    #[allow(dead_code)]
     output_dir: PathBuf,
     backend: Box<dyn StorageBackend>,
     doc_records: Vec<DocRecord>,
