@@ -1,14 +1,20 @@
 [project]
 name = "kosha-client"
-version = "0.1.2"
+version = "0.2.0"
 description = "OpenSearch-compatible Python client for the Kosha search engine"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [
     { name = "DecoverAI", email = "engineering@decoverai.com" },
 ]
-urls = { Homepage = "https://github.com/ravi-decoverai/Kosha", Source = "https://github.com/ravi-decoverai/Kosha" }
+urls = { Homepage = "https://github.com/decover-tech/kosha", Source = "https://github.com/decover-tech/kosha" }
+
+# The generated stubs package is optional; without it, the client falls back to
+# direct HTTP calls (same as v0.1.x behavior).
 dependencies = []
+
+[project.optional-dependencies]
+stubs = ["kosha-client-stubs>=0.1"]
 
 [build-system]
 requires = ["setuptools"]

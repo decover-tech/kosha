@@ -6,59 +6,12 @@ import json
 import logging
 import time
 import urllib.parse
-import urllib.request
-from datetime import date, datetime
-from decimal import Decimal
 from typing import Any, Sequence
-from uuid import UUID
 
-try:
-    import numpy as np
-except ImportError:
-    np = None  # type: ignore[assignment]
+from .compat import Transport as CompatTransport
+from .transport import KoshaRequestError, Transport, json_default
 
 logger = logging.getLogger(__name__)
-
-
-def _json_default(data: Any) -> Any:
-    """Mirror opensearchpy.serializer.JSONSerializer.default so documents
-    carrying datetimes, UUIDs, Decimals or numpy scalars serialize exactly
-    as they would on the OpenSearch path."""
-    if isinstance(data, (date, datetime)):
-        return data.isoformat()
-    if isinstance(data, UUID):
-        return str(data)
-    if isinstance(data, Decimal):
-        return float(data)
-    if np is not None:
-        if isinstance(data, np.integer):
-            return int(data)
-        if isinstance(data, (np.floating, np.bool_)):
-            return data.item()
-        if isinstance(data, np.datetime64):
-            return data.item().isoformat()
-    raise TypeError(f"Unable to serialize {data!r} (type: {type(data)})")
-
-
-# ─── Transport shim ─────────────────────────────────────────────────────────
-#
-# opensearchpy.helpers.bulk() (used by ParagraphRepository._bulk_insert_sources)
-# is a client-agnostic helper: it does NOT call client.bulk() directly. It
-# first reaches into client.transport.serializer to JSON-encode and chunk
-# actions by size (_ActionChunker.feed), then calls client.bulk(body=ndjson)
-# once per chunk — which is exactly the newline-delimited body KoshaClient.bulk()
-# already parses. Without this shim, chunking blows up with AttributeError
-# before KoshaClient.bulk() is ever reached.
-class _Serializer:
-    def dumps(self, data: Any) -> str:
-        if isinstance(data, str):
-            return data
-        return json.dumps(data, default=_json_default)
-
-
-class _Transport:
-    def __init__(self) -> None:
-        self.serializer = _Serializer()
 
 
 # ─── Public interface ──────────────────────────────────────────────────────
@@ -86,6 +39,7 @@ class KoshaClient:
         self,
         hosts: Any = None,
         http_auth: Any = None,
+        api_key: str | None = None,
         timeout: int = 60,
         max_retries: int = 3,
         retry_on_timeout: bool = True,
@@ -95,58 +49,69 @@ class KoshaClient:
         # Normalise the Kosha base URL from the same ``hosts`` format
         # that ``opensearchpy`` accepts.
         if isinstance(hosts, str):
-            self._kosha_url = hosts.rstrip("/")
+            kosha_url = hosts.rstrip("/")
         elif isinstance(hosts, (list, tuple)) and len(hosts) > 0:
             h = hosts[0]
             if isinstance(h, str):
-                self._kosha_url = h.rstrip("/")
+                kosha_url = h.rstrip("/")
             elif isinstance(h, dict):
                 scheme = h.get("scheme", "http")
                 host = h.get("host", "localhost")
                 port = h.get("port", 8080)
-                self._kosha_url = f"{scheme}://{host}:{port}"
+                kosha_url = f"{scheme}://{host}:{port}"
             else:
-                self._kosha_url = "http://localhost:8080"
+                kosha_url = "http://localhost:8080"
         else:
-            self._kosha_url = kwargs.get("kosha_url", "http://localhost:8080")
+            kosha_url = kwargs.get("kosha_url", "http://localhost:8080")
 
-        self._timeout = timeout
-        self._auth = http_auth
+        # Resolve API key: explicit arg > http_auth tuple > env var.
+        resolved_api_key = api_key
+        if resolved_api_key is None and http_auth is not None:
+            if isinstance(http_auth, tuple) and len(http_auth) == 2:
+                resolved_api_key = http_auth[1]  # (user, key) backward compat
+            elif isinstance(http_auth, str):
+                resolved_api_key = http_auth
+        if resolved_api_key is None:
+            import os
+            resolved_api_key = os.environ.get("KOSHA_API_KEY")
+
+        # Use the v1 proto-defined path template for all requests.
+        self._transport = Transport(
+            base_url=kosha_url,
+            api_key=resolved_api_key,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_on_timeout=retry_on_timeout,
+        )
 
         # Kosha namespace → index name mapping.
         # In Phase 1, index name is used directly as the namespace.
         self._namespace = kwargs.get("namespace", "default")
 
         # Duck-typed transport so opensearchpy.helpers.bulk() can chunk
-        # actions before delegating to self.bulk() — see _Transport above.
-        self.transport = _Transport()
+        # actions before delegating to self.bulk().
+        self.transport = CompatTransport()
 
-        logger.info("KoshaClient targeting %s namespace=%s", self._kosha_url, self._namespace)
+        logger.info("KoshaClient targeting %s namespace=%s api_key=%s",
+                     kosha_url, self._namespace, bool(resolved_api_key))
 
     # ── Low-level request helpers ──────────────────────────────────────────
 
     def _request(self, method: str, path: str, body: Any = None) -> Any:
-        url = f"{self._kosha_url}/{path.lstrip('/')}"
-        data = json.dumps(body, default=_json_default).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("Content-Type", "application/json")
-        if self._auth:
-            import base64
-            user, pwd = self._auth
-            token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
-            req.add_header("Authorization", f"Basic {token}")
+        """Legacy request helper — delegates to the Transport layer.
 
-        try:
-            resp = urllib.request.urlopen(req, timeout=self._timeout)
-            return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            body_bytes = e.read()
-            try:
-                err = json.loads(body_bytes.decode())
-            except json.JSONDecodeError:
-                err = {"error": body_bytes.decode()}
-            logger.warning("Kosha request failed: %s %s → %s %s", method, path, e.code, err)
-            raise KoshaRequestError(e.code, err.get("error", str(e)), err) from e
+        Paths here are relative (no ``/v1/namespaces/...`` prefix); they are
+        appended directly to the base URL.  Used by the legacy Phase 1 routes.
+        """
+        return self._transport.request(method, path, body)
+
+    def _v1_request(self, method: str, namespace: str, action: str, body: Any = None) -> Any:
+        """Request against a v1 proto-defined path.
+
+        Builds ``/v1/namespaces/{namespace}/{action}`` automatically.
+        """
+        path = f"v1/namespaces/{namespace}/{action}"
+        return self._transport.request(method, path, body)
 
     # ── Search ─────────────────────────────────────────────────────────────
 
@@ -885,15 +850,3 @@ class IndexOps:
 
     def flush(self, index: str | None = None, **params: Any) -> dict:
         return {"_shards": {"total": 1, "successful": 1, "failed": 0}}
-
-
-# ─── Error type ─────────────────────────────────────────────────────────────
-
-class KoshaRequestError(Exception):
-    """Raised when a Kosha HTTP request fails."""
-
-    def __init__(self, status_code: int, error: str, info: dict | None = None):
-        self.status_code = status_code
-        self.error = error
-        self.info = info or {}
-        super().__init__(f"KoshaRequestError({status_code}): {error}")

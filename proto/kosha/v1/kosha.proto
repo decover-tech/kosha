@@ -1,0 +1,313 @@
+syntax = "proto3";
+
+package kosha.v1;
+
+option go_package = "github.com/decover-tech/kosha/proto/kosha/v1;koshav1";
+option java_package = "com.decover.kosha.v1";
+option java_multiple_files = true;
+
+import "google/api/annotations.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+
+// ─── Service ─────────────────────────────────────────────────────────────────
+//
+// Kosha is a storage-disaggregated search engine with S3 as durable storage
+// and local NVMe as a transparent read-through cache (see DESIGN.md §5, §12).
+//
+// HTTP/JSON is the primary transport; gRPC is the secondary transport for
+// internal, latency-sensitive callers.  Both share this service definition.
+//
+// The HTTP paths use a versioned prefix (/v1/) so the public API can evolve
+// independently of internal use.
+//
+// ── Authentication ──────────────────────────────────────────────────────────
+//
+// Every request must carry an API key identifying the tenant/client.  The key
+// is passed via an HTTP header (or gRPC metadata) and maps to a tenant ID that
+// scopes all namespace access:
+//
+//   Authorization: Bearer <api_key>
+//   X-Api-Key: <api_key>              (alternative for serverless/edge)
+//
+// The server validates the key against its configured KOSHA_API_KEYS and
+// extracts a tenant prefix that is prepended to every namespace argument:
+//
+//   POST /v1/namespaces/my-index/search
+//   → tenant "acme-corp" → actual namespace becomes "acme-corp/my-index"
+//
+// This ensures tenants cannot read or write each other's data even if they
+// guess another tenant's namespace name.  See DESIGN.md §10 (Multi-Tenancy).
+
+service Kosha {
+  // Health check — liveness probe for load balancers / K8s.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse) {
+    option (google.api.http) = { get: "/v1/healthz" };
+  }
+
+  // Bulk-index documents into a namespace.
+  rpc IndexDocuments(IndexDocumentsRequest) returns (IndexDocumentsResponse) {
+    option (google.api.http) = {
+      post: "/v1/namespaces/{namespace}/documents"
+      body: "*"
+    };
+  }
+
+  // Search — BM25 lexical (Phase 1) and hybrid lexical + ANN (Phase 2).
+  rpc Search(SearchRequest) returns (SearchResponse) {
+    option (google.api.http) = {
+      post: "/v1/namespaces/{namespace}/search"
+      body: "*"
+    };
+  }
+
+  // Flush buffered documents to a segment, making them queryable.
+  rpc Flush(FlushRequest) returns (FlushResponse) {
+    option (google.api.http) = {
+      post: "/v1/namespaces/{namespace}/flush"
+      body: "*"
+    };
+  }
+
+  // Delete documents matching a filter query (tombstone-based).
+  rpc DeleteByQuery(DeleteByQueryRequest) returns (DeleteByQueryResponse) {
+    option (google.api.http) = {
+      post: "/v1/namespaces/{namespace}/delete"
+      body: "*"
+    };
+  }
+
+  // Get statistics for all namespaces or a specific one.
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse) {
+    option (google.api.http) = {
+      get: "/v1/stats"
+      additional_bindings: { get: "/v1/namespaces/{namespace}/stats" }
+    };
+  }
+
+  // Create a namespace with an optional schema.
+  rpc CreateNamespace(CreateNamespaceRequest) returns (Namespace) {
+    option (google.api.http) = {
+      post: "/v1/namespaces"
+      body: "*"
+    };
+  }
+
+  // Delete a namespace and its segments.
+  rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse) {
+    option (google.api.http) = {
+      delete: "/v1/namespaces/{namespace}"
+    };
+  }
+}
+
+// ─── Health ──────────────────────────────────────────────────────────────────
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string status = 1;  // "ok"
+}
+
+// ─── Namespace management ───────────────────────────────────────────────────
+
+message CreateNamespaceRequest {
+  string namespace = 1;
+  optional NamespaceSchema schema = 2;
+}
+
+message NamespaceSchema {
+  map<string, FieldSchema> fields = 1;
+}
+
+message FieldSchema {
+  FieldType type = 1;
+  bool indexed = 2;       // whether the field is full-text indexed
+  bool stored = 3;        // whether the field value is stored and returned
+  repeated string analyzer = 4;  // tokenizer / analyzer choice
+}
+
+enum FieldType {
+  FIELD_TYPE_UNSPECIFIED = 0;
+  FIELD_TYPE_TEXT = 1;
+  FIELD_TYPE_KEYWORD = 2;
+  FIELD_TYPE_INTEGER = 3;
+  FIELD_TYPE_FLOAT = 4;
+  FIELD_TYPE_DATE = 5;
+  FIELD_TYPE_BOOLEAN = 6;
+  FIELD_TYPE_VECTOR = 7;
+}
+
+message Namespace {
+  string id = 1;
+  NamespaceSchema schema = 2;
+  int64 document_count = 3;
+  int64 segment_count = 4;
+  int64 version = 5;
+  int64 created_at = 6;  // Unix timestamp (seconds)
+}
+
+message DeleteNamespaceRequest {
+  string namespace = 1;
+}
+
+message DeleteNamespaceResponse {
+  string namespace = 1;
+  bool acknowledged = 2;
+}
+
+// ─── Document model ─────────────────────────────────────────────────────────
+
+message Field {
+  string name = 1;
+  FieldType field_type = 2;
+  string value = 3;
+}
+
+message Document {
+  string id = 1;
+  repeated Field fields = 2;
+}
+
+// ─── Index ──────────────────────────────────────────────────────────────────
+
+message IndexDocumentsRequest {
+  string namespace = 1;
+  repeated Document documents = 2;
+}
+
+message IndexDocumentsResponse {
+  int64 indexed_count = 1;
+  string namespace = 2;
+}
+
+// ─── Flush ──────────────────────────────────────────────────────────────────
+
+message FlushRequest {
+  string namespace = 1;
+}
+
+message FlushResponse {
+  string status = 1;  // "flushed"
+}
+
+// ─── Delete by query ────────────────────────────────────────────────────────
+
+message DeleteByQueryRequest {
+  string namespace = 1;
+  google.protobuf.Struct filter = 2;   // Kosha-native filter (term/terms/range/bool)
+  google.protobuf.Struct query = 3;    // ES-style query (fallback alias for filter)
+}
+
+message DeleteByQueryResponse {
+  int64 deleted = 1;
+  string namespace = 2;
+}
+
+// ─── Search ─────────────────────────────────────────────────────────────────
+
+message SearchRequest {
+  string namespace = 1;
+  string query_text = 2;
+  int32 max_results = 3;
+  int32 from = 4;
+
+  // BM25 parameters.
+  optional double bm25_k1 = 5;
+  optional double bm25_b = 6;
+
+  // Filters — Kosha-native filter clause (term/terms/range/bool).
+  // Same shape as the ES bool filter that KoshaClient already translates.
+  google.protobuf.Struct filter = 7;
+
+  // Sorting.
+  repeated SortSpec sort = 8;
+
+  // Highlighting config.
+  optional HighlightConfig highlight = 9;
+
+  // Aggregations (keyed by aggregation name).
+  map<string, google.protobuf.Struct> aggregations = 10;
+
+  // Wildcard query.
+  optional WildcardQuery wildcard = 11;
+
+  // Match phrase query.
+  optional MatchPhraseQuery match_phrase = 12;
+
+  // kNN / ANN vector search (Phase 2).
+  optional KnnQuery knn = 13;
+
+  // Mode — defaults to LEXICAL in Phase 1.
+  RetrievalMode mode = 14;
+}
+
+enum RetrievalMode {
+  RETRIEVAL_MODE_UNSPECIFIED = 0;
+  RETRIEVAL_MODE_LEXICAL = 1;
+  RETRIEVAL_MODE_SEMANTIC = 2;  // Phase 2
+  RETRIEVAL_MODE_HYBRID = 3;    // Phase 2
+}
+
+message SortSpec {
+  string field = 1;
+  string order = 2;  // "asc" or "desc"
+}
+
+message HighlightConfig {
+  string field = 1;
+  repeated string pre_tags = 2;
+  repeated string post_tags = 3;
+}
+
+message WildcardQuery {
+  string field = 1;
+  string pattern = 2;
+  bool case_insensitive = 3;
+}
+
+message MatchPhraseQuery {
+  string field = 1;
+  string phrase = 2;
+  int32 slop = 3;
+}
+
+message KnnQuery {
+  string field = 1;
+  repeated float vector = 2;
+  int32 k = 3;
+  int32 num_candidates = 4;
+  google.protobuf.Struct filter = 5;
+}
+
+message SearchResponse {
+  repeated ScoredDocument results = 1;
+  int64 total_hits = 2;
+  google.protobuf.Struct aggregations = 3;
+}
+
+message ScoredDocument {
+  string doc_id = 1;
+  double score = 2;
+  repeated Field fields = 3;
+  repeated string highlights = 4;
+}
+
+// ─── Stats ──────────────────────────────────────────────────────────────────
+
+message GetStatsRequest {
+  optional string namespace = 1;  // if empty, return all namespaces
+}
+
+message GetStatsResponse {
+  int64 total_documents = 1;
+  int64 total_segments = 2;
+  repeated NamespaceStats namespaces = 3;
+}
+
+message NamespaceStats {
+  string namespace = 1;
+  int64 documents = 2;
+  int64 segments = 3;
+  int64 version = 4;
+}

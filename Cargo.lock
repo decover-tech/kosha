@@ -1470,6 +1470,7 @@ dependencies = [
  "kosha-query",
  "kosha-segment",
  "kosha-write",
+ "once_cell",
  "serde",
  "serde_json",
  "tokio",

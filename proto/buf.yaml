@@ -1,0 +1,8 @@
+version: v2
+name: buf.build/decover/kosha
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

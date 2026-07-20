@@ -16,5 +16,6 @@ same shape as the OpenSearch / Elasticsearch JSON API.
 """
 
 from .client import KoshaClient
+from .transport import KoshaRequestError
 
-__all__ = ["KoshaClient"]
+__all__ = ["KoshaClient", "KoshaRequestError"]

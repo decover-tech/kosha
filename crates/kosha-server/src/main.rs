@@ -12,13 +12,42 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// Map of valid API keys → tenant id.
+/// Loaded once from `KOSHA_API_KEYS` env var (format: `key1=tenant1,key2=tenant2`).
+/// In single-tenant/dev mode, `KOSHA_API_KEY` sets a single key with tenant "default".
+static API_KEYS: once_cell::sync::Lazy<HashMap<String, String>> =
+    once_cell::sync::Lazy::new(load_api_keys);
+
+fn load_api_keys() -> HashMap<String, String> {
+    // Multi-tenant: KOSHA_API_KEYS = "sk-kosha-1=acme-corp,sk-kosha-2=other-org"
+    if let Ok(keys) = std::env::var("KOSHA_API_KEYS") {
+        return keys
+            .split(',')
+            .filter_map(|pair| {
+                pair.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect();
+    }
+    // Single-tenant: KOSHA_API_KEY = "sk-kosha-abc123"
+    if let Ok(key) = std::env::var("KOSHA_API_KEY") {
+        let mut m = HashMap::new();
+        m.insert(key, "default".to_string());
+        return m;
+    }
+    // Dev mode: no auth required
+    HashMap::new()
+}
+
+/// Extract the tenant prefix from a namespace for isolation.
+fn tenant_namespace(tenant: &str, namespace: &str) -> String {
+    format!("{tenant}/{namespace}")
+}
+
 #[cfg(feature = "s3")]
 mod s3_storage;
 
 use kosha_control::Controller;
-use kosha_core::{
-    IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery, StorageBackend,
-};
+use kosha_core::{IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::Searcher;
 use kosha_write::Indexer;
 
@@ -191,17 +220,95 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
             .ok();
     }
 
-    let response = route(&request_line, &headers, &body, state);
+    // ── API key authentication ──────────────────────────────────────────
+    // Per proto/kosha/v1/kosha.proto: Authorization: Bearer <key> or X-Api-Key.
+    let tenant = match authenticate(&headers) {
+        Ok(t) => t,
+        Err(resp) => {
+            stream.write_all(resp.as_bytes()).ok();
+            return Ok(());
+        }
+    };
+
+    let response = route(&request_line, &headers, &body, &tenant, state);
     stream.write_all(response.as_bytes()).ok();
     Ok(())
+}
+
+/// Extract and validate the API key from request headers.
+/// Returns the tenant id on success, or a 401 response string on failure.
+fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
+    // Dev mode: if no keys configured, allow all requests.
+    if API_KEYS.is_empty() {
+        return Ok("dev".to_string());
+    }
+
+    let api_key: Option<&str> = headers
+        .get("authorization")
+        .map(|v| v.as_str())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| {
+            headers.get("x-api-key").map(|v| v.as_str())
+        })
+        .or_else(|| {
+            // Check case-insensitively for x-api-key (raw headers may preserve case)
+            headers.iter().find_map(|(k, v)| {
+                if k.eq_ignore_ascii_case("x-api-key") {
+                    Some(v.as_str())
+                } else {
+                    None
+                }
+            })
+        });
+
+    match api_key {
+        Some(key) => match API_KEYS.get(key) {
+            Some(tenant) => Ok(tenant.clone()),
+            None => Err(json_error_body(401, "invalid API key")),
+        },
+        None => Err(json_error_body(401, "missing API key — use Authorization: Bearer <key> or X-Api-Key header")),
+    }
 }
 
 fn route(
     request_line: &str,
     _headers: &HashMap<String, String>,
     body: &[u8],
+    tenant: &str,
     state: &AppState,
 ) -> String {
+    // ── v1 proto-defined routes ────────────────────────────────────────────
+    // proto/kosha/v1/kosha.proto is the canonical source of truth for paths.
+    if request_line.starts_with("GET /v1/healthz") {
+        return json_ok(&serde_json::json!({"status": "ok"}));
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/documents") {
+        return handle_index_with_ns(&ns, tenant, body, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/search") {
+        return handle_search_post_with_ns(&ns, tenant, body, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/flush") {
+        return handle_flush_with_ns(&ns, tenant, body, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/delete") {
+        return handle_delete_with_ns(&ns, tenant, body, state);
+    }
+
+    if request_line.starts_with("GET /v1/stats") {
+        return handle_stats(state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/stats") {
+        return handle_namespace_stats(&ns, tenant, state);
+    }
+
+    // ── Legacy Phase 1 routes (backward compat) ────────────────────────────
+    // These will be removed after DecoverAI cuts over to the v1 paths.
     if request_line.starts_with("GET /healthz") {
         return json_ok(&serde_json::json!({"status": "ok"}));
     }
@@ -231,6 +338,21 @@ fn route(
     }
 
     json_error(404, "not found")
+}
+
+/// Extract a namespace from a v1 path: `METHOD /v1/namespaces/{ns}/suffix ...`
+fn extract_namespace<'a>(
+    request_line: &'a str,
+    prefix: &str,
+    suffix: &str,
+) -> Option<String> {
+    let after_method = request_line.split(' ').nth(1)?;
+    let after_prefix = after_method.strip_prefix(prefix)?;
+    let ns = after_prefix.strip_suffix(suffix)?;
+    if ns.is_empty() || ns.contains('/') {
+        return None;
+    }
+    Some(url_decode(ns))
 }
 
 // ─── POST /index ────────────────────────────────────────────────────────────
@@ -498,6 +620,84 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     }
 }
 
+// ─── v1 route handlers (proto-defined paths, tenant-scoped namespaces) ─────
+
+fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
+    let scoped_ns = tenant_namespace(tenant, namespace);
+    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => body_val_fallback(body),
+    };
+    if let Some(obj) = body_val.as_object_mut() {
+        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
+    }
+    handle_index(body, state)
+}
+
+fn handle_search_post_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
+    let scoped_ns = tenant_namespace(tenant, namespace);
+    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return json_error(400, "invalid JSON"),
+    };
+    if let Some(obj) = body_val.as_object_mut() {
+        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
+    }
+    let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
+    handle_search_post(&modified_body, state)
+}
+
+fn handle_flush_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
+    let scoped_ns = tenant_namespace(tenant, namespace);
+    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => serde_json::json!({}),
+    };
+    if let Some(obj) = body_val.as_object_mut() {
+        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
+    }
+    let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
+    handle_flush(&modified_body, state)
+}
+
+fn handle_delete_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
+    let scoped_ns = tenant_namespace(tenant, namespace);
+    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return json_error(400, "invalid JSON"),
+    };
+    if let Some(obj) = body_val.as_object_mut() {
+        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
+    }
+    let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
+    handle_delete(&modified_body, state)
+}
+
+fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> String {
+    let scoped_ns = tenant_namespace(tenant, namespace);
+    let indexer = state.indexer.lock().unwrap();
+    let manifest = match indexer.manifest(&NamespaceId(scoped_ns.clone())) {
+        Some(m) => m,
+        None => return json_error(404, &format!("namespace '{namespace}' not found")),
+    };
+    let ns_docs: u64 = manifest.segments.iter().map(|s| s.doc_count as u64).sum();
+    json_ok(&serde_json::json!({
+        "namespace": namespace,
+        "documents": ns_docs,
+        "segments": manifest.segments.len(),
+        "version": manifest.version,
+    }))
+}
+
+/// If the body is not valid JSON, try parsing as a raw object with just the documents field.
+fn body_val_fallback(body: &[u8]) -> serde_json::Value {
+    // Try parsing as a JSON object with a documents array
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        return v;
+    }
+    serde_json::json!({})
+}
+
 // ─── JSON response helpers ──────────────────────────────────────────────────
 
 fn json_ok<T: serde::Serialize>(value: &T) -> String {
@@ -512,6 +712,23 @@ fn json_error(status_code: u16, message: &str) -> String {
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",
+        404 => "404 Not Found",
+        500 => "500 Internal Server Error",
+        _ => "500 Internal Server Error",
+    };
+    format!(
+        "HTTP/1.1 {status_line}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// Returns *just* the JSON body (no HTTP headers) for an error response.
+/// Used by `authenticate()` which constructs its own HTTP response.
+fn json_error_body(status_code: u16, message: &str) -> String {
+    let body = serde_json::json!({"error": message}).to_string();
+    let status_line = match status_code {
+        400 => "400 Bad Request",
+        401 => "401 Unauthorized",
         404 => "404 Not Found",
         500 => "500 Internal Server Error",
         _ => "500 Internal Server Error",
@@ -562,6 +779,7 @@ mod tests {
             "GET /healthz HTTP/1.1\r\n",
             &HashMap::new(),
             b"",
+            "test",
             &test_state(),
         );
         assert!(response.starts_with("HTTP/1.1 200 OK"));
@@ -574,6 +792,7 @@ mod tests {
             "GET /nope HTTP/1.1\r\n",
             &HashMap::new(),
             b"",
+            "test",
             &test_state(),
         );
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
@@ -585,6 +804,7 @@ mod tests {
             "GET /healthz HTTP/1.1\r\n",
             &HashMap::new(),
             b"",
+            "test",
             &test_state(),
         );
         let (status, headers, body) = parse(&response);
@@ -605,7 +825,7 @@ mod tests {
             }],
         };
         let body = serde_json::to_vec(&req).unwrap();
-        let response = route("POST /index HTTP/1.1\r\n", &HashMap::new(), &body, &state);
+        let response = route("POST /index HTTP/1.1\r\n", &HashMap::new(), &body, "test", &state);
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"indexed_count\":1"));
     }
@@ -630,7 +850,7 @@ mod tests {
             ],
         };
         let body = serde_json::to_vec(&req).unwrap();
-        let index_resp = route("POST /index HTTP/1.1\r\n", &HashMap::new(), &body, &state);
+        let index_resp = route("POST /index HTTP/1.1\r\n", &HashMap::new(), &body, "test", &state);
         assert!(index_resp.contains("\"indexed_count\":2"));
 
         // Trigger flush so search can read from disk.
@@ -644,6 +864,7 @@ mod tests {
             &format!("GET /search?ns={ns}&q=quick HTTP/1.1\r\n"),
             &HashMap::new(),
             b"",
+            "test",
             &state,
         );
         assert!(search_resp.starts_with("HTTP/1.1 200 OK"));
@@ -654,6 +875,7 @@ mod tests {
             &format!("GET /search?ns={ns}&q=dog HTTP/1.1\r\n"),
             &HashMap::new(),
             b"",
+            "test",
             &state,
         );
         assert!(search_resp2.starts_with("HTTP/1.1 200 OK"));
@@ -667,6 +889,7 @@ mod tests {
             "GET /search?ns=nonexistent&q=test HTTP/1.1\r\n",
             &HashMap::new(),
             b"",
+            "test",
             &state,
         );
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
@@ -675,7 +898,7 @@ mod tests {
     #[test]
     fn search_missing_params_returns_400() {
         let state = test_state();
-        let response = route("GET /search HTTP/1.1\r\n", &HashMap::new(), b"", &state);
+        let response = route("GET /search HTTP/1.1\r\n", &HashMap::new(), b"", "test", &state);
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
     }
 

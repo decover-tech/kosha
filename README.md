@@ -30,9 +30,15 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
                      delete, flush)
     clients/
       python/kosha_client  OpenSearch-compatible Python client    — Epic 11
-    proto/            protobuf definitions (dsearch.proto)        — Epic 1
-    docs/             development and integration guides
-    DESIGN.md         architecture document (v1 draft)
+                           (spec → codegen → thin client)
+      python/README.md     how the client is structured
+    proto/
+      buf.yaml             Buf module config
+      kosha/v1/kosha.proto  Canonical API contract (source of truth) — Epic 1
+    gen/                   Generated stubs + OpenAPI spec (git-ignored)
+    tools/codegen/         Code generation scripts and docs
+    docs/                  Development and integration guides
+    DESIGN.md              Architecture document (v1 draft)
 
 ## Development
 

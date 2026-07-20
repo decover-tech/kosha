@@ -14,5 +14,11 @@
 *.pyc
 *.egg-info
 
+# Generated code (can be regenerated from proto)
+/gen
+
+# Python build artifacts
+**/dist/
+
 # Local dev volumes (docker-compose)
 /volumes
