@@ -9,11 +9,14 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+#[cfg(feature = "s3")]
+mod s3_storage;
+
 use kosha_control::Controller;
-use kosha_core::{IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
+use kosha_core::{IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery, StorageBackend};
 use kosha_query::Searcher;
 use kosha_write::Indexer;
 
@@ -23,17 +26,99 @@ struct AppState {
     controller: Mutex<Controller>,
     indexer: Mutex<Indexer>,
     searcher: Searcher,
+    data_dir: PathBuf,
+    #[cfg(feature = "s3")]
+    s3_storage: Option<s3_storage::S3Storage>,
 }
 
 impl AppState {
     fn new(data_dir: PathBuf) -> Self {
         let controller = Controller::new();
         let indexer = Indexer::new(data_dir.clone());
-        let searcher = Searcher::new(data_dir);
+        let searcher = Searcher::new(data_dir.clone());
+
+        #[cfg(feature = "s3")]
+        let s3_storage = {
+            let bucket = std::env::var("KOSHA_S3_BUCKET").ok();
+            let prefix = std::env::var("KOSHA_S3_PREFIX").unwrap_or_default();
+            if let Some(ref bucket) = bucket {
+                let b = bucket.clone();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                match rt {
+                    Ok(rt) => {
+                        let fut = s3_storage::S3Storage::new(
+                            data_dir.clone(), b, prefix,
+                        );
+                        match rt.block_on(fut) {
+                            Ok(s3) => {
+                                println!("S3 storage enabled: bucket={}", bucket);
+                                Some(s3)
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to init S3 storage: {e}");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to create tokio runtime: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
         Self {
             controller: Mutex::new(controller),
             indexer: Mutex::new(indexer),
             searcher,
+            data_dir,
+            #[cfg(feature = "s3")]
+            s3_storage,
+        }
+    }
+
+    /// Sync a segment directory to S3 (after flush).
+    #[cfg(feature = "s3")]
+    fn sync_to_s3(&self, seg_dir: &PathBuf) {
+        if let Some(ref s3) = self.s3_storage {
+            if let Ok(entries) = std::fs::read_dir(seg_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            let s3_path = format!("{}/{}",
+                                seg_dir.strip_prefix(&self.data_dir).unwrap_or(seg_dir).to_string_lossy(),
+                                name
+                            );
+                            if let Ok(data) = std::fs::read(&path) {
+                                let _ = s3.write(&s3_path, &data);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure a segment is available locally (download from S3 if needed).
+    #[cfg(feature = "s3")]
+    fn ensure_segment_local(&self, seg_path: &Path) {
+        if seg_path.exists() { return; }
+        if let Some(ref s3) = self.s3_storage {
+            if let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) {
+                let s3_prefix = rel_path.to_string_lossy();
+                if let Ok(files) = s3.list(&s3_prefix) {
+                    for file in &files {
+                        let s3_key = format!("{}/{}", s3_prefix, file);
+                        let _ = s3.read(&s3_key);
+                    }
+                }
+            }
         }
     }
 }
@@ -194,6 +279,22 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
         }
     }
 
+    // Sync to S3 after flush (if S3 is configured).
+    #[cfg(feature = "s3")]
+    {
+        if let Some(ref ns_name) = ns {
+            let ns_id = NamespaceId(ns_name.clone());
+            if let Ok(indexer) = state.indexer.lock() {
+                if let Some(manifest) = indexer.manifest(&ns_id).cloned() {
+                    for entry in &manifest.segments {
+                        let seg_path = state.data_dir.join(ns_name).join(&entry.segment_id.0);
+                        state.sync_to_s3(&seg_path);
+                    }
+                }
+            }
+        }
+    }
+
     json_ok(&serde_json::json!({"status": "flushed"}))
 }
 
@@ -300,6 +401,13 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         (m, t)
     };
 
+    // Ensure segment dirs exist locally (download from S3 if needed).
+    #[cfg(feature = "s3")]
+    for entry in &manifest.segments {
+        let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
+        state.ensure_segment_local(&seg_path);
+    }
+
     match state
         .searcher
         .search(&ns, &manifest, &query, tombstones.as_ref())
@@ -367,6 +475,13 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         let t = indexer.get_tombstones(&ns).cloned();
         (m, t)
     };
+
+    // Ensure segment dirs exist locally (download from S3 if needed).
+    #[cfg(feature = "s3")]
+    for entry in &manifest.segments {
+        let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
+        state.ensure_segment_local(&seg_path);
+    }
 
     match state
         .searcher
