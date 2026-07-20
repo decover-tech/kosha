@@ -150,8 +150,17 @@ class KoshaClient:
 
     # ── Search ─────────────────────────────────────────────────────────────
 
-    def search(self, index: str | None = None, body: dict | None = None, **params: Any) -> dict:
+    def _resolve_ns(self, index):
+        """Resolve namespace from opensearch_dsl index parameter (can be list)."""
         ns = index or self._namespace
+        if isinstance(ns, (list, tuple)):
+            ns = ns[0] if ns else self._namespace
+        if ns is None:
+            ns = "default"
+        return str(ns)
+
+    def search(self, index: str | None = None, body: dict | None = None, **params: Any) -> dict:
+        ns = self._resolve_ns(index)
 
         query_text = self._extract_query_text(body) if body else ""
         size = body.get("size", 10) if body else 10
@@ -550,7 +559,7 @@ class KoshaClient:
     def index(self, index: str | None = None, id: str | None = None,
               body: dict | None = None, **params: Any) -> dict:
         """Index a single document."""
-        ns = index or self._namespace
+        ns = self._resolve_ns(index)
         fields = []
         for k, v in (body or {}).items():
             if isinstance(v, str):
@@ -586,7 +595,7 @@ class KoshaClient:
         as a list or newline-delimited string) and indexes each document via
         Kosha.
         """
-        default_ns = index or self._namespace
+        default_ns = self._resolve_ns(index)
         # (namespace, doc) pairs in original order — response items must stay
         # aligned with the request actions for opensearchpy's success parsing.
         indexed: list[tuple[str, dict]] = []
@@ -669,7 +678,7 @@ class KoshaClient:
         non-empty placeholder (``*`` rendered as ``match``) and report the
         total_hits.
         """
-        ns = index or self._namespace
+        ns = self._resolve_ns(index)
         try:
             result = self.search(index=ns, body={"query": {"match": {"_all": "*"}}, "size": 0})
             count = result["hits"]["total"]["value"]
@@ -682,7 +691,7 @@ class KoshaClient:
     def update(self, index: str | None = None, id: str | None = None,
                body: dict | None = None, **params: Any) -> dict:
         """Update a document by re-indexing (tombstone-based in Phase 1)."""
-        ns = index or self._namespace
+        ns = self._resolve_ns(index)
         doc_body = (body or {}).get("doc", body or {})
         fields = []
         for k, v in doc_body.items():
@@ -706,7 +715,7 @@ class KoshaClient:
     def delete_by_query(self, index: str | None = None,
                         body: dict | None = None, **params: Any) -> dict:
         """Delete documents matching a filter query."""
-        ns = index or self._namespace
+        ns = self._resolve_ns(index)
         query = body.get("query", {}) if body else {}
         filter_clause = self._extract_filter(body) or query
         kosha_body = {"namespace": ns, "filter": filter_clause}
@@ -727,7 +736,7 @@ class KoshaClient:
         Supports simple ``ctx._source.X = ctx._source.Y`` (field copy)
         and ``ctx._source.X = 'value'`` (literal set) scripts.
         """
-        ns = index or self._namespace
+        ns = self._resolve_ns(index)
         query = (body or {}).get("query", {})
         script = (body or {}).get("script", {})
         source = script.get("source", "").strip()
