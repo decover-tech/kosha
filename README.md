@@ -40,6 +40,51 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
     docs/                  Development and integration guides
     DESIGN.md              Architecture document (v1 draft)
 
+## Quickstart (test as a customer would)
+
+```bash
+# 1. Start Kosha locally
+docker compose up --build
+
+# 2. In another terminal, run the quickstart script
+KOSHA_HOST=http://localhost:8080 KOSHA_API_KEY=sk-kosha-dev python scripts/quickstart.py
+```
+
+Expected output:
+```
+═══ 1. Health check ═══
+   Kosha reachable: True
+
+═══ 2. Index documents ═══
+   Indexed: 3 documents
+
+═══ 3. Search ═══
+   Found 1 result(s) for 'breach':
+     [doc-1] breach of contract  (score=0.287)
+
+═══ 4. Flush + re-search ═══
+   Found 1 result(s) for 'antitrust':
+     [doc-3] merger analysis  (score=0.287)
+
+═══ 5. Stats ═══
+   Total documents: 3
+     dev/quickstart-demo: 3 docs, 1 segment(s)
+```
+
+Or for a hosted instance:
+```python
+from kosha_client import KoshaClient
+
+client = KoshaClient(
+    hosts="https://app.kosha.io",
+    api_key="sk-acme-corp-xxx",
+)
+client.ping()  # True
+```
+
+The client respects `KOSHA_HOST` and `KOSHA_API_KEY` env vars — no code changes needed
+between local dev and production.
+
 ## Development
 
 Prerequisites: Rust stable (via [rustup](https://rustup.rs) — the repo pins the

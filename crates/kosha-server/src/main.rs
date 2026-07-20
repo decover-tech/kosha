@@ -47,17 +47,16 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 #[cfg(feature = "s3")]
 mod s3_storage;
 
-use kosha_control::Controller;
+use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 #[cfg(feature = "s3")]
 use kosha_core::StorageBackend;
-use kosha_core::{IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::Searcher;
 use kosha_write::Indexer;
 
 // ─── Application state ──────────────────────────────────────────────────────
 
 struct AppState {
-    controller: Mutex<Controller>,
+    controller: Mutex<Box<dyn ControlStore>>,
     indexer: Mutex<Indexer>,
     searcher: Searcher,
     data_dir: PathBuf,
@@ -67,7 +66,6 @@ struct AppState {
 
 impl AppState {
     fn new(data_dir: PathBuf) -> Self {
-        let controller = Controller::new();
         let indexer = Indexer::new(data_dir.clone());
         let searcher = Searcher::new(data_dir.clone());
 
@@ -104,8 +102,33 @@ impl AppState {
             }
         };
 
+        // ── Control plane: in-memory or Postgres ─────────────────────────
+        let control_store: Box<dyn ControlStore> =
+            if let Ok(db_url) = std::env::var("DATABASE_URL") {
+                #[cfg(feature = "postgres")]
+                match kosha_control::PgStore::new(&db_url) {
+                    Ok(store) => {
+                        println!("control plane: postgres ({db_url})");
+                        Box::new(store)
+                    }
+                    Err(e) => {
+                        eprintln!("WARN: failed to connect to postgres, falling back to in-memory: {e}");
+                        Box::new(kosha_control::Controller::new())
+                    }
+                }
+                #[cfg(not(feature = "postgres"))]
+                {
+                    println!("control plane: in-memory (DATABASE_URL set but postgres feature disabled)");
+                    let _ = db_url; // suppress unused warning
+                    Box::new(kosha_control::Controller::new())
+                }
+            } else {
+                println!("control plane: in-memory (no DATABASE_URL)");
+                Box::new(kosha_control::Controller::new())
+            };
+
         Self {
-            controller: Mutex::new(controller),
+            controller: Mutex::new(control_store),
             indexer: Mutex::new(indexer),
             searcher,
             data_dir,

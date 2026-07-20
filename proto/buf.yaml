@@ -1,5 +1,7 @@
 version: v2
 name: buf.build/decover/kosha
+deps:
+  - buf.build/googleapis/googleapis
 lint:
   use:
     - STANDARD

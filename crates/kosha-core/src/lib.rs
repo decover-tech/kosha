@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+// ─── Control store trait (in-memory or Postgres) ──────────────────────────
+
+/// Pluggable namespace registry and manifest store.
+///
+/// In-memory (`kosha_control::Controller`) is the default.
+/// Postgres (`kosha_control::PgStore`) is used in production via the
+/// `postgres` feature and a `DATABASE_URL` env var.
+pub trait ControlStore: Send + Sync {
+    fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError>;
+    fn ensure_namespace(&mut self, id: NamespaceId);
+    fn has_namespace(&self, id: &NamespaceId) -> bool;
+    fn manifest(&self, id: &NamespaceId) -> Option<&Manifest>;
+    fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut Manifest>;
+    fn compare_and_swap_manifest(
+        &mut self,
+        id: &NamespaceId,
+        expected_version: u64,
+        new_manifest: Manifest,
+    ) -> Result<(), KoshaError>;
+    fn list_namespaces(&self) -> Vec<NamespaceId>;
+    fn namespace_count(&self) -> usize;
+}
+
 // ─── Identifiers ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

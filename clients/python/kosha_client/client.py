@@ -46,8 +46,13 @@ class KoshaClient:
         pool_maxsize: int = 20,
         **kwargs: Any,
     ) -> None:
-        # Normalise the Kosha base URL from the same ``hosts`` format
-        # that ``opensearchpy`` accepts.
+        # Normalise the Kosha base URL.  Resolution order:
+        #   1. ``hosts`` arg (opensearchpy-compatible)
+        #   2. ``KOSHA_HOST`` env var (customer-friendly)
+        #   3. Fallback to localhost:8080 (dev)
+        import os as _os
+        if hosts is None:
+            hosts = _os.environ.get("KOSHA_HOST") or kwargs.get("kosha_url")
         if isinstance(hosts, str):
             kosha_url = hosts.rstrip("/")
         elif isinstance(hosts, (list, tuple)) and len(hosts) > 0:
@@ -72,8 +77,7 @@ class KoshaClient:
             elif isinstance(http_auth, str):
                 resolved_api_key = http_auth
         if resolved_api_key is None:
-            import os
-            resolved_api_key = os.environ.get("KOSHA_API_KEY")
+            resolved_api_key = _os.environ.get("KOSHA_API_KEY")
 
         # Use the v1 proto-defined path template for all requests.
         self._transport = Transport(

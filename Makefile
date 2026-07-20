@@ -32,6 +32,13 @@ gen/python: proto-gen  # for now, proto-gen includes python; isolate later
 
 gen/go: proto-gen      # for now, proto-gen includes go; isolate later
 
+# ── Quickstart ────────────────────────────────────────────────────────────
+
+.PHONY: quickstart
+
+quickstart:
+	KOSHA_HOST=http://localhost:8080 KOSHA_API_KEY=sk-kosha-dev python scripts/quickstart.py
+
 # ── Python client ──────────────────────────────────────────────────────────
 
 .PHONY: client-python-build client-python-publish
@@ -49,6 +56,14 @@ rust-test:
 
 rust-build:
 	cargo build --release
+
+# ── Database ──────────────────────────────────────────────────────────────
+
+.PHONY: db-migrate
+
+db-migrate:
+	@echo "Applying Kosha migrations to $$DATABASE_URL ..."
+	psql "$$DATABASE_URL" -f crates/kosha-control/migrations/001_create_kosha_tables.sql
 
 # ── All ────────────────────────────────────────────────────────────────────
 

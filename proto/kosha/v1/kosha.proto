@@ -8,7 +8,6 @@ option java_multiple_files = true;
 
 import "google/api/annotations.proto";
 import "google/protobuf/struct.proto";
-import "google/protobuf/wrappers.proto";
 
 // ─── Service ─────────────────────────────────────────────────────────────────
 //
@@ -39,7 +38,7 @@ import "google/protobuf/wrappers.proto";
 // This ensures tenants cannot read or write each other's data even if they
 // guess another tenant's namespace name.  See DESIGN.md §10 (Multi-Tenancy).
 
-service Kosha {
+service KoshaService {
   // Health check — liveness probe for load balancers / K8s.
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse) {
     option (google.api.http) = { get: "/v1/healthz" };
@@ -86,7 +85,7 @@ service Kosha {
   }
 
   // Create a namespace with an optional schema.
-  rpc CreateNamespace(CreateNamespaceRequest) returns (Namespace) {
+  rpc CreateNamespace(CreateNamespaceRequest) returns (CreateNamespaceResponse) {
     option (google.api.http) = {
       post: "/v1/namespaces"
       body: "*"
@@ -138,7 +137,7 @@ enum FieldType {
   FIELD_TYPE_VECTOR = 7;
 }
 
-message Namespace {
+message CreateNamespaceResponse {
   string id = 1;
   NamespaceSchema schema = 2;
   int64 document_count = 3;

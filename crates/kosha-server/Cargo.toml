@@ -11,6 +11,7 @@ workspace = true
 [features]
 default = []
 s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:tokio"]
+postgres = ["kosha-control/postgres"]
 
 [dependencies]
 kosha-core = { path = "../kosha-core" }

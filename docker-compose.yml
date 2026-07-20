@@ -40,6 +40,7 @@ services:
     depends_on:
       - createbuckets
     environment:
+      KOSHA_API_KEY: sk-kosha-dev  # matches quickstart script
       KOSHA_ROLE: query
       KOSHA_HTTP_PORT: "8080"
       KOSHA_S3_ENDPOINT: http://minio:9000
