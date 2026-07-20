@@ -1,12 +1,29 @@
 name: kosha
 
 # Standalone local stack for engine development: MinIO as the S3 stand-in
-# (implementation plan step 9) plus the kosha-server image itself.
+# (implementation plan step 9), Postgres for the control plane, plus the
+# kosha-server image itself.
 #
 # NOTE: when developing against the full Decover backend, Kosha is deployed
 # into the local k8s cluster by the backend repo's Tilt setup instead — see
 # docs/local-development.md. This compose file is for working on Kosha alone.
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: kosha
+      POSTGRES_PASSWORD: kosha-dev
+      POSTGRES_DB: kosha
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kosha"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -38,7 +55,10 @@ services:
     build: .
     image: kosha:latest
     depends_on:
-      - createbuckets
+      createbuckets:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     environment:
       KOSHA_API_KEY: sk-kosha-dev  # matches quickstart script
       KOSHA_ROLE: query
@@ -47,9 +67,11 @@ services:
       KOSHA_S3_BUCKET: dsearch-dev
       KOSHA_S3_ACCESS_KEY: kosha
       KOSHA_S3_SECRET_KEY: kosha-dev-secret
+      DATABASE_URL: postgres://kosha:kosha-dev@postgres:5432/kosha
     ports:
       - "8080:8080" # HTTP/JSON
       - "50051:50051" # gRPC (from Epic 8)
 
 volumes:
   minio-data:
+  pg-data:

@@ -74,7 +74,7 @@ for h in hits:
 # ── 4. Flush + verify ────────────────────────────────────────────────────────
 section("4. Flush + re-search")
 # The client already flushes after bulk in Phase 1, but demonstrate the explicit call.
-resp = client.transport._request("POST", "flush", body={"namespace": NAMESPACE})
+resp = client._transport.request("POST", "flush", body={"namespace": NAMESPACE})
 print(f"   Flush: {resp}")
 
 resp = client.search(index=NAMESPACE, body={"query": {"match": {"content": "antitrust"}}})
@@ -88,7 +88,7 @@ for h in hits:
 
 # ── 5. Stats ─────────────────────────────────────────────────────────────────
 section("5. Stats")
-resp = client.transport._request("GET", "stats")
+resp = client._transport.request("GET", "stats")
 total_docs = resp.get("total_documents", 0)
 namespaces = resp.get("namespaces", [])
 print(f"   Total documents: {total_docs}")
