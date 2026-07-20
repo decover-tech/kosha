@@ -43,9 +43,12 @@ impl WalWriter {
         let seq = Self::next_seq(&wal_dir);
         let file = format!("wal-{:020x}.wal", seq);
         Self {
-            backend, wal_dir, current_file: file,
+            backend,
+            wal_dir,
+            current_file: file,
             seq: AtomicU64::new(seq + 1),
-            buffer: Vec::new(), records_in_buffer: 0,
+            buffer: Vec::new(),
+            records_in_buffer: 0,
         }
     }
 
@@ -55,9 +58,14 @@ impl WalWriter {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if let Some(rest) = name.strip_prefix("wal-").and_then(|s| s.strip_suffix(".wal")) {
+                if let Some(rest) = name
+                    .strip_prefix("wal-")
+                    .and_then(|s| s.strip_suffix(".wal"))
+                {
                     if let Ok(n) = u64::from_str_radix(rest, 16) {
-                        if n > max { max = n; }
+                        if n > max {
+                            max = n;
+                        }
                     }
                 }
             }
@@ -66,7 +74,11 @@ impl WalWriter {
     }
 
     /// Append a batch of documents to the WAL.
-    pub fn append(&mut self, namespace: &NamespaceId, documents: &[Document]) -> Result<(), KoshaError> {
+    pub fn append(
+        &mut self,
+        namespace: &NamespaceId,
+        documents: &[Document],
+    ) -> Result<(), KoshaError> {
         let record = WalRecord::new(namespace.clone(), documents.to_vec());
         self.append_record(&record)
     }
@@ -76,14 +88,17 @@ impl WalWriter {
         let doc_count = record.documents.len() as u32;
 
         // Write to buffer
-        self.buffer.extend_from_slice(&(ns_bytes.len() as u32).to_le_bytes());
+        self.buffer
+            .extend_from_slice(&(ns_bytes.len() as u32).to_le_bytes());
         self.buffer.extend_from_slice(ns_bytes);
-        self.buffer.extend_from_slice(&record.timestamp.to_le_bytes());
+        self.buffer
+            .extend_from_slice(&record.timestamp.to_le_bytes());
         self.buffer.extend_from_slice(&doc_count.to_le_bytes());
 
         for doc in &record.documents {
             let id_bytes = doc.id.0.as_bytes();
-            self.buffer.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+            self.buffer
+                .extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
             self.buffer.extend_from_slice(id_bytes);
 
             let field_count = doc.fields.len() as u32;
@@ -91,11 +106,13 @@ impl WalWriter {
 
             for field in &doc.fields {
                 let name_bytes = field.name.as_bytes();
-                self.buffer.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+                self.buffer
+                    .extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
                 self.buffer.extend_from_slice(name_bytes);
                 self.buffer.push(field.field_type as u8);
                 let val_bytes = field.value.as_bytes();
-                self.buffer.extend_from_slice(&(val_bytes.len() as u64).to_le_bytes());
+                self.buffer
+                    .extend_from_slice(&(val_bytes.len() as u64).to_le_bytes());
                 self.buffer.extend_from_slice(val_bytes);
             }
         }
@@ -106,7 +123,9 @@ impl WalWriter {
     }
 
     fn flush_buffer(&mut self) -> Result<(), KoshaError> {
-        if self.records_in_buffer == 0 { return Ok(()); }
+        if self.records_in_buffer == 0 {
+            return Ok(());
+        }
 
         let mut final_buf = Vec::new();
         final_buf.extend_from_slice(&Self::MAGIC.to_le_bytes());
@@ -162,18 +181,26 @@ impl WalWriter {
 
         for path in &files {
             let data = std::fs::read(path)?;
-            if data.len() < 12 { continue; }
+            if data.len() < 12 {
+                continue;
+            }
             let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-            if magic != Self::MAGIC { continue; }
+            if magic != Self::MAGIC {
+                continue;
+            }
             let _version = u32::from_le_bytes(data[4..8].try_into().unwrap());
             let record_count = u32::from_le_bytes(data[8..12].try_into().unwrap());
 
             let mut cursor = &data[12..];
             for _ in 0..record_count {
-                if cursor.len() < 4 { break; }
+                if cursor.len() < 4 {
+                    break;
+                }
                 let ns_len = u32::from_le_bytes(cursor[..4].try_into().unwrap()) as usize;
                 cursor = &cursor[4..];
-                if cursor.len() < ns_len + 8 + 4 { break; }
+                if cursor.len() < ns_len + 8 + 4 {
+                    break;
+                }
                 let ns_bytes = &cursor[..ns_len];
                 let namespace = NamespaceId(String::from_utf8_lossy(ns_bytes).to_string());
                 cursor = &cursor[ns_len..];
@@ -184,10 +211,14 @@ impl WalWriter {
 
                 let mut documents = Vec::with_capacity(doc_count);
                 for _ in 0..doc_count {
-                    if cursor.len() < 4 { break; }
+                    if cursor.len() < 4 {
+                        break;
+                    }
                     let id_len = u32::from_le_bytes(cursor[..4].try_into().unwrap()) as usize;
                     cursor = &cursor[4..];
-                    if cursor.len() < id_len + 4 { break; }
+                    if cursor.len() < id_len + 4 {
+                        break;
+                    }
                     let id_bytes = &cursor[..id_len];
                     let doc_id = DocumentId(String::from_utf8_lossy(id_bytes).to_string());
                     cursor = &cursor[id_len..];
@@ -196,32 +227,52 @@ impl WalWriter {
 
                     let mut fields = Vec::with_capacity(field_count);
                     for _ in 0..field_count {
-                        if cursor.len() < 4 { break; }
+                        if cursor.len() < 4 {
+                            break;
+                        }
                         let name_len = u32::from_le_bytes(cursor[..4].try_into().unwrap()) as usize;
                         cursor = &cursor[4..];
-                        if cursor.len() < name_len + 1 { break; }
+                        if cursor.len() < name_len + 1 {
+                            break;
+                        }
                         let name_bytes = &cursor[..name_len];
                         let name = String::from_utf8_lossy(name_bytes).to_string();
                         cursor = &cursor[name_len..];
                         let field_type = match cursor[0] {
-                            0 => FieldType::Text, 1 => FieldType::Keyword,
-                            2 => FieldType::Integer, 3 => FieldType::Float,
-                            4 => FieldType::Date, 5 => FieldType::Boolean, 6 => FieldType::Vector,
+                            0 => FieldType::Text,
+                            1 => FieldType::Keyword,
+                            2 => FieldType::Integer,
+                            3 => FieldType::Float,
+                            4 => FieldType::Date,
+                            5 => FieldType::Boolean,
+                            6 => FieldType::Vector,
                             _ => FieldType::Text,
                         };
                         cursor = &cursor[1..];
-                        if cursor.len() < 8 { break; }
+                        if cursor.len() < 8 {
+                            break;
+                        }
                         let val_len = u64::from_le_bytes(cursor[..8].try_into().unwrap()) as usize;
                         cursor = &cursor[8..];
-                        if cursor.len() < val_len { break; }
+                        if cursor.len() < val_len {
+                            break;
+                        }
                         let val_bytes = &cursor[..val_len];
                         let value = String::from_utf8_lossy(val_bytes).to_string();
                         cursor = &cursor[val_len..];
-                        fields.push(Field { name, field_type, value });
+                        fields.push(Field {
+                            name,
+                            field_type,
+                            value,
+                        });
                     }
                     documents.push(Document { id: doc_id, fields });
                 }
-                records.push(WalRecord { namespace, documents, timestamp });
+                records.push(WalRecord {
+                    namespace,
+                    documents,
+                    timestamp,
+                });
             }
         }
 
@@ -282,14 +333,22 @@ mod tests {
         let mut wal = WalWriter::new(backend, dir.clone());
 
         let ns = NamespaceId("ns".into());
-        wal.append(&ns, &[Document {
-            id: DocumentId("d1".into()),
-            fields: vec![Field::text("t", "batch1")],
-        }]).unwrap();
-        wal.append(&ns, &[Document {
-            id: DocumentId("d2".into()),
-            fields: vec![Field::text("t", "batch2")],
-        }]).unwrap();
+        wal.append(
+            &ns,
+            &[Document {
+                id: DocumentId("d1".into()),
+                fields: vec![Field::text("t", "batch1")],
+            }],
+        )
+        .unwrap();
+        wal.append(
+            &ns,
+            &[Document {
+                id: DocumentId("d2".into()),
+                fields: vec![Field::text("t", "batch2")],
+            }],
+        )
+        .unwrap();
 
         // Each append creates a separate WAL file (sequential rotation)
         wal.flush_buffer().unwrap();

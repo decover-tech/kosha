@@ -493,7 +493,8 @@ impl Searcher {
 
                 // ── Postings AND/OR: AND for multi-term queries, OR for wildcard ──
                 let mut scored: HashMap<u32, f64> = HashMap::new();
-                let use_and = term_postings.len() > 1 && !is_wildcard_mode && phrase_tokenized.is_none();
+                let use_and =
+                    term_postings.len() > 1 && !is_wildcard_mode && phrase_tokenized.is_none();
 
                 if !use_and {
                     // OR mode (wildcard, phrase, or single term): score any matching doc.
@@ -502,7 +503,9 @@ impl Searcher {
                         for posting in *postings {
                             if let Some(doc_rec) = reader.doc_record(posting.doc_id) {
                                 let score = scorer.score_term(
-                                    posting.term_frequency, df, doc_rec.field_length,
+                                    posting.term_frequency,
+                                    df,
+                                    doc_rec.field_length,
                                 );
                                 *scored.entry(posting.doc_id).or_insert(0.0) += score;
                             }
@@ -512,24 +515,15 @@ impl Searcher {
                     // Multi-term: intersect doc_ids, then score intersection.
                     // Start with the shortest postings list for efficiency.
                     let mut candidates: Vec<(u32, Vec<Vec<u32>>)> = {
-                        let shortest = term_postings
-                            .iter()
-                            .min_by_key(|(_, p)| p.len())
-                            .unwrap();
-                        shortest
-                            .1
-                            .iter()
-                            .map(|p| (p.doc_id, Vec::new()))
-                            .collect()
+                        let shortest = term_postings.iter().min_by_key(|(_, p)| p.len()).unwrap();
+                        shortest.1.iter().map(|p| (p.doc_id, Vec::new())).collect()
                     };
                     let _doc_freqs: HashMap<u32, HashMap<&str, u32>> = HashMap::new();
 
                     // For each candidate doc, verify it appears in ALL other postings lists.
                     for (_term, postings) in &term_postings {
-                        let term_docs: HashMap<u32, &kosha_core::Posting> = postings
-                            .iter()
-                            .map(|p| (p.doc_id, p))
-                            .collect();
+                        let term_docs: HashMap<u32, &kosha_core::Posting> =
+                            postings.iter().map(|p| (p.doc_id, p)).collect();
                         candidates.retain(|(doc_id, _)| term_docs.contains_key(doc_id));
                         if candidates.is_empty() {
                             break;

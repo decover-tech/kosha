@@ -71,10 +71,15 @@ impl SegmentWriter {
         backend: Box<dyn StorageBackend>,
     ) -> Self {
         Self {
-            segment_id, output_dir, backend,
-            doc_records: Vec::new(), inverted_index: HashMap::new(),
+            segment_id,
+            output_dir,
+            backend,
+            doc_records: Vec::new(),
+            inverted_index: HashMap::new(),
             total_field_length: 0,
-            filter_string: HashMap::new(), filter_integer: HashMap::new(), filter_float: HashMap::new(),
+            filter_string: HashMap::new(),
+            filter_integer: HashMap::new(),
+            filter_float: HashMap::new(),
             vectors: Vec::new(),
         }
     }

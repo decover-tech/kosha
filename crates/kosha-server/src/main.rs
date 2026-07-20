@@ -16,7 +16,9 @@ use std::sync::Mutex;
 mod s3_storage;
 
 use kosha_control::Controller;
-use kosha_core::{IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery, StorageBackend};
+use kosha_core::{
+    IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery, StorageBackend,
+};
 use kosha_query::Searcher;
 use kosha_write::Indexer;
 
@@ -48,9 +50,7 @@ impl AppState {
                     .build();
                 match rt {
                     Ok(rt) => {
-                        let fut = s3_storage::S3Storage::new(
-                            data_dir.clone(), b, prefix,
-                        );
+                        let fut = s3_storage::S3Storage::new(data_dir.clone(), b, prefix);
                         match rt.block_on(fut) {
                             Ok(s3) => {
                                 println!("S3 storage enabled: bucket={}", bucket);
@@ -91,8 +91,12 @@ impl AppState {
                     let path = entry.path();
                     if path.is_file() {
                         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            let s3_path = format!("{}/{}",
-                                seg_dir.strip_prefix(&self.data_dir).unwrap_or(seg_dir).to_string_lossy(),
+                            let s3_path = format!(
+                                "{}/{}",
+                                seg_dir
+                                    .strip_prefix(&self.data_dir)
+                                    .unwrap_or(seg_dir)
+                                    .to_string_lossy(),
                                 name
                             );
                             if let Ok(data) = std::fs::read(&path) {
@@ -108,7 +112,9 @@ impl AppState {
     /// Ensure a segment is available locally (download from S3 if needed).
     #[cfg(feature = "s3")]
     fn ensure_segment_local(&self, seg_path: &Path) {
-        if seg_path.exists() { return; }
+        if seg_path.exists() {
+            return;
+        }
         if let Some(ref s3) = self.s3_storage {
             if let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) {
                 let s3_prefix = rel_path.to_string_lossy();

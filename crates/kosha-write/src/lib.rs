@@ -208,7 +208,9 @@ impl Indexer {
                 continue;
             }
             let reader = kosha_segment::SegmentReader::open(seg_dir)?;
-            let tombstones = self.tombstones.get(namespace)
+            let tombstones = self
+                .tombstones
+                .get(namespace)
                 .and_then(|t| t.get(&entry.segment_id));
 
             for doc_rec in &reader.doc_records {
@@ -228,7 +230,11 @@ impl Indexer {
         }
 
         // Write a new merged segment.
-        let seg_id = SegmentId(format!("{}-compact-{:x}", namespace.0.replace('/', "_"), chrono_now()));
+        let seg_id = SegmentId(format!(
+            "{}-compact-{:x}",
+            namespace.0.replace('/', "_"),
+            chrono_now()
+        ));
         let seg_dir = data_dir.join(&namespace.0).join(seg_id.0.as_str());
         let mut writer = kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir);
 
@@ -241,7 +247,9 @@ impl Indexer {
 
         // Update manifest: remove old segments, add merged segment.
         let manifest = self.manifests.get_mut(namespace).unwrap();
-        manifest.segments.retain(|e| !old_segment_ids.contains(&e.segment_id));
+        manifest
+            .segments
+            .retain(|e| !old_segment_ids.contains(&e.segment_id));
         manifest.version += 1;
         manifest.segments.push(kosha_core::ManifestEntry {
             segment_id: seg_id,
@@ -310,7 +318,10 @@ impl Indexer {
 /// Standalone filter applier for delete operations (no Searcher dependency).
 fn chrono_now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
 }
 
 pub fn apply_filter_delete(

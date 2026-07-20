@@ -343,8 +343,11 @@ impl StorageBackend for LocalStorage {
     }
     fn delete(&self, path: &str) -> Result<(), KoshaError> {
         let p = self.root.join(path);
-        if p.is_dir() { std::fs::remove_dir_all(&p)?; }
-        else { std::fs::remove_file(&p)?; }
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p)?;
+        } else {
+            std::fs::remove_file(&p)?;
+        }
         Ok(())
     }
     fn list(&self, path: &str) -> Result<Vec<String>, KoshaError> {
@@ -378,8 +381,15 @@ pub struct WalRecord {
 impl WalRecord {
     pub fn new(namespace: NamespaceId, documents: Vec<Document>) -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-        Self { namespace, documents, timestamp }
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Self {
+            namespace,
+            documents,
+            timestamp,
+        }
     }
 }
 

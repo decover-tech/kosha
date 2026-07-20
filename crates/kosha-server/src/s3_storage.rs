@@ -38,15 +38,24 @@ impl Debug for S3Storage {
 impl S3Storage {
     /// Create a new S3 storage backend.
     /// Reads AWS credentials from the environment (standard AWS SDK chain).
-    pub async fn new(local_root: PathBuf, bucket: String, prefix: String) -> Result<Self, KoshaError> {
+    pub async fn new(
+        local_root: PathBuf,
+        bucket: String,
+        prefix: String,
+    ) -> Result<Self, KoshaError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = aws_sdk_s3::Client::new(&config);
         let local = LocalStorage::new(local_root);
-        let rt = tokio::runtime::Runtime::new().map_err(|e| {
-            KoshaError::NotFound(format!("failed to create tokio runtime: {e}"))
-        })?;
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| KoshaError::NotFound(format!("failed to create tokio runtime: {e}")))?;
 
-        Ok(Self { local, bucket, prefix, rt, client })
+        Ok(Self {
+            local,
+            bucket,
+            prefix,
+            rt,
+            client,
+        })
     }
 
     fn s3_key(&self, path: &str) -> String {
@@ -59,8 +68,7 @@ impl S3Storage {
 
     /// Upload a local file to S3. Uses multi-part upload for files > 5MB.
     fn upload_to_s3(&self, local_path: &Path, s3_key: &str) -> Result<(), KoshaError> {
-        let data = std::fs::read(local_path)
-            .map_err(KoshaError::Io)?;
+        let data = std::fs::read(local_path).map_err(KoshaError::Io)?;
         let size = data.len();
 
         let client = self.client.clone();
@@ -76,7 +84,9 @@ impl S3Storage {
                     .key(&key)
                     .send()
                     .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 create_multipart_upload: {e}")))?;
+                    .map_err(|e| {
+                        KoshaError::NotFound(format!("S3 create_multipart_upload: {e}"))
+                    })?;
 
                 let upload_id = mpu.upload_id().unwrap_or_default();
                 let mut parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
@@ -94,7 +104,9 @@ impl S3Storage {
                         .key(&key)
                         .upload_id(upload_id)
                         .part_number(part_number)
-                        .body(aws_sdk_s3::primitives::ByteStream::from(Vec::from(part_data)))
+                        .body(aws_sdk_s3::primitives::ByteStream::from(Vec::from(
+                            part_data,
+                        )))
                         .send()
                         .await
                         .map_err(|e| KoshaError::NotFound(format!("S3 upload_part: {e}")))?;
@@ -123,7 +135,9 @@ impl S3Storage {
                     )
                     .send()
                     .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 complete_multipart_upload: {e}")))?;
+                    .map_err(|e| {
+                        KoshaError::NotFound(format!("S3 complete_multipart_upload: {e}"))
+                    })?;
             } else {
                 // Single PUT for small files
                 client
@@ -154,7 +168,10 @@ impl S3Storage {
                 .await
                 .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?;
 
-            let bytes = resp.body.collect().await
+            let bytes = resp
+                .body
+                .collect()
+                .await
                 .map_err(|e| KoshaError::NotFound(format!("S3 read body: {e}")))?
                 .into_bytes();
             Ok::<Vec<u8>, KoshaError>(bytes.to_vec())
