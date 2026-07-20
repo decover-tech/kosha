@@ -23,13 +23,6 @@ struct SegmentEntry {
     doc_count: u32,
 }
 
-/// JSON-serialisable manifest stored inside the `segments_json` column.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredManifest {
-    version: u64,
-    segments: Vec<SegmentEntry>,
-}
-
 impl PgStore {
     /// Create a new Postgres-backed store.
     ///
@@ -40,7 +33,8 @@ impl PgStore {
             .build()
             .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
 
-        let pool = rt.block_on(sqlx::PgPool::connect(database_url))
+        let pool = rt
+            .block_on(sqlx::PgPool::connect(database_url))
             .map_err(|e| format!("failed to connect to postgres: {e}"))?;
 
         // Run migration inline (no external migrator dependency).
@@ -61,12 +55,11 @@ impl ControlStore for PgStore {
 
         let id_str = id.0.clone();
         rt.block_on(async move {
-            let result = sqlx::query(
-                "INSERT INTO kosha.namespaces (id) VALUES ($1) ON CONFLICT DO NOTHING"
-            )
-            .bind(&id_str)
-            .execute(&self.pool)
-            .await;
+            let result =
+                sqlx::query("INSERT INTO kosha.namespaces (id) VALUES ($1) ON CONFLICT DO NOTHING")
+                    .bind(&id_str)
+                    .execute(&self.pool)
+                    .await;
 
             match result {
                 Ok(r) if r.rows_affected() == 0 => {
@@ -76,7 +69,7 @@ impl ControlStore for PgStore {
                     // Also ensure a manifest row exists.
                     let _ = sqlx::query(
                         "INSERT INTO kosha.manifests (namespace_id, version, segments_json) \
-                         VALUES ($1, 0, '[]') ON CONFLICT DO NOTHING"
+                         VALUES ($1, 0, '[]') ON CONFLICT DO NOTHING",
                     )
                     .bind(&id_str)
                     .execute(&self.pool)
@@ -96,16 +89,15 @@ impl ControlStore for PgStore {
 
         let id_str = id.0.clone();
         rt.block_on(async move {
-            let _ = sqlx::query(
-                "INSERT INTO kosha.namespaces (id) VALUES ($1) ON CONFLICT DO NOTHING"
-            )
-            .bind(&id_str)
-            .execute(&self.pool)
-            .await;
+            let _ =
+                sqlx::query("INSERT INTO kosha.namespaces (id) VALUES ($1) ON CONFLICT DO NOTHING")
+                    .bind(&id_str)
+                    .execute(&self.pool)
+                    .await;
 
             let _ = sqlx::query(
                 "INSERT INTO kosha.manifests (namespace_id, version, segments_json) \
-                 VALUES ($1, 0, '[]') ON CONFLICT DO NOTHING"
+                 VALUES ($1, 0, '[]') ON CONFLICT DO NOTHING",
             )
             .bind(&id_str)
             .execute(&self.pool)
@@ -121,19 +113,18 @@ impl ControlStore for PgStore {
 
         let id_str = id.0.clone();
         rt.block_on(async move {
-            let row: Option<(i64,)> = sqlx::query_as(
-                "SELECT COUNT(*) FROM kosha.namespaces WHERE id = $1"
-            )
-            .bind(&id_str)
-            .fetch_optional(&self.pool)
-            .await
-            .unwrap_or(None);
+            let row: Option<(i64,)> =
+                sqlx::query_as("SELECT COUNT(*) FROM kosha.namespaces WHERE id = $1")
+                    .bind(&id_str)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .unwrap_or(None);
 
             matches!(row, Some((count,)) if count > 0)
         })
     }
 
-    fn manifest(&self, id: &NamespaceId) -> Option<&Manifest> {
+    fn manifest(&self, _id: &NamespaceId) -> Option<&Manifest> {
         // Simplified: returns None for live queries — the server uses
         // `manifest_cloned()` which calls into `self.manifest()` on the
         // Indexer, not the control store directly.
@@ -145,7 +136,7 @@ impl ControlStore for PgStore {
         None
     }
 
-    fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut Manifest> {
+    fn manifest_mut(&mut self, _id: &NamespaceId) -> Option<&mut Manifest> {
         // Same simplification as `manifest()` above.
         None
     }
@@ -163,17 +154,22 @@ impl ControlStore for PgStore {
 
         let id_str = id.0.clone();
         let segments_json = serde_json::to_string(
-            &new_manifest.segments.iter().map(|s| SegmentEntry {
-                segment_id: s.segment_id.0.clone(),
-                doc_count: s.doc_count,
-            }).collect::<Vec<_>>()
-        ).map_err(|e| KoshaError::NotFound(e.to_string()))?;
+            &new_manifest
+                .segments
+                .iter()
+                .map(|s| SegmentEntry {
+                    segment_id: s.segment_id.0.clone(),
+                    doc_count: s.doc_count,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| KoshaError::NotFound(e.to_string()))?;
 
         rt.block_on(async move {
             let result = sqlx::query(
                 "UPDATE kosha.manifests \
                  SET version = $1, segments_json = $2, updated_at = NOW() \
-                 WHERE namespace_id = $3 AND version = $4"
+                 WHERE namespace_id = $3 AND version = $4",
             )
             .bind(new_manifest.version as i64)
             .bind(&segments_json)
@@ -183,11 +179,9 @@ impl ControlStore for PgStore {
             .await;
 
             match result {
-                Ok(r) if r.rows_affected() == 0 => {
-                    Err(KoshaError::NotFound(
-                        format!("manifest CAS failed for {id_str}: version mismatch or namespace not found")
-                    ))
-                }
+                Ok(r) if r.rows_affected() == 0 => Err(KoshaError::NotFound(format!(
+                    "manifest CAS failed for {id_str}: version mismatch or namespace not found"
+                ))),
                 Ok(_) => Ok(()),
                 Err(e) => Err(KoshaError::NotFound(e.to_string())),
             }
@@ -201,12 +195,11 @@ impl ControlStore for PgStore {
             .unwrap();
 
         rt.block_on(async move {
-            let rows: Vec<(String,)> = sqlx::query_as(
-                "SELECT id FROM kosha.namespaces ORDER BY created_at DESC"
-            )
-            .fetch_all(&self.pool)
-            .await
-            .unwrap_or_default();
+            let rows: Vec<(String,)> =
+                sqlx::query_as("SELECT id FROM kosha.namespaces ORDER BY created_at DESC")
+                    .fetch_all(&self.pool)
+                    .await
+                    .unwrap_or_default();
 
             rows.into_iter().map(|(id,)| NamespaceId(id)).collect()
         })
