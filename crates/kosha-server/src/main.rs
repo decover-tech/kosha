@@ -292,6 +292,16 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
             .ok();
     }
 
+    // Liveness/readiness probes hit this with no Authorization header (k8s
+    // httpGet probes don't support that out of the box) — must stay
+    // unauthenticated, per the doc comment at the top of this file.
+    if request_line.starts_with("GET /healthz") || request_line.starts_with("GET /v1/healthz") {
+        stream
+            .write_all(json_ok(&serde_json::json!({"status": "ok"})).as_bytes())
+            .ok();
+        return Ok(());
+    }
+
     // ── API key authentication ──────────────────────────────────────────
     // Per proto/kosha/v1/kosha.proto: Authorization: Bearer <key> or X-Api-Key.
     let tenant = match authenticate(&headers) {
@@ -419,9 +429,17 @@ fn route(
 }
 
 /// Extract a namespace from a v1 path: `METHOD /v1/namespaces/{ns}/suffix ...`
+///
+/// `prefix` includes the HTTP method (e.g. "POST /v1/namespaces/"), but the
+/// request line's path segment doesn't — match the method against the full
+/// request line, then strip only the path portion of `prefix` from the path.
 fn extract_namespace(request_line: &str, prefix: &str, suffix: &str) -> Option<String> {
+    if !request_line.starts_with(prefix) {
+        return None;
+    }
     let after_method = request_line.split(' ').nth(1)?;
-    let after_prefix = after_method.strip_prefix(prefix)?;
+    let path_prefix = prefix.split(' ').nth(1)?;
+    let after_prefix = after_method.strip_prefix(path_prefix)?;
     let ns = after_prefix.strip_suffix(suffix)?;
     if ns.is_empty() || ns.contains('/') {
         return None;
@@ -705,7 +723,8 @@ fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppS
     if let Some(obj) = body_val.as_object_mut() {
         obj.insert("namespace".into(), serde_json::json!(scoped_ns));
     }
-    handle_index(body, state)
+    let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
+    handle_index(&modified_body, state)
 }
 
 fn handle_search_post_with_ns(
@@ -1033,6 +1052,55 @@ mod tests {
         );
         assert!(search_resp2.starts_with("HTTP/1.1 200 OK"));
         assert!(search_resp2.contains("\"total_hits\":1"));
+    }
+
+    #[test]
+    fn v1_tenant_scoped_index_then_search_works() {
+        // Regression test: extract_namespace previously could never match
+        // (it stripped a method-prefixed string like "POST /v1/namespaces/"
+        // from a path-only token), and handle_index_with_ns previously
+        // discarded its tenant-scoped body and forwarded the original
+        // request instead — both silently 404'd every v1 namespace route.
+        let state = test_state();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "documents": [{"id": "d1", "fields": [{"name": "title", "field_type": "Text", "value": "quick brown fox"}]}]
+        }))
+        .unwrap();
+        let index_resp = route(
+            "POST /v1/namespaces/my-index/documents HTTP/1.1\r\n",
+            &HashMap::new(),
+            &body,
+            "acme-corp",
+            &state,
+        );
+        assert!(
+            index_resp.starts_with("HTTP/1.1 200 OK"),
+            "index response: {index_resp}"
+        );
+        assert!(index_resp.contains("\"indexed_count\":1"));
+
+        {
+            let mut indexer = state.indexer.lock().unwrap();
+            indexer
+                .flush_namespace(&NamespaceId("acme-corp/my-index".into()))
+                .unwrap();
+        }
+
+        let search_body =
+            serde_json::to_vec(&serde_json::json!({"query_text": "quick", "max_results": 5}))
+                .unwrap();
+        let search_resp = route(
+            "POST /v1/namespaces/my-index/search HTTP/1.1\r\n",
+            &HashMap::new(),
+            &search_body,
+            "acme-corp",
+            &state,
+        );
+        assert!(
+            search_resp.starts_with("HTTP/1.1 200 OK"),
+            "search response: {search_resp}"
+        );
+        assert!(search_resp.contains("\"total_hits\":1"));
     }
 
     #[test]
