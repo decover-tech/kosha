@@ -88,6 +88,10 @@ class KoshaClient:
             retry_on_timeout=retry_on_timeout,
         )
 
+        self._kosha_url = kosha_url
+        self._auth = http_auth
+        self._timeout = timeout
+
         # Kosha namespace → index name mapping.
         # In Phase 1, index name is used directly as the namespace.
         self._namespace = kwargs.get("namespace", "default")
@@ -854,3 +858,7 @@ class IndexOps:
 
     def flush(self, index: str | None = None, **params: Any) -> dict:
         return {"_shards": {"total": 1, "successful": 1, "failed": 0}}
+
+    def close(self, index: str, **params: Any) -> dict:
+        logger.info("IndexOps.close(%s) — no-op (Kosha has no close-index concept)", index)
+        return {"acknowledged": True, "shards_acknowledged": True, "indices": {index: {"closed": True}}}
