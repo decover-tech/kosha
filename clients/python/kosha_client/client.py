@@ -366,6 +366,11 @@ class KoshaClient:
                 if translated and KoshaClient._is_filter_only_clause(clause):
                     must_clauses.append(translated)
                     has_clauses = True
+            for clause in bool_q.get("should", []):
+                translated = KoshaClient._translate_es_clause(clause)
+                if translated and KoshaClient._is_filter_only_clause(clause):
+                    must_clauses.append(translated)
+                    has_clauses = True
 
         # post_filter
         post_filter = body.get("post_filter")
