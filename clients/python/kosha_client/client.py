@@ -198,7 +198,12 @@ class KoshaClient:
         if knn:
             kosha_body["knn"] = knn
 
-        result = self._request("POST", "search", body=kosha_body)
+        try:
+            result = self._request("POST", "search", body=kosha_body)
+        except KoshaRequestError as e:
+            if e.status_code == 404:
+                return self._build_search_response([], 0, size, 0)
+            raise
         kosha_hits = result.get("results", [])
         total = result.get("total_hits", 0)
         kosha_aggs = result.get("aggregations")
