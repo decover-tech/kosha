@@ -856,10 +856,38 @@ class IndexOps:
         return {index: {"aliases": {}, "mappings": {}, "settings": {}}}
 
     def get_mapping(self, index: str | None = None, **params: Any) -> dict:
-        return {}
+        idx = index or "default"
+        return {
+            idx: {
+                "mappings": {
+                    "properties": {
+                        "documentId": {"type": "keyword"},
+                        "content": {"type": "text"},
+                        "title": {"type": "text"},
+                        "sender": {"type": "keyword"},
+                        "recipients": {"type": "keyword"},
+                        "sentAt": {"type": "date"},
+                        "matterId": {"type": "keyword"},
+                        "orgId": {"type": "keyword"},
+                    }
+                }
+            }
+        }
 
     def get_settings(self, index: str | None = None, **params: Any) -> dict:
-        return {}
+        idx = index or "default"
+        return {
+            idx: {
+                "settings": {
+                    "index": {
+                        "knn": "true",
+                        "refresh_interval": "-1",
+                        "number_of_shards": "1",
+                        "number_of_replicas": "0",
+                    }
+                }
+            }
+        }
 
     def flush(self, index: str | None = None, **params: Any) -> dict:
         return {"_shards": {"total": 1, "successful": 1, "failed": 0}}
