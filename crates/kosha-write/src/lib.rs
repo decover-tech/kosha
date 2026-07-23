@@ -631,15 +631,14 @@ mod tests {
         assert_eq!(idx2.manifest(&ns).unwrap().segments.len(), 1);
 
         // The next flush must not reuse the restored segment ID.
-        idx2
-            .index_documents(
-                ns.clone(),
-                vec![Document {
-                    id: DocumentId("d2".into()),
-                    fields: vec![Field::text("title", "fresh doc")],
-                }],
-            )
-            .unwrap();
+        idx2.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("d2".into()),
+                fields: vec![Field::text("title", "fresh doc")],
+            }],
+        )
+        .unwrap();
         idx2.flush_namespace(&ns).unwrap();
         let m = idx2.manifest(&ns).unwrap();
         assert_eq!(m.segments.len(), 2);

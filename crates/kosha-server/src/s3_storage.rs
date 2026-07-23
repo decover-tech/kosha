@@ -113,13 +113,7 @@ impl S3Storage {
             loader = loader.region(aws_config::Region::new(region.clone()));
         }
         if let (Some(key), Some(secret)) = (&config.access_key, &config.secret_key) {
-            let creds = aws_sdk_s3::config::Credentials::new(
-                key,
-                secret,
-                None,
-                None,
-                "kosha-env",
-            );
+            let creds = aws_sdk_s3::config::Credentials::new(key, secret, None, None, "kosha-env");
             loader = loader.credentials_provider(creds);
         }
         let shared = loader.load().await;
@@ -388,7 +382,10 @@ mod tests {
                 format!("{}/{}", cfg_prefix.trim_end_matches('/'), path)
             }
         };
-        assert_eq!(storage_prefix("kosha/", "ns/seg/a.bin"), "kosha/ns/seg/a.bin");
+        assert_eq!(
+            storage_prefix("kosha/", "ns/seg/a.bin"),
+            "kosha/ns/seg/a.bin"
+        );
         assert_eq!(storage_prefix("", "ns/seg/a.bin"), "ns/seg/a.bin");
     }
 

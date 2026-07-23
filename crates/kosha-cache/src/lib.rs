@@ -70,9 +70,7 @@ impl Cache {
 
     /// True when a segment directory (or file) is already present locally.
     pub fn contains(&self, key: &str) -> bool {
-        self.path_for(key)
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        self.path_for(key).map(|p| p.exists()).unwrap_or(false)
     }
 
     /// Store a file in the cache by copying `source_path` under `key`.

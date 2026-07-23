@@ -90,9 +90,9 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 #[cfg(feature = "s3")]
 mod s3_storage;
 
+use kosha_cache::Cache;
 #[cfg(feature = "s3")]
 use kosha_core::StorageBackend;
-use kosha_cache::Cache;
 use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::Searcher;
 use kosha_write::Indexer;
@@ -183,10 +183,7 @@ impl AppState {
             match kosha_control::PgStore::new(&db_url) {
                 Ok(store) => {
                     control_plane_kind = "postgres";
-                    println!(
-                        "control plane: postgres ({})",
-                        redact_database_url(&db_url)
-                    );
+                    println!("control plane: postgres ({})", redact_database_url(&db_url));
                     Box::new(store)
                 }
                 Err(e) => {
@@ -779,7 +776,11 @@ fn handle_stats(state: &AppState) -> String {
 
     #[cfg(feature = "s3")]
     let (s3_enabled, s3_bucket, s3_prefix) = match &state.s3_storage {
-        Some(s3) => (true, Some(s3.bucket().to_string()), Some(s3.prefix().to_string())),
+        Some(s3) => (
+            true,
+            Some(s3.bucket().to_string()),
+            Some(s3.prefix().to_string()),
+        ),
         None => (false, None, None),
     };
     #[cfg(not(feature = "s3"))]
@@ -1352,7 +1353,13 @@ mod tests {
             }],
         };
         let body = serde_json::to_vec(&req).unwrap();
-        route("POST /index HTTP/1.1\r\n", &HashMap::new(), &body, "test", &state);
+        route(
+            "POST /index HTTP/1.1\r\n",
+            &HashMap::new(),
+            &body,
+            "test",
+            &state,
+        );
 
         let flush_body = serde_json::to_vec(&serde_json::json!({"namespace": ns})).unwrap();
         let resp = route(
