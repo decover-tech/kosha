@@ -1,13 +1,19 @@
 name: Release
 
-# Publishes the public kosha-server image to GHCR (ghcr.io/decover-tech/kosha).
+# Publishes kosha-server to two registries from one build:
+#
+#   GHCR  ghcr.io/decover-tech/kosha                             (public face)
+#   ECR   <nonprod>.dkr.ecr.us-east-1.amazonaws.com/decover/kosha (staging pulls)
 #
 #   push to main        -> :main          (floating, what staging tracks)
 #   tag v0.2.5          -> :0.2.5, :0.2, :latest
 #
-# After the first push, flip the package to public: GitHub org -> Packages ->
+# AWS auth: OIDC via the AWS_GITHUB_ROLE_ARN secret (GitHubActionsKoshaRole —
+# trust scoped to this repo's main branch + v* tags; may push only to the
+# decover/kosha ECR repo in the nonprod account).
+#
+# GHCR: the package stays private until flipped: GitHub org -> Packages ->
 # kosha -> Package settings -> connect this repo -> Change visibility: public.
-# A public package pulls with no imagePullSecrets (staging EKS included).
 
 on:
   push:
@@ -17,6 +23,8 @@ on:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/kosha
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: decover/kosha
 
 jobs:
   publish:
@@ -26,6 +34,7 @@ jobs:
       contents: read
       packages: write
       attestations: write
+      id-token: write # AWS OIDC
     steps:
       - uses: actions/checkout@v4
 
@@ -39,10 +48,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ${{ env.IMAGE }}
+          images: |
+            ${{ env.IMAGE }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
