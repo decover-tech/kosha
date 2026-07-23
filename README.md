@@ -106,9 +106,17 @@ auto-created.
 
 ### Run with Docker
 
+Pre-built multi-arch images are published to GHCR on every merge to `main`
+(`:main`) and for every `v*` tag (`:0.2.5`, `:0.2`, `:latest`):
+
+    docker pull ghcr.io/decover-tech/kosha:latest
+    docker run --rm -p 8080:8080 ghcr.io/decover-tech/kosha:latest
+    curl localhost:8080/healthz   # -> ok
+
+Or build locally:
+
     docker build -t kosha:latest .
     docker run --rm -p 8080:8080 kosha:latest
-    curl localhost:8080/healthz   # -> ok
 
 Or bring up the whole local stack (MinIO + server): `docker compose up --build`.
 
