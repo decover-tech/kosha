@@ -1,19 +1,26 @@
 name: Release
 
-# Publishes kosha-server to two registries from one build:
+# Publishes kosha-server to three registries from one build:
 #
-#   GHCR  ghcr.io/decover-tech/kosha                             (public face)
-#   ECR   <nonprod>.dkr.ecr.us-east-1.amazonaws.com/decover/kosha (staging pulls)
+#   GHCR       ghcr.io/decover-tech/kosha                             (public face)
+#   Docker Hub docker.io/decoverai/kosha                              (public pulls)
+#   ECR        <nonprod>.dkr.ecr.us-east-1.amazonaws.com/decover/kosha (staging pulls)
 #
 #   push to main        -> :main          (floating, what staging tracks)
 #   tag v0.2.5          -> :0.2.5, :0.2, :latest
 #
 # AWS auth: OIDC via the AWS_GITHUB_ROLE_ARN secret (GitHubActionsKoshaRole —
-# trust scoped to this repo's main branch + v* tags; may push only to the
-# decover/kosha ECR repo in the nonprod account).
+# trust scoped to this repo's main branch + v* tags). The ECR registry is
+# derived from the role's account at login, so pointing the secret at a role
+# in another account moves the push there with no workflow change. Staging
+# uses a role in account 010928200670 (push rights only to decover/kosha
+# there) so the staging cluster pulls in-account, like every other service.
 #
 # GHCR: the package stays private until flipped: GitHub org -> Packages ->
 # kosha -> Package settings -> connect this repo -> Change visibility: public.
+#
+# Docker Hub: requires repo secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
+# (a Docker Hub access token with read/write/delete on decoverai/kosha).
 
 on:
   push:
@@ -21,8 +28,13 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/kosha
+  DOCKERHUB_IMAGE: decoverai/kosha
   AWS_REGION: us-east-1
   ECR_REPOSITORY: decover/kosha
 
@@ -48,6 +60,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -63,6 +80,7 @@ jobs:
         with:
           images: |
             ${{ env.IMAGE }}
+            ${{ env.DOCKERHUB_IMAGE }}
             ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
           tags: |
             type=semver,pattern={{version}}
