@@ -8,14 +8,19 @@ with Kosha instead of OpenSearch** — will be executed.
 
 The backend repo (`../backend`) wires Kosha into the local cluster:
 
-- `deployments/k8s/dev/kosha.yaml` — `Deployment/kosha` +
-  `Service/kosha-service` (HTTP `:8080`, gRPC `:50051`).
+- `deployments/k8s/kosha/` — dedicated Kubernetes namespace `kosha` with
+  `dev` / `stage` / `prod` overlays (`Deployment/kosha` +
+  `Service/kosha-service`, HTTP `:8080`, gRPC `:50051`).
+- Local Tilt includes `../kosha/dev` from `deployments/k8s/dev`.
 - `Tiltfile` — `docker_build("kosha", "../Kosha")` plus a `kosha` resource
   with port-forwards `8081:8080` (HTTP; host port 8080 is taken by bach) and
   `50051:50051` (gRPC).
+- Backend clients reach Kosha at
+  `http://kosha-service.kosha.svc.cluster.local:8080`.
 
 So `tilt up` in the backend repo builds this repo's Dockerfile and runs Kosha
-next to the rest of the stack. Nothing routes traffic to it yet.
+in the `kosha` namespace next to the rest of the stack. Nothing routes traffic
+to it yet (sage/pandora/celery stay on OpenSearch in the dev overlay).
 
 Sanity check from the host:
 
@@ -92,4 +97,18 @@ Even after Epic 11, Phase 1 Kosha is BM25 lexical only — semantic retrieval
 
 This repo is self-contained for engine development:
 
-    docker compose up --build   # MinIO (S3 stand-in) + kosha-server
+    docker compose up --build   # Postgres + MinIO + kosha-server
+
+Phase 1 persistence knobs (also used by stage/prod Deployments):
+
+| Env | Purpose |
+|-----|---------|
+| `DATABASE_URL` | Postgres control plane (`kosha.manifests`) |
+| `KOSHA_S3_BUCKET` / `KOSHA_S3_PREFIX` | Durable segment store |
+| `KOSHA_S3_ENDPOINT` | MinIO / custom S3 endpoint (path-style by default) |
+| `KOSHA_S3_ACCESS_KEY` / `KOSHA_S3_SECRET_KEY` | Or standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` |
+| `KOSHA_DATA_DIR` | Local SSD/cache root (never authoritative when S3 is on) |
+
+On startup the server logs which control plane and S3 backend it bound, and
+how many manifests it restored. `/stats` exposes `control_plane`,
+`cache_root`, `cache_size_bytes`, and `s3_enabled`.

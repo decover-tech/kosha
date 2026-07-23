@@ -282,6 +282,25 @@ impl Indexer {
         Ok(())
     }
 
+    /// Restore a persisted manifest (from the control store) on startup, so a
+    /// previously-indexed namespace is searchable again after a restart.
+    ///
+    /// Also advances the namespace's segment counter past any restored
+    /// segment IDs, so future flushes can't collide with segments that exist
+    /// in durable storage (e.g. S3) but not on local disk.
+    pub fn restore_manifest(&mut self, namespace: NamespaceId, manifest: Manifest) {
+        let max_counter = manifest
+            .segments
+            .iter()
+            .filter_map(|e| segment_flush_counter(&e.segment_id))
+            .max();
+        if let Some(max) = max_counter {
+            let buf = self.buffer_mut(namespace.clone());
+            buf.segment_counter = buf.segment_counter.max(max + 1);
+        }
+        self.manifests.insert(namespace, manifest);
+    }
+
     pub fn manifest(&self, namespace: &NamespaceId) -> Option<&Manifest> {
         self.manifests.get(namespace)
     }
@@ -312,6 +331,18 @@ impl Indexer {
             );
         }
         self.buffers.get_mut(&namespace).unwrap()
+    }
+}
+
+/// Parse the flush counter from a segment ID of the form `{ns}-{counter:06x}`
+/// produced by `flush_namespace`. Returns `None` for IDs from other sources
+/// (e.g. compaction segments, which embed a timestamp instead of a counter).
+fn segment_flush_counter(segment_id: &SegmentId) -> Option<u64> {
+    let suffix = segment_id.0.rsplit('-').next()?;
+    if suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        u64::from_str_radix(suffix, 16).ok()
+    } else {
+        None
     }
 }
 
@@ -566,6 +597,53 @@ mod tests {
             // d2 has doc_seq=1
             assert!(seqs.contains(&1));
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_manifest_recovers_namespace_without_segment_collisions() {
+        let dir = std::env::temp_dir().join("kosha-test-restore");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Index + flush, producing one persisted segment.
+        let ns = NamespaceId("tenant/idx".into());
+        let mut idx = Indexer::new(dir.clone());
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("d1".into()),
+                fields: vec![Field::text("title", "hello world")],
+            }],
+        )
+        .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let persisted = idx.manifest(&ns).unwrap().clone();
+        assert_eq!(persisted.segments.len(), 1);
+
+        // Simulate a restart on ephemeral storage: local segment files are
+        // gone, but the control store still holds the manifest.
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut idx2 = Indexer::new(dir.clone());
+        assert!(idx2.manifest(&ns).is_none());
+
+        idx2.restore_manifest(ns.clone(), persisted);
+        assert_eq!(idx2.manifest(&ns).unwrap().segments.len(), 1);
+
+        // The next flush must not reuse the restored segment ID.
+        idx2
+            .index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId("d2".into()),
+                    fields: vec![Field::text("title", "fresh doc")],
+                }],
+            )
+            .unwrap();
+        idx2.flush_namespace(&ns).unwrap();
+        let m = idx2.manifest(&ns).unwrap();
+        assert_eq!(m.segments.len(), 2);
+        assert_ne!(m.segments[0].segment_id, m.segments[1].segment_id);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

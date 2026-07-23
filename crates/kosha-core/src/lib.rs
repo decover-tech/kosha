@@ -13,6 +13,22 @@ pub trait ControlStore: Send + Sync {
     fn has_namespace(&self, id: &NamespaceId) -> bool;
     fn manifest(&self, id: &NamespaceId) -> Option<&Manifest>;
     fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut Manifest>;
+
+    /// Owned copy of the manifest for a namespace.
+    ///
+    /// Default implementation clones `manifest()`; stores that cannot return
+    /// a borrowed reference (e.g. Postgres) override this to read through.
+    fn manifest_cloned(&self, id: &NamespaceId) -> Option<Manifest> {
+        self.manifest(id).cloned()
+    }
+
+    /// Persist a manifest for a namespace (upsert, last-write-wins).
+    ///
+    /// Used by the node to publish the current segment list after flush so
+    /// the state survives restarts. For multi-writer publish with optimistic
+    /// concurrency, use `compare_and_swap_manifest` instead.
+    fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError>;
+
     fn compare_and_swap_manifest(
         &mut self,
         id: &NamespaceId,

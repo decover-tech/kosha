@@ -5,14 +5,16 @@
 //!
 //! Tables live in a `kosha` schema — see `migrations/001_create_kosha_tables.sql`.
 
-use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
+use kosha_core::{ControlStore, KoshaError, Manifest, ManifestEntry, NamespaceId, SegmentId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Postgres-backed store.
 ///
-/// Uses a synchronous wrapper around `sqlx`'s async pool so it can slot into
-/// the current single-threaded server without a runtime refactor.
+/// Uses a synchronous wrapper around `sqlx`'s async pool so callers don't
+/// need an async runtime. The pool itself is `Send + Sync`; each call runs
+/// its query on a fresh current-thread runtime, so concurrent callers (the
+/// server handles connections on separate threads) are safe.
 pub struct PgStore {
     pool: sqlx::PgPool,
 }
@@ -215,20 +217,91 @@ impl ControlStore for PgStore {
     }
 
     fn manifest(&self, _id: &NamespaceId) -> Option<&Manifest> {
-        // Simplified: returns None for live queries — the server uses
-        // `manifest_cloned()` which calls into `self.manifest()` on the
-        // Indexer, not the control store directly.
-        //
-        // For a full implementation, the PgStore would need an internal
-        // cache or return owned values.  Keeping this as a placeholder
-        // for now — the Indexer's in-memory manifest is the source of
-        // truth for query path until Phase 2.
+        // Cannot return a borrowed reference from a database query — use
+        // `manifest_cloned()` below, which is the read path callers take.
         None
     }
 
     fn manifest_mut(&mut self, _id: &NamespaceId) -> Option<&mut Manifest> {
-        // Same simplification as `manifest()` above.
+        // Same limitation as `manifest()` above.
         None
+    }
+
+    fn manifest_cloned(&self, id: &NamespaceId) -> Option<Manifest> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+
+        let id_str = id.0.clone();
+        rt.block_on(async move {
+            let row: Option<(i64, String)> = sqlx::query_as(
+                "SELECT version, segments_json FROM kosha.manifests WHERE namespace_id = $1",
+            )
+            .bind(&id_str)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()?;
+
+            let (version, segments_json) = row?;
+            let entries: Vec<SegmentEntry> = serde_json::from_str(&segments_json).ok()?;
+            Some(Manifest {
+                version: version as u64,
+                segments: entries
+                    .into_iter()
+                    .map(|e| ManifestEntry {
+                        segment_id: SegmentId(e.segment_id),
+                        doc_count: e.doc_count,
+                    })
+                    .collect(),
+            })
+        })
+    }
+
+    fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+
+        let id_str = id.0.clone();
+        let version = manifest.version as i64;
+        let segments_json = serde_json::to_string(
+            &manifest
+                .segments
+                .iter()
+                .map(|s| SegmentEntry {
+                    segment_id: s.segment_id.0.clone(),
+                    doc_count: s.doc_count,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+
+        rt.block_on(async move {
+            // kosha.manifests has a FK to kosha.namespaces — ensure the
+            // namespace row exists first.
+            sqlx::query("INSERT INTO kosha.namespaces (id) VALUES ($1) ON CONFLICT DO NOTHING")
+                .bind(&id_str)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+
+            sqlx::query(
+                "INSERT INTO kosha.manifests (namespace_id, version, segments_json) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (namespace_id) DO UPDATE \
+                 SET version = $2, segments_json = $3, updated_at = NOW()",
+            )
+            .bind(&id_str)
+            .bind(version)
+            .bind(&segments_json)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+
+            Ok(())
+        })
     }
 
     fn compare_and_swap_manifest(

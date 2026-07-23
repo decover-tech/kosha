@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Map of valid API keys → tenant id.
 ///
@@ -91,6 +92,7 @@ mod s3_storage;
 
 #[cfg(feature = "s3")]
 use kosha_core::StorageBackend;
+use kosha_cache::Cache;
 use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::Searcher;
 use kosha_write::Indexer;
@@ -101,56 +103,90 @@ struct AppState {
     controller: Mutex<Box<dyn ControlStore>>,
     indexer: Mutex<Indexer>,
     searcher: Searcher,
+    /// Local segment / SSD cache root (`KOSHA_DATA_DIR`). Never authoritative
+    /// when S3 is enabled — losing it is a cache-miss event only.
     data_dir: PathBuf,
+    /// Read-through cache handle over `data_dir` (DESIGN.md §9).
+    cache: Cache,
+    control_plane_kind: &'static str,
     #[cfg(feature = "s3")]
     s3_storage: Option<s3_storage::S3Storage>,
 }
 
 impl AppState {
     fn new(data_dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&data_dir).ok();
+        // Segment files must live under data_dir (indexer/searcher paths).
+        // KOSHA_CACHE_DIR is accepted for deploy overlays but Phase 1 always
+        // materializes segments in KOSHA_DATA_DIR so paths stay consistent.
+        if let Ok(extra) = std::env::var("KOSHA_CACHE_DIR") {
+            let extra_path = PathBuf::from(&extra);
+            if extra_path != data_dir {
+                println!(
+                    "WARN: KOSHA_CACHE_DIR={extra} differs from KOSHA_DATA_DIR; using data_dir for segment cache ({})",
+                    data_dir.display()
+                );
+            }
+        }
+        let cache = Cache::new(data_dir.clone());
         let indexer = Indexer::new(data_dir.clone());
         let searcher = Searcher::new(data_dir.clone());
 
         #[cfg(feature = "s3")]
         let s3_storage = {
-            let bucket = std::env::var("KOSHA_S3_BUCKET").ok();
-            let prefix = std::env::var("KOSHA_S3_PREFIX").unwrap_or_default();
-            if let Some(ref bucket) = bucket {
-                let b = bucket.clone();
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                match rt {
-                    Ok(rt) => {
-                        let fut = s3_storage::S3Storage::new(data_dir.clone(), b, prefix);
-                        match rt.block_on(fut) {
-                            Ok(s3) => {
-                                println!("S3 storage enabled: bucket={}", bucket);
-                                Some(s3)
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to init S3 storage: {e}");
-                                None
+            match s3_storage::S3Config::from_env() {
+                Some(cfg) => {
+                    let bucket = cfg.bucket.clone();
+                    let prefix = cfg.prefix.clone();
+                    let endpoint = cfg.endpoint.clone();
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    match rt {
+                        Ok(rt) => {
+                            let fut = s3_storage::S3Storage::new(data_dir.clone(), cfg);
+                            match rt.block_on(fut) {
+                                Ok(s3) => {
+                                    println!(
+                                        "S3 storage enabled: bucket={bucket} prefix={prefix:?} endpoint={endpoint:?} local_cache={}",
+                                        data_dir.display()
+                                    );
+                                    Some(s3)
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to init S3 storage: {e}");
+                                    None
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to create tokio runtime: {e}");
-                        None
+                        Err(e) => {
+                            eprintln!("Failed to create tokio runtime: {e}");
+                            None
+                        }
                     }
                 }
-            } else {
-                None
+                None => {
+                    println!(
+                        "S3 storage disabled (KOSHA_S3_BUCKET unset); segments are local-only under {}",
+                        data_dir.display()
+                    );
+                    None
+                }
             }
         };
 
         // ── Control plane: in-memory or Postgres ─────────────────────────
+        let mut control_plane_kind: &'static str = "in-memory";
         let control_store: Box<dyn ControlStore> = if let Ok(db_url) = std::env::var("DATABASE_URL")
         {
             #[cfg(feature = "postgres")]
             match kosha_control::PgStore::new(&db_url) {
                 Ok(store) => {
-                    println!("control plane: postgres ({db_url})");
+                    control_plane_kind = "postgres";
+                    println!(
+                        "control plane: postgres ({})",
+                        redact_database_url(&db_url)
+                    );
                     Box::new(store)
                 }
                 Err(e) => {
@@ -165,7 +201,7 @@ impl AppState {
                 println!(
                     "control plane: in-memory (DATABASE_URL set but postgres feature disabled)"
                 );
-                let _ = db_url; // suppress unused warning
+                let _ = db_url;
                 Box::new(kosha_control::Controller::new())
             }
         } else {
@@ -173,13 +209,87 @@ impl AppState {
             Box::new(kosha_control::Controller::new())
         };
 
+        // ── Restore manifests from the control store ───────────────────────
+        // The Indexer starts empty on every boot; without this, previously
+        // indexed namespaces vanish from search after a restart. Segment
+        // files are re-fetched from S3 lazily at search time
+        // (`ensure_segment_local`) when local disk is ephemeral.
+        let mut indexer = indexer;
+        let mut restored = 0usize;
+        let mut restored_segments = 0usize;
+        for ns in control_store.list_namespaces() {
+            if let Some(manifest) = control_store.manifest_cloned(&ns) {
+                if !manifest.segments.is_empty() {
+                    restored_segments += manifest.segments.len();
+                    indexer.restore_manifest(ns, manifest);
+                    restored += 1;
+                }
+            }
+        }
+        println!(
+            "control plane: restored {restored} namespace(s), {restored_segments} segment ref(s); cache_root={} size_bytes={}",
+            cache.root().display(),
+            cache.total_size()
+        );
+
         Self {
             controller: Mutex::new(control_store),
             indexer: Mutex::new(indexer),
             searcher,
             data_dir,
+            cache,
+            control_plane_kind,
             #[cfg(feature = "s3")]
             s3_storage,
+        }
+    }
+
+    /// Persist the indexer's current manifest for a namespace into the
+    /// control store, so the segment list survives restarts.
+    fn persist_manifest(&self, ns: &NamespaceId) {
+        let manifest = {
+            let indexer = self.indexer.lock().unwrap();
+            indexer.manifest_cloned(ns)
+        };
+        if let Some(manifest) = manifest {
+            let mut ctrl = self.controller.lock().unwrap();
+            match ctrl.save_manifest(ns, &manifest) {
+                Ok(()) => {
+                    println!(
+                        "control plane: saved manifest ns={} version={} segments={} backend={}",
+                        ns.0,
+                        manifest.version,
+                        manifest.segments.len(),
+                        self.control_plane_kind
+                    );
+                }
+                Err(e) => {
+                    eprintln!("WARN: failed to persist manifest for '{}': {e}", ns.0);
+                }
+            }
+        }
+    }
+
+    /// After a flush: persist the manifest and upload new segment files to S3.
+    fn publish_namespace(&self, ns: &NamespaceId) {
+        self.persist_manifest(ns);
+        #[cfg(feature = "s3")]
+        self.sync_namespace_to_s3(ns);
+    }
+
+    /// Sync all segments listed in the namespace manifest to S3.
+    #[cfg(feature = "s3")]
+    fn sync_namespace_to_s3(&self, ns: &NamespaceId) {
+        let manifest = {
+            let indexer = self.indexer.lock().unwrap();
+            indexer.manifest_cloned(ns)
+        };
+        let Some(manifest) = manifest else {
+            return;
+        };
+        for entry in &manifest.segments {
+            let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+            self.sync_to_s3(&seg_path);
         }
     }
 
@@ -187,21 +297,23 @@ impl AppState {
     #[cfg(feature = "s3")]
     fn sync_to_s3(&self, seg_dir: &PathBuf) {
         if let Some(ref s3) = self.s3_storage {
+            if !seg_dir.exists() {
+                return;
+            }
             if let Ok(entries) = std::fs::read_dir(seg_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_file() {
                         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            let s3_path = format!(
-                                "{}/{}",
-                                seg_dir
-                                    .strip_prefix(&self.data_dir)
-                                    .unwrap_or(seg_dir)
-                                    .to_string_lossy(),
-                                name
-                            );
+                            let rel = seg_dir
+                                .strip_prefix(&self.data_dir)
+                                .unwrap_or(seg_dir)
+                                .to_string_lossy();
+                            let s3_path = format!("{rel}/{name}");
                             if let Ok(data) = std::fs::read(&path) {
-                                let _ = s3.write(&s3_path, &data);
+                                if let Err(e) = s3.write(&s3_path, &data) {
+                                    eprintln!("WARN: S3 upload failed for {s3_path}: {e}");
+                                }
                             }
                         }
                     }
@@ -210,24 +322,69 @@ impl AppState {
         }
     }
 
-    /// Ensure a segment is available locally (download from S3 if needed).
+    /// Ensure a segment is available locally (download from S3 on cache miss).
     #[cfg(feature = "s3")]
     fn ensure_segment_local(&self, seg_path: &Path) {
+        if let Ok(rel) = seg_path.strip_prefix(&self.data_dir) {
+            let key = rel.to_string_lossy();
+            if self.cache.contains(key.as_ref()) {
+                // Directory exists with at least the path present.
+                if seg_path.exists() {
+                    return;
+                }
+            }
+        }
         if seg_path.exists() {
             return;
         }
         if let Some(ref s3) = self.s3_storage {
             if let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) {
                 let s3_prefix = rel_path.to_string_lossy();
-                if let Ok(files) = s3.list(&s3_prefix) {
-                    for file in &files {
-                        let s3_key = format!("{}/{}", s3_prefix, file);
-                        let _ = s3.read(&s3_key);
+                match s3.list(&s3_prefix) {
+                    Ok(files) if !files.is_empty() => {
+                        println!(
+                            "cache miss: hydrating segment {} ({} file(s) from S3)",
+                            s3_prefix,
+                            files.len()
+                        );
+                        for file in &files {
+                            let logical = format!("{s3_prefix}/{file}");
+                            match s3.read(&logical) {
+                                Ok(bytes) => {
+                                    if let Err(e) = self.cache.put_bytes(&logical, &bytes) {
+                                        eprintln!(
+                                            "WARN: failed to materialize cache file {logical}: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("WARN: S3 download failed for {logical}: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        eprintln!("WARN: no S3 objects found for segment {s3_prefix}");
+                    }
+                    Err(e) => {
+                        eprintln!("WARN: S3 list failed for segment {s3_prefix}: {e}");
                     }
                 }
             }
         }
     }
+}
+
+/// Redact the password portion of a Postgres URL for logs.
+fn redact_database_url(url: &str) -> String {
+    // postgresql://user:password@host/db → postgresql://user:***@host/db
+    if let Some((scheme_user, rest)) = url.split_once("://") {
+        if let Some((userinfo, hostpart)) = rest.split_once('@') {
+            let user = userinfo.split(':').next().unwrap_or("user");
+            return format!("{scheme_user}://{user}:***@{hostpart}");
+        }
+    }
+    url.to_string()
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -236,18 +393,37 @@ fn main() {
     let role = std::env::var("KOSHA_ROLE").unwrap_or_else(|_| "query".into());
     let port = std::env::var("KOSHA_HTTP_PORT").unwrap_or_else(|_| "8080".into());
     let data_dir = std::env::var("KOSHA_DATA_DIR").unwrap_or_else(|_| "/var/lib/kosha/data".into());
+    let io_timeout_secs: u64 = std::env::var("KOSHA_HTTP_IO_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
     let addr = format!("0.0.0.0:{port}");
 
-    let state = AppState::new(PathBuf::from(data_dir.clone()));
+    let state = Arc::new(AppState::new(PathBuf::from(data_dir.clone())));
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     println!("kosha-server role={role} listening on {addr} data_dir={data_dir}");
 
+    serve(listener, state, Duration::from_secs(io_timeout_secs));
+}
+
+/// Accept loop: one thread per connection.
+///
+/// A single slow or stalled client must never block the server — including
+/// the /healthz probe, whose connection would otherwise sit in the accept
+/// queue behind whatever is stuck. Socket-level timeouts bound how long a
+/// stalled client can hold its handler thread.
+fn serve(listener: TcpListener, state: Arc<AppState>, io_timeout: Duration) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(err) = handle(&state, stream) {
-                    eprintln!("request error: {err}");
-                }
+                stream.set_read_timeout(Some(io_timeout)).ok();
+                stream.set_write_timeout(Some(io_timeout)).ok();
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || {
+                    if let Err(err) = handle(&state, stream) {
+                        eprintln!("request error: {err}");
+                    }
+                });
             }
             Err(err) => eprintln!("accept error: {err}"),
         }
@@ -270,16 +446,22 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).ok() == Some(0) || line == "\r\n" {
-            break;
-        }
-        let line = line.trim_end();
-        if let Some((key, value)) = line.split_once(':') {
-            let k = key.trim().to_lowercase();
-            let v = value.trim();
-            headers.insert(k, v.to_string());
-            if let Some(len) = headers.get("content-length") {
-                content_length = len.parse().unwrap_or(0);
+        match reader.read_line(&mut line) {
+            // EOF, socket timeout, or any other read error ends the headers.
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if line == "\r\n" {
+                    break;
+                }
+                let line = line.trim_end();
+                if let Some((key, value)) = line.split_once(':') {
+                    let k = key.trim().to_lowercase();
+                    let v = value.trim();
+                    headers.insert(k, v.to_string());
+                    if let Some(len) = headers.get("content-length") {
+                        content_length = len.parse().unwrap_or(0);
+                    }
+                }
             }
         }
     }
@@ -455,23 +637,35 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
         Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
     };
 
-    let count = {
+    let ns = request.namespace;
+    let (count, manifest_changed) = {
         let mut indexer = state.indexer.lock().unwrap();
-        match indexer.index_documents(request.namespace.clone(), request.documents) {
+        let version_before = indexer.manifest(&ns).map(|m| m.version);
+        let count = match indexer.index_documents(ns.clone(), request.documents) {
             Ok(c) => c,
             Err(e) => return json_error(500, &format!("indexing error: {e}")),
-        }
+        };
+        // index_documents auto-flushes when the buffer hits the threshold,
+        // which mutates the manifest — detect that via the version.
+        let manifest_changed = indexer.manifest(&ns).map(|m| m.version) != version_before;
+        (count, manifest_changed)
     };
 
     // Ensure namespace is registered in the controller.
     {
         let mut ctrl = state.controller.lock().unwrap();
-        ctrl.ensure_namespace(request.namespace.clone());
+        ctrl.ensure_namespace(ns.clone());
+    }
+
+    // An auto-flush updated the segment list — publish manifest + S3 so the
+    // write survives restarts (explicit flushes go through publish_namespace too).
+    if manifest_changed {
+        state.publish_namespace(&ns);
     }
 
     json_ok(&IndexResponse {
         indexed_count: count,
-        namespace: request.namespace,
+        namespace: ns,
     })
 }
 
@@ -499,18 +693,16 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
         }
     }
 
-    // Sync to S3 after flush (if S3 is configured).
-    #[cfg(feature = "s3")]
-    {
-        if let Some(ref ns_name) = ns {
-            let ns_id = NamespaceId(ns_name.clone());
-            if let Ok(indexer) = state.indexer.lock() {
-                if let Some(manifest) = indexer.manifest(&ns_id).cloned() {
-                    for entry in &manifest.segments {
-                        let seg_path = state.data_dir.join(ns_name).join(&entry.segment_id.0);
-                        state.sync_to_s3(&seg_path);
-                    }
-                }
+    // Publish manifest(s) to the control store and upload segments to S3.
+    match ns {
+        Some(ref name) => state.publish_namespace(&NamespaceId(name.clone())),
+        None => {
+            let all: Vec<NamespaceId> = {
+                let indexer = state.indexer.lock().unwrap();
+                indexer.namespaces().cloned().collect()
+            };
+            for ns_id in &all {
+                state.publish_namespace(ns_id);
             }
         }
     }
@@ -585,10 +777,25 @@ fn handle_stats(state: &AppState) -> String {
         }));
     }
 
+    #[cfg(feature = "s3")]
+    let (s3_enabled, s3_bucket, s3_prefix) = match &state.s3_storage {
+        Some(s3) => (true, Some(s3.bucket().to_string()), Some(s3.prefix().to_string())),
+        None => (false, None, None),
+    };
+    #[cfg(not(feature = "s3"))]
+    let (s3_enabled, s3_bucket, s3_prefix): (bool, Option<String>, Option<String>) =
+        (false, None, None);
+
     json_ok(&serde_json::json!({
         "total_documents": total_docs,
         "total_segments": total_segments,
         "namespaces": namespaces,
+        "control_plane": state.control_plane_kind,
+        "cache_root": state.cache.root().display().to_string(),
+        "cache_size_bytes": state.cache.total_size(),
+        "s3_enabled": s3_enabled,
+        "s3_bucket": s3_bucket,
+        "s3_prefix": s3_prefix,
     }))
 }
 
@@ -1129,6 +1336,103 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
     }
 
+    #[test]
+    fn flush_persists_manifest_to_control_store() {
+        // Regression: manifests were only kept in the in-process indexer map
+        // and never written to the control store, so a restart made every
+        // namespace vanish from search.
+        let state = test_state();
+        let ns = "test-ns-persist";
+
+        let req = IndexRequest {
+            namespace: NamespaceId(ns.into()),
+            documents: vec![Document {
+                id: DocumentId("doc1".into()),
+                fields: vec![Field::text("title", "hello world")],
+            }],
+        };
+        let body = serde_json::to_vec(&req).unwrap();
+        route("POST /index HTTP/1.1\r\n", &HashMap::new(), &body, "test", &state);
+
+        let flush_body = serde_json::to_vec(&serde_json::json!({"namespace": ns})).unwrap();
+        let resp = route(
+            "POST /flush HTTP/1.1\r\n",
+            &HashMap::new(),
+            &flush_body,
+            "test",
+            &state,
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "flush: {resp}");
+
+        let ctrl = state.controller.lock().unwrap();
+        let m = ctrl
+            .manifest(&NamespaceId(ns.into()))
+            .expect("flush must persist the manifest to the control store");
+        assert_eq!(m.version, 1);
+        assert_eq!(m.segments.len(), 1);
+        assert_eq!(m.segments[0].doc_count, 1);
+    }
+
+    #[test]
+    fn auto_flush_during_index_persists_manifest() {
+        // Regression: index_documents auto-flushes when the buffer hits the
+        // flush threshold (1000) — that manifest update was never persisted.
+        let state = test_state();
+        let ns = "test-ns-autoflush";
+
+        let docs: Vec<Document> = (0..1000)
+            .map(|i| Document {
+                id: DocumentId(format!("doc{i}")),
+                fields: vec![Field::text("title", format!("document number {i}"))],
+            })
+            .collect();
+        let req = IndexRequest {
+            namespace: NamespaceId(ns.into()),
+            documents: docs,
+        };
+        let body = serde_json::to_vec(&req).unwrap();
+        let resp = route(
+            "POST /index HTTP/1.1\r\n",
+            &HashMap::new(),
+            &body,
+            "test",
+            &state,
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "index: {resp}");
+
+        let ctrl = state.controller.lock().unwrap();
+        let m = ctrl
+            .manifest(&NamespaceId(ns.into()))
+            .expect("auto-flush must persist the manifest to the control store");
+        assert_eq!(m.segments.len(), 1);
+        assert_eq!(m.segments[0].doc_count, 1000);
+    }
+
+    #[test]
+    fn stalled_connection_does_not_block_healthz() {
+        // Regression: the accept loop used to handle one connection at a
+        // time, so a single stalled client blocked every subsequent request
+        // — including the /healthz probe.
+        use std::io::Read;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(test_state());
+        std::thread::spawn(move || serve(listener, state, Duration::from_secs(30)));
+
+        // A client that connects but never sends anything.
+        let _stalled = TcpStream::connect(addr).unwrap();
+        std::thread::sleep(Duration::from_millis(100)); // let the server accept it
+
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(b"GET /healthz HTTP/1.1\r\nhost: x\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "response: {resp}");
+    }
+
     fn parse(response: &str) -> (&str, &str, &str) {
         let (head, body) = response
             .split_once("\r\n\r\n")
@@ -1150,5 +1454,17 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         AppState::new(dir)
+    }
+
+    #[test]
+    fn redact_database_url_hides_password() {
+        assert_eq!(
+            redact_database_url("postgresql://kosha:secret@host:5432/kosha"),
+            "postgresql://kosha:***@host:5432/kosha"
+        );
+        assert_eq!(
+            redact_database_url("postgresql://localhost/kosha"),
+            "postgresql://localhost/kosha"
+        );
     }
 }
