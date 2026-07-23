@@ -1,30 +1,89 @@
 # Kosha
 
+[![CI](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml/badge.svg)](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml)
+[![rustfmt](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml/badge.svg?job=fmt)](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml)
+[![test](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml/badge.svg?job=test)](https://github.com/decover-tech/Kosha/actions/workflows/ci.yml)
+
 A storage-disaggregated search engine: **S3 is the source of truth, local NVMe
 SSD is a transparent cache, and compute nodes are disposable.** Kosha is being
-built to replace Elasticsearch/OpenSearch for Decover's search workloads, and
-is intended to be reusable as a general-purpose, schema-driven search service.
+built to replace Elasticsearch/OpenSearch and is intended to be reusable as a general-purpose, schema-driven search service.
 
 See [DESIGN.md](DESIGN.md) for the full architecture.
 
-> **Status: early development (Phase 1 — BM25 lexical search only).**
-> The crate layout below is a skeleton; no query/index functionality exists
-> yet. Vector/ANN retrieval, RRF fusion, and rerank are Phase 2
+> **Status: Phase 1 complete — BM25 lexical + kNN/ANN search implemented.**
+> All seven crates have functional BM25 indexing, query, filtering,
+> aggregation, and HNSW vector search. RRF fusion and rerank are Phase 2
 > (DESIGN.md §3.1).
 
 ## Repository layout
 
     crates/
-      kosha-core      shared types (namespace/segment ids)
-      kosha-segment   segment file format (DESIGN.md §6.2)        — Epic 2
-      kosha-write     WAL, buffer, flush, compaction (§7)         — Epic 3
+      kosha-core      shared types, data model, filter/query DSL  — Epic 2
+      kosha-segment   segment format: inverted idx, doc store,    — Epic 2
+                     filter columns, vector store, HNSW graph
+      kosha-write     document buffer + flush-to-segment          — Epic 3
       kosha-cache     NVMe SSD read-through cache (§9)            — Epic 4
-      kosha-query     BM25 read path (§8)                         — Epic 5
-      kosha-control   namespace registry + manifest store (§5)    — Epic 6
-      kosha-server    node binary: ingest/query/compaction + API  — Epic 8
-    proto/            protobuf definitions (dsearch.proto)        — Epic 1
-    docs/             development and integration guides
-    DESIGN.md         architecture document (v1 draft)
+      kosha-query     BM25 scorer, kNN/ANN search, aggregations,  — Epic 5
+                     wildcard, match phrase, filtering
+      kosha-control   in-memory namespace + manifest store        — Epic 6
+      kosha-server    HTTP API (healthz, index, search, stats,    — Epic 8
+                     delete, flush)
+    clients/
+      python/kosha_client  OpenSearch-compatible Python client    — Epic 11
+                           (spec → codegen → thin client)
+      python/README.md     how the client is structured
+    proto/
+      buf.yaml             Buf module config
+      kosha/v1/kosha.proto  Canonical API contract (source of truth) — Epic 1
+    gen/                   Generated stubs + OpenAPI spec (git-ignored)
+    tools/codegen/         Code generation scripts and docs
+    docs/                  Development and integration guides
+    DESIGN.md              Architecture document (v1 draft)
+
+## Quickstart (test as a customer would)
+
+```bash
+# 1. Start Kosha locally
+docker compose up --build
+
+# 2. In another terminal, run the quickstart script
+KOSHA_HOST=http://localhost:8080 KOSHA_API_KEY=sk-kosha-dev python scripts/quickstart.py
+```
+
+Expected output:
+```
+═══ 1. Health check ═══
+   Kosha reachable: True
+
+═══ 2. Index documents ═══
+   Indexed: 3 documents
+
+═══ 3. Search ═══
+   Found 1 result(s) for 'breach':
+     [doc-1] breach of contract  (score=0.287)
+
+═══ 4. Flush + re-search ═══
+   Found 1 result(s) for 'antitrust':
+     [doc-3] merger analysis  (score=0.287)
+
+═══ 5. Stats ═══
+   Total documents: 3
+     dev/quickstart-demo: 3 docs, 1 segment(s)
+```
+
+Or for a hosted instance:
+```python
+from kosha_client import KoshaClient
+
+client = KoshaClient(
+    hosts="https://app.kosha.io",
+    api_key="sk-acme-corp-xxx",
+)
+client.ping()  # True
+```
+
+The client respects `KOSHA_HOST` and `KOSHA_API_KEY` env vars — no code changes needed
+between local dev and production.
 
 ## Development
 
@@ -47,9 +106,17 @@ auto-created.
 
 ### Run with Docker
 
+Pre-built multi-arch images are published to GHCR on every merge to `main`
+(`:main`) and for every `v*` tag (`:0.2.5`, `:0.2`, `:latest`):
+
+    docker pull ghcr.io/decover-tech/kosha:latest
+    docker run --rm -p 8080:8080 ghcr.io/decover-tech/kosha:latest
+    curl localhost:8080/healthz   # -> ok
+
+Or build locally:
+
     docker build -t kosha:latest .
     docker run --rm -p 8080:8080 kosha:latest
-    curl localhost:8080/healthz   # -> ok
 
 Or bring up the whole local stack (MinIO + server): `docker compose up --build`.
 

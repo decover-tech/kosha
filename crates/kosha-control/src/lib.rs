@@ -6,7 +6,13 @@
 
 use std::collections::HashMap;
 
-use kosha_core::{KoshaError, Manifest, NamespaceId};
+use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
+
+#[cfg(feature = "postgres")]
+mod postgres;
+
+#[cfg(feature = "postgres")]
+pub use postgres::PgStore;
 
 /// In-memory namespace registry and manifest store.
 ///
@@ -112,6 +118,38 @@ impl Controller {
 impl Default for Controller {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ControlStore for Controller {
+    fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
+        self.create_namespace(id)
+    }
+    fn ensure_namespace(&mut self, id: NamespaceId) {
+        self.ensure_namespace(id)
+    }
+    fn has_namespace(&self, id: &NamespaceId) -> bool {
+        self.has_namespace(id)
+    }
+    fn manifest(&self, id: &NamespaceId) -> Option<&Manifest> {
+        self.manifest(id)
+    }
+    fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut Manifest> {
+        self.manifest_mut(id)
+    }
+    fn compare_and_swap_manifest(
+        &mut self,
+        id: &NamespaceId,
+        expected_version: u64,
+        new_manifest: Manifest,
+    ) -> Result<(), KoshaError> {
+        self.compare_and_swap_manifest(id, expected_version, new_manifest)
+    }
+    fn list_namespaces(&self) -> Vec<NamespaceId> {
+        self.list_namespaces().to_vec()
+    }
+    fn namespace_count(&self) -> usize {
+        self.namespace_count()
     }
 }
 

@@ -11,7 +11,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
-RUN cargo build --release --locked --package kosha-server
+RUN cargo build --release --locked --package kosha-server --features postgres,s3
 
 # ---------- Runtime stage ----------
 FROM debian:bookworm-slim AS runtime

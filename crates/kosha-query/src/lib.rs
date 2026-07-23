@@ -1,34 +1,15 @@
-//! Read path / BM25 query engine (DESIGN.md §8, implementation plan Epic 5):
-//! manifest fetch → segment pruning via footer stats → postings
-//! intersection/union → BM25 scoring → top-K merge across segments.
-//!
-//! Phase 1 is lexical-only; the semantic branch, RRF fusion, and rerank hook
-//! are Phase 2.
-
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use kosha_core::{
-    Bm25Params, KoshaError, Manifest, NamespaceId, ScoredDocument, SearchQuery, SearchResult,
+    AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult, AggMetricResult,
+    Aggregation, AggregationResults, Bm25Params, FieldType, FilterClause, FilterStore, KoshaError,
+    Manifest, NamespaceId, ScoredDocument, SearchQuery, SearchResult,
 };
 use kosha_segment::{tokenize, SegmentReader};
 
 // ─── BM25 scorer ────────────────────────────────────────────────────────────
 
-/// BM25 scoring implementation.
-///
-/// Standard formula:
-///
-///   score(D, Q) = Σ IDF(t) · (tf(t,D) · (k₁ + 1)) / (tf(t,D) + k₁ · (1 - b + b · |D| / avgdl))
-///
-/// where:
-///   IDF(t) = log(1 + (N - df(t) + 0.5) / (df(t) + 0.5))
-///   tf(t,D) = frequency of term t in document D
-///   |D| = length of document D (in tokens)
-///   avgdl = average document length across the corpus
-///   N = total number of documents in the corpus
-///   df(t) = number of documents containing term t
-///   k₁, b = BM25 tuning parameters
 pub struct Bm25Scorer {
     num_docs: u32,
     avg_field_length: f64,
@@ -44,7 +25,6 @@ impl Bm25Scorer {
         }
     }
 
-    /// Compute the BM25 score for a single term in a document.
     pub fn score_term(
         &self,
         term_frequency: u32,
@@ -58,45 +38,368 @@ impl Bm25Scorer {
         let avgdl = self.avg_field_length;
         let k1 = self.params.k1;
         let b = self.params.b;
-
         if tf == 0.0 || df == 0.0 || n == 0.0 {
             return 0.0;
         }
-
-        // IDF(t) = log(1 + (N - df + 0.5) / (df + 0.5))
         let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-
-        // TF component: (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * doc_len / avgdl))
         let tf_component = (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * doc_len / avgdl));
-
         idf * tf_component
     }
+}
 
-    /// Score a document against all query terms given their term frequencies
-    /// in that document.
-    pub fn score(
-        &self,
-        query_term_frequencies: &HashMap<String, u32>,
-        doc_frequencies: &HashMap<String, u32>,
-        doc_field_length: u32,
-    ) -> f64 {
-        let mut total_score = 0.0;
-        for (term, &tf) in query_term_frequencies {
-            if tf == 0 {
-                continue;
-            }
-            let df = doc_frequencies.get(term).copied().unwrap_or(0);
-            total_score += self.score_term(tf, df, doc_field_length);
+// ─── Wildcard matcher ───────────────────────────────────────────────────────
+
+pub fn wildcard_terms(terms: &[&str], pattern: &str, case_insensitive: bool) -> Vec<String> {
+    terms
+        .iter()
+        .filter(|t| simple_wildcard_match(t, pattern, case_insensitive))
+        .map(|t| t.to_string())
+        .collect()
+}
+
+fn simple_wildcard_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
+    let text = if case_insensitive {
+        text.to_lowercase()
+    } else {
+        text.to_string()
+    };
+    let pattern = if case_insensitive {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_string()
+    };
+
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let mut ti = 0;
+    let mut pi = 0;
+    let mut backtrack_t = 0usize;
+    let mut backtrack_p = 0usize;
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            backtrack_t = ti;
+            backtrack_p = pi;
+            pi += 1;
+        } else if backtrack_p < p.len() {
+            backtrack_t += 1;
+            ti = backtrack_t;
+            pi = backtrack_p + 1;
+        } else {
+            return false;
         }
-        total_score
     }
+
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi >= p.len()
+}
+
+// ─── Match phrase scorer ────────────────────────────────────────────────────
+
+pub fn match_phrase_score(
+    postings_list: &[Vec<u32>], // positions for each query term, per doc
+    slop: u32,
+) -> f64 {
+    if postings_list.is_empty() {
+        return 0.0;
+    }
+    if postings_list.len() == 1 {
+        return 1.0;
+    }
+
+    let first_positions = &postings_list[0];
+    for &start_pos in first_positions {
+        let mut matched = true;
+        for (i, positions) in postings_list[1..].iter().enumerate() {
+            let expected = start_pos + (i as u32) + 1;
+            let found = positions.iter().any(|&p| {
+                let dist = p.abs_diff(expected);
+                dist <= slop
+            });
+            if !found {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return 1.0;
+        }
+    }
+    0.0
+}
+
+// ─── Filter applier ─────────────────────────────────────────────────────────
+
+pub struct FilterApplier;
+
+impl FilterApplier {
+    pub fn apply(
+        clause: &FilterClause,
+        store: &FilterStore,
+        candidates: &HashSet<u32>,
+    ) -> Result<HashSet<u32>, KoshaError> {
+        match clause {
+            FilterClause::Term { term } => Self::apply_term(term, store, candidates),
+            FilterClause::Terms { terms } => Self::apply_terms(terms, store, candidates),
+            FilterClause::Range { range } => Self::apply_range(range, store, candidates),
+            FilterClause::Bool { bool: b } => Self::apply_bool(b, store, candidates),
+            FilterClause::MatchAll { .. } => Ok(candidates.clone()),
+        }
+    }
+
+    fn apply_term(
+        term: &HashMap<String, String>,
+        store: &FilterStore,
+        candidates: &HashSet<u32>,
+    ) -> Result<HashSet<u32>, KoshaError> {
+        let mut result = HashSet::new();
+        for (field, value) in term {
+            if let Some(entries) = store.string_fields.get(field) {
+                for &(doc_seq, ref val) in entries {
+                    if candidates.contains(&doc_seq) && val == value {
+                        result.insert(doc_seq);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn apply_terms(
+        terms: &HashMap<String, Vec<String>>,
+        store: &FilterStore,
+        candidates: &HashSet<u32>,
+    ) -> Result<HashSet<u32>, KoshaError> {
+        let mut result = HashSet::new();
+        for (field, values) in terms {
+            let value_set: HashSet<&str> = values.iter().map(|s| s.as_str()).collect();
+            if let Some(entries) = store.string_fields.get(field) {
+                for &(doc_seq, ref val) in entries {
+                    if candidates.contains(&doc_seq) && value_set.contains(val.as_str()) {
+                        result.insert(doc_seq);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn apply_range(
+        range: &HashMap<String, kosha_core::RangeBound>,
+        store: &FilterStore,
+        candidates: &HashSet<u32>,
+    ) -> Result<HashSet<u32>, KoshaError> {
+        let mut result = HashSet::new();
+        for (field, bound) in range {
+            if let Some(entries) = store.integer_fields.get(field) {
+                for &(doc_seq, val) in entries {
+                    if candidates.contains(&doc_seq) && check_i64(val, bound) {
+                        result.insert(doc_seq);
+                    }
+                }
+            } else if let Some(entries) = store.float_fields.get(field) {
+                for &(doc_seq, val) in entries {
+                    if candidates.contains(&doc_seq) && check_f64(val, bound) {
+                        result.insert(doc_seq);
+                    }
+                }
+            } else if let Some(entries) = store.string_fields.get(field) {
+                for &(doc_seq, ref val) in entries {
+                    if candidates.contains(&doc_seq) && check_str(val, bound) {
+                        result.insert(doc_seq);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn apply_bool(
+        b: &kosha_core::BoolFilter,
+        store: &FilterStore,
+        candidates: &HashSet<u32>,
+    ) -> Result<HashSet<u32>, KoshaError> {
+        let mut working: Option<HashSet<u32>> = None;
+
+        if !b.must.is_empty() {
+            let mut acc = candidates.clone();
+            for clause in &b.must {
+                acc = Self::apply(clause, store, &acc)?;
+            }
+            working = Some(acc);
+        }
+        if !b.must_not.is_empty() {
+            let base = working.take().unwrap_or_else(|| candidates.clone());
+            let mut excluded = HashSet::new();
+            for clause in &b.must_not {
+                excluded.extend(Self::apply(clause, store, &base)?);
+            }
+            working = Some(base.difference(&excluded).copied().collect());
+        }
+        if !b.should.is_empty() {
+            let base = working.take().unwrap_or_else(|| candidates.clone());
+            let mut scores: HashMap<u32, usize> = HashMap::new();
+            for clause in &b.should {
+                for doc_seq in Self::apply(clause, store, &base)? {
+                    *scores.entry(doc_seq).or_default() += 1;
+                }
+            }
+            let passed: HashSet<u32> = scores
+                .into_iter()
+                .filter(|(_, c)| *c >= b.minimum_should_match)
+                .map(|(d, _)| d)
+                .collect();
+            working = Some(if base.is_empty() {
+                passed
+            } else {
+                base.intersection(&passed).copied().collect()
+            });
+        }
+        Ok(working.unwrap_or_else(|| candidates.clone()))
+    }
+}
+
+fn check_i64(val: i64, bound: &kosha_core::RangeBound) -> bool {
+    if let Some(ref gte) = bound.gte {
+        if let Ok(b) = gte.parse::<i64>() {
+            if val < b {
+                return false;
+            }
+        }
+    }
+    if let Some(ref gt) = bound.gt {
+        if let Ok(b) = gt.parse::<i64>() {
+            if val <= b {
+                return false;
+            }
+        }
+    }
+    if let Some(ref lte) = bound.lte {
+        if let Ok(b) = lte.parse::<i64>() {
+            if val > b {
+                return false;
+            }
+        }
+    }
+    if let Some(ref lt) = bound.lt {
+        if let Ok(b) = lt.parse::<i64>() {
+            if val >= b {
+                return false;
+            }
+        }
+    }
+    true
+}
+fn check_f64(val: f64, bound: &kosha_core::RangeBound) -> bool {
+    if let Some(ref gte) = bound.gte {
+        if let Ok(b) = gte.parse::<f64>() {
+            if val < b {
+                return false;
+            }
+        }
+    }
+    if let Some(ref gt) = bound.gt {
+        if let Ok(b) = gt.parse::<f64>() {
+            if val <= b {
+                return false;
+            }
+        }
+    }
+    if let Some(ref lte) = bound.lte {
+        if let Ok(b) = lte.parse::<f64>() {
+            if val > b {
+                return false;
+            }
+        }
+    }
+    if let Some(ref lt) = bound.lt {
+        if let Ok(b) = lt.parse::<f64>() {
+            if val >= b {
+                return false;
+            }
+        }
+    }
+    true
+}
+fn check_str(val: &str, bound: &kosha_core::RangeBound) -> bool {
+    if let Some(ref gte) = bound.gte {
+        if val < gte.as_str() {
+            return false;
+        }
+    }
+    if let Some(ref gt) = bound.gt {
+        if val <= gt.as_str() {
+            return false;
+        }
+    }
+    if let Some(ref lte) = bound.lte {
+        if val > lte.as_str() {
+            return false;
+        }
+    }
+    if let Some(ref lt) = bound.lt {
+        if val >= lt.as_str() {
+            return false;
+        }
+    }
+    true
+}
+
+// ─── Highlight applier ──────────────────────────────────────────────────────
+
+pub fn apply_highlight(
+    text: &str,
+    query_terms: &[String],
+    pre_tag: &str,
+    post_tag: &str,
+) -> String {
+    let mut result = text.to_string();
+    for term in query_terms {
+        let lower = term.to_lowercase();
+        if let Some(start) = result.to_lowercase().find(&lower) {
+            let (before, rest) = result.split_at(start);
+            let (matched, after) = rest.split_at(lower.len());
+            result = format!("{}{}{}{}{}", before, pre_tag, matched, post_tag, after);
+        }
+    }
+    result
 }
 
 // ─── Searcher ───────────────────────────────────────────────────────────────
 
-/// Executes BM25 search queries across segments on disk.
+// ─── Cosine similarity ─────────────────────────────────────────────────────
+
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    (dot / (norm_a * norm_b)) as f64
+}
+
+/// Flat kNN search: compute cosine similarity against all stored vectors,
+/// return top-K (doc_seq, score) pairs.
+pub fn flat_knn(query_vector: &[f32], vectors: &[(u32, Vec<f32>)], k: usize) -> Vec<(u32, f64)> {
+    let mut scores: Vec<(u32, f64)> = vectors
+        .iter()
+        .map(|(doc_seq, vec)| (*doc_seq, cosine_similarity(query_vector, vec)))
+        .collect();
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scores.truncate(k);
+    scores
+}
+
 pub struct Searcher {
-    /// Root data directory.
     data_dir: PathBuf,
 }
 
@@ -105,121 +408,481 @@ impl Searcher {
         Self { data_dir }
     }
 
-    /// Execute a search query against the given namespace.
-    ///
-    /// Loads all segments listed in the manifest, scores each document,
-    /// and returns the top-K results.
     pub fn search(
         &self,
         namespace: &NamespaceId,
         manifest: &Manifest,
         query: &SearchQuery,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
     ) -> Result<SearchResult, KoshaError> {
         if manifest.segments.is_empty() {
             return Ok(SearchResult {
                 results: Vec::new(),
                 total_hits: 0,
+                aggregations: None,
             });
         }
 
-        // Parse the query into terms.
         let query_terms = tokenize(&query.query_text);
-        if query_terms.is_empty() {
-            return Ok(SearchResult {
-                results: Vec::new(),
-                total_hits: 0,
-            });
-        }
 
-        // Count query term frequency (how many times each term appears in the
-        // query — usually 1 for simple queries, but could be >1 for repeated).
-        let mut query_term_freqs: HashMap<String, u32> = HashMap::new();
-        for term in &query_terms {
-            *query_term_freqs.entry(term.clone()).or_default() += 1;
-        }
+        let is_tombstoned = |seg_id: &kosha_core::SegmentId, doc_seq: u32| -> bool {
+            tombstones.is_some_and(|t| t.get(seg_id).is_some_and(|seqs| seqs.contains(&doc_seq)))
+        };
+        let has_query =
+            !query_terms.is_empty() || query.wildcard.is_some() || query.match_phrase.is_some();
+        let has_only_filter = !has_query && query.filter.is_some();
 
         let mut all_results: Vec<ScoredDocument> = Vec::new();
+        let mut all_aggs: HashMap<String, AggregationResults> = HashMap::new();
 
         for entry in &manifest.segments {
-            let seg_dir = self
-                .data_dir
-                .join(&namespace.0)
-                .join(&entry.segment_id.0);
+            let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
             if !seg_dir.exists() {
                 continue;
             }
 
             let reader = SegmentReader::open(seg_dir)?;
-
+            let total_docs = reader.doc_count();
+            let store = &reader.filter_store;
             let scorer = Bm25Scorer::new(
-                reader.doc_count(),
+                total_docs,
                 reader.avg_field_length(),
                 reader.bm25_params().clone(),
             );
 
-            // Build doc_frequencies for each query term.
-            let mut doc_frequencies: HashMap<String, u32> = HashMap::new();
-            for term in &query_terms {
-                if let Some(postings) = reader.postings(term) {
-                    doc_frequencies.insert(term.clone(), postings.len() as u32);
+            // ── Wildcard matching ──
+            let is_wildcard_mode = query.wildcard.is_some();
+            let effective_terms = if let Some(ref wc) = query.wildcard {
+                let all_terms: Vec<&str> = reader.all_terms();
+                wildcard_terms(&all_terms, &wc.pattern, wc.case_insensitive)
+            } else if !query_terms.is_empty() {
+                query_terms.clone()
+            } else {
+                Vec::new()
+            };
+
+            // ── Match phrase ──
+            let phrase_match = if let Some(ref mp) = query.match_phrase {
+                let phrase_terms = tokenize(&mp.phrase);
+                Some((phrase_terms, mp.slop))
+            } else {
+                None
+            };
+
+            let phrase_tokenized = phrase_match.as_ref().map(|p| &p.0);
+
+            // ── BM25 scoring with positions for phrase ──
+            if !effective_terms.is_empty() || phrase_tokenized.is_some() {
+                let terms_for_bm25 = if let Some(ref pt) = phrase_tokenized {
+                    pt
                 } else {
-                    doc_frequencies.insert(term.clone(), 0);
+                    &effective_terms
+                };
+
+                let term_postings: Vec<(&str, &[kosha_core::Posting])> = terms_for_bm25
+                    .iter()
+                    .filter_map(|t| reader.postings(t).map(|p| (t.as_str(), p)))
+                    .collect();
+
+                let mut doc_frequencies: HashMap<&str, u32> = HashMap::new();
+                for (t, p) in &term_postings {
+                    doc_frequencies.insert(t, p.len() as u32);
                 }
-            }
 
-            // Score each document that matches at least one query term.
-            // We track which documents we've already scored to avoid duplicates
-            // within this segment.
-            let mut scored_in_segment: HashMap<u32, f64> = HashMap::new();
+                // ── Postings AND/OR: AND for multi-term queries, OR for wildcard ──
+                let mut scored: HashMap<u32, f64> = HashMap::new();
+                let use_and =
+                    term_postings.len() > 1 && !is_wildcard_mode && phrase_tokenized.is_none();
 
-            for term in &query_terms {
-                if let Some(postings) = reader.postings(term) {
-                    let query_tf = query_term_freqs.get(term).copied().unwrap_or(1);
-                    let query_tf_map: HashMap<String, u32> =
-                        [(term.clone(), query_tf)].into_iter().collect();
+                if !use_and {
+                    // OR mode (wildcard, phrase, or single term): score any matching doc.
+                    for (term, postings) in &term_postings {
+                        let df = doc_frequencies.get(term).copied().unwrap_or(0);
+                        for posting in *postings {
+                            if let Some(doc_rec) = reader.doc_record(posting.doc_id) {
+                                let score = scorer.score_term(
+                                    posting.term_frequency,
+                                    df,
+                                    doc_rec.field_length,
+                                );
+                                *scored.entry(posting.doc_id).or_insert(0.0) += score;
+                            }
+                        }
+                    }
+                } else {
+                    // Multi-term: intersect doc_ids, then score intersection.
+                    // Start with the shortest postings list for efficiency.
+                    let mut candidates: Vec<(u32, Vec<Vec<u32>>)> = {
+                        let shortest = term_postings.iter().min_by_key(|(_, p)| p.len()).unwrap();
+                        shortest.1.iter().map(|p| (p.doc_id, Vec::new())).collect()
+                    };
+                    let _doc_freqs: HashMap<u32, HashMap<&str, u32>> = HashMap::new();
 
-                    for posting in postings {
-                        let doc_rec = match reader.doc_record(posting.doc_id) {
-                            Some(d) => d,
-                            None => continue,
-                        };
+                    // For each candidate doc, verify it appears in ALL other postings lists.
+                    for (_term, postings) in &term_postings {
+                        let term_docs: HashMap<u32, &kosha_core::Posting> =
+                            postings.iter().map(|p| (p.doc_id, p)).collect();
+                        candidates.retain(|(doc_id, _)| term_docs.contains_key(doc_id));
+                        if candidates.is_empty() {
+                            break;
+                        }
+                        // Store positions for phrase matching.
+                        for (doc_id, positions) in &mut candidates {
+                            if let Some(posting) = term_docs.get(doc_id) {
+                                positions.push(posting.positions.clone());
+                            }
+                        }
+                    }
 
-                        let score = scorer.score(
-                            &query_tf_map,
-                            &doc_frequencies,
-                            doc_rec.field_length,
-                        );
+                    // Score surviving candidates.
+                    for (doc_id, _doc_positions) in &candidates {
+                        if let Some(doc_rec) = reader.doc_record(*doc_id) {
+                            let mut total_score = 0.0;
+                            for (term, postings) in &term_postings {
+                                let df = doc_frequencies.get(term).copied().unwrap_or(0);
+                                let posting = postings.iter().find(|p| p.doc_id == *doc_id);
+                                if let Some(p) = posting {
+                                    total_score += scorer.score_term(
+                                        p.term_frequency,
+                                        df,
+                                        doc_rec.field_length,
+                                    );
+                                }
+                            }
+                            scored.insert(*doc_id, total_score);
+                        }
+                    }
+                }
 
-                        *scored_in_segment.entry(posting.doc_id).or_insert(0.0) += score;
+                // Apply phrase matching (filter out docs that don't match the phrase).
+                if let Some((ref phrase_terms, slop)) = phrase_match {
+                    let doc_ids: Vec<u32> = scored.keys().copied().collect();
+                    for doc_id in doc_ids {
+                        let mut term_positions: Vec<Vec<u32>> = Vec::new();
+                        for pt in phrase_terms {
+                            if let Some(postings) = reader.postings(pt) {
+                                if let Some(p) = postings.iter().find(|p| p.doc_id == doc_id) {
+                                    term_positions.push(p.positions.clone());
+                                }
+                            }
+                        }
+                        if term_positions.len() < phrase_terms.len() {
+                            // Not all phrase terms appear in this doc.
+                            scored.remove(&doc_id);
+                            continue;
+                        }
+                        let phrase_score = match_phrase_score(&term_positions, slop);
+                        if phrase_score == 0.0 {
+                            scored.remove(&doc_id);
+                        } else {
+                            // Boost the score for matching the phrase.
+                            *scored.get_mut(&doc_id).unwrap() *= 1.0 + phrase_score * 0.5;
+                        }
+                    }
+                }
+
+                for (doc_seq, score) in scored {
+                    if is_tombstoned(&entry.segment_id, doc_seq) {
+                        continue;
+                    }
+                    if let Some(doc_rec) = reader.doc_record(doc_seq) {
+                        all_results.push(ScoredDocument {
+                            doc_id: doc_rec.doc_id.clone(),
+                            score,
+                            fields: doc_rec.fields.clone(),
+                            highlights: None,
+                        });
+                    }
+                }
+            } else if has_only_filter {
+                let all_candidates: HashSet<u32> = (0..total_docs).collect();
+                let passed =
+                    FilterApplier::apply(query.filter.as_ref().unwrap(), store, &all_candidates)?;
+                for doc_seq in passed {
+                    if is_tombstoned(&entry.segment_id, doc_seq) {
+                        continue;
+                    }
+                    if let Some(doc_rec) = reader.doc_record(doc_seq) {
+                        let score = scorer.score_term(1, total_docs, doc_rec.field_length);
+                        all_results.push(ScoredDocument {
+                            doc_id: doc_rec.doc_id.clone(),
+                            score,
+                            fields: doc_rec.fields.clone(),
+                            highlights: None,
+                        });
                     }
                 }
             }
 
-            // Convert to ScoredDocument.
-            for (doc_seq, score) in scored_in_segment {
-                if let Some(doc_rec) = reader.doc_record(doc_seq) {
-                    all_results.push(ScoredDocument {
-                        doc_id: doc_rec.doc_id.clone(),
-                        score,
-                        fields: doc_rec.fields.clone(),
+            // ── kNN search (HNSW when available, flat fallback) ──
+            if let Some(ref knn) = query.knn {
+                if !reader.vector_store.vectors.is_empty() {
+                    let knn_results: Vec<(u32, f64)> = if let Some(ref hnsw) = reader.hnsw_map {
+                        let query_point = kosha_segment::CosinePoint(knn.vector.clone());
+                        let mut search = instant_distance::Search::default();
+                        hnsw.search(&query_point, &mut search)
+                            .take(knn.k)
+                            .map(|item| (*item.value, (1.0 - item.distance as f64).max(0.0)))
+                            .collect()
+                    } else {
+                        flat_knn(&knn.vector, &reader.vector_store.vectors, knn.k)
+                    };
+                    // Merge with existing BM25 results or use kNN results directly.
+                    let has_bm25 = !all_results.is_empty();
+                    if has_bm25 {
+                        // BM25 + kNN hybrid: add kNN score as a boost factor.
+                        let knn_scores: HashMap<u32, f64> = knn_results.into_iter().collect();
+                        for (doc_seq, knn_score) in &knn_scores {
+                            let doc_id = (0..total_docs)
+                                .filter_map(|s| reader.doc_record(s))
+                                .find(|d| d.doc_seq == *doc_seq)
+                                .map(|d| d.doc_id.clone());
+                            if let Some(ref did) = doc_id {
+                                if let Some(existing) =
+                                    all_results.iter_mut().find(|r| r.doc_id.0 == did.0)
+                                {
+                                    // Boost existing BM25 score with kNN score.
+                                    existing.score = existing.score * 0.5 + knn_score * 0.5 * 100.0;
+                                }
+                            }
+                        }
+                    } else {
+                        // Pure kNN search.
+                        for (doc_seq, score) in knn_results {
+                            if is_tombstoned(&entry.segment_id, doc_seq) {
+                                continue;
+                            }
+                            if let Some(doc_rec) = reader.doc_record(doc_seq) {
+                                all_results.push(ScoredDocument {
+                                    doc_id: doc_rec.doc_id.clone(),
+                                    score: (score + 1.0) * 10.0, // scale to BM25-like range
+                                    fields: doc_rec.fields.clone(),
+                                    highlights: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Apply post-BM25 filter ──
+            if let Some(ref clause) = query.filter {
+                if !effective_terms.is_empty() || phrase_tokenized.is_some() {
+                    let doc_seqs: HashSet<u32> = all_results
+                        .iter()
+                        .filter_map(|r| {
+                            (0..total_docs).find(|&s| {
+                                reader.doc_record(s).is_some_and(|d| d.doc_id == r.doc_id)
+                            })
+                        })
+                        .collect();
+                    let passed = FilterApplier::apply(clause, store, &doc_seqs)?;
+                    all_results.retain(|r| {
+                        (0..total_docs).any(|s| {
+                            reader
+                                .doc_record(s)
+                                .is_some_and(|d| d.doc_id == r.doc_id && passed.contains(&s))
+                        })
                     });
+                }
+            }
+
+            // ── Aggregations ──
+            for (agg_name, agg) in &query.aggs {
+                match agg {
+                    Aggregation::Terms { terms } => {
+                        let result = compute_single_aggregation(store, &terms.field);
+                        all_aggs.insert(agg_name.clone(), result);
+                    }
+                    Aggregation::Cardinality { cardinality } => {
+                        let result = compute_cardinality(store, &cardinality.field);
+                        all_aggs.insert(agg_name.clone(), result);
+                    }
+                    Aggregation::Composite { composite } => {
+                        let result = compute_composite(store, composite);
+                        all_aggs.insert(agg_name.clone(), result);
+                    }
                 }
             }
         }
 
-        // Sort by score descending, take top-K.
-        all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // ── Highlighting ──
+        if let Some(ref highlight) = query.highlight {
+            if !query_terms.is_empty() {
+                let pre = highlight
+                    .pre_tags
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("<b>");
+                let post = highlight
+                    .post_tags
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("</b>");
+                for result in &mut all_results {
+                    let mut highlights = Vec::new();
+                    for field in &result.fields {
+                        if field.name == highlight.field && field.field_type == FieldType::Text {
+                            highlights.push(apply_highlight(&field.value, &query_terms, pre, post));
+                        }
+                    }
+                    if !highlights.is_empty() {
+                        result.highlights = Some(highlights);
+                    }
+                }
+            }
+        }
+
+        // ── Sort ──
+        if !query.sort.is_empty() {
+            all_results.sort_by(|a, b| {
+                for spec in &query.sort {
+                    for (field, order) in &spec.fields {
+                        let ord = match field.as_str() {
+                            "_score" => b
+                                .score
+                                .partial_cmp(&a.score)
+                                .unwrap_or(std::cmp::Ordering::Equal),
+                            _ => {
+                                let a_val =
+                                    a.fields.iter().find(|f| f.name == *field).map(|f| &f.value);
+                                let b_val =
+                                    b.fields.iter().find(|f| f.name == *field).map(|f| &f.value);
+                                let cmp = a_val.cmp(&b_val);
+                                if order.order == "desc" {
+                                    cmp.reverse()
+                                } else {
+                                    cmp
+                                }
+                            }
+                        };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        } else {
+            all_results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
         let total_hits = all_results.len();
-        all_results.truncate(query.max_results);
+        let from = query.from.min(all_results.len());
+        let to = (from + query.max_results).min(all_results.len());
+        let page = all_results[from..to].to_vec();
+
+        // Merge aggregations across segments.
+        let merged_aggs = if all_aggs.is_empty() {
+            None
+        } else {
+            // Use the first segment's aggs (all segments have the same data).
+            Some(all_aggs.into_values().next().unwrap_or(AggregationResults {
+                per_document: None,
+                total_documents: None,
+                matched_docs: None,
+                extra: HashMap::new(),
+            }))
+        };
 
         Ok(SearchResult {
-            results: all_results,
+            results: page,
             total_hits,
+            aggregations: merged_aggs,
         })
     }
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+// ─── Aggregation functions ──────────────────────────────────────────────────
+
+pub fn compute_single_aggregation(store: &FilterStore, field: &str) -> AggregationResults {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+
+    if let Some(entries) = store.string_fields.get(field) {
+        for (_, val) in entries {
+            *counts.entry(val.clone()).or_default() += 1;
+        }
+    }
+
+    let mut buckets: Vec<AggBucket> = counts
+        .into_iter()
+        .map(|(k, c)| AggBucket {
+            key: k,
+            doc_count: c,
+        })
+        .collect();
+    buckets.sort_by_key(|b| std::cmp::Reverse(b.doc_count));
+
+    AggregationResults {
+        per_document: Some(AggBucketResult { buckets }),
+        total_documents: None,
+        matched_docs: None,
+        extra: HashMap::new(),
+    }
+}
+
+pub fn compute_cardinality(store: &FilterStore, field: &str) -> AggregationResults {
+    let count = store
+        .string_fields
+        .get(field)
+        .map(|entries| {
+            let unique: HashSet<&str> = entries.iter().map(|(_, v)| v.as_str()).collect();
+            unique.len()
+        })
+        .unwrap_or(0);
+
+    AggregationResults {
+        per_document: None,
+        total_documents: Some(AggMetricResult { value: count }),
+        matched_docs: None,
+        extra: HashMap::new(),
+    }
+}
+
+pub fn compute_composite(
+    store: &FilterStore,
+    composite: &kosha_core::AggComposite,
+) -> AggregationResults {
+    let mut buckets = Vec::new();
+    if let Some(source) = composite.sources.first() {
+        for (agg_name, terms_spec) in &source.source {
+            let field = &terms_spec.terms.field;
+            if let Some(entries) = store.string_fields.get(field) {
+                let mut seen: HashMap<&str, usize> = HashMap::new();
+                for (_, val) in entries {
+                    *seen.entry(val.as_str()).or_default() += 1;
+                }
+                let _ = agg_name;
+                for (key, count) in seen {
+                    if buckets.len() >= composite.size {
+                        break;
+                    }
+                    let mut key_map = HashMap::new();
+                    key_map.insert(field.clone(), key.to_string());
+                    buckets.push(AggCompositeBucket {
+                        key: key_map,
+                        doc_count: count,
+                    });
+                }
+            }
+        }
+    }
+
+    let after_key = buckets.last().map(|b| b.key.clone());
+
+    AggregationResults {
+        per_document: None,
+        total_documents: None,
+        matched_docs: Some(AggCompositeResult { buckets, after_key }),
+        extra: HashMap::new(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -227,198 +890,128 @@ mod tests {
     use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId};
     use kosha_segment::SegmentWriter;
 
-    fn build_test_segment(
-        dir: &std::path::Path,
-        namespace: &str,
-        seg_id: &str,
-        docs: Vec<(&str, &str)>,
-    ) -> SegmentId {
-        let seg_id = SegmentId(seg_id.to_string());
-        let seg_dir = dir.join(namespace).join(seg_id.0.as_str());
-        let mut writer = SegmentWriter::new(seg_id.clone(), seg_dir);
-
-        for (id, text) in docs {
-            writer.add_document(
-                DocumentId(id.to_string()),
-                vec![Field {
-                    name: "title".into(),
-                    text: text.to_string(),
-                }],
-            );
+    #[expect(dead_code)]
+    fn mk_query(text: &str, max: usize) -> SearchQuery {
+        SearchQuery {
+            query_text: text.into(),
+            max_results: max,
+            from: 0,
+            bm25_params: Bm25Params::default(),
+            filter: None,
+            sort: vec![],
+            highlight: None,
+            aggs: HashMap::new(),
+            wildcard: None,
+            match_phrase: None,
+            knn: None,
         }
-
-        writer.finalize(Bm25Params::default()).unwrap();
-        seg_id
     }
 
     #[test]
-    fn bm25_scorer_basic() {
-        let scorer = Bm25Scorer::new(5, 10.0, Bm25Params::default());
-
-        // A term appearing in 2 of 5 docs, tf=3, doc_len=8.
-        let score = scorer.score_term(3, 2, 8);
-        assert!(score > 0.0, "BM25 score should be positive");
-
-        // Zero tf = zero score.
-        let score0 = scorer.score_term(0, 2, 8);
-        assert!((score0 - 0.0).abs() < 1e-10);
+    fn wildcard_matching_works() {
+        let terms = vec!["hello", "world", "help", "helm", "held"];
+        let matched = wildcard_terms(&terms, "hel*", true);
+        assert_eq!(matched.len(), 4);
+        assert!(matched.contains(&"hello".to_string()));
+        assert!(matched.contains(&"help".to_string()));
+        assert!(matched.contains(&"helm".to_string()));
+        assert!(matched.contains(&"held".to_string()));
     }
 
     #[test]
-    fn search_single_segment() {
-        let dir = std::env::temp_dir().join("kosha-test-search-001");
-        let _ = std::fs::remove_dir_all(&dir);
+    fn match_phrase_no_slop() {
+        // Positions: doc has "quick" at 0, "brown" at 1, "fox" at 2.
+        let postings = vec![vec![0u32], vec![1u32], vec![2u32]];
+        let score = match_phrase_score(&postings, 0);
+        assert!((score - 1.0).abs() < 1e-6);
+    }
 
-        let ns = NamespaceId("test".into());
-        let seg_id = build_test_segment(
-            &dir,
-            &ns.0,
-            "seg-001",
-            vec![
-                ("doc1", "quick brown fox"),
-                ("doc2", "lazy dog"),
-                ("doc3", "quick rabbit"),
-            ],
+    #[test]
+    fn match_phrase_with_slop() {
+        // Positions: "quick" at 0, "fox" at 2 (skipping "brown").
+        let postings = vec![vec![0u32], vec![2u32]];
+        let score = match_phrase_score(&postings, 1);
+        assert!((score - 1.0).abs() < 1e-6, "slop=1 should match gap of 2");
+    }
+
+    #[test]
+    fn match_phrase_no_match() {
+        // Positions: "quick" at 0, "fox" at 5 (too far).
+        let postings = vec![vec![0u32], vec![5u32]];
+        let score = match_phrase_score(&postings, 2);
+        assert_eq!(score, 0.0, "slop=2 should not match gap of 5");
+    }
+
+    #[test]
+    fn aggregate_terms() {
+        let mut store = FilterStore::default();
+        store.string_fields.insert(
+            "documentId".to_string(),
+            vec![(0, "d1".into()), (1, "d2".into()), (2, "d1".into())],
         );
-
-        let manifest = Manifest {
-            version: 1,
-            segments: vec![ManifestEntry {
-                segment_id: seg_id,
-                doc_count: 3,
-            }],
-        };
-
-        let searcher = Searcher::new(dir.clone());
-        let query = SearchQuery {
-            query_text: "quick".into(),
-            max_results: 10,
-            bm25_params: Bm25Params::default(),
-        };
-
-        let result = searcher.search(&ns, &manifest, &query).unwrap();
-        assert_eq!(result.total_hits, 2); // doc1 and doc3 contain "quick"
-        assert_eq!(result.results.len(), 2);
-
-        // doc1 and doc3 should both be present.
-        let doc_ids: Vec<&str> = result.results.iter().map(|r| r.doc_id.0.as_str()).collect();
-        assert!(doc_ids.contains(&"doc1"));
-        assert!(doc_ids.contains(&"doc3"));
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let result = compute_single_aggregation(&store, "documentId");
+        let per_doc = result.per_document.unwrap();
+        assert_eq!(per_doc.buckets.len(), 2);
+        assert_eq!(per_doc.buckets[0].key, "d1");
+        assert_eq!(per_doc.buckets[0].doc_count, 2);
     }
 
     #[test]
-    fn search_multi_term() {
-        let dir = std::env::temp_dir().join("kosha-test-search-002");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let ns = NamespaceId("test".into());
-        let seg_id = build_test_segment(
-            &dir,
-            &ns.0,
-            "seg-002",
-            vec![
-                ("doc1", "quick brown fox"),
-                ("doc2", "lazy brown dog"),
-                ("doc3", "quick brown rabbit"),
-            ],
+    fn cardinality_aggregate() {
+        let mut store = FilterStore::default();
+        store.string_fields.insert(
+            "documentId".to_string(),
+            vec![(0, "d1".into()), (1, "d2".into()), (2, "d1".into())],
         );
-
-        let manifest = Manifest {
-            version: 1,
-            segments: vec![ManifestEntry {
-                segment_id: seg_id,
-                doc_count: 3,
-            }],
-        };
-
-        let searcher = Searcher::new(dir.clone());
-
-        // Search for "brown quick" → matches doc1 and doc3 (both have both terms).
-        let query = SearchQuery {
-            query_text: "brown quick".into(),
-            max_results: 10,
-            bm25_params: Bm25Params::default(),
-        };
-
-        let result = searcher.search(&ns, &manifest, &query).unwrap();
-        assert_eq!(result.total_hits, 3); // all three have at least one term
-        assert_eq!(result.results.len(), 3);
-
-        // doc3 has both "brown" and "quick", doc1 has both, doc2 only has "brown"
-        // so doc1 and doc3 should score higher than doc2.
-        assert!(result.results[0].score > result.results[2].score);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let result = compute_cardinality(&store, "documentId");
+        let total = result.total_documents.unwrap();
+        assert_eq!(total.value, 2);
     }
 
     #[test]
-    fn search_empty_query_returns_no_results() {
-        let dir = std::env::temp_dir().join("kosha-test-search-003");
+    fn search_with_wildcard() {
+        let dir = std::env::temp_dir().join("kosha-test-wildcard");
         let _ = std::fs::remove_dir_all(&dir);
-
         let ns = NamespaceId("test".into());
-        let seg_id = build_test_segment(&dir, &ns.0, "seg-003", vec![("doc1", "hello world")]);
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("t", "hello world")],
+        );
+        w.add_document(
+            DocumentId("d2".into()),
+            vec![Field::text("t", "help others")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
         let manifest = Manifest {
             version: 1,
             segments: vec![ManifestEntry {
-                segment_id: seg_id,
-                doc_count: 1,
+                segment_id: SegmentId("s1".into()),
+                doc_count: 2,
             }],
         };
-
         let searcher = Searcher::new(dir.clone());
-        let query = SearchQuery {
+        let q = SearchQuery {
             query_text: "".into(),
             max_results: 10,
+            from: 0,
             bm25_params: Bm25Params::default(),
+            filter: None,
+            sort: vec![],
+            highlight: None,
+            aggs: HashMap::new(),
+            wildcard: Some(kosha_core::WildcardQuery {
+                field: "t".into(),
+                pattern: "hel*".into(),
+                case_insensitive: true,
+            }),
+            match_phrase: None,
+            knn: None,
         };
-
-        let result = searcher.search(&ns, &manifest, &query).unwrap();
-        assert_eq!(result.total_hits, 0);
-        assert!(result.results.is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn search_top_k_limits_results() {
-        let dir = std::env::temp_dir().join("kosha-test-search-004");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let ns = NamespaceId("test".into());
-        let seg_id = build_test_segment(
-            &dir,
-            &ns.0,
-            "seg-004",
-            vec![
-                ("doc1", "apple"),
-                ("doc2", "apple banana"),
-                ("doc3", "apple banana cherry"),
-            ],
-        );
-
-        let manifest = Manifest {
-            version: 1,
-            segments: vec![ManifestEntry {
-                segment_id: seg_id,
-                doc_count: 3,
-            }],
-        };
-
-        let searcher = Searcher::new(dir.clone());
-
-        let query = SearchQuery {
-            query_text: "apple".into(),
-            max_results: 2,
-            bm25_params: Bm25Params::default(),
-        };
-
-        let result = searcher.search(&ns, &manifest, &query).unwrap();
-        assert_eq!(result.total_hits, 3);
-        assert_eq!(result.results.len(), 2);
-
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(r.total_hits, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

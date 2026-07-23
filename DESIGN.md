@@ -354,7 +354,26 @@ intent extraction (NER), and answer generation.** Rationale: fusion and cursorin
 coupled to segment-level ranking internals Kosha controls; rerank (Cohere) and intent (NER) are
 product-specific concerns that don't belong in a generalized search engine.
 
-### 12.1 Transport: HTTP/JSON primary, gRPC secondary
+### 12.1 Spec-first design (Elastic-style)
+
+The Kosha API follows a strict **spec → server + client** pattern, modeled on Elasticsearch's
+approach:
+
+1. **Source of truth**: `proto/kosha/v1/kosha.proto` — a single protobuf service definition
+   with `google.api.http` annotations that jointly define the gRPC and HTTP/JSON surfaces.
+2. **Spec compilation**: the proto is compiled into a standalone OpenAPI spec via buf +
+   protoc-gen-openapiv2, which becomes the public contract for non-gRPC clients.
+3. **Code generation**: all language clients (Python, Go, TypeScript, etc.) are auto-generated
+   from either the proto (gRPC stubs) or the OpenAPI spec (REST clients). No hand-written
+   request/response serialization.
+4. **Thin client layer**: a minimal hand-written wrapper around the generated stub that adds
+   auth, retry, logging, and (for Python) the opensearch compatibility shim — no business logic.
+
+This is the same pattern Elastic uses ([elasticsearch-specification](https://github.com/elastic/elasticsearch-specification)):
+a formal spec drives codegen in every language; the spec IS the contract, clients are derived
+artifacts.
+
+### 12.2 Transport: HTTP/JSON primary, gRPC secondary
 
 Given the intent to open-source Kosha as a serverless-friendly service (§15), **HTTP/JSON is
 the primary, canonical API surface; gRPC is an optional secondary transport for internal,
@@ -373,56 +392,37 @@ latency-sensitive callers** (Sage today).
   Pandora/Valora) can keep using gRPC against the same logical API — it's a second binding of the
   same service definition (see below), not a fork of the API.
 
-The service is defined once (as a protobuf service, since protobuf's schema discipline is worth
-keeping even for the HTTP surface) and exposed two ways: gRPC directly, and HTTP/JSON via
-`google.api.http` annotations (the same transcoding approach used by grpc-gateway/Envoy), so both
-transports share one source of truth for the request/response shapes below.
+The service is defined once in `proto/kosha/v1/kosha.proto` and exposed two ways:
 
-```protobuf
-service Kosha {
-  rpc IndexDocuments(IndexRequest) returns (IndexResponse) {
-    option (google.api.http) = { post: "/v1/namespaces/{namespace_id}/documents" body: "*" };
-  }
-  rpc Search(SearchRequest) returns (SearchResponse) {
-    option (google.api.http) = { post: "/v1/namespaces/{namespace_id}/search" body: "*" };
-  }
-  rpc CreateNamespace(NamespaceSpec) returns (Namespace) {
-    option (google.api.http) = { post: "/v1/namespaces" body: "*" };
-  }
-  rpc GetNamespaceStats(NamespaceId) returns (NamespaceStats) {
-    option (google.api.http) = { get: "/v1/namespaces/{namespace_id}/stats" };
-  }
-}
+| Transport | Mechanism | Use case |
+|-----------|-----------|----------|
+| **HTTP/JSON** | gRPC transcoding via `google.api.http` annotations | External/open-source callers, curl, serverless |
+| **gRPC** | Direct HTTP/2 | Internal Decover services (Sage, Bach) |
 
-message SearchRequest {
-  string namespace_id = 1;
-  string query_text = 2;
-  repeated float query_embedding = 3;
-  RetrievalMode mode = 4;          // LEXICAL | SEMANTIC | HYBRID
-  repeated Filter filters = 5;      // term/range/set predicates
-  int32 max_results = 6;
-  Cursor cursor = 7;
-  bool include_highlights = 8;
-}
-
-message SearchResponse {
-  repeated Hit hits = 1;
-  Cursor next_cursor = 2;
-}
-```
-
-Equivalent HTTP call for the sketch above:
+Equivalent HTTP calls from the proto definition:
 
 ```
-POST /v1/namespaces/{namespace_id}/search
-{
-  "query_text": "breach of contract",
-  "mode": "LEXICAL",
-  "filters": [...],
-  "max_results": 20,
-  "cursor": null,
-  "include_highlights": true
-}
+# Index documents
+POST /v1/namespaces/{namespace}/documents
+{"documents": [{"id": "doc1", "fields": [{"name": "title", "value": "hello"}]}]}
+
+# Search
+POST /v1/namespaces/{namespace}/search
+{"query_text": "breach of contract", "max_results": 20}
+
+# Health
+GET /v1/healthz
+
+# Stats
+GET /v1/stats
+GET /v1/namespaces/{namespace}/stats
+
+# Flush
+POST /v1/namespaces/{namespace}/flush
+
+# Delete by query
+POST /v1/namespaces/{namespace}/delete
+{"filter": {"term": {"documentId": "doc1"}}}
 ```
 
 `common/index/paragraph_repository.py`'s `search_similar_paragraphs(...)` becomes a thin
