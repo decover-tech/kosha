@@ -177,12 +177,21 @@ jobs:
         working-directory: /tmp/digests/dockerhub
         run: |
           tags=$(jq -cr --arg img "$DOCKERHUB_IMAGE" '.tags[] | select(startswith($img)) | "-t " + .' <<< "$DOCKER_METADATA_OUTPUT_JSON" | tr '\n' ' ')
-          # Keep image ref in printf's format string (not the file-name args) so
-          # a digest that itself contains '%' cannot be misread as a format.
-          docker buildx imagetools create $tags $(printf '%s@sha256:%s ' "$DOCKERHUB_IMAGE" *)
+          # Build one source ref per digest file. Do not use printf with a
+          # multi-arg format — with two platform digests printf reuses the
+          # format and emits a bare "<digest>@sha256:" that imagetools rejects.
+          sources=()
+          for digest in *; do
+            sources+=("${DOCKERHUB_IMAGE}@sha256:${digest}")
+          done
+          docker buildx imagetools create $tags "${sources[@]}"
 
       - name: Create and push ECR manifest
         working-directory: /tmp/digests/ecr
         run: |
           tags=$(jq -cr --arg img "$ECR_IMAGE" '.tags[] | select(startswith($img)) | "-t " + .' <<< "$DOCKER_METADATA_OUTPUT_JSON" | tr '\n' ' ')
-          docker buildx imagetools create $tags $(printf '%s@sha256:%s ' "$ECR_IMAGE" *)
+          sources=()
+          for digest in *; do
+            sources+=("${ECR_IMAGE}@sha256:${digest}")
+          done
+          docker buildx imagetools create $tags "${sources[@]}"
