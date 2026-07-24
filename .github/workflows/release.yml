@@ -1,13 +1,27 @@
 name: Release
 
-# Publishes kosha-server to three registries from one build:
+# Publishes kosha-server to two registries from one multi-arch build:
 #
-#   GHCR       ghcr.io/decover-tech/kosha                             (public face)
-#   Docker Hub docker.io/decoverai/kosha                              (public pulls)
+#   Docker Hub docker.io/ravidecoverai/kosha                          (public / prod pulls)
 #   ECR        <nonprod>.dkr.ecr.us-east-1.amazonaws.com/decover/kosha (staging pulls)
 #
 #   push to main        -> :main          (floating, what staging tracks)
 #   tag v0.2.5          -> :0.2.5, :0.2, :latest
+#
+# amd64 and arm64 build on native runners (ubuntu-latest / ubuntu-24.04-arm)
+# instead of cross-compiling arm64 under QEMU emulation — Rust under QEMU was
+# taking 2+ hours per release. Each platform job pushes its image by digest to
+# both registries (cache-from/to makes the 2nd push near-instant once the
+# first has compiled), then the merge job combines the two per-platform
+# digests into one multi-arch manifest per registry via `buildx imagetools`.
+#
+# GHCR was dropped: Docker Hub + ECR cover public distribution and internal
+# staging pulls respectively.
+#
+# Trade-off: build-time provenance attestation is off (provenance: false) for
+# the by-digest builds — combining provenance across a cross-registry manifest
+# merge is a separate, more involved setup. Revisit if SLSA attestations become
+# a requirement.
 #
 # AWS auth: OIDC via the AWS_GITHUB_ROLE_ARN secret (GitHubActionsKoshaRole —
 # trust scoped to this repo's main branch + v* tags). The ECR registry is
@@ -16,11 +30,8 @@ name: Release
 # uses a role in account 010928200670 (push rights only to decover/kosha
 # there) so the staging cluster pulls in-account, like every other service.
 #
-# GHCR: the package stays private until flipped: GitHub org -> Packages ->
-# kosha -> Package settings -> connect this repo -> Change visibility: public.
-#
 # Docker Hub: requires repo secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
-# (a Docker Hub access token with read/write/delete on decoverai/kosha).
+# (a Docker Hub access token with read/write/delete on ravidecoverai/kosha).
 
 on:
   push:
@@ -33,32 +44,29 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/kosha
-  DOCKERHUB_IMAGE: decoverai/kosha
+  DOCKERHUB_IMAGE: ravidecoverai/kosha
   AWS_REGION: us-east-1
   ECR_REPOSITORY: decover/kosha
 
 jobs:
-  publish:
-    name: build + push multi-arch image
-    runs-on: ubuntu-latest
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      packages: write
-      attestations: write
       id-token: write # AWS OIDC
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
-
       - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/login-action@v3
         with:
@@ -75,25 +83,106 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set per-job env
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+          echo "ECR_IMAGE=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}" >> "$GITHUB_ENV"
+
+      # First push writes the GHA layer cache; subsequent registry pushes reuse it.
+      - name: Build and push by digest (Docker Hub)
+        id: build-dockerhub
+        uses: docker/build-push-action@v6
+        with:
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=${{ env.DOCKERHUB_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Build and push by digest (ECR)
+        id: build-ecr
+        uses: docker/build-push-action@v6
+        with:
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=${{ env.ECR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+
+      - name: Export digests
+        run: |
+          mkdir -p /tmp/digests/dockerhub /tmp/digests/ecr
+          dockerhub_digest="${{ steps.build-dockerhub.outputs.digest }}"
+          ecr_digest="${{ steps.build-ecr.outputs.digest }}"
+          touch "/tmp/digests/dockerhub/${dockerhub_digest#sha256:}"
+          touch "/tmp/digests/ecr/${ecr_digest#sha256:}"
+
+      - name: Upload digests
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge multi-arch manifests
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      id-token: write # AWS OIDC
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set per-job env
+        run: |
+          echo "ECR_IMAGE=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}" >> "$GITHUB_ENV"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
       - uses: docker/metadata-action@v5
         id: meta
         with:
           images: |
-            ${{ env.IMAGE }}
             ${{ env.DOCKERHUB_IMAGE }}
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+            ${{ env.ECR_IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
 
-      - uses: docker/build-push-action@v6
-        with:
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: true
+      - name: Create and push Docker Hub manifest
+        working-directory: /tmp/digests/dockerhub
+        run: |
+          tags=$(jq -cr --arg img "$DOCKERHUB_IMAGE" '.tags[] | select(startswith($img)) | "-t " + .' <<< "$DOCKER_METADATA_OUTPUT_JSON" | tr '\n' ' ')
+          # Keep image ref in printf's format string (not the file-name args) so
+          # a digest that itself contains '%' cannot be misread as a format.
+          docker buildx imagetools create $tags $(printf '%s@sha256:%s ' "$DOCKERHUB_IMAGE" *)
+
+      - name: Create and push ECR manifest
+        working-directory: /tmp/digests/ecr
+        run: |
+          tags=$(jq -cr --arg img "$ECR_IMAGE" '.tags[] | select(startswith($img)) | "-t " + .' <<< "$DOCKER_METADATA_OUTPUT_JSON" | tr '\n' ' ')
+          docker buildx imagetools create $tags $(printf '%s@sha256:%s ' "$ECR_IMAGE" *)
