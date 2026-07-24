@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use kosha_core::{
     AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult, AggMetricResult,
     Aggregation, AggregationResults, Bm25Params, FieldType, FilterClause, FilterStore, KoshaError,
-    Manifest, NamespaceId, ScoredDocument, SearchQuery, SearchResult,
+    Manifest, NamespaceId, ScoredDocument, SearchQuery, SearchResult, SortSpec,
 };
 use kosha_segment::{tokenize, SegmentReader};
 
@@ -583,9 +583,24 @@ impl Searcher {
                     }
                 }
 
+                // Apply filter to this segment's scored docs *before* merging
+                // into all_results. Filtering all_results inside the segment
+                // loop previously dropped hits from earlier segments.
+                let passed_filter: Option<HashSet<u32>> = if let Some(ref clause) = query.filter {
+                    let candidates: HashSet<u32> = scored.keys().copied().collect();
+                    Some(FilterApplier::apply(clause, store, &candidates)?)
+                } else {
+                    None
+                };
+
                 for (doc_seq, score) in scored {
                     if is_tombstoned(&entry.segment_id, doc_seq) {
                         continue;
+                    }
+                    if let Some(ref passed) = passed_filter {
+                        if !passed.contains(&doc_seq) {
+                            continue;
+                        }
                     }
                     if let Some(doc_rec) = reader.doc_record(doc_seq) {
                         all_results.push(ScoredDocument {
@@ -667,28 +682,6 @@ impl Searcher {
                 }
             }
 
-            // ── Apply post-BM25 filter ──
-            if let Some(ref clause) = query.filter {
-                if !effective_terms.is_empty() || phrase_tokenized.is_some() {
-                    let doc_seqs: HashSet<u32> = all_results
-                        .iter()
-                        .filter_map(|r| {
-                            (0..total_docs).find(|&s| {
-                                reader.doc_record(s).is_some_and(|d| d.doc_id == r.doc_id)
-                            })
-                        })
-                        .collect();
-                    let passed = FilterApplier::apply(clause, store, &doc_seqs)?;
-                    all_results.retain(|r| {
-                        (0..total_docs).any(|s| {
-                            reader
-                                .doc_record(s)
-                                .is_some_and(|d| d.doc_id == r.doc_id && passed.contains(&s))
-                        })
-                    });
-                }
-            }
-
             // ── Aggregations ──
             for (agg_name, agg) in &query.aggs {
                 match agg {
@@ -737,44 +730,31 @@ impl Searcher {
 
         // ── Sort ──
         if !query.sort.is_empty() {
-            all_results.sort_by(|a, b| {
-                for spec in &query.sort {
-                    for (field, order) in &spec.fields {
-                        let ord = match field.as_str() {
-                            "_score" => b
-                                .score
-                                .partial_cmp(&a.score)
-                                .unwrap_or(std::cmp::Ordering::Equal),
-                            _ => {
-                                let a_val =
-                                    a.fields.iter().find(|f| f.name == *field).map(|f| &f.value);
-                                let b_val =
-                                    b.fields.iter().find(|f| f.name == *field).map(|f| &f.value);
-                                let cmp = a_val.cmp(&b_val);
-                                if order.order == "desc" {
-                                    cmp.reverse()
-                                } else {
-                                    cmp
-                                }
-                            }
-                        };
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
+            all_results.sort_by(|a, b| compare_sort_keys(a, b, &query.sort));
         } else {
             all_results.sort_by(|a, b| {
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
             });
         }
 
+        // ── search_after (cursor pagination) ──
+        // Apply after sorting so the cursor advances in sort order. When
+        // search_after is set, `from` is ignored (OpenSearch semantics).
+        let mut page_start = query.from.min(all_results.len());
+        if let Some(ref after) = query.search_after {
+            if !after.is_empty() {
+                page_start = all_results
+                    .iter()
+                    .position(|r| is_strictly_after_cursor(r, after, &query.sort))
+                    .unwrap_or(all_results.len());
+            }
+        }
+
         let total_hits = all_results.len();
-        let from = query.from.min(all_results.len());
+        let from = page_start.min(all_results.len());
         let to = (from + query.max_results).min(all_results.len());
         let page = all_results[from..to].to_vec();
 
@@ -884,10 +864,100 @@ pub fn compute_composite(
     }
 }
 
+fn field_sort_value(doc: &ScoredDocument, field: &str) -> String {
+    match field {
+        "_score" => format!("{}", doc.score),
+        "_id" => doc.doc_id.0.clone(),
+        _ => doc
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| f.value.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// True when `doc` sorts strictly after the search_after cursor.
+fn is_strictly_after_cursor(doc: &ScoredDocument, after: &[String], sort: &[SortSpec]) -> bool {
+    if sort.is_empty() {
+        // Default ranking: score desc, then _id asc. Cursor is typically [_id]
+        // when callers only paginate by id (Decover embed updater).
+        if after.len() == 1 {
+            return doc.doc_id.0.as_str() > after[0].as_str();
+        }
+        return false;
+    }
+
+    let mut idx = 0usize;
+    for spec in sort {
+        for (field, order) in &spec.fields {
+            if idx >= after.len() {
+                return true;
+            }
+            let val = field_sort_value(doc, field);
+            let cursor = &after[idx];
+            let cmp = if field == "_score" {
+                let val_f: f64 = val.parse().unwrap_or(0.0);
+                let cur_f: f64 = cursor.parse().unwrap_or(0.0);
+                val_f
+                    .partial_cmp(&cur_f)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                val.as_str().cmp(cursor.as_str())
+            };
+            // Interpret comparison in the field's sort direction: "greater"
+            // means further along the result list.
+            let directed = if order.order == "desc" {
+                cmp.reverse()
+            } else {
+                cmp
+            };
+            match directed {
+                std::cmp::Ordering::Greater => return true,
+                std::cmp::Ordering::Less => return false,
+                std::cmp::Ordering::Equal => idx += 1,
+            }
+        }
+    }
+    false
+}
+
+fn compare_sort_keys(
+    a: &ScoredDocument,
+    b: &ScoredDocument,
+    sort: &[SortSpec],
+) -> std::cmp::Ordering {
+    for spec in sort {
+        for (field, order) in &spec.fields {
+            let ord = match field.as_str() {
+                "_score" => a
+                    .score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                "_id" => a.doc_id.0.cmp(&b.doc_id.0),
+                _ => {
+                    let a_val = a.fields.iter().find(|f| f.name == *field).map(|f| &f.value);
+                    let b_val = b.fields.iter().find(|f| f.name == *field).map(|f| &f.value);
+                    a_val.cmp(&b_val)
+                }
+            };
+            let ord = if order.order == "desc" {
+                ord.reverse()
+            } else {
+                ord
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+    }
+    a.doc_id.0.cmp(&b.doc_id.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId};
+    use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId, SortOrder};
     use kosha_segment::SegmentWriter;
 
     #[expect(dead_code)]
@@ -899,6 +969,7 @@ mod tests {
             bm25_params: Bm25Params::default(),
             filter: None,
             sort: vec![],
+            search_after: None,
             highlight: None,
             aggs: HashMap::new(),
             wildcard: None,
@@ -1000,6 +1071,7 @@ mod tests {
             bm25_params: Bm25Params::default(),
             filter: None,
             sort: vec![],
+            search_after: None,
             highlight: None,
             aggs: HashMap::new(),
             wildcard: Some(kosha_core::WildcardQuery {
@@ -1012,6 +1084,159 @@ mod tests {
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_after_by_id_paginates() {
+        let dir = std::env::temp_dir().join("kosha-test-search-after");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for i in 0..5 {
+            w.add_document(
+                DocumentId(format!("doc-{i}")),
+                vec![
+                    Field::text("content", "shared token"),
+                    Field::text("documentId", "same-doc"),
+                ],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 5,
+            }],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let mut id_sort = std::collections::HashMap::new();
+        id_sort.insert(
+            "_id".into(),
+            SortOrder {
+                order: "asc".into(),
+            },
+        );
+
+        let page1 = searcher
+            .search(
+                &ns,
+                &manifest,
+                &SearchQuery {
+                    query_text: "shared".into(),
+                    max_results: 2,
+                    from: 0,
+                    bm25_params: Bm25Params::default(),
+                    filter: None,
+                    sort: vec![SortSpec {
+                        fields: id_sort.clone(),
+                    }],
+                    search_after: None,
+                    highlight: None,
+                    aggs: HashMap::new(),
+                    wildcard: None,
+                    match_phrase: None,
+                    knn: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(page1.results.len(), 2);
+        assert_eq!(page1.results[0].doc_id.0, "doc-0");
+        assert_eq!(page1.results[1].doc_id.0, "doc-1");
+
+        let page2 = searcher
+            .search(
+                &ns,
+                &manifest,
+                &SearchQuery {
+                    query_text: "shared".into(),
+                    max_results: 2,
+                    from: 0,
+                    bm25_params: Bm25Params::default(),
+                    filter: None,
+                    sort: vec![SortSpec { fields: id_sort }],
+                    search_after: Some(vec![page1.results[1].doc_id.0.clone()]),
+                    highlight: None,
+                    aggs: HashMap::new(),
+                    wildcard: None,
+                    match_phrase: None,
+                    knn: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(page2.results.len(), 2);
+        assert_eq!(page2.results[0].doc_id.0, "doc-2");
+        assert_eq!(page2.results[1].doc_id.0, "doc-3");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filter_keeps_hits_across_segments() {
+        let dir = std::env::temp_dir().join("kosha-test-filter-multiseg");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+
+        for (seg, doc_id, matter) in [("s1", "a", "m1"), ("s2", "b", "m1"), ("s3", "c", "m2")] {
+            let seg_dir = dir.join(&ns.0).join(seg);
+            let mut w = SegmentWriter::new(SegmentId(seg.into()), seg_dir);
+            w.add_document(
+                DocumentId(doc_id.into()),
+                vec![
+                    Field::text("content", "shared token"),
+                    Field::text("matterId", matter),
+                ],
+            );
+            w.finalize(Bm25Params::default()).unwrap();
+        }
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![
+                ManifestEntry {
+                    segment_id: SegmentId("s1".into()),
+                    doc_count: 1,
+                },
+                ManifestEntry {
+                    segment_id: SegmentId("s2".into()),
+                    doc_count: 1,
+                },
+                ManifestEntry {
+                    segment_id: SegmentId("s3".into()),
+                    doc_count: 1,
+                },
+            ],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let q = SearchQuery {
+            query_text: "shared".into(),
+            max_results: 10,
+            from: 0,
+            bm25_params: Bm25Params::default(),
+            filter: Some(kosha_core::FilterClause::Term {
+                term: std::collections::HashMap::from([("matterId".into(), "m1".into())]),
+            }),
+            sort: vec![],
+            search_after: None,
+            highlight: None,
+            aggs: HashMap::new(),
+            wildcard: None,
+            match_phrase: None,
+            knn: None,
+        };
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(
+            r.total_hits, 2,
+            "BM25+filter must keep hits from every segment"
+        );
+        let ids: std::collections::HashSet<_> =
+            r.results.iter().map(|d| d.doc_id.0.as_str()).collect();
+        assert!(ids.contains("a"));
+        assert!(ids.contains("b"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

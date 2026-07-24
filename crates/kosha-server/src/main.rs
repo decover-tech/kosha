@@ -887,6 +887,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         from: 0,
         filter: None,
         sort: vec![],
+        search_after: None,
         highlight: None,
         aggs: std::collections::HashMap::new(),
         wildcard: None,

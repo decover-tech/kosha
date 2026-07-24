@@ -515,6 +515,11 @@ pub struct SearchQuery {
     pub filter: Option<FilterClause>,
     #[serde(default)]
     pub sort: Vec<SortSpec>,
+    /// OpenSearch-compatible search_after cursor. Values align with `sort`
+    /// (or `_id` when sorting by document id). Results strictly after this
+    /// cursor in sort order are returned.
+    #[serde(default)]
+    pub search_after: Option<Vec<String>>,
     #[serde(default)]
     pub highlight: Option<HighlightConfig>,
     #[serde(default)]

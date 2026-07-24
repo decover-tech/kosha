@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from typing import Any, Sequence
 
 from .compat import Transport as CompatTransport
@@ -143,9 +145,15 @@ class KoshaClient:
         wildcard = self._extract_wildcard(body)
         match_phrase = self._extract_match_phrase(body)
         knn = self._extract_knn(body)
+        sort = self._extract_sort(body)
+        search_after = body.get("search_after") if body else None
+        if search_after is not None:
+            search_after = [str(v) for v in search_after]
 
-        # Determine if we need POST (agg/wildcard/phrase/filter/knn present).
-        needs_post = bool(filter_clause or aggs or wildcard or match_phrase or knn)
+        # Determine if we need POST (agg/wildcard/phrase/filter/knn/sort/cursor).
+        needs_post = bool(
+            filter_clause or aggs or wildcard or match_phrase or knn or sort or search_after
+        )
 
         if not needs_post:
             bm25_params = {}
@@ -158,7 +166,9 @@ class KoshaClient:
             url = f"{self._kosha_url}/search?{urllib.parse.urlencode(query_params)}"
             try:
                 req = urllib.request.Request(url)
-                if self._auth:
+                if self._transport.api_key:
+                    req.add_header("Authorization", f"Bearer {self._transport.api_key}")
+                elif self._auth:
                     import base64
                     user, pwd = self._auth
                     token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
@@ -181,11 +191,12 @@ class KoshaClient:
             total = result.get("total_hits", 0)
             return self._build_search_response(kosha_hits, from_, size, took_ms, total)
 
+        # search_after replaces from (OpenSearch semantics).
         kosha_body = {
             "namespace": ns,
             "query_text": query_text,
-            "max_results": size + from_,
-            "from": from_,
+            "max_results": size if search_after else size + from_,
+            "from": 0 if search_after else from_,
         }
         if filter_clause:
             kosha_body["filter"] = filter_clause
@@ -197,6 +208,10 @@ class KoshaClient:
             kosha_body["match_phrase"] = match_phrase
         if knn:
             kosha_body["knn"] = knn
+        if sort:
+            kosha_body["sort"] = sort
+        if search_after:
+            kosha_body["search_after"] = search_after
 
         try:
             result = self._request("POST", "search", body=kosha_body)
@@ -208,7 +223,8 @@ class KoshaClient:
         total = result.get("total_hits", 0)
         kosha_aggs = result.get("aggregations")
 
-        response = self._build_search_response(kosha_hits, 0, size, 0, total)
+        # Server already applied from/search_after/size — do not re-slice.
+        response = self._build_search_response(kosha_hits, 0, len(kosha_hits) or size, 0, total)
         if kosha_aggs:
             response["aggregations"] = kosha_aggs
         return response
@@ -516,6 +532,33 @@ class KoshaClient:
         return None
 
     @staticmethod
+    def _extract_sort(body: dict | None) -> list[dict] | None:
+        """Translate OpenSearch ``sort`` into Kosha ``SortSpec`` objects.
+
+        Accepts ``[{"_id": "asc"}]`` or ``[{"_id": {"order": "asc"}}]``.
+        """
+        if not body:
+            return None
+        raw = body.get("sort")
+        if not raw:
+            return None
+        out: list[dict] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            spec: dict[str, dict[str, str]] = {}
+            for field, val in entry.items():
+                if isinstance(val, str):
+                    spec[field] = {"order": val}
+                elif isinstance(val, dict):
+                    spec[field] = {"order": str(val.get("order", "asc"))}
+                else:
+                    spec[field] = {"order": "asc"}
+            if spec:
+                out.append(spec)
+        return out or None
+
+    @staticmethod
     def _extract_knn(body: dict | None) -> dict | None:
         """Extract kNN query from an ES query body."""
         if not body:
@@ -539,20 +582,42 @@ class KoshaClient:
     def _field_to_kosha(name: str, value: str, field_type: str = "Text") -> dict:
         return {"name": name, "field_type": field_type, "value": value}
 
+    @classmethod
+    def _source_to_fields(cls, source: dict | None) -> list[dict]:
+        """Convert an OpenSearch ``_source`` / ``doc`` body into Kosha fields.
+
+        Handles scalar types and float/int vectors (``contentEmbedding``).
+        Unwraps ``{"doc": {...}}`` update payloads from ``helpers.bulk``.
+        """
+        if not source:
+            return []
+        if "doc" in source and isinstance(source.get("doc"), dict):
+            # Update actions wrap the partial doc; ignore meta keys.
+            source = source["doc"]
+
+        fields: list[dict] = []
+        for k, v in source.items():
+            if k.startswith("__type__"):
+                continue
+            if isinstance(v, str):
+                fields.append(cls._field_to_kosha(k, v, "Text"))
+            elif isinstance(v, bool):
+                fields.append(cls._field_to_kosha(k, str(v).lower(), "Boolean"))
+            elif isinstance(v, (int, float)):
+                fields.append(cls._field_to_kosha(k, str(v), "Float"))
+            elif isinstance(v, (list, tuple)) and (
+                len(v) == 0 or all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
+            ):
+                fields.append(cls._field_to_kosha(k, json.dumps(list(v)), "Vector"))
+            elif isinstance(v, (list, tuple)):
+                fields.append(cls._field_to_kosha(k, json.dumps(list(v), default=json_default), "Text"))
+        return fields
+
     def index(self, index: str | None = None, id: str | None = None,
               body: dict | None = None, **params: Any) -> dict:
         """Index a single document."""
         ns = self._resolve_ns(index)
-        fields = []
-        for k, v in (body or {}).items():
-            if isinstance(v, str):
-                fields.append(self._field_to_kosha(k, v, "Text"))
-            elif isinstance(v, bool):
-                fields.append(self._field_to_kosha(k, str(v).lower(), "Boolean"))
-            elif isinstance(v, (int, float)):
-                fields.append(self._field_to_kosha(k, str(v), "Float"))
-            elif isinstance(v, (list, tuple)) and all(isinstance(x, (int, float)) for x in v):
-                fields.append(self._field_to_kosha(k, json.dumps(v), "Vector"))
+        fields = self._source_to_fields(body or {})
         doc = {
             "id": id or "",
             "fields": fields,
@@ -619,14 +684,9 @@ class KoshaClient:
                 source = {}
             i += 2
 
-            fields = []
-            for k, v in source.items():
-                if isinstance(v, str):
-                    fields.append(self._field_to_kosha(k, v, "Text"))
-                elif isinstance(v, bool):
-                    fields.append(self._field_to_kosha(k, str(v).lower(), "Boolean"))
-                elif isinstance(v, (int, float)):
-                    fields.append(self._field_to_kosha(k, str(v), "Float"))
+            # helpers.bulk update actions send {"doc": {...}} — unwrap + keep
+            # Vector fields (contentEmbedding) that index() already supported.
+            fields = self._source_to_fields(source if isinstance(source, dict) else {})
             doc = {
                 "id": doc_id or "",
                 "fields": fields,
@@ -675,15 +735,7 @@ class KoshaClient:
                body: dict | None = None, **params: Any) -> dict:
         """Update a document by re-indexing (tombstone-based in Phase 1)."""
         ns = self._resolve_ns(index)
-        doc_body = (body or {}).get("doc", body or {})
-        fields = []
-        for k, v in doc_body.items():
-            if isinstance(v, str):
-                fields.append(self._field_to_kosha(k, v, "Text"))
-            elif isinstance(v, bool):
-                fields.append(self._field_to_kosha(k, str(v).lower(), "Boolean"))
-            elif isinstance(v, (int, float)):
-                fields.append(self._field_to_kosha(k, str(v), "Float"))
+        fields = self._source_to_fields(body or {})
         payload = {"namespace": ns, "documents": [{"id": id or "", "fields": fields}]}
         self._request("POST", "index", body=payload)
         return {
