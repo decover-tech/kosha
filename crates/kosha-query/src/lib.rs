@@ -864,7 +864,7 @@ pub fn compute_composite(
     }
 }
 
-fn field_sort_value<'a>(doc: &'a ScoredDocument, field: &str) -> String {
+fn field_sort_value(doc: &ScoredDocument, field: &str) -> String {
     match field {
         "_score" => format!("{}", doc.score),
         "_id" => doc.doc_id.0.clone(),
