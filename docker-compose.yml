@@ -63,11 +63,21 @@ services:
       KOSHA_API_KEY: sk-kosha-dev  # matches quickstart script
       KOSHA_ROLE: query
       KOSHA_HTTP_PORT: "8080"
-      KOSHA_S3_ENDPOINT: http://minio:9000
+      KOSHA_DATA_DIR: /var/lib/kosha/data
+      # S3 / MinIO — kosha-server reads these (and standard AWS_* aliases).
       KOSHA_S3_BUCKET: dsearch-dev
+      KOSHA_S3_PREFIX: kosha/
+      KOSHA_S3_ENDPOINT: http://minio:9000
+      KOSHA_S3_FORCE_PATH_STYLE: "true"
       KOSHA_S3_ACCESS_KEY: kosha
       KOSHA_S3_SECRET_KEY: kosha-dev-secret
+      AWS_DEFAULT_REGION: us-east-1
+      # Manifest control plane
       DATABASE_URL: postgres://kosha:kosha-dev@postgres:5432/kosha
+    volumes:
+      # Local SSD/cache stand-in. Ephemeral across `docker compose down -v`,
+      # but survives container restarts. Source of truth is MinIO + Postgres.
+      - kosha-data:/var/lib/kosha/data
     ports:
       - "8080:8080" # HTTP/JSON
       - "50051:50051" # gRPC (from Epic 8)
@@ -75,3 +85,4 @@ services:
 volumes:
   minio-data:
   pg-data:
+  kosha-data:

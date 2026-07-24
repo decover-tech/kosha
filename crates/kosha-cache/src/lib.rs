@@ -1,13 +1,15 @@
-//! SSD cache layer (DESIGN.md §9, implementation plan Epic 4): a read-through,
-//! write-behind cache over segment files, keyed by `(namespace_id,
-//! segment_id, file, byte_range)` and backed by local NVMe storage.
+//! SSD cache layer (DESIGN.md §9, implementation plan Epic 4): a read-through
+//! cache over segment files, backed by local NVMe / pod disk.
 //!
 //! The cache is never authoritative — losing it is a performance event, not a
-//! correctness event.
+//! correctness event. Durable state lives in S3 (segments) + Postgres
+//! (manifests).
 //!
-//! Phase 1 is a no-op pass-through cache. Real NVMe-backed caching is Epic 4.
+//! Phase 1: the cache root is typically the same tree as `KOSHA_DATA_DIR`
+//! (segment directories written/read by the indexer and searcher). Keys are
+//! relative paths like `{namespace}/{segment_id}/doc_store.bin`.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use kosha_core::KoshaError;
 
@@ -19,11 +21,8 @@ pub struct CachedFile {
 }
 
 /// Read-through cache for segment files.
-///
-/// In Phase 1 this is a no-op: it always reports a cache miss, expecting the
-/// caller to load data from the source directly.
 pub struct Cache {
-    /// Root directory for cached files.
+    /// Root directory for cached files (usually `KOSHA_DATA_DIR`).
     cache_dir: PathBuf,
 }
 
@@ -33,23 +32,50 @@ impl Cache {
         Self { cache_dir }
     }
 
+    pub fn root(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// Resolve a relative cache key to an absolute path under `cache_dir`.
+    ///
+    /// Rejects absolute paths and `..` components.
+    pub fn path_for(&self, key: &str) -> Result<PathBuf, KoshaError> {
+        let key = key.trim_start_matches('/');
+        let mut out = self.cache_dir.clone();
+        for comp in Path::new(key).components() {
+            match comp {
+                Component::Normal(part) => out.push(part),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(KoshaError::NotFound(format!(
+                        "invalid cache key (path traversal): {key}"
+                    )));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Attempt to retrieve a file from cache.
     ///
     /// Returns `None` if the file is not cached (cache miss).
     pub fn get(&self, key: &str) -> Option<CachedFile> {
-        let path = self.cache_dir.join(sanitize_key(key));
-        if path.exists() {
+        let path = self.path_for(key).ok()?;
+        if path.is_file() {
             Some(CachedFile { local_path: path })
         } else {
             None
         }
     }
 
-    /// Store a file in the cache.
-    ///
-    /// Copies the file at `source_path` into the cache under the given key.
+    /// True when a segment directory (or file) is already present locally.
+    pub fn contains(&self, key: &str) -> bool {
+        self.path_for(key).map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// Store a file in the cache by copying `source_path` under `key`.
     pub fn put(&self, key: &str, source_path: &Path) -> Result<CachedFile, KoshaError> {
-        let dest = self.cache_dir.join(sanitize_key(key));
+        let dest = self.path_for(key)?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -57,11 +83,23 @@ impl Cache {
         Ok(CachedFile { local_path: dest })
     }
 
+    /// Store bytes directly under `key` (used when downloading from S3).
+    pub fn put_bytes(&self, key: &str, data: &[u8]) -> Result<CachedFile, KoshaError> {
+        let dest = self.path_for(key)?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, data)?;
+        Ok(CachedFile { local_path: dest })
+    }
+
     /// Remove a file from the cache.
     pub fn evict(&self, key: &str) -> Result<(), KoshaError> {
-        let path = self.cache_dir.join(sanitize_key(key));
-        if path.exists() {
+        let path = self.path_for(key)?;
+        if path.is_file() {
             std::fs::remove_file(&path)?;
+        } else if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
         }
         Ok(())
     }
@@ -98,11 +136,6 @@ impl Cache {
     }
 }
 
-/// Replace path separators with underscores to avoid directory traversal.
-fn sanitize_key(key: &str) -> String {
-    key.replace(['/', '\\'], "_")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,24 +144,27 @@ mod tests {
     #[test]
     fn cache_miss_returns_none() {
         let dir = std::env::temp_dir().join("kosha-test-cache-miss");
-        let cache = Cache::new(dir);
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
         assert!(cache.get("nonexistent-key").is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn cache_put_and_get() {
+    fn cache_put_and_get_preserves_hierarchy() {
         let dir = std::env::temp_dir().join("kosha-test-cache-put");
+        let _ = fs::remove_dir_all(&dir);
         let cache = Cache::new(dir.clone());
 
-        // Create a source file.
         let src = dir.join("source.txt");
         fs::write(&src, b"hello world").unwrap();
 
         let cached = cache.put("my-ns/my-seg/doc_store.bin", &src).unwrap();
         assert!(cached.local_path.exists());
+        assert!(cached.local_path.ends_with("doc_store.bin"));
+        assert!(cached.local_path.to_string_lossy().contains("my-ns"));
 
         let retrieved = cache.get("my-ns/my-seg/doc_store.bin").unwrap();
-        assert!(retrieved.local_path.exists());
         assert_eq!(
             fs::read_to_string(retrieved.local_path).unwrap(),
             "hello world"
@@ -138,18 +174,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_path_traversal() {
+        let dir = std::env::temp_dir().join("kosha-test-cache-trav");
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
+        assert!(cache.path_for("../etc/passwd").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cache_evict() {
         let dir = std::env::temp_dir().join("kosha-test-cache-evict");
+        let _ = fs::remove_dir_all(&dir);
         let cache = Cache::new(dir.clone());
 
         let src = dir.join("src.txt");
         fs::write(&src, b"data").unwrap();
 
-        cache.put("key", &src).unwrap();
-        assert!(cache.get("key").is_some());
+        cache.put("key.bin", &src).unwrap();
+        assert!(cache.get("key.bin").is_some());
 
-        cache.evict("key").unwrap();
-        assert!(cache.get("key").is_none());
+        cache.evict("key.bin").unwrap();
+        assert!(cache.get("key.bin").is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -157,6 +203,7 @@ mod tests {
     #[test]
     fn cache_clear() {
         let dir = std::env::temp_dir().join("kosha-test-cache-clear");
+        let _ = fs::remove_dir_all(&dir);
         let cache = Cache::new(dir.clone());
 
         let src = dir.join("src.txt");

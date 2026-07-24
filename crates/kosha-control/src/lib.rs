@@ -2,7 +2,8 @@
 //! namespace/schema registry and the manifest pointer store backing
 //! compare-and-swap manifest publishes.
 //!
-//! Phase 1 uses an in-memory store. Postgres persistence will follow.
+//! In-memory (`Controller`) is the default; Postgres (`PgStore`) is used in
+//! production via the `postgres` feature and a `DATABASE_URL` env var.
 
 use std::collections::HashMap;
 
@@ -16,8 +17,8 @@ pub use postgres::PgStore;
 
 /// In-memory namespace registry and manifest store.
 ///
-/// Tracks namespaces and their current segment manifests. Thread-safe for
-/// single-threaded use; the server is currently single-threaded.
+/// Tracks namespaces and their current segment manifests. Not internally
+/// synchronized — the server guards it with a `Mutex`.
 pub struct Controller {
     /// Maps namespace ID → current manifest.
     manifests: HashMap<NamespaceId, Manifest>,
@@ -76,6 +77,20 @@ impl Controller {
     /// Get a mutable reference to the manifest for a namespace.
     pub fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut Manifest> {
         self.manifests.get_mut(id)
+    }
+
+    /// Persist a manifest for a namespace (upsert, last-write-wins).
+    /// Registers the namespace if it wasn't already known.
+    pub fn save_manifest(
+        &mut self,
+        id: &NamespaceId,
+        manifest: &Manifest,
+    ) -> Result<(), KoshaError> {
+        if !self.namespaces.contains(id) {
+            self.namespaces.push(id.clone());
+        }
+        self.manifests.insert(id.clone(), manifest.clone());
+        Ok(())
     }
 
     /// Atomically update the manifest for a namespace (compare-and-swap style).
@@ -137,6 +152,9 @@ impl ControlStore for Controller {
     fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut Manifest> {
         self.manifest_mut(id)
     }
+    fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError> {
+        self.save_manifest(id, manifest)
+    }
     fn compare_and_swap_manifest(
         &mut self,
         id: &NamespaceId,
@@ -182,6 +200,43 @@ mod tests {
         // Second ensure should be a no-op.
         ctrl.ensure_namespace(ns);
         assert_eq!(ctrl.namespace_count(), 1);
+    }
+
+    #[test]
+    fn save_manifest_upserts() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("tenant/idx".into());
+
+        // Save without a prior create: registers the namespace too.
+        ctrl.save_manifest(
+            &ns,
+            &Manifest {
+                version: 3,
+                segments: vec![ManifestEntry {
+                    segment_id: kosha_core::SegmentId("tenant_idx-000000".into()),
+                    doc_count: 7,
+                }],
+            },
+        )
+        .unwrap();
+        assert!(ctrl.has_namespace(&ns));
+        assert_eq!(ctrl.manifest(&ns).unwrap().version, 3);
+        assert_eq!(ctrl.manifest(&ns).unwrap().segments.len(), 1);
+
+        // Overwrite is last-write-wins.
+        ctrl.save_manifest(
+            &ns,
+            &Manifest {
+                version: 4,
+                segments: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(ctrl.manifest(&ns).unwrap().version, 4);
+        assert_eq!(ctrl.namespace_count(), 1);
+
+        // The trait's default `manifest_cloned` works off `manifest()`.
+        assert_eq!(ctrl.manifest_cloned(&ns).unwrap().version, 4);
     }
 
     #[test]
