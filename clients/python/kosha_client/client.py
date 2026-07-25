@@ -246,7 +246,9 @@ class KoshaClient:
             score = k_hit.get("score", 0.0)
             source = {}
             for field in k_hit.get("fields", []):
-                source[field["name"]] = field.get("value", "")
+                source[field["name"]] = self._decode_field_value(
+                    field.get("value", ""), field.get("field_type")
+                )
                 # Store field type for filter-aware operations.
                 if field.get("field_type") not in ("Text", None):
                     source[f"__type__{field['name']}"] = field["field_type"]
@@ -582,6 +584,44 @@ class KoshaClient:
     def _field_to_kosha(name: str, value: str, field_type: str = "Text") -> dict:
         return {"name": name, "field_type": field_type, "value": value}
 
+    # Below this length, a numeric list is treated as an incidental tuple
+    # (coordinates, RGB, lat/long, ...) rather than a semantic embedding —
+    # shape-based, so no caller's field names need to be known here. Every
+    # embedding model in production use (OpenAI, Azure OpenAI, Cohere,
+    # Mistral, Gemini) outputs at least a few hundred dimensions; incidental
+    # numeric tuples are never more than a handful. Kosha's Vector storage
+    # (``vector.idx``) is shared across every Vector field in a segment, so
+    # mixing a real embedding with a low-dim tuple corrupts it (dimension
+    # mismatch -> read_f32_le panics on retrieval) and forces lexical-only
+    # queries to rebuild an HNSW graph they never needed.
+    _MIN_VECTOR_DIM = 8
+
+    @staticmethod
+    def _decode_field_value(value: str, field_type: str | None) -> Any:
+        """Reverse of ``_field_to_kosha``.
+
+        Kosha always returns field values as strings on the wire
+        (server-side ``Field.value: String``), regardless of field_type.
+        Callers index straight into these (``hit.bottom_left[0]``,
+        ``if hit.isHot``), so they must come back as the original Python
+        type, not the raw string. ``Keyword`` is used exclusively (by this
+        client) for JSON-encoded lists that aren't Vector-worthy, so it
+        decodes the same way as Vector.
+        """
+        if field_type == "Float":
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return value
+        if field_type == "Boolean":
+            return value == "true"
+        if field_type in ("Vector", "Keyword"):
+            try:
+                return json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return value
+        return value
+
     @classmethod
     def _source_to_fields(cls, source: dict | None) -> list[dict]:
         """Convert an OpenSearch ``_source`` / ``doc`` body into Kosha fields.
@@ -605,12 +645,21 @@ class KoshaClient:
                 fields.append(cls._field_to_kosha(k, str(v).lower(), "Boolean"))
             elif isinstance(v, (int, float)):
                 fields.append(cls._field_to_kosha(k, str(v), "Float"))
-            elif isinstance(v, (list, tuple)) and (
-                len(v) == 0 or all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
+            elif (
+                isinstance(v, (list, tuple))
+                and len(v) >= cls._MIN_VECTOR_DIM
+                and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
             ):
                 fields.append(cls._field_to_kosha(k, json.dumps(list(v)), "Vector"))
             elif isinstance(v, (list, tuple)):
-                fields.append(cls._field_to_kosha(k, json.dumps(list(v), default=json_default), "Text"))
+                # Everything else list-shaped: short numeric tuples (below
+                # _MIN_VECTOR_DIM), empty lists, string lists (recipients),
+                # mixed content. JSON-encode as Keyword — stored verbatim
+                # and filterable by exact match, but never tokenized and
+                # never inserted into the shared Vector store. Decoded back
+                # to a Python list by _decode_field_value.
+                fields.append(cls._field_to_kosha(k, json.dumps(list(v), default=json_default), "Keyword"))
+            # else: unsupported type — skip silently (matches prior behavior)
         return fields
 
     def index(self, index: str | None = None, id: str | None = None,
