@@ -37,6 +37,18 @@ runs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
+    # The bare ghcr.io/actions/actions-runner image (nonprod-runner-kosha's
+    # ARC runner) has no AWS CLI preinstalled, unlike GitHub-hosted runners
+    # — needed below for `aws eks update-kubeconfig`.
+    - name: Install AWS CLI v2
+      shell: bash
+      run: |
+        curl "https://awscliv2.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+        unzip -q /tmp/awscliv2.zip -d /tmp
+        rm /tmp/awscliv2.zip
+        sudo /tmp/aws/install --update
+        rm -rf /tmp/aws/
+
     - uses: azure/setup-kubectl@v4
 
     - name: Set up Kustomize
