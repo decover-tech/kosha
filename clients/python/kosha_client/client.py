@@ -247,7 +247,7 @@ class KoshaClient:
             source = {}
             for field in k_hit.get("fields", []):
                 source[field["name"]] = self._decode_field_value(
-                    field["name"], field.get("value", ""), field.get("field_type")
+                    field.get("value", ""), field.get("field_type")
                 )
                 # Store field type for filter-aware operations.
                 if field.get("field_type") not in ("Text", None):
@@ -584,24 +584,29 @@ class KoshaClient:
     def _field_to_kosha(name: str, value: str, field_type: str = "Text") -> dict:
         return {"name": name, "field_type": field_type, "value": value}
 
-    # Numeric-list fields that are coordinate pairs, not semantic embeddings.
-    # Kosha's Vector storage (``vector.idx``) is shared across every Vector
-    # field in a segment, so mixing a real 1536-dim embedding with a 2-float
-    # bbox pair corrupts it (dimension mismatch -> read_f32_le panics on
-    # retrieval) and forces lexical-only queries to rebuild an HNSW graph
-    # they never needed. These always index as Text instead, and are
-    # decoded back to a plain float list in ``_decode_field_value``.
-    _PLAIN_LIST_FIELDS = frozenset({"bottom_left", "top_right"})
+    # Below this length, a numeric list is treated as an incidental tuple
+    # (coordinates, RGB, lat/long, ...) rather than a semantic embedding —
+    # shape-based, so no caller's field names need to be known here. Every
+    # embedding model in production use (OpenAI, Azure OpenAI, Cohere,
+    # Mistral, Gemini) outputs at least a few hundred dimensions; incidental
+    # numeric tuples are never more than a handful. Kosha's Vector storage
+    # (``vector.idx``) is shared across every Vector field in a segment, so
+    # mixing a real embedding with a low-dim tuple corrupts it (dimension
+    # mismatch -> read_f32_le panics on retrieval) and forces lexical-only
+    # queries to rebuild an HNSW graph they never needed.
+    _MIN_VECTOR_DIM = 8
 
     @staticmethod
-    def _decode_field_value(name: str, value: str, field_type: str | None) -> Any:
+    def _decode_field_value(value: str, field_type: str | None) -> Any:
         """Reverse of ``_field_to_kosha``.
 
         Kosha always returns field values as strings on the wire
         (server-side ``Field.value: String``), regardless of field_type.
         Callers index straight into these (``hit.bottom_left[0]``,
         ``if hit.isHot``), so they must come back as the original Python
-        type, not the raw string.
+        type, not the raw string. ``Keyword`` is used exclusively (by this
+        client) for JSON-encoded lists that aren't Vector-worthy, so it
+        decodes the same way as Vector.
         """
         if field_type == "Float":
             try:
@@ -610,12 +615,7 @@ class KoshaClient:
                 return value
         if field_type == "Boolean":
             return value == "true"
-        if field_type == "Vector":
-            try:
-                return json.loads(value)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return value
-        if name in KoshaClient._PLAIN_LIST_FIELDS:
+        if field_type in ("Vector", "Keyword"):
             try:
                 return json.loads(value)
             except (TypeError, ValueError, json.JSONDecodeError):
@@ -647,18 +647,18 @@ class KoshaClient:
                 fields.append(cls._field_to_kosha(k, str(v), "Float"))
             elif (
                 isinstance(v, (list, tuple))
-                and len(v) > 0
-                and k not in cls._PLAIN_LIST_FIELDS
+                and len(v) >= cls._MIN_VECTOR_DIM
                 and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
             ):
-                # Non-empty numeric lists only — empty lists (e.g. system_tags=[],
-                # recipients=[]) must NOT become zero-dim Vectors. Mixed dims in
-                # one segment corrupt vector.idx and panic the server on read.
-                # Known coordinate-pair fields (_PLAIN_LIST_FIELDS) are excluded
-                # too — they're bbox pairs, not embeddings.
                 fields.append(cls._field_to_kosha(k, json.dumps(list(v)), "Vector"))
             elif isinstance(v, (list, tuple)):
-                fields.append(cls._field_to_kosha(k, json.dumps(list(v), default=json_default), "Text"))
+                # Everything else list-shaped: short numeric tuples (below
+                # _MIN_VECTOR_DIM), empty lists, string lists (recipients),
+                # mixed content. JSON-encode as Keyword — stored verbatim
+                # and filterable by exact match, but never tokenized and
+                # never inserted into the shared Vector store. Decoded back
+                # to a Python list by _decode_field_value.
+                fields.append(cls._field_to_kosha(k, json.dumps(list(v), default=json_default), "Keyword"))
             # else: unsupported type — skip silently (matches prior behavior)
         return fields
 
