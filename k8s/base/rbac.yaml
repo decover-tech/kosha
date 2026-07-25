@@ -1,0 +1,58 @@
+# Scoped grant for the CI deploy role (see release.yml deploy-staging /
+# deploy-production). Bound by Kubernetes group, not by IAM role directly —
+# each cluster's EKS Access Entry maps its own CI principal (a different IAM
+# role per AWS account) onto the "kosha-ci" group, so this manifest is
+# identical across stage/prod.
+#
+# Namespace itself is cluster-scoped, so managing it needs a ClusterRole —
+# scoped via resourceNames to just the "kosha" namespace object, nothing else
+# cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kosha-namespace-reconciler
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: ["kosha"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kosha-ci-namespace-reconciler
+subjects:
+  - kind: Group
+    name: kosha-ci
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: kosha-namespace-reconciler
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kosha-deployer
+  namespace: kosha
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kosha-ci-deployer
+  namespace: kosha
+subjects:
+  - kind: Group
+    name: kosha-ci
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: kosha-deployer
+  apiGroup: rbac.authorization.k8s.io
