@@ -246,7 +246,9 @@ class KoshaClient:
             score = k_hit.get("score", 0.0)
             source = {}
             for field in k_hit.get("fields", []):
-                source[field["name"]] = field.get("value", "")
+                source[field["name"]] = self._decode_field_value(
+                    field["name"], field.get("value", ""), field.get("field_type")
+                )
                 # Store field type for filter-aware operations.
                 if field.get("field_type") not in ("Text", None):
                     source[f"__type__{field['name']}"] = field["field_type"]
@@ -582,6 +584,44 @@ class KoshaClient:
     def _field_to_kosha(name: str, value: str, field_type: str = "Text") -> dict:
         return {"name": name, "field_type": field_type, "value": value}
 
+    # Numeric-list fields that are coordinate pairs, not semantic embeddings.
+    # Kosha's Vector storage (``vector.idx``) is shared across every Vector
+    # field in a segment, so mixing a real 1536-dim embedding with a 2-float
+    # bbox pair corrupts it (dimension mismatch -> read_f32_le panics on
+    # retrieval) and forces lexical-only queries to rebuild an HNSW graph
+    # they never needed. These always index as Text instead, and are
+    # decoded back to a plain float list in ``_decode_field_value``.
+    _PLAIN_LIST_FIELDS = frozenset({"bottom_left", "top_right"})
+
+    @staticmethod
+    def _decode_field_value(name: str, value: str, field_type: str | None) -> Any:
+        """Reverse of ``_field_to_kosha``.
+
+        Kosha always returns field values as strings on the wire
+        (server-side ``Field.value: String``), regardless of field_type.
+        Callers index straight into these (``hit.bottom_left[0]``,
+        ``if hit.isHot``), so they must come back as the original Python
+        type, not the raw string.
+        """
+        if field_type == "Float":
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return value
+        if field_type == "Boolean":
+            return value == "true"
+        if field_type == "Vector":
+            try:
+                return json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return value
+        if name in KoshaClient._PLAIN_LIST_FIELDS:
+            try:
+                return json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return value
+        return value
+
     @classmethod
     def _source_to_fields(cls, source: dict | None) -> list[dict]:
         """Convert an OpenSearch ``_source`` / ``doc`` body into Kosha fields.
@@ -605,12 +645,21 @@ class KoshaClient:
                 fields.append(cls._field_to_kosha(k, str(v).lower(), "Boolean"))
             elif isinstance(v, (int, float)):
                 fields.append(cls._field_to_kosha(k, str(v), "Float"))
-            elif isinstance(v, (list, tuple)) and (
-                len(v) == 0 or all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
+            elif (
+                isinstance(v, (list, tuple))
+                and len(v) > 0
+                and k not in cls._PLAIN_LIST_FIELDS
+                and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
             ):
+                # Non-empty numeric lists only — empty lists (e.g. system_tags=[],
+                # recipients=[]) must NOT become zero-dim Vectors. Mixed dims in
+                # one segment corrupt vector.idx and panic the server on read.
+                # Known coordinate-pair fields (_PLAIN_LIST_FIELDS) are excluded
+                # too — they're bbox pairs, not embeddings.
                 fields.append(cls._field_to_kosha(k, json.dumps(list(v)), "Vector"))
             elif isinstance(v, (list, tuple)):
                 fields.append(cls._field_to_kosha(k, json.dumps(list(v), default=json_default), "Text"))
+            # else: unsupported type — skip silently (matches prior behavior)
         return fields
 
     def index(self, index: str | None = None, id: str | None = None,
