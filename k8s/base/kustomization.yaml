@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+
+# rbac.yaml is intentionally NOT listed here. It grants the CI deploy role
+# its own permissions — Kubernetes' RBAC escalation check correctly forbids
+# that role from managing its own Role/RoleBinding/ClusterRole/
+# ClusterRoleBinding objects, so including it here would make every CI run
+# fail on those 4 objects even though the app resources above succeed
+# (verified live: `kubectl apply --dry-run=server --as <ci-role> --as-group
+# kosha-ci` returns `unchanged` for all 5 resources above, `Forbidden` for
+# the 4 rbac.yaml objects). Apply rbac.yaml by hand
+# (`kubectl apply -f rbac.yaml`) as a one-time, human-reviewed bootstrap
+# per cluster instead.

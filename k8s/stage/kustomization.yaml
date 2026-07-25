@@ -1,0 +1,25 @@
+# Staging overlay — tracks the floating `:main` tag pushed to ECR on every
+# merge to main (see ../../.github/workflows/release.yml). The deploy job
+# repoints `newName` to the real ECR registry host at deploy time, since the
+# hostname is only known after `aws-actions/amazon-ecr-login`.
+#
+# kosha-secret (database-url, bootstrap-api-key) is intentionally not
+# committed here — the deploy job creates/refreshes it via
+# `kustomize edit add secret` from GitHub Environment secrets just before
+# `kustomize build | kubectl apply`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kosha
+
+resources:
+  - ../base
+
+patches:
+  - path: configmap-patch.yaml
+  - path: serviceaccount-patch.yaml
+
+images:
+  - name: kosha
+    newName: decover/kosha
+    newTag: main
