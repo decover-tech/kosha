@@ -24,7 +24,12 @@ env:
 jobs:
   deploy:
     name: Deploy to EKS (${{ inputs.environment }})
-    runs-on: ubuntu-latest
+    # decoverai-nonprod/-prod have no public API endpoint (see backend's
+    # deploy.yml), so this needs a self-hosted runner already inside the
+    # VPC rather than a GitHub-hosted one. Reusing backend's nonprod runner
+    # for staging; production still needs its own runner/role before the
+    # disabled production job above can come back.
+    runs-on: nonprod-runner
     environment: ${{ inputs.environment }}
     permissions:
       contents: read
