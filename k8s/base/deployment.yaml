@@ -53,11 +53,13 @@ spec:
             periodSeconds: 20
           resources:
             requests:
-              memory: "256Mi"
+              memory: "512Mi"
               cpu: "250m"
+              ephemeral-storage: "10Gi"
             limits:
-              memory: "1Gi"
-              cpu: "1000m"
+              memory: "4Gi"
+              cpu: "2"
+              ephemeral-storage: "60Gi"
           volumeMounts:
             - name: cache
               mountPath: /var/cache/kosha

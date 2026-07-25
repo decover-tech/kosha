@@ -5,10 +5,24 @@ the real EKS clusters (`decoverai-nonprod` staging, `decoverai-prod`
 production).
 
     k8s/
-      base/     Namespace, ServiceAccount, ConfigMap, Deployment, Service
+      base/     Namespace, ServiceAccount, ConfigMap, Deployment, Service —
+                env-agnostic defaults only
       stage/    tracks the floating `:main` tag (ECR, what every merge to
-                main pushes)
-      prod/     tracks versioned releases (Docker Hub, public)
+                main pushes); configmap-patch.yaml / serviceaccount-patch.yaml
+                layer in staging's S3 bucket + IRSA role
+      prod/     tracks versioned releases (Docker Hub, public); same S3/IRSA
+                patch shape, with prod's own bucket + role
+
+S3-backed segment storage and IRSA are wired in (`KOSHA_S3_BUCKET`,
+`KOSHA_S3_PREFIX`, `AWS_DEFAULT_REGION` via ConfigMap; `eks.amazonaws.com/
+role-arn` on the ServiceAccount) — these values were confirmed against the
+already-running staging deployment (see below), not derived from the `infra`
+Terraform repo directly. **Production's values follow the same
+`{name_prefix}-kosha[-segments]` naming convention but are not independently
+verified** (this session's AWS credentials only reached the nonprod
+account) — confirm `decoverai-prod-kosha-segments` and
+`arn:aws:iam::992382824254:role/decoverai-prod-kosha` actually exist before
+the first production deploy.
 
 Backend services reach Kosha at `kosha-service.kosha.svc.cluster.local:8080`
 (HTTP) / `:50051` (gRPC) — same DNS shape as the local dev setup documented
@@ -51,15 +65,20 @@ Before these jobs can succeed end to end, someone with access needs to:
    (staging) — this is normal EKS node-role ECR auth, already working for
    every other in-account image, so almost certainly a non-issue.
 
-## Not yet wired in (fast-follow)
+## A staging deployment already exists
 
-S3-backed durable segment storage (bucket, IRSA role for the `kosha`
-ServiceAccount, `KOSHA_S3_*` env vars) is intentionally out of scope for
-now. `KOSHA_S3_BUCKET` is left unset, so `kosha-server` runs local-disk-only
-— a supported, explicit mode (see `crates/kosha-server/src/s3_storage.rs`).
-Revisit once IRSA/S3 provisioning is ready.
+As of this writing, `kosha` is already running in the `kosha` namespace on
+`decoverai-nonprod` — deployed manually, ahead of this pipeline existing.
+`kustomize build k8s/stage` was checked (`kubectl apply --dry-run=server`)
+against the live cluster and every object comes back `configured` (an
+update-in-place), not an error — so once the GitHub Environment secrets
+above exist, the pipeline's `kubectl apply` will converge onto the existing
+Deployment/Service/ConfigMap/ServiceAccount rather than replacing them,
+with no need to delete anything first.
 
 ## Local verification
 
     kustomize build k8s/stage            # render, no cluster needed
     kubectl apply --dry-run=client -k k8s/stage   # validate against the k8s API schema
+    # with real cluster credentials (aws eks update-kubeconfig --name decoverai-nonprod):
+    kubectl apply --dry-run=server -k k8s/stage   # validate against the live API server, no changes persisted

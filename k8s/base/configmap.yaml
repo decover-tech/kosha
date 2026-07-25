@@ -1,3 +1,6 @@
+# Env-agnostic defaults. S3/region settings (KOSHA_S3_BUCKET,
+# KOSHA_S3_PREFIX, AWS_DEFAULT_REGION) are per-environment and layered in by
+# each overlay's configmap-patch.yaml, since the bucket differs per env.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -7,3 +10,4 @@ data:
   KOSHA_ROLE: "query"
   KOSHA_HTTP_PORT: "8080"
   KOSHA_DATA_DIR: /var/cache/kosha/data
+  KOSHA_CACHE_DIR: /var/cache/kosha

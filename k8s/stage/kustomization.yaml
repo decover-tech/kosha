@@ -15,6 +15,10 @@ namespace: kosha
 resources:
   - ../base
 
+patches:
+  - path: configmap-patch.yaml
+  - path: serviceaccount-patch.yaml
+
 images:
   - name: kosha
     newName: decover/kosha
