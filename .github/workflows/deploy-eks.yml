@@ -1,0 +1,100 @@
+name: Deploy to EKS (reusable)
+
+# Shared by release.yml (automatic: staging on push to main, production on
+# v* tags) and deploy.yml (manual workflow_dispatch — e.g. to redeploy a
+# specific version, or force a rollout without a new build). Kept as one
+# reusable workflow so the kustomize/kubectl steps only exist in one place.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub Environment to deploy to: staging | production"
+        required: true
+        type: string
+      image_tag:
+        description: "Image tag to deploy. Falls back to `main` (staging, ECR) or `latest` (production, Docker Hub) if empty."
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: decover/kosha
+
+jobs:
+  deploy:
+    name: Deploy to EKS (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write # AWS OIDC
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ECR login is only needed for staging (production pulls from the
+      # public Docker Hub image, no auth required).
+      - name: Login to Amazon ECR
+        if: inputs.environment == 'staging'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Set up Kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s -- 5.4.3
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Resolve per-environment settings
+        id: cfg
+        run: |
+          if [[ "${{ inputs.environment }}" == "staging" ]]; then
+            echo "cluster=decoverai-nonprod" >> "$GITHUB_OUTPUT"
+            echo "k8s_dir=k8s/stage" >> "$GITHUB_OUTPUT"
+          else
+            echo "cluster=decoverai-prod" >> "$GITHUB_OUTPUT"
+            echo "k8s_dir=k8s/prod" >> "$GITHUB_OUTPUT"
+          fi
+          # Strip a leading "v" if present (release.yml passes github.ref_name
+          # for production, e.g. "v0.2.5"; the actual Docker Hub tag has no
+          # "v" prefix — see docker/metadata-action's semver pattern below).
+          raw_tag="${{ inputs.image_tag }}"
+          default_tag="main"
+          [[ "${{ inputs.environment }}" != "staging" ]] && default_tag="latest"
+          echo "image_tag=${raw_tag#v}" >> "$GITHUB_OUTPUT"
+          if [[ -z "$raw_tag" ]]; then
+            echo "image_tag=${default_tag}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ steps.cfg.outputs.cluster }}
+
+      # kosha-secret is generated here rather than committed to git — see
+      # the comment in k8s/{stage,prod}/kustomization.yaml.
+      - name: Deploy
+        working-directory: ${{ steps.cfg.outputs.k8s_dir }}
+        env:
+          DATABASE_URL: ${{ secrets.KOSHA_DATABASE_URL }}
+          KOSHA_API_KEY: ${{ secrets.KOSHA_API_KEY }}
+          IMAGE_TAG: ${{ steps.cfg.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.environment }}" == "staging" ]]; then
+            image="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
+          else
+            image="ravidecoverai/kosha:${IMAGE_TAG}"
+          fi
+          kustomize edit set image "kosha=${image}"
+          kustomize edit add secret kosha-secret \
+            --from-literal=database-url="$DATABASE_URL" \
+            --from-literal=bootstrap-api-key="$KOSHA_API_KEY"
+          kubectl apply -k .
+          kubectl -n kosha rollout restart deployment/kosha
+          kubectl -n kosha rollout status deployment/kosha --timeout=5m
