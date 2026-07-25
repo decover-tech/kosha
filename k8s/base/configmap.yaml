@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kosha-config
+  namespace: kosha
+data:
+  KOSHA_ROLE: "query"
+  KOSHA_HTTP_PORT: "8080"
+  KOSHA_DATA_DIR: /var/cache/kosha/data

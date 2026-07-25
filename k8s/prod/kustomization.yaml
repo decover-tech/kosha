@@ -1,0 +1,22 @@
+# Production overlay — tracks versioned releases published to Docker Hub
+# (public) on `v*` tags (see ../../.github/workflows/release.yml). The
+# deploy job overrides `newTag` to the exact released version at deploy
+# time (stripped of the leading `v`, matching the semver tag
+# docker/metadata-action pushes).
+#
+# kosha-secret (database-url, bootstrap-api-key) is intentionally not
+# committed here — the deploy job creates/refreshes it via
+# `kustomize edit add secret` from GitHub Environment secrets just before
+# `kustomize build | kubectl apply`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kosha
+
+resources:
+  - ../base
+
+images:
+  - name: kosha
+    newName: ravidecoverai/kosha
+    newTag: latest
