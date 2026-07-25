@@ -43,27 +43,30 @@ image that was just published, generates the `kosha-secret` Secret in-cluster
 rollout (a `kubectl apply` alone is a no-op when a floating tag string like
 `:main` hasn't changed).
 
-### Prerequisites (one-time, manual — not automated by this repo)
+### Prerequisites
 
-Before these jobs can succeed end to end, someone with access needs to:
+- **staging — done.** GitHub Environment `staging` exists with
+  `KOSHA_DATABASE_URL` / `KOSHA_API_KEY` (copied from the already-working
+  live secret). EKS access: `GitHubActionsKoshaRole`
+  (`arn:aws:iam::010928200670:role/GitHubActionsKoshaRole` — the same role
+  already used for the ECR push, whose OIDC trust already covers
+  `refs/heads/main`) was granted an EKS Access Entry mapping it to the
+  `kosha-ci` Kubernetes group, and `k8s/base/rbac.yaml` (Role/RoleBinding
+  scoped to the `kosha` namespace, plus a ClusterRole/ClusterRoleBinding
+  scoped via `resourceNames` to just the `kosha` Namespace object) was
+  applied by hand to `decoverai-nonprod`. Verified with a full
+  `kubectl apply --dry-run=server` impersonating that exact role+group:
+  all 5 objects the pipeline manages come back `unchanged`. Nothing left
+  to do for `deploy-staging` to run.
+- **production — not done.** Needs its own GitHub Environment secrets
+  (`AWS_GITHUB_ROLE_ARN` for a role in the prod account, 992382824254 —
+  doesn't exist yet; `KOSHA_DATABASE_URL`; `KOSHA_API_KEY`), plus the same
+  `k8s/base/rbac.yaml` bootstrap + EKS Access Entry on `decoverai-prod`
+  once that role exists.
 
-1. Create GitHub Environments `staging` and `production` on this repo, each
-   with:
-   - `AWS_GITHUB_ROLE_ARN` — an OIDC-assumable role that can
-     `eks:DescribeCluster` on the target cluster *and* has EKS RBAC (an
-     access entry or `aws-auth` mapping) granting it write access
-     (Deployments/Services/Secrets/ConfigMaps) in the `kosha` namespace.
-     Staging can likely reuse the existing ECR-push role (same account,
-     010928200670) with the RBAC grant added; production needs its own role
-     in the prod account.
-   - `KOSHA_DATABASE_URL` — Postgres connection string for that
-     environment's control plane.
-   - `KOSHA_API_KEY` — the bootstrap API key `kosha-server` should accept
-     (this is also the value backend clients must be configured with, so
-     client and server agree).
-2. Confirm the `kosha` namespace's node pool can actually pull from ECR
-   (staging) — this is normal EKS node-role ECR auth, already working for
-   every other in-account image, so almost certainly a non-issue.
+`rbac.yaml` is intentionally not part of the kustomization the pipeline
+applies (see the comment in `k8s/base/kustomization.yaml` for why) — it's a
+one-time, human-reviewed `kubectl apply -f k8s/base/rbac.yaml` per cluster.
 
 ## A staging deployment already exists
 
