@@ -79,14 +79,19 @@ env:
 jobs:
   build-amd64:
     name: build (linux/amd64)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # TEMPORARY: Blacksmith runners are not picking up jobs for this repo
+    # (amd64 build queued indefinitely with no runner assigned on the
+    # v0.1.0 release run). Falling back to the GitHub-hosted runner and
+    # standard docker/* actions until Blacksmith recovers, then revert to
+    # blacksmith-4vcpu-ubuntu-2404 + useblacksmith/* actions.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write # AWS OIDC
     steps:
       - uses: actions/checkout@v4
 
-      - uses: useblacksmith/setup-docker-builder@v1
+      - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
         with:
@@ -113,7 +118,7 @@ jobs:
       # read a cache from the ECR image.
       - name: Build and push by digest (Docker Hub)
         id: build-dockerhub
-        uses: useblacksmith/build-push-action@v2
+        uses: docker/build-push-action@v6
         with:
           platforms: linux/amd64
           provenance: false
@@ -123,7 +128,7 @@ jobs:
 
       - name: Build and push by digest (ECR)
         id: build-ecr
-        uses: useblacksmith/build-push-action@v2
+        uses: docker/build-push-action@v6
         with:
           platforms: linux/amd64
           provenance: false
