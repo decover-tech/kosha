@@ -3,8 +3,14 @@ name: Deploy to EKS
 # Manual on-demand deploy — e.g. to force a rollout without a new build, or
 # to redeploy/roll back to a specific previously-published tag. The
 # automatic path (staging on push to main, production on v* tags) lives in
-# release.yml; both call the same reusable workflow (deploy-eks.yml) so the
-# actual kustomize/kubectl steps only exist in one place.
+# release.yml; both call the same deploy-eks composite action so the actual
+# kustomize/kubectl steps only exist in one place.
+#
+# This is a composite action rather than a reusable workflow on purpose:
+# self-hosted ARC runner labels (nonprod-runner-kosha) don't resolve for a
+# job defined inside a called reusable workflow — GitHub can't find a
+# matching runner and the run fails instantly (startup_failure, no jobs
+# ever created). The job — and its runs-on — has to live here.
 
 on:
   workflow_dispatch:
@@ -26,8 +32,18 @@ on:
 
 jobs:
   deploy:
-    uses: ./.github/workflows/deploy-eks.yml
-    with:
-      environment: ${{ inputs.environment }}
-      image_tag: ${{ inputs.image_tag }}
-    secrets: inherit
+    name: Deploy to EKS (${{ inputs.environment }})
+    runs-on: nonprod-runner-kosha
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write # AWS OIDC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/deploy-eks
+        with:
+          environment: ${{ inputs.environment }}
+          image_tag: ${{ inputs.image_tag }}
+          aws_role_arn: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          database_url: ${{ secrets.KOSHA_DATABASE_URL }}
+          kosha_api_key: ${{ secrets.KOSHA_API_KEY }}
