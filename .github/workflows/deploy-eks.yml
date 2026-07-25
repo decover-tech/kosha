@@ -26,10 +26,12 @@ jobs:
     name: Deploy to EKS (${{ inputs.environment }})
     # decoverai-nonprod/-prod have no public API endpoint (see backend's
     # deploy.yml), so this needs a self-hosted runner already inside the
-    # VPC rather than a GitHub-hosted one. Reusing backend's nonprod runner
-    # for staging; production still needs its own runner/role before the
-    # disabled production job above can come back.
-    runs-on: nonprod-runner
+    # VPC rather than a GitHub-hosted one. nonprod-runner-kosha is a
+    # dedicated ARC (Actions Runner Controller) scale set for this repo,
+    # deployed in gh-arc-systems alongside backend's own per-service scale
+    # sets. Production still needs its own runner/role before the disabled
+    # production job above can come back.
+    runs-on: nonprod-runner-kosha
     environment: ${{ inputs.environment }}
     permissions:
       contents: read
