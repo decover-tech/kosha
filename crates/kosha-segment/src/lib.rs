@@ -326,9 +326,30 @@ pub struct SegmentReader {
 }
 
 impl SegmentReader {
+    /// Opens a segment, always loading vectors and building the HNSW graph.
+    /// Kept for callers that genuinely need the vector store regardless of
+    /// query shape (merge/compaction, tests). Query-time lexical search
+    /// should use `open_with_options` instead — see its doc comment.
     pub fn open(segment_dir: PathBuf) -> Result<Self, KoshaError> {
-        let vs = Self::read_vectors(&segment_dir)?;
-        let hm = build_hnsw(&vs.vectors).map(|(m, _)| m);
+        Self::open_with_options(segment_dir, true)
+    }
+
+    /// Opens a segment, loading the vector store and building its HNSW graph
+    /// only when `load_vectors` is true.
+    ///
+    /// `vector.idx` reads and `build_hnsw` are the dominant cost of opening a
+    /// segment (especially under emulation, e.g. amd64-under-Rosetta), yet a
+    /// pure lexical/BM25 query (no `query.knn`) never touches either. Skipping
+    /// both for that case is what keeps keyword search latency independent of
+    /// embedding volume.
+    pub fn open_with_options(segment_dir: PathBuf, load_vectors: bool) -> Result<Self, KoshaError> {
+        let (vs, hm) = if load_vectors {
+            let vs = Self::read_vectors(&segment_dir)?;
+            let hm = build_hnsw(&vs.vectors).map(|(m, _)| m);
+            (vs, hm)
+        } else {
+            (VectorStore::default(), None)
+        };
         Ok(Self {
             segment_dir: segment_dir.clone(),
             footer: Self::read_footer(&segment_dir)?,
@@ -711,6 +732,40 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].positions, vec![0]);
         assert_eq!(p[1].positions, vec![0, 3]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_with_options_skips_vectors_and_hnsw_when_not_requested() {
+        let dir = std::env::temp_dir().join("kosha-test-seg-lazy-vectors");
+        let _ = fs::remove_dir_all(&dir);
+        let seg_id = SegmentId("test".into());
+        let mut w = SegmentWriter::new(seg_id.clone(), dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![
+                Field::text("t", "quick brown fox"),
+                Field::vector("contentEmbedding", vec![0.1, 0.2, 0.3]),
+            ],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        // Lexical path: no vectors read, no HNSW built.
+        let lexical = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(lexical.vector_store.vectors.is_empty());
+        assert!(lexical.hnsw_map.is_none());
+        // Lexical data is unaffected — still fully readable.
+        assert!(lexical.postings("quick").is_some());
+
+        // KNN path (and open(), its default): vectors + HNSW present.
+        let knn = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+        assert_eq!(knn.vector_store.vectors.len(), 1);
+        assert!(knn.hnsw_map.is_some());
+
+        let default_open = SegmentReader::open(dir.clone()).unwrap();
+        assert_eq!(default_open.vector_store.vectors.len(), 1);
+        assert!(default_open.hnsw_map.is_some());
 
         let _ = fs::remove_dir_all(&dir);
     }

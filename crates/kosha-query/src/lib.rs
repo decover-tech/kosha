@@ -443,7 +443,10 @@ impl Searcher {
                 continue;
             }
 
-            let reader = SegmentReader::open(seg_dir)?;
+            // Lexical/BM25 queries (no query.knn) never touch vectors or the
+            // HNSW graph — skip loading both so keyword search latency stops
+            // scaling with embedding volume/segment count.
+            let reader = SegmentReader::open_with_options(seg_dir, query.knn.is_some())?;
             let total_docs = reader.doc_count();
             let store = &reader.filter_store;
             let scorer = Bm25Scorer::new(
@@ -960,7 +963,6 @@ mod tests {
     use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId, SortOrder};
     use kosha_segment::SegmentWriter;
 
-    #[expect(dead_code)]
     fn mk_query(text: &str, max: usize) -> SearchQuery {
         SearchQuery {
             query_text: text.into(),
@@ -1084,6 +1086,48 @@ mod tests {
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_query_still_finds_vectors_after_lazy_loading_change() {
+        // SegmentReader::open_with_options skips vectors/HNSW for lexical
+        // queries; this proves the KNN path (query.knn.is_some()) still
+        // loads and searches them correctly.
+        let dir = std::env::temp_dir().join("kosha-test-knn-lazy");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::vector("contentEmbedding", vec![1.0, 0.0, 0.0])],
+        );
+        w.add_document(
+            DocumentId("d2".into()),
+            vec![Field::vector("contentEmbedding", vec![0.0, 1.0, 0.0])],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 2,
+            }],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let mut q = mk_query("", 10);
+        q.knn = Some(kosha_core::KnnQuery {
+            field: "contentEmbedding".into(),
+            vector: vec![1.0, 0.0, 0.0],
+            k: 1,
+            num_candidates: 10,
+            filter: None,
+        });
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(r.total_hits, 1);
+        assert_eq!(r.results[0].doc_id.0, "d1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
