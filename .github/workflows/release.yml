@@ -291,25 +291,48 @@ jobs:
           done
           docker buildx imagetools create $tags "${sources[@]}"
 
+  # These call the deploy-eks composite action rather than a reusable
+  # workflow — self-hosted ARC runner labels don't resolve for jobs defined
+  # inside a called reusable workflow, so runs-on has to live directly in
+  # the job that triggers on push/tag. See .github/actions/deploy-eks.
   deploy-staging:
     name: Deploy to EKS (staging)
     needs: merge
     if: github.ref == 'refs/heads/main'
-    uses: ./.github/workflows/deploy-eks.yml
-    with:
-      environment: staging
-      image_tag: main
-    secrets: inherit
+    runs-on: nonprod-runner-kosha
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write # AWS OIDC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/deploy-eks
+        with:
+          environment: staging
+          image_tag: main
+          aws_role_arn: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          database_url: ${{ secrets.KOSHA_DATABASE_URL }}
+          kosha_api_key: ${{ secrets.KOSHA_API_KEY }}
 
   deploy-production:
     name: Deploy to EKS (production)
     needs: merge
     # Temporarily disabled — staging deploy is still being validated end to
-    # end, and production doesn't have its own AWS role/EKS access set up
-    # yet. Restore `startsWith(github.ref, 'refs/tags/v')` once that's done.
+    # end, and production doesn't have its own AWS role/EKS access (or its
+    # own ARC runner — prod-runner-kosha doesn't exist yet) set up yet.
+    # Restore `startsWith(github.ref, 'refs/tags/v')` once that's done.
     if: false
-    uses: ./.github/workflows/deploy-eks.yml
-    with:
-      environment: production
-      image_tag: ${{ github.ref_name }}
-    secrets: inherit
+    runs-on: prod-runner-kosha
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # AWS OIDC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/deploy-eks
+        with:
+          environment: production
+          image_tag: ${{ github.ref_name }}
+          aws_role_arn: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          database_url: ${{ secrets.KOSHA_DATABASE_URL }}
+          kosha_api_key: ${{ secrets.KOSHA_API_KEY }}
