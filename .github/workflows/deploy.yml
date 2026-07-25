@@ -1,0 +1,33 @@
+name: Deploy to EKS
+
+# Manual on-demand deploy — e.g. to force a rollout without a new build, or
+# to redeploy/roll back to a specific previously-published tag. The
+# automatic path (staging on push to main, production on v* tags) lives in
+# release.yml; both call the same reusable workflow (deploy-eks.yml) so the
+# actual kustomize/kubectl steps only exist in one place.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        # production is deliberately not offered yet — no AWS role/EKS
+        # access set up for that account. Add it back to `options` once
+        # deploy-production in release.yml is re-enabled.
+        description: "Environment to deploy to"
+        required: true
+        type: choice
+        options:
+          - staging
+        default: staging
+      image_tag:
+        description: "Image tag to deploy (blank = main for staging, latest for production). Use this to redeploy a specific version."
+        required: false
+        type: string
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy-eks.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image_tag: ${{ inputs.image_tag }}
+    secrets: inherit

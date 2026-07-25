@@ -34,14 +34,17 @@ name: Release
 # (a Docker Hub access token with read/write/delete on ravidecoverai/kosha).
 #
 # Deploy: after each successful merge, deploy-staging (push to main) and
-# deploy-production (v* tags) kustomize-apply k8s/{stage,prod} to the real
-# EKS clusters (decoverai-nonprod / decoverai-prod) and force a rollout
-# restart, since `kubectl apply` alone is a no-op when a floating tag string
-# like `:main` hasn't changed. Each needs its own GitHub Environment
-# ("staging" / "production") with secrets AWS_GITHUB_ROLE_ARN (must also
-# have EKS RBAC — an access entry or aws-auth mapping — granting it write
-# access to the `kosha` namespace), KOSHA_DATABASE_URL, and KOSHA_API_KEY.
-# See k8s/README.md.
+# deploy-production (v* tags) call deploy-eks.yml (reusable) to
+# kustomize-apply k8s/{stage,prod} to the real EKS clusters
+# (decoverai-nonprod / decoverai-prod) and force a rollout restart, since
+# `kubectl apply` alone is a no-op when a floating tag string like `:main`
+# hasn't changed. Each needs its own GitHub Environment ("staging" /
+# "production") with secrets AWS_GITHUB_ROLE_ARN (must also have EKS RBAC —
+# an access entry or aws-auth mapping — granting it write access to the
+# `kosha` namespace), KOSHA_DATABASE_URL, and KOSHA_API_KEY. See
+# k8s/README.md. For an on-demand redeploy/rollback without a new build,
+# use the separate "Deploy to EKS" workflow (deploy.yml,
+# workflow_dispatch) — it calls the same reusable workflow.
 
 on:
   push:
@@ -208,98 +211,23 @@ jobs:
 
   deploy-staging:
     name: Deploy to EKS (staging)
-    runs-on: ubuntu-latest
     needs: merge
     if: github.ref == 'refs/heads/main'
-    environment: staging
-    permissions:
-      contents: read
-      id-token: write # AWS OIDC
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - uses: azure/setup-kubectl@v4
-
-      - name: Set up Kustomize
-        run: |
-          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s -- 5.4.3
-          sudo mv kustomize /usr/local/bin/
-
-      - name: Update kubeconfig
-        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name decoverai-nonprod
-
-      # kosha-secret is generated here rather than committed to git — see
-      # the comment in k8s/stage/kustomization.yaml.
-      - name: Deploy
-        working-directory: k8s/stage
-        env:
-          DATABASE_URL: ${{ secrets.KOSHA_DATABASE_URL }}
-          KOSHA_API_KEY: ${{ secrets.KOSHA_API_KEY }}
-        run: |
-          set -euo pipefail
-          kustomize edit set image "kosha=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:main"
-          kustomize edit add secret kosha-secret \
-            --from-literal=database-url="$DATABASE_URL" \
-            --from-literal=bootstrap-api-key="$KOSHA_API_KEY"
-          kubectl apply -k .
-          kubectl -n kosha rollout restart deployment/kosha
-          kubectl -n kosha rollout status deployment/kosha --timeout=5m
+    uses: ./.github/workflows/deploy-eks.yml
+    with:
+      environment: staging
+      image_tag: main
+    secrets: inherit
 
   deploy-production:
     name: Deploy to EKS (production)
-    runs-on: ubuntu-latest
     needs: merge
-    if: startsWith(github.ref, 'refs/tags/v')
-    environment: production
-    permissions:
-      contents: read
-      id-token: write # AWS OIDC
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: azure/setup-kubectl@v4
-
-      - name: Set up Kustomize
-        run: |
-          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s -- 5.4.3
-          sudo mv kustomize /usr/local/bin/
-
-      - name: Update kubeconfig
-        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name decoverai-prod
-
-      # kosha-secret is generated here rather than committed to git — see
-      # the comment in k8s/prod/kustomization.yaml.
-      - name: Deploy
-        working-directory: k8s/prod
-        env:
-          DATABASE_URL: ${{ secrets.KOSHA_DATABASE_URL }}
-          KOSHA_API_KEY: ${{ secrets.KOSHA_API_KEY }}
-        run: |
-          set -euo pipefail
-          # docker/metadata-action's `type=semver,pattern={{version}}` tag
-          # (pushed by the merge job above) has no leading "v" — strip it so
-          # this matches the image that was actually just published.
-          image_tag="${GITHUB_REF_NAME#v}"
-          kustomize edit set image "kosha=ravidecoverai/kosha:${image_tag}"
-          kustomize edit add secret kosha-secret \
-            --from-literal=database-url="$DATABASE_URL" \
-            --from-literal=bootstrap-api-key="$KOSHA_API_KEY"
-          kubectl apply -k .
-          kubectl -n kosha rollout restart deployment/kosha
-          kubectl -n kosha rollout status deployment/kosha --timeout=5m
+    # Temporarily disabled — staging deploy is still being validated end to
+    # end, and production doesn't have its own AWS role/EKS access set up
+    # yet. Restore `startsWith(github.ref, 'refs/tags/v')` once that's done.
+    if: false
+    uses: ./.github/workflows/deploy-eks.yml
+    with:
+      environment: production
+      image_tag: ${{ github.ref_name }}
+    secrets: inherit
