@@ -32,7 +32,9 @@ REGION = "us-east-1"
 # Case-law search uses a separate managed OpenSearch cluster (its own basic
 # auth) and is intentionally NOT migrated by this Job.
 INDEX_PATTERNS = [
-    "paragraph_index*",  # PARAGRAPH_INDEX (paragraph_index_hnsw) + per-matter customs
+    # Pin to the staging PARAGRAPH_INDEX. Do not use paragraph_index* —
+    # that also matches paragraph_index_hnsw_v2, which Sage does not read.
+    "paragraph_index_hnsw",
     "page_index*",
     "findings_index*",
     "document_index*",
