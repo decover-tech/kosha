@@ -20,10 +20,10 @@ RUN apt-get update \
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --locked --recipe-path recipe.json \
-    --package kosha-server --features postgres,s3
+    --package kosha-server --features migrate
 
 COPY . .
-RUN cargo build --release --locked --package kosha-server --features postgres,s3
+RUN cargo build --release --locked --package kosha-server --features migrate
 
 # ---------- Runtime ----------
 FROM debian:bookworm-slim AS runtime

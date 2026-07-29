@@ -87,6 +87,8 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
     format!("{tenant}/{namespace}")
 }
 
+#[cfg(feature = "migrate")]
+mod migrate;
 #[cfg(feature = "s3")]
 mod s3_storage;
 
@@ -387,6 +389,22 @@ fn redact_database_url(url: &str) -> String {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("migrate") {
+        #[cfg(feature = "migrate")]
+        {
+            if let Err(error) = migrate::run(std::env::args().skip(2)) {
+                eprintln!("migration failed: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "migrate"))]
+        {
+            eprintln!("migration failed: this binary was built without the `migrate` feature");
+            std::process::exit(1);
+        }
+    }
+
     let role = std::env::var("KOSHA_ROLE").unwrap_or_else(|_| "query".into());
     let port = std::env::var("KOSHA_HTTP_PORT").unwrap_or_else(|_| "8080".into());
     let data_dir = std::env::var("KOSHA_DATA_DIR").unwrap_or_else(|_| "/var/lib/kosha/data".into());

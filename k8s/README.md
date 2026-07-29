@@ -81,39 +81,42 @@ with no need to delete anything first.
 
 ## Migrating staging data from OpenSearch → Kosha
 
-`k8s/stage/es-to-kosha-migration-job.yaml` is a self-contained one-shot
-backfill (DESIGN.md §14): a ConfigMap carrying `scripts/copy_es_to_kosha.py`
-plus a `batch/v1` Job that scrolls every backend search index on the staging
-OpenSearch domain (`paragraph_index_hnsw`, `page_index`, `findings_index`,
-`document_index`, `completions_index`, `cases_index` — copied by exact alias
-name so Kosha namespaces match what Sage reads; missing names are skipped)
-and replays each doc into the same-named Kosha namespace
-via `kosha-service.kosha.svc.cluster.local:8080`. It is deliberately **not**
-part of the kustomize overlay — apply it by hand, once:
+`k8s/stage/es-to-kosha-migration-job.yaml` is a one-shot direct backfill
+(DESIGN.md §14). `kosha-server migrate` sliced-scrolls each shared OpenSearch
+alias (`paragraph_index_hnsw`, `page_index`, `findings_index`,
+`document_index`, `completions_index`, `cases_index`), builds 20k-document
+Kosha segments in-process with the WAL disabled, uploads each immutable
+segment to S3, and publishes its Postgres manifest entry. It bypasses the
+HTTP `/index` path entirely. Exact alias names keep Kosha namespaces aligned
+with what Sage reads; missing names are skipped.
+
+The Job is deliberately **not** part of the kustomize overlay — apply it by
+hand after the `:main` image containing the migrate subcommand is deployed:
 
     # optional: preview what would move, without writing anything
     kubectl apply -f k8s/stage/es-to-kosha-migration-job.yaml --dry-run=server
 
     kubectl apply -f k8s/stage/es-to-kosha-migration-job.yaml
     kubectl logs -n kosha -f job/es-to-kosha-migration
+    # after successful completion, reload manifests from Postgres:
+    kubectl rollout restart deployment/kosha -n kosha
 
 Notes:
 
-- **ES auth is SigV4 via the node instance profile.** The Job intentionally
-  has no `serviceAccountName`, so boto3 resolves the same EC2 node identity
-  the backend pods use today against the ES domain. Don't point it at the
-  `kosha` IRSA role (S3-only).
-- **Kosha auth** comes from `kosha-secret` (`bootstrap-api-key`), same
-  namespace, same secret the server Deployment uses.
-- Re-running is safe (doc ids are preserved → upserts). To smoke-test first,
-  edit the Job's command to add `--dry-run` (counts only) or
-  `--limit 500 --namespace migration-smoke` (small copy into a scratch
-  namespace), then `kubectl delete job es-to-kosha-migration` and re-apply.
-- After changing `scripts/copy_es_to_kosha.py`, regenerate the manifest with
-  `make migration-job-manifest` and re-apply.
-- The Job runs with `--workers 4` (ES sliced scroll). Kosha still serializes
-  writes on a single ingest mutex, so the win is overlapping ES reads with
-  Kosha writes rather than true multi-writer ingest.
+- **IAM prerequisite:** the `kosha` service account IRSA already writes S3;
+  it must also allow `es:ESHttp*` on the staging OpenSearch domain. Without
+  that policy the Job fails immediately with an explicit 403.
+- `DATABASE_URL` comes from `kosha-secret`; S3/data-dir settings come from
+  `kosha-config`. No Kosha API key is needed because this bypasses HTTP.
+- A run replaces the namespace manifest with newly-built segments (while
+  choosing segment IDs beyond any prior/partial run). Old S3 segments become
+  unreferenced; they can be garbage-collected later. During migration, the
+  namespace is only partially populated, so keep Sage reads on OpenSearch.
+- For a 500-document smoke test, run one alias into a scratch namespace by
+  adding `--limit 500 --namespace migration-smoke` and retaining exactly one
+  `--index`.
+- Regenerate the manifest after CLI/Job changes with
+  `make migration-job-manifest`.
 
 ## Local verification
 

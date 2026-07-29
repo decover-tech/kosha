@@ -157,6 +157,29 @@ impl S3Storage {
         }
     }
 
+    /// Upload every regular file in a locally-built segment directory.
+    ///
+    /// `logical_dir` is relative to the storage root, for example
+    /// `paragraph_index_hnsw/paragraph_index_hnsw-000001`. Segment files are
+    /// immutable, so callers only need to invoke this for newly-built
+    /// segments.
+    pub fn sync_segment_dir(&self, logical_dir: &Path) -> Result<(), KoshaError> {
+        let local_dir = Path::new(&self.local.root).join(logical_dir);
+        for entry in std::fs::read_dir(&local_dir).map_err(KoshaError::Io)? {
+            let entry = entry.map_err(KoshaError::Io)?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let logical_path = logical_dir.join(name).to_string_lossy().into_owned();
+            self.upload_to_s3(&path, &self.s3_key(&logical_path))?;
+        }
+        Ok(())
+    }
+
     /// Upload a local file to S3. Uses multi-part upload for files > 5MB.
     fn upload_to_s3(&self, local_path: &Path, s3_key: &str) -> Result<(), KoshaError> {
         let data = std::fs::read(local_path).map_err(KoshaError::Io)?;
