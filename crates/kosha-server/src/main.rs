@@ -267,16 +267,21 @@ impl AppState {
         }
     }
 
-    /// After a flush: persist the manifest and upload new segment files to S3.
+    /// After a flush: persist the manifest and upload the new segment to S3.
     fn publish_namespace(&self, ns: &NamespaceId) {
         self.persist_manifest(ns);
         #[cfg(feature = "s3")]
-        self.sync_namespace_to_s3(ns);
+        self.sync_latest_segment_to_s3(ns);
     }
 
-    /// Sync all segments listed in the namespace manifest to S3.
+    /// Upload only the newest segment for `ns` to S3.
+    ///
+    /// Segments are immutable and every flush publishes immediately after
+    /// appending exactly one segment, so re-uploading the full manifest on
+    /// each flush is unnecessary and turns a bulk backfill into O(n²) S3
+    /// work as the segment count grows.
     #[cfg(feature = "s3")]
-    fn sync_namespace_to_s3(&self, ns: &NamespaceId) {
+    fn sync_latest_segment_to_s3(&self, ns: &NamespaceId) {
         let manifest = {
             let indexer = self.indexer.lock().unwrap();
             indexer.manifest_cloned(ns)
@@ -284,10 +289,11 @@ impl AppState {
         let Some(manifest) = manifest else {
             return;
         };
-        for entry in &manifest.segments {
-            let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
-            self.sync_to_s3(&seg_path);
-        }
+        let Some(entry) = manifest.segments.last() else {
+            return;
+        };
+        let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+        self.sync_to_s3(&seg_path);
     }
 
     /// Sync a segment directory to S3 (after flush).
