@@ -268,10 +268,11 @@ impl EsClient {
         slice_id: usize,
         slice_max: usize,
     ) -> Result<SearchResponse> {
+        // No `track_total_hits`: OpenSearch rejects it outright in a scroll
+        // context, and per-index totals already come from `_count`.
         let mut body = json!({
             "size": size,
             "sort": ["_doc"],
-            "track_total_hits": false,
             "query": {"match_all": {}},
         });
         if slice_max > 1 {
