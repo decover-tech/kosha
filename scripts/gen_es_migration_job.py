@@ -26,28 +26,29 @@ ES_HOST = "https://vpc-decoverai-nonprod-search-rdaf2ygjik3teui5prmuotjlx4.us-ea
 ES_AUTH_MODE = "sigv4"
 REGION = "us-east-1"
 
-# All index families the backend keeps on the default staging ES domain
-# (backend/common/settings.py). Patterns that match nothing are skipped with
-# a warning, so listing a family that doesn't exist on staging is harmless.
-# Case-law search uses a separate managed OpenSearch cluster (its own basic
-# auth) and is intentionally NOT migrated by this Job.
-INDEX_PATTERNS = [
-    "page_index*",
-    "findings_index*",
-    "document_index*",
-    "completions_index*",
-    "cases_index*",
-]
-
 # Copied by exact name (--index), NOT resolved through _cat/indices.
-# paragraph_index_hnsw is an ALIAS for the concrete index
-# paragraph_index_hnsw_v2, and _cat/indices resolves aliases to their concrete
-# backing index — which would name the Kosha namespace after _v2, while Sage
-# looks its namespace up under the alias string. Scroll/count work fine
-# against an alias, so copy it under the name Sage actually reads.
+#
+# These are the strings Sage / IndexRegistry read (often ALIASES pointing at a
+# concrete *_v2 index). `_cat/indices` resolves aliases to their concrete
+# backing index, so a `--pattern 'findings_index*'` backfill would land docs
+# in Kosha namespace `findings_index_v2` while Sage looks up `findings_index`.
+# Scroll/count work fine against an alias, so copy under the name Sage reads.
+#
+# Names that don't exist on staging are skipped with a warning by the copy
+# script. Case-law search uses a separate managed OpenSearch cluster and is
+# intentionally NOT migrated by this Job.
 INDEX_NAMES = [
     "paragraph_index_hnsw",
+    "page_index",
+    "findings_index",
+    "document_index",
+    "completions_index",
+    "cases_index",
 ]
+
+# Optional wildcard families (per-matter customs, etc.). Empty for staging —
+# shared defaults above cover what Sage reads today.
+INDEX_PATTERNS: list[str] = []
 
 CONFIGMAP_HEADER = """\
 # GENERATED FILE — do not edit by hand.
@@ -152,7 +153,8 @@ def render() -> str:
         "    " + line if line.strip() else "" for line in script.splitlines()
     )
     args = " ".join(f"--index '{n}'" for n in INDEX_NAMES)
-    args += " " + " ".join(f"--pattern '{p}'" for p in INDEX_PATTERNS)
+    if INDEX_PATTERNS:
+        args += " " + " ".join(f"--pattern '{p}'" for p in INDEX_PATTERNS)
     args += " --batch-size 200 --scroll-size 1000"
     job = JOB.replace("__ES_HOST__", ES_HOST).replace("__ES_AUTH_MODE__", ES_AUTH_MODE)
     job = job.replace("__REGION__", REGION).replace("__ARGS__", args)

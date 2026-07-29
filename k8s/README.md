@@ -84,9 +84,10 @@ with no need to delete anything first.
 `k8s/stage/es-to-kosha-migration-job.yaml` is a self-contained one-shot
 backfill (DESIGN.md §14): a ConfigMap carrying `scripts/copy_es_to_kosha.py`
 plus a `batch/v1` Job that scrolls every backend search index on the staging
-OpenSearch domain (`paragraph_index*`, `page_index*`, `findings_index*`,
-`document_index*`, `completions_index*`, `cases_index*` — patterns that match
-nothing are skipped) and replays each doc into the same-named Kosha namespace
+OpenSearch domain (`paragraph_index_hnsw`, `page_index`, `findings_index`,
+`document_index`, `completions_index`, `cases_index` — copied by exact alias
+name so Kosha namespaces match what Sage reads; missing names are skipped)
+and replays each doc into the same-named Kosha namespace
 via `kosha-service.kosha.svc.cluster.local:8080`. It is deliberately **not**
 part of the kustomize overlay — apply it by hand, once:
 

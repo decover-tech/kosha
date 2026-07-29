@@ -278,14 +278,28 @@ data:
 
 
     def resolve_indices(es: EsScrollClient, args: argparse.Namespace) -> list[str]:
-        """Concrete list of ES indices to copy, in stable order, de-duplicated."""
+        """List of ES indices/aliases to copy, in stable order, de-duplicated.
+
+        ``--index`` values are kept verbatim (do not resolve through
+        ``_cat/indices``): staging shared indices are often aliases whose
+        concrete backing name differs (e.g. ``findings_index`` →
+        ``findings_index_v2``), and Sage uses the alias string as the Kosha
+        namespace. ``--pattern`` still expands via ``_cat/indices``.
+        """
         indices: list[str] = []
+        # Exact names first so the big shared aliases copy before any patterns.
+        for name in args.index or []:
+            try:
+                es.count(name)
+            except RuntimeError as exc:
+                logger.warning("index %r not reachable (%s) — skipping", name, exc)
+                continue
+            indices.append(name)
         for pattern in args.pattern or []:
             matched = es.list_indices(pattern)
             if not matched:
                 logger.warning("pattern %r matched no indices — skipping", pattern)
             indices.extend(matched)
-        indices.extend(args.index or [])
         if not indices and not args.index and not args.pattern:
             indices.append(os.environ.get("PARAGRAPH_INDEX") or "paragraph_index")
         if not indices:
@@ -506,7 +520,7 @@ spec:
               # boto3/botocore for SigV4 signing against the managed ES domain
               # (requires NAT egress to PyPI, which the staging cluster has).
               pip install --quiet --disable-pip-version-check boto3
-              exec python /scripts/copy_es_to_kosha.py --index 'paragraph_index_hnsw' --pattern 'page_index*' --pattern 'findings_index*' --pattern 'document_index*' --pattern 'completions_index*' --pattern 'cases_index*' --batch-size 200 --scroll-size 1000
+              exec python /scripts/copy_es_to_kosha.py --index 'paragraph_index_hnsw' --index 'page_index' --index 'findings_index' --index 'document_index' --index 'completions_index' --index 'cases_index' --batch-size 200 --scroll-size 1000
           resources:
             requests:
               cpu: "250m"

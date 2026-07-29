@@ -258,14 +258,28 @@ def source_to_fields(source: dict) -> list[dict]:
 
 
 def resolve_indices(es: EsScrollClient, args: argparse.Namespace) -> list[str]:
-    """Concrete list of ES indices to copy, in stable order, de-duplicated."""
+    """List of ES indices/aliases to copy, in stable order, de-duplicated.
+
+    ``--index`` values are kept verbatim (do not resolve through
+    ``_cat/indices``): staging shared indices are often aliases whose
+    concrete backing name differs (e.g. ``findings_index`` →
+    ``findings_index_v2``), and Sage uses the alias string as the Kosha
+    namespace. ``--pattern`` still expands via ``_cat/indices``.
+    """
     indices: list[str] = []
+    # Exact names first so the big shared aliases copy before any patterns.
+    for name in args.index or []:
+        try:
+            es.count(name)
+        except RuntimeError as exc:
+            logger.warning("index %r not reachable (%s) — skipping", name, exc)
+            continue
+        indices.append(name)
     for pattern in args.pattern or []:
         matched = es.list_indices(pattern)
         if not matched:
             logger.warning("pattern %r matched no indices — skipping", pattern)
         indices.extend(matched)
-    indices.extend(args.index or [])
     if not indices and not args.index and not args.pattern:
         indices.append(os.environ.get("PARAGRAPH_INDEX") or "paragraph_index")
     if not indices:
