@@ -30,9 +30,10 @@ REGION = "us-east-1"
 #
 # These are the strings Sage / IndexRegistry read (often ALIASES pointing at a
 # concrete *_v2 index). `_cat/indices` resolves aliases to their concrete
-# backing index, so a `--pattern 'findings_index*'` backfill would land docs
-# in Kosha namespace `findings_index_v2` while Sage looks up `findings_index`.
-# Scroll/count work fine against an alias, so copy under the name Sage reads.
+# backing index, so a `--pattern 'findings_index*'` (or `*`) backfill would
+# land docs in Kosha namespace `findings_index_v2` while Sage looks up
+# `findings_index`. Scroll/count work fine against an alias, so copy under
+# the name Sage reads.
 #
 # Names that don't exist on staging are skipped with a warning by the copy
 # script. Case-law search uses a separate managed OpenSearch cluster and is
@@ -47,7 +48,8 @@ INDEX_NAMES = [
 ]
 
 # Optional wildcard families (per-matter customs, etc.). Empty for staging —
-# shared defaults above cover what Sage reads today.
+# shared defaults above cover what Sage reads today. Do NOT use `*` here: it
+# resolves aliases to concrete *_v2 names and mis-names Kosha namespaces.
 INDEX_PATTERNS: list[str] = []
 
 CONFIGMAP_HEADER = """\
@@ -130,10 +132,10 @@ spec:
               exec python /scripts/copy_es_to_kosha.py __ARGS__
           resources:
             requests:
-              cpu: "250m"
-              memory: "512Mi"
+              cpu: "500m"
+              memory: "1Gi"
             limits:
-              cpu: "1"
+              cpu: "2"
               memory: "2Gi"
           volumeMounts:
             - name: script
@@ -152,10 +154,10 @@ def render() -> str:
     embedded = "\n".join(
         "    " + line if line.strip() else "" for line in script.splitlines()
     )
-    args = " ".join(f"--index '{n}'" for n in INDEX_NAMES)
-    if INDEX_PATTERNS:
-        args += " " + " ".join(f"--pattern '{p}'" for p in INDEX_PATTERNS)
-    args += " --batch-size 200 --scroll-size 1000"
+    parts = [f"--index '{n}'" for n in INDEX_NAMES]
+    parts += [f"--pattern '{p}'" for p in INDEX_PATTERNS]
+    parts += ["--batch-size 200", "--scroll-size 1000", "--workers 4"]
+    args = " ".join(parts)
     job = JOB.replace("__ES_HOST__", ES_HOST).replace("__ES_AUTH_MODE__", ES_AUTH_MODE)
     job = job.replace("__REGION__", REGION).replace("__ARGS__", args)
     return CONFIGMAP_HEADER + embedded + "\n" + job

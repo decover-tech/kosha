@@ -111,6 +111,9 @@ Notes:
   namespace), then `kubectl delete job es-to-kosha-migration` and re-apply.
 - After changing `scripts/copy_es_to_kosha.py`, regenerate the manifest with
   `make migration-job-manifest` and re-apply.
+- The Job runs with `--workers 4` (ES sliced scroll). Kosha still serializes
+  writes on a single ingest mutex, so the win is overlapping ES reads with
+  Kosha writes rather than true multi-writer ingest.
 
 ## Local verification
 

@@ -44,6 +44,9 @@ data:
         python scripts/copy_es_to_kosha.py \
             --index paragraph_index_hnsw --namespace smoke-test --limit 100
 
+        # Parallel sliced scroll (4 ES partitions writing concurrently)
+        python scripts/copy_es_to_kosha.py --index paragraph_index_hnsw --workers 4
+
         # Count what would move, write nothing
         python scripts/copy_es_to_kosha.py --pattern 'paragraph_index*' --dry-run
 
@@ -68,10 +71,12 @@ data:
     import logging
     import os
     import sys
+    import threading
     import time
     import urllib.error
     import urllib.parse
     import urllib.request
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     logger = logging.getLogger("copy_es_to_kosha")
 
@@ -175,13 +180,24 @@ data:
             result = self._request("POST", f"/{urllib.parse.quote(index)}/_count", body)
             return int(result.get("count", 0))
 
-        def open_scroll(self, index: str, size: int, keepalive: str) -> tuple[str, list, int]:
-            body = {
+        def open_scroll(
+            self,
+            index: str,
+            size: int,
+            keepalive: str,
+            slice_id: int | None = None,
+            slice_max: int | None = None,
+        ) -> tuple[str, list, int]:
+            body: dict = {
                 "size": size,
                 "sort": ["_doc"],
                 "track_total_hits": True,
                 "query": {"match_all": {}},
             }
+            # Point-in-time sliced scroll: each worker gets a disjoint partition of
+            # the index (ES/OpenSearch). Omit the key for the single-worker path.
+            if slice_id is not None and slice_max is not None and slice_max > 1:
+                body["slice"] = {"id": slice_id, "max": slice_max}
             result = self._request(
                 "POST", f"/{urllib.parse.quote(index)}/_search?scroll={keepalive}", body
             )
@@ -327,58 +343,104 @@ data:
         """
         total = es.count(index)
         planned = min(total, args.limit) if args.limit else total
+        workers = max(1, int(args.workers))
         scope = f"capped by --limit from {total}" if args.limit and args.limit < total else "full index"
-        logger.info("index %s → namespace %s: %s docs (%s)", index, namespace, planned, scope)
+        logger.info(
+            "index %s → namespace %s: %s docs (%s, workers=%s)",
+            index, namespace, planned, scope, workers,
+        )
 
-        copied = 0
-        with_embedding = 0
-        batch: list[dict] = []
+        progress = {"copied": 0, "with_embedding": 0}
+        progress_lock = threading.Lock()
+        log_every = max(args.batch_size, 200)
 
-        def _send_batch() -> None:
-            if not batch:
-                return
-            kosha.index_batch(namespace, batch)
-            batch.clear()
-            if args.sleep > 0:
-                time.sleep(args.sleep)
+        def _run_slice(slice_id: int) -> tuple[int, int]:
+            local_copied = 0
+            local_emb = 0
+            batch: list[dict] = []
 
-        scroll_id, hits, _ = es.open_scroll(index, args.scroll_size, args.scroll_keepalive)
-        try:
-            while True:
-                for hit in hits:
-                    if args.limit and copied >= args.limit:
+            def send_batch() -> None:
+                nonlocal batch
+                if not batch:
+                    return
+                n = len(batch)
+                kosha.index_batch(namespace, batch)
+                batch = []
+                if args.sleep > 0:
+                    time.sleep(args.sleep)
+                with progress_lock:
+                    progress["copied"] += n
+                    total_copied = progress["copied"]
+                if total_copied % log_every < n or total_copied >= planned:
+                    logger.info(
+                        "index %s: %s / %s docs copied",
+                        index, min(total_copied, planned), planned,
+                    )
+
+            def limit_reached() -> bool:
+                if not args.limit:
+                    return False
+                with progress_lock:
+                    return progress["copied"] >= args.limit
+
+            scroll_id, hits, _ = es.open_scroll(
+                index,
+                args.scroll_size,
+                args.scroll_keepalive,
+                slice_id=slice_id,
+                slice_max=workers,
+            )
+            try:
+                while True:
+                    if limit_reached():
                         break
-                    doc_id = hit.get("_id")
-                    if not doc_id:
-                        logger.warning("hit without _id in %s — skipping", index)
-                        continue
-                    source = hit.get("_source") or {}
-                    if args.embedding_field in source:
-                        with_embedding += 1
-                    batch.append({"id": doc_id, "fields": source_to_fields(source)})
-                    copied += 1
-                    if len(batch) >= args.batch_size:
-                        _send_batch()
-                        logger.info("index %s: %s / %s docs copied", index, copied, planned)
-                if args.limit and copied >= args.limit:
-                    break
-                if not hits:
-                    break
-                scroll_id, hits = es.next_scroll(scroll_id, args.scroll_keepalive)
-                if not hits:
-                    break
-        finally:
-            es.clear_scroll(scroll_id)
+                    for hit in hits:
+                        if limit_reached():
+                            break
+                        doc_id = hit.get("_id")
+                        if not doc_id:
+                            logger.warning("hit without _id in %s — skipping", index)
+                            continue
+                        source = hit.get("_source") or {}
+                        if args.embedding_field in source:
+                            local_emb += 1
+                        batch.append({"id": doc_id, "fields": source_to_fields(source)})
+                        local_copied += 1
+                        if len(batch) >= args.batch_size:
+                            send_batch()
+                    if limit_reached() or not hits:
+                        break
+                    scroll_id, hits = es.next_scroll(scroll_id, args.scroll_keepalive)
+                    if not hits:
+                        break
+            finally:
+                es.clear_scroll(scroll_id)
 
-        _send_batch()
+            send_batch()
+            with progress_lock:
+                progress["with_embedding"] += local_emb
+            return local_copied, local_emb
+
+        if workers == 1:
+            _run_slice(0)
+        else:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"scroll-{index}") as pool:
+                futures = [pool.submit(_run_slice, i) for i in range(workers)]
+                for fut in as_completed(futures):
+                    fut.result()  # surface worker errors
+
+        with progress_lock:
+            copied = progress["copied"]
+            with_emb = progress["with_embedding"]
+
         if copied > 0:
             kosha.flush(namespace)
         logger.info(
             "index %s: %s namespace %s — %s docs copied, %s with %s",
             index, "flushed" if copied else "skipped (empty)", namespace,
-            copied, with_embedding, args.embedding_field,
+            copied, with_emb, args.embedding_field,
         )
-        return copied, with_embedding
+        return copied, with_emb
 
 
     def dry_run(es: EsScrollClient, indices: list[str], args: argparse.Namespace) -> None:
@@ -398,7 +460,7 @@ data:
             description="Copy chunks + embeddings from ElasticSearch/OpenSearch into Kosha."
         )
         parser.add_argument("--index", action="append",
-                            help="Concrete ES index to copy (repeatable).")
+                            help="Concrete ES index/alias to copy (repeatable).")
         parser.add_argument("--pattern", action="append",
                             help="ES index pattern resolved via _cat/indices (repeatable).")
         parser.add_argument("--namespace",
@@ -411,6 +473,8 @@ data:
                             help="ES scroll page size (default 1000).")
         parser.add_argument("--scroll-keepalive", default="5m",
                             help="ES scroll context keepalive (default 5m).")
+        parser.add_argument("--workers", type=int, default=1,
+                            help="Parallel ES sliced-scroll workers per index (default 1).")
         parser.add_argument("--sleep", type=float, default=0.0,
                             help="Seconds to sleep between batches (throttle, default 0).")
         parser.add_argument("--embedding-field", default=DEFAULT_EMBEDDING_FIELD,
@@ -421,6 +485,9 @@ data:
                             help="Count docs per index, write nothing.")
         parser.add_argument("--verbose", action="store_true")
         args = parser.parse_args(argv)
+
+        if args.workers < 1:
+            parser.error("--workers must be >= 1")
 
         logging.basicConfig(
             level=logging.DEBUG if args.verbose else logging.INFO,
@@ -520,13 +587,13 @@ spec:
               # boto3/botocore for SigV4 signing against the managed ES domain
               # (requires NAT egress to PyPI, which the staging cluster has).
               pip install --quiet --disable-pip-version-check boto3
-              exec python /scripts/copy_es_to_kosha.py --index 'paragraph_index_hnsw' --index 'page_index' --index 'findings_index' --index 'document_index' --index 'completions_index' --index 'cases_index' --batch-size 200 --scroll-size 1000
+              exec python /scripts/copy_es_to_kosha.py --index 'paragraph_index_hnsw' --index 'page_index' --index 'findings_index' --index 'document_index' --index 'completions_index' --index 'cases_index' --batch-size 200 --scroll-size 1000 --workers 4
           resources:
             requests:
-              cpu: "250m"
-              memory: "512Mi"
+              cpu: "500m"
+              memory: "1Gi"
             limits:
-              cpu: "1"
+              cpu: "2"
               memory: "2Gi"
           volumeMounts:
             - name: script
