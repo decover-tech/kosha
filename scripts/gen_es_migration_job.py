@@ -32,14 +32,21 @@ REGION = "us-east-1"
 # Case-law search uses a separate managed OpenSearch cluster (its own basic
 # auth) and is intentionally NOT migrated by this Job.
 INDEX_PATTERNS = [
-    # Pin to the staging PARAGRAPH_INDEX. Do not use paragraph_index* —
-    # that also matches paragraph_index_hnsw_v2, which Sage does not read.
-    "paragraph_index_hnsw",
     "page_index*",
     "findings_index*",
     "document_index*",
     "completions_index*",
     "cases_index*",
+]
+
+# Copied by exact name (--index), NOT resolved through _cat/indices.
+# paragraph_index_hnsw is an ALIAS for the concrete index
+# paragraph_index_hnsw_v2, and _cat/indices resolves aliases to their concrete
+# backing index — which would name the Kosha namespace after _v2, while Sage
+# looks its namespace up under the alias string. Scroll/count work fine
+# against an alias, so copy it under the name Sage actually reads.
+INDEX_NAMES = [
+    "paragraph_index_hnsw",
 ]
 
 CONFIGMAP_HEADER = """\
@@ -144,7 +151,8 @@ def render() -> str:
     embedded = "\n".join(
         "    " + line if line.strip() else "" for line in script.splitlines()
     )
-    args = " ".join(f"--pattern '{p}'" for p in INDEX_PATTERNS)
+    args = " ".join(f"--index '{n}'" for n in INDEX_NAMES)
+    args += " " + " ".join(f"--pattern '{p}'" for p in INDEX_PATTERNS)
     args += " --batch-size 200 --scroll-size 1000"
     job = JOB.replace("__ES_HOST__", ES_HOST).replace("__ES_AUTH_MODE__", ES_AUTH_MODE)
     job = job.replace("__REGION__", REGION).replace("__ARGS__", args)

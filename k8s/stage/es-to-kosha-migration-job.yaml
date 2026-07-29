@@ -506,7 +506,7 @@ spec:
               # boto3/botocore for SigV4 signing against the managed ES domain
               # (requires NAT egress to PyPI, which the staging cluster has).
               pip install --quiet --disable-pip-version-check boto3
-              exec python /scripts/copy_es_to_kosha.py --pattern 'paragraph_index_hnsw' --pattern 'page_index*' --pattern 'findings_index*' --pattern 'document_index*' --pattern 'completions_index*' --pattern 'cases_index*' --batch-size 200 --scroll-size 1000
+              exec python /scripts/copy_es_to_kosha.py --index 'paragraph_index_hnsw' --pattern 'page_index*' --pattern 'findings_index*' --pattern 'document_index*' --pattern 'completions_index*' --pattern 'cases_index*' --batch-size 200 --scroll-size 1000
           resources:
             requests:
               cpu: "250m"
