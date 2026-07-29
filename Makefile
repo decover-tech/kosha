@@ -8,6 +8,7 @@
 #   make gen              — generate everything
 #   make rust-test        — run Rust tests
 #   make rust-build       — build Rust binary
+#   make migration-job-manifest — regen the ES→Kosha staging backfill Job YAML
 #   make all              — lint + gen + build + test
 #
 
@@ -48,6 +49,15 @@ client-python-build:
 
 client-python-publish:
 	python -m twine upload clients/python/dist/*
+
+# ── ES → Kosha migration ───────────────────────────────────────────────────
+
+.PHONY: migration-job-manifest
+
+# Regenerate the self-contained staging backfill manifest (ConfigMap with the
+# copy script embedded + Job) after changing scripts/copy_es_to_kosha.py.
+migration-job-manifest:
+	python3 scripts/gen_es_migration_job.py > k8s/stage/es-to-kosha-migration-job.yaml
 
 # ── Rust ───────────────────────────────────────────────────────────────────
 

@@ -79,6 +79,45 @@ above exist, the pipeline's `kubectl apply` will converge onto the existing
 Deployment/Service/ConfigMap/ServiceAccount rather than replacing them,
 with no need to delete anything first.
 
+## Migrating staging data from OpenSearch → Kosha
+
+`k8s/stage/es-to-kosha-migration-job.yaml` is a one-shot direct backfill
+(DESIGN.md §14). `kosha-server migrate` sliced-scrolls each shared OpenSearch
+alias (`paragraph_index_hnsw`, `page_index`, `findings_index`,
+`document_index`, `completions_index`, `cases_index`), builds 20k-document
+Kosha segments in-process with the WAL disabled, uploads each immutable
+segment to S3, and publishes its Postgres manifest entry. It bypasses the
+HTTP `/index` path entirely. Exact alias names keep Kosha namespaces aligned
+with what Sage reads; missing names are skipped.
+
+The Job is deliberately **not** part of the kustomize overlay — apply it by
+hand after the `:main` image containing the migrate subcommand is deployed:
+
+    # optional: preview what would move, without writing anything
+    kubectl apply -f k8s/stage/es-to-kosha-migration-job.yaml --dry-run=server
+
+    kubectl apply -f k8s/stage/es-to-kosha-migration-job.yaml
+    kubectl logs -n kosha -f job/es-to-kosha-migration
+    # after successful completion, reload manifests from Postgres:
+    kubectl rollout restart deployment/kosha -n kosha
+
+Notes:
+
+- **IAM prerequisite:** the `kosha` service account IRSA already writes S3;
+  it must also allow `es:ESHttp*` on the staging OpenSearch domain. Without
+  that policy the Job fails immediately with an explicit 403.
+- `DATABASE_URL` comes from `kosha-secret`; S3/data-dir settings come from
+  `kosha-config`. No Kosha API key is needed because this bypasses HTTP.
+- A run replaces the namespace manifest with newly-built segments (while
+  choosing segment IDs beyond any prior/partial run). Old S3 segments become
+  unreferenced; they can be garbage-collected later. During migration, the
+  namespace is only partially populated, so keep Sage reads on OpenSearch.
+- For a 500-document smoke test, run one alias into a scratch namespace by
+  adding `--limit 500 --namespace migration-smoke` and retaining exactly one
+  `--index`.
+- Regenerate the manifest after CLI/Job changes with
+  `make migration-job-manifest`.
+
 ## Local verification
 
     kustomize build k8s/stage            # render, no cluster needed
