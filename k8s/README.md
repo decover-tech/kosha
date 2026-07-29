@@ -79,6 +79,38 @@ above exist, the pipeline's `kubectl apply` will converge onto the existing
 Deployment/Service/ConfigMap/ServiceAccount rather than replacing them,
 with no need to delete anything first.
 
+## Migrating staging data from OpenSearch → Kosha
+
+`k8s/stage/es-to-kosha-migration-job.yaml` is a self-contained one-shot
+backfill (DESIGN.md §14): a ConfigMap carrying `scripts/copy_es_to_kosha.py`
+plus a `batch/v1` Job that scrolls every backend search index on the staging
+OpenSearch domain (`paragraph_index*`, `page_index*`, `findings_index*`,
+`document_index*`, `completions_index*`, `cases_index*` — patterns that match
+nothing are skipped) and replays each doc into the same-named Kosha namespace
+via `kosha-service.kosha.svc.cluster.local:8080`. It is deliberately **not**
+part of the kustomize overlay — apply it by hand, once:
+
+    # optional: preview what would move, without writing anything
+    kubectl apply -f k8s/stage/es-to-kosha-migration-job.yaml --dry-run=server
+
+    kubectl apply -f k8s/stage/es-to-kosha-migration-job.yaml
+    kubectl logs -n kosha -f job/es-to-kosha-migration
+
+Notes:
+
+- **ES auth is SigV4 via the node instance profile.** The Job intentionally
+  has no `serviceAccountName`, so boto3 resolves the same EC2 node identity
+  the backend pods use today against the ES domain. Don't point it at the
+  `kosha` IRSA role (S3-only).
+- **Kosha auth** comes from `kosha-secret` (`bootstrap-api-key`), same
+  namespace, same secret the server Deployment uses.
+- Re-running is safe (doc ids are preserved → upserts). To smoke-test first,
+  edit the Job's command to add `--dry-run` (counts only) or
+  `--limit 500 --namespace migration-smoke` (small copy into a scratch
+  namespace), then `kubectl delete job es-to-kosha-migration` and re-apply.
+- After changing `scripts/copy_es_to_kosha.py`, regenerate the manifest with
+  `make migration-job-manifest` and re-apply.
+
 ## Local verification
 
     kustomize build k8s/stage            # render, no cluster needed
