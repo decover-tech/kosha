@@ -608,6 +608,10 @@ fn route(
         return handle_index(body, state);
     }
 
+    if request_line.starts_with("POST /replace") {
+        return handle_replace(body, state);
+    }
+
     if request_line.starts_with("GET /search") {
         return handle_search_get(request_line, state);
     }
@@ -687,6 +691,50 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     json_ok(&IndexResponse {
         indexed_count: count,
         namespace: ns,
+    })
+}
+
+// ─── POST /replace ──────────────────────────────────────────────────────────
+
+fn handle_replace(body: &[u8], state: &AppState) -> String {
+    let request: IndexRequest = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid JSON: {error}")),
+    };
+    let namespace = request.namespace;
+
+    // Replacement scans immutable segments, so materialize any S3-backed
+    // segment directories before entering the indexer lock.
+    #[cfg(feature = "s3")]
+    {
+        let manifest = {
+            let indexer = state.indexer.lock().unwrap();
+            indexer.manifest_cloned(&namespace)
+        };
+        if let Some(manifest) = manifest {
+            for entry in &manifest.segments {
+                let path = state.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                state.ensure_segment_local(&path);
+            }
+        }
+    }
+
+    let count = {
+        let mut indexer = state.indexer.lock().unwrap();
+        match indexer.replace_documents(namespace.clone(), request.documents) {
+            Ok(count) => count,
+            Err(error) => return json_error(500, &format!("replacement error: {error}")),
+        }
+    };
+    {
+        let mut controller = state.controller.lock().unwrap();
+        controller.ensure_namespace(namespace.clone());
+    }
+    state.publish_namespace(&namespace);
+
+    json_ok(&IndexResponse {
+        indexed_count: count,
+        namespace,
     })
 }
 
@@ -1227,6 +1275,65 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"indexed_count\":1"));
+    }
+
+    #[test]
+    fn replace_endpoint_removes_old_document_version() {
+        let state = test_state();
+        let namespace = NamespaceId("test-replace".into());
+        let initial = IndexRequest {
+            namespace: namespace.clone(),
+            documents: vec![Document {
+                id: DocumentId("doc1".into()),
+                fields: vec![Field::text("title", "old value")],
+            }],
+        };
+        route(
+            "POST /index HTTP/1.1\r\n",
+            &HashMap::new(),
+            &serde_json::to_vec(&initial).unwrap(),
+            "test",
+            &state,
+        );
+        state
+            .indexer
+            .lock()
+            .unwrap()
+            .flush_namespace(&namespace)
+            .unwrap();
+
+        let replacement = IndexRequest {
+            namespace,
+            documents: vec![Document {
+                id: DocumentId("doc1".into()),
+                fields: vec![Field::text("title", "new value")],
+            }],
+        };
+        let response = route(
+            "POST /replace HTTP/1.1\r\n",
+            &HashMap::new(),
+            &serde_json::to_vec(&replacement).unwrap(),
+            "test",
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+
+        let old = route(
+            "GET /search?ns=test-replace&q=old HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"",
+            "test",
+            &state,
+        );
+        let new = route(
+            "GET /search?ns=test-replace&q=new HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"",
+            "test",
+            &state,
+        );
+        assert!(old.contains("\"total_hits\":0"));
+        assert!(new.contains("\"total_hits\":1"));
     }
 
     #[test]

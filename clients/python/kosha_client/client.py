@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Sequence
 
 from .compat import Transport as CompatTransport
@@ -17,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─── Public interface ──────────────────────────────────────────────────────
+
 
 class KoshaClient:
     """Drop-in replacement for ``opensearchpy.OpenSearch``.
@@ -34,6 +38,7 @@ class KoshaClient:
     * ``bulk()``    — multi-document index via ``opensearchpy.helpers.bulk``
     * ``count()``   — document count
     * ``update()``  — update by id
+    * ``update_by_query()`` — synchronous or task-polled scripted updates
     * ``delete_by_query()``  — delete matching documents
     """
 
@@ -53,6 +58,7 @@ class KoshaClient:
         #   2. ``KOSHA_HOST`` env var (customer-friendly)
         #   3. Fallback to localhost:8080 (dev)
         import os as _os
+
         if hosts is None:
             hosts = _os.environ.get("KOSHA_HOST") or kwargs.get("kosha_url")
         if isinstance(hosts, str):
@@ -101,9 +107,15 @@ class KoshaClient:
         # Duck-typed transport so opensearchpy.helpers.bulk() can chunk
         # actions before delegating to self.bulk().
         self.transport = CompatTransport()
+        self._tasks: dict[str, dict] = {}
+        self._tasks_lock = threading.Lock()
 
-        logger.info("KoshaClient targeting %s namespace=%s api_key=%s",
-                     kosha_url, self._namespace, bool(resolved_api_key))
+        logger.info(
+            "KoshaClient targeting %s namespace=%s api_key=%s",
+            kosha_url,
+            self._namespace,
+            bool(resolved_api_key),
+        )
 
     # ── Low-level request helpers ──────────────────────────────────────────
 
@@ -115,7 +127,9 @@ class KoshaClient:
         """
         return self._transport.request(method, path, body)
 
-    def _v1_request(self, method: str, namespace: str, action: str, body: Any = None) -> Any:
+    def _v1_request(
+        self, method: str, namespace: str, action: str, body: Any = None
+    ) -> Any:
         """Request against a v1 proto-defined path.
 
         Builds ``/v1/namespaces/{namespace}/{action}`` automatically.
@@ -134,7 +148,9 @@ class KoshaClient:
             ns = "default"
         return str(ns)
 
-    def search(self, index: str | None = None, body: dict | None = None, **params: Any) -> dict:
+    def search(
+        self, index: str | None = None, body: dict | None = None, **params: Any
+    ) -> dict:
         ns = self._resolve_ns(index)
 
         query_text = self._extract_query_text(body) if body else ""
@@ -152,7 +168,13 @@ class KoshaClient:
 
         # Determine if we need POST (agg/wildcard/phrase/filter/knn/sort/cursor).
         needs_post = bool(
-            filter_clause or aggs or wildcard or match_phrase or knn or sort or search_after
+            filter_clause
+            or aggs
+            or wildcard
+            or match_phrase
+            or knn
+            or sort
+            or search_after
         )
 
         if not needs_post:
@@ -170,6 +192,7 @@ class KoshaClient:
                     req.add_header("Authorization", f"Bearer {self._transport.api_key}")
                 elif self._auth:
                     import base64
+
                     user, pwd = self._auth
                     token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
                     req.add_header("Authorization", f"Basic {token}")
@@ -224,7 +247,9 @@ class KoshaClient:
         kosha_aggs = result.get("aggregations")
 
         # Server already applied from/search_after/size — do not re-slice.
-        response = self._build_search_response(kosha_hits, 0, len(kosha_hits) or size, 0, total)
+        response = self._build_search_response(
+            kosha_hits, 0, len(kosha_hits) or size, 0, total
+        )
         if kosha_aggs:
             response["aggregations"] = kosha_aggs
         return response
@@ -252,15 +277,17 @@ class KoshaClient:
                 # Store field type for filter-aware operations.
                 if field.get("field_type") not in ("Text", None):
                     source[f"__type__{field['name']}"] = field["field_type"]
-            hits.append({
-                "_index": self._namespace,
-                "_id": doc_id,
-                "_score": score,
-                "_source": source,
-            })
+            hits.append(
+                {
+                    "_index": self._namespace,
+                    "_id": doc_id,
+                    "_score": score,
+                    "_source": source,
+                }
+            )
 
         # Apply offset/pagination in Python (Kosha returns flat top-N).
-        page = hits[from_: from_ + size]
+        page = hits[from_ : from_ + size]
 
         return {
             "took": took_ms,
@@ -341,7 +368,12 @@ class KoshaClient:
         """Extract BM25 tuning parameters if present in the query body."""
         params = {}
         if "settings" in query:
-            sim = query["settings"].get("index", {}).get("similarity", {}).get("default", {})
+            sim = (
+                query["settings"]
+                .get("index", {})
+                .get("similarity", {})
+                .get("default", {})
+            )
             if sim.get("type") == "BM25":
                 k1 = sim.get("k1", 1.2)
                 b = sim.get("b", 0.75)
@@ -368,6 +400,13 @@ class KoshaClient:
         has_clauses = False
 
         query = body.get("query") or {}
+
+        # A filter-only clause may be the query itself, as in
+        # {"query": {"terms": {"documentId": [...]}}}.
+        if KoshaClient._is_filter_only_clause(query):
+            translated = KoshaClient._translate_es_clause(query)
+            if translated:
+                return translated
 
         # bool.filter clauses
         bool_q = query.get("bool")
@@ -639,8 +678,12 @@ class KoshaClient:
         for k, v in source.items():
             if k.startswith("__type__"):
                 continue
+            declared_type = source.get(f"__type__{k}")
             if isinstance(v, str):
-                fields.append(cls._field_to_kosha(k, v, "Text"))
+                field_type = (
+                    declared_type if declared_type in ("Text", "Keyword") else "Text"
+                )
+                fields.append(cls._field_to_kosha(k, v, field_type))
             elif isinstance(v, bool):
                 fields.append(cls._field_to_kosha(k, str(v).lower(), "Boolean"))
             elif isinstance(v, (int, float)):
@@ -648,7 +691,9 @@ class KoshaClient:
             elif (
                 isinstance(v, (list, tuple))
                 and len(v) >= cls._MIN_VECTOR_DIM
-                and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
+                and all(
+                    isinstance(x, (int, float)) and not isinstance(x, bool) for x in v
+                )
             ):
                 fields.append(cls._field_to_kosha(k, json.dumps(list(v)), "Vector"))
             elif isinstance(v, (list, tuple)):
@@ -658,12 +703,21 @@ class KoshaClient:
                 # and filterable by exact match, but never tokenized and
                 # never inserted into the shared Vector store. Decoded back
                 # to a Python list by _decode_field_value.
-                fields.append(cls._field_to_kosha(k, json.dumps(list(v), default=json_default), "Keyword"))
+                fields.append(
+                    cls._field_to_kosha(
+                        k, json.dumps(list(v), default=json_default), "Keyword"
+                    )
+                )
             # else: unsupported type — skip silently (matches prior behavior)
         return fields
 
-    def index(self, index: str | None = None, id: str | None = None,
-              body: dict | None = None, **params: Any) -> dict:
+    def index(
+        self,
+        index: str | None = None,
+        id: str | None = None,
+        body: dict | None = None,
+        **params: Any,
+    ) -> dict:
         """Index a single document."""
         ns = self._resolve_ns(index)
         fields = self._source_to_fields(body or {})
@@ -684,8 +738,9 @@ class KoshaClient:
 
     # ── Bulk ───────────────────────────────────────────────────────────────
 
-    def bulk(self, body: Sequence | str, index: str | None = None,
-             **params: Any) -> dict:
+    def bulk(
+        self, body: Sequence | str, index: str | None = None, **params: Any
+    ) -> dict:
         """Bulk-index documents.
 
         Accepts the standard OpenSearch bulk body format (action+source lines
@@ -693,9 +748,9 @@ class KoshaClient:
         Kosha.
         """
         default_ns = self._resolve_ns(index)
-        # (namespace, doc) pairs in original order — response items must stay
-        # aligned with the request actions for opensearchpy's success parsing.
-        indexed: list[tuple[str, dict]] = []
+        # (namespace, op, doc) triples in original order — response items must
+        # stay aligned with the request actions for opensearchpy parsing.
+        actions: list[tuple[str, str, dict]] = []
         errors: list[dict] = []
 
         # Parse the bulk body.
@@ -704,7 +759,11 @@ class KoshaClient:
         while i < len(lines):
             action_line = lines[i]
             try:
-                action = json.loads(action_line) if isinstance(action_line, str) else action_line
+                action = (
+                    json.loads(action_line)
+                    if isinstance(action_line, str)
+                    else action_line
+                )
             except json.JSONDecodeError:
                 i += 1
                 continue
@@ -720,7 +779,15 @@ class KoshaClient:
                     break
 
             if op_type == "delete":
-                errors.append({"delete": {"_id": doc_id, "status": 501, "error": "not implemented"}})
+                errors.append(
+                    {
+                        "delete": {
+                            "_id": doc_id,
+                            "status": 501,
+                            "error": "not implemented",
+                        }
+                    }
+                )
                 i += 1
                 continue
 
@@ -728,42 +795,66 @@ class KoshaClient:
                 break
             source_line = lines[i + 1]
             try:
-                source = json.loads(source_line) if isinstance(source_line, str) else source_line
+                source = (
+                    json.loads(source_line)
+                    if isinstance(source_line, str)
+                    else source_line
+                )
             except json.JSONDecodeError:
                 source = {}
             i += 2
 
             # helpers.bulk update actions send {"doc": {...}} — unwrap + keep
             # Vector fields (contentEmbedding) that index() already supported.
+            # Partial updates are merged server-side by POST /replace.
             fields = self._source_to_fields(source if isinstance(source, dict) else {})
             doc = {
                 "id": doc_id or "",
                 "fields": fields,
             }
-            indexed.append((doc_index or default_ns, doc))
+            actions.append((doc_index or default_ns, op_type or "index", doc))
 
-        # Route each document to the namespace named by its action's _index
-        # (writes must land where searches look), then flush so the docs are
-        # visible — Kosha only searches flushed segments.
+        # Route each document to the namespace named by its action's _index.
+        # Fresh writes use /index + flush; updates use durable /replace.
         docs_by_ns: dict[str, list[dict]] = {}
-        for doc_ns, doc in indexed:
-            docs_by_ns.setdefault(doc_ns, []).append(doc)
+        updates_by_ns: dict[str, list[dict]] = {}
+        for doc_ns, op_type, doc in actions:
+            if op_type == "update":
+                updates_by_ns.setdefault(doc_ns, []).append(doc)
+            else:
+                docs_by_ns.setdefault(doc_ns, []).append(doc)
         for doc_ns, docs in docs_by_ns.items():
-            self._request("POST", "index", body={"namespace": doc_ns, "documents": docs})
+            self._request(
+                "POST", "index", body={"namespace": doc_ns, "documents": docs}
+            )
             self._request("POST", "flush", {"namespace": doc_ns})
+        for doc_ns, docs in updates_by_ns.items():
+            self._request(
+                "POST", "replace", body={"namespace": doc_ns, "documents": docs}
+            )
 
         return {
             "errors": bool(errors),
             "items": (
-                [{"index": {"_index": doc_ns, "_id": d["id"], "status": 201}}
-                 for doc_ns, d in indexed]
+                [
+                    {
+                        ("update" if op_type == "update" else "index"): {
+                            "_index": doc_ns,
+                            "_id": d["id"],
+                            "status": 200 if op_type == "update" else 201,
+                        }
+                    }
+                    for doc_ns, op_type, d in actions
+                ]
                 + errors
             ),
         }
 
     # ── Count ──────────────────────────────────────────────────────────────
 
-    def count(self, index: str | None = None, body: dict | None = None, **params: Any) -> dict:
+    def count(
+        self, index: str | None = None, body: dict | None = None, **params: Any
+    ) -> dict:
         """Return document count from a broad search.
 
         Kosha does not have a dedicated count API, so we search with a
@@ -772,7 +863,9 @@ class KoshaClient:
         """
         ns = self._resolve_ns(index)
         try:
-            result = self.search(index=ns, body={"query": {"match": {"_all": "*"}}, "size": 0})
+            result = self.search(
+                index=ns, body={"query": {"match": {"_all": "*"}}, "size": 0}
+            )
             count = result["hits"]["total"]["value"]
         except KoshaRequestError:
             count = 0
@@ -780,13 +873,18 @@ class KoshaClient:
 
     # ── Update ─────────────────────────────────────────────────────────────
 
-    def update(self, index: str | None = None, id: str | None = None,
-               body: dict | None = None, **params: Any) -> dict:
-        """Update a document by re-indexing (tombstone-based in Phase 1)."""
+    def update(
+        self,
+        index: str | None = None,
+        id: str | None = None,
+        body: dict | None = None,
+        **params: Any,
+    ) -> dict:
+        """Update a document by durable replace (merges partial ``doc`` patches)."""
         ns = self._resolve_ns(index)
         fields = self._source_to_fields(body or {})
         payload = {"namespace": ns, "documents": [{"id": id or "", "fields": fields}]}
-        self._request("POST", "index", body=payload)
+        self._request("POST", "replace", body=payload)
         return {
             "_index": ns,
             "_id": id or "",
@@ -796,8 +894,9 @@ class KoshaClient:
 
     # ── Delete by query ────────────────────────────────────────────────────
 
-    def delete_by_query(self, index: str | None = None,
-                        body: dict | None = None, **params: Any) -> dict:
+    def delete_by_query(
+        self, index: str | None = None, body: dict | None = None, **params: Any
+    ) -> dict:
         """Delete documents matching a filter query."""
         ns = self._resolve_ns(index)
         query = body.get("query", {}) if body else {}
@@ -813,37 +912,92 @@ class KoshaClient:
 
     # ── Update by query ────────────────────────────────────────────────────
 
-    def update_by_query(self, index: str | None = None,
-                        body: dict | None = None, **params: Any) -> dict:
+    def update_by_query(
+        self, index: str | None = None, body: dict | None = None, **params: Any
+    ) -> dict:
         """Update documents matching a query.
 
-        Supports simple ``ctx._source.X = ctx._source.Y`` (field copy)
-        and ``ctx._source.X = 'value'`` (literal set) scripts.
+        Supports simple field-copy/literal scripts and parameter-map scripts
+        used by metadata backfills. ``wait_for_completion=False`` returns an
+        OpenSearch-compatible task id that can be polled through
+        ``client.tasks.get(task_id=...)``.
         """
         ns = self._resolve_ns(index)
-        query = (body or {}).get("query", {})
-        script = (body or {}).get("script", {})
+        request_body = body or {}
+        if params.get("wait_for_completion", True) is False:
+            task_id = f"kosha:{uuid.uuid4().hex}"
+            with self._tasks_lock:
+                self._tasks[task_id] = {"completed": False, "task": {"id": task_id}}
+
+            def run() -> None:
+                try:
+                    response = self._execute_update_by_query(ns, request_body)
+                    status = {"completed": True, "response": response}
+                except Exception as exc:  # surfaced through the tasks API
+                    status = {
+                        "completed": True,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "reason": str(exc),
+                        },
+                    }
+                with self._tasks_lock:
+                    self._tasks[task_id] = status
+
+            threading.Thread(
+                target=run,
+                name=f"kosha-update-by-query-{task_id[-8:]}",
+                daemon=True,
+            ).start()
+            return {"task": task_id}
+
+        return self._execute_update_by_query(ns, request_body)
+
+    @staticmethod
+    def _compile_update_script(
+        script: dict,
+    ) -> tuple[str | None, list[tuple[str, str]]]:
+        """Compile the supported Painless subset into assignments."""
         source = script.get("source", "").strip()
+        lookup_match = re.search(
+            r"(?:String|def)\s+_did\s*=\s*ctx\._source\.(\w+)", source
+        )
+        lookup_field = lookup_match.group(1) if lookup_match else None
+        map_assignments = re.findall(
+            r"ctx\._source\.(\w+)\s*=\s*params\.(\w+)\s*\[\s*_did\s*\]",
+            source,
+        )
+        if map_assignments:
+            if not lookup_field:
+                raise NotImplementedError(
+                    "Kosha parameter-map scripts must define "
+                    "'_did = ctx._source.<field>'"
+                )
+            return lookup_field, map_assignments
 
-        # Parse the script to extract target field and source expression.
-        target_field = None
-        source_expr = None
-        import re
-        m = re.match(r"ctx\._source\.(\w+)\s*=\s*(.+)", source)
-        if m:
-            target_field = m.group(1)
-            source_expr = m.group(2).strip().strip("'").strip('"')
+        simple = re.fullmatch(r"\s*ctx\._source\.(\w+)\s*=\s*(.+?)\s*;?\s*", source)
+        if simple:
+            expression = simple.group(2).strip().strip("'").strip('"')
+            if expression.startswith("ctx._source."):
+                expression = expression.removeprefix("ctx._source.")
+            return None, [(simple.group(1), expression)]
 
-        if not target_field:
-            raise NotImplementedError(
-                f"Kosha does not support script: {source!r}. "
-                "Only simple 'ctx._source.X = ...' patterns work."
-            )
+        raise NotImplementedError(
+            f"Kosha does not support script: {source!r}. "
+            "Supported forms are simple assignments and params.<map>[_did] lookups."
+        )
 
-        # Search for matching docs in pages.
+    def _execute_update_by_query(self, ns: str, body: dict) -> dict:
+        query = body.get("query", {})
+        script = body.get("script", {})
+        lookup_field, assignments = self._compile_update_script(script)
+        script_params = script.get("params", {})
+
+        # Snapshot every match before replacing any document. This keeps
+        # pagination stable and preserves all fields on immutable segments.
         page_size = 100
         from_ = 0
-        total_updated = 0
+        hits: list[dict] = []
         while True:
             search_body = {
                 "query": query,
@@ -851,38 +1005,61 @@ class KoshaClient:
                 "from": from_,
                 "_source": True,
             }
-            try:
-                result = self.search(index=ns, body=search_body)
-            except KoshaRequestError:
+            result = self.search(index=ns, body=search_body)
+            page = result.get("hits", {}).get("hits", [])
+            if not page:
                 break
-
-            hits = result.get("hits", {}).get("hits", [])
-            if not hits:
-                break
-
-            for hit in hits:
-                doc_id = hit["_id"]
-                source_fields = hit.get("_source", {})
-
-                # Evaluate the source expression.
-                if source_expr in source_fields:
-                    new_value = source_fields[source_expr]
-                else:
-                    new_value = source_expr
-
-                # Re-index with updated field.
-                source_fields[target_field] = new_value
-                self.index(index=ns, id=doc_id, body=source_fields)
-                total_updated += 1
-
+            hits.extend(page)
             from_ += page_size
 
-        # Flush to persist updated segments.
-        self._request("POST", "flush", {"namespace": ns})
+        updated = 0
+        noops = 0
+        documents: list[dict] = []
+        for hit in hits:
+            source_fields = dict(hit.get("_source", {}))
+            changed = False
+            for target_field, expression in assignments:
+                if lookup_field is not None:
+                    lookup_value = source_fields.get(lookup_field)
+                    values = script_params.get(expression, {})
+                    if lookup_value not in values:
+                        continue
+                    new_value = values[lookup_value]
+                elif expression in source_fields:
+                    new_value = source_fields[expression]
+                else:
+                    new_value = expression
+
+                if source_fields.get(target_field) != new_value:
+                    source_fields[target_field] = new_value
+                    changed = True
+
+            if changed:
+                updated += 1
+            else:
+                noops += 1
+            documents.append(
+                {
+                    "id": hit["_id"],
+                    "fields": self._source_to_fields(source_fields),
+                }
+            )
+
+        if updated:
+            # The replace route rewrites affected immutable segments, so old
+            # versions cannot reappear after a server restart. Include no-op
+            # snapshots because the query is replaced as one consistent set.
+            self._request(
+                "POST",
+                "replace",
+                {"namespace": ns, "documents": documents},
+            )
 
         return {
-            "updated": total_updated,
-            "total": total_updated,
+            "updated": updated,
+            "noop": noops,
+            "total": len(hits),
+            "version_conflicts": 0,
             "failures": [],
         }
 
@@ -907,6 +1084,11 @@ class KoshaClient:
         """Return an object that mimics ``opensearchpy.client.IndicesClient``."""
         return IndexOps(self)
 
+    @property
+    def tasks(self) -> "TasksOps":
+        """Return an object that mimics ``opensearchpy.client.TasksClient``."""
+        return TasksOps(self)
+
     def ping(self, **params: Any) -> bool:
         """Check if Kosha is reachable."""
         try:
@@ -919,7 +1101,22 @@ class KoshaClient:
         pass
 
 
-# ─── Indices operations (stub) ──────────────────────────────────────────────
+# ─── Tasks / indices operations ─────────────────────────────────────────────
+
+
+class TasksOps:
+    """Minimal task polling API for asynchronous compatibility operations."""
+
+    def __init__(self, client: KoshaClient) -> None:
+        self._client = client
+
+    def get(self, task_id: str, **params: Any) -> dict:
+        with self._client._tasks_lock:
+            task = self._client._tasks.get(task_id)
+            if task is None:
+                raise KoshaRequestError(404, f"task {task_id!r} not found")
+            return dict(task)
+
 
 class IndexOps:
     """Mimics ``opensearchpy.client.IndicesClient`` for compatibility.
@@ -943,7 +1140,10 @@ class IndexOps:
             return False
 
     def delete(self, index: str, **params: Any) -> dict:
-        logger.info("IndexOps.delete(%s) — no-op (Kosha does not support index deletion yet)", index)
+        logger.info(
+            "IndexOps.delete(%s) — no-op (Kosha does not support index deletion yet)",
+            index,
+        )
         return {"acknowledged": True}
 
     def put_mapping(self, index: str, body: dict, **params: Any) -> dict:
@@ -999,5 +1199,11 @@ class IndexOps:
         return {"_shards": {"total": 1, "successful": 1, "failed": 0}}
 
     def close(self, index: str, **params: Any) -> dict:
-        logger.info("IndexOps.close(%s) — no-op (Kosha has no close-index concept)", index)
-        return {"acknowledged": True, "shards_acknowledged": True, "indices": {index: {"closed": True}}}
+        logger.info(
+            "IndexOps.close(%s) — no-op (Kosha has no close-index concept)", index
+        )
+        return {
+            "acknowledged": True,
+            "shards_acknowledged": True,
+            "indices": {index: {"closed": True}},
+        }
