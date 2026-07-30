@@ -28,6 +28,8 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
       kosha-control   in-memory namespace + manifest store        — Epic 6
       kosha-server    HTTP API (healthz, index, search, stats,    — Epic 8
                      delete, flush)
+      kosha-cli       Remote `kosha` CLI (profiles, search,       — Epic 12
+                     index, curl escape hatch)
     clients/
       python/kosha_client  OpenSearch-compatible Python client    — Epic 11
                            (spec → codegen → thin client)
@@ -46,32 +48,25 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 # 1. Start Kosha locally
 docker compose up --build
 
-# 2. In another terminal, run the quickstart script
-KOSHA_HOST=http://localhost:8080 KOSHA_API_KEY=sk-kosha-dev python scripts/quickstart.py
+# 2. Install the CLI (or use cargo run -p kosha-cli -- …)
+cargo install --path crates/kosha-cli
+
+# 3. In another terminal, explore the index
+export KOSHA_HOST=http://localhost:8080
+export KOSHA_API_KEY=sk-kosha-dev
+
+kosha health
+kosha index -n quickstart-demo --file crates/kosha-cli/examples/docs.jsonl
+kosha flush -n quickstart-demo
+kosha search -n quickstart-demo "breach"
+kosha stats -n quickstart-demo
 ```
 
-Expected output:
-```
-═══ 1. Health check ═══
-   Kosha reachable: True
+See [crates/kosha-cli/README.md](crates/kosha-cli/README.md) for profiles
+(`~/.kosha/config.toml`), `--json` output, and the `kosha curl` escape hatch.
 
-═══ 2. Index documents ═══
-   Indexed: 3 documents
+The Python client still works the same way for application code:
 
-═══ 3. Search ═══
-   Found 1 result(s) for 'breach':
-     [doc-1] breach of contract  (score=0.287)
-
-═══ 4. Flush + re-search ═══
-   Found 1 result(s) for 'antitrust':
-     [doc-3] merger analysis  (score=0.287)
-
-═══ 5. Stats ═══
-   Total documents: 3
-     dev/quickstart-demo: 3 docs, 1 segment(s)
-```
-
-Or for a hosted instance:
 ```python
 from kosha_client import KoshaClient
 
@@ -82,8 +77,8 @@ client = KoshaClient(
 client.ping()  # True
 ```
 
-The client respects `KOSHA_HOST` and `KOSHA_API_KEY` env vars — no code changes needed
-between local dev and production.
+Both the CLI and the Python client respect `KOSHA_HOST` and `KOSHA_API_KEY`.
+`scripts/quickstart.py` remains as a scripted alternative to the CLI flow.
 
 ## Development
 
