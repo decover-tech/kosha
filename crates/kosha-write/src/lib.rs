@@ -137,6 +137,105 @@ impl Indexer {
         Ok(count)
     }
 
+    /// Replace documents by id without leaving tombstones behind.
+    ///
+    /// Immutable segments containing an old version are rewritten, preserving
+    /// their other live documents. Partial replacement documents are merged
+    /// field-by-field onto the latest existing copy (OpenSearch `_update`
+    /// semantics). The rewritten manifests stop referencing the old segments,
+    /// so replacements remain correct after a process restart.
+    pub fn replace_documents(
+        &mut self,
+        namespace: NamespaceId,
+        documents: Vec<Document>,
+    ) -> Result<usize, KoshaError> {
+        if documents.is_empty() {
+            return Ok(0);
+        }
+
+        // Include buffered versions in the segment scan.
+        self.flush_namespace(&namespace)?;
+        let replacement_ids: HashSet<&str> =
+            documents.iter().map(|doc| doc.id.0.as_str()).collect();
+        let manifest = self.manifests.get(&namespace).cloned().unwrap_or(Manifest {
+            version: 0,
+            segments: Vec::new(),
+        });
+        let mut replaced_segments = HashSet::new();
+        let mut carried_documents = Vec::new();
+        // Latest segment wins when the same id was appended more than once.
+        let mut existing_fields: HashMap<String, Vec<kosha_core::Field>> = HashMap::new();
+
+        for entry in &manifest.segments {
+            let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+            if !seg_dir.exists() {
+                continue;
+            }
+            let reader = kosha_segment::SegmentReader::open(seg_dir)?;
+            if !reader
+                .doc_records
+                .iter()
+                .any(|record| replacement_ids.contains(record.doc_id.0.as_str()))
+            {
+                continue;
+            }
+
+            replaced_segments.insert(entry.segment_id.clone());
+            let tombstones = self
+                .tombstones
+                .get(&namespace)
+                .and_then(|by_segment| by_segment.get(&entry.segment_id));
+            for record in &reader.doc_records {
+                if tombstones.is_some_and(|set| set.contains(&record.doc_seq)) {
+                    continue;
+                }
+                if replacement_ids.contains(record.doc_id.0.as_str()) {
+                    existing_fields.insert(record.doc_id.0.clone(), record.fields.clone());
+                } else {
+                    carried_documents.push(Document {
+                        id: record.doc_id.clone(),
+                        fields: record.fields.clone(),
+                    });
+                }
+            }
+        }
+
+        if !replaced_segments.is_empty() {
+            if let Some(current) = self.manifests.get_mut(&namespace) {
+                current
+                    .segments
+                    .retain(|entry| !replaced_segments.contains(&entry.segment_id));
+                current.version += 1;
+            }
+            if let Some(tombstones) = self.tombstones.get_mut(&namespace) {
+                for segment_id in &replaced_segments {
+                    tombstones.remove(segment_id);
+                }
+            }
+        }
+
+        let count = documents.len();
+        for document in documents {
+            let merged = match existing_fields.remove(&document.id.0) {
+                Some(base_fields) => Document {
+                    id: document.id,
+                    fields: merge_fields(base_fields, document.fields),
+                },
+                None => document,
+            };
+            carried_documents.push(merged);
+        }
+        self.index_documents(namespace.clone(), carried_documents)?;
+        self.flush_namespace(&namespace)?;
+
+        // The manifest no longer references these immutable segments.
+        for segment_id in replaced_segments {
+            let seg_dir = self.data_dir.join(&namespace.0).join(segment_id.0);
+            std::fs::remove_dir_all(seg_dir).ok();
+        }
+        Ok(count)
+    }
+
     pub fn flush_namespace(&mut self, namespace: &NamespaceId) -> Result<(), KoshaError> {
         let data_dir = self.data_dir.clone();
         let (docs, seg_id, bm25_params) = {
@@ -337,6 +436,23 @@ impl Indexer {
 /// Parse the flush counter from a segment ID of the form `{ns}-{counter:06x}`
 /// produced by `flush_namespace`. Returns `None` for IDs from other sources
 /// (e.g. compaction segments, which embed a timestamp instead of a counter).
+fn merge_fields(
+    mut base: Vec<kosha_core::Field>,
+    patch: Vec<kosha_core::Field>,
+) -> Vec<kosha_core::Field> {
+    for field in patch {
+        if let Some(existing) = base
+            .iter_mut()
+            .find(|candidate| candidate.name == field.name)
+        {
+            *existing = field;
+        } else {
+            base.push(field);
+        }
+    }
+    base
+}
+
 fn segment_flush_counter(segment_id: &SegmentId) -> Option<u64> {
     let suffix = segment_id.0.rsplit('-').next()?;
     if suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -643,6 +759,105 @@ mod tests {
         let m = idx2.manifest(&ns).unwrap();
         assert_eq!(m.segments.len(), 2);
         assert_ne!(m.segments[0].segment_id, m.segments[1].segment_id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_documents_rewrites_old_versions_durably() {
+        let dir = std::env::temp_dir().join("kosha-test-replace");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let mut idx = Indexer::new(dir.clone());
+        idx.index_documents(
+            ns.clone(),
+            vec![
+                Document {
+                    id: DocumentId("d1".into()),
+                    fields: vec![Field::text("title", "old")],
+                },
+                Document {
+                    id: DocumentId("d2".into()),
+                    fields: vec![Field::text("title", "preserved")],
+                },
+            ],
+        )
+        .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let old_segment = idx.manifest(&ns).unwrap().segments[0].segment_id.clone();
+
+        idx.replace_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("d1".into()),
+                fields: vec![Field::text("title", "new")],
+            }],
+        )
+        .unwrap();
+
+        let manifest = idx.manifest(&ns).unwrap().clone();
+        assert_eq!(manifest.segments.len(), 1);
+        assert_ne!(manifest.segments[0].segment_id, old_segment);
+        assert!(!dir.join(&ns.0).join(&old_segment.0).exists());
+
+        let reader = kosha_segment::SegmentReader::open(
+            dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
+        )
+        .unwrap();
+        assert_eq!(reader.doc_records.len(), 2);
+        let values: HashMap<_, _> = reader
+            .doc_records
+            .iter()
+            .map(|record| (record.doc_id.0.as_str(), record.fields[0].value.as_str()))
+            .collect();
+        assert_eq!(values.get("d1"), Some(&"new"));
+        assert_eq!(values.get("d2"), Some(&"preserved"));
+        assert!(idx.get_tombstones(&ns).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_documents_merges_partial_field_patches() {
+        let dir = std::env::temp_dir().join("kosha-test-replace-merge");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let mut idx = Indexer::new(dir.clone());
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("d1".into()),
+                fields: vec![
+                    Field::text("title", "hello"),
+                    Field::keyword("sentAt", "old"),
+                ],
+            }],
+        )
+        .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+
+        idx.replace_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("d1".into()),
+                fields: vec![Field::keyword("sentAt", "new")],
+            }],
+        )
+        .unwrap();
+
+        let manifest = idx.manifest(&ns).unwrap().clone();
+        let reader = kosha_segment::SegmentReader::open(
+            dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
+        )
+        .unwrap();
+        assert_eq!(reader.doc_records.len(), 1);
+        let fields: HashMap<_, _> = reader.doc_records[0]
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.value.as_str()))
+            .collect();
+        assert_eq!(fields.get("title"), Some(&"hello"));
+        assert_eq!(fields.get("sentAt"), Some(&"new"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
