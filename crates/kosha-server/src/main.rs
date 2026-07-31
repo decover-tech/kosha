@@ -1397,7 +1397,10 @@ mod tests {
             &state,
         );
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("\"existing\":[\"present\"]"), "{response}");
+        assert!(
+            response.contains("\"existing\":[\"present\"]"),
+            "{response}"
+        );
         assert!(response.contains("\"missing\":[\"absent\"]"), "{response}");
     }
 
