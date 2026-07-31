@@ -4,6 +4,7 @@
 //! Phase 1 HTTP/JSON API:
 //!   - `GET  /healthz`           → 200 OK (liveness probe)
 //!   - `POST /index              ` → index documents into a namespace
+//!   - `POST /exists             ` → batch doc_id existence check
 //!   - `GET  /search             ` → BM25 search across a namespace
 
 use std::collections::HashMap;
@@ -585,6 +586,10 @@ fn route(
         return handle_delete_with_ns(&ns, tenant, body, state);
     }
 
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/exists") {
+        return handle_exists_with_ns(&ns, tenant, body, state);
+    }
+
     if request_line.starts_with("GET /v1/stats") {
         return handle_stats(state);
     }
@@ -606,6 +611,10 @@ fn route(
 
     if request_line.starts_with("POST /index") {
         return handle_index(body, state);
+    }
+
+    if request_line.starts_with("POST /exists") {
+        return handle_exists(body, state);
     }
 
     if request_line.starts_with("POST /replace") {
@@ -692,6 +701,68 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
         indexed_count: count,
         namespace: ns,
     })
+}
+
+// ─── POST /exists ───────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct ExistsRequest {
+    namespace: NamespaceId,
+    ids: Vec<String>,
+}
+
+fn handle_exists(body: &[u8], state: &AppState) -> String {
+    let request: ExistsRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+    };
+
+    // Existence scans immutable segments, so materialize any S3-backed
+    // segment directories before entering the indexer lock.
+    #[cfg(feature = "s3")]
+    {
+        let manifest = {
+            let indexer = state.indexer.lock().unwrap();
+            indexer.manifest_cloned(&request.namespace)
+        };
+        if let Some(manifest) = manifest {
+            for entry in &manifest.segments {
+                let path = state
+                    .data_dir
+                    .join(&request.namespace.0)
+                    .join(&entry.segment_id.0);
+                state.ensure_segment_local(&path);
+            }
+        }
+    }
+
+    let ids: Vec<kosha_core::DocumentId> = request
+        .ids
+        .iter()
+        .cloned()
+        .map(kosha_core::DocumentId)
+        .collect();
+    let existing = {
+        let mut indexer = state.indexer.lock().unwrap();
+        match indexer.existing_ids(&request.namespace, &ids) {
+            Ok(set) => set,
+            Err(e) => return json_error(500, &format!("exists error: {e}")),
+        }
+    };
+    let mut present = Vec::new();
+    let mut missing = Vec::new();
+    for id in &request.ids {
+        if existing.contains(&kosha_core::DocumentId(id.clone())) {
+            present.push(id.clone());
+        } else {
+            missing.push(id.clone());
+        }
+    }
+    json_ok(&serde_json::json!({
+        "namespace": request.namespace.0,
+        "existing": present,
+        "missing": missing,
+    }))
 }
 
 // ─── POST /replace ──────────────────────────────────────────────────────────
@@ -1052,6 +1123,19 @@ fn handle_delete_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &App
     handle_delete(&modified_body, state)
 }
 
+fn handle_exists_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
+    let scoped_ns = tenant_namespace(tenant, namespace);
+    let mut req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+    };
+    if let Some(obj) = req.as_object_mut() {
+        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
+    }
+    let modified = serde_json::to_vec(&req).unwrap_or_else(|_| body.to_vec());
+    handle_exists(&modified, state)
+}
+
 fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
     let indexer = state.indexer.lock().unwrap();
@@ -1275,6 +1359,46 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"indexed_count\":1"));
+    }
+
+    #[test]
+    fn exists_endpoint_reports_present_and_missing() {
+        let state = test_state();
+        let ns = NamespaceId("exists-ns".into());
+        let req = IndexRequest {
+            namespace: ns.clone(),
+            documents: vec![Document {
+                id: DocumentId("present".into()),
+                fields: vec![Field::text("title", "hello")],
+            }],
+        };
+        let body = serde_json::to_vec(&req).unwrap();
+        let _ = route(
+            "POST /index HTTP/1.1\r\n",
+            &HashMap::new(),
+            &body,
+            "test",
+            &state,
+        );
+        let _ = route(
+            "POST /flush HTTP/1.1\r\n",
+            &HashMap::new(),
+            br#"{"namespace":"exists-ns"}"#,
+            "test",
+            &state,
+        );
+
+        let exists_body = br#"{"namespace":"exists-ns","ids":["present","absent"]}"#;
+        let response = route(
+            "POST /exists HTTP/1.1\r\n",
+            &HashMap::new(),
+            exists_body,
+            "test",
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"existing\":[\"present\"]"), "{response}");
+        assert!(response.contains("\"missing\":[\"absent\"]"), "{response}");
     }
 
     #[test]
