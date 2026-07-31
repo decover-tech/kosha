@@ -117,7 +117,8 @@ Notes:
   `kosha-config`. No Kosha API key is needed because this bypasses HTTP.
 - A full run **replaces** the namespace manifest with newly-built segments
   (segment IDs continue past any prior/partial run). Old S3 segments become
-  unreferenced; they can be garbage-collected later. During migration, the
+  unreferenced and marked for grace-period GC (`POST /v1/admin/gc-segments`,
+  or the background sweeper). During migration, the
   namespace is only partially populated, so keep Sage reads on OpenSearch
   until the Job completes and Kosha is restarted.
 - **Delta catch-up** (missing ids only): pass `--ids-file /path/ids.txt`

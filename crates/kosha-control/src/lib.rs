@@ -6,8 +6,9 @@
 //! production via the `postgres` feature and a `DATABASE_URL` env var.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
+use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId, SegmentGcEntry, SegmentId};
 
 #[cfg(feature = "postgres")]
 mod postgres;
@@ -24,6 +25,8 @@ pub struct Controller {
     manifests: HashMap<NamespaceId, Manifest>,
     /// Track which namespaces have been created.
     namespaces: Vec<NamespaceId>,
+    /// Orphaned segments awaiting grace-period GC.
+    segment_gc: HashMap<(NamespaceId, SegmentId), SegmentGcEntry>,
 }
 
 impl Controller {
@@ -31,7 +34,15 @@ impl Controller {
         Self {
             manifests: HashMap::new(),
             namespaces: Vec::new(),
+            segment_gc: HashMap::new(),
         }
+    }
+
+    fn now_unix() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
     }
 
     /// Create a new namespace. Returns an error if it already exists.
@@ -128,6 +139,53 @@ impl Controller {
     pub fn namespace_count(&self) -> usize {
         self.namespaces.len()
     }
+
+    pub fn mark_segments_for_gc(
+        &mut self,
+        namespace: &NamespaceId,
+        segment_ids: &[SegmentId],
+        by_version: u64,
+    ) -> Result<(), KoshaError> {
+        let now = Self::now_unix();
+        for segment_id in segment_ids {
+            self.segment_gc.insert(
+                (namespace.clone(), segment_id.clone()),
+                SegmentGcEntry {
+                    namespace_id: namespace.clone(),
+                    segment_id: segment_id.clone(),
+                    unreferenced_at_unix: now,
+                    unreferenced_by_version: by_version,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub fn list_gc_candidates(&self, older_than_unix: i64) -> Result<Vec<SegmentGcEntry>, KoshaError> {
+        let mut out: Vec<_> = self
+            .segment_gc
+            .values()
+            .filter(|entry| entry.unreferenced_at_unix <= older_than_unix)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.unreferenced_at_unix
+                .cmp(&b.unreferenced_at_unix)
+                .then_with(|| a.namespace_id.0.cmp(&b.namespace_id.0))
+                .then_with(|| a.segment_id.0.cmp(&b.segment_id.0))
+        });
+        Ok(out)
+    }
+
+    pub fn clear_gc_mark(
+        &mut self,
+        namespace: &NamespaceId,
+        segment_id: &SegmentId,
+    ) -> Result<(), KoshaError> {
+        self.segment_gc
+            .remove(&(namespace.clone(), segment_id.clone()));
+        Ok(())
+    }
 }
 
 impl Default for Controller {
@@ -168,6 +226,24 @@ impl ControlStore for Controller {
     }
     fn namespace_count(&self) -> usize {
         self.namespace_count()
+    }
+    fn mark_segments_for_gc(
+        &mut self,
+        namespace: &NamespaceId,
+        segment_ids: &[SegmentId],
+        by_version: u64,
+    ) -> Result<(), KoshaError> {
+        self.mark_segments_for_gc(namespace, segment_ids, by_version)
+    }
+    fn list_gc_candidates(&self, older_than_unix: i64) -> Result<Vec<SegmentGcEntry>, KoshaError> {
+        self.list_gc_candidates(older_than_unix)
+    }
+    fn clear_gc_mark(
+        &mut self,
+        namespace: &NamespaceId,
+        segment_id: &SegmentId,
+    ) -> Result<(), KoshaError> {
+        self.clear_gc_mark(namespace, segment_id)
     }
 }
 
@@ -267,5 +343,24 @@ mod tests {
             segments: vec![],
         };
         assert!(ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2).is_err());
+    }
+
+    #[test]
+    fn segment_gc_mark_list_clear() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("tenant/idx".into());
+        let seg = SegmentId("tenant_idx-000001".into());
+
+        ctrl.mark_segments_for_gc(&ns, &[seg.clone()], 3).unwrap();
+        let due = ctrl.list_gc_candidates(i64::MAX).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].segment_id, seg);
+        assert_eq!(due[0].unreferenced_by_version, 3);
+
+        // Not yet due if cutoff is before mark time.
+        assert!(ctrl.list_gc_candidates(0).unwrap().is_empty());
+
+        ctrl.clear_gc_mark(&ns, &seg).unwrap();
+        assert!(ctrl.list_gc_candidates(i64::MAX).unwrap().is_empty());
     }
 }

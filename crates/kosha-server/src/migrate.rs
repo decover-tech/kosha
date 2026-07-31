@@ -19,7 +19,7 @@ use aws_sigv4::http_request::{
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use kosha_control::PgStore;
-use kosha_core::{ControlStore, Document, DocumentId, Field, Manifest, NamespaceId};
+use kosha_core::{ControlStore, Document, DocumentId, Field, Manifest, NamespaceId, SegmentId};
 use kosha_write::Indexer;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -515,6 +515,11 @@ struct Publisher {
     original_entries: usize,
     published_entries: usize,
     replacement: Manifest,
+    /// Prior live segment IDs dropped by replace mode; marked for GC once
+    /// the first replacement manifest is durable (not before — a concurrent
+    /// sweeper would otherwise see them as still live and clear the marks).
+    replace_orphans: Vec<SegmentId>,
+    orphans_marked: bool,
 }
 
 impl Publisher {
@@ -525,12 +530,19 @@ impl Publisher {
         existing: &Manifest,
         mode: PublishMode,
     ) -> Self {
-        let replacement = match mode {
-            PublishMode::Replace => Manifest {
-                version: existing.version,
-                segments: Vec::new(),
-            },
-            PublishMode::Append => existing.clone(),
+        let (replacement, replace_orphans) = match mode {
+            PublishMode::Replace => (
+                Manifest {
+                    version: existing.version,
+                    segments: Vec::new(),
+                },
+                existing
+                    .segments
+                    .iter()
+                    .map(|entry| entry.segment_id.clone())
+                    .collect(),
+            ),
+            PublishMode::Append => (existing.clone(), Vec::new()),
         };
         Self {
             data_dir,
@@ -541,6 +553,8 @@ impl Publisher {
             original_entries: existing.segments.len(),
             published_entries: 0,
             replacement,
+            replace_orphans,
+            orphans_marked: false,
         }
     }
 
@@ -555,6 +569,7 @@ impl Publisher {
             self.replacement.version += 1;
             self.replacement.segments.push(entry.clone());
             self.store.save_manifest(namespace, &self.replacement)?;
+            self.mark_replace_orphans(namespace)?;
             let local_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
             if let Err(error) = std::fs::remove_dir_all(&local_dir) {
                 eprintln!(
@@ -568,6 +583,35 @@ impl Publisher {
                 namespace.0, entry.segment_id.0, entry.doc_count, self.replacement.version
             );
         }
+        Ok(())
+    }
+
+    fn mark_replace_orphans(&mut self, namespace: &NamespaceId) -> Result<()> {
+        if self.orphans_marked || self.replace_orphans.is_empty() {
+            return Ok(());
+        }
+        let live: std::collections::HashSet<&str> = self
+            .replacement
+            .segments
+            .iter()
+            .map(|entry| entry.segment_id.0.as_str())
+            .collect();
+        let dropped: Vec<SegmentId> = self
+            .replace_orphans
+            .iter()
+            .filter(|id| !live.contains(id.0.as_str()))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            self.store
+                .mark_segments_for_gc(namespace, &dropped, self.replacement.version)?;
+            println!(
+                "migrate: marked {} prior segment(s) for GC on namespace={}",
+                dropped.len(),
+                namespace.0
+            );
+        }
+        self.orphans_marked = true;
         Ok(())
     }
 }

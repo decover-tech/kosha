@@ -5,7 +5,9 @@
 //!
 //! Tables live in a `kosha` schema — see `migrations/001_create_kosha_tables.sql`.
 
-use kosha_core::{ControlStore, KoshaError, Manifest, ManifestEntry, NamespaceId, SegmentId};
+use kosha_core::{
+    ControlStore, KoshaError, Manifest, ManifestEntry, NamespaceId, SegmentGcEntry, SegmentId,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
@@ -49,10 +51,14 @@ impl PgStore {
             )
             .map_err(|e| format!("failed to connect to postgres: {e}"))?;
 
-        // Run migration inline (no external migrator dependency).
-        let migration = include_str!("../migrations/001_create_kosha_tables.sql");
-        rt.block_on(sqlx::raw_sql(migration).execute(&pool))
-            .map_err(|e| format!("migration failed: {e}"))?;
+        // Run migrations inline (no external migrator dependency).
+        for migration in [
+            include_str!("../migrations/001_create_kosha_tables.sql"),
+            include_str!("../migrations/003_create_segment_gc.sql"),
+        ] {
+            rt.block_on(sqlx::raw_sql(migration).execute(&pool))
+                .map_err(|e| format!("migration failed: {e}"))?;
+        }
 
         Ok(Self { pool, rt })
     }
@@ -331,6 +337,90 @@ impl ControlStore for PgStore {
                 .unwrap_or((0,));
 
             row.0 as usize
+        })
+    }
+
+    fn mark_segments_for_gc(
+        &mut self,
+        namespace: &NamespaceId,
+        segment_ids: &[SegmentId],
+        by_version: u64,
+    ) -> Result<(), KoshaError> {
+        if segment_ids.is_empty() {
+            return Ok(());
+        }
+        let ns = namespace.0.clone();
+        let version = by_version as i64;
+        let ids: Vec<String> = segment_ids.iter().map(|s| s.0.clone()).collect();
+
+        self.rt.block_on(async {
+            for segment_id in &ids {
+                sqlx::query(
+                    "INSERT INTO kosha.segment_gc \
+                     (namespace_id, segment_id, unreferenced_at, unreferenced_by_version) \
+                     VALUES ($1, $2, NOW(), $3) \
+                     ON CONFLICT (namespace_id, segment_id) DO UPDATE \
+                     SET unreferenced_by_version = EXCLUDED.unreferenced_by_version",
+                )
+                .bind(&ns)
+                .bind(segment_id)
+                .bind(version)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_gc_candidates(&self, older_than_unix: i64) -> Result<Vec<SegmentGcEntry>, KoshaError> {
+        self.rt.block_on(async {
+            let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+                "SELECT namespace_id, segment_id, \
+                        EXTRACT(EPOCH FROM unreferenced_at)::BIGINT, \
+                        unreferenced_by_version \
+                 FROM kosha.segment_gc \
+                 WHERE unreferenced_at <= to_timestamp($1) \
+                 ORDER BY unreferenced_at ASC",
+            )
+            .bind(older_than_unix)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(namespace_id, segment_id, unreferenced_at_unix, unreferenced_by_version)| {
+                        SegmentGcEntry {
+                            namespace_id: NamespaceId(namespace_id),
+                            segment_id: SegmentId(segment_id),
+                            unreferenced_at_unix,
+                            unreferenced_by_version: unreferenced_by_version as u64,
+                        }
+                    },
+                )
+                .collect())
+        })
+    }
+
+    fn clear_gc_mark(
+        &mut self,
+        namespace: &NamespaceId,
+        segment_id: &SegmentId,
+    ) -> Result<(), KoshaError> {
+        let ns = namespace.0.clone();
+        let seg = segment_id.0.clone();
+        self.rt.block_on(async {
+            sqlx::query(
+                "DELETE FROM kosha.segment_gc WHERE namespace_id = $1 AND segment_id = $2",
+            )
+            .bind(&ns)
+            .bind(&seg)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+            Ok(())
         })
     }
 }

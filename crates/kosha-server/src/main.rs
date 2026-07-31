@@ -97,6 +97,7 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 
 #[cfg(feature = "migrate")]
 mod migrate;
+mod segment_gc;
 #[cfg(feature = "s3")]
 mod s3_storage;
 
@@ -280,11 +281,41 @@ impl AppState {
         }
     }
 
-    /// After a flush: persist the manifest and upload the new segment to S3.
+    /// After a flush/replace: upload the newest segment, persist the manifest,
+    /// and mark any dropped segment IDs for grace-period S3 GC.
     fn publish_namespace(&self, ns: &NamespaceId) {
-        self.persist_manifest(ns);
+        let previous = {
+            let ctrl = self.controller.lock().unwrap();
+            ctrl.manifest_cloned(ns)
+        };
+        let current = {
+            let indexer = self.indexer.lock().unwrap();
+            indexer.manifest_cloned(ns)
+        };
+
+        // Upload before flipping the durable pointer so GC cannot observe a
+        // live segment ID with missing S3 objects.
         #[cfg(feature = "s3")]
         self.sync_latest_segment_to_s3(ns);
+
+        self.persist_manifest(ns);
+
+        if let Some(ref current) = current {
+            let mut ctrl = self.controller.lock().unwrap();
+            match segment_gc::mark_dropped_segments(
+                ctrl.as_mut(),
+                ns,
+                previous.as_ref(),
+                current,
+            ) {
+                Ok(0) => {}
+                Ok(n) => println!(
+                    "segment GC: marked {n} orphaned segment(s) for ns={} version={}",
+                    ns.0, current.version
+                ),
+                Err(e) => eprintln!("WARN: failed to mark segments for GC on '{}': {e}", ns.0),
+            }
+        }
     }
 
     /// Upload only the newest segment for `ns` to S3.
@@ -504,10 +535,43 @@ fn main() {
     let addr = format!("0.0.0.0:{port}");
 
     let state = Arc::new(AppState::new(PathBuf::from(data_dir.clone())));
+    spawn_segment_gc_loop(Arc::clone(&state));
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     println!("kosha-server role={role} listening on {addr} data_dir={data_dir}");
 
     serve(listener, state, Duration::from_secs(io_timeout_secs));
+}
+
+fn spawn_segment_gc_loop(state: Arc<AppState>) {
+    let interval = segment_gc::interval_secs_from_env();
+    segment_gc::spawn_background_loop(interval, move || {
+        let options = segment_gc::GcOptions {
+            grace_secs: segment_gc::grace_secs_from_env(),
+            namespace: None,
+            reconcile: false,
+            dry_run: false,
+        };
+        #[cfg(feature = "s3")]
+        let report = segment_gc::run_gc_locked(
+            &state.controller,
+            state.s3_storage.as_ref(),
+            &options,
+        );
+        #[cfg(not(feature = "s3"))]
+        let report = segment_gc::run_gc_locked(&state.controller, None, &options);
+        if report.deleted_segments > 0 || !report.errors.is_empty() {
+            println!(
+                "segment GC: deleted_segments={} deleted_objects={} skipped_live={} errors={}",
+                report.deleted_segments,
+                report.deleted_objects,
+                report.skipped_live,
+                report.errors.len()
+            );
+            for err in &report.errors {
+                eprintln!("segment GC: {err}");
+            }
+        }
+    });
 }
 
 /// Accept loop: one thread per connection.
@@ -692,6 +756,10 @@ fn route(
 
     if request_line.starts_with("POST /v1/admin/rebuild-filter-blooms") {
         return handle_rebuild_filter_blooms(body, tenant, state);
+    }
+
+    if request_line.starts_with("POST /v1/admin/gc-segments") {
+        return handle_gc_segments(body, tenant, state);
     }
 
     // ── Legacy Phase 1 routes (backward compat) ────────────────────────────
@@ -1505,6 +1573,59 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
         "rebuilt": rebuilt,
         "errors": errors,
     }))
+}
+
+/// POST /v1/admin/gc-segments — sweep orphaned S3 segments past the grace window.
+///
+/// Body (all fields optional):
+/// ```json
+/// {
+///   "namespace": "tenant/index",
+///   "grace_secs": 86400,
+///   "reconcile": false,
+///   "dry_run": false
+/// }
+/// ```
+/// When `reconcile` is true, list S3 under the namespace(s) and mark prefixes
+/// absent from the live manifest (age-gated) before sweeping.
+fn handle_gc_segments(body: &[u8], _tenant: &str, state: &AppState) -> String {
+    let req: serde_json::Value = serde_json::from_slice(body).unwrap_or_else(|_| serde_json::json!({}));
+    let grace_secs = req
+        .get("grace_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(segment_gc::grace_secs_from_env);
+    let reconcile = req
+        .get("reconcile")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dry_run = req.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let namespace = req
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .map(|s| NamespaceId(s.to_string()));
+
+    let options = segment_gc::GcOptions {
+        grace_secs,
+        namespace,
+        reconcile,
+        dry_run,
+    };
+
+    #[cfg(feature = "s3")]
+    let report =
+        segment_gc::run_gc_locked(&state.controller, state.s3_storage.as_ref(), &options);
+    #[cfg(not(feature = "s3"))]
+    let report = {
+        if reconcile {
+            return json_error(
+                400,
+                "reconcile requires the server to be built with the `s3` feature and KOSHA_S3_BUCKET set",
+            );
+        }
+        segment_gc::run_gc_locked(&state.controller, None, &options)
+    };
+
+    json_ok(&report)
 }
 
 /// POST /v1/admin/api-keys — create a new API key for a tenant.

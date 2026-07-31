@@ -297,6 +297,152 @@ impl S3Storage {
         Ok(data)
     }
 
+    /// List segment IDs under a namespace prefix, with the newest object
+    /// `LastModified` as a unix timestamp (0 when unknown).
+    ///
+    /// Keys are expected as `{namespace}/{segment_id}/{file}`.
+    pub fn list_segment_ids(&self, namespace: &str) -> Result<Vec<(String, i64)>, KoshaError> {
+        use std::collections::HashMap;
+
+        let mut prefix = self.s3_key(namespace);
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let prefix_for_strip = prefix.clone();
+
+        self.rt.block_on(async move {
+            let mut newest: HashMap<String, i64> = HashMap::new();
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut req = client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&prefix);
+                if let Some(token) = &continuation {
+                    req = req.continuation_token(token);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+
+                for obj in resp.contents() {
+                    let Some(key) = obj.key() else {
+                        continue;
+                    };
+                    let relative = key
+                        .strip_prefix(&prefix_for_strip)
+                        .unwrap_or(key)
+                        .trim_start_matches('/');
+                    let Some((segment_id, _)) = relative.split_once('/') else {
+                        continue;
+                    };
+                    if segment_id.is_empty() {
+                        continue;
+                    }
+                    let ts = obj.last_modified().map(|t| t.secs()).unwrap_or(0);
+                    newest
+                        .entry(segment_id.to_string())
+                        .and_modify(|prev| *prev = (*prev).max(ts))
+                        .or_insert(ts);
+                }
+
+                if resp.is_truncated() == Some(true) {
+                    continuation = resp.next_continuation_token().map(|s| s.to_string());
+                    if continuation.is_none() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            Ok(newest.into_iter().collect())
+        })
+    }
+
+    /// Delete every object under `{namespace}/{segment_id}/`.
+    pub fn delete_segment_prefix(
+        &self,
+        namespace: &str,
+        segment_id: &str,
+    ) -> Result<usize, KoshaError> {
+        let logical = format!(
+            "{}/{}/",
+            namespace.trim_end_matches('/'),
+            segment_id.trim_matches('/')
+        );
+        let mut prefix = self.s3_key(&logical);
+        if !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+
+        self.rt.block_on(async move {
+            let mut deleted = 0usize;
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut req = client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&prefix);
+                if let Some(token) = &continuation {
+                    req = req.continuation_token(token);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+
+                let keys: Vec<String> = resp
+                    .contents()
+                    .iter()
+                    .filter_map(|obj| obj.key().map(|k| k.to_string()))
+                    .collect();
+
+                for chunk in keys.chunks(1000) {
+                    let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk
+                        .iter()
+                        .filter_map(|key| {
+                            aws_sdk_s3::types::ObjectIdentifier::builder()
+                                .key(key)
+                                .build()
+                                .ok()
+                        })
+                        .collect();
+                    if objects.is_empty() {
+                        continue;
+                    }
+                    let delete = aws_sdk_s3::types::Delete::builder()
+                        .set_objects(Some(objects))
+                        .quiet(true)
+                        .build()
+                        .map_err(|e| KoshaError::NotFound(format!("S3 delete build: {e}")))?;
+                    client
+                        .delete_objects()
+                        .bucket(&bucket)
+                        .delete(delete)
+                        .send()
+                        .await
+                        .map_err(|e| KoshaError::NotFound(format!("S3 delete_objects: {e}")))?;
+                    deleted += chunk.len();
+                }
+
+                if resp.is_truncated() == Some(true) {
+                    continuation = resp.next_continuation_token().map(|s| s.to_string());
+                    if continuation.is_none() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            Ok(deleted)
+        })
+    }
+
     /// List object key basenames under a logical (unprefixed) directory path.
     fn list_remote(&self, path: &str) -> Result<Vec<String>, KoshaError> {
         let mut prefix = self.s3_key(path);

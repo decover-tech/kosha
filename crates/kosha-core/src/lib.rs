@@ -39,6 +39,35 @@ pub trait ControlStore: Send + Sync {
     ) -> Result<(), KoshaError>;
     fn list_namespaces(&self) -> Vec<NamespaceId>;
     fn namespace_count(&self) -> usize;
+
+    /// Record segment IDs that left the live manifest and may be deleted
+    /// from durable storage after a grace period.
+    fn mark_segments_for_gc(
+        &mut self,
+        namespace: &NamespaceId,
+        segment_ids: &[SegmentId],
+        by_version: u64,
+    ) -> Result<(), KoshaError>;
+
+    /// GC candidates older than `older_than_unix` (seconds since epoch).
+    fn list_gc_candidates(&self, older_than_unix: i64) -> Result<Vec<SegmentGcEntry>, KoshaError>;
+
+    /// Drop a GC mark after a successful delete (or if the segment is live again).
+    fn clear_gc_mark(
+        &mut self,
+        namespace: &NamespaceId,
+        segment_id: &SegmentId,
+    ) -> Result<(), KoshaError>;
+}
+
+/// A segment that is no longer referenced by the current manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentGcEntry {
+    pub namespace_id: NamespaceId,
+    pub segment_id: SegmentId,
+    /// Unix timestamp (seconds) when the segment became unreferenced.
+    pub unreferenced_at_unix: i64,
+    pub unreferenced_by_version: u64,
 }
 
 // ─── Identifiers ───────────────────────────────────────────────────────────
