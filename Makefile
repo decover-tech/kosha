@@ -8,11 +8,12 @@
 #   make gen              — generate everything
 #   make rust-test        — run Rust tests
 #   make rust-build       — build Rust binary
+#   make client-python-test — run Python client unit tests
 #   make migration-job-manifest — regen the ES→Kosha staging backfill Job YAML
 #   make all              — lint + gen + build + test
 #
 
-.PHONY: proto-lint proto-gen openapi gen gen/python gen/go rust-test rust-build all
+.PHONY: proto-lint proto-gen openapi gen gen/python gen/go rust-test rust-build client-python-test all
 
 # ── Proto ──────────────────────────────────────────────────────────────────
 
@@ -42,13 +43,17 @@ quickstart:
 
 # ── Python client ──────────────────────────────────────────────────────────
 
-.PHONY: client-python-build client-python-publish
+.PHONY: client-python-build client-python-publish client-python-test
 
 client-python-build:
 	python -m build clients/python
 
 client-python-publish:
 	python -m twine upload clients/python/dist/*
+
+client-python-test:
+	python -m pip install -e clients/python pytest
+	python -m pytest clients/python/tests/ -q
 
 # ── ES → Kosha migration ───────────────────────────────────────────────────
 
@@ -91,4 +96,4 @@ db-migrate: db-bootstrap
 
 # ── All ────────────────────────────────────────────────────────────────────
 
-all: proto-lint proto-gen rust-build rust-test
+all: proto-lint proto-gen rust-build rust-test client-python-test
