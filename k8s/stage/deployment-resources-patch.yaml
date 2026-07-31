@@ -1,7 +1,12 @@
 # Staging needs a warm working set large enough for OpenSearch→Kosha
-# catch-up and segment hydration. The base 4Gi memory / 10Gi emptyDir
-# OOMs after the first restart once manifests are loaded; keep prod on
-# the conservative base until it is sized separately.
+# catch-up and segment hydration. The base 4Gi memory OOMs after the first
+# restart once manifests are loaded; keep prod on the conservative base
+# until it is sized separately.
+#
+# Cache capacity is no longer sized here: the cache is a hostPath on the
+# kosha pool's NVMe instance store (see base/deployment.yaml), so its size
+# is the node's instance-store size, not a pod-level sizeLimit. Only the
+# container filesystem counts against ephemeral-storage.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,11 +20,5 @@ spec:
           resources:
             requests:
               memory: "8Gi"
-              ephemeral-storage: "20Gi"
             limits:
               memory: "32Gi"
-              ephemeral-storage: "60Gi"
-      volumes:
-        - name: cache
-          emptyDir:
-            sizeLimit: "60Gi"

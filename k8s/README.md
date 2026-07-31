@@ -9,7 +9,7 @@ production).
                 env-agnostic defaults only
       stage/    tracks the floating `:main` tag (ECR, what every merge to
                 main pushes); configmap/serviceaccount patches plus a
-                larger memory + cache emptyDir for warm hydration
+                larger memory ceiling for warm hydration
       prod/     tracks versioned releases (Docker Hub, public); same S3/IRSA
                 patch shape, with prod's own bucket + role (keeps base
                 resource sizes until sized separately)
@@ -24,6 +24,41 @@ verified** (this session's AWS credentials only reached the nonprod
 account) — confirm `decoverai-prod-kosha-segments` and
 `arn:aws:iam::992382824254:role/decoverai-prod-kosha` actually exist before
 the first production deploy.
+
+## The kosha node pool (Karpenter, NVMe instance store)
+
+Kosha runs on a dedicated Karpenter pool whose nodes have a local NVMe
+instance store, formatted and mounted at `/var/lib/kosha-cache` by the
+`EC2NodeClass` user-data. `base/deployment.yaml` is pinned to that pool:
+
+- `nodeSelector: kosha.dev/instance-store: nvme` — the label is unique to
+  the pool
+- toleration for `dedicated=kosha:NoSchedule` — the pool's taint keeps
+  everything else off it
+- the `cache` volume is a `hostPath` on `/var/lib/kosha-cache`, mounted at
+  `/var/cache/kosha` (so `KOSHA_DATA_DIR` / `KOSHA_CACHE_DIR` in the
+  ConfigMap are unchanged)
+
+Consequences worth knowing:
+
+- **`strategy: Recreate`.** Two kosha pods must never share a node, or a
+  rolling update's surge pod would write the same host directory as the
+  outgoing pod. Recreate costs a few seconds of downtime per deploy; the
+  Deployment is a single replica regardless. If Kosha ever needs >1
+  replica, add a `requiredDuringSchedulingIgnoredDuringExecution` pod
+  anti-affinity on `app: kosha` over `kubernetes.io/hostname` instead.
+- **Cache capacity is the node's, not the pod's.** hostPath usage is not
+  tracked by the kubelet, so `ephemeral-storage` requests/limits are sized
+  for the container filesystem only (logs, `/tmp`) — deliberately small, so
+  scheduling isn't constrained against the node's small root EBS volume.
+  Sizing the cache means choosing instance types in the `NodePool`.
+- **The cache survives pod restarts, not node replacement.** Contents are
+  rebuildable from the Postgres manifest + S3 segments, so a Karpenter node
+  swap costs a cold hydration, not data.
+- **Prod needs the same pool before it deploys.** These constraints live in
+  `base/`, so `k8s/prod` inherits them; without the label and taint on
+  `decoverai-prod`, the pod sits `Pending` forever. Add it to that cluster's
+  Karpenter config alongside the other unverified prod prerequisites below.
 
 Backend services reach Kosha at `kosha-service.kosha.svc.cluster.local:8080`
 (HTTP) / `:50051` (gRPC) — same DNS shape as the local dev setup documented
@@ -104,6 +139,14 @@ hand after the `:main` image containing the migrate subcommand is deployed:
 
 Notes:
 
+- **Scheduling:** the Job has *no* nodeSelector/toleration for the kosha
+  pool, on purpose — it uses its own `emptyDir` scratch, and sharing the
+  pool's `/var/lib/kosha-cache` would mean writing the live server's data
+  directory. It therefore needs some other schedulable nodegroup in the
+  cluster. If the kosha pool is now the only one, add the toleration +
+  nodeSelector to `scripts/gen_es_migration_job.py` and drop the Job's
+  `ephemeral-storage` request to fit the node's root EBS volume (its
+  `emptyDir` is kubelet-root-backed, *not* the NVMe mount).
 - **IAM prerequisite:** the `kosha` service account IRSA already writes S3;
   it must also allow `es:ESHttp*` on the staging OpenSearch domain. Without
   that policy the Job fails immediately with an explicit 403.
