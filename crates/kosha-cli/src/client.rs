@@ -113,6 +113,14 @@ impl Client {
         )
     }
 
+    pub fn rebuild_filter_blooms(&self, namespace: &str) -> Result<Value, ClientError> {
+        self.request(
+            Method::POST,
+            "/v1/admin/rebuild-filter-blooms",
+            Some(serde_json::json!({"namespace": namespace})),
+        )
+    }
+
     pub fn curl(
         &self,
         method: Method,

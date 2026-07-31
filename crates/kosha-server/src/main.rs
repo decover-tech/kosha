@@ -3,14 +3,17 @@
 //! One binary, three roles (DESIGN.md §5): `ingest`, `query`, `compaction`.
 //! Phase 1 HTTP/JSON API:
 //!   - `GET  /healthz`           → 200 OK (liveness probe)
-//!   - `POST /index              ` → index documents into a namespace
+//!   - `POST /index              ` → upsert documents by id into a namespace
 //!   - `POST /exists             ` → batch doc_id existence check
+//!   - `POST /replace            ` → partial field merge by id (OpenSearch `_update`)
 //!   - `GET  /search             ` → BM25 search across a namespace
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "s3")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -96,8 +99,11 @@ mod s3_storage;
 use kosha_cache::Cache;
 #[cfg(feature = "s3")]
 use kosha_core::StorageBackend;
+#[cfg(feature = "s3")]
+use kosha_core::{segment_may_match, FilterClause};
 use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::Searcher;
+use kosha_segment::SegmentReader;
 use kosha_write::Indexer;
 
 // ─── Application state ──────────────────────────────────────────────────────
@@ -379,6 +385,78 @@ impl AppState {
             }
         }
     }
+
+    /// Ensure a single file within a segment dir is local (e.g. `footer.json`).
+    #[cfg(feature = "s3")]
+    fn ensure_file_local(&self, seg_path: &Path, file_name: &str) {
+        let local = seg_path.join(file_name);
+        if local.exists() {
+            return;
+        }
+        let Some(ref s3) = self.s3_storage else {
+            return;
+        };
+        let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+            return;
+        };
+        let logical = format!("{}/{file_name}", rel_path.to_string_lossy());
+        match s3.read(&logical) {
+            Ok(bytes) => {
+                if let Err(e) = self.cache.put_bytes(&logical, &bytes) {
+                    eprintln!("WARN: failed to materialize cache file {logical}: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("WARN: S3 download failed for {logical}: {e}");
+            }
+        }
+    }
+
+    /// Hydrate only segments that might match `filter` (footer bloom prune first).
+    #[cfg(feature = "s3")]
+    fn hydrate_segments_for_search(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+        filter: Option<&FilterClause>,
+    ) {
+        for entry in &manifest.segments {
+            let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+            if let Some(filter) = filter {
+                self.ensure_file_local(&seg_path, "footer.json");
+                if let Ok(footer) = SegmentReader::read_footer(&seg_path) {
+                    if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
+                        continue;
+                    }
+                }
+            }
+            self.ensure_segment_local(&seg_path);
+        }
+    }
+
+    /// Upload a single file from a local segment dir to S3.
+    #[cfg(feature = "s3")]
+    fn sync_file_to_s3(&self, seg_dir: &Path, file_name: &str) {
+        let Some(ref s3) = self.s3_storage else {
+            return;
+        };
+        let path = seg_dir.join(file_name);
+        if !path.is_file() {
+            return;
+        }
+        let Ok(rel) = seg_dir.strip_prefix(&self.data_dir) else {
+            return;
+        };
+        let s3_path = format!("{}/{file_name}", rel.to_string_lossy());
+        match std::fs::read(&path) {
+            Ok(data) => {
+                if let Err(e) = s3.write(&s3_path, &data) {
+                    eprintln!("WARN: S3 upload failed for {s3_path}: {e}");
+                }
+            }
+            Err(e) => eprintln!("WARN: failed to read {s3_path} for upload: {e}"),
+        }
+    }
 }
 
 /// Redact the password portion of a Postgres URL for logs.
@@ -603,6 +681,10 @@ fn route(
         return handle_create_api_key(body, tenant, state);
     }
 
+    if request_line.starts_with("POST /v1/admin/rebuild-filter-blooms") {
+        return handle_rebuild_filter_blooms(body, tenant, state);
+    }
+
     // ── Legacy Phase 1 routes (backward compat) ────────────────────────────
     // These will be removed after DecoverAI cuts over to the v1 paths.
     if request_line.starts_with("GET /healthz") {
@@ -672,6 +754,23 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     };
 
     let ns = request.namespace;
+
+    // Upsert may rewrite immutable segments that hold prior versions of the
+    // same ids, so materialize any S3-backed segment directories first.
+    #[cfg(feature = "s3")]
+    {
+        let manifest = {
+            let indexer = state.indexer.lock().unwrap();
+            indexer.manifest_cloned(&ns)
+        };
+        if let Some(manifest) = manifest {
+            for entry in &manifest.segments {
+                let path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                state.ensure_segment_local(&path);
+            }
+        }
+    }
+
     let (count, manifest_changed) = {
         let mut indexer = state.indexer.lock().unwrap();
         let version_before = indexer.manifest(&ns).map(|m| m.version);
@@ -679,8 +778,9 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
             Ok(c) => c,
             Err(e) => return json_error(500, &format!("indexing error: {e}")),
         };
-        // index_documents auto-flushes when the buffer hits the threshold,
-        // which mutates the manifest — detect that via the version.
+        // index_documents auto-flushes when the buffer hits the threshold
+        // (or rewrites on id collision), which mutates the manifest —
+        // detect that via the version.
         let manifest_changed = indexer.manifest(&ns).map(|m| m.version) != version_before;
         (count, manifest_changed)
     };
@@ -972,12 +1072,9 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         (m, t)
     };
 
-    // Ensure segment dirs exist locally (download from S3 if needed).
+    // Footer-first hydrate: bloom-prune before downloading full segments.
     #[cfg(feature = "s3")]
-    for entry in &manifest.segments {
-        let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
-        state.ensure_segment_local(&seg_path);
-    }
+    state.hydrate_segments_for_search(&ns, &manifest, query.filter.as_ref());
 
     match state
         .searcher
@@ -1048,12 +1145,8 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         (m, t)
     };
 
-    // Ensure segment dirs exist locally (download from S3 if needed).
     #[cfg(feature = "s3")]
-    for entry in &manifest.segments {
-        let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
-        state.ensure_segment_local(&seg_path);
-    }
+    state.hydrate_segments_for_search(&ns, &manifest, query.filter.as_ref());
 
     match state
         .searcher
@@ -1149,6 +1242,81 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
         "documents": ns_docs,
         "segments": manifest.segments.len(),
         "version": manifest.version,
+    }))
+}
+
+/// POST /v1/admin/rebuild-filter-blooms — rewrite footer blooms from filters.bin.
+///
+/// Request body: `{"namespace": "paragraph_index_hnsw"}` (tenant-scoped when
+/// authenticated). Hydrates each segment, rebuilds `filter_blooms`, and uploads
+/// the updated `footer.json` to S3 when configured.
+fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> String {
+    let req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+    };
+    let ns_raw = match req.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return json_error(400, "missing 'namespace'"),
+    };
+    // Prefer the name as given (migration uses bare index names); fall back
+    // to tenant-scoped lookup used by v1 routes.
+    let ns = {
+        let indexer = state.indexer.lock().unwrap();
+        if ns_raw.contains('/') {
+            let ns = NamespaceId(ns_raw.to_string());
+            if indexer.manifest_cloned(&ns).is_some() {
+                ns
+            } else {
+                return json_error(404, &format!("namespace '{}' not found", ns.0));
+            }
+        } else {
+            let bare = NamespaceId(ns_raw.to_string());
+            if indexer.manifest_cloned(&bare).is_some() {
+                bare
+            } else {
+                let scoped = NamespaceId(tenant_namespace(tenant, ns_raw));
+                if indexer.manifest_cloned(&scoped).is_some() {
+                    scoped
+                } else {
+                    return json_error(404, &format!("namespace '{ns_raw}' not found"));
+                }
+            }
+        }
+    };
+
+    let manifest = {
+        let indexer = state.indexer.lock().unwrap();
+        indexer
+            .manifest_cloned(&ns)
+            .expect("namespace existence checked above")
+    };
+
+    let mut rebuilt = 0usize;
+    let mut errors = Vec::new();
+    for entry in &manifest.segments {
+        let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
+        #[cfg(feature = "s3")]
+        state.ensure_segment_local(&seg_path);
+        if !seg_path.exists() {
+            errors.push(format!("{}: segment not local", entry.segment_id.0));
+            continue;
+        }
+        match SegmentReader::rewrite_filter_blooms(&seg_path) {
+            Ok(_) => {
+                rebuilt += 1;
+                #[cfg(feature = "s3")]
+                state.sync_file_to_s3(&seg_path, "footer.json");
+            }
+            Err(e) => errors.push(format!("{}: {e}", entry.segment_id.0)),
+        }
+    }
+
+    json_ok(&serde_json::json!({
+        "namespace": ns.0,
+        "segments": manifest.segments.len(),
+        "rebuilt": rebuilt,
+        "errors": errors,
     }))
 }
 

@@ -211,12 +211,38 @@ impl Indexer {
         }
     }
 
+    /// Index documents into a namespace (OpenSearch `index` semantics).
+    ///
+    /// Same `doc_id` overwrites any prior live copy: buffered versions are
+    /// dropped in place; flushed versions trigger a durable segment rewrite
+    /// so duplicates do not accumulate. Incoming batches are last-write-wins
+    /// on `doc_id`. New ids take the fast append path.
     pub fn index_documents(
         &mut self,
         namespace: NamespaceId,
         documents: Vec<Document>,
     ) -> Result<usize, KoshaError> {
-        // Write to WAL first for durability.
+        let documents = dedupe_documents_last_wins(documents);
+        let count = documents.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let ids: Vec<DocumentId> = documents.iter().map(|doc| doc.id.clone()).collect();
+        let id_set: HashSet<&DocumentId> = ids.iter().collect();
+
+        // Drop buffered prior versions so a re-index before flush does not
+        // duplicate within the next segment.
+        if let Some(buf) = self.buffers.get_mut(&namespace) {
+            buf.documents.retain(|doc| !id_set.contains(&doc.id));
+        }
+
+        if self.has_flushed_ids(&namespace, &ids)? {
+            // Durable full-document replace (no field merge).
+            return self.rewrite_documents(namespace, documents, false);
+        }
+
+        // Fast path: ids are new — append like the original Phase 1 writer.
         if self.wal_enabled {
             if let Ok(mut wal) = self.wal.lock() {
                 wal.append(&namespace, &documents).ok();
@@ -224,7 +250,6 @@ impl Indexer {
         }
 
         let buf = self.buffer_mut(namespace.clone());
-        let count = documents.len();
         buf.documents.extend(documents);
         if buf.documents.len() >= self.flush_threshold {
             self.flush_namespace(&namespace)?;
@@ -243,6 +268,19 @@ impl Indexer {
         &mut self,
         namespace: NamespaceId,
         documents: Vec<Document>,
+    ) -> Result<usize, KoshaError> {
+        self.rewrite_documents(namespace, documents, true)
+    }
+
+    /// Rewrite segments that contain `documents`' ids, then write the new
+    /// versions. When `merge` is true, patch fields onto the latest existing
+    /// copy (`/replace`); when false, the incoming document fully replaces it
+    /// (`/index` upsert).
+    fn rewrite_documents(
+        &mut self,
+        namespace: NamespaceId,
+        documents: Vec<Document>,
+        merge: bool,
     ) -> Result<usize, KoshaError> {
         if documents.is_empty() {
             return Ok(0);
@@ -285,7 +323,9 @@ impl Indexer {
                     continue;
                 }
                 if replacement_ids.contains(record.doc_id.0.as_str()) {
-                    existing_fields.insert(record.doc_id.0.clone(), record.fields.clone());
+                    if merge {
+                        existing_fields.insert(record.doc_id.0.clone(), record.fields.clone());
+                    }
                 } else {
                     carried_documents.push(Document {
                         id: record.doc_id.clone(),
@@ -311,17 +351,23 @@ impl Indexer {
 
         let count = documents.len();
         for document in documents {
-            let merged = match existing_fields.remove(&document.id.0) {
-                Some(base_fields) => Document {
-                    id: document.id,
-                    fields: merge_fields(base_fields, document.fields),
-                },
-                None => document,
+            let merged = if merge {
+                match existing_fields.remove(&document.id.0) {
+                    Some(base_fields) => Document {
+                        id: document.id,
+                        fields: merge_fields(base_fields, document.fields),
+                    },
+                    None => document,
+                }
+            } else {
+                document
             };
             carried_documents.push(merged);
         }
         self.id_index.remove(&namespace);
-        self.index_documents(namespace.clone(), carried_documents)?;
+        // Bypass upsert re-entry: these ids were just removed from live
+        // segments, so the append path is correct and avoids a rewrite loop.
+        self.append_documents(namespace.clone(), carried_documents)?;
         self.flush_namespace(&namespace)?;
 
         // The manifest no longer references these immutable segments.
@@ -330,6 +376,54 @@ impl Indexer {
             std::fs::remove_dir_all(seg_dir).ok();
         }
         Ok(count)
+    }
+
+    /// Append without upsert checks. Used by segment rewrite after old
+    /// versions of the same ids have already been removed from the manifest.
+    fn append_documents(
+        &mut self,
+        namespace: NamespaceId,
+        documents: Vec<Document>,
+    ) -> Result<usize, KoshaError> {
+        if documents.is_empty() {
+            return Ok(0);
+        }
+        if self.wal_enabled {
+            if let Ok(mut wal) = self.wal.lock() {
+                wal.append(&namespace, &documents).ok();
+            }
+        }
+        let buf = self.buffer_mut(namespace.clone());
+        let count = documents.len();
+        buf.documents.extend(documents);
+        if buf.documents.len() >= self.flush_threshold {
+            self.flush_namespace(&namespace)?;
+        }
+        Ok(count)
+    }
+
+    fn has_flushed_ids(
+        &mut self,
+        namespace: &NamespaceId,
+        ids: &[DocumentId],
+    ) -> Result<bool, KoshaError> {
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        self.ensure_id_index(namespace)?;
+        let Some(index) = self.id_index.get(namespace) else {
+            return Ok(false);
+        };
+        let tombstones = self.tombstones.get(namespace);
+        Ok(ids.iter().any(|id| {
+            index.get(id).is_some_and(|locs| {
+                locs.iter().any(|(seg, seq)| {
+                    !tombstones
+                        .and_then(|t| t.get(seg))
+                        .is_some_and(|set| set.contains(seq))
+                })
+            })
+        }))
     }
 
     pub fn flush_namespace(&mut self, namespace: &NamespaceId) -> Result<(), KoshaError> {
@@ -551,6 +645,22 @@ fn merge_fields(
         }
     }
     base
+}
+
+/// Last occurrence of each `doc_id` wins (OpenSearch bulk last-write-wins).
+fn dedupe_documents_last_wins(documents: Vec<Document>) -> Vec<Document> {
+    let mut last_by_id: HashMap<String, Document> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for document in documents {
+        let id = document.id.0.clone();
+        if last_by_id.insert(id.clone(), document).is_none() {
+            order.push(id);
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|id| last_by_id.remove(&id))
+        .collect()
 }
 
 fn segment_flush_counter(segment_id: &SegmentId) -> Option<u64> {
@@ -901,6 +1011,98 @@ mod tests {
         let m = idx2.manifest(&ns).unwrap();
         assert_eq!(m.segments.len(), 2);
         assert_ne!(m.segments[0].segment_id, m.segments[1].segment_id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_documents_upserts_by_id_without_duplicates() {
+        let dir = std::env::temp_dir().join("kosha-test-index-upsert");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let mut idx = Indexer::new(dir.clone()).with_wal(false);
+        idx.index_documents(
+            ns.clone(),
+            vec![
+                Document {
+                    id: DocumentId("d1".into()),
+                    fields: vec![Field::text("title", "old"), Field::keyword("keep", "stale")],
+                },
+                Document {
+                    id: DocumentId("d2".into()),
+                    fields: vec![Field::text("title", "preserved")],
+                },
+            ],
+        )
+        .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("d1".into()),
+                fields: vec![Field::text("title", "new")],
+            }],
+        )
+        .unwrap();
+
+        let manifest = idx.manifest(&ns).unwrap().clone();
+        assert_eq!(manifest.segments.len(), 1);
+        let reader = kosha_segment::SegmentReader::open(
+            dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
+        )
+        .unwrap();
+        assert_eq!(reader.doc_records.len(), 2);
+        let by_id: HashMap<_, _> = reader
+            .doc_records
+            .iter()
+            .map(|record| (record.doc_id.0.as_str(), &record.fields))
+            .collect();
+        let d1: HashMap<_, _> = by_id["d1"]
+            .iter()
+            .map(|field| (field.name.as_str(), field.value.as_str()))
+            .collect();
+        // Full replace — old fields not present on the new doc are dropped.
+        assert_eq!(d1.get("title"), Some(&"new"));
+        assert!(!d1.contains_key("keep"));
+        assert_eq!(by_id["d2"][0].value, "preserved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_documents_dedupes_buffer_before_flush() {
+        let dir = std::env::temp_dir().join("kosha-test-index-buffer-dedupe");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let mut idx = Indexer::new(dir.clone()).with_wal(false);
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("d1".into()),
+                fields: vec![Field::text("title", "first")],
+            }],
+        )
+        .unwrap();
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("d1".into()),
+                fields: vec![Field::text("title", "second")],
+            }],
+        )
+        .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+
+        let manifest = idx.manifest(&ns).unwrap().clone();
+        assert_eq!(manifest.segments.len(), 1);
+        assert_eq!(manifest.segments[0].doc_count, 1);
+        let reader = kosha_segment::SegmentReader::open(
+            dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
+        )
+        .unwrap();
+        assert_eq!(reader.doc_records.len(), 1);
+        assert_eq!(reader.doc_records[0].fields[0].value, "second");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

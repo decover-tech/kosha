@@ -56,8 +56,11 @@ name: Release
 # hasn't changed. Each needs its own GitHub Environment ("staging" /
 # "production") with secrets AWS_GITHUB_ROLE_ARN (must also have EKS RBAC —
 # an access entry or aws-auth mapping — granting it write access to the
-# `kosha` namespace), KOSHA_DATABASE_URL, and KOSHA_API_KEY. See
-# k8s/README.md. For an on-demand redeploy/rollback without a new build,
+# `kosha` namespace), plus KOSHA_DATABASE_URL, KOSHA_API_KEY,
+# KOSHA_S3_BUCKET, KOSHA_S3_PREFIX, KOSHA_IRSA_ROLE_ARN, EKS_CLUSTER_NAME
+# (and optional KOSHA_AWS_REGION). See k8s/README.md. For an on-demand
+# redeploy/rollback without a new build,
+
 # use the separate "Deploy to EKS" workflow (deploy.yml,
 # workflow_dispatch) — it calls the same reusable workflow.
 
@@ -318,6 +321,11 @@ jobs:
           aws_role_arn: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
           database_url: ${{ secrets.KOSHA_DATABASE_URL }}
           kosha_api_key: ${{ secrets.KOSHA_API_KEY }}
+          eks_cluster_name: ${{ secrets.EKS_CLUSTER_NAME }}
+          s3_bucket: ${{ secrets.KOSHA_S3_BUCKET }}
+          s3_prefix: ${{ secrets.KOSHA_S3_PREFIX }}
+          irsa_role_arn: ${{ secrets.KOSHA_IRSA_ROLE_ARN }}
+          aws_region: ${{ secrets.KOSHA_AWS_REGION }}
 
   deploy-production:
     name: Deploy to EKS (production)
@@ -341,3 +349,8 @@ jobs:
           aws_role_arn: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
           database_url: ${{ secrets.KOSHA_DATABASE_URL }}
           kosha_api_key: ${{ secrets.KOSHA_API_KEY }}
+          eks_cluster_name: ${{ secrets.EKS_CLUSTER_NAME }}
+          s3_bucket: ${{ secrets.KOSHA_S3_BUCKET }}
+          s3_prefix: ${{ secrets.KOSHA_S3_PREFIX }}
+          irsa_role_arn: ${{ secrets.KOSHA_IRSA_ROLE_ARN }}
+          aws_region: ${{ secrets.KOSHA_AWS_REGION }}

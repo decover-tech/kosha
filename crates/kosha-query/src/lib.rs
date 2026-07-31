@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use kosha_core::{
-    AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult, AggMetricResult,
-    Aggregation, AggregationResults, Bm25Params, FieldType, FilterClause, FilterStore, KoshaError,
-    Manifest, NamespaceId, ScoredDocument, SearchQuery, SearchResult, SortSpec,
+    segment_may_match, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
+    AggMetricResult, Aggregation, AggregationResults, Bm25Params, FieldType, FilterClause,
+    FilterStore, KoshaError, Manifest, NamespaceId, ScoredDocument, SearchQuery, SearchResult,
+    SortSpec,
 };
 use kosha_segment::{tokenize, SegmentReader};
 
@@ -441,6 +442,15 @@ impl Searcher {
             let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
             if !seg_dir.exists() {
                 continue;
+            }
+
+            // Prune via footer blooms before opening inverted/filters/vectors.
+            if let Some(ref filter) = query.filter {
+                if let Ok(footer) = SegmentReader::read_footer(&seg_dir) {
+                    if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
+                        continue;
+                    }
+                }
             }
 
             // Lexical/BM25 queries (no query.knn) never touch vectors or the
@@ -1281,6 +1291,73 @@ mod tests {
             r.results.iter().map(|d| d.doc_id.0.as_str()).collect();
         assert!(ids.contains("a"));
         assert!(ids.contains("b"));
+
+        // Bloom pruning: m2 segment footer must reject matterId=m1.
+        let s3_footer = SegmentReader::read_footer(&dir.join(&ns.0).join("s3")).unwrap();
+        assert!(!kosha_core::segment_may_match(
+            q.filter.as_ref().unwrap(),
+            s3_footer.filter_blooms.as_ref()
+        ));
+        let s1_footer = SegmentReader::read_footer(&dir.join(&ns.0).join("s1")).unwrap();
+        assert!(kosha_core::segment_may_match(
+            q.filter.as_ref().unwrap(),
+            s1_footer.filter_blooms.as_ref()
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_footer_without_blooms_still_searches() {
+        let dir = std::env::temp_dir().join("kosha-test-filter-legacy-footer");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        w.add_document(
+            DocumentId("a".into()),
+            vec![
+                Field::text("content", "shared token"),
+                Field::text("matterId", "m1"),
+            ],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        // Strip blooms to simulate a pre-bloom segment.
+        let mut footer = SegmentReader::read_footer(&seg_dir).unwrap();
+        footer.filter_blooms = None;
+        std::fs::write(
+            seg_dir.join("footer.json"),
+            serde_json::to_string_pretty(&footer).unwrap(),
+        )
+        .unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 1,
+            }],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let q = SearchQuery {
+            query_text: "shared".into(),
+            max_results: 10,
+            from: 0,
+            bm25_params: Bm25Params::default(),
+            filter: Some(kosha_core::FilterClause::Term {
+                term: std::collections::HashMap::from([("matterId".into(), "m1".into())]),
+            }),
+            sort: vec![],
+            search_after: None,
+            highlight: None,
+            aggs: HashMap::new(),
+            wildcard: None,
+            match_phrase: None,
+            knn: None,
+        };
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(r.total_hits, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

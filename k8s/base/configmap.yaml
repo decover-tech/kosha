@@ -1,6 +1,6 @@
 # Env-agnostic defaults. S3/region settings (KOSHA_S3_BUCKET,
-# KOSHA_S3_PREFIX, AWS_DEFAULT_REGION) are per-environment and layered in by
-# each overlay's configmap-patch.yaml, since the bucket differs per env.
+# KOSHA_S3_PREFIX, AWS_DEFAULT_REGION) are injected at deploy time from
+# GitHub Environment secrets — never committed as customer-specific values.
 apiVersion: v1
 kind: ConfigMap
 metadata:

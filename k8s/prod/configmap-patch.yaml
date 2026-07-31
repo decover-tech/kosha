@@ -1,13 +1,9 @@
-# Bucket name follows the same {name_prefix}-kosha-segments convention
-# confirmed live on staging (decoverai-stage-kosha-segments) — NOT
-# independently verified against the prod cluster (this session's AWS
-# credentials only reach the nonprod account). Confirm before first deploy.
+# Env-specific S3/region values are NOT committed here — the deploy action
+# writes them at apply time from GitHub Environment secrets (see
+# .github/actions/deploy-eks).
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: kosha-config
   namespace: kosha
-data:
-  KOSHA_S3_BUCKET: decoverai-prod-kosha-segments
-  KOSHA_S3_PREFIX: segments/
-  AWS_DEFAULT_REGION: us-east-1
+data: {}
