@@ -8,26 +8,34 @@ production).
       base/     Namespace, ServiceAccount, ConfigMap, Deployment, Service —
                 env-agnostic defaults only
       stage/    tracks the floating `:main` tag (ECR, what every merge to
-                main pushes); configmap/serviceaccount patches plus a
-                larger memory + cache emptyDir for warm hydration
+                main pushes); configmap/serviceaccount/NVMe-hostPath patches
       prod/     tracks versioned releases (Docker Hub, public); same S3/IRSA
                 patch shape, with prod's own bucket + role (keeps base
                 resource sizes until sized separately)
 
-S3-backed segment storage and IRSA are wired in (`KOSHA_S3_BUCKET`,
-`KOSHA_S3_PREFIX`, `AWS_DEFAULT_REGION` via ConfigMap; `eks.amazonaws.com/
-role-arn` on the ServiceAccount) — these values were confirmed against the
-already-running staging deployment (see below), not derived from the `infra`
-Terraform repo directly. **Production's values follow the same
-`{name_prefix}-kosha[-segments]` naming convention but are not independently
-verified** (this session's AWS credentials only reached the nonprod
-account) — confirm `decoverai-prod-kosha-segments` and
-`arn:aws:iam::992382824254:role/decoverai-prod-kosha` actually exist before
-the first production deploy.
+## Contract with `decover-tech/infra` (do not diverge)
 
-Backend services reach Kosha at `kosha-service.kosha.svc.cluster.local:8080`
-(HTTP) / `:50051` (gRPC) — same DNS shape as the local dev setup documented
-in `docs/local-development.md`.
+Kosha's AWS pieces are owned by the infra Terraform module
+`terraform/envs/aws/modules/kosha` (+ the EKS NVMe node group). This repo
+must stay aligned with that contract — **never** deploy the staging/prod
+Kosha server into `decoverai-services`.
+
+| Field | Staging | Production |
+|-------|---------|------------|
+| K8s namespace | `kosha` | `kosha` |
+| ServiceAccount | `kosha` | `kosha` |
+| Service DNS | `kosha-service.kosha.svc.cluster.local` | same |
+| S3 bucket | `decoverai-stage-kosha-segments` | `decoverai-prod-kosha-segments` |
+| S3 prefix | `segments/` | `segments/` |
+| IRSA role | `arn:aws:iam::010928200670:role/decoverai-stage-kosha` | `arn:aws:iam::992382824254:role/decoverai-prod-kosha` |
+| Secrets Manager | `decoverai-stage/kosha` | `decoverai-prod/kosha` |
+| Node label | `kosha.dev/instance-store=nvme` | (when NVMe NG enabled) |
+| Node taint | `dedicated=kosha:NoSchedule` | (when NVMe NG enabled) |
+| Host cache path | `/var/lib/kosha-cache` → pod `/var/cache/kosha` | same shape |
+
+Backend apps in `decoverai-services` are **clients only**; they call
+`http://kosha-service.kosha.svc.cluster.local:8080` and hold a copy of
+`kosha-secret` for the API key.
 
 ## Deploying
 

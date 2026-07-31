@@ -1,7 +1,15 @@
-# Staging needs a warm working set large enough for OpenSearch→Kosha
-# catch-up and segment hydration. The base 4Gi memory / 10Gi emptyDir
-# OOMs after the first restart once manifests are loaded; keep prod on
-# the conservative base until it is sized separately.
+# Staging sizing + scheduling contract with decover-tech/infra.
+#
+# Infra (terraform/envs/aws/modules/eks) provisions a dedicated NVMe node
+# group labeled `kosha.dev/instance-store=nvme` and tainted
+# `dedicated=kosha:NoSchedule`, with AL2023 user data mounting the local
+# instance-store at host path `/var/lib/kosha-cache`. This overlay MUST pin
+# here and bind-mount that hostPath — do not use emptyDir on staging, and
+# do not schedule onto the shared app node pool (that caused the dual-Kosha
+# drift with a leftover Deployment in `decoverai-services`).
+#
+# Memory/ephemeral requests stay large so a cold S3 rewarm after spot reclaim
+# does not OOM (DESIGN.md §9).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,16 +18,29 @@ metadata:
 spec:
   template:
     spec:
+      nodeSelector:
+        kosha.dev/instance-store: nvme
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: kosha
+          effect: NoSchedule
       containers:
         - name: kosha
           resources:
             requests:
               memory: "8Gi"
+              cpu: "1"
               ephemeral-storage: "20Gi"
             limits:
               memory: "32Gi"
+              cpu: "4"
               ephemeral-storage: "60Gi"
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/kosha
       volumes:
         - name: cache
-          emptyDir:
-            sizeLimit: "60Gi"
+          hostPath:
+            path: /var/lib/kosha-cache
+            type: DirectoryOrCreate
