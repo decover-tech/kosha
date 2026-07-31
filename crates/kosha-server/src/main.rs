@@ -99,9 +99,9 @@ mod s3_storage;
 use kosha_cache::Cache;
 #[cfg(feature = "s3")]
 use kosha_core::StorageBackend;
-use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 #[cfg(feature = "s3")]
 use kosha_core::{segment_may_match, FilterClause};
+use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::Searcher;
 use kosha_segment::SegmentReader;
 use kosha_write::Indexer;

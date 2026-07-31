@@ -651,10 +651,7 @@ fn decode_base64(s: &str) -> Option<Vec<u8>> {
             val(chunk[2])?,
             val(chunk[3])?,
         );
-        let n = (u32::from(a) << 18)
-            | (u32::from(b) << 12)
-            | (u32::from(c) << 6)
-            | u32::from(d);
+        let n = (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
         out.push(((n >> 16) & 0xff) as u8);
         if chunk[2] != b'=' {
             out.push(((n >> 8) & 0xff) as u8);

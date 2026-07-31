@@ -1026,10 +1026,7 @@ mod tests {
             vec![
                 Document {
                     id: DocumentId("d1".into()),
-                    fields: vec![
-                        Field::text("title", "old"),
-                        Field::keyword("keep", "stale"),
-                    ],
+                    fields: vec![Field::text("title", "old"), Field::keyword("keep", "stale")],
                 },
                 Document {
                     id: DocumentId("d2".into()),
