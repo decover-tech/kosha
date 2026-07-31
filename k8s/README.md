@@ -8,10 +8,11 @@ production).
       base/     Namespace, ServiceAccount, ConfigMap, Deployment, Service —
                 env-agnostic defaults only
       stage/    tracks the floating `:main` tag (ECR, what every merge to
-                main pushes); configmap-patch.yaml / serviceaccount-patch.yaml
-                layer in staging's S3 bucket + IRSA role
+                main pushes); configmap/serviceaccount patches plus a
+                larger memory + cache emptyDir for warm hydration
       prod/     tracks versioned releases (Docker Hub, public); same S3/IRSA
-                patch shape, with prod's own bucket + role
+                patch shape, with prod's own bucket + role (keeps base
+                resource sizes until sized separately)
 
 S3-backed segment storage and IRSA are wired in (`KOSHA_S3_BUCKET`,
 `KOSHA_S3_PREFIX`, `AWS_DEFAULT_REGION` via ConfigMap; `eks.amazonaws.com/
