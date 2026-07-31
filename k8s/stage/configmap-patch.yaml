@@ -1,9 +1,10 @@
+# Env-specific S3/region values are NOT committed here — the deploy action
+# writes them at apply time from GitHub Environment secrets (see
+# .github/actions/deploy-eks). Keeps this repo free of customer/account
+# bucket names.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: kosha-config
   namespace: kosha
-data:
-  KOSHA_S3_BUCKET: decoverai-stage-kosha-segments
-  KOSHA_S3_PREFIX: segments/
-  AWS_DEFAULT_REGION: us-east-1
+data: {}

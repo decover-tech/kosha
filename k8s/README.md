@@ -1,29 +1,34 @@
 # Kosha k8s manifests
 
-Kustomize layout for running `kosha-server` in its own `kosha` namespace on
-the real EKS clusters (`decoverai-nonprod` staging, `decoverai-prod`
-production).
+Kustomize layout for running `kosha-server` in its own **`kosha`**
+namespace. Manifests stay product-generic: no customer account names,
+bucket names, or IAM role ARNs are committed here.
 
     k8s/
       base/     Namespace, ServiceAccount, ConfigMap, Deployment, Service —
-                env-agnostic defaults only
-      stage/    tracks the floating `:main` tag (ECR, what every merge to
-                main pushes); configmap/serviceaccount patches plus a
-                larger memory ceiling for warm hydration
-      prod/     tracks versioned releases (Docker Hub, public); same S3/IRSA
-                patch shape, with prod's own bucket + role (keeps base
-                resource sizes until sized separately)
+                env-agnostic defaults only (includes kosha NVMe node-pool
+                scheduling; see below)
+      stage/    floating `:main` image tag + larger memory for warm hydration
+      prod/     versioned release image tag
 
-S3-backed segment storage and IRSA are wired in (`KOSHA_S3_BUCKET`,
-`KOSHA_S3_PREFIX`, `AWS_DEFAULT_REGION` via ConfigMap; `eks.amazonaws.com/
-role-arn` on the ServiceAccount) — these values were confirmed against the
-already-running staging deployment (see below), not derived from the `infra`
-Terraform repo directly. **Production's values follow the same
-`{name_prefix}-kosha[-segments]` naming convention but are not independently
-verified** (this session's AWS credentials only reached the nonprod
-account) — confirm `decoverai-prod-kosha-segments` and
-`arn:aws:iam::992382824254:role/decoverai-prod-kosha` actually exist before
-the first production deploy.
+## Contract with the infra / deploy environment
+
+| Field | In this repo | Provided at deploy time |
+|-------|--------------|-------------------------|
+| K8s namespace | `kosha` | — |
+| ServiceAccount | `kosha` | IRSA annotation |
+| Service DNS | `kosha-service.kosha.svc.cluster.local` | — |
+| S3 bucket / prefix | — | `KOSHA_S3_BUCKET`, `KOSHA_S3_PREFIX` |
+| AWS region | — | `KOSHA_AWS_REGION` (default `us-east-1`) |
+| IRSA role ARN | — | `KOSHA_IRSA_ROLE_ARN` |
+| Postgres URL / API key | — | `KOSHA_DATABASE_URL`, `KOSHA_API_KEY` |
+| EKS cluster name | — | `EKS_CLUSTER_NAME` |
+
+Customer-specific staging/prod wiring (bucket names, role ARNs, cluster
+names) lives in **infra Terraform outputs** and **GitHub Environment
+secrets** for this repo's deploy workflows — not in these YAML files.
+
+Clients reach Kosha at `http://kosha-service.kosha.svc.cluster.local:8080`.
 
 ## The kosha node pool (Karpenter, NVMe instance store)
 
@@ -56,85 +61,43 @@ Consequences worth knowing:
   rebuildable from the Postgres manifest + S3 segments, so a Karpenter node
   swap costs a cold hydration, not data.
 - **Prod needs the same pool before it deploys.** These constraints live in
-  `base/`, so `k8s/prod` inherits them; without the label and taint on
-  `decoverai-prod`, the pod sits `Pending` forever. Add it to that cluster's
-  Karpenter config alongside the other unverified prod prerequisites below.
-
-Backend services reach Kosha at `kosha-service.kosha.svc.cluster.local:8080`
-(HTTP) / `:50051` (gRPC) — same DNS shape as the local dev setup documented
-in `docs/local-development.md`.
+  `base/`, so `k8s/prod` inherits them; without the label and taint on the
+  prod cluster, the pod sits `Pending` forever.
 
 ## Deploying
 
-`.github/workflows/release.yml` applies these automatically:
+`.github/workflows/release.yml` / `deploy.yml` call
+`.github/actions/deploy-eks`, which:
 
-- `deploy-staging` — on push to `main`, after the multi-arch image merge job
-- `deploy-production` — on `v*` tags, after the multi-arch image merge job
+1. Reads Environment secrets (DB URL, API key, S3, IRSA, cluster)
+2. `kustomize edit set image` + generates `kosha-secret`
+3. Patches ConfigMap / ServiceAccount with the env-specific S3 + IRSA values
+4. `kubectl apply -k` and rolls out `deployment/kosha` in namespace `kosha`
 
-Each job assumes the AWS OIDC role in `secrets.AWS_GITHUB_ROLE_ARN` (scoped
-per-environment via GitHub Environments `staging` / `production`), points
-`kubectl` at the right cluster, uses `kustomize edit set image` to pin the
-image that was just published, generates the `kosha-secret` Secret in-cluster
-(not committed to git — see below), `kubectl apply`s, and force-restarts the
-rollout (a `kubectl apply` alone is a no-op when a floating tag string like
-`:main` hasn't changed).
+### Required GitHub Environment secrets
 
-### Prerequisites
+| Secret | Purpose |
+|--------|---------|
+| `AWS_GITHUB_ROLE_ARN` | OIDC deploy role |
+| `KOSHA_DATABASE_URL` | Postgres URL for control plane |
+| `KOSHA_API_KEY` | Bootstrap / client API key |
+| `KOSHA_S3_BUCKET` | Segment bucket name |
+| `KOSHA_S3_PREFIX` | Key prefix (e.g. `segments/`) |
+| `KOSHA_IRSA_ROLE_ARN` | `eks.amazonaws.com/role-arn` value |
+| `EKS_CLUSTER_NAME` | Target EKS cluster |
+| `KOSHA_AWS_REGION` | Optional, default `us-east-1` |
 
-- **staging — done.** GitHub Environment `staging` exists with
-  `KOSHA_DATABASE_URL` / `KOSHA_API_KEY` (copied from the already-working
-  live secret). EKS access: `GitHubActionsKoshaRole`
-  (`arn:aws:iam::010928200670:role/GitHubActionsKoshaRole` — the same role
-  already used for the ECR push, whose OIDC trust already covers
-  `refs/heads/main`) was granted an EKS Access Entry mapping it to the
-  `kosha-ci` Kubernetes group, and `k8s/base/rbac.yaml` (Role/RoleBinding
-  scoped to the `kosha` namespace, plus a ClusterRole/ClusterRoleBinding
-  scoped via `resourceNames` to just the `kosha` Namespace object) was
-  applied by hand to `decoverai-nonprod`. Verified with a full
-  `kubectl apply --dry-run=server` impersonating that exact role+group:
-  all 5 objects the pipeline manages come back `unchanged`. Nothing left
-  to do for `deploy-staging` to run.
-- **production — not done.** Needs its own GitHub Environment secrets
-  (`AWS_GITHUB_ROLE_ARN` for a role in the prod account, 992382824254 —
-  doesn't exist yet; `KOSHA_DATABASE_URL`; `KOSHA_API_KEY`), plus the same
-  `k8s/base/rbac.yaml` bootstrap + EKS Access Entry on `decoverai-prod`
-  once that role exists.
+`rbac.yaml` is a one-time, human-reviewed bootstrap per cluster
+(`kubectl apply -f k8s/base/rbac.yaml`).
 
-`rbac.yaml` is intentionally not part of the kustomization the pipeline
-applies (see the comment in `k8s/base/kustomization.yaml` for why) — it's a
-one-time, human-reviewed `kubectl apply -f k8s/base/rbac.yaml` per cluster.
-
-## A staging deployment already exists
-
-As of this writing, `kosha` is already running in the `kosha` namespace on
-`decoverai-nonprod` — deployed manually, ahead of this pipeline existing.
-`kustomize build k8s/stage` was checked (`kubectl apply --dry-run=server`)
-against the live cluster and every object comes back `configured` (an
-update-in-place), not an error — so once the GitHub Environment secrets
-above exist, the pipeline's `kubectl apply` will converge onto the existing
-Deployment/Service/ConfigMap/ServiceAccount rather than replacing them,
-with no need to delete anything first.
-
-## Migrating staging data from OpenSearch → Kosha
+## Migrating data from OpenSearch → Kosha
 
 `k8s/stage/es-to-kosha-migration-job.yaml` is a one-shot direct backfill
-(DESIGN.md §14). `kosha-server migrate` sliced-scrolls each shared OpenSearch
-alias (`paragraph_index_hnsw`, `page_index`, `findings_index`,
-`document_index`, `completions_index`, `cases_index`), builds 20k-document
-Kosha segments in-process with the WAL disabled, uploads each immutable
-segment to S3, and publishes its Postgres manifest entry. It bypasses the
-HTTP `/index` path entirely. Exact alias names keep Kosha namespaces aligned
-with what Sage reads; missing names are skipped.
-
-The Job is deliberately **not** part of the kustomize overlay — apply it by
-hand after the `:main` image containing the migrate subcommand is deployed:
-
-    # optional: preview what would move, without writing anything
-    kubectl apply -f k8s/stage/es-to-kosha-migration-job.yaml --dry-run=server
+(DESIGN.md §14). Apply by hand after the `:main` image containing migrate
+is deployed:
 
     kubectl apply -f k8s/stage/es-to-kosha-migration-job.yaml
     kubectl logs -n kosha -f job/es-to-kosha-migration
-    # after successful completion, reload manifests from Postgres:
     kubectl rollout restart deployment/kosha -n kosha
 
 Notes:
@@ -162,17 +125,18 @@ Notes:
   added to the existing manifest without wiping prior data. Prefer this over
   re-indexing ids that already exist.
 - Use `POST /exists` `{"namespace","ids"}` to compute a missing-id set for
-  `--ids-file`. Prefer `POST /replace` (not `/index`) when rewriting an
-  existing `doc_id` — `/index` still appends.
+  `--ids-file`. Prefer `POST /replace` for partial field merges; `/index`
+  upserts the full document by id.
 - For a 500-document smoke test, run one alias into a scratch namespace by
   adding `--limit 500 --namespace migration-smoke` and retaining exactly one
   `--index`.
 - Regenerate the manifest after CLI/Job changes with
-  `make migration-job-manifest`.
+  `make migration-job-manifest`. OpenSearch host/IAM for that Job are
+  environment-specific — edit or regenerate before use.
 
 ## Local verification
 
-    kustomize build k8s/stage            # render, no cluster needed
-    kubectl apply --dry-run=client -k k8s/stage   # validate against the k8s API schema
-    # with real cluster credentials (aws eks update-kubeconfig --name decoverai-nonprod):
-    kubectl apply --dry-run=server -k k8s/stage   # validate against the live API server, no changes persisted
+    kustomize build k8s/stage
+    kubectl apply --dry-run=client -k k8s/stage
+    # with real cluster credentials:
+    kubectl apply --dry-run=server -k k8s/stage
