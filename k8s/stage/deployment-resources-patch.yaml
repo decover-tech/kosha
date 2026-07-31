@@ -1,0 +1,25 @@
+# Staging needs a warm working set large enough for OpenSearch→Kosha
+# catch-up and segment hydration. The base 4Gi memory / 10Gi emptyDir
+# OOMs after the first restart once manifests are loaded; keep prod on
+# the conservative base until it is sized separately.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kosha
+  namespace: kosha
+spec:
+  template:
+    spec:
+      containers:
+        - name: kosha
+          resources:
+            requests:
+              memory: "8Gi"
+              ephemeral-storage: "20Gi"
+            limits:
+              memory: "32Gi"
+              ephemeral-storage: "60Gi"
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: "60Gi"

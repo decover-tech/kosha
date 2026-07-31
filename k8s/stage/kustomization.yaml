@@ -18,6 +18,7 @@ resources:
 patches:
   - path: configmap-patch.yaml
   - path: serviceaccount-patch.yaml
+  - path: deployment-resources-patch.yaml
 
 images:
   - name: kosha
