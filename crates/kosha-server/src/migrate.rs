@@ -39,6 +39,14 @@ const MIN_VECTOR_DIM: usize = 8;
 type DynError = Box<dyn Error + Send + Sync>;
 type Result<T> = std::result::Result<T, DynError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishMode {
+    /// Replace the namespace manifest with only this run's segments (default).
+    Replace,
+    /// Keep existing segments and append this run's new segments (delta catch-up).
+    Append,
+}
+
 #[derive(Debug, Clone)]
 struct Args {
     indices: Vec<String>,
@@ -49,6 +57,10 @@ struct Args {
     flush_docs: usize,
     limit: Option<usize>,
     keepalive: String,
+    /// When set, only these OpenSearch `_id`s are copied (implies Append unless
+    /// `--replace` is also passed).
+    ids_file: Option<PathBuf>,
+    mode: PublishMode,
 }
 
 impl Args {
@@ -62,7 +74,11 @@ impl Args {
             flush_docs: 20_000,
             limit: None,
             keepalive: "5m".into(),
+            ids_file: None,
+            mode: PublishMode::Replace,
         };
+        let mut append = false;
+        let mut replace = false;
         let mut it = argv.into_iter();
         while let Some(flag) = it.next() {
             let value = |it: &mut dyn Iterator<Item = String>, flag: &str| -> Result<String> {
@@ -78,6 +94,11 @@ impl Args {
                 "--flush-docs" => args.flush_docs = value(&mut it, "--flush-docs")?.parse()?,
                 "--limit" => args.limit = Some(value(&mut it, "--limit")?.parse()?),
                 "--scroll-keepalive" => args.keepalive = value(&mut it, "--scroll-keepalive")?,
+                "--ids-file" => {
+                    args.ids_file = Some(PathBuf::from(value(&mut it, "--ids-file")?));
+                }
+                "--append" => append = true,
+                "--replace" => replace = true,
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -91,6 +112,20 @@ impl Args {
         if args.namespace.is_some() && args.indices.len() != 1 {
             return Err("--namespace requires exactly one --index".into());
         }
+        if args.ids_file.is_some() && args.indices.len() != 1 {
+            return Err("--ids-file requires exactly one --index".into());
+        }
+        if append && replace {
+            return Err("--append and --replace are mutually exclusive".into());
+        }
+        args.mode = if replace {
+            PublishMode::Replace
+        } else if append || args.ids_file.is_some() {
+            // Delta catch-up: keep prior segments and add only the new ones.
+            PublishMode::Append
+        } else {
+            PublishMode::Replace
+        };
         if args.workers == 0
             || args.scroll_size == 0
             || args.batch_size == 0
@@ -108,6 +143,10 @@ fn print_help() {
          \n\
          Directly build Kosha segments from OpenSearch and publish to S3/Postgres.\n\
          \n\
+         By default a full run *replaces* the namespace manifest with newly-built\n\
+         segments (safe re-run / full catch-up). For a delta catch-up of missing\n\
+         docs only, pass --ids-file (implies --append).\n\
+         \n\
          Options:\n\
            --index NAME              exact index/alias (repeatable; defaults to shared aliases)\n\
            --namespace NAME          override Kosha namespace (requires one --index)\n\
@@ -116,7 +155,10 @@ fn print_help() {
            --batch-size N            docs sent to the segment writer at once (default 1000)\n\
            --flush-docs N            target docs per immutable segment (default 20000)\n\
            --limit N                 cap docs per index (smoke tests)\n\
-           --scroll-keepalive VALUE  OpenSearch scroll keepalive (default 5m)"
+           --scroll-keepalive VALUE  OpenSearch scroll keepalive (default 5m)\n\
+           --ids-file PATH           only copy these OpenSearch _ids (one per line; implies --append)\n\
+           --append                  append new segments to the existing manifest\n\
+           --replace                 replace the namespace manifest (default without --ids-file)"
     );
 }
 
@@ -260,6 +302,39 @@ impl EsClient {
         Ok(response.count)
     }
 
+    /// Fetch docs by `_id` via OpenSearch `_mget` (delta catch-up path).
+    fn mget(&self, index: &str, ids: &[String]) -> Result<Vec<Document>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[derive(Deserialize)]
+        struct MgetResponse {
+            docs: Vec<MgetDoc>,
+        }
+        #[derive(Deserialize)]
+        struct MgetDoc {
+            found: bool,
+            #[serde(rename = "_id", default)]
+            id: String,
+            #[serde(rename = "_source", default)]
+            source: Map<String, Value>,
+        }
+        let response: MgetResponse = self.request(
+            http::Method::POST,
+            &format!("/{index}/_mget"),
+            Some(json!({ "ids": ids })),
+        )?;
+        Ok(response
+            .docs
+            .into_iter()
+            .filter(|d| d.found)
+            .map(|d| Document {
+                id: DocumentId(d.id),
+                fields: source_to_fields(d.source),
+            })
+            .collect())
+    }
+
     fn open_scroll(
         &self,
         index: &str,
@@ -342,6 +417,36 @@ fn hit_to_document(hit: Hit) -> Document {
     }
 }
 
+fn read_ids_file(path: &PathBuf) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read --ids-file {}: {e}", path.display()))?;
+    let mut ids = Vec::new();
+    for line in text.lines() {
+        let id = line.trim();
+        if id.is_empty() || id.starts_with('#') {
+            continue;
+        }
+        ids.push(id.to_string());
+    }
+    Ok(ids)
+}
+
+fn copy_ids(
+    es: &EsClient,
+    index: &str,
+    ids: &[String],
+    batch_size: usize,
+    sender: mpsc::SyncSender<Vec<Document>>,
+) -> Result<()> {
+    for chunk in ids.chunks(batch_size.max(1)) {
+        let docs = es.mget(index, chunk)?;
+        if !docs.is_empty() {
+            sender.send(docs)?;
+        }
+    }
+    Ok(())
+}
+
 fn scroll_index(
     es: &EsClient,
     index: &str,
@@ -413,17 +518,29 @@ struct Publisher {
 }
 
 impl Publisher {
-    fn new(data_dir: PathBuf, s3: S3Storage, store: PgStore, existing: &Manifest) -> Self {
+    fn new(
+        data_dir: PathBuf,
+        s3: S3Storage,
+        store: PgStore,
+        existing: &Manifest,
+        mode: PublishMode,
+    ) -> Self {
+        let replacement = match mode {
+            PublishMode::Replace => Manifest {
+                version: existing.version,
+                segments: Vec::new(),
+            },
+            PublishMode::Append => existing.clone(),
+        };
         Self {
             data_dir,
             s3,
             store,
+            // Indexer still holds restored prior segments; skip them when
+            // selecting newly flushed entries to publish.
             original_entries: existing.segments.len(),
             published_entries: 0,
-            replacement: Manifest {
-                version: existing.version,
-                segments: Vec::new(),
-            },
+            replacement,
         }
     }
 
@@ -472,18 +589,34 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
     let mut store = PgStore::new(&database_url)?;
 
     println!(
-        "migrate: indices={:?} workers={} scroll_size={} batch_size={} flush_docs={} limit={:?}",
-        args.indices, args.workers, args.scroll_size, args.batch_size, args.flush_docs, args.limit
+        "migrate: indices={:?} workers={} scroll_size={} batch_size={} flush_docs={} limit={:?} mode={:?} ids_file={:?}",
+        args.indices,
+        args.workers,
+        args.scroll_size,
+        args.batch_size,
+        args.flush_docs,
+        args.limit,
+        args.mode,
+        args.ids_file,
     );
 
+    let ids_file_ids = match &args.ids_file {
+        Some(path) => Some(read_ids_file(path)?),
+        None => None,
+    };
+
     for index in &args.indices {
-        let total = match es.count(index) {
-            Ok(total) => total,
-            Err(error) if error.to_string().contains("404") => {
-                eprintln!("WARN: index/alias {index:?} not found — skipping");
-                continue;
+        let total = if let Some(ids) = &ids_file_ids {
+            ids.len()
+        } else {
+            match es.count(index) {
+                Ok(total) => total,
+                Err(error) if error.to_string().contains("404") => {
+                    eprintln!("WARN: index/alias {index:?} not found — skipping");
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         };
         let planned = args.limit.map_or(total, |limit| limit.min(total));
         let namespace = NamespaceId(args.namespace.clone().unwrap_or_else(|| index.clone()));
@@ -495,17 +628,33 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
             version: 0,
             segments: Vec::new(),
         });
-        // Restore only to advance segment IDs beyond an existing/partial run.
-        // Publisher atomically replaces old entries with this run's entries.
+        // Restore to advance segment IDs beyond an existing/partial run.
+        // Replace mode: Publisher publishes only this run's segments.
+        // Append mode: Publisher keeps existing segments and adds new ones.
         indexer.restore_manifest(namespace.clone(), existing.clone());
-        let mut publisher = Publisher::new(data_dir.clone(), s3, store, &existing);
+        let mut publisher = Publisher::new(data_dir.clone(), s3, store, &existing, args.mode);
         let started = Instant::now();
         let (sender, receiver) = mpsc::sync_channel::<Vec<Document>>(args.workers * 2);
         let es_worker = es.clone();
         let index_worker = index.clone();
         let args_worker = args.clone();
-        let scroll =
-            thread::spawn(move || scroll_index(&es_worker, &index_worker, &args_worker, sender));
+        let ids_worker = ids_file_ids.clone();
+        let producer = thread::spawn(move || -> Result<()> {
+            if let Some(mut ids) = ids_worker {
+                if let Some(limit) = args_worker.limit {
+                    ids.truncate(limit);
+                }
+                copy_ids(
+                    &es_worker,
+                    &index_worker,
+                    &ids,
+                    args_worker.batch_size,
+                    sender,
+                )
+            } else {
+                scroll_index(&es_worker, &index_worker, &args_worker, sender)
+            }
+        });
 
         let mut copied = 0usize;
         while let Ok(documents) = receiver.recv() {
@@ -530,18 +679,19 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
                 );
             }
         }
-        scroll
+        producer
             .join()
-            .map_err(|_| "OpenSearch coordinator thread panicked")??;
+            .map_err(|_| "OpenSearch producer thread panicked")??;
 
         indexer.flush_namespace(&namespace)?;
         publisher.publish_new(&indexer, &namespace)?;
         println!(
-            "migrate: completed index={} docs={} elapsed={:.1}s throughput={:.0} docs/sec",
+            "migrate: completed index={} docs={} elapsed={:.1}s throughput={:.0} docs/sec mode={:?}",
             index,
             copied,
             started.elapsed().as_secs_f64(),
-            copied as f64 / started.elapsed().as_secs_f64().max(0.001)
+            copied as f64 / started.elapsed().as_secs_f64().max(0.001),
+            args.mode,
         );
 
         // Move owned clients to the next namespace.
@@ -607,5 +757,22 @@ mod tests {
         assert_eq!(args.indices, ["a", "b"]);
         assert_eq!(args.workers, 8);
         assert_eq!(args.flush_docs, 20_000);
+        assert_eq!(args.mode, PublishMode::Replace);
+    }
+
+    #[test]
+    fn ids_file_implies_append_mode() {
+        let args = Args::parse([
+            "--index".into(),
+            "paragraph_index_hnsw".into(),
+            "--ids-file".into(),
+            "/tmp/missing-ids.txt".into(),
+        ])
+        .unwrap();
+        assert_eq!(args.mode, PublishMode::Append);
+        assert_eq!(
+            args.ids_file.as_deref(),
+            Some(std::path::Path::new("/tmp/missing-ids.txt"))
+        );
     }
 }

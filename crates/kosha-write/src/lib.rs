@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use kosha_core::{
-    Bm25Params, Document, FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry,
-    NamespaceId, RangeBound, SegmentId,
+    Bm25Params, Document, DocumentId, FilterClause, FilterStore, KoshaError, Manifest,
+    ManifestEntry, NamespaceId, RangeBound, SegmentId,
 };
 use kosha_segment::SegmentWriter;
 
@@ -25,6 +25,9 @@ pub struct Indexer {
     bm25_params: Bm25Params,
     /// Tombstoned docs: namespace → segment_id → set of doc_seqs
     tombstones: HashMap<NamespaceId, HashMap<SegmentId, HashSet<u32>>>,
+    /// Lazy per-namespace map of doc_id → flushed (segment, seq) locations.
+    /// Built on first `/exists` call; invalidated across replace/compact/restore.
+    id_index: HashMap<NamespaceId, HashMap<DocumentId, Vec<(SegmentId, u32)>>>,
     /// Write-Ahead Log for durability
     wal: std::sync::Mutex<crate::wal::WalWriter>,
     /// Whether WAL is enabled
@@ -45,6 +48,7 @@ impl Indexer {
             flush_threshold: 1000,
             bm25_params: Bm25Params::default(),
             tombstones: HashMap::new(),
+            id_index: HashMap::new(),
             wal: std::sync::Mutex::new(wal),
             wal_enabled: true,
         };
@@ -114,6 +118,97 @@ impl Indexer {
         namespace: &NamespaceId,
     ) -> Option<&HashMap<SegmentId, HashSet<u32>>> {
         self.tombstones.get(namespace)
+    }
+
+    /// Which of `ids` already exist in the namespace (buffer or flushed segments)?
+    ///
+    /// Flushed lookups require local segment files (hydrated cache). Missing
+    /// local files are treated as absent for that segment.
+    pub fn existing_ids(
+        &mut self,
+        namespace: &NamespaceId,
+        ids: &[DocumentId],
+    ) -> Result<HashSet<DocumentId>, KoshaError> {
+        let mut found = HashSet::new();
+        if ids.is_empty() {
+            return Ok(found);
+        }
+        let wanted: HashSet<&DocumentId> = ids.iter().collect();
+
+        if let Some(buf) = self.buffers.get(namespace) {
+            for doc in &buf.documents {
+                if wanted.contains(&doc.id) {
+                    found.insert(doc.id.clone());
+                }
+            }
+        }
+
+        self.ensure_id_index(namespace)?;
+        if let Some(index) = self.id_index.get(namespace) {
+            let tombstones = self.tombstones.get(namespace);
+            for id in ids {
+                if found.contains(id) {
+                    continue;
+                }
+                let Some(locs) = index.get(id) else {
+                    continue;
+                };
+                let alive = locs.iter().any(|(seg, seq)| {
+                    !tombstones
+                        .and_then(|t| t.get(seg))
+                        .is_some_and(|set| set.contains(seq))
+                });
+                if alive {
+                    found.insert(id.clone());
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn ensure_id_index(&mut self, namespace: &NamespaceId) -> Result<(), KoshaError> {
+        if self.id_index.contains_key(namespace) {
+            return Ok(());
+        }
+        let mut index: HashMap<DocumentId, Vec<(SegmentId, u32)>> = HashMap::new();
+        let Some(manifest) = self.manifests.get(namespace).cloned() else {
+            self.id_index.insert(namespace.clone(), index);
+            return Ok(());
+        };
+        let data_dir = self.data_dir.clone();
+        for entry in &manifest.segments {
+            let seg_dir = data_dir.join(&namespace.0).join(&entry.segment_id.0);
+            if !seg_dir.exists() {
+                continue;
+            }
+            let reader = kosha_segment::SegmentReader::open_with_options(seg_dir, false)?;
+            for rec in &reader.doc_records {
+                index
+                    .entry(rec.doc_id.clone())
+                    .or_default()
+                    .push((entry.segment_id.clone(), rec.doc_seq));
+            }
+        }
+        self.id_index.insert(namespace.clone(), index);
+        Ok(())
+    }
+
+    fn remember_flushed_ids(
+        &mut self,
+        namespace: &NamespaceId,
+        seg_id: &SegmentId,
+        docs: &[Document],
+    ) {
+        if !self.id_index.contains_key(namespace) {
+            return;
+        }
+        let index = self.id_index.entry(namespace.clone()).or_default();
+        for (seq, doc) in docs.iter().enumerate() {
+            index
+                .entry(doc.id.clone())
+                .or_default()
+                .push((seg_id.clone(), seq as u32));
+        }
     }
 
     pub fn index_documents(
@@ -225,6 +320,7 @@ impl Indexer {
             };
             carried_documents.push(merged);
         }
+        self.id_index.remove(&namespace);
         self.index_documents(namespace.clone(), carried_documents)?;
         self.flush_namespace(&namespace)?;
 
@@ -267,6 +363,8 @@ impl Indexer {
                 wal.clear().ok();
             }
         }
+
+        self.remember_flushed_ids(namespace, &seg_id, &docs);
 
         let manifest = self.manifests.entry(namespace.clone()).or_insert(Manifest {
             version: 0,
@@ -369,6 +467,7 @@ impl Indexer {
                 ts.remove(seg_id);
             }
         }
+        self.id_index.remove(namespace);
 
         Ok(())
     }
@@ -397,6 +496,7 @@ impl Indexer {
             let buf = self.buffer_mut(namespace.clone());
             buf.segment_counter = buf.segment_counter.max(max + 1);
         }
+        self.id_index.remove(&namespace);
         self.manifests.insert(namespace, manifest);
     }
 
@@ -713,6 +813,48 @@ mod tests {
             // d2 has doc_seq=1
             assert!(seqs.contains(&1));
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_ids_sees_buffer_and_flushed_docs() {
+        let dir = std::env::temp_dir().join("kosha-test-exists");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ns = NamespaceId("exists".into());
+        let mut idx = Indexer::new(dir.clone()).with_wal(false);
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("flushed".into()),
+                fields: vec![Field::text("title", "a")],
+            }],
+        )
+        .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("buffered".into()),
+                fields: vec![Field::text("title", "b")],
+            }],
+        )
+        .unwrap();
+
+        let found = idx
+            .existing_ids(
+                &ns,
+                &[
+                    DocumentId("flushed".into()),
+                    DocumentId("buffered".into()),
+                    DocumentId("missing".into()),
+                ],
+            )
+            .unwrap();
+        assert!(found.contains(&DocumentId("flushed".into())));
+        assert!(found.contains(&DocumentId("buffered".into())));
+        assert!(!found.contains(&DocumentId("missing".into())));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

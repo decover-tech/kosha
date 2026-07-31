@@ -108,10 +108,18 @@ Notes:
   that policy the Job fails immediately with an explicit 403.
 - `DATABASE_URL` comes from `kosha-secret`; S3/data-dir settings come from
   `kosha-config`. No Kosha API key is needed because this bypasses HTTP.
-- A run replaces the namespace manifest with newly-built segments (while
-  choosing segment IDs beyond any prior/partial run). Old S3 segments become
+- A full run **replaces** the namespace manifest with newly-built segments
+  (segment IDs continue past any prior/partial run). Old S3 segments become
   unreferenced; they can be garbage-collected later. During migration, the
-  namespace is only partially populated, so keep Sage reads on OpenSearch.
+  namespace is only partially populated, so keep Sage reads on OpenSearch
+  until the Job completes and Kosha is restarted.
+- **Delta catch-up** (missing ids only): pass `--ids-file /path/ids.txt`
+  (one OpenSearch `_id` per line). This implies `--append` — new segments are
+  added to the existing manifest without wiping prior data. Prefer this over
+  re-indexing ids that already exist.
+- Use `POST /exists` `{"namespace","ids"}` to compute a missing-id set for
+  `--ids-file`. Prefer `POST /replace` (not `/index`) when rewriting an
+  existing `doc_id` — `/index` still appends.
 - For a 500-document smoke test, run one alias into a scratch namespace by
   adding `--limit 500 --namespace migration-smoke` and retaining exactly one
   `--index`.
