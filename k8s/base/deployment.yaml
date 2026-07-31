@@ -10,12 +10,27 @@ spec:
   selector:
     matchLabels:
       app: kosha
+  # The cache lives on the node's instance store (hostPath, below), so two
+  # kosha pods must never share a node — a rolling update's surge pod would
+  # write the same host directory as the outgoing pod. Recreate trades a few
+  # seconds of downtime for that guarantee; already a single replica anyway.
+  strategy:
+    type: Recreate
   template:
     metadata:
       labels:
         app: kosha
     spec:
       serviceAccountName: kosha
+      # Land only on the Karpenter-managed kosha NVMe pool. The label is
+      # unique to that pool; the taint keeps everything else off it.
+      nodeSelector:
+        kosha.dev/instance-store: nvme
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: kosha
+          effect: NoSchedule
       containers:
         - name: kosha
           image: kosha
@@ -52,18 +67,28 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 20
           resources:
+            # ephemeral-storage now only covers the container filesystem
+            # (logs, /tmp) — the segment cache is on the instance-store
+            # hostPath, which the kubelet does not account for. Large
+            # ephemeral-storage requests here would only constrain
+            # scheduling against the node's small root EBS volume.
             requests:
               memory: "512Mi"
               cpu: "250m"
-              ephemeral-storage: "10Gi"
+              ephemeral-storage: "1Gi"
             limits:
               memory: "4Gi"
               cpu: "2"
-              ephemeral-storage: "60Gi"
+              ephemeral-storage: "8Gi"
           volumeMounts:
             - name: cache
               mountPath: /var/cache/kosha
       volumes:
+        # The node's user-data (EC2NodeClass) formats and mounts the NVMe
+        # instance store at this exact path. Data here is a cache: it is
+        # rebuildable from the Postgres manifest + S3 segments, and is lost
+        # when the node is replaced.
         - name: cache
-          emptyDir:
-            sizeLimit: "10Gi"
+          hostPath:
+            path: /var/lib/kosha-cache
+            type: DirectoryOrCreate
