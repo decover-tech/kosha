@@ -815,7 +815,7 @@ class KoshaClient:
             actions.append((doc_index or default_ns, op_type or "index", doc))
 
         # Route each document to the namespace named by its action's _index.
-        # Fresh writes use /index + flush; updates use durable /replace.
+        # `index` upserts full docs via /index; partial `update` uses /replace.
         docs_by_ns: dict[str, list[dict]] = {}
         updates_by_ns: dict[str, list[dict]] = {}
         for doc_ns, op_type, doc in actions:

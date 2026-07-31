@@ -3,8 +3,9 @@
 //! One binary, three roles (DESIGN.md §5): `ingest`, `query`, `compaction`.
 //! Phase 1 HTTP/JSON API:
 //!   - `GET  /healthz`           → 200 OK (liveness probe)
-//!   - `POST /index              ` → index documents into a namespace
+//!   - `POST /index              ` → upsert documents by id into a namespace
 //!   - `POST /exists             ` → batch doc_id existence check
+//!   - `POST /replace            ` → partial field merge by id (OpenSearch `_update`)
 //!   - `GET  /search             ` → BM25 search across a namespace
 
 use std::collections::HashMap;
@@ -753,6 +754,23 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     };
 
     let ns = request.namespace;
+
+    // Upsert may rewrite immutable segments that hold prior versions of the
+    // same ids, so materialize any S3-backed segment directories first.
+    #[cfg(feature = "s3")]
+    {
+        let manifest = {
+            let indexer = state.indexer.lock().unwrap();
+            indexer.manifest_cloned(&ns)
+        };
+        if let Some(manifest) = manifest {
+            for entry in &manifest.segments {
+                let path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                state.ensure_segment_local(&path);
+            }
+        }
+    }
+
     let (count, manifest_changed) = {
         let mut indexer = state.indexer.lock().unwrap();
         let version_before = indexer.manifest(&ns).map(|m| m.version);
@@ -760,8 +778,9 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
             Ok(c) => c,
             Err(e) => return json_error(500, &format!("indexing error: {e}")),
         };
-        // index_documents auto-flushes when the buffer hits the threshold,
-        // which mutates the manifest — detect that via the version.
+        // index_documents auto-flushes when the buffer hits the threshold
+        // (or rewrites on id collision), which mutates the manifest —
+        // detect that via the version.
         let manifest_changed = indexer.manifest(&ns).map(|m| m.version) != version_before;
         (count, manifest_changed)
     };
