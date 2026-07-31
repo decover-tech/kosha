@@ -718,18 +718,37 @@ class KoshaClient:
         body: dict | None = None,
         **params: Any,
     ) -> dict:
-        """Index a single document."""
+        """Index a single document (ES ``PUT /_doc/{id}`` upsert semantics).
+
+        When ``id`` is set, uses ``PUT /v1/namespaces/{ns}/documents/{id}`` so
+        re-indexing the same id fully replaces the prior document. Without an
+        id, falls back to bulk ``POST …/documents`` (server assigns nothing —
+        callers should supply ids for idempotent writes).
+        """
         ns = self._resolve_ns(index)
         fields = self._source_to_fields(body or {})
-        doc = {
-            "id": id or "",
-            "fields": fields,
-        }
-        payload = {"namespace": ns, "documents": [doc]}
+        if id:
+            # ES-shaped PUT: full-document upsert by id (omitted fields dropped).
+            result = self._v1_request(
+                "PUT",
+                ns,
+                f"documents/{urllib.parse.quote(str(id), safe='')}",
+                body={"fields": fields},
+            )
+            return {
+                "_index": ns,
+                "_id": id,
+                "_version": 1,
+                "result": result.get("result", "created"),
+                "_shards": {"total": 1, "successful": 1, "failed": 0},
+                "_seq_no": result.get("indexed_count", 1),
+            }
+
+        payload = {"namespace": ns, "documents": [{"id": "", "fields": fields}]}
         result = self._request("POST", "index", body=payload)
         return {
             "_index": ns,
-            "_id": id or "",
+            "_id": "",
             "_version": 1,
             "result": "created",
             "_shards": {"total": 1, "successful": 1, "failed": 0},

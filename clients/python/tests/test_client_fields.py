@@ -375,3 +375,30 @@ def test_bulk_update_routes_through_replace(monkeypatch):
     assert requests[1][:2] == ("POST", "flush")
     assert requests[2][:2] == ("POST", "replace")
     assert requests[2][2]["documents"][0]["id"] == "chunk-2"
+
+
+def test_index_with_id_uses_put_document(monkeypatch):
+    client = KoshaClient(hosts=["http://localhost:9"], api_key="k")
+    calls = []
+
+    def fake_v1(method, namespace, action, body=None):
+        calls.append((method, namespace, action, body))
+        return {"result": "updated", "indexed_count": 1}
+
+    monkeypatch.setattr(client, "_v1_request", fake_v1)
+    response = client.index(index="paragraphs", id="doc-1", body={"title": "hello"})
+
+    assert response["result"] == "updated"
+    assert response["_id"] == "doc-1"
+    assert calls == [
+        (
+            "PUT",
+            "paragraphs",
+            "documents/doc-1",
+            {
+                "fields": [
+                    {"name": "title", "field_type": "Text", "value": "hello"},
+                ]
+            },
+        )
+    ]

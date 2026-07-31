@@ -378,9 +378,12 @@ impl Indexer {
         Ok(count)
     }
 
-    /// Append without upsert checks. Used by segment rewrite after old
-    /// versions of the same ids have already been removed from the manifest.
-    fn append_documents(
+    /// Append without upsert checks.
+    ///
+    /// Used by segment rewrite after old versions of the same ids have already
+    /// been removed from the manifest, and by the explicit `?mode=append`
+    /// ingest path when callers want ES-unlike duplicate-tolerant writes.
+    pub fn append_documents(
         &mut self,
         namespace: NamespaceId,
         documents: Vec<Document>,

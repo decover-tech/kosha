@@ -3,10 +3,14 @@
 //! One binary, three roles (DESIGN.md §5): `ingest`, `query`, `compaction`.
 //! Phase 1 HTTP/JSON API:
 //!   - `GET  /healthz`           → 200 OK (liveness probe)
-//!   - `POST /index              ` → upsert documents by id into a namespace
+//!   - `POST /index              ` → upsert documents by id (ES `index` / `PUT /_doc/{id}`)
+//!   - `PUT  /v1/.../documents/{id}` → single-doc full upsert (ES `PUT /_doc/{id}`)
 //!   - `POST /exists             ` → batch doc_id existence check
 //!   - `POST /replace            ` → partial field merge by id (OpenSearch `_update`)
 //!   - `GET  /search             ` → BM25 search across a namespace
+//!
+//! Bulk `POST …/documents` and `POST /index` accept `?mode=append` to skip
+//! upsert checks (legacy duplicate-tolerant ingest).
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -648,8 +652,13 @@ fn route(
         return json_ok(&serde_json::json!({"status": "ok"}));
     }
 
+    if let Some((ns, doc_id)) = extract_namespace_doc_id(request_line) {
+        return handle_put_document_with_ns(&ns, &doc_id, tenant, body, state);
+    }
+
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/documents") {
-        return handle_index_with_ns(&ns, tenant, body, state);
+        let append = query_param(request_line, "mode").as_deref() == Some("append");
+        return handle_index_with_ns(&ns, tenant, body, state, append);
     }
 
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/search") {
@@ -692,7 +701,8 @@ fn route(
     }
 
     if request_line.starts_with("POST /index") {
-        return handle_index(body, state);
+        let append = query_param(request_line, "mode").as_deref() == Some("append");
+        return handle_index(body, state, append);
     }
 
     if request_line.starts_with("POST /exists") {
@@ -731,13 +741,14 @@ fn route(
 /// `prefix` includes the HTTP method (e.g. "POST /v1/namespaces/"), but the
 /// request line's path segment doesn't — match the method against the full
 /// request line, then strip only the path portion of `prefix` from the path.
+/// Query strings (`?mode=append`) are ignored for path matching.
 fn extract_namespace(request_line: &str, prefix: &str, suffix: &str) -> Option<String> {
     if !request_line.starts_with(prefix) {
         return None;
     }
-    let after_method = request_line.split(' ').nth(1)?;
+    let path = request_path(request_line)?;
     let path_prefix = prefix.split(' ').nth(1)?;
-    let after_prefix = after_method.strip_prefix(path_prefix)?;
+    let after_prefix = path.strip_prefix(path_prefix)?;
     let ns = after_prefix.strip_suffix(suffix)?;
     if ns.is_empty() || ns.contains('/') {
         return None;
@@ -745,9 +756,41 @@ fn extract_namespace(request_line: &str, prefix: &str, suffix: &str) -> Option<S
     Some(url_decode(ns))
 }
 
+/// Extract `(namespace, id)` from `PUT /v1/namespaces/{ns}/documents/{id}`.
+fn extract_namespace_doc_id(request_line: &str) -> Option<(String, String)> {
+    if !request_line.starts_with("PUT /v1/namespaces/") {
+        return None;
+    }
+    let path = request_path(request_line)?;
+    let rest = path.strip_prefix("/v1/namespaces/")?;
+    let (ns, after) = rest.split_once("/documents/")?;
+    if ns.is_empty() || ns.contains('/') || after.is_empty() || after.contains('/') {
+        return None;
+    }
+    Some((url_decode(ns), url_decode(after)))
+}
+
+fn request_path(request_line: &str) -> Option<&str> {
+    request_line.split(' ').nth(1)?.split('?').next()
+}
+
+fn query_param(request_line: &str, key: &str) -> Option<String> {
+    let path_and_query = request_line.split(' ').nth(1)?;
+    let query = path_and_query.split_once('?')?.1;
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        let k = parts.next()?;
+        let v = parts.next().unwrap_or("");
+        if k == key {
+            return Some(url_decode(v));
+        }
+    }
+    None
+}
+
 // ─── POST /index ────────────────────────────────────────────────────────────
 
-fn handle_index(body: &[u8], state: &AppState) -> String {
+fn handle_index(body: &[u8], state: &AppState, append: bool) -> String {
     let request: IndexRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
@@ -757,8 +800,9 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
 
     // Upsert may rewrite immutable segments that hold prior versions of the
     // same ids, so materialize any S3-backed segment directories first.
+    // Append never scans existing segments for id collisions.
     #[cfg(feature = "s3")]
-    {
+    if !append {
         let manifest = {
             let indexer = state.indexer.lock().unwrap();
             indexer.manifest_cloned(&ns)
@@ -774,11 +818,18 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     let (count, manifest_changed) = {
         let mut indexer = state.indexer.lock().unwrap();
         let version_before = indexer.manifest(&ns).map(|m| m.version);
-        let count = match indexer.index_documents(ns.clone(), request.documents) {
-            Ok(c) => c,
-            Err(e) => return json_error(500, &format!("indexing error: {e}")),
+        let count = if append {
+            match indexer.append_documents(ns.clone(), request.documents) {
+                Ok(c) => c,
+                Err(e) => return json_error(500, &format!("indexing error: {e}")),
+            }
+        } else {
+            match indexer.index_documents(ns.clone(), request.documents) {
+                Ok(c) => c,
+                Err(e) => return json_error(500, &format!("indexing error: {e}")),
+            }
         };
-        // index_documents auto-flushes when the buffer hits the threshold
+        // index/append auto-flushes when the buffer hits the threshold
         // (or rewrites on id collision), which mutates the manifest —
         // detect that via the version.
         let manifest_changed = indexer.manifest(&ns).map(|m| m.version) != version_before;
@@ -801,6 +852,125 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
         indexed_count: count,
         namespace: ns,
     })
+}
+
+// ─── PUT /v1/namespaces/{ns}/documents/{id} ─────────────────────────────────
+
+fn handle_put_document(
+    namespace: NamespaceId,
+    id: String,
+    body: &[u8],
+    state: &AppState,
+) -> String {
+    let fields = match parse_put_document_fields(body) {
+        Ok(fields) => fields,
+        Err(e) => return json_error(400, &e),
+    };
+    let doc_id = kosha_core::DocumentId(id.clone());
+
+    #[cfg(feature = "s3")]
+    {
+        let manifest = {
+            let indexer = state.indexer.lock().unwrap();
+            indexer.manifest_cloned(&namespace)
+        };
+        if let Some(manifest) = manifest {
+            for entry in &manifest.segments {
+                let path = state
+                    .data_dir
+                    .join(&namespace.0)
+                    .join(&entry.segment_id.0);
+                state.ensure_segment_local(&path);
+            }
+        }
+    }
+
+    let (result, manifest_changed) = {
+        let mut indexer = state.indexer.lock().unwrap();
+        let existed = match indexer.existing_ids(&namespace, &[doc_id.clone()]) {
+            Ok(set) => set.contains(&doc_id),
+            Err(e) => return json_error(500, &format!("exists error: {e}")),
+        };
+        let version_before = indexer.manifest(&namespace).map(|m| m.version);
+        if let Err(e) = indexer.index_documents(
+            namespace.clone(),
+            vec![kosha_core::Document {
+                id: doc_id,
+                fields,
+            }],
+        ) {
+            return json_error(500, &format!("indexing error: {e}"));
+        }
+        let manifest_changed =
+            indexer.manifest(&namespace).map(|m| m.version) != version_before;
+        let result = if existed { "updated" } else { "created" };
+        (result, manifest_changed)
+    };
+
+    {
+        let mut ctrl = state.controller.lock().unwrap();
+        ctrl.ensure_namespace(namespace.clone());
+    }
+    if manifest_changed {
+        state.publish_namespace(&namespace);
+    }
+
+    json_ok(&serde_json::json!({
+        "namespace": namespace.0,
+        "id": id,
+        "result": result,
+        "indexed_count": 1,
+    }))
+}
+
+/// Parse a PUT body as either native `{"fields":[…]}` or ES-style flat source.
+fn parse_put_document_fields(body: &[u8]) -> Result<Vec<kosha_core::Field>, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "document body must be a JSON object".to_string())?;
+
+    if let Some(fields_val) = obj.get("fields") {
+        return serde_json::from_value(fields_val.clone())
+            .map_err(|e| format!("invalid fields: {e}"));
+    }
+
+    let mut fields = Vec::new();
+    for (name, val) in obj {
+        if name == "id" {
+            continue;
+        }
+        fields.push(shorthand_field(name, val)?);
+    }
+    Ok(fields)
+}
+
+fn shorthand_field(name: &str, value: &serde_json::Value) -> Result<kosha_core::Field, String> {
+    use kosha_core::{Field, FieldType};
+    match value {
+        serde_json::Value::String(s) => Ok(Field::text(name, s.clone())),
+        serde_json::Value::Number(n) if n.is_i64() => {
+            Ok(Field::integer(name, n.as_i64().unwrap()))
+        }
+        serde_json::Value::Number(n) => Ok(Field {
+            name: name.into(),
+            field_type: FieldType::Float,
+            value: n.to_string(),
+        }),
+        serde_json::Value::Bool(b) => Ok(Field {
+            name: name.into(),
+            field_type: FieldType::Boolean,
+            value: b.to_string(),
+        }),
+        serde_json::Value::Null => Err(format!(
+            "field {name:?} is null; omit it or use a concrete value"
+        )),
+        other => Ok(Field::text(
+            name,
+            serde_json::to_string(other).map_err(|e| e.to_string())?,
+        )),
+    }
 }
 
 // ─── POST /exists ───────────────────────────────────────────────────────────
@@ -1159,7 +1329,13 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
 
 // ─── v1 route handlers (proto-defined paths, tenant-scoped namespaces) ─────
 
-fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
+fn handle_index_with_ns(
+    namespace: &str,
+    tenant: &str,
+    body: &[u8],
+    state: &AppState,
+    append: bool,
+) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
     let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -1169,7 +1345,18 @@ fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppS
         obj.insert("namespace".into(), serde_json::json!(scoped_ns));
     }
     let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
-    handle_index(&modified_body, state)
+    handle_index(&modified_body, state, append)
+}
+
+fn handle_put_document_with_ns(
+    namespace: &str,
+    doc_id: &str,
+    tenant: &str,
+    body: &[u8],
+    state: &AppState,
+) -> String {
+    let scoped_ns = tenant_namespace(tenant, namespace);
+    handle_put_document(NamespaceId(scoped_ns), doc_id.to_string(), body, state)
 }
 
 fn handle_search_post_with_ns(
@@ -1527,6 +1714,121 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"indexed_count\":1"));
+    }
+
+    #[test]
+    fn put_document_upserts_like_elasticsearch_put_doc() {
+        let state = test_state();
+        let create = route(
+            "PUT /v1/namespaces/put-ns/documents/doc1 HTTP/1.1\r\n",
+            &HashMap::new(),
+            br#"{"title":"old","keep":"stale"}"#,
+            "test",
+            &state,
+        );
+        assert!(create.starts_with("HTTP/1.1 200 OK"), "{create}");
+        assert!(create.contains("\"result\":\"created\""));
+
+        {
+            let mut indexer = state.indexer.lock().unwrap();
+            indexer
+                .flush_namespace(&NamespaceId("test/put-ns".into()))
+                .unwrap();
+        }
+
+        let update = route(
+            "PUT /v1/namespaces/put-ns/documents/doc1 HTTP/1.1\r\n",
+            &HashMap::new(),
+            br#"{"title":"new"}"#,
+            "test",
+            &state,
+        );
+        assert!(update.starts_with("HTTP/1.1 200 OK"), "{update}");
+        assert!(update.contains("\"result\":\"updated\""));
+
+        let old = route(
+            "GET /search?ns=test/put-ns&q=old HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"",
+            "test",
+            &state,
+        );
+        let stale = route(
+            "GET /search?ns=test/put-ns&q=stale HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"",
+            "test",
+            &state,
+        );
+        let fresh = route(
+            "GET /search?ns=test/put-ns&q=new HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"",
+            "test",
+            &state,
+        );
+        assert!(old.contains("\"total_hits\":0"), "{old}");
+        // Full replace drops omitted fields (unlike /replace merge).
+        assert!(stale.contains("\"total_hits\":0"), "{stale}");
+        assert!(fresh.contains("\"total_hits\":1"), "{fresh}");
+    }
+
+    #[test]
+    fn index_mode_append_allows_duplicate_ids() {
+        let state = test_state();
+        let ns = NamespaceId("append-ns".into());
+        let req = IndexRequest {
+            namespace: ns.clone(),
+            documents: vec![Document {
+                id: DocumentId("dup".into()),
+                fields: vec![Field::text("title", "first")],
+            }],
+        };
+        let body = serde_json::to_vec(&req).unwrap();
+        let _ = route(
+            "POST /index HTTP/1.1\r\n",
+            &HashMap::new(),
+            &body,
+            "test",
+            &state,
+        );
+        {
+            let mut indexer = state.indexer.lock().unwrap();
+            indexer.flush_namespace(&ns).unwrap();
+        }
+        let again = IndexRequest {
+            namespace: ns.clone(),
+            documents: vec![Document {
+                id: DocumentId("dup".into()),
+                fields: vec![Field::text("title", "second")],
+            }],
+        };
+        let response = route(
+            "POST /index?mode=append HTTP/1.1\r\n",
+            &HashMap::new(),
+            &serde_json::to_vec(&again).unwrap(),
+            "test",
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        {
+            let mut indexer = state.indexer.lock().unwrap();
+            indexer.flush_namespace(&ns).unwrap();
+        }
+        let manifest = state.indexer.lock().unwrap().manifest(&ns).unwrap().clone();
+        let mut total = 0u32;
+        for entry in &manifest.segments {
+            let reader = kosha_segment::SegmentReader::open(
+                state.data_dir.join(&ns.0).join(&entry.segment_id.0),
+            )
+            .unwrap();
+            total += reader
+                .doc_records
+                .iter()
+                .filter(|r| r.doc_id.0 == "dup")
+                .count() as u32;
+        }
+        assert_eq!(total, 2, "append must keep both copies");
     }
 
     #[test]

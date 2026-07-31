@@ -45,9 +45,25 @@ service KoshaService {
   }
 
   // Bulk-index documents into a namespace.
+  //
+  // Default semantics match Elasticsearch `index` / `PUT /_doc/{id}`: same
+  // document id fully replaces any prior live copy (upsert). Pass
+  // `?mode=append` to skip existence checks and allow duplicate ids.
   rpc IndexDocuments(IndexDocumentsRequest) returns (IndexDocumentsResponse) {
     option (google.api.http) = {
       post: "/v1/namespaces/{namespace}/documents"
+      body: "*"
+    };
+  }
+
+  // Create or fully replace a single document by id.
+  //
+  // Elasticsearch-equivalent of `PUT /{index}/_doc/{id}`: the request body is
+  // the full document source; omitted fields are dropped (unlike Update /
+  // POST /replace, which merges fields).
+  rpc PutDocument(PutDocumentRequest) returns (PutDocumentResponse) {
+    option (google.api.http) = {
+      put: "/v1/namespaces/{namespace}/documents/{id}"
       body: "*"
     };
   }
@@ -178,6 +194,22 @@ message IndexDocumentsRequest {
 message IndexDocumentsResponse {
   int64 indexed_count = 1;
   string namespace = 2;
+}
+
+message PutDocumentRequest {
+  string namespace = 1;
+  string id = 2;
+  // Full document body. Prefer repeated Field; flat JSON source objects are
+  // also accepted by the HTTP JSON gateway (shorthand → Text/typed fields).
+  repeated Field fields = 3;
+}
+
+message PutDocumentResponse {
+  string namespace = 1;
+  string id = 2;
+  // "created" or "updated" — mirrors Elasticsearch Index API `result`.
+  string result = 3;
+  int64 indexed_count = 4;
 }
 
 // ─── Flush ──────────────────────────────────────────────────────────────────

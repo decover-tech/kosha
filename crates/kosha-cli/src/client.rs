@@ -70,6 +70,25 @@ impl Client {
         )
     }
 
+    /// Create or fully replace a single document (ES `PUT /_doc/{id}`).
+    pub fn put_document(
+        &self,
+        namespace: &str,
+        id: &str,
+        document: Document,
+    ) -> Result<Value, ClientError> {
+        let body = serde_json::json!({ "fields": document.fields });
+        self.request(
+            Method::PUT,
+            &format!(
+                "/v1/namespaces/{}/documents/{}",
+                encode_ns(namespace),
+                encode_ns(id)
+            ),
+            Some(body),
+        )
+    }
+
     pub fn search(&self, namespace: &str, query: SearchQuery) -> Result<SearchResult, ClientError> {
         let mut body = serde_json::to_value(&query).map_err(|e| ClientError(e.to_string()))?;
         if let Some(obj) = body.as_object_mut() {
