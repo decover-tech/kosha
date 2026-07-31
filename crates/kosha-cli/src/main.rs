@@ -101,6 +101,11 @@ enum Commands {
         #[arg(long)]
         filter: String,
     },
+    /// Rebuild footer filter blooms for a namespace (enables segment pruning)
+    RebuildFilterBlooms {
+        #[arg(short = 'n', long)]
+        namespace: String,
+    },
     /// Raw HTTP escape hatch (any path)
     Curl {
         /// HTTP method (GET, POST, …)
@@ -243,6 +248,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_value(&value, cli.json, |v| {
                 let deleted = v.get("deleted").and_then(|d| d.as_u64()).unwrap_or(0);
                 println!("deleted {deleted} document(s) from namespace {namespace}");
+                Ok(())
+            })?;
+        }
+        Commands::RebuildFilterBlooms { namespace } => {
+            let value = client.rebuild_filter_blooms(&namespace)?;
+            print_value(&value, cli.json, |v| {
+                let rebuilt = v.get("rebuilt").and_then(|d| d.as_u64()).unwrap_or(0);
+                let segments = v.get("segments").and_then(|d| d.as_u64()).unwrap_or(0);
+                let errors = v
+                    .get("errors")
+                    .and_then(|e| e.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                println!(
+                    "rebuilt filter blooms for {rebuilt}/{segments} segment(s) in {namespace}"
+                );
+                if errors > 0 {
+                    println!("({errors} error(s) — see --json for details)");
+                }
                 Ok(())
             })?;
         }

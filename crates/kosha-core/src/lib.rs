@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 // ─── Control store trait (in-memory or Postgres) ──────────────────────────
@@ -458,6 +460,263 @@ pub struct Footer {
     pub avg_field_length: f64,
     pub bm25_params: Bm25Params,
     pub created_at: String,
+    /// Per string-filter-field bloom filters for segment pruning.
+    ///
+    /// `None` means a legacy segment written before blooms existed — callers
+    /// must not prune. `Some(map)` means field inventory is known: a missing
+    /// field key means the segment has no values for that field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_blooms: Option<HashMap<String, BloomFilter>>,
+}
+
+// ─── Bloom filter (segment pruning) ────────────────────────────────────────
+
+/// Target false-positive rate when sizing blooms at write time.
+pub const BLOOM_TARGET_FPR: f64 = 0.01;
+/// Cap on bloom bitset size per field (keeps footer.json bounded).
+pub const BLOOM_MAX_BYTES: usize = 64 * 1024;
+
+/// Compact bloom filter over string filter values in one segment field.
+///
+/// Negatives are definitive (safe to skip the segment). Positives still require
+/// opening `filters.bin` and applying the real predicate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BloomFilter {
+    /// Base64-encoded bitset.
+    pub bits_b64: String,
+    /// Number of bits in the bitset.
+    pub num_bits: u32,
+    /// Number of hash functions.
+    pub k: u8,
+}
+
+impl BloomFilter {
+    /// Build a bloom from unique string values at ~[`BLOOM_TARGET_FPR`].
+    pub fn build<'a, I>(values: I) -> Self
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let unique: Vec<&str> = {
+            let mut seen = HashMap::new();
+            for v in values {
+                seen.insert(v, ());
+            }
+            seen.into_keys().collect()
+        };
+        let n = unique.len().max(1);
+        let mut num_bits = bloom_num_bits(n, BLOOM_TARGET_FPR);
+        let max_bits = BLOOM_MAX_BYTES * 8;
+        if num_bits > max_bits {
+            num_bits = max_bits;
+        }
+        num_bits = num_bits.max(64);
+        let k = bloom_num_hashes(num_bits, n).clamp(1, 16) as u8;
+        let mut bits = vec![0u8; num_bits.div_ceil(8)];
+        let mut filter = Self {
+            bits_b64: String::new(),
+            num_bits: num_bits as u32,
+            k,
+        };
+        for v in unique {
+            filter.insert_into(&mut bits, v);
+        }
+        filter.bits_b64 = encode_base64(&bits);
+        filter
+    }
+
+    pub fn may_contain(&self, value: &str) -> bool {
+        let bits = match decode_base64(&self.bits_b64) {
+            Some(b) if !b.is_empty() && self.num_bits > 0 => b,
+            _ => return true, // corrupt/empty → cannot prune
+        };
+        let m = self.num_bits as u64;
+        let (h1, h2) = bloom_hashes(value);
+        for i in 0..self.k {
+            let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) % m;
+            let idx = (bit / 8) as usize;
+            let mask = 1u8 << (bit % 8);
+            if idx >= bits.len() || bits[idx] & mask == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn insert_into(&self, bits: &mut [u8], value: &str) {
+        let m = self.num_bits as u64;
+        let (h1, h2) = bloom_hashes(value);
+        for i in 0..self.k {
+            let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) % m;
+            let idx = (bit / 8) as usize;
+            let mask = 1u8 << (bit % 8);
+            if idx < bits.len() {
+                bits[idx] |= mask;
+            }
+        }
+    }
+}
+
+/// Build per-field blooms from columnar string filter entries.
+pub fn build_filter_blooms(
+    string_fields: &HashMap<String, Vec<(u32, String)>>,
+) -> HashMap<String, BloomFilter> {
+    let mut out = HashMap::new();
+    for (field, entries) in string_fields {
+        if entries.is_empty() {
+            continue;
+        }
+        let bloom = BloomFilter::build(entries.iter().map(|(_, v)| v.as_str()));
+        out.insert(field.clone(), bloom);
+    }
+    out
+}
+
+fn bloom_num_bits(n: usize, fpr: f64) -> usize {
+    if n == 0 {
+        return 64;
+    }
+    let n = n as f64;
+    let bits = (-(n) * fpr.ln() / (2f64.ln().powi(2))).ceil() as usize;
+    bits.max(64)
+}
+
+fn bloom_num_hashes(num_bits: usize, n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    ((num_bits as f64 / n as f64) * 2f64.ln()).round() as usize
+}
+
+/// Stable FNV-1a based double hash (not `DefaultHasher`, which is not portable).
+fn bloom_hashes(value: &str) -> (u64, u64) {
+    let h1 = fnv1a64(value.as_bytes(), 0x9e3779b97f4a7c15);
+    let h2 = fnv1a64(value.as_bytes(), 0xbf58476d1ce4e5b9) | 1; // odd → full period
+    (h1, h2)
+}
+
+fn fnv1a64(data: &[u8], seed: u64) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64 ^ seed;
+    for &b in data {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn encode_base64(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => Some(0),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let (a, b, c, d) = (
+            val(chunk[0])?,
+            val(chunk[1])?,
+            val(chunk[2])?,
+            val(chunk[3])?,
+        );
+        let n = (u32::from(a) << 18)
+            | (u32::from(b) << 12)
+            | (u32::from(c) << 6)
+            | u32::from(d);
+        out.push(((n >> 16) & 0xff) as u8);
+        if chunk[2] != b'=' {
+            out.push(((n >> 8) & 0xff) as u8);
+        }
+        if chunk[3] != b'=' {
+            out.push((n & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Whether a segment with the given footer blooms might satisfy `filter`.
+///
+/// Returns `true` when the segment must be opened (possible match, or not
+/// enough bloom metadata to decide). Returns `false` only when blooms prove
+/// no document in the segment can match.
+pub fn segment_may_match(
+    filter: &FilterClause,
+    blooms: Option<&HashMap<String, BloomFilter>>,
+) -> bool {
+    let Some(blooms) = blooms else {
+        return true; // legacy footer — cannot prune
+    };
+    match filter {
+        // Term/Terms field maps are OR'd by FilterApplier — skip only if every
+        // alternative is impossible.
+        FilterClause::Term { term } => {
+            term.is_empty()
+                || term.iter().any(|(field, value)| match blooms.get(field) {
+                    Some(bloom) => bloom.may_contain(value),
+                    None => false,
+                })
+        }
+        FilterClause::Terms { terms } => {
+            terms.is_empty()
+                || terms.iter().any(|(field, values)| match blooms.get(field) {
+                    Some(bloom) => values.iter().any(|v| bloom.may_contain(v)),
+                    None => false,
+                })
+        }
+        FilterClause::Bool { bool: b } => {
+            for child in &b.must {
+                if !segment_may_match(child, Some(blooms)) {
+                    return false;
+                }
+            }
+            // FilterApplier always intersects should when non-empty.
+            if !b.should.is_empty() && b.minimum_should_match > 0 {
+                let matching = b
+                    .should
+                    .iter()
+                    .filter(|c| segment_may_match(c, Some(blooms)))
+                    .count();
+                if matching < b.minimum_should_match {
+                    return false;
+                }
+            }
+            // must_not cannot prove a segment has no matches via bloom.
+            true
+        }
+        FilterClause::Range { .. } | FilterClause::MatchAll { .. } => true,
+    }
 }
 
 // ─── Manifest ──────────────────────────────────────────────────────────────
@@ -662,5 +921,85 @@ mod tests {
         let p: MatchPhraseQuery = serde_json::from_str(json).unwrap();
         assert_eq!(p.phrase, "tribal tax credit");
         assert_eq!(p.slop, 2);
+    }
+
+    #[test]
+    fn bloom_contains_inserted_values() {
+        let bloom = BloomFilter::build(["m1", "m2", "m3"]);
+        assert!(bloom.may_contain("m1"));
+        assert!(bloom.may_contain("m2"));
+        assert!(bloom.may_contain("m3"));
+        assert!(!bloom.may_contain("matter-definitely-absent-xyz"));
+    }
+
+    #[test]
+    fn bloom_roundtrips_through_serde() {
+        let bloom = BloomFilter::build(["matter-a"]);
+        let json = serde_json::to_string(&bloom).unwrap();
+        let back: BloomFilter = serde_json::from_str(&json).unwrap();
+        assert!(back.may_contain("matter-a"));
+        assert!(!back.may_contain("matter-absent"));
+    }
+
+    #[test]
+    fn footer_legacy_without_blooms_deserializes() {
+        let json = r#"{
+            "segment_id": "s1",
+            "doc_count": 1,
+            "total_field_length": 3,
+            "avg_field_length": 3.0,
+            "bm25_params": {"k1": 1.2, "b": 0.75},
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let footer: Footer = serde_json::from_str(json).unwrap();
+        assert!(footer.filter_blooms.is_none());
+    }
+
+    #[test]
+    fn segment_may_match_prunes_absent_matter() {
+        let blooms = HashMap::from([("matterId".into(), BloomFilter::build(["m1"]))]);
+        let keep = FilterClause::Term {
+            term: HashMap::from([("matterId".into(), "m1".into())]),
+        };
+        let skip = FilterClause::Term {
+            term: HashMap::from([("matterId".into(), "m2".into())]),
+        };
+        assert!(segment_may_match(&keep, Some(&blooms)));
+        assert!(!segment_may_match(&skip, Some(&blooms)));
+        assert!(segment_may_match(&skip, None), "legacy footer never pruned");
+    }
+
+    #[test]
+    fn segment_may_match_terms_and_bool() {
+        let blooms = HashMap::from([
+            ("matterId".into(), BloomFilter::build(["m1"])),
+            ("tag".into(), BloomFilter::build(["alpha"])),
+        ]);
+        let terms = FilterClause::Terms {
+            terms: HashMap::from([("matterId".into(), vec!["m2".into(), "m1".into()])]),
+        };
+        assert!(segment_may_match(&terms, Some(&blooms)));
+
+        let terms_miss = FilterClause::Terms {
+            terms: HashMap::from([("matterId".into(), vec!["m9".into()])]),
+        };
+        assert!(!segment_may_match(&terms_miss, Some(&blooms)));
+
+        let must = FilterClause::Bool {
+            bool: BoolFilter {
+                must: vec![
+                    FilterClause::Term {
+                        term: HashMap::from([("matterId".into(), "m1".into())]),
+                    },
+                    FilterClause::Term {
+                        term: HashMap::from([("tag".into(), "missing".into())]),
+                    },
+                ],
+                must_not: vec![],
+                should: vec![],
+                minimum_should_match: 1,
+            },
+        };
+        assert!(!segment_may_match(&must, Some(&blooms)));
     }
 }
