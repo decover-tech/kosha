@@ -20,6 +20,7 @@ All of these are CI gates — run them locally first:
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --all-features
+    make client-python-test      # if you touched clients/python
     docker build -t kosha:ci .   # if you touched the Dockerfile or build config
 
 ## Conventions
