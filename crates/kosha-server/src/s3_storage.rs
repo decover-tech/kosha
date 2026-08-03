@@ -15,6 +15,18 @@ use std::path::{Path, PathBuf};
 
 use kosha_core::{KoshaError, LocalStorage, StorageBackend};
 
+/// Join a configured key prefix with a logical (unprefixed) path, the same
+/// way for every call site — `S3Storage::s3_key` and the concurrent fetch
+/// path in `read_many` both delegate here so they can't drift apart.
+fn join_s3_key(prefix: &str, path: &str) -> String {
+    let path = path.trim_start_matches('/');
+    if prefix.is_empty() {
+        path.to_string()
+    } else {
+        format!("{}/{}", prefix.trim_end_matches('/'), path)
+    }
+}
+
 /// Configuration for the S3-backed segment store.
 #[derive(Debug, Clone)]
 pub struct S3Config {
@@ -149,12 +161,7 @@ impl S3Storage {
     }
 
     pub fn s3_key(&self, path: &str) -> String {
-        let path = path.trim_start_matches('/');
-        if self.prefix.is_empty() {
-            path.to_string()
-        } else {
-            format!("{}/{}", self.prefix.trim_end_matches('/'), path)
-        }
+        join_s3_key(&self.prefix, path)
     }
 
     /// Upload every regular file in a locally-built segment directory.
@@ -265,6 +272,68 @@ impl S3Storage {
         })
     }
 
+    /// Download multiple logical paths concurrently, bounded by
+    /// `max_concurrent` in-flight requests, each persisted to local cache
+    /// exactly as [`StorageBackend::read`] does.
+    ///
+    /// Segment hydration (DESIGN.md §8 step 4 calls for retrieval "fanned
+    /// out across the query node's worker pool") used to fetch one file at a
+    /// time via repeated `read()` calls — total latency was the sum of every
+    /// S3 GET across every segment/file in the manifest. This fans requests
+    /// out as concurrent tasks on the storage runtime instead, so hydrating
+    /// N missing files costs roughly `ceil(N / max_concurrent)` GET
+    /// latencies rather than N.
+    ///
+    /// Returns one `(logical_path, result)` pair per input path, in
+    /// completion order (not input order).
+    pub fn read_many(
+        &self,
+        paths: &[String],
+        max_concurrent: usize,
+    ) -> Vec<(String, Result<Vec<u8>, KoshaError>)> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let local_root = self.local.root.clone();
+        let bucket = self.bucket.clone();
+        let prefix = self.prefix.clone();
+        let client = self.client.clone();
+        let mut pending: std::collections::VecDeque<String> = paths.to_vec().into();
+        let max_concurrent = max_concurrent.max(1);
+
+        self.rt.block_on(async move {
+            let mut set = tokio::task::JoinSet::new();
+            let spawn_next =
+                |set: &mut tokio::task::JoinSet<(String, Result<Vec<u8>, KoshaError>)>,
+                 pending: &mut std::collections::VecDeque<String>| {
+                    let Some(path) = pending.pop_front() else {
+                        return;
+                    };
+                    let client = client.clone();
+                    let bucket = bucket.clone();
+                    let prefix = prefix.clone();
+                    let local_root = local_root.clone();
+                    set.spawn(async move {
+                        let result = fetch_one(&client, &bucket, &prefix, &local_root, &path).await;
+                        (path, result)
+                    });
+                };
+
+            for _ in 0..max_concurrent.min(pending.len()) {
+                spawn_next(&mut set, &mut pending);
+            }
+
+            let mut results = Vec::with_capacity(paths.len());
+            while let Some(joined) = set.join_next().await {
+                if let Ok(pair) = joined {
+                    results.push(pair);
+                }
+                spawn_next(&mut set, &mut pending);
+            }
+            results
+        })
+    }
+
     /// Download a file from S3 to local cache.
     fn download_from_s3(&self, s3_key: &str, local_path: &Path) -> Result<Vec<u8>, KoshaError> {
         let client = self.client.clone();
@@ -334,6 +403,47 @@ impl S3Storage {
     }
 }
 
+/// Fetch one logical path for [`S3Storage::read_many`]: serve from local
+/// disk if already present, otherwise GET from S3 and persist before
+/// returning the bytes.
+async fn fetch_one(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    local_root: &Path,
+    path: &str,
+) -> Result<Vec<u8>, KoshaError> {
+    let local_path = local_root.join(path);
+    if local_path.exists() {
+        return tokio::fs::read(&local_path).await.map_err(KoshaError::Io);
+    }
+
+    let s3_key = join_s3_key(prefix, path);
+
+    let resp = client
+        .get_object()
+        .bucket(bucket)
+        .key(&s3_key)
+        .send()
+        .await
+        .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?;
+    let bytes = resp
+        .body
+        .collect()
+        .await
+        .map_err(|e| KoshaError::NotFound(format!("S3 read body: {e}")))?
+        .into_bytes();
+
+    if let Some(parent) = local_path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    tokio::fs::write(&local_path, &bytes)
+        .await
+        .map_err(KoshaError::Io)?;
+
+    Ok(bytes.to_vec())
+}
+
 impl StorageBackend for S3Storage {
     fn read(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
         let local_path = Path::new(&self.local.root).join(path);
@@ -397,19 +507,16 @@ mod tests {
 
     #[test]
     fn s3_key_joins_prefix() {
-        let storage_prefix = |prefix: &str, path: &str| -> String {
-            let cfg_prefix = prefix.to_string();
-            if cfg_prefix.is_empty() {
-                path.to_string()
-            } else {
-                format!("{}/{}", cfg_prefix.trim_end_matches('/'), path)
-            }
-        };
-        assert_eq!(
-            storage_prefix("kosha/", "ns/seg/a.bin"),
-            "kosha/ns/seg/a.bin"
-        );
-        assert_eq!(storage_prefix("", "ns/seg/a.bin"), "ns/seg/a.bin");
+        assert_eq!(join_s3_key("kosha/", "ns/seg/a.bin"), "kosha/ns/seg/a.bin");
+        assert_eq!(join_s3_key("", "ns/seg/a.bin"), "ns/seg/a.bin");
+    }
+
+    #[test]
+    fn s3_key_strips_leading_slash_from_path_and_trailing_from_prefix() {
+        // read_many's fetch_one and S3Storage::s3_key must agree on this —
+        // both delegate to join_s3_key so they can't drift apart.
+        assert_eq!(join_s3_key("kosha", "/ns/seg/a.bin"), "kosha/ns/seg/a.bin");
+        assert_eq!(join_s3_key("kosha/", "/ns/seg/a.bin"), "kosha/ns/seg/a.bin");
     }
 
     #[test]

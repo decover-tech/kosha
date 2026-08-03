@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use kosha_core::{
     segment_may_match, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
@@ -8,6 +9,71 @@ use kosha_core::{
     SortSpec,
 };
 use kosha_segment::{tokenize, SegmentReader};
+
+/// Default number of parsed segments kept resident in memory (see
+/// [`SegmentCache`]). Segments are immutable once written (DESIGN.md §6.2),
+/// so caching a parsed segment indefinitely is safe — the only reason to
+/// bound this is memory, not staleness.
+const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = 64;
+
+/// In-memory LRU cache of parsed segments, keyed by
+/// `(namespace, segment_id, load_vectors)`.
+///
+/// Without this, every query re-reads and re-parses `doc_store.bin` +
+/// `inverted.idx` (+ `vector.idx`/HNSW when applicable) from disk for every
+/// segment in the manifest, even when the local NVMe cache is fully warm —
+/// so latency scales with total corpus size instead of query cost. Because
+/// segments are immutable, a cache hit here never needs invalidation; only
+/// eviction to bound memory.
+struct SegmentCache {
+    capacity: usize,
+    entries: Mutex<HashMap<(String, String, bool), Arc<SegmentReader>>>,
+    recency: Mutex<VecDeque<(String, String, bool)>>,
+}
+
+impl SegmentCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: Mutex::new(HashMap::new()),
+            recency: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn touch(&self, key: &(String, String, bool)) {
+        let mut recency = self.recency.lock().unwrap();
+        if let Some(pos) = recency.iter().position(|k| k == key) {
+            recency.remove(pos);
+        }
+        recency.push_back(key.clone());
+    }
+
+    fn get(&self, key: &(String, String, bool)) -> Option<Arc<SegmentReader>> {
+        let hit = self.entries.lock().unwrap().get(key).cloned();
+        if hit.is_some() {
+            self.touch(key);
+        }
+        hit
+    }
+
+    fn insert(&self, key: (String, String, bool), reader: Arc<SegmentReader>) {
+        {
+            let mut entries = self.entries.lock().unwrap();
+            entries.insert(key.clone(), reader);
+        }
+        self.touch(&key);
+
+        loop {
+            let over_capacity = self.entries.lock().unwrap().len() > self.capacity;
+            if !over_capacity {
+                break;
+            }
+            let oldest = self.recency.lock().unwrap().pop_front();
+            let Some(oldest_key) = oldest else { break };
+            self.entries.lock().unwrap().remove(&oldest_key);
+        }
+    }
+}
 
 // ─── BM25 scorer ────────────────────────────────────────────────────────────
 
@@ -402,11 +468,39 @@ pub fn flat_knn(query_vector: &[f32], vectors: &[(u32, Vec<f32>)], k: usize) -> 
 
 pub struct Searcher {
     data_dir: PathBuf,
+    segment_cache: SegmentCache,
 }
 
 impl Searcher {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir }
+        Self::with_segment_cache_capacity(data_dir, DEFAULT_SEGMENT_CACHE_CAPACITY)
+    }
+
+    /// Like [`Searcher::new`], but with an explicit cap on how many parsed
+    /// segments are kept resident in memory at once (see [`SegmentCache`]).
+    pub fn with_segment_cache_capacity(data_dir: PathBuf, capacity: usize) -> Self {
+        Self {
+            data_dir,
+            segment_cache: SegmentCache::new(capacity),
+        }
+    }
+
+    /// Return the cached parsed segment for `(namespace, segment_id,
+    /// load_vectors)`, opening and caching it on miss.
+    fn open_segment(
+        &self,
+        namespace: &str,
+        segment_id: &str,
+        seg_dir: PathBuf,
+        load_vectors: bool,
+    ) -> Result<Arc<SegmentReader>, KoshaError> {
+        let key = (namespace.to_string(), segment_id.to_string(), load_vectors);
+        if let Some(cached) = self.segment_cache.get(&key) {
+            return Ok(cached);
+        }
+        let reader = Arc::new(SegmentReader::open_with_options(seg_dir, load_vectors)?);
+        self.segment_cache.insert(key, Arc::clone(&reader));
+        Ok(reader)
     }
 
     pub fn search(
@@ -456,7 +550,12 @@ impl Searcher {
             // Lexical/BM25 queries (no query.knn) never touch vectors or the
             // HNSW graph — skip loading both so keyword search latency stops
             // scaling with embedding volume/segment count.
-            let reader = SegmentReader::open_with_options(seg_dir, query.knn.is_some())?;
+            let reader = self.open_segment(
+                &namespace.0,
+                &entry.segment_id.0,
+                seg_dir,
+                query.knn.is_some(),
+            )?;
             let total_docs = reader.doc_count();
             let store = &reader.filter_store;
             let scorer = Bm25Scorer::new(
@@ -1049,6 +1148,53 @@ mod tests {
         let result = compute_cardinality(&store, "documentId");
         let total = result.total_documents.unwrap();
         assert_eq!(total.value, 2);
+    }
+
+    #[test]
+    fn repeated_search_serves_warm_segment_from_memory_not_disk() {
+        // Regression test for the "warm NVMe cache still re-parses every
+        // segment on every query" bug: without an in-memory segment cache,
+        // deleting a segment's files between two searches would make the
+        // second search fail (or silently return 0 hits once `seg_dir.exists()`
+        // is false), even though nothing about the query or manifest changed.
+        let dir = std::env::temp_dir().join("kosha-test-segment-cache-warm");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("t", "hello world")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 1,
+            }],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let q = mk_query("hello", 10);
+
+        let first = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(first.total_hits, 1, "first search should hit the segment");
+
+        // Simulate the NVMe cache having evicted (or never re-fetched) this
+        // segment's files — the parsed segment should already be cached in
+        // memory from the first search, so this must not matter.
+        std::fs::remove_file(seg_dir.join("doc_store.bin")).unwrap();
+        std::fs::remove_file(seg_dir.join("inverted.idx")).unwrap();
+
+        let second = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(
+            second.total_hits, 1,
+            "second search must be served from the in-memory segment cache, \
+             not re-read the (now-deleted) files from disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
