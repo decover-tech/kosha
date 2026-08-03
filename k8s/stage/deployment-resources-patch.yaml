@@ -17,6 +17,15 @@
 # kosha pool's NVMe instance store (see base/deployment.yaml), so its size
 # is the node's instance-store size, not a pod-level sizeLimit. Only the
 # container filesystem counts against ephemeral-storage.
+#
+# imagePullPolicy: base/deployment.yaml uses IfNotPresent, which is correct
+# for prod's immutable v* tags but actively wrong for staging's floating
+# :main tag — kubelet only checks whether an image with that literal tag
+# *string* is already cached on the node, with no idea the registry-side
+# :main now points at a different digest. That silently reused a stale
+# pre-fix image across at least two deploys here (once diagnosed via a live
+# kubectl patch that this file never captured, so it kept recurring on the
+# next redeploy). Always for staging; leave prod on IfNotPresent.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,6 +36,7 @@ spec:
     spec:
       containers:
         - name: kosha
+          imagePullPolicy: Always
           resources:
             requests:
               cpu: "1"
