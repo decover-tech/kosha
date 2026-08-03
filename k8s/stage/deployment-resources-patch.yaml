@@ -3,6 +3,16 @@
 # restart once manifests are loaded; keep prod on the conservative base
 # until it is sized separately.
 #
+# Bumped again after concurrent segment hydration exceeded 32Gi under load
+# on a node too small to grant the difference (see infra repo #67/#68 —
+# the kosha Karpenter pool now targets i4i.2xlarge+ instead of i4i.large, so
+# a node can actually back this limit instead of the pod getting evicted at
+# the node-memory level before its own cgroup limit ever mattered).
+# ephemeral-storage/cpu raised to match: hydration writes segment files to
+# the container filesystem transiently before they land in the NVMe cache
+# (see kosha-cache), and fan-out hydration (KOSHA_HYDRATE_CONCURRENCY) is
+# CPU-bound during concurrent segment parsing.
+#
 # Cache capacity is no longer sized here: the cache is a hostPath on the
 # kosha pool's NVMe instance store (see base/deployment.yaml), so its size
 # is the node's instance-store size, not a pod-level sizeLimit. Only the
@@ -19,6 +29,10 @@ spec:
         - name: kosha
           resources:
             requests:
-              memory: "8Gi"
+              cpu: "1"
+              ephemeral-storage: "5Gi"
+              memory: "40Gi"
             limits:
-              memory: "32Gi"
+              cpu: "7"
+              ephemeral-storage: "100Gi"
+              memory: "56Gi"
