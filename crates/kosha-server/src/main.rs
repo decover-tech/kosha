@@ -120,6 +120,10 @@ struct AppState {
     control_plane_kind: &'static str,
     #[cfg(feature = "s3")]
     s3_storage: Option<s3_storage::S3Storage>,
+    /// Max in-flight S3 GETs when hydrating segments for a search
+    /// (`KOSHA_HYDRATE_CONCURRENCY`, default 16). See `ensure_segments_local`.
+    #[cfg(feature = "s3")]
+    hydrate_concurrency: usize,
 }
 
 impl AppState {
@@ -137,9 +141,25 @@ impl AppState {
                 );
             }
         }
-        let cache = Cache::new(data_dir.clone());
+        // `KOSHA_CACHE_MAX_BYTES`: bound the NVMe cache and evict LRU files
+        // once exceeded (DESIGN.md §9). Unset = unbounded (legacy behavior).
+        let cache_max_bytes: Option<u64> = std::env::var("KOSHA_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let cache = Cache::with_max_bytes(data_dir.clone(), cache_max_bytes);
         let indexer = Indexer::new(data_dir.clone());
-        let searcher = Searcher::new(data_dir.clone());
+
+        // `KOSHA_SEGMENT_CACHE_CAPACITY`: how many parsed segments the
+        // searcher keeps resident in memory across queries. Segments are
+        // immutable, so this is a pure memory/latency trade-off, not a
+        // staleness one — see `kosha_query::SegmentCache`.
+        let searcher = match std::env::var("KOSHA_SEGMENT_CACHE_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            Some(capacity) => Searcher::with_segment_cache_capacity(data_dir.clone(), capacity),
+            None => Searcher::new(data_dir.clone()),
+        };
 
         #[cfg(feature = "s3")]
         let s3_storage = {
@@ -247,6 +267,12 @@ impl AppState {
             control_plane_kind,
             #[cfg(feature = "s3")]
             s3_storage,
+            #[cfg(feature = "s3")]
+            hydrate_concurrency: std::env::var("KOSHA_HYDRATE_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(16),
         }
     }
 
@@ -337,51 +363,64 @@ impl AppState {
     /// Ensure a segment is available locally (download from S3 on cache miss).
     #[cfg(feature = "s3")]
     fn ensure_segment_local(&self, seg_path: &Path) {
-        if let Ok(rel) = seg_path.strip_prefix(&self.data_dir) {
-            let key = rel.to_string_lossy();
-            if self.cache.contains(key.as_ref()) {
-                // Directory exists with at least the path present.
-                if seg_path.exists() {
-                    return;
+        self.ensure_segments_local(std::slice::from_ref(&seg_path.to_path_buf()));
+    }
+
+    /// Ensure every listed segment directory is available locally, fanning
+    /// out S3 downloads for all of them (and all their files) as a single
+    /// batch instead of hydrating segment-by-segment, file-by-file.
+    ///
+    /// DESIGN.md §8 step 4 calls for per-segment retrieval "fanned out
+    /// across the query node's worker pool" — the old code instead awaited
+    /// one blocking `s3.read()` at a time, so total hydration latency was
+    /// the sum of every S3 GET across every segment/file in the manifest.
+    /// For a namespace with many segments (or one big enough to need many),
+    /// that serial chain is what turned a single search into tens of
+    /// seconds to multiple minutes.
+    #[cfg(feature = "s3")]
+    fn ensure_segments_local(&self, seg_paths: &[PathBuf]) {
+        let Some(ref s3) = self.s3_storage else {
+            return;
+        };
+
+        let mut logical_paths: Vec<String> = Vec::new();
+        for seg_path in seg_paths {
+            if seg_path.exists() {
+                continue;
+            }
+            let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+                continue;
+            };
+            let s3_prefix = rel_path.to_string_lossy().into_owned();
+            match s3.list(&s3_prefix) {
+                Ok(files) if !files.is_empty() => {
+                    logical_paths.extend(files.iter().map(|f| format!("{s3_prefix}/{f}")));
+                }
+                Ok(_) => {
+                    eprintln!("WARN: no S3 objects found for segment {s3_prefix}");
+                }
+                Err(e) => {
+                    eprintln!("WARN: S3 list failed for segment {s3_prefix}: {e}");
                 }
             }
         }
-        if seg_path.exists() {
+
+        if logical_paths.is_empty() {
             return;
         }
-        if let Some(ref s3) = self.s3_storage {
-            if let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) {
-                let s3_prefix = rel_path.to_string_lossy();
-                match s3.list(&s3_prefix) {
-                    Ok(files) if !files.is_empty() => {
-                        println!(
-                            "cache miss: hydrating segment {} ({} file(s) from S3)",
-                            s3_prefix,
-                            files.len()
-                        );
-                        for file in &files {
-                            let logical = format!("{s3_prefix}/{file}");
-                            match s3.read(&logical) {
-                                Ok(bytes) => {
-                                    if let Err(e) = self.cache.put_bytes(&logical, &bytes) {
-                                        eprintln!(
-                                            "WARN: failed to materialize cache file {logical}: {e}"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("WARN: S3 download failed for {logical}: {e}");
-                                }
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        eprintln!("WARN: no S3 objects found for segment {s3_prefix}");
-                    }
-                    Err(e) => {
-                        eprintln!("WARN: S3 list failed for segment {s3_prefix}: {e}");
-                    }
-                }
+        println!(
+            "cache miss: hydrating {} file(s) across {} segment(s) from S3 (fan-out={})",
+            logical_paths.len(),
+            seg_paths.len(),
+            self.hydrate_concurrency
+        );
+        for (path, result) in s3.read_many(&logical_paths, self.hydrate_concurrency) {
+            match result {
+                // read_many already persisted the bytes to disk (same root
+                // dir as `self.cache`); just tell the cache's size/LRU
+                // accounting about the new file instead of re-writing it.
+                Ok(_) => self.cache.note_external_write(&path),
+                Err(e) => eprintln!("WARN: S3 download failed for {path}: {e}"),
             }
         }
     }
@@ -401,11 +440,7 @@ impl AppState {
         };
         let logical = format!("{}/{file_name}", rel_path.to_string_lossy());
         match s3.read(&logical) {
-            Ok(bytes) => {
-                if let Err(e) = self.cache.put_bytes(&logical, &bytes) {
-                    eprintln!("WARN: failed to materialize cache file {logical}: {e}");
-                }
-            }
+            Ok(_) => self.cache.note_external_write(&logical),
             Err(e) => {
                 eprintln!("WARN: S3 download failed for {logical}: {e}");
             }
@@ -420,6 +455,7 @@ impl AppState {
         manifest: &kosha_core::Manifest,
         filter: Option<&FilterClause>,
     ) {
+        let mut to_hydrate: Vec<PathBuf> = Vec::new();
         for entry in &manifest.segments {
             let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
             if let Some(filter) = filter {
@@ -430,8 +466,9 @@ impl AppState {
                     }
                 }
             }
-            self.ensure_segment_local(&seg_path);
+            to_hydrate.push(seg_path);
         }
+        self.ensure_segments_local(&to_hydrate);
     }
 
     /// Upload a single file from a local segment dir to S3.
@@ -995,27 +1032,35 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
 // ─── GET /stats ──────────────────────────────────────────────────────────────
 
 fn handle_stats(state: &AppState) -> String {
-    let indexer = state.indexer.lock().unwrap();
-    let mut namespaces: Vec<serde_json::Value> = Vec::new();
-    let mut total_docs: u64 = 0;
-    let mut total_segments: usize = 0;
+    // Collect everything that needs `indexer` first, then drop the lock
+    // before touching anything else — a slow /stats call must never hold up
+    // concurrent searches' manifest lookups (both used to share this lock
+    // for the whole handler body, including a directory-tree cache-size
+    // walk that could itself take tens of seconds on a large cache).
+    let (namespaces, total_docs, total_segments) = {
+        let indexer = state.indexer.lock().unwrap();
+        let mut namespaces: Vec<serde_json::Value> = Vec::new();
+        let mut total_docs: u64 = 0;
+        let mut total_segments: usize = 0;
 
-    for ns in indexer.namespaces() {
-        let manifest = match indexer.manifest(ns) {
-            Some(m) => m,
-            None => continue,
-        };
-        let ns_docs: u64 = manifest.segments.iter().map(|s| s.doc_count as u64).sum();
-        total_docs += ns_docs;
-        total_segments += manifest.segments.len();
+        for ns in indexer.namespaces() {
+            let manifest = match indexer.manifest(ns) {
+                Some(m) => m,
+                None => continue,
+            };
+            let ns_docs: u64 = manifest.segments.iter().map(|s| s.doc_count as u64).sum();
+            total_docs += ns_docs;
+            total_segments += manifest.segments.len();
 
-        namespaces.push(serde_json::json!({
-            "namespace": ns.0,
-            "documents": ns_docs,
-            "segments": manifest.segments.len(),
-            "version": manifest.version,
-        }));
-    }
+            namespaces.push(serde_json::json!({
+                "namespace": ns.0,
+                "documents": ns_docs,
+                "segments": manifest.segments.len(),
+                "version": manifest.version,
+            }));
+        }
+        (namespaces, total_docs, total_segments)
+    };
 
     #[cfg(feature = "s3")]
     let (s3_enabled, s3_bucket, s3_prefix) = match &state.s3_storage {
