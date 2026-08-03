@@ -149,16 +149,29 @@ impl AppState {
         let cache = Cache::with_max_bytes(data_dir.clone(), cache_max_bytes);
         let indexer = Indexer::new(data_dir.clone());
 
-        // `KOSHA_SEGMENT_CACHE_CAPACITY`: how many parsed segments the
-        // searcher keeps resident in memory across queries. Segments are
-        // immutable, so this is a pure memory/latency trade-off, not a
-        // staleness one — see `kosha_query::SegmentCache`.
-        let searcher = match std::env::var("KOSHA_SEGMENT_CACHE_CAPACITY")
+        // `KOSHA_SEGMENT_CACHE_CAPACITY` / `KOSHA_SEGMENT_CACHE_MAX_BYTES`:
+        // how many parsed segments the searcher keeps resident in memory
+        // across queries, and the approximate byte budget for them.
+        // Segments are immutable, so this is a pure memory/latency
+        // trade-off, not a staleness one — see `kosha_query::SegmentCache`.
+        // The byte budget is the one that actually bounds worst-case
+        // memory: an unfiltered query can open dozens of segments in one
+        // shot (nothing to bloom-prune), well under a generous count cap,
+        // while still exhausting the container's memory if those segments
+        // are individually large.
+        let segment_cache_capacity: Option<usize> = std::env::var("KOSHA_SEGMENT_CACHE_CAPACITY")
             .ok()
-            .and_then(|v| v.parse().ok())
-        {
-            Some(capacity) => Searcher::with_segment_cache_capacity(data_dir.clone(), capacity),
-            None => Searcher::new(data_dir.clone()),
+            .and_then(|v| v.parse().ok());
+        let segment_cache_max_bytes: Option<u64> = std::env::var("KOSHA_SEGMENT_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let searcher = match (segment_cache_capacity, segment_cache_max_bytes) {
+            (None, None) => Searcher::new(data_dir.clone()),
+            (capacity, max_bytes) => Searcher::with_segment_cache_limits(
+                data_dir.clone(),
+                capacity.unwrap_or(kosha_query::DEFAULT_SEGMENT_CACHE_CAPACITY),
+                max_bytes.unwrap_or(kosha_query::DEFAULT_SEGMENT_CACHE_MAX_BYTES),
+            ),
         };
 
         #[cfg(feature = "s3")]

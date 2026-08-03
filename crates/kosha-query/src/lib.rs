@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kosha_core::{
@@ -14,7 +15,14 @@ use kosha_segment::{tokenize, SegmentReader};
 /// [`SegmentCache`]). Segments are immutable once written (DESIGN.md §6.2),
 /// so caching a parsed segment indefinitely is safe — the only reason to
 /// bound this is memory, not staleness.
-const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = 64;
+pub const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = 64;
+
+/// Default byte budget for [`SegmentCache`] (see its doc comment for why
+/// this exists at all). Deliberately conservative and independent of
+/// container memory limits — a query that needs more resident segments than
+/// this just re-parses on a cache miss (slower, still correct) rather than
+/// growing the cache without bound.
+pub const DEFAULT_SEGMENT_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// In-memory LRU cache of parsed segments, keyed by
 /// `(namespace, segment_id, load_vectors)`.
@@ -25,22 +33,42 @@ const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = 64;
 /// so latency scales with total corpus size instead of query cost. Because
 /// segments are immutable, a cache hit here never needs invalidation; only
 /// eviction to bound memory.
+///
+/// Bounded by *both* entry count and an approximate byte budget. Count alone
+/// is not enough: an unfiltered lexical query has to open every segment in
+/// the manifest (nothing to bloom-prune), so a single query against a large
+/// namespace can insert dozens of segments in one shot, well under a
+/// generous count cap, while still exhausting the container's memory if
+/// those segments are individually large — that's a container-level OOM
+/// (SIGKILL), not the graceful "re-parse on next miss" this cache is meant
+/// to guarantee. The byte size used per entry is approximate (the on-disk
+/// footprint of the files that were actually loaded), not an exact
+/// `size_of` of the parsed structures, but it's the right order of
+/// magnitude and, critically, bounds worst case instead of trusting entry
+/// count to correlate with memory.
+/// Cache key: `(namespace, segment_id, load_vectors)`.
+type SegmentCacheKey = (String, String, bool);
+
 struct SegmentCache {
     capacity: usize,
-    entries: Mutex<HashMap<(String, String, bool), Arc<SegmentReader>>>,
-    recency: Mutex<VecDeque<(String, String, bool)>>,
+    max_bytes: u64,
+    entries: Mutex<HashMap<SegmentCacheKey, (Arc<SegmentReader>, u64)>>,
+    recency: Mutex<VecDeque<SegmentCacheKey>>,
+    total_bytes: AtomicU64,
 }
 
 impl SegmentCache {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, max_bytes: u64) -> Self {
         Self {
             capacity,
+            max_bytes,
             entries: Mutex::new(HashMap::new()),
             recency: Mutex::new(VecDeque::new()),
+            total_bytes: AtomicU64::new(0),
         }
     }
 
-    fn touch(&self, key: &(String, String, bool)) {
+    fn touch(&self, key: &SegmentCacheKey) {
         let mut recency = self.recency.lock().unwrap();
         if let Some(pos) = recency.iter().position(|k| k == key) {
             recency.remove(pos);
@@ -48,31 +76,63 @@ impl SegmentCache {
         recency.push_back(key.clone());
     }
 
-    fn get(&self, key: &(String, String, bool)) -> Option<Arc<SegmentReader>> {
-        let hit = self.entries.lock().unwrap().get(key).cloned();
+    fn get(&self, key: &SegmentCacheKey) -> Option<Arc<SegmentReader>> {
+        let hit = self
+            .entries
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|(r, _)| r.clone());
         if hit.is_some() {
             self.touch(key);
         }
         hit
     }
 
-    fn insert(&self, key: (String, String, bool), reader: Arc<SegmentReader>) {
+    fn insert(&self, key: SegmentCacheKey, reader: Arc<SegmentReader>, approx_bytes: u64) {
         {
             let mut entries = self.entries.lock().unwrap();
-            entries.insert(key.clone(), reader);
+            entries.insert(key.clone(), (reader, approx_bytes));
         }
+        self.total_bytes.fetch_add(approx_bytes, Ordering::Relaxed);
         self.touch(&key);
 
         loop {
             let over_capacity = self.entries.lock().unwrap().len() > self.capacity;
-            if !over_capacity {
+            let over_budget = self.total_bytes.load(Ordering::Relaxed) > self.max_bytes;
+            if !over_capacity && !over_budget {
                 break;
             }
             let oldest = self.recency.lock().unwrap().pop_front();
             let Some(oldest_key) = oldest else { break };
-            self.entries.lock().unwrap().remove(&oldest_key);
+            if let Some((_, size)) = self.entries.lock().unwrap().remove(&oldest_key) {
+                self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+            }
         }
     }
+}
+
+/// Sum the on-disk size of a segment's component files, as a proxy for the
+/// in-memory footprint of its parsed representation. Missing files (e.g.
+/// `vector.idx` when `load_vectors` is false) simply contribute nothing.
+fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u64 {
+    let mut files = vec![
+        "doc_store.bin",
+        "inverted.idx",
+        "filters.bin",
+        "footer.json",
+    ];
+    if load_vectors {
+        files.push("vector.idx");
+    }
+    files
+        .iter()
+        .map(|f| {
+            std::fs::metadata(seg_dir.join(f))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 // ─── BM25 scorer ────────────────────────────────────────────────────────────
@@ -473,15 +533,28 @@ pub struct Searcher {
 
 impl Searcher {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self::with_segment_cache_capacity(data_dir, DEFAULT_SEGMENT_CACHE_CAPACITY)
+        Self::with_segment_cache_limits(
+            data_dir,
+            DEFAULT_SEGMENT_CACHE_CAPACITY,
+            DEFAULT_SEGMENT_CACHE_MAX_BYTES,
+        )
     }
 
     /// Like [`Searcher::new`], but with an explicit cap on how many parsed
     /// segments are kept resident in memory at once (see [`SegmentCache`]).
+    /// Uses the default byte budget.
     pub fn with_segment_cache_capacity(data_dir: PathBuf, capacity: usize) -> Self {
+        Self::with_segment_cache_limits(data_dir, capacity, DEFAULT_SEGMENT_CACHE_MAX_BYTES)
+    }
+
+    /// Like [`Searcher::new`], with explicit control over both the entry
+    /// count and the approximate byte budget for the in-memory segment
+    /// cache (see [`SegmentCache`] — the byte budget is the one that
+    /// actually bounds worst-case memory; count alone does not).
+    pub fn with_segment_cache_limits(data_dir: PathBuf, capacity: usize, max_bytes: u64) -> Self {
         Self {
             data_dir,
-            segment_cache: SegmentCache::new(capacity),
+            segment_cache: SegmentCache::new(capacity, max_bytes),
         }
     }
 
@@ -498,8 +571,10 @@ impl Searcher {
         if let Some(cached) = self.segment_cache.get(&key) {
             return Ok(cached);
         }
+        let approx_bytes = approx_segment_bytes(&seg_dir, load_vectors);
         let reader = Arc::new(SegmentReader::open_with_options(seg_dir, load_vectors)?);
-        self.segment_cache.insert(key, Arc::clone(&reader));
+        self.segment_cache
+            .insert(key, Arc::clone(&reader), approx_bytes);
         Ok(reader)
     }
 
@@ -1192,6 +1267,84 @@ mod tests {
             second.total_hits, 1,
             "second search must be served from the in-memory segment cache, \
              not re-read the (now-deleted) files from disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_cache_evicts_on_byte_budget_not_just_entry_count() {
+        // Regression test for a real staging OOM: an unfiltered query opens
+        // every segment in the manifest in one shot (nothing to
+        // bloom-prune), so a generous *entry count* cap alone doesn't bound
+        // memory if individual segments are large — the cache must also
+        // evict once an approximate *byte* budget is exceeded, even with
+        // plenty of count headroom left.
+        let dir = std::env::temp_dir().join("kosha-test-segment-cache-bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+
+        let seg1_dir = dir.join(&ns.0).join("s1");
+        let mut w1 = SegmentWriter::new(SegmentId("s1".into()), seg1_dir.clone());
+        w1.add_document(DocumentId("d1".into()), vec![Field::text("t", "alpha")]);
+        w1.finalize(Bm25Params::default()).unwrap();
+
+        let seg2_dir = dir.join(&ns.0).join("s2");
+        let mut w2 = SegmentWriter::new(SegmentId("s2".into()), seg2_dir.clone());
+        w2.add_document(DocumentId("d2".into()), vec![Field::text("t", "beta")]);
+        w2.finalize(Bm25Params::default()).unwrap();
+
+        let seg_size = |dir: &std::path::Path| -> u64 {
+            [
+                "doc_store.bin",
+                "inverted.idx",
+                "filters.bin",
+                "footer.json",
+            ]
+            .iter()
+            .map(|f| std::fs::metadata(dir.join(f)).unwrap().len())
+            .sum()
+        };
+        let seg1_bytes = seg_size(&seg1_dir);
+        let seg2_bytes = seg_size(&seg2_dir);
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![
+                ManifestEntry {
+                    segment_id: SegmentId("s1".into()),
+                    doc_count: 1,
+                },
+                ManifestEntry {
+                    segment_id: SegmentId("s2".into()),
+                    doc_count: 1,
+                },
+            ],
+        };
+
+        // Generous entry-count cap (10) but a byte budget that fits s1 alone,
+        // not both — inserting s2 must evict s1 to stay under budget.
+        let max_bytes = seg1_bytes + seg2_bytes - 1;
+        let searcher = Searcher::with_segment_cache_limits(dir.clone(), 10, max_bytes);
+        let q = mk_query("alpha beta", 10);
+
+        let first = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(first.total_hits, 2, "both segments should match once");
+
+        // s1 (opened first, so oldest in LRU order) should have been evicted
+        // to make room for s2 — delete s1's files and confirm the next
+        // search actually needs to re-read them (and fails, since they're
+        // gone) rather than serving a stale in-memory hit.
+        std::fs::remove_file(seg1_dir.join("doc_store.bin")).unwrap();
+        std::fs::remove_file(seg1_dir.join("inverted.idx")).unwrap();
+
+        let second = searcher.search(&ns, &manifest, &q, None);
+        assert!(
+            second.is_err(),
+            "s1 should have been evicted by the byte budget (despite the \
+             generous count cap), so re-opening it after deleting its files \
+             must fail — a successful search here would mean the cache grew \
+             past its byte budget"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
