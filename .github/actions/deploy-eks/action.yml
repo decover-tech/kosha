@@ -44,11 +44,25 @@ inputs:
 runs:
   using: composite
   steps:
+    # `inputs.aws_region`'s own `default: us-east-1` only applies when the
+    # caller omits the key entirely — callers here always pass
+    # `${{ secrets.KOSHA_AWS_REGION }}`, so an unset secret still "provides"
+    # an empty string and bypasses that default. Resolve the effective
+    # region once, defensively, before anything downstream depends on it —
+    # `aws-actions/configure-aws-credentials` treats an empty `aws-region`
+    # as not supplied at all and hard-fails.
+    - name: Resolve AWS region
+      id: region
+      shell: bash
+      run: |
+        region="${{ inputs.aws_region }}"
+        echo "value=${region:-us-east-1}" >> "$GITHUB_OUTPUT"
+
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
         role-to-assume: ${{ inputs.aws_role_arn }}
-        aws-region: ${{ inputs.aws_region }}
+        aws-region: ${{ steps.region.outputs.value }}
 
     - name: Login to Amazon ECR
       if: inputs.environment == 'staging' && inputs.image_repository == ''
@@ -92,11 +106,8 @@ runs:
 
     - name: Update kubeconfig
       shell: bash
-      env:
-        AWS_REGION: ${{ inputs.aws_region }}
       run: |
-        region="${AWS_REGION:-us-east-1}"
-        aws eks update-kubeconfig --region "$region" --name ${{ inputs.eks_cluster_name }}
+        aws eks update-kubeconfig --region "${{ steps.region.outputs.value }}" --name ${{ inputs.eks_cluster_name }}
 
     - name: Deploy
       shell: bash
@@ -108,11 +119,11 @@ runs:
         KOSHA_S3_BUCKET: ${{ inputs.s3_bucket }}
         KOSHA_S3_PREFIX: ${{ inputs.s3_prefix }}
         KOSHA_IRSA_ROLE_ARN: ${{ inputs.irsa_role_arn }}
-        KOSHA_AWS_REGION: ${{ inputs.aws_region }}
+        AWS_REGION: ${{ steps.region.outputs.value }}
         IMAGE_REPOSITORY: ${{ inputs.image_repository }}
       run: |
         set -euo pipefail
-        region="${KOSHA_AWS_REGION:-us-east-1}"
+        region="$AWS_REGION"
         if [[ -n "$IMAGE_REPOSITORY" ]]; then
           image="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
         elif [[ "${{ inputs.environment }}" == "staging" ]]; then
