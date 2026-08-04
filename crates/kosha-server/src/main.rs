@@ -14,6 +14,8 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(feature = "s3")]
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(feature = "s3")]
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -126,6 +128,154 @@ struct AppState {
     /// (`KOSHA_HYDRATE_CONCURRENCY`, default 16). See `ensure_segments_local`.
     #[cfg(feature = "s3")]
     hydrate_concurrency: usize,
+    /// Segments currently being hydrated from S3, keyed by local segment
+    /// path. Guards against every concurrent request against a cold
+    /// namespace independently re-fetching the same segments — see
+    /// `ensure_segments_local`, which is the only place this is touched.
+    /// Only callers that *insert* a fresh entry ("owners") perform the S3
+    /// fetch; callers that find an existing entry ("waiters") block on its
+    /// `SegmentFetch` instead of redundantly downloading the same files.
+    #[cfg(feature = "s3")]
+    in_flight_segments: Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>,
+    /// Server-wide ceiling on concurrent hydration *operations* (as
+    /// distinct from `hydrate_concurrency`, which bounds the S3 GET
+    /// fan-out *within* a single hydration operation). Without this,
+    /// thread-per-connection means an unbounded number of concurrent
+    /// requests can each be hydrating a distinct cold segment batch at
+    /// once, each fanning out up to `hydrate_concurrency` GETs — the
+    /// combination is what produced the staging OOMs this exists to fix.
+    /// `KOSHA_MAX_CONCURRENT_HYDRATIONS`, default 4.
+    #[cfg(feature = "s3")]
+    hydration_semaphore: Semaphore,
+}
+
+/// Per-segment single-flight completion signal used by
+/// `ensure_segments_local`'s in-flight registry. `done` flips to `true`
+/// exactly once, when the owning caller's fetch attempt finishes —
+/// successfully or not; waiters only learn the actual outcome by re-checking
+/// `AppState::segment_is_complete` themselves afterward, same as the owner
+/// does, so a failed fetch is never mistaken for a successful one.
+#[cfg(feature = "s3")]
+#[derive(Default)]
+struct SegmentFetch {
+    done: Mutex<bool>,
+    cv: Condvar,
+}
+
+/// Minimal counting semaphore built on `Mutex`/`Condvar`.
+///
+/// The hydration path in this file is synchronous from the caller's point of
+/// view — `ensure_segments_local` runs on the request-handling thread and
+/// blocks on `S3Storage::read_many`'s own `Runtime::block_on` — so a blocking
+/// semaphore matches the rest of the file's concurrency model. (`std` has no
+/// built-in semaphore; pulling in `tokio::sync::Semaphore` would mean adding
+/// the `sync` feature to a crate that otherwise only uses tokio internally,
+/// behind a blocking boundary, to run S3 SDK futures.)
+#[cfg(feature = "s3")]
+struct Semaphore {
+    permits: Mutex<usize>,
+    cv: Condvar,
+}
+
+#[cfg(feature = "s3")]
+impl Semaphore {
+    fn new(permits: usize) -> Self {
+        Self {
+            permits: Mutex::new(permits),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Block until a permit is available, then hold it until the returned
+    /// guard is dropped.
+    fn acquire(&self) -> SemaphorePermit<'_> {
+        let mut permits = self.permits.lock().unwrap();
+        while *permits == 0 {
+            permits = self.cv.wait(permits).unwrap();
+        }
+        *permits -= 1;
+        SemaphorePermit { sem: self }
+    }
+}
+
+#[cfg(feature = "s3")]
+struct SemaphorePermit<'a> {
+    sem: &'a Semaphore,
+}
+
+#[cfg(feature = "s3")]
+impl Drop for SemaphorePermit<'_> {
+    fn drop(&mut self) {
+        let mut permits = self.sem.permits.lock().unwrap();
+        *permits += 1;
+        self.sem.cv.notify_one();
+    }
+}
+
+/// Segments this caller must fetch itself, paired with the completion
+/// signal it must flip via `complete_owned` once done.
+#[cfg(feature = "s3")]
+type OwnedFetches = Vec<(PathBuf, Arc<SegmentFetch>)>;
+
+/// Partition `seg_paths` into segments this caller must fetch itself
+/// (`owned`) and segments another in-flight caller is already fetching
+/// (`waiting`), atomically with respect to `in_flight`: exactly one caller
+/// becomes the owner for any given not-yet-cached segment.
+///
+/// Free function (rather than an `AppState` method) so it only depends on
+/// the in-flight map and an `is_complete` predicate — this lets tests drive
+/// it directly with a fake predicate/fetch instead of needing a real
+/// `S3Storage`/network.
+#[cfg(feature = "s3")]
+fn partition_for_hydration(
+    in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>,
+    seg_paths: &[PathBuf],
+    is_complete: impl Fn(&Path) -> bool,
+) -> (OwnedFetches, Vec<Arc<SegmentFetch>>) {
+    let mut owned = Vec::new();
+    let mut waiting = Vec::new();
+    let mut guard = in_flight.lock().unwrap();
+    for seg_path in seg_paths {
+        if is_complete(seg_path) {
+            continue;
+        }
+        match guard.get(seg_path) {
+            Some(existing) => waiting.push(Arc::clone(existing)),
+            None => {
+                let entry = Arc::new(SegmentFetch::default());
+                guard.insert(seg_path.clone(), Arc::clone(&entry));
+                owned.push((seg_path.clone(), entry));
+            }
+        }
+    }
+    (owned, waiting)
+}
+
+/// Signal that `owned`'s fetch attempt is finished (regardless of outcome)
+/// and remove each entry from `in_flight` so a future cache miss can retry
+/// it — must be called exactly once per batch returned by
+/// `partition_for_hydration`, whether the fetch succeeded or failed.
+#[cfg(feature = "s3")]
+fn complete_owned(in_flight: &Mutex<HashMap<PathBuf, Arc<SegmentFetch>>>, owned: &OwnedFetches) {
+    let mut guard = in_flight.lock().unwrap();
+    for (seg_path, entry) in owned {
+        guard.remove(seg_path);
+        let mut done = entry.done.lock().unwrap();
+        *done = true;
+        entry.cv.notify_all();
+    }
+}
+
+/// Block until every entry in `waiting` has been signalled complete by its
+/// owner (see `complete_owned`).
+#[cfg(feature = "s3")]
+fn wait_for(waiting: &[Arc<SegmentFetch>]) {
+    for entry in waiting {
+        let mut done = entry.done.lock().unwrap();
+        while !*done {
+            done = entry.cv.wait(done).unwrap();
+        }
+    }
 }
 
 impl AppState {
@@ -288,6 +438,22 @@ impl AppState {
                 .and_then(|v| v.parse().ok())
                 .filter(|n| *n > 0)
                 .unwrap_or(16),
+            #[cfg(feature = "s3")]
+            in_flight_segments: Mutex::new(HashMap::new()),
+            // Each hydration operation can itself fan out up to
+            // `hydrate_concurrency` (default 16) concurrent S3 GETs, so a
+            // small operation-level ceiling still allows meaningful GET
+            // parallelism (default 4 ops × 16 fan-out = 64 concurrent GETs
+            // worst case) while capping how many *independent* segment
+            // batches (and their buffered bytes) can be resident at once.
+            #[cfg(feature = "s3")]
+            hydration_semaphore: Semaphore::new(
+                std::env::var("KOSHA_MAX_CONCURRENT_HYDRATIONS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or(4),
+            ),
         }
     }
 
@@ -423,52 +589,75 @@ impl AppState {
     /// would silently search a partial corpus. Callers must check this and
     /// fail the request rather than return a deceptively successful empty
     /// result.
+    ///
+    /// Concurrent callers racing on the same not-yet-cached segment(s) are
+    /// coalesced via `in_flight_segments`: only the first ("owner") actually
+    /// hits S3 for a given segment, and the rest ("waiters") block until the
+    /// owner finishes, then fall through to the same `segment_is_complete`
+    /// recheck the owner uses — so a failed fetch is visible to waiters too,
+    /// not silently treated as success. `hydration_semaphore` additionally
+    /// bounds how many *owner* hydration batches run at once, server-wide.
     #[cfg(feature = "s3")]
     fn ensure_segments_local(&self, seg_paths: &[PathBuf]) -> Vec<String> {
         let Some(ref s3) = self.s3_storage else {
             return Vec::new();
         };
 
-        let mut logical_paths: Vec<String> = Vec::new();
-        for seg_path in seg_paths {
-            if Self::segment_is_complete(seg_path) {
-                continue;
+        let (owned, waiting) = partition_for_hydration(
+            &self.in_flight_segments,
+            seg_paths,
+            Self::segment_is_complete,
+        );
+
+        if !owned.is_empty() {
+            // Bound total concurrent hydration *operations* server-wide —
+            // released as soon as this operation's fetch is done, before
+            // waiters below get to run.
+            let _permit = self.hydration_semaphore.acquire();
+
+            let mut logical_paths: Vec<String> = Vec::new();
+            for (seg_path, _) in &owned {
+                let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+                    continue;
+                };
+                let s3_prefix = rel_path.to_string_lossy().into_owned();
+                match s3.list(&s3_prefix) {
+                    Ok(files) if !files.is_empty() => {
+                        logical_paths.extend(files.iter().map(|f| format!("{s3_prefix}/{f}")));
+                    }
+                    Ok(_) => {
+                        eprintln!("WARN: no S3 objects found for segment {s3_prefix}");
+                    }
+                    Err(e) => {
+                        eprintln!("WARN: S3 list failed for segment {s3_prefix}: {e}");
+                    }
+                }
             }
-            let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
-                continue;
-            };
-            let s3_prefix = rel_path.to_string_lossy().into_owned();
-            match s3.list(&s3_prefix) {
-                Ok(files) if !files.is_empty() => {
-                    logical_paths.extend(files.iter().map(|f| format!("{s3_prefix}/{f}")));
-                }
-                Ok(_) => {
-                    eprintln!("WARN: no S3 objects found for segment {s3_prefix}");
-                }
-                Err(e) => {
-                    eprintln!("WARN: S3 list failed for segment {s3_prefix}: {e}");
+
+            if !logical_paths.is_empty() {
+                println!(
+                    "cache miss: hydrating {} file(s) across {} segment(s) from S3 (fan-out={})",
+                    logical_paths.len(),
+                    owned.len(),
+                    self.hydrate_concurrency
+                );
+                for (path, result) in s3.read_many(&logical_paths, self.hydrate_concurrency) {
+                    match result {
+                        // read_many already persisted the bytes to disk (same
+                        // root dir as `self.cache`); just tell the cache's
+                        // size/LRU accounting about the new file instead of
+                        // re-writing it.
+                        Ok(_) => self.cache.note_external_write(&path),
+                        Err(e) => eprintln!("WARN: S3 download failed for {path}: {e}"),
+                    }
                 }
             }
+
+            drop(_permit);
+            complete_owned(&self.in_flight_segments, &owned);
         }
 
-        if !logical_paths.is_empty() {
-            println!(
-                "cache miss: hydrating {} file(s) across {} segment(s) from S3 (fan-out={})",
-                logical_paths.len(),
-                seg_paths.len(),
-                self.hydrate_concurrency
-            );
-            for (path, result) in s3.read_many(&logical_paths, self.hydrate_concurrency) {
-                match result {
-                    // read_many already persisted the bytes to disk (same
-                    // root dir as `self.cache`); just tell the cache's
-                    // size/LRU accounting about the new file instead of
-                    // re-writing it.
-                    Ok(_) => self.cache.note_external_write(&path),
-                    Err(e) => eprintln!("WARN: S3 download failed for {path}: {e}"),
-                }
-            }
-        }
+        wait_for(&waiting);
 
         seg_paths
             .iter()
@@ -1757,6 +1946,144 @@ mod tests {
         let msg = hydration_failed_message(&many);
         assert!(msg.contains("15 segment(s)"));
         assert!(msg.contains("(+5 more)"));
+    }
+
+    // ── Segment hydration coalescing ────────────────────────────────────
+    //
+    // `partition_for_hydration` / `complete_owned` / `wait_for` are the
+    // free functions `ensure_segments_local` uses to single-flight
+    // concurrent S3 hydration. They're deliberately independent of
+    // `S3Storage` (no real network / AWS creds needed) so the coalescing
+    // logic itself can be exercised directly with many real OS threads.
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn concurrent_requests_for_same_segment_coalesce_to_one_fetch() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        let in_flight: Mutex<HashMap<PathBuf, Arc<SegmentFetch>>> = Mutex::new(HashMap::new());
+        // Stand-in for `segment_is_complete`: false until the one fetcher
+        // "hydrates" it.
+        let hydrated = AtomicBool::new(false);
+        let fetch_count = AtomicUsize::new(0);
+        let seg_path = PathBuf::from("ns/seg-1");
+        let n = 8;
+        let barrier = Barrier::new(n);
+
+        std::thread::scope(|scope| {
+            for _ in 0..n {
+                scope.spawn(|| {
+                    barrier.wait(); // maximize actual overlap between threads
+                    let (owned, waiting) = partition_for_hydration(
+                        &in_flight,
+                        std::slice::from_ref(&seg_path),
+                        |_| hydrated.load(Ordering::SeqCst),
+                    );
+                    if !owned.is_empty() {
+                        fetch_count.fetch_add(1, Ordering::SeqCst);
+                        // Simulate a slow S3 fetch so the other threads have
+                        // time to observe the in-flight entry and become
+                        // waiters instead of also becoming owners.
+                        std::thread::sleep(Duration::from_millis(50));
+                        hydrated.store(true, Ordering::SeqCst);
+                        complete_owned(&in_flight, &owned);
+                    } else {
+                        wait_for(&waiting);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            fetch_count.load(Ordering::SeqCst),
+            1,
+            "only one thread should have performed the fetch; the rest must coalesce onto it"
+        );
+        assert!(
+            in_flight.lock().unwrap().is_empty(),
+            "in-flight entry must be removed after completion so a future cache miss can retry"
+        );
+        assert!(hydrated.load(Ordering::SeqCst));
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn hydration_failure_unblocks_waiters_instead_of_hanging_or_faking_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+
+        let in_flight: Mutex<HashMap<PathBuf, Arc<SegmentFetch>>> = Mutex::new(HashMap::new());
+        let seg_path = PathBuf::from("ns/seg-failing");
+        let n = 4;
+        let barrier = Barrier::new(n);
+        let waiters_that_saw_incomplete = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            for _ in 0..n {
+                scope.spawn(|| {
+                    barrier.wait();
+                    // `is_complete` always returns false — the segment never
+                    // becomes available, i.e. the owner's fetch permanently
+                    // fails.
+                    let (owned, waiting) = partition_for_hydration(
+                        &in_flight,
+                        std::slice::from_ref(&seg_path),
+                        |_| false,
+                    );
+                    if !owned.is_empty() {
+                        std::thread::sleep(Duration::from_millis(50));
+                        // The fetch "failed": nothing marks the segment
+                        // complete, but completion must still be signalled
+                        // so waiters don't hang forever.
+                        complete_owned(&in_flight, &owned);
+                    } else {
+                        wait_for(&waiting);
+                        // A waiter must be released promptly (this test
+                        // would otherwise hang) and, upon rechecking
+                        // completion itself exactly like the owner does,
+                        // see the segment as still incomplete rather than
+                        // assuming the owner's fetch succeeded.
+                        waiters_that_saw_incomplete.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            waiters_that_saw_incomplete.load(Ordering::SeqCst),
+            n - 1,
+            "every waiter must be unblocked after the owner's failed fetch"
+        );
+        assert!(in_flight.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn semaphore_bounds_concurrent_permits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sem = Semaphore::new(2);
+        let active = AtomicUsize::new(0);
+        let max_seen = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                scope.spawn(|| {
+                    let _permit = sem.acquire();
+                    let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(cur, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= 2,
+            "semaphore must never let more than 2 permits be held concurrently, saw {}",
+            max_seen.load(Ordering::SeqCst)
+        );
     }
 
     #[test]
