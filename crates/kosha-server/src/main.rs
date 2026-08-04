@@ -374,9 +374,30 @@ impl AppState {
     }
 
     /// Ensure a segment is available locally (download from S3 on cache miss).
+    /// Returns `true` if the segment is actually complete afterward.
     #[cfg(feature = "s3")]
-    fn ensure_segment_local(&self, seg_path: &Path) {
-        self.ensure_segments_local(std::slice::from_ref(&seg_path.to_path_buf()));
+    fn ensure_segment_local(&self, seg_path: &Path) -> bool {
+        self.ensure_segments_local(std::slice::from_ref(&seg_path.to_path_buf()))
+            .is_empty()
+    }
+
+    /// The files that must all be present for a segment to be usable by the
+    /// searcher. `vector.idx` is intentionally excluded — Phase 1 lexical
+    /// queries never load it (see `kosha_query`'s lazy vector loading), so
+    /// its absence must not count as an incomplete segment.
+    #[cfg(feature = "s3")]
+    const REQUIRED_SEGMENT_FILES: [&'static str; 4] = [
+        "footer.json",
+        "doc_store.bin",
+        "inverted.idx",
+        "filters.bin",
+    ];
+
+    #[cfg(feature = "s3")]
+    fn segment_is_complete(seg_path: &Path) -> bool {
+        Self::REQUIRED_SEGMENT_FILES
+            .iter()
+            .all(|f| seg_path.join(f).is_file())
     }
 
     /// Ensure every listed segment directory is available locally, fanning
@@ -390,15 +411,25 @@ impl AppState {
     /// For a namespace with many segments (or one big enough to need many),
     /// that serial chain is what turned a single search into tens of
     /// seconds to multiple minutes.
+    ///
+    /// Returns the relative paths of segments that are still incomplete
+    /// after the attempt. Every failure along the way (S3 list, S3 GET, or
+    /// the final local write) is logged as a `WARN` and otherwise
+    /// swallowed so one bad segment doesn't abort hydrating the rest — but
+    /// that means a caller that ignores this return value can't tell "this
+    /// segment has no data" from "hydration failed for this segment," and
+    /// would silently search a partial corpus. Callers must check this and
+    /// fail the request rather than return a deceptively successful empty
+    /// result.
     #[cfg(feature = "s3")]
-    fn ensure_segments_local(&self, seg_paths: &[PathBuf]) {
+    fn ensure_segments_local(&self, seg_paths: &[PathBuf]) -> Vec<String> {
         let Some(ref s3) = self.s3_storage else {
-            return;
+            return Vec::new();
         };
 
         let mut logical_paths: Vec<String> = Vec::new();
         for seg_path in seg_paths {
-            if seg_path.exists() {
+            if Self::segment_is_complete(seg_path) {
                 continue;
             }
             let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
@@ -418,24 +449,31 @@ impl AppState {
             }
         }
 
-        if logical_paths.is_empty() {
-            return;
-        }
-        println!(
-            "cache miss: hydrating {} file(s) across {} segment(s) from S3 (fan-out={})",
-            logical_paths.len(),
-            seg_paths.len(),
-            self.hydrate_concurrency
-        );
-        for (path, result) in s3.read_many(&logical_paths, self.hydrate_concurrency) {
-            match result {
-                // read_many already persisted the bytes to disk (same root
-                // dir as `self.cache`); just tell the cache's size/LRU
-                // accounting about the new file instead of re-writing it.
-                Ok(_) => self.cache.note_external_write(&path),
-                Err(e) => eprintln!("WARN: S3 download failed for {path}: {e}"),
+        if !logical_paths.is_empty() {
+            println!(
+                "cache miss: hydrating {} file(s) across {} segment(s) from S3 (fan-out={})",
+                logical_paths.len(),
+                seg_paths.len(),
+                self.hydrate_concurrency
+            );
+            for (path, result) in s3.read_many(&logical_paths, self.hydrate_concurrency) {
+                match result {
+                    // read_many already persisted the bytes to disk (same
+                    // root dir as `self.cache`); just tell the cache's
+                    // size/LRU accounting about the new file instead of
+                    // re-writing it.
+                    Ok(_) => self.cache.note_external_write(&path),
+                    Err(e) => eprintln!("WARN: S3 download failed for {path}: {e}"),
+                }
             }
         }
+
+        seg_paths
+            .iter()
+            .filter(|p| !Self::segment_is_complete(p))
+            .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
     }
 
     /// Ensure a single file within a segment dir is local (e.g. `footer.json`).
@@ -460,14 +498,19 @@ impl AppState {
         }
     }
 
-    /// Hydrate only segments that might match `filter` (footer bloom prune first).
+    /// Hydrate only segments that might match `filter` (footer bloom prune
+    /// first). Returns the relative paths of segments that are still
+    /// incomplete after hydration was attempted — see `ensure_segments_local`.
+    /// An empty result means every segment the search actually needs is
+    /// present; a non-empty one means the caller must not proceed with the
+    /// search as if the corpus were complete.
     #[cfg(feature = "s3")]
     fn hydrate_segments_for_search(
         &self,
         ns: &NamespaceId,
         manifest: &kosha_core::Manifest,
         filter: Option<&FilterClause>,
-    ) {
+    ) -> Vec<String> {
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         for entry in &manifest.segments {
             let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
@@ -481,7 +524,7 @@ impl AppState {
             }
             to_hydrate.push(seg_path);
         }
-        self.ensure_segments_local(&to_hydrate);
+        self.ensure_segments_local(&to_hydrate)
     }
 
     /// Upload a single file from a local segment dir to S3.
@@ -1132,7 +1175,12 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
 
     // Footer-first hydrate: bloom-prune before downloading full segments.
     #[cfg(feature = "s3")]
-    state.hydrate_segments_for_search(&ns, &manifest, query.filter.as_ref());
+    {
+        let missing = state.hydrate_segments_for_search(&ns, &manifest, query.filter.as_ref());
+        if !missing.is_empty() {
+            return json_error(503, &hydration_failed_message(&missing));
+        }
+    }
 
     match state
         .searcher
@@ -1204,7 +1252,12 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     };
 
     #[cfg(feature = "s3")]
-    state.hydrate_segments_for_search(&ns, &manifest, query.filter.as_ref());
+    {
+        let missing = state.hydrate_segments_for_search(&ns, &manifest, query.filter.as_ref());
+        if !missing.is_empty() {
+            return json_error(503, &hydration_failed_message(&missing));
+        }
+    }
 
     match state
         .searcher
@@ -1449,6 +1502,30 @@ fn body_val_fallback(body: &[u8]) -> serde_json::Value {
     serde_json::json!({})
 }
 
+/// Error message for a search that can't proceed because hydrating one or
+/// more required segments from S3 failed — returning results anyway would
+/// silently look like "0 hits" for a namespace that actually has data.
+#[cfg(feature = "s3")]
+fn hydration_failed_message(missing: &[String]) -> String {
+    const MAX_LISTED: usize = 10;
+    let listed: Vec<&str> = missing
+        .iter()
+        .take(MAX_LISTED)
+        .map(|s| s.as_str())
+        .collect();
+    let suffix = if missing.len() > MAX_LISTED {
+        format!(" (+{} more)", missing.len() - MAX_LISTED)
+    } else {
+        String::new()
+    };
+    format!(
+        "segment hydration failed for {} segment(s), search would be incomplete: {}{}",
+        missing.len(),
+        listed.join(", "),
+        suffix
+    )
+}
+
 // ─── JSON response helpers ──────────────────────────────────────────────────
 
 fn json_ok<T: serde::Serialize>(value: &T) -> String {
@@ -1465,6 +1542,7 @@ fn json_error(status_code: u16, message: &str) -> String {
         400 => "400 Bad Request",
         404 => "404 Not Found",
         500 => "500 Internal Server Error",
+        503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     };
     format!(
@@ -1523,6 +1601,51 @@ mod tests {
     use super::*;
     use kosha_core::{Document, DocumentId, Field};
     use std::fs;
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn segment_is_complete_requires_all_core_files_but_not_vector_idx() {
+        let dir = std::env::temp_dir().join("kosha-test-segment-complete");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        assert!(
+            !AppState::segment_is_complete(&dir),
+            "empty dir must not count as complete"
+        );
+
+        for f in ["footer.json", "doc_store.bin", "inverted.idx"] {
+            fs::write(dir.join(f), b"x").unwrap();
+        }
+        assert!(
+            !AppState::segment_is_complete(&dir),
+            "missing filters.bin must still be incomplete"
+        );
+
+        fs::write(dir.join("filters.bin"), b"x").unwrap();
+        assert!(
+            AppState::segment_is_complete(&dir),
+            "all four core files present (vector.idx not required) must be complete"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn hydration_failed_message_lists_and_truncates() {
+        let few = vec!["ns/seg-1".to_string(), "ns/seg-2".to_string()];
+        let msg = hydration_failed_message(&few);
+        assert!(msg.contains("2 segment(s)"));
+        assert!(msg.contains("ns/seg-1"));
+        assert!(msg.contains("ns/seg-2"));
+        assert!(!msg.contains("more)"));
+
+        let many: Vec<String> = (0..15).map(|i| format!("ns/seg-{i}")).collect();
+        let msg = hydration_failed_message(&many);
+        assert!(msg.contains("15 segment(s)"));
+        assert!(msg.contains("(+5 more)"));
+    }
 
     #[test]
     fn healthz_returns_200_ok() {
