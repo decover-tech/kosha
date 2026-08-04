@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kosha_core::{
-    segment_may_match, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
-    AggMetricResult, Aggregation, AggregationResults, Bm25Params, DocumentId, FieldType,
-    FilterClause, FilterStore, KoshaError, Manifest, NamespaceId, ScoredDocument, SearchQuery,
-    SearchResult, SortSpec,
+    segment_may_contain_terms, segment_may_match, AggBucket, AggBucketResult, AggCompositeBucket,
+    AggCompositeResult, AggMetricResult, Aggregation, AggregationResults, Bm25Params, DocumentId,
+    FieldType, FilterClause, FilterStore, KoshaError, Manifest, NamespaceId, ScoredDocument,
+    SearchQuery, SearchResult, SortSpec, TermBloomMode,
 };
 use kosha_segment::{tokenize, SegmentReader};
 
@@ -596,6 +596,18 @@ impl Searcher {
         }
 
         let query_terms = tokenize(&query.query_text);
+        let phrase_terms_for_prune = query.match_phrase.as_ref().map(|mp| tokenize(&mp.phrase));
+        // Term-bloom prune before open. Wildcard expansion needs the segment
+        // vocabulary, so it cannot be pruned here (OR over unknown terms).
+        let term_prune: Option<(Vec<String>, TermBloomMode)> = if query.wildcard.is_some() {
+            None
+        } else if let Some(ref pt) = phrase_terms_for_prune {
+            Some((pt.clone(), TermBloomMode::And))
+        } else if !query_terms.is_empty() {
+            Some((query_terms.clone(), TermBloomMode::And))
+        } else {
+            None
+        };
 
         let is_tombstoned = |seg_id: &kosha_core::SegmentId, doc_seq: u32| -> bool {
             tombstones.is_some_and(|t| t.get(seg_id).is_some_and(|seqs| seqs.contains(&doc_seq)))
@@ -619,10 +631,17 @@ impl Searcher {
             }
 
             // Prune via footer blooms before opening inverted/filters/vectors.
-            if let Some(ref filter) = query.filter {
+            if query.filter.is_some() || term_prune.is_some() {
                 if let Ok(footer) = SegmentReader::read_footer(&seg_dir) {
-                    if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
-                        continue;
+                    if let Some(ref filter) = query.filter {
+                        if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
+                            continue;
+                        }
+                    }
+                    if let Some((ref terms, mode)) = term_prune {
+                        if !segment_may_contain_terms(terms, mode, footer.term_bloom.as_ref()) {
+                            continue;
+                        }
                     }
                 }
             }
@@ -709,46 +728,46 @@ impl Searcher {
                         }
                     }
                 } else {
-                    // Multi-term: intersect doc_ids, then score intersection.
-                    // Start with the shortest postings list for efficiency.
-                    let mut and_candidates: Vec<(u32, Vec<Vec<u32>>)> = {
-                        let shortest = term_postings.iter().min_by_key(|(_, p)| p.len()).unwrap();
-                        shortest.1.iter().map(|p| (p.doc_id, Vec::new())).collect()
-                    };
-                    let _doc_freqs: HashMap<u32, HashMap<&str, u32>> = HashMap::new();
+                    // Multi-term AND: build per-term doc→posting maps once,
+                    // intersect starting from the shortest list, then score
+                    // via O(1) lookup. The previous path rebuilt a map for
+                    // intersection but re-scanned each postings list with
+                    // `.find()` while scoring (~O(hits · postings)) — that
+                    // dominated warm multi-term latency (see scoring_profile).
+                    let term_maps: Vec<(&str, HashMap<u32, &kosha_core::Posting>, u32)> =
+                        term_postings
+                            .iter()
+                            .map(|(term, postings)| {
+                                let df = doc_frequencies.get(term).copied().unwrap_or(0);
+                                let map = postings.iter().map(|p| (p.doc_id, p)).collect();
+                                (*term, map, df)
+                            })
+                            .collect();
 
-                    // For each candidate doc, verify it appears in ALL other postings lists.
-                    for (_term, postings) in &term_postings {
-                        let term_docs: HashMap<u32, &kosha_core::Posting> =
-                            postings.iter().map(|p| (p.doc_id, p)).collect();
-                        and_candidates.retain(|(doc_id, _)| term_docs.contains_key(doc_id));
+                    let mut and_candidates: Vec<u32> = {
+                        let shortest = term_maps.iter().min_by_key(|(_, m, _)| m.len()).unwrap();
+                        shortest.1.keys().copied().collect()
+                    };
+                    for (_, map, _) in &term_maps {
+                        and_candidates.retain(|doc_id| map.contains_key(doc_id));
                         if and_candidates.is_empty() {
                             break;
                         }
-                        // Store positions for phrase matching.
-                        for (doc_id, positions) in &mut and_candidates {
-                            if let Some(posting) = term_docs.get(doc_id) {
-                                positions.push(posting.positions.clone());
-                            }
-                        }
                     }
 
-                    // Score surviving candidates.
-                    for (doc_id, _doc_positions) in &and_candidates {
-                        if let Some(doc_rec) = reader.doc_record(*doc_id) {
+                    for doc_id in and_candidates {
+                        if let Some(doc_rec) = reader.doc_record(doc_id) {
                             let mut total_score = 0.0;
-                            for (term, postings) in &term_postings {
-                                let df = doc_frequencies.get(term).copied().unwrap_or(0);
-                                let posting = postings.iter().find(|p| p.doc_id == *doc_id);
-                                if let Some(p) = posting {
+                            for (_, map, df) in &term_maps {
+                                if let Some(p) = map.get(&doc_id) {
                                     total_score += scorer.score_term(
                                         p.term_frequency,
-                                        df,
+                                        *df,
                                         doc_rec.field_length,
                                     );
                                 }
                             }
-                            scored.insert(*doc_id, total_score);
+                            scored.insert(doc_id, total_score);
                         }
                     }
                 }
@@ -1375,14 +1394,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let ns = NamespaceId("test".into());
 
+        // Both segments must contain every query term — multi-term BM25 is
+        // AND, and term-bloom prune skips segments missing any required term.
         let seg1_dir = dir.join(&ns.0).join("s1");
         let mut w1 = SegmentWriter::new(SegmentId("s1".into()), seg1_dir.clone());
-        w1.add_document(DocumentId("d1".into()), vec![Field::text("t", "alpha")]);
+        w1.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("t", "alpha beta")],
+        );
         w1.finalize(Bm25Params::default()).unwrap();
 
         let seg2_dir = dir.join(&ns.0).join("s2");
         let mut w2 = SegmentWriter::new(SegmentId("s2".into()), seg2_dir.clone());
-        w2.add_document(DocumentId("d2".into()), vec![Field::text("t", "beta")]);
+        w2.add_document(
+            DocumentId("d2".into()),
+            vec![Field::text("t", "alpha beta")],
+        );
         w2.finalize(Bm25Params::default()).unwrap();
 
         let seg_size = |dir: &std::path::Path| -> u64 {
@@ -1609,6 +1636,99 @@ mod tests {
             "deep bounded page (from>0) must match the equivalent slice of a full sort"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn term_bloom_skips_segments_without_query_terms() {
+        let dir = std::env::temp_dir().join("kosha-test-term-bloom-prune");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+
+        let seg_a = dir.join(&ns.0).join("s-match");
+        let mut wa = SegmentWriter::new(SegmentId("s-match".into()), seg_a.clone());
+        wa.add_document(
+            DocumentId("hit".into()),
+            vec![Field::text("content", "contract language here")],
+        );
+        wa.finalize(Bm25Params::default()).unwrap();
+
+        let seg_b = dir.join(&ns.0).join("s-miss");
+        let mut wb = SegmentWriter::new(SegmentId("s-miss".into()), seg_b.clone());
+        wb.add_document(
+            DocumentId("miss".into()),
+            vec![Field::text("content", "completely different vocabulary")],
+        );
+        wb.finalize(Bm25Params::default()).unwrap();
+
+        let miss_footer = SegmentReader::read_footer(&seg_b).unwrap();
+        assert!(
+            !kosha_core::segment_may_contain_terms(
+                &["contract".into()],
+                kosha_core::TermBloomMode::And,
+                miss_footer.term_bloom.as_ref(),
+            ),
+            "segment without 'contract' must be bloom-prunable"
+        );
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![
+                ManifestEntry {
+                    segment_id: SegmentId("s-match".into()),
+                    doc_count: 1,
+                },
+                ManifestEntry {
+                    segment_id: SegmentId("s-miss".into()),
+                    doc_count: 1,
+                },
+            ],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let r = searcher
+            .search(&ns, &manifest, &mk_query("contract", 10), None)
+            .unwrap();
+        assert_eq!(r.total_hits, 1);
+        assert_eq!(r.results[0].doc_id.0, "hit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_term_and_intersects_and_scores() {
+        // Multi-term queries take the AND path (HashMap posting lookup).
+        // Docs must contain *all* terms; partial matches are excluded.
+        let dir = std::env::temp_dir().join("kosha-test-multi-term-and");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        w.add_document(
+            DocumentId("both".into()),
+            vec![Field::text("content", "contract dispute clause")],
+        );
+        w.add_document(
+            DocumentId("only-contract".into()),
+            vec![Field::text("content", "contract alone")],
+        );
+        w.add_document(
+            DocumentId("only-dispute".into()),
+            vec![Field::text("content", "dispute alone")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 3,
+            }],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let r = searcher
+            .search(&ns, &manifest, &mk_query("contract dispute", 10), None)
+            .unwrap();
+        assert_eq!(r.total_hits, 1);
+        assert_eq!(r.results[0].doc_id.0, "both");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
