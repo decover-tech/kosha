@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rayon::prelude::*;
+
 use kosha_core::{
     segment_may_contain_terms, segment_may_match, AggBucket, AggBucketResult, AggCompositeBucket,
     AggCompositeResult, AggMetricResult, Aggregation, AggregationResults, Bm25Params, DocumentId,
-    FieldType, FilterClause, FilterStore, KoshaError, Manifest, NamespaceId, ScoredDocument,
-    SearchQuery, SearchResult, SortSpec, TermBloomMode,
+    FieldType, FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry, NamespaceId,
+    ScoredDocument, SearchQuery, SearchResult, SortSpec, TermBloomMode,
 };
 use kosha_segment::{tokenize, SegmentReader};
 
@@ -578,6 +580,340 @@ impl Searcher {
         Ok(reader)
     }
 
+    /// Score one manifest segment against `query`: open it (bloom-pruning
+    /// first, to skip the open entirely when possible), run BM25/wildcard/
+    /// phrase/kNN scoring, apply the filter, and compute this segment's own
+    /// aggregation contribution. Returns `Ok(None)` when the segment is
+    /// absent locally or pruned by a bloom check — same skip conditions the
+    /// old sequential loop's `continue` handled.
+    ///
+    /// Segments are otherwise fully independent of each other until the
+    /// caller reduces their outputs (candidates flattened, aggregations
+    /// merged) — see [`Searcher::search`], which runs this via
+    /// `par_iter().map(...)` across the manifest instead of one at a time.
+    #[allow(clippy::too_many_arguments)]
+    fn score_segment(
+        &self,
+        namespace: &NamespaceId,
+        entry: &ManifestEntry,
+        query: &SearchQuery,
+        query_terms: &[String],
+        term_prune: Option<&(Vec<String>, TermBloomMode)>,
+        sort_value_fields: &[String],
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
+    ) -> Result<Option<SegmentOutput>, KoshaError> {
+        let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+        if !seg_dir.exists() {
+            return Ok(None);
+        }
+
+        // Prune via footer blooms before opening inverted/filters/vectors.
+        if query.filter.is_some() || term_prune.is_some() {
+            if let Ok(footer) = SegmentReader::read_footer(&seg_dir) {
+                if let Some(ref filter) = query.filter {
+                    if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
+                        return Ok(None);
+                    }
+                }
+                if let Some((terms, mode)) = term_prune {
+                    if !segment_may_contain_terms(terms, *mode, footer.term_bloom.as_ref()) {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        let is_tombstoned = |doc_seq: u32| -> bool {
+            tombstones.is_some_and(|t| {
+                t.get(&entry.segment_id)
+                    .is_some_and(|seqs| seqs.contains(&doc_seq))
+            })
+        };
+
+        // Lexical/BM25 queries (no query.knn) never touch vectors or the
+        // HNSW graph — skip loading both so keyword search latency stops
+        // scaling with embedding volume/segment count.
+        let reader = self.open_segment(
+            &namespace.0,
+            &entry.segment_id.0,
+            seg_dir,
+            query.knn.is_some(),
+        )?;
+        let total_docs = reader.doc_count();
+        let store = &reader.filter_store;
+        let scorer = Bm25Scorer::new(
+            total_docs,
+            reader.avg_field_length(),
+            reader.bm25_params().clone(),
+        );
+
+        let has_query =
+            !query_terms.is_empty() || query.wildcard.is_some() || query.match_phrase.is_some();
+        let has_only_filter = !has_query && query.filter.is_some();
+
+        // Per-segment hits keyed by doc_seq for O(1) kNN hybrid merge.
+        let mut seg_hits: HashMap<u32, (f64, DocumentId)> = HashMap::new();
+
+        // ── Wildcard matching ──
+        let is_wildcard_mode = query.wildcard.is_some();
+        let effective_terms = if let Some(ref wc) = query.wildcard {
+            let all_terms: Vec<&str> = reader.all_terms();
+            wildcard_terms(&all_terms, &wc.pattern, wc.case_insensitive)
+        } else if !query_terms.is_empty() {
+            query_terms.to_vec()
+        } else {
+            Vec::new()
+        };
+
+        // ── Match phrase ──
+        let phrase_match = if let Some(ref mp) = query.match_phrase {
+            let phrase_terms = tokenize(&mp.phrase);
+            Some((phrase_terms, mp.slop))
+        } else {
+            None
+        };
+
+        let phrase_tokenized = phrase_match.as_ref().map(|p| &p.0);
+
+        // ── BM25 scoring with positions for phrase ──
+        if !effective_terms.is_empty() || phrase_tokenized.is_some() {
+            let terms_for_bm25 = if let Some(ref pt) = phrase_tokenized {
+                pt
+            } else {
+                &effective_terms
+            };
+
+            let term_postings: Vec<(&str, &[kosha_core::Posting])> = terms_for_bm25
+                .iter()
+                .filter_map(|t| reader.postings(t).map(|p| (t.as_str(), p)))
+                .collect();
+
+            let mut doc_frequencies: HashMap<&str, u32> = HashMap::new();
+            for (t, p) in &term_postings {
+                doc_frequencies.insert(t, p.len() as u32);
+            }
+
+            // ── Postings AND/OR: AND for multi-term queries, OR for wildcard ──
+            let mut scored: HashMap<u32, f64> = HashMap::new();
+            let use_and =
+                term_postings.len() > 1 && !is_wildcard_mode && phrase_tokenized.is_none();
+
+            if !use_and {
+                // OR mode (wildcard, phrase, or single term): score any matching doc.
+                for (term, postings) in &term_postings {
+                    let df = doc_frequencies.get(term).copied().unwrap_or(0);
+                    for posting in *postings {
+                        if let Some(meta) = reader.doc_meta(posting.doc_id) {
+                            let score =
+                                scorer.score_term(posting.term_frequency, df, meta.field_length);
+                            *scored.entry(posting.doc_id).or_insert(0.0) += score;
+                        }
+                    }
+                }
+            } else {
+                // Multi-term AND: build per-term doc→posting maps once,
+                // intersect starting from the shortest list, then score
+                // via O(1) lookup. The previous path rebuilt a map for
+                // intersection but re-scanned each postings list with
+                // `.find()` while scoring (~O(hits · postings)) — that
+                // dominated warm multi-term latency (see scoring_profile).
+                let term_maps: Vec<(&str, HashMap<u32, &kosha_core::Posting>, u32)> = term_postings
+                    .iter()
+                    .map(|(term, postings)| {
+                        let df = doc_frequencies.get(term).copied().unwrap_or(0);
+                        let map = postings.iter().map(|p| (p.doc_id, p)).collect();
+                        (*term, map, df)
+                    })
+                    .collect();
+
+                let mut and_candidates: Vec<u32> = {
+                    let shortest = term_maps.iter().min_by_key(|(_, m, _)| m.len()).unwrap();
+                    shortest.1.keys().copied().collect()
+                };
+                for (_, map, _) in &term_maps {
+                    and_candidates.retain(|doc_id| map.contains_key(doc_id));
+                    if and_candidates.is_empty() {
+                        break;
+                    }
+                }
+
+                for doc_id in and_candidates {
+                    if let Some(meta) = reader.doc_meta(doc_id) {
+                        let mut total_score = 0.0;
+                        for (_, map, df) in &term_maps {
+                            if let Some(p) = map.get(&doc_id) {
+                                total_score +=
+                                    scorer.score_term(p.term_frequency, *df, meta.field_length);
+                            }
+                        }
+                        scored.insert(doc_id, total_score);
+                    }
+                }
+            }
+
+            // Apply phrase matching (filter out docs that don't match the phrase).
+            if let Some((ref phrase_terms, slop)) = phrase_match {
+                // Fetch each phrase term's postings once (not once per
+                // candidate doc) and index by doc_id for O(1) lookup —
+                // matters more once `postings()` can become an on-demand
+                // read in a later milestone, but is a real redundant-work
+                // fix even today.
+                let phrase_postings: Vec<HashMap<u32, &[u32]>> = phrase_terms
+                    .iter()
+                    .map(|pt| {
+                        reader
+                            .postings(pt)
+                            .map(|postings| {
+                                postings
+                                    .iter()
+                                    .map(|p| (p.doc_id, p.positions.as_slice()))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect();
+
+                let doc_ids: Vec<u32> = scored.keys().copied().collect();
+                for doc_id in doc_ids {
+                    let mut term_positions: Vec<Vec<u32>> = Vec::new();
+                    for term_map in &phrase_postings {
+                        if let Some(positions) = term_map.get(&doc_id) {
+                            term_positions.push(positions.to_vec());
+                        }
+                    }
+                    if term_positions.len() < phrase_terms.len() {
+                        // Not all phrase terms appear in this doc.
+                        scored.remove(&doc_id);
+                        continue;
+                    }
+                    let phrase_score = match_phrase_score(&term_positions, slop);
+                    if phrase_score == 0.0 {
+                        scored.remove(&doc_id);
+                    } else {
+                        // Boost the score for matching the phrase.
+                        *scored.get_mut(&doc_id).unwrap() *= 1.0 + phrase_score * 0.5;
+                    }
+                }
+            }
+
+            // Apply filter to this segment's scored docs *before* merging
+            // into candidates. Filtering after the segment loop previously
+            // dropped hits from earlier segments.
+            let passed_filter: Option<HashSet<u32>> = if let Some(ref clause) = query.filter {
+                let filter_candidates: HashSet<u32> = scored.keys().copied().collect();
+                Some(FilterApplier::apply(clause, store, &filter_candidates)?)
+            } else {
+                None
+            };
+
+            for (doc_seq, score) in scored {
+                if is_tombstoned(doc_seq) {
+                    continue;
+                }
+                if let Some(ref passed) = passed_filter {
+                    if !passed.contains(&doc_seq) {
+                        continue;
+                    }
+                }
+                if let Some(meta) = reader.doc_meta(doc_seq) {
+                    seg_hits.insert(doc_seq, (score, meta.doc_id.clone()));
+                }
+            }
+        } else if has_only_filter {
+            let all_candidates: HashSet<u32> = (0..total_docs).collect();
+            let passed =
+                FilterApplier::apply(query.filter.as_ref().unwrap(), store, &all_candidates)?;
+            for doc_seq in passed {
+                if is_tombstoned(doc_seq) {
+                    continue;
+                }
+                if let Some(meta) = reader.doc_meta(doc_seq) {
+                    let score = scorer.score_term(1, total_docs, meta.field_length);
+                    seg_hits.insert(doc_seq, (score, meta.doc_id.clone()));
+                }
+            }
+        }
+
+        // ── kNN search (HNSW when available, flat fallback) ──
+        if let Some(ref knn) = query.knn {
+            if !reader.vector_store.vectors.is_empty() {
+                let knn_results: Vec<(u32, f64)> = if let Some(ref hnsw) = reader.hnsw_map {
+                    let query_point = kosha_segment::CosinePoint(knn.vector.clone());
+                    let mut search = instant_distance::Search::default();
+                    hnsw.search(&query_point, &mut search)
+                        .take(knn.k)
+                        .map(|item| (*item.value, (1.0 - item.distance as f64).max(0.0)))
+                        .collect()
+                } else {
+                    flat_knn(&knn.vector, &reader.vector_store.vectors, knn.k)
+                };
+                // Merge with this segment's BM25 hits or use kNN directly.
+                // Per-segment HashMap keeps hybrid merge O(k), not O(hits·k).
+                if !seg_hits.is_empty() {
+                    for (doc_seq, knn_score) in knn_results {
+                        if let Some(existing) = seg_hits.get_mut(&doc_seq) {
+                            existing.0 = existing.0 * 0.5 + knn_score * 0.5 * 100.0;
+                        }
+                    }
+                } else {
+                    // Pure kNN search for this segment.
+                    for (doc_seq, score) in knn_results {
+                        if is_tombstoned(doc_seq) {
+                            continue;
+                        }
+                        if let Some(meta) = reader.doc_meta(doc_seq) {
+                            seg_hits.insert(doc_seq, ((score + 1.0) * 10.0, meta.doc_id.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let sort_value_maps = if sort_value_fields.is_empty() {
+            HashMap::new()
+        } else {
+            build_sort_value_maps(store, sort_value_fields)
+        };
+        let mut candidates = Vec::with_capacity(seg_hits.len());
+        for (doc_seq, (score, doc_id)) in seg_hits {
+            let sort_values = if sort_value_fields.is_empty() {
+                Vec::new()
+            } else {
+                extract_sort_values(doc_seq, sort_value_fields, &sort_value_maps)
+            };
+            candidates.push(HitCandidate {
+                reader: Arc::clone(&reader),
+                doc_seq,
+                doc_id,
+                score,
+                sort_values,
+            });
+        }
+
+        // ── Aggregations (this segment's own contribution only) ──
+        let mut aggs = HashMap::new();
+        for (agg_name, agg) in &query.aggs {
+            match agg {
+                Aggregation::Terms { terms } => {
+                    let result = compute_single_aggregation(store, &terms.field);
+                    aggs.insert(agg_name.clone(), result);
+                }
+                Aggregation::Cardinality { cardinality } => {
+                    let result = compute_cardinality(store, &cardinality.field);
+                    aggs.insert(agg_name.clone(), result);
+                }
+                Aggregation::Composite { composite } => {
+                    let result = compute_composite(store, composite);
+                    aggs.insert(agg_name.clone(), result);
+                }
+            }
+        }
+
+        Ok(Some(SegmentOutput { candidates, aggs }))
+    }
+
     pub fn search(
         &self,
         namespace: &NamespaceId,
@@ -609,321 +945,54 @@ impl Searcher {
             None
         };
 
-        let is_tombstoned = |seg_id: &kosha_core::SegmentId, doc_seq: u32| -> bool {
-            tombstones.is_some_and(|t| t.get(seg_id).is_some_and(|seqs| seqs.contains(&doc_seq)))
-        };
-        let has_query =
-            !query_terms.is_empty() || query.wildcard.is_some() || query.match_phrase.is_some();
-        let has_only_filter = !has_query && query.filter.is_some();
-
         // Score-only candidates (#37): defer `fields.clone()` until after
         // top-k / page selection so clone+sort cost scales with page size,
-        // not total hit count. Readers stay alive so the page can materialize.
+        // not total hit count. Each candidate carries its own `Arc<SegmentReader>`
+        // clone so the page can materialize after the segment loop finishes.
         let sort_value_fields = sort_fields_needing_values(&query.sort);
-        let mut readers: Vec<Arc<SegmentReader>> = Vec::new();
+
+        // Segments are independent until this reduce step, and opening
+        // (I/O + parse) plus BM25/kNN scoring is what dominates wall-clock
+        // for a broad query that touches most/all segments in the manifest
+        // — so score them concurrently instead of one at a time.
+        // `par_iter().map(...).collect()` preserves manifest order in the
+        // output Vec no matter which thread finishes first, so the reduce
+        // below is deterministic and behavior-identical to the old
+        // sequential loop, just faster.
+        let segment_outputs: Vec<SegmentOutput> = manifest
+            .segments
+            .par_iter()
+            .map(|entry| {
+                self.score_segment(
+                    namespace,
+                    entry,
+                    query,
+                    &query_terms,
+                    term_prune.as_ref(),
+                    &sort_value_fields,
+                    tombstones,
+                )
+            })
+            .collect::<Result<Vec<Option<SegmentOutput>>, KoshaError>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
         let mut candidates: Vec<HitCandidate> = Vec::new();
         let mut all_aggs: HashMap<String, AggregationResults> = HashMap::new();
-
-        for entry in &manifest.segments {
-            let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
-            if !seg_dir.exists() {
-                continue;
-            }
-
-            // Prune via footer blooms before opening inverted/filters/vectors.
-            if query.filter.is_some() || term_prune.is_some() {
-                if let Ok(footer) = SegmentReader::read_footer(&seg_dir) {
-                    if let Some(ref filter) = query.filter {
-                        if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
-                            continue;
-                        }
-                    }
-                    if let Some((ref terms, mode)) = term_prune {
-                        if !segment_may_contain_terms(terms, mode, footer.term_bloom.as_ref()) {
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // Lexical/BM25 queries (no query.knn) never touch vectors or the
-            // HNSW graph — skip loading both so keyword search latency stops
-            // scaling with embedding volume/segment count.
-            let reader = self.open_segment(
-                &namespace.0,
-                &entry.segment_id.0,
-                seg_dir,
-                query.knn.is_some(),
-            )?;
-            let reader_idx = readers.len();
-            readers.push(Arc::clone(&reader));
-            let total_docs = reader.doc_count();
-            let store = &reader.filter_store;
-            let scorer = Bm25Scorer::new(
-                total_docs,
-                reader.avg_field_length(),
-                reader.bm25_params().clone(),
-            );
-
-            // Per-segment hits keyed by doc_seq for O(1) kNN hybrid merge.
-            let mut seg_hits: HashMap<u32, (f64, DocumentId)> = HashMap::new();
-
-            // ── Wildcard matching ──
-            let is_wildcard_mode = query.wildcard.is_some();
-            let effective_terms = if let Some(ref wc) = query.wildcard {
-                let all_terms: Vec<&str> = reader.all_terms();
-                wildcard_terms(&all_terms, &wc.pattern, wc.case_insensitive)
-            } else if !query_terms.is_empty() {
-                query_terms.clone()
-            } else {
-                Vec::new()
-            };
-
-            // ── Match phrase ──
-            let phrase_match = if let Some(ref mp) = query.match_phrase {
-                let phrase_terms = tokenize(&mp.phrase);
-                Some((phrase_terms, mp.slop))
-            } else {
-                None
-            };
-
-            let phrase_tokenized = phrase_match.as_ref().map(|p| &p.0);
-
-            // ── BM25 scoring with positions for phrase ──
-            if !effective_terms.is_empty() || phrase_tokenized.is_some() {
-                let terms_for_bm25 = if let Some(ref pt) = phrase_tokenized {
-                    pt
-                } else {
-                    &effective_terms
-                };
-
-                let term_postings: Vec<(&str, &[kosha_core::Posting])> = terms_for_bm25
-                    .iter()
-                    .filter_map(|t| reader.postings(t).map(|p| (t.as_str(), p)))
-                    .collect();
-
-                let mut doc_frequencies: HashMap<&str, u32> = HashMap::new();
-                for (t, p) in &term_postings {
-                    doc_frequencies.insert(t, p.len() as u32);
-                }
-
-                // ── Postings AND/OR: AND for multi-term queries, OR for wildcard ──
-                let mut scored: HashMap<u32, f64> = HashMap::new();
-                let use_and =
-                    term_postings.len() > 1 && !is_wildcard_mode && phrase_tokenized.is_none();
-
-                if !use_and {
-                    // OR mode (wildcard, phrase, or single term): score any matching doc.
-                    for (term, postings) in &term_postings {
-                        let df = doc_frequencies.get(term).copied().unwrap_or(0);
-                        for posting in *postings {
-                            if let Some(meta) = reader.doc_meta(posting.doc_id) {
-                                let score = scorer.score_term(
-                                    posting.term_frequency,
-                                    df,
-                                    meta.field_length,
-                                );
-                                *scored.entry(posting.doc_id).or_insert(0.0) += score;
-                            }
-                        }
-                    }
-                } else {
-                    // Multi-term AND: build per-term doc→posting maps once,
-                    // intersect starting from the shortest list, then score
-                    // via O(1) lookup. The previous path rebuilt a map for
-                    // intersection but re-scanned each postings list with
-                    // `.find()` while scoring (~O(hits · postings)) — that
-                    // dominated warm multi-term latency (see scoring_profile).
-                    let term_maps: Vec<(&str, HashMap<u32, &kosha_core::Posting>, u32)> =
-                        term_postings
-                            .iter()
-                            .map(|(term, postings)| {
-                                let df = doc_frequencies.get(term).copied().unwrap_or(0);
-                                let map = postings.iter().map(|p| (p.doc_id, p)).collect();
-                                (*term, map, df)
-                            })
-                            .collect();
-
-                    let mut and_candidates: Vec<u32> = {
-                        let shortest = term_maps.iter().min_by_key(|(_, m, _)| m.len()).unwrap();
-                        shortest.1.keys().copied().collect()
-                    };
-                    for (_, map, _) in &term_maps {
-                        and_candidates.retain(|doc_id| map.contains_key(doc_id));
-                        if and_candidates.is_empty() {
-                            break;
-                        }
-                    }
-
-                    for doc_id in and_candidates {
-                        if let Some(meta) = reader.doc_meta(doc_id) {
-                            let mut total_score = 0.0;
-                            for (_, map, df) in &term_maps {
-                                if let Some(p) = map.get(&doc_id) {
-                                    total_score +=
-                                        scorer.score_term(p.term_frequency, *df, meta.field_length);
-                                }
-                            }
-                            scored.insert(doc_id, total_score);
-                        }
-                    }
-                }
-
-                // Apply phrase matching (filter out docs that don't match the phrase).
-                if let Some((ref phrase_terms, slop)) = phrase_match {
-                    // Fetch each phrase term's postings once (not once per
-                    // candidate doc) and index by doc_id for O(1) lookup —
-                    // matters more once `postings()` can become an on-demand
-                    // read in a later milestone, but is a real redundant-work
-                    // fix even today.
-                    let phrase_postings: Vec<HashMap<u32, &[u32]>> = phrase_terms
-                        .iter()
-                        .map(|pt| {
-                            reader
-                                .postings(pt)
-                                .map(|postings| {
-                                    postings
-                                        .iter()
-                                        .map(|p| (p.doc_id, p.positions.as_slice()))
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        })
-                        .collect();
-
-                    let doc_ids: Vec<u32> = scored.keys().copied().collect();
-                    for doc_id in doc_ids {
-                        let mut term_positions: Vec<Vec<u32>> = Vec::new();
-                        for term_map in &phrase_postings {
-                            if let Some(positions) = term_map.get(&doc_id) {
-                                term_positions.push(positions.to_vec());
-                            }
-                        }
-                        if term_positions.len() < phrase_terms.len() {
-                            // Not all phrase terms appear in this doc.
-                            scored.remove(&doc_id);
-                            continue;
-                        }
-                        let phrase_score = match_phrase_score(&term_positions, slop);
-                        if phrase_score == 0.0 {
-                            scored.remove(&doc_id);
-                        } else {
-                            // Boost the score for matching the phrase.
-                            *scored.get_mut(&doc_id).unwrap() *= 1.0 + phrase_score * 0.5;
-                        }
-                    }
-                }
-
-                // Apply filter to this segment's scored docs *before* merging
-                // into candidates. Filtering after the segment loop previously
-                // dropped hits from earlier segments.
-                let passed_filter: Option<HashSet<u32>> = if let Some(ref clause) = query.filter {
-                    let filter_candidates: HashSet<u32> = scored.keys().copied().collect();
-                    Some(FilterApplier::apply(clause, store, &filter_candidates)?)
-                } else {
-                    None
-                };
-
-                for (doc_seq, score) in scored {
-                    if is_tombstoned(&entry.segment_id, doc_seq) {
-                        continue;
-                    }
-                    if let Some(ref passed) = passed_filter {
-                        if !passed.contains(&doc_seq) {
-                            continue;
-                        }
-                    }
-                    if let Some(meta) = reader.doc_meta(doc_seq) {
-                        seg_hits.insert(doc_seq, (score, meta.doc_id.clone()));
-                    }
-                }
-            } else if has_only_filter {
-                let all_candidates: HashSet<u32> = (0..total_docs).collect();
-                let passed =
-                    FilterApplier::apply(query.filter.as_ref().unwrap(), store, &all_candidates)?;
-                for doc_seq in passed {
-                    if is_tombstoned(&entry.segment_id, doc_seq) {
-                        continue;
-                    }
-                    if let Some(meta) = reader.doc_meta(doc_seq) {
-                        let score = scorer.score_term(1, total_docs, meta.field_length);
-                        seg_hits.insert(doc_seq, (score, meta.doc_id.clone()));
-                    }
-                }
-            }
-
-            // ── kNN search (HNSW when available, flat fallback) ──
-            if let Some(ref knn) = query.knn {
-                if !reader.vector_store.vectors.is_empty() {
-                    let knn_results: Vec<(u32, f64)> = if let Some(ref hnsw) = reader.hnsw_map {
-                        let query_point = kosha_segment::CosinePoint(knn.vector.clone());
-                        let mut search = instant_distance::Search::default();
-                        hnsw.search(&query_point, &mut search)
-                            .take(knn.k)
-                            .map(|item| (*item.value, (1.0 - item.distance as f64).max(0.0)))
-                            .collect()
-                    } else {
-                        flat_knn(&knn.vector, &reader.vector_store.vectors, knn.k)
-                    };
-                    // Merge with this segment's BM25 hits or use kNN directly.
-                    // Per-segment HashMap keeps hybrid merge O(k), not O(hits·k).
-                    if !seg_hits.is_empty() {
-                        for (doc_seq, knn_score) in knn_results {
-                            if let Some(existing) = seg_hits.get_mut(&doc_seq) {
-                                existing.0 = existing.0 * 0.5 + knn_score * 0.5 * 100.0;
-                            }
-                        }
-                    } else {
-                        // Pure kNN search for this segment.
-                        for (doc_seq, score) in knn_results {
-                            if is_tombstoned(&entry.segment_id, doc_seq) {
-                                continue;
-                            }
-                            if let Some(meta) = reader.doc_meta(doc_seq) {
-                                seg_hits
-                                    .insert(doc_seq, ((score + 1.0) * 10.0, meta.doc_id.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            let sort_value_maps = if sort_value_fields.is_empty() {
-                HashMap::new()
-            } else {
-                build_sort_value_maps(store, &sort_value_fields)
-            };
-            for (doc_seq, (score, doc_id)) in seg_hits {
-                let sort_values = if sort_value_fields.is_empty() {
-                    Vec::new()
-                } else {
-                    extract_sort_values(doc_seq, &sort_value_fields, &sort_value_maps)
-                };
-                candidates.push(HitCandidate {
-                    reader_idx,
-                    doc_seq,
-                    doc_id,
-                    score,
-                    sort_values,
-                });
-            }
-
-            // ── Aggregations ──
-            for (agg_name, agg) in &query.aggs {
-                match agg {
-                    Aggregation::Terms { terms } => {
-                        let result = compute_single_aggregation(store, &terms.field);
-                        all_aggs.insert(agg_name.clone(), result);
-                    }
-                    Aggregation::Cardinality { cardinality } => {
-                        let result = compute_cardinality(store, &cardinality.field);
-                        all_aggs.insert(agg_name.clone(), result);
-                    }
-                    Aggregation::Composite { composite } => {
-                        let result = compute_composite(store, composite);
-                        all_aggs.insert(agg_name.clone(), result);
-                    }
-                }
+        for output in segment_outputs {
+            candidates.extend(output.candidates);
+            // Last-segment-wins per agg name, same reduction the old
+            // sequential loop did via repeated `all_aggs.insert(...)`.
+            // `segment_outputs` is in manifest order, so this is
+            // behavior-identical to before — not a new source of
+            // nondeterminism from parallelizing the scoring above. Note:
+            // this was already a pre-existing simplification (each named
+            // aggregation reflects only the last segment that computed it,
+            // not a true cross-segment merge) — unrelated to this change,
+            // called out separately rather than silently fixed here.
+            for (agg_name, result) in output.aggs {
+                all_aggs.insert(agg_name, result);
             }
         }
 
@@ -991,7 +1060,7 @@ impl Searcher {
         // from disk (one seek+read per document, not the whole segment).
         let mut page = Vec::with_capacity(to - from);
         for cand in &candidates[from..to] {
-            let Some(doc_rec) = readers[cand.reader_idx].doc_record_full(cand.doc_seq)? else {
+            let Some(doc_rec) = cand.reader.doc_record_full(cand.doc_seq)? else {
                 continue;
             };
             let mut doc = ScoredDocument {
@@ -1050,12 +1119,24 @@ impl Searcher {
 /// Lightweight hit kept through ranking; full field payloads are cloned only
 /// for the final page (see issue #37).
 struct HitCandidate {
-    reader_idx: usize,
+    /// The segment this hit came from. An `Arc` clone rather than an index
+    /// into a shared `Vec` — segments are scored in parallel (see
+    /// [`Searcher::score_segment`]), so there's no single ordered `Vec` of
+    /// readers to index into by the time candidates are merged.
+    reader: Arc<SegmentReader>,
     doc_seq: u32,
     doc_id: DocumentId,
     score: f64,
     /// Values for [`sort_fields_needing_values`], parallel to that list.
     sort_values: Vec<String>,
+}
+
+/// One segment's independent contribution to a query: its scored candidates
+/// and its own aggregation results. Produced by [`Searcher::score_segment`]
+/// and merged by [`Searcher::search`] after all segments have been scored.
+struct SegmentOutput {
+    candidates: Vec<HitCandidate>,
+    aggs: HashMap<String, AggregationResults>,
 }
 
 fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
@@ -2230,6 +2311,75 @@ mod tests {
             q.filter.as_ref().unwrap(),
             s1_footer.filter_blooms.as_ref()
         ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Segments are now scored concurrently via `par_iter` (see
+    /// `Searcher::score_segment`), so completion order across threads is not
+    /// guaranteed run to run. Correctness must not depend on it: build a
+    /// manifest wide enough to actually get scheduled across multiple
+    /// threads, give every doc the same score (so ranking falls through to
+    /// the `doc_id` tie-break), and assert the returned page is byte-for-byte
+    /// identical across many repeated queries.
+    #[test]
+    fn parallel_segment_scoring_is_deterministic_across_many_segments() {
+        let dir = std::env::temp_dir().join("kosha-test-parallel-determinism");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+
+        let seg_count = 24;
+        let mut manifest_segments = Vec::new();
+        for i in 0..seg_count {
+            let seg_name = format!("s{i}");
+            let seg_dir = dir.join(&ns.0).join(&seg_name);
+            let mut w = SegmentWriter::new(SegmentId(seg_name.clone()), seg_dir);
+            w.add_document(
+                DocumentId(format!("doc-{i:03}")),
+                vec![Field::text(
+                    "content",
+                    "contract terms and conditions apply",
+                )],
+            );
+            w.finalize(Bm25Params::default()).unwrap();
+            manifest_segments.push(ManifestEntry {
+                segment_id: SegmentId(seg_name),
+                doc_count: 1,
+            });
+        }
+        let manifest = Manifest {
+            version: 1,
+            segments: manifest_segments,
+        };
+        let searcher = Searcher::new(dir.clone());
+        let q = SearchQuery {
+            query_text: "contract".into(),
+            max_results: 5,
+            from: 0,
+            bm25_params: Bm25Params::default(),
+            filter: None,
+            sort: vec![],
+            search_after: None,
+            highlight: None,
+            aggs: HashMap::new(),
+            wildcard: None,
+            match_phrase: None,
+            knn: None,
+        };
+
+        let first = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(first.total_hits, seg_count, "every segment has one hit");
+        let first_ids: Vec<String> = first.results.iter().map(|d| d.doc_id.0.clone()).collect();
+
+        for _ in 0..19 {
+            let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+            assert_eq!(r.total_hits, first.total_hits);
+            let ids: Vec<String> = r.results.iter().map(|d| d.doc_id.0.clone()).collect();
+            assert_eq!(
+                ids, first_ids,
+                "page contents/order must be stable across repeated parallel-scored queries"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
