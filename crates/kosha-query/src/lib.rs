@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use kosha_core::{
     segment_may_match, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
-    AggMetricResult, Aggregation, AggregationResults, Bm25Params, FieldType, FilterClause,
-    FilterStore, KoshaError, Manifest, NamespaceId, ScoredDocument, SearchQuery, SearchResult,
-    SortSpec,
+    AggMetricResult, Aggregation, AggregationResults, Bm25Params, DocumentId, FieldType,
+    FilterClause, FilterStore, KoshaError, Manifest, NamespaceId, ScoredDocument, SearchQuery,
+    SearchResult, SortSpec,
 };
 use kosha_segment::{tokenize, SegmentReader};
 
@@ -604,7 +604,12 @@ impl Searcher {
             !query_terms.is_empty() || query.wildcard.is_some() || query.match_phrase.is_some();
         let has_only_filter = !has_query && query.filter.is_some();
 
-        let mut all_results: Vec<ScoredDocument> = Vec::new();
+        // Score-only candidates (#37): defer `fields.clone()` until after
+        // top-k / page selection so clone+sort cost scales with page size,
+        // not total hit count. Readers stay alive so the page can materialize.
+        let sort_value_fields = sort_fields_needing_values(&query.sort);
+        let mut readers: Vec<Arc<SegmentReader>> = Vec::new();
+        let mut candidates: Vec<HitCandidate> = Vec::new();
         let mut all_aggs: HashMap<String, AggregationResults> = HashMap::new();
 
         for entry in &manifest.segments {
@@ -631,6 +636,8 @@ impl Searcher {
                 seg_dir,
                 query.knn.is_some(),
             )?;
+            let reader_idx = readers.len();
+            readers.push(Arc::clone(&reader));
             let total_docs = reader.doc_count();
             let store = &reader.filter_store;
             let scorer = Bm25Scorer::new(
@@ -638,6 +645,9 @@ impl Searcher {
                 reader.avg_field_length(),
                 reader.bm25_params().clone(),
             );
+
+            // Per-segment hits keyed by doc_seq for O(1) kNN hybrid merge.
+            let mut seg_hits: HashMap<u32, (f64, DocumentId)> = HashMap::new();
 
             // ── Wildcard matching ──
             let is_wildcard_mode = query.wildcard.is_some();
@@ -701,7 +711,7 @@ impl Searcher {
                 } else {
                     // Multi-term: intersect doc_ids, then score intersection.
                     // Start with the shortest postings list for efficiency.
-                    let mut candidates: Vec<(u32, Vec<Vec<u32>>)> = {
+                    let mut and_candidates: Vec<(u32, Vec<Vec<u32>>)> = {
                         let shortest = term_postings.iter().min_by_key(|(_, p)| p.len()).unwrap();
                         shortest.1.iter().map(|p| (p.doc_id, Vec::new())).collect()
                     };
@@ -711,12 +721,12 @@ impl Searcher {
                     for (_term, postings) in &term_postings {
                         let term_docs: HashMap<u32, &kosha_core::Posting> =
                             postings.iter().map(|p| (p.doc_id, p)).collect();
-                        candidates.retain(|(doc_id, _)| term_docs.contains_key(doc_id));
-                        if candidates.is_empty() {
+                        and_candidates.retain(|(doc_id, _)| term_docs.contains_key(doc_id));
+                        if and_candidates.is_empty() {
                             break;
                         }
                         // Store positions for phrase matching.
-                        for (doc_id, positions) in &mut candidates {
+                        for (doc_id, positions) in &mut and_candidates {
                             if let Some(posting) = term_docs.get(doc_id) {
                                 positions.push(posting.positions.clone());
                             }
@@ -724,7 +734,7 @@ impl Searcher {
                     }
 
                     // Score surviving candidates.
-                    for (doc_id, _doc_positions) in &candidates {
+                    for (doc_id, _doc_positions) in &and_candidates {
                         if let Some(doc_rec) = reader.doc_record(*doc_id) {
                             let mut total_score = 0.0;
                             for (term, postings) in &term_postings {
@@ -771,11 +781,11 @@ impl Searcher {
                 }
 
                 // Apply filter to this segment's scored docs *before* merging
-                // into all_results. Filtering all_results inside the segment
-                // loop previously dropped hits from earlier segments.
+                // into candidates. Filtering after the segment loop previously
+                // dropped hits from earlier segments.
                 let passed_filter: Option<HashSet<u32>> = if let Some(ref clause) = query.filter {
-                    let candidates: HashSet<u32> = scored.keys().copied().collect();
-                    Some(FilterApplier::apply(clause, store, &candidates)?)
+                    let filter_candidates: HashSet<u32> = scored.keys().copied().collect();
+                    Some(FilterApplier::apply(clause, store, &filter_candidates)?)
                 } else {
                     None
                 };
@@ -790,12 +800,7 @@ impl Searcher {
                         }
                     }
                     if let Some(doc_rec) = reader.doc_record(doc_seq) {
-                        all_results.push(ScoredDocument {
-                            doc_id: doc_rec.doc_id.clone(),
-                            score,
-                            fields: doc_rec.fields.clone(),
-                            highlights: None,
-                        });
+                        seg_hits.insert(doc_seq, (score, doc_rec.doc_id.clone()));
                     }
                 }
             } else if has_only_filter {
@@ -808,12 +813,7 @@ impl Searcher {
                     }
                     if let Some(doc_rec) = reader.doc_record(doc_seq) {
                         let score = scorer.score_term(1, total_docs, doc_rec.field_length);
-                        all_results.push(ScoredDocument {
-                            doc_id: doc_rec.doc_id.clone(),
-                            score,
-                            fields: doc_rec.fields.clone(),
-                            highlights: None,
-                        });
+                        seg_hits.insert(doc_seq, (score, doc_rec.doc_id.clone()));
                     }
                 }
             }
@@ -831,42 +831,46 @@ impl Searcher {
                     } else {
                         flat_knn(&knn.vector, &reader.vector_store.vectors, knn.k)
                     };
-                    // Merge with existing BM25 results or use kNN results directly.
-                    let has_bm25 = !all_results.is_empty();
-                    if has_bm25 {
-                        // BM25 + kNN hybrid: add kNN score as a boost factor.
-                        let knn_scores: HashMap<u32, f64> = knn_results.into_iter().collect();
-                        for (doc_seq, knn_score) in &knn_scores {
-                            let doc_id = (0..total_docs)
-                                .filter_map(|s| reader.doc_record(s))
-                                .find(|d| d.doc_seq == *doc_seq)
-                                .map(|d| d.doc_id.clone());
-                            if let Some(ref did) = doc_id {
-                                if let Some(existing) =
-                                    all_results.iter_mut().find(|r| r.doc_id.0 == did.0)
-                                {
-                                    // Boost existing BM25 score with kNN score.
-                                    existing.score = existing.score * 0.5 + knn_score * 0.5 * 100.0;
-                                }
+                    // Merge with this segment's BM25 hits or use kNN directly.
+                    // Per-segment HashMap keeps hybrid merge O(k), not O(hits·k).
+                    if !seg_hits.is_empty() {
+                        for (doc_seq, knn_score) in knn_results {
+                            if let Some(existing) = seg_hits.get_mut(&doc_seq) {
+                                existing.0 = existing.0 * 0.5 + knn_score * 0.5 * 100.0;
                             }
                         }
                     } else {
-                        // Pure kNN search.
+                        // Pure kNN search for this segment.
                         for (doc_seq, score) in knn_results {
                             if is_tombstoned(&entry.segment_id, doc_seq) {
                                 continue;
                             }
                             if let Some(doc_rec) = reader.doc_record(doc_seq) {
-                                all_results.push(ScoredDocument {
-                                    doc_id: doc_rec.doc_id.clone(),
-                                    score: (score + 1.0) * 10.0, // scale to BM25-like range
-                                    fields: doc_rec.fields.clone(),
-                                    highlights: None,
-                                });
+                                seg_hits.insert(
+                                    doc_seq,
+                                    ((score + 1.0) * 10.0, doc_rec.doc_id.clone()),
+                                );
                             }
                         }
                     }
                 }
+            }
+
+            for (doc_seq, (score, doc_id)) in seg_hits {
+                let sort_values = if sort_value_fields.is_empty() {
+                    Vec::new()
+                } else if let Some(doc_rec) = reader.doc_record(doc_seq) {
+                    extract_sort_values(doc_rec, &sort_value_fields)
+                } else {
+                    continue;
+                };
+                candidates.push(HitCandidate {
+                    reader_idx,
+                    doc_seq,
+                    doc_id,
+                    score,
+                    sort_values,
+                });
             }
 
             // ── Aggregations ──
@@ -888,62 +892,102 @@ impl Searcher {
             }
         }
 
-        // ── Highlighting ──
-        if let Some(ref highlight) = query.highlight {
-            if !query_terms.is_empty() {
-                let pre = highlight
-                    .pre_tags
-                    .first()
-                    .map(|s| s.as_str())
-                    .unwrap_or("<b>");
-                let post = highlight
-                    .post_tags
-                    .first()
-                    .map(|s| s.as_str())
-                    .unwrap_or("</b>");
-                for result in &mut all_results {
+        // ── Sort (score-only / sort-key candidates — no full field payloads) ──
+        let sort_cmp = |a: &HitCandidate, b: &HitCandidate| -> std::cmp::Ordering {
+            if !query.sort.is_empty() {
+                compare_candidate_sort_keys(a, b, &query.sort, &sort_value_fields)
+            } else {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
+            }
+        };
+
+        // ── search_after (cursor pagination) ──
+        // search_after needs a fully sorted order to locate the cursor's
+        // position — that position is data-dependent, so it can't be
+        // bounded to a top-k without knowing where the cursor falls, unlike
+        // the plain from/max_results path below. When search_after is set,
+        // `from` is ignored (OpenSearch semantics).
+        let has_search_after = query
+            .search_after
+            .as_ref()
+            .is_some_and(|after| !after.is_empty());
+        let mut page_start = query.from.min(candidates.len());
+        if has_search_after {
+            candidates.sort_by(sort_cmp);
+            if let Some(ref after) = query.search_after {
+                page_start = candidates
+                    .iter()
+                    .position(|r| {
+                        candidate_is_strictly_after_cursor(
+                            r,
+                            after,
+                            &query.sort,
+                            &sort_value_fields,
+                        )
+                    })
+                    .unwrap_or(candidates.len());
+            }
+        }
+
+        let total_hits = candidates.len();
+        let from = page_start.min(candidates.len());
+        let to = (from + query.max_results).min(candidates.len());
+
+        // Bounded top-k (#37): when we haven't already fully sorted for
+        // search_after, partition so the top `to` candidates are correctly
+        // ranked without sorting the remaining `total_hits - to` — this is
+        // what makes cost scale with the page requested (`from +
+        // max_results`) instead of total hit count. `to == 0` needs no
+        // ordering at all (the page is empty either way).
+        if !has_search_after && to > 0 {
+            if to < candidates.len() {
+                candidates.select_nth_unstable_by(to - 1, sort_cmp);
+                candidates[..to].sort_by(sort_cmp);
+            } else {
+                candidates.sort_by(sort_cmp);
+            }
+        }
+
+        // Materialize fields / highlights only for the returned page.
+        let mut page = Vec::with_capacity(to - from);
+        for cand in &candidates[from..to] {
+            let Some(doc_rec) = readers[cand.reader_idx].doc_record(cand.doc_seq) else {
+                continue;
+            };
+            let mut doc = ScoredDocument {
+                doc_id: cand.doc_id.clone(),
+                score: cand.score,
+                fields: doc_rec.fields.clone(),
+                highlights: None,
+            };
+            if let Some(ref highlight) = query.highlight {
+                if !query_terms.is_empty() {
+                    let pre = highlight
+                        .pre_tags
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or("<b>");
+                    let post = highlight
+                        .post_tags
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or("</b>");
                     let mut highlights = Vec::new();
-                    for field in &result.fields {
+                    for field in &doc.fields {
                         if field.name == highlight.field && field.field_type == FieldType::Text {
                             highlights.push(apply_highlight(&field.value, &query_terms, pre, post));
                         }
                     }
                     if !highlights.is_empty() {
-                        result.highlights = Some(highlights);
+                        doc.highlights = Some(highlights);
                     }
                 }
             }
+            page.push(doc);
         }
-
-        // ── Sort ──
-        if !query.sort.is_empty() {
-            all_results.sort_by(|a, b| compare_sort_keys(a, b, &query.sort));
-        } else {
-            all_results.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
-            });
-        }
-
-        // ── search_after (cursor pagination) ──
-        // Apply after sorting so the cursor advances in sort order. When
-        // search_after is set, `from` is ignored (OpenSearch semantics).
-        let mut page_start = query.from.min(all_results.len());
-        if let Some(ref after) = query.search_after {
-            if !after.is_empty() {
-                page_start = all_results
-                    .iter()
-                    .position(|r| is_strictly_after_cursor(r, after, &query.sort))
-                    .unwrap_or(all_results.len());
-            }
-        }
-
-        let total_hits = all_results.len();
-        let from = page_start.min(all_results.len());
-        let to = (from + query.max_results).min(all_results.len());
-        let page = all_results[from..to].to_vec();
 
         // Merge aggregations across segments.
         let merged_aggs = if all_aggs.is_empty() {
@@ -963,6 +1007,60 @@ impl Searcher {
             total_hits,
             aggregations: merged_aggs,
         })
+    }
+}
+
+/// Lightweight hit kept through ranking; full field payloads are cloned only
+/// for the final page (see issue #37).
+struct HitCandidate {
+    reader_idx: usize,
+    doc_seq: u32,
+    doc_id: DocumentId,
+    score: f64,
+    /// Values for [`sort_fields_needing_values`], parallel to that list.
+    sort_values: Vec<String>,
+}
+
+fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
+    let mut fields = Vec::new();
+    for spec in sort {
+        for field in spec.fields.keys() {
+            if field != "_score" && field != "_id" && !fields.iter().any(|f| f == field) {
+                fields.push(field.clone());
+            }
+        }
+    }
+    fields
+}
+
+fn extract_sort_values(doc_rec: &kosha_core::DocRecord, fields: &[String]) -> Vec<String> {
+    fields
+        .iter()
+        .map(|field| {
+            doc_rec
+                .fields
+                .iter()
+                .find(|f| f.name == *field)
+                .map(|f| f.value.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn candidate_sort_value<'a>(
+    cand: &'a HitCandidate,
+    field: &str,
+    sort_value_fields: &[String],
+) -> std::borrow::Cow<'a, str> {
+    match field {
+        "_score" => std::borrow::Cow::Owned(format!("{}", cand.score)),
+        "_id" => std::borrow::Cow::Borrowed(cand.doc_id.0.as_str()),
+        _ => sort_value_fields
+            .iter()
+            .position(|f| f == field)
+            .and_then(|i| cand.sort_values.get(i))
+            .map(|s| std::borrow::Cow::Borrowed(s.as_str()))
+            .unwrap_or(std::borrow::Cow::Borrowed("")),
     }
 }
 
@@ -1051,26 +1149,18 @@ pub fn compute_composite(
     }
 }
 
-fn field_sort_value(doc: &ScoredDocument, field: &str) -> String {
-    match field {
-        "_score" => format!("{}", doc.score),
-        "_id" => doc.doc_id.0.clone(),
-        _ => doc
-            .fields
-            .iter()
-            .find(|f| f.name == field)
-            .map(|f| f.value.clone())
-            .unwrap_or_default(),
-    }
-}
-
-/// True when `doc` sorts strictly after the search_after cursor.
-fn is_strictly_after_cursor(doc: &ScoredDocument, after: &[String], sort: &[SortSpec]) -> bool {
+/// True when `cand` sorts strictly after the search_after cursor.
+fn candidate_is_strictly_after_cursor(
+    cand: &HitCandidate,
+    after: &[String],
+    sort: &[SortSpec],
+    sort_value_fields: &[String],
+) -> bool {
     if sort.is_empty() {
         // Default ranking: score desc, then _id asc. Cursor is typically [_id]
         // when callers only paginate by id (Decover embed updater).
         if after.len() == 1 {
-            return doc.doc_id.0.as_str() > after[0].as_str();
+            return cand.doc_id.0.as_str() > after[0].as_str();
         }
         return false;
     }
@@ -1081,7 +1171,7 @@ fn is_strictly_after_cursor(doc: &ScoredDocument, after: &[String], sort: &[Sort
             if idx >= after.len() {
                 return true;
             }
-            let val = field_sort_value(doc, field);
+            let val = candidate_sort_value(cand, field, sort_value_fields);
             let cursor = &after[idx];
             let cmp = if field == "_score" {
                 let val_f: f64 = val.parse().unwrap_or(0.0);
@@ -1090,7 +1180,7 @@ fn is_strictly_after_cursor(doc: &ScoredDocument, after: &[String], sort: &[Sort
                     .partial_cmp(&cur_f)
                     .unwrap_or(std::cmp::Ordering::Equal)
             } else {
-                val.as_str().cmp(cursor.as_str())
+                val.as_ref().cmp(cursor.as_str())
             };
             // Interpret comparison in the field's sort direction: "greater"
             // means further along the result list.
@@ -1109,10 +1199,11 @@ fn is_strictly_after_cursor(doc: &ScoredDocument, after: &[String], sort: &[Sort
     false
 }
 
-fn compare_sort_keys(
-    a: &ScoredDocument,
-    b: &ScoredDocument,
+fn compare_candidate_sort_keys(
+    a: &HitCandidate,
+    b: &HitCandidate,
     sort: &[SortSpec],
+    sort_value_fields: &[String],
 ) -> std::cmp::Ordering {
     for spec in sort {
         for (field, order) in &spec.fields {
@@ -1123,9 +1214,9 @@ fn compare_sort_keys(
                     .unwrap_or(std::cmp::Ordering::Equal),
                 "_id" => a.doc_id.0.cmp(&b.doc_id.0),
                 _ => {
-                    let a_val = a.fields.iter().find(|f| f.name == *field).map(|f| &f.value);
-                    let b_val = b.fields.iter().find(|f| f.name == *field).map(|f| &f.value);
-                    a_val.cmp(&b_val)
+                    let a_val = candidate_sort_value(a, field, sort_value_fields);
+                    let b_val = candidate_sort_value(b, field, sort_value_fields);
+                    a_val.as_ref().cmp(b_val.as_ref())
                 }
             };
             let ord = if order.order == "desc" {
@@ -1437,6 +1528,204 @@ mod tests {
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
         assert_eq!(r.results[0].doc_id.0, "d1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bounded_topk_selection_matches_full_sort_order() {
+        // Regression test for issue #37's second fix: bounded top-k
+        // selection (select_nth_unstable_by + a small sort of just the
+        // page) instead of a full sort over every candidate. Cross-checks
+        // against an unbounded query (max_results covering every hit) to
+        // prove the partial-selection path returns exactly the same order
+        // — for both the first page and a page deep enough to require
+        // `from > 0`, rather than hand-deriving expected BM25 scores.
+        let dir = std::env::temp_dir().join("kosha-test-bounded-topk");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        let n = 60usize;
+        for i in 0..n {
+            // Distinct term frequency per doc so BM25 scores are unique and
+            // the ranking is deterministic, not tie-broken by doc_id alone.
+            let repeats = i + 1;
+            let content = format!("{}filler", "contract ".repeat(repeats));
+            w.add_document(
+                DocumentId(format!("doc-{i:03}")),
+                vec![Field::text("content", content)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: n as u32,
+            }],
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        let full = searcher
+            .search(&ns, &manifest, &mk_query("contract", n), None)
+            .unwrap();
+        assert_eq!(full.total_hits, n);
+        assert_eq!(full.results.len(), n);
+
+        // First page: bounded selection with `to` well under total_hits.
+        let page1 = searcher
+            .search(&ns, &manifest, &mk_query("contract", 5), None)
+            .unwrap();
+        assert_eq!(page1.total_hits, n);
+        assert_eq!(
+            page1
+                .results
+                .iter()
+                .map(|d| d.doc_id.0.clone())
+                .collect::<Vec<_>>(),
+            full.results[0..5]
+                .iter()
+                .map(|d| d.doc_id.0.clone())
+                .collect::<Vec<_>>(),
+            "bounded top-k page must match the equivalent slice of a full sort"
+        );
+
+        // Deep page: from > 0, still `to < total_hits` — exercises the
+        // select_nth_unstable_by partition at a non-trivial offset.
+        let mut deep_query = mk_query("contract", 5);
+        deep_query.from = 20;
+        let page2 = searcher.search(&ns, &manifest, &deep_query, None).unwrap();
+        assert_eq!(
+            page2
+                .results
+                .iter()
+                .map(|d| d.doc_id.0.clone())
+                .collect::<Vec<_>>(),
+            full.results[20..25]
+                .iter()
+                .map(|d| d.doc_id.0.clone())
+                .collect::<Vec<_>>(),
+            "deep bounded page (from>0) must match the equivalent slice of a full sort"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_materialization_pages_large_hit_sets() {
+        // Issue #37: scoring must accumulate score-only candidates and clone
+        // fields only for the returned page. Correctness check: many hits,
+        // small max_results, full total_hits, and page docs still carry fields.
+        let dir = std::env::temp_dir().join("kosha-test-deferred-materialize");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        let n = 200usize;
+        for i in 0..n {
+            w.add_document(
+                DocumentId(format!("doc-{i:04}")),
+                vec![
+                    Field::text(
+                        "content",
+                        format!(
+                            "shared token in document {i} with padding {}",
+                            "x".repeat(256)
+                        ),
+                    ),
+                    Field::keyword("custodian", format!("user-{}", i % 7)),
+                ],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: n as u32,
+            }],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let r = searcher
+            .search(&ns, &manifest, &mk_query("shared", 5), None)
+            .unwrap();
+        assert_eq!(r.total_hits, n);
+        assert_eq!(r.results.len(), 5);
+        for doc in &r.results {
+            assert!(
+                doc.fields.iter().any(|f| f.name == "content"),
+                "page docs must still materialize fields"
+            );
+            assert!(
+                doc.fields.iter().any(|f| f.name == "custodian"),
+                "metadata fields must be present on the page"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn field_sort_still_works_with_deferred_materialization() {
+        let dir = std::env::temp_dir().join("kosha-test-deferred-field-sort");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for (id, custodian) in [("a", "z-user"), ("b", "a-user"), ("c", "m-user")] {
+            w.add_document(
+                DocumentId(id.into()),
+                vec![
+                    Field::text("content", "shared token"),
+                    Field::keyword("custodian", custodian),
+                ],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 3,
+            }],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let mut custodian_sort = HashMap::new();
+        custodian_sort.insert(
+            "custodian".into(),
+            SortOrder {
+                order: "asc".into(),
+            },
+        );
+        let r = searcher
+            .search(
+                &ns,
+                &manifest,
+                &SearchQuery {
+                    query_text: "shared".into(),
+                    max_results: 2,
+                    from: 0,
+                    bm25_params: Bm25Params::default(),
+                    filter: None,
+                    sort: vec![SortSpec {
+                        fields: custodian_sort,
+                    }],
+                    search_after: None,
+                    highlight: None,
+                    aggs: HashMap::new(),
+                    wildcard: None,
+                    match_phrase: None,
+                    knn: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(r.total_hits, 3);
+        assert_eq!(r.results.len(), 2);
+        assert_eq!(r.results[0].doc_id.0, "b"); // a-user
+        assert_eq!(r.results[1].doc_id.0, "c"); // m-user
         let _ = std::fs::remove_dir_all(&dir);
     }
 
