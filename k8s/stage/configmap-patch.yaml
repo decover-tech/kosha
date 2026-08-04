@@ -7,4 +7,19 @@ kind: ConfigMap
 metadata:
   name: kosha-config
   namespace: kosha
-data: {}
+data:
+  # kosha-query's in-memory segment cache defaults to a 4GiB byte budget
+  # (deliberately conservative and independent of container memory limits —
+  # see kosha-query::DEFAULT_SEGMENT_CACHE_MAX_BYTES). staging's largest
+  # namespace (paragraph_index_hnsw: 53 segments, ~1.05M docs) exceeds that
+  # once parsed into memory, so segments were being evicted *during* a
+  # single query (eviction runs per-insert) before it even finished opening
+  # all 53 — meaning "repeat" queries were still mostly re-parsing from
+  # disk, not actually serving from the in-memory cache. Confirmed live:
+  # raising this to 24GiB dropped a repeat paragraph_index_hnsw query from
+  # ~28s to ~0.44s, and findings_index from ~15s to ~0.29s.
+  #
+  # 24GiB leaves comfortable headroom under the 56Gi container memory limit
+  # (k8s/stage/deployment-resources-patch.yaml) for hydration buffers and
+  # other overhead on the i4i.2xlarge node.
+  KOSHA_SEGMENT_CACHE_MAX_BYTES: "25769803776"
