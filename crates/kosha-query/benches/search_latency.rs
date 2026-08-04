@@ -21,6 +21,8 @@
 //!   ~28.5 ms → ~2.5 ms (**−91%**)
 //! - AND HashMap posting lookup (`warm_bm25_and_25053_hits_page5`):
 //!   ~209 ms → ~5.2 ms (**−97%**)
+//! - term-bloom multi-segment skip (`bm25_term_bloom_20segs_cache1`,
+//!   cache capacity 1): ~7.6 ms → ~0.41 ms (**−95%**)
 //!
 //! For phase-level remaining-cost analysis see `scoring_profile`.
 
@@ -93,6 +95,45 @@ fn mk_query(text: &str) -> SearchQuery {
     }
 }
 
+/// Many segments, only one contains the rare query term — term blooms should
+/// skip opening the rest.
+const TERM_BLOOM_SEGS: usize = 20;
+const TERM_BLOOM_DOCS_PER_SEG: usize = 500;
+
+fn build_term_bloom_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
+    let _ = std::fs::remove_dir_all(dir);
+    let ns = NamespaceId("bench-term-bloom".into());
+    let mut entries = Vec::with_capacity(TERM_BLOOM_SEGS);
+    for s in 0..TERM_BLOOM_SEGS {
+        let seg_id = format!("s{s}");
+        let seg_dir = dir.join(&ns.0).join(&seg_id);
+        let mut w = SegmentWriter::new(SegmentId(seg_id.clone()), seg_dir);
+        for i in 0..TERM_BLOOM_DOCS_PER_SEG {
+            let content = if s == 0 {
+                format!("raretermxyz paragraph {i} with shared padding text")
+            } else {
+                format!("ordinary vocabulary paragraph {i} segment {s} padding text")
+            };
+            w.add_document(
+                DocumentId(format!("s{s}-d{i}")),
+                vec![Field::text("content", content)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        entries.push(ManifestEntry {
+            segment_id: SegmentId(seg_id),
+            doc_count: TERM_BLOOM_DOCS_PER_SEG as u32,
+        });
+    }
+    (
+        ns,
+        Manifest {
+            version: 1,
+            segments: entries,
+        },
+    )
+}
+
 fn bench_search_latency(c: &mut Criterion) {
     let dir = std::env::temp_dir().join("kosha-bench-search-latency-e2e");
     let (ns, manifest) = build_corpus(&dir);
@@ -144,6 +185,44 @@ fn bench_search_latency(c: &mut Criterion) {
     group.finish();
 
     let _ = std::fs::remove_dir_all(&dir);
+
+    // ── Term-bloom multi-segment skip ────────────────────────────────────
+    // Cache holds only one parsed segment so a no-prune baseline must
+    // re-parse every segment each query — matching the "can't keep the whole
+    // namespace resident" case term blooms are meant to fix. (A fully warm
+    // in-memory cache of all segments would make footer reads look slower
+    // than free Arc clones, which is the wrong comparison.)
+    let tb_dir = std::env::temp_dir().join("kosha-bench-search-latency-term-bloom");
+    let (tb_ns, tb_manifest) = build_term_bloom_corpus(&tb_dir);
+    let tb_searcher = Searcher::with_segment_cache_limits(tb_dir.clone(), 1, u64::MAX);
+    let tb_query = mk_query("raretermxyz");
+    let tb_warm = tb_searcher
+        .search(&tb_ns, &tb_manifest, &tb_query, None)
+        .unwrap();
+    assert_eq!(tb_warm.total_hits, TERM_BLOOM_DOCS_PER_SEG);
+
+    let mut tb_group = c.benchmark_group("term_bloom_multiseg");
+    tb_group.throughput(Throughput::Elements(
+        (TERM_BLOOM_SEGS * TERM_BLOOM_DOCS_PER_SEG) as u64,
+    ));
+    tb_group.sample_size(30);
+    tb_group.bench_function("bm25_term_bloom_20segs_cache1", |b| {
+        b.iter(|| {
+            let r = tb_searcher
+                .search(
+                    black_box(&tb_ns),
+                    black_box(&tb_manifest),
+                    black_box(&tb_query),
+                    None,
+                )
+                .unwrap();
+            black_box(r.total_hits);
+            black_box(r.results.len());
+        })
+    });
+    tb_group.finish();
+
+    let _ = std::fs::remove_dir_all(&tb_dir);
 }
 
 criterion_group!(benches, bench_search_latency);

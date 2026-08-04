@@ -467,6 +467,13 @@ pub struct Footer {
     /// field key means the segment has no values for that field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter_blooms: Option<HashMap<String, BloomFilter>>,
+    /// Bloom over the segment's inverted-index vocabulary (tokenized query
+    /// terms). Used to skip segments that cannot contain required BM25 terms
+    /// without opening `inverted.idx`.
+    ///
+    /// `None` means a legacy segment — callers must not prune on query terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term_bloom: Option<BloomFilter>,
 }
 
 // ─── Bloom filter (segment pruning) ────────────────────────────────────────
@@ -569,6 +576,45 @@ pub fn build_filter_blooms(
         out.insert(field.clone(), bloom);
     }
     out
+}
+
+/// Build a bloom over a segment's inverted-index term vocabulary.
+pub fn build_term_bloom<'a, I>(terms: I) -> BloomFilter
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    BloomFilter::build(terms)
+}
+
+/// How [`segment_may_contain_terms`] combines multiple query terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermBloomMode {
+    /// All terms must possibly be present (multi-term BM25 / phrase).
+    And,
+    /// At least one term must possibly be present (wildcard OR expansion).
+    Or,
+}
+
+/// Whether a segment with the given term bloom might contain `terms`.
+///
+/// Returns `true` when the segment must be opened (possible match, empty
+/// term list, or legacy/`None` bloom). Returns `false` only when the bloom
+/// proves the segment cannot satisfy the term constraint.
+pub fn segment_may_contain_terms(
+    terms: &[String],
+    mode: TermBloomMode,
+    bloom: Option<&BloomFilter>,
+) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let Some(bloom) = bloom else {
+        return true; // legacy footer — cannot prune
+    };
+    match mode {
+        TermBloomMode::And => terms.iter().all(|t| bloom.may_contain(t)),
+        TermBloomMode::Or => terms.iter().any(|t| bloom.may_contain(t)),
+    }
 }
 
 fn bloom_num_bits(n: usize, fpr: f64) -> usize {
@@ -950,6 +996,41 @@ mod tests {
         }"#;
         let footer: Footer = serde_json::from_str(json).unwrap();
         assert!(footer.filter_blooms.is_none());
+        assert!(footer.term_bloom.is_none());
+    }
+
+    #[test]
+    fn segment_may_contain_terms_and_or() {
+        let bloom = build_term_bloom(["contract", "warranty"]);
+        let both = vec!["contract".into(), "warranty".into()];
+        // Distinctive absent tokens avoid rare bloom false positives at 1% FPR.
+        let absent = "definitely-absent-term-xyz-qqq";
+        let missing = vec!["contract".into(), absent.into()];
+        let only_absent = vec![absent.into()];
+        assert!(segment_may_contain_terms(
+            &both,
+            TermBloomMode::And,
+            Some(&bloom)
+        ));
+        assert!(!segment_may_contain_terms(
+            &missing,
+            TermBloomMode::And,
+            Some(&bloom)
+        ));
+        assert!(segment_may_contain_terms(
+            &missing,
+            TermBloomMode::Or,
+            Some(&bloom)
+        ));
+        assert!(!segment_may_contain_terms(
+            &only_absent,
+            TermBloomMode::Or,
+            Some(&bloom)
+        ));
+        assert!(
+            segment_may_contain_terms(&missing, TermBloomMode::And, None),
+            "legacy footer never pruned"
+        );
     }
 
     #[test]

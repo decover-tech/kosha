@@ -100,9 +100,11 @@ use kosha_cache::Cache;
 #[cfg(feature = "s3")]
 use kosha_core::StorageBackend;
 #[cfg(feature = "s3")]
-use kosha_core::{segment_may_match, FilterClause};
+use kosha_core::{segment_may_contain_terms, segment_may_match, TermBloomMode};
 use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::Searcher;
+#[cfg(feature = "s3")]
+use kosha_segment::tokenize;
 use kosha_segment::SegmentReader;
 use kosha_write::Indexer;
 
@@ -498,27 +500,35 @@ impl AppState {
         }
     }
 
-    /// Hydrate only segments that might match `filter` (footer bloom prune
-    /// first). Returns the relative paths of segments that are still
-    /// incomplete after hydration was attempted — see `ensure_segments_local`.
-    /// An empty result means every segment the search actually needs is
-    /// present; a non-empty one means the caller must not proceed with the
-    /// search as if the corpus were complete.
+    /// Hydrate only segments that might match the query (footer filter + term
+    /// bloom prune first). Returns the relative paths of segments that are
+    /// still incomplete after hydration was attempted — see
+    /// `ensure_segments_local`. An empty result means every segment the
+    /// search actually needs is present; a non-empty one means the caller
+    /// must not proceed with the search as if the corpus were complete.
     #[cfg(feature = "s3")]
     fn hydrate_segments_for_search(
         &self,
         ns: &NamespaceId,
         manifest: &kosha_core::Manifest,
-        filter: Option<&FilterClause>,
+        query: &SearchQuery,
     ) -> Vec<String> {
+        let term_prune = term_bloom_prune_for_query(query);
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         for entry in &manifest.segments {
             let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
-            if let Some(filter) = filter {
+            if query.filter.is_some() || term_prune.is_some() {
                 self.ensure_file_local(&seg_path, "footer.json");
                 if let Ok(footer) = SegmentReader::read_footer(&seg_path) {
-                    if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
-                        continue;
+                    if let Some(ref filter) = query.filter {
+                        if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
+                            continue;
+                        }
+                    }
+                    if let Some((ref terms, mode)) = term_prune {
+                        if !segment_may_contain_terms(terms, mode, footer.term_bloom.as_ref()) {
+                            continue;
+                        }
                     }
                 }
             }
@@ -1176,7 +1186,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // Footer-first hydrate: bloom-prune before downloading full segments.
     #[cfg(feature = "s3")]
     {
-        let missing = state.hydrate_segments_for_search(&ns, &manifest, query.filter.as_ref());
+        let missing = state.hydrate_segments_for_search(&ns, &manifest, &query);
         if !missing.is_empty() {
             return json_error(503, &hydration_failed_message(&missing));
         }
@@ -1253,7 +1263,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
 
     #[cfg(feature = "s3")]
     {
-        let missing = state.hydrate_segments_for_search(&ns, &manifest, query.filter.as_ref());
+        let missing = state.hydrate_segments_for_search(&ns, &manifest, &query);
         if !missing.is_empty() {
             return json_error(503, &hydration_failed_message(&missing));
         }
@@ -1356,11 +1366,12 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
     }))
 }
 
-/// POST /v1/admin/rebuild-filter-blooms — rewrite footer blooms from filters.bin.
+/// POST /v1/admin/rebuild-filter-blooms — rewrite footer blooms from segment files.
 ///
 /// Request body: `{"namespace": "paragraph_index_hnsw"}` (tenant-scoped when
-/// authenticated). Hydrates each segment, rebuilds `filter_blooms`, and uploads
-/// the updated `footer.json` to S3 when configured.
+/// authenticated). Hydrates each segment, rebuilds `filter_blooms` (from
+/// `filters.bin`) and `term_bloom` (from `inverted.idx`), and uploads the
+/// updated `footer.json` to S3 when configured.
 fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> String {
     let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -1413,7 +1424,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
             errors.push(format!("{}: segment not local", entry.segment_id.0));
             continue;
         }
-        match SegmentReader::rewrite_filter_blooms(&seg_path) {
+        match SegmentReader::rewrite_footer_blooms(&seg_path) {
             Ok(_) => {
                 rebuilt += 1;
                 #[cfg(feature = "s3")]
@@ -1500,6 +1511,30 @@ fn body_val_fallback(body: &[u8]) -> serde_json::Value {
         return v;
     }
     serde_json::json!({})
+}
+
+/// Lexical terms used for footer term-bloom prune before hydrate/open.
+///
+/// Wildcard queries cannot be pruned here — expansion needs the segment
+/// vocabulary. Phrase and multi-term BM25 use AND semantics.
+#[cfg(feature = "s3")]
+fn term_bloom_prune_for_query(query: &SearchQuery) -> Option<(Vec<String>, TermBloomMode)> {
+    if query.wildcard.is_some() {
+        return None;
+    }
+    if let Some(ref mp) = query.match_phrase {
+        let terms = tokenize(&mp.phrase);
+        if terms.is_empty() {
+            return None;
+        }
+        return Some((terms, TermBloomMode::And));
+    }
+    let terms = tokenize(&query.query_text);
+    if terms.is_empty() {
+        None
+    } else {
+        Some((terms, TermBloomMode::And))
+    }
 }
 
 /// Error message for a search that can't proceed because hydrating one or

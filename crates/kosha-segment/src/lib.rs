@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use instant_distance::{Builder, HnswMap, Point, Search};
 use kosha_core::{
-    build_filter_blooms, AggBucket, AggBucketResult, AggMetricResult, AggregationResults,
-    Bm25Params, DocRecord, DocumentId, Field, FieldType, FilterStore, Footer, KoshaError,
-    LocalStorage, Posting, SegmentId, StorageBackend, VectorStore,
+    build_filter_blooms, build_term_bloom, AggBucket, AggBucketResult, AggMetricResult,
+    AggregationResults, Bm25Params, DocRecord, DocumentId, Field, FieldType, FilterStore, Footer,
+    KoshaError, LocalStorage, Posting, SegmentId, StorageBackend, VectorStore,
 };
 
 /// A point in HNSW space using cosine distance.
@@ -306,6 +306,9 @@ impl SegmentWriter {
             bm25_params,
             created_at: chrono_like_now(),
             filter_blooms: Some(build_filter_blooms(&self.filter_string)),
+            term_bloom: Some(build_term_bloom(
+                self.inverted_index.keys().map(|s| s.as_str()),
+            )),
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -409,6 +412,25 @@ impl SegmentReader {
         let json = serde_json::to_string_pretty(&footer)?;
         fs::write(segment_dir.join("footer.json"), json.as_bytes())?;
         Ok(footer)
+    }
+
+    /// Rebuild `term_bloom` from `inverted.idx` and rewrite `footer.json` only.
+    ///
+    /// Used to unlock lexical segment pruning on segments written before term
+    /// blooms existed.
+    pub fn rewrite_term_bloom(segment_dir: &Path) -> Result<Footer, KoshaError> {
+        let mut footer = Self::read_footer(segment_dir)?;
+        let index = Self::read_inverted_index(segment_dir)?;
+        footer.term_bloom = Some(build_term_bloom(index.keys().map(|s| s.as_str())));
+        let json = serde_json::to_string_pretty(&footer)?;
+        fs::write(segment_dir.join("footer.json"), json.as_bytes())?;
+        Ok(footer)
+    }
+
+    /// Rebuild both filter and term blooms into `footer.json`.
+    pub fn rewrite_footer_blooms(segment_dir: &Path) -> Result<Footer, KoshaError> {
+        Self::rewrite_filter_blooms(segment_dir)?;
+        Self::rewrite_term_bloom(segment_dir)
     }
 
     fn read_doc_store(segment_dir: &Path) -> Result<Vec<DocRecord>, KoshaError> {
@@ -803,6 +825,42 @@ mod tests {
         let matter = blooms.get("matterId").expect("matterId bloom");
         assert!(matter.may_contain("m1"));
         assert!(!matter.may_contain("m-absent"));
+
+        let term_bloom = footer.term_bloom.expect("term bloom written");
+        assert!(term_bloom.may_contain("hello"));
+        assert!(!term_bloom.may_contain("absent-term-xyz"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewrite_term_bloom_updates_legacy_footer() {
+        let dir = std::env::temp_dir().join("kosha-test-seg-rewrite-term-bloom");
+        let _ = fs::remove_dir_all(&dir);
+        let mut w = SegmentWriter::new(SegmentId("test".into()), dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("content", "contract dispute")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let mut footer = SegmentReader::read_footer(&dir).unwrap();
+        footer.term_bloom = None;
+        fs::write(
+            dir.join("footer.json"),
+            serde_json::to_string_pretty(&footer).unwrap(),
+        )
+        .unwrap();
+        assert!(SegmentReader::read_footer(&dir)
+            .unwrap()
+            .term_bloom
+            .is_none());
+
+        let rewritten = SegmentReader::rewrite_term_bloom(&dir).unwrap();
+        let bloom = rewritten.term_bloom.expect("term bloom rebuilt");
+        assert!(bloom.may_contain("contract"));
+        assert!(bloom.may_contain("dispute"));
+        assert!(!bloom.may_contain("absent-term-xyz"));
 
         let _ = fs::remove_dir_all(&dir);
     }
