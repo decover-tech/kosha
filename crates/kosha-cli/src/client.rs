@@ -121,6 +121,14 @@ impl Client {
         )
     }
 
+    pub fn backfill_offset_tables(&self, namespace: &str) -> Result<Value, ClientError> {
+        self.request(
+            Method::POST,
+            "/v1/admin/backfill-offset-tables",
+            Some(serde_json::json!({"namespace": namespace})),
+        )
+    }
+
     pub fn curl(
         &self,
         method: Method,

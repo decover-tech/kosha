@@ -788,6 +788,10 @@ fn route(
         return handle_rebuild_filter_blooms(body, tenant, state);
     }
 
+    if request_line.starts_with("POST /v1/admin/backfill-offset-tables") {
+        return handle_backfill_offset_tables(body, tenant, state);
+    }
+
     // ── Legacy Phase 1 routes (backward compat) ────────────────────────────
     // These will be removed after DecoverAI cuts over to the v1 paths.
     if request_line.starts_with("GET /healthz") {
@@ -1438,6 +1442,79 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
         "namespace": ns.0,
         "segments": manifest.segments.len(),
         "rebuilt": rebuilt,
+        "errors": errors,
+    }))
+}
+
+fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) -> String {
+    let req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+    };
+    let ns_raw = match req.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return json_error(400, "missing 'namespace'"),
+    };
+    // Prefer the name as given (migration uses bare index names); fall back
+    // to tenant-scoped lookup used by v1 routes.
+    let ns = {
+        let indexer = state.indexer.lock().unwrap();
+        if ns_raw.contains('/') {
+            let ns = NamespaceId(ns_raw.to_string());
+            if indexer.manifest_cloned(&ns).is_some() {
+                ns
+            } else {
+                return json_error(404, &format!("namespace '{}' not found", ns.0));
+            }
+        } else {
+            let bare = NamespaceId(ns_raw.to_string());
+            if indexer.manifest_cloned(&bare).is_some() {
+                bare
+            } else {
+                let scoped = NamespaceId(tenant_namespace(tenant, ns_raw));
+                if indexer.manifest_cloned(&scoped).is_some() {
+                    scoped
+                } else {
+                    return json_error(404, &format!("namespace '{ns_raw}' not found"));
+                }
+            }
+        }
+    };
+
+    let manifest = {
+        let indexer = state.indexer.lock().unwrap();
+        indexer
+            .manifest_cloned(&ns)
+            .expect("namespace existence checked above")
+    };
+
+    let mut backfilled = 0usize;
+    let mut errors = Vec::new();
+    for entry in &manifest.segments {
+        let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
+        #[cfg(feature = "s3")]
+        state.ensure_segment_local(&seg_path);
+        if !seg_path.exists() {
+            errors.push(format!("{}: segment not local", entry.segment_id.0));
+            continue;
+        }
+        match SegmentReader::backfill_offset_tables(&seg_path) {
+            Ok(_) => {
+                backfilled += 1;
+                #[cfg(feature = "s3")]
+                {
+                    state.sync_file_to_s3(&seg_path, "doc_store.offsets");
+                    state.sync_file_to_s3(&seg_path, "footer.json");
+                }
+            }
+            Err(e) => errors.push(format!("{}: {e}", entry.segment_id.0)),
+        }
+    }
+
+    json_ok(&serde_json::json!({
+        "namespace": ns.0,
+        "segments": manifest.segments.len(),
+        "backfilled": backfilled,
         "errors": errors,
     }))
 }

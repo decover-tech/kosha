@@ -14,7 +14,7 @@
 //! Current vs proposed (Criterion medians):
 //! - `and_score_via_find` ~196 ms vs `and_score_via_hashmap` ~2.3 ms (~85×)
 //! - `rank_sort_all` ~2.4 ms vs `rank_select_nth_page` ~0.42 ms (~6×; already landed)
-//! - `score_or_via_doc_record` ≈ `score_or_via_field_lengths` (no win — HashMap
+//! - `score_or_via_doc_meta` ≈ `score_or_via_field_lengths` (no win — HashMap
 //!   insert dominates; side `field_lengths[]` alone is not justified yet)
 //!
 //! ## Before / after validation for a future fix
@@ -70,7 +70,7 @@ struct Cand {
     doc_seq: u32,
 }
 
-fn score_or_via_doc_record(
+fn score_or_via_doc_meta(
     reader: &SegmentReader,
     scorer: &Bm25Scorer,
     postings: &[Posting],
@@ -78,8 +78,8 @@ fn score_or_via_doc_record(
 ) -> HashMap<u32, f64> {
     let mut scored = HashMap::with_capacity(postings.len());
     for posting in postings {
-        if let Some(doc_rec) = reader.doc_record(posting.doc_id) {
-            let score = scorer.score_term(posting.term_frequency, df, doc_rec.field_length);
+        if let Some(meta) = reader.doc_meta(posting.doc_id) {
+            let score = scorer.score_term(posting.term_frequency, df, meta.field_length);
             *scored.entry(posting.doc_id).or_insert(0.0) += score;
         }
     }
@@ -118,11 +118,11 @@ fn and_score_via_find(
 
     let mut scored = HashMap::with_capacity(and_candidates.len());
     for doc_id in and_candidates {
-        if let Some(doc_rec) = reader.doc_record(doc_id) {
+        if let Some(meta) = reader.doc_meta(doc_id) {
             let mut total = 0.0;
             for (postings, df) in term_postings {
                 if let Some(p) = postings.iter().find(|p| p.doc_id == doc_id) {
-                    total += scorer.score_term(p.term_frequency, *df, doc_rec.field_length);
+                    total += scorer.score_term(p.term_frequency, *df, meta.field_length);
                 }
             }
             scored.insert(doc_id, total);
@@ -167,9 +167,9 @@ fn and_score_via_hashmap(
 fn collect_candidates(reader: &SegmentReader, scored: &HashMap<u32, f64>) -> Vec<Cand> {
     let mut cands = Vec::with_capacity(scored.len());
     for (&doc_seq, &score) in scored {
-        if let Some(rec) = reader.doc_record(doc_seq) {
+        if let Some(meta) = reader.doc_meta(doc_seq) {
             cands.push(Cand {
-                doc_id: rec.doc_id.clone(),
+                doc_id: meta.doc_id.clone(),
                 score,
                 doc_seq,
             });
@@ -209,8 +209,8 @@ fn sort_all(cands: &mut [Cand]) {
 fn materialize_page(reader: &SegmentReader, cands: &[Cand], page: usize) -> usize {
     let mut bytes = 0usize;
     for c in cands.iter().take(page) {
-        if let Some(rec) = reader.doc_record(c.doc_seq) {
-            let fields = rec.fields.clone();
+        if let Some(rec) = reader.doc_record_full(c.doc_seq).unwrap() {
+            let fields = rec.fields;
             bytes += fields
                 .iter()
                 .map(|f| f.name.len() + f.value.len())
@@ -236,7 +236,7 @@ fn bench_scoring_profile(c: &mut Criterion) {
     assert!(dispute.len() >= HIT_COUNT);
 
     let field_lengths: Vec<u32> = (0..reader.doc_count())
-        .map(|i| reader.doc_record(i).unwrap().field_length)
+        .map(|i| reader.doc_meta(i).unwrap().field_length)
         .collect();
 
     let term_postings: [(&[Posting], u32); 2] = [
@@ -249,7 +249,7 @@ fn bench_scoring_profile(c: &mut Criterion) {
     {
         use std::time::Instant;
         let t0 = Instant::now();
-        let scored = score_or_via_doc_record(&reader, &scorer, contract, contract.len() as u32);
+        let scored = score_or_via_doc_meta(&reader, &scorer, contract, contract.len() as u32);
         let score_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
@@ -284,9 +284,9 @@ fn bench_scoring_profile(c: &mut Criterion) {
     group.sample_size(30);
 
     // ── Single-term OR scoring: doc_record vs field_lengths ───────────────
-    group.bench_function("score_or_via_doc_record", |b| {
+    group.bench_function("score_or_via_doc_meta", |b| {
         b.iter(|| {
-            black_box(score_or_via_doc_record(
+            black_box(score_or_via_doc_meta(
                 black_box(&reader),
                 black_box(&scorer),
                 black_box(contract),
@@ -326,7 +326,7 @@ fn bench_scoring_profile(c: &mut Criterion) {
     });
 
     // ── Ranking: full sort vs select_nth (already landed in #37) ──────────
-    let scored = score_or_via_doc_record(&reader, &scorer, contract, contract.len() as u32);
+    let scored = score_or_via_doc_meta(&reader, &scorer, contract, contract.len() as u32);
     let base_cands = collect_candidates(&reader, &scored);
     group.bench_function("rank_sort_all", |b| {
         b.iter_batched(

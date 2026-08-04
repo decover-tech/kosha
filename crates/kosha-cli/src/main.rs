@@ -106,6 +106,13 @@ enum Commands {
         #[arg(short = 'n', long)]
         namespace: String,
     },
+    /// Backfill doc_store.offsets on segments written before lazy doc
+    /// loading existed, so they stop paying full-segment materialization
+    /// cost on every query without waiting for their next compaction cycle.
+    BackfillOffsetTables {
+        #[arg(short = 'n', long)]
+        namespace: String,
+    },
     /// Raw HTTP escape hatch (any path)
     Curl {
         /// HTTP method (GET, POST, …)
@@ -263,6 +270,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(0);
                 println!(
                     "rebuilt filter blooms for {rebuilt}/{segments} segment(s) in {namespace}"
+                );
+                if errors > 0 {
+                    println!("({errors} error(s) — see --json for details)");
+                }
+                Ok(())
+            })?;
+        }
+        Commands::BackfillOffsetTables { namespace } => {
+            let value = client.backfill_offset_tables(&namespace)?;
+            print_value(&value, cli.json, |v| {
+                let backfilled = v.get("backfilled").and_then(|d| d.as_u64()).unwrap_or(0);
+                let segments = v.get("segments").and_then(|d| d.as_u64()).unwrap_or(0);
+                let errors = v
+                    .get("errors")
+                    .and_then(|e| e.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                println!(
+                    "backfilled doc_store.offsets for {backfilled}/{segments} segment(s) in {namespace}"
                 );
                 if errors > 0 {
                     println!("({errors} error(s) — see --json for details)");
@@ -536,6 +562,25 @@ mod tests {
                 assert_eq!(max_results, 5);
             }
             _ => panic!("expected search"),
+        }
+    }
+
+    #[test]
+    fn parses_backfill_offset_tables() {
+        let cli = Cli::try_parse_from([
+            "kosha",
+            "--host",
+            "http://localhost:8080",
+            "backfill-offset-tables",
+            "-n",
+            "demo",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::BackfillOffsetTables { namespace } => {
+                assert_eq!(namespace, "demo");
+            }
+            _ => panic!("expected backfill-offset-tables"),
         }
     }
 
