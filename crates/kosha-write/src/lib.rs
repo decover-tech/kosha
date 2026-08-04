@@ -182,11 +182,11 @@ impl Indexer {
                 continue;
             }
             let reader = kosha_segment::SegmentReader::open_with_options(seg_dir, false)?;
-            for rec in &reader.doc_records {
+            for meta in reader.iter_doc_meta() {
                 index
-                    .entry(rec.doc_id.clone())
+                    .entry(meta.doc_id.clone())
                     .or_default()
-                    .push((entry.segment_id.clone(), rec.doc_seq));
+                    .push((entry.segment_id.clone(), meta.doc_seq));
             }
         }
         self.id_index.insert(namespace.clone(), index);
@@ -306,9 +306,8 @@ impl Indexer {
             }
             let reader = kosha_segment::SegmentReader::open(seg_dir)?;
             if !reader
-                .doc_records
-                .iter()
-                .any(|record| replacement_ids.contains(record.doc_id.0.as_str()))
+                .iter_doc_meta()
+                .any(|meta| replacement_ids.contains(meta.doc_id.0.as_str()))
             {
                 continue;
             }
@@ -318,7 +317,7 @@ impl Indexer {
                 .tombstones
                 .get(&namespace)
                 .and_then(|by_segment| by_segment.get(&entry.segment_id));
-            for record in &reader.doc_records {
+            for record in reader.iter_doc_records() {
                 if tombstones.is_some_and(|set| set.contains(&record.doc_seq)) {
                     continue;
                 }
@@ -488,10 +487,23 @@ impl Indexer {
         let data_dir = self.data_dir.clone();
         let ns_dir = data_dir.join(&namespace.0);
 
-        // Collect all doc_records from all segments.
-        use kosha_core::DocRecord;
-        let mut all_docs: Vec<DocRecord> = Vec::new();
+        // Stream every surviving document straight into the new segment
+        // writer instead of collecting every source segment's full content
+        // into an `all_docs` buffer first. A namespace being compacted is,
+        // by definition, made up of segments that can each be arbitrarily
+        // large — holding all of them resident at once here would
+        // reintroduce exactly the memory-scaling problem lazy segment
+        // loading (`SegmentReader::doc_meta`/`doc_record_full`) exists to
+        // fix, just on the write path instead of the read path.
+        let seg_id = SegmentId(format!(
+            "{}-compact-{:x}",
+            namespace.0.replace('/', "_"),
+            chrono_now()
+        ));
+        let seg_dir = data_dir.join(&namespace.0).join(seg_id.0.as_str());
+        let mut writer = kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir);
         let mut old_segment_ids: Vec<SegmentId> = Vec::new();
+        let mut any_docs = false;
 
         for entry in &manifest.segments {
             let seg_dir = ns_dir.join(&entry.segment_id.0);
@@ -504,33 +516,21 @@ impl Indexer {
                 .get(namespace)
                 .and_then(|t| t.get(&entry.segment_id));
 
-            for doc_rec in &reader.doc_records {
+            for doc_rec in reader.iter_doc_records() {
                 // Skip tombstoned docs.
                 if let Some(ts) = tombstones {
                     if ts.contains(&doc_rec.doc_seq) {
                         continue;
                     }
                 }
-                all_docs.push(doc_rec.clone());
+                writer.add_document(doc_rec.doc_id, doc_rec.fields);
+                any_docs = true;
             }
             old_segment_ids.push(entry.segment_id.clone());
         }
 
-        if all_docs.is_empty() {
+        if !any_docs {
             return Ok(());
-        }
-
-        // Write a new merged segment.
-        let seg_id = SegmentId(format!(
-            "{}-compact-{:x}",
-            namespace.0.replace('/', "_"),
-            chrono_now()
-        ));
-        let seg_dir = data_dir.join(&namespace.0).join(seg_id.0.as_str());
-        let mut writer = kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir);
-
-        for doc in &all_docs {
-            writer.add_document(doc.doc_id.clone(), doc.fields.clone());
         }
 
         let bm25_params = self.buffer_mut(namespace.clone()).bm25_params.clone();
@@ -1052,9 +1052,9 @@ mod tests {
             dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
         )
         .unwrap();
-        assert_eq!(reader.doc_records.len(), 2);
-        let by_id: HashMap<_, _> = reader
-            .doc_records
+        let records: Vec<_> = reader.iter_doc_records().collect();
+        assert_eq!(records.len(), 2);
+        let by_id: HashMap<_, _> = records
             .iter()
             .map(|record| (record.doc_id.0.as_str(), &record.fields))
             .collect();
@@ -1101,8 +1101,9 @@ mod tests {
             dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
         )
         .unwrap();
-        assert_eq!(reader.doc_records.len(), 1);
-        assert_eq!(reader.doc_records[0].fields[0].value, "second");
+        let records: Vec<_> = reader.iter_doc_records().collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].fields[0].value, "second");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1148,9 +1149,9 @@ mod tests {
             dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
         )
         .unwrap();
-        assert_eq!(reader.doc_records.len(), 2);
-        let values: HashMap<_, _> = reader
-            .doc_records
+        let records: Vec<_> = reader.iter_doc_records().collect();
+        assert_eq!(records.len(), 2);
+        let values: HashMap<_, _> = records
             .iter()
             .map(|record| (record.doc_id.0.as_str(), record.fields[0].value.as_str()))
             .collect();
@@ -1194,8 +1195,9 @@ mod tests {
             dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
         )
         .unwrap();
-        assert_eq!(reader.doc_records.len(), 1);
-        let fields: HashMap<_, _> = reader.doc_records[0]
+        let records: Vec<_> = reader.iter_doc_records().collect();
+        assert_eq!(records.len(), 1);
+        let fields: HashMap<_, _> = records[0]
             .fields
             .iter()
             .map(|field| (field.name.as_str(), field.value.as_str()))

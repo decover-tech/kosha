@@ -474,7 +474,19 @@ pub struct Footer {
     /// `None` means a legacy segment — callers must not prune on query terms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub term_bloom: Option<BloomFilter>,
+    /// Segment format version. `0` (the `#[serde(default)]`) means a legacy
+    /// segment written before `doc_store.offsets` existed — readers must not
+    /// assume that sidecar is present or trustworthy even if it happens to
+    /// exist on disk. `1` means the writer emitted `doc_store.offsets`
+    /// alongside `doc_store.bin`, enabling lazy per-document loading instead
+    /// of parsing the whole segment into memory to open it.
+    #[serde(default)]
+    pub format_version: u32,
 }
+
+/// Current segment format version written by `SegmentWriter`. See
+/// `Footer::format_version`.
+pub const SEGMENT_FORMAT_VERSION: u32 = 1;
 
 // ─── Bloom filter (segment pruning) ────────────────────────────────────────
 
@@ -877,6 +889,12 @@ pub enum KoshaError {
     Serde(serde_json::Error),
     NotFound(String),
     InvalidFilter(String),
+    /// A segment's sidecar index (e.g. `doc_store.offsets`) exists but fails
+    /// a sanity check (bad header, doc-count mismatch, truncated file).
+    /// Callers should treat this as a signal to fall back to the legacy
+    /// full-parse path for that component, not as a fatal error for the
+    /// whole segment.
+    CorruptSegment(String),
 }
 
 impl std::fmt::Display for KoshaError {
@@ -888,6 +906,7 @@ impl std::fmt::Display for KoshaError {
             Self::Serde(e) => write!(f, "serialization error: {e}"),
             Self::NotFound(msg) => write!(f, "{msg}"),
             Self::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
+            Self::CorruptSegment(msg) => write!(f, "corrupt segment data: {msg}"),
         }
     }
 }

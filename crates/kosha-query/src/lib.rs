@@ -717,11 +717,11 @@ impl Searcher {
                     for (term, postings) in &term_postings {
                         let df = doc_frequencies.get(term).copied().unwrap_or(0);
                         for posting in *postings {
-                            if let Some(doc_rec) = reader.doc_record(posting.doc_id) {
+                            if let Some(meta) = reader.doc_meta(posting.doc_id) {
                                 let score = scorer.score_term(
                                     posting.term_frequency,
                                     df,
-                                    doc_rec.field_length,
+                                    meta.field_length,
                                 );
                                 *scored.entry(posting.doc_id).or_insert(0.0) += score;
                             }
@@ -756,15 +756,12 @@ impl Searcher {
                     }
 
                     for doc_id in and_candidates {
-                        if let Some(doc_rec) = reader.doc_record(doc_id) {
+                        if let Some(meta) = reader.doc_meta(doc_id) {
                             let mut total_score = 0.0;
                             for (_, map, df) in &term_maps {
                                 if let Some(p) = map.get(&doc_id) {
-                                    total_score += scorer.score_term(
-                                        p.term_frequency,
-                                        *df,
-                                        doc_rec.field_length,
-                                    );
+                                    total_score +=
+                                        scorer.score_term(p.term_frequency, *df, meta.field_length);
                                 }
                             }
                             scored.insert(doc_id, total_score);
@@ -774,14 +771,32 @@ impl Searcher {
 
                 // Apply phrase matching (filter out docs that don't match the phrase).
                 if let Some((ref phrase_terms, slop)) = phrase_match {
+                    // Fetch each phrase term's postings once (not once per
+                    // candidate doc) and index by doc_id for O(1) lookup —
+                    // matters more once `postings()` can become an on-demand
+                    // read in a later milestone, but is a real redundant-work
+                    // fix even today.
+                    let phrase_postings: Vec<HashMap<u32, &[u32]>> = phrase_terms
+                        .iter()
+                        .map(|pt| {
+                            reader
+                                .postings(pt)
+                                .map(|postings| {
+                                    postings
+                                        .iter()
+                                        .map(|p| (p.doc_id, p.positions.as_slice()))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
+
                     let doc_ids: Vec<u32> = scored.keys().copied().collect();
                     for doc_id in doc_ids {
                         let mut term_positions: Vec<Vec<u32>> = Vec::new();
-                        for pt in phrase_terms {
-                            if let Some(postings) = reader.postings(pt) {
-                                if let Some(p) = postings.iter().find(|p| p.doc_id == doc_id) {
-                                    term_positions.push(p.positions.clone());
-                                }
+                        for term_map in &phrase_postings {
+                            if let Some(positions) = term_map.get(&doc_id) {
+                                term_positions.push(positions.to_vec());
                             }
                         }
                         if term_positions.len() < phrase_terms.len() {
@@ -818,8 +833,8 @@ impl Searcher {
                             continue;
                         }
                     }
-                    if let Some(doc_rec) = reader.doc_record(doc_seq) {
-                        seg_hits.insert(doc_seq, (score, doc_rec.doc_id.clone()));
+                    if let Some(meta) = reader.doc_meta(doc_seq) {
+                        seg_hits.insert(doc_seq, (score, meta.doc_id.clone()));
                     }
                 }
             } else if has_only_filter {
@@ -830,9 +845,9 @@ impl Searcher {
                     if is_tombstoned(&entry.segment_id, doc_seq) {
                         continue;
                     }
-                    if let Some(doc_rec) = reader.doc_record(doc_seq) {
-                        let score = scorer.score_term(1, total_docs, doc_rec.field_length);
-                        seg_hits.insert(doc_seq, (score, doc_rec.doc_id.clone()));
+                    if let Some(meta) = reader.doc_meta(doc_seq) {
+                        let score = scorer.score_term(1, total_docs, meta.field_length);
+                        seg_hits.insert(doc_seq, (score, meta.doc_id.clone()));
                     }
                 }
             }
@@ -864,24 +879,25 @@ impl Searcher {
                             if is_tombstoned(&entry.segment_id, doc_seq) {
                                 continue;
                             }
-                            if let Some(doc_rec) = reader.doc_record(doc_seq) {
-                                seg_hits.insert(
-                                    doc_seq,
-                                    ((score + 1.0) * 10.0, doc_rec.doc_id.clone()),
-                                );
+                            if let Some(meta) = reader.doc_meta(doc_seq) {
+                                seg_hits
+                                    .insert(doc_seq, ((score + 1.0) * 10.0, meta.doc_id.clone()));
                             }
                         }
                     }
                 }
             }
 
+            let sort_value_maps = if sort_value_fields.is_empty() {
+                HashMap::new()
+            } else {
+                build_sort_value_maps(store, &sort_value_fields)
+            };
             for (doc_seq, (score, doc_id)) in seg_hits {
                 let sort_values = if sort_value_fields.is_empty() {
                     Vec::new()
-                } else if let Some(doc_rec) = reader.doc_record(doc_seq) {
-                    extract_sort_values(doc_rec, &sort_value_fields)
                 } else {
-                    continue;
+                    extract_sort_values(doc_seq, &sort_value_fields, &sort_value_maps)
                 };
                 candidates.push(HitCandidate {
                     reader_idx,
@@ -970,16 +986,18 @@ impl Searcher {
             }
         }
 
-        // Materialize fields / highlights only for the returned page.
+        // Materialize fields / highlights only for the returned page — the
+        // only place a `Lazy` segment's full field content is ever read
+        // from disk (one seek+read per document, not the whole segment).
         let mut page = Vec::with_capacity(to - from);
         for cand in &candidates[from..to] {
-            let Some(doc_rec) = readers[cand.reader_idx].doc_record(cand.doc_seq) else {
+            let Some(doc_rec) = readers[cand.reader_idx].doc_record_full(cand.doc_seq)? else {
                 continue;
             };
             let mut doc = ScoredDocument {
                 doc_id: cand.doc_id.clone(),
                 score: cand.score,
-                fields: doc_rec.fields.clone(),
+                fields: doc_rec.fields,
                 highlights: None,
             };
             if let Some(ref highlight) = query.highlight {
@@ -1052,15 +1070,55 @@ fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
     fields
 }
 
-fn extract_sort_values(doc_rec: &kosha_core::DocRecord, fields: &[String]) -> Vec<String> {
+/// Build `doc_seq -> value` maps for each requested custom-sort field,
+/// sourced from the segment's already-eager `filter_store` (populated from
+/// `filters.bin`) instead of full document field content. Every filterable
+/// field type (`Keyword`/`Boolean`/`Date`/`Text`/`Integer`/`Float`) already
+/// lands in one of `filter_store`'s three maps at write time (see
+/// `SegmentWriter::add_document`), so this needs zero new disk I/O even
+/// once `doc_store.bin`'s full content is only loaded lazily — sorting on a
+/// field would otherwise be the one place deferred materialization forced a
+/// disk read per candidate instead of just per returned page. Built once
+/// per segment per query, not once per hit.
+fn build_sort_value_maps(
+    store: &FilterStore,
+    fields: &[String],
+) -> HashMap<String, HashMap<u32, String>> {
     fields
         .iter()
         .map(|field| {
-            doc_rec
-                .fields
-                .iter()
-                .find(|f| f.name == *field)
-                .map(|f| f.value.clone())
+            let map = if let Some(entries) = store.string_fields.get(field) {
+                entries.iter().map(|(seq, v)| (*seq, v.clone())).collect()
+            } else if let Some(entries) = store.integer_fields.get(field) {
+                entries
+                    .iter()
+                    .map(|(seq, v)| (*seq, v.to_string()))
+                    .collect()
+            } else if let Some(entries) = store.float_fields.get(field) {
+                entries
+                    .iter()
+                    .map(|(seq, v)| (*seq, v.to_string()))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+            (field.clone(), map)
+        })
+        .collect()
+}
+
+fn extract_sort_values(
+    doc_seq: u32,
+    fields: &[String],
+    sort_value_maps: &HashMap<String, HashMap<u32, String>>,
+) -> Vec<String> {
+    fields
+        .iter()
+        .map(|field| {
+            sort_value_maps
+                .get(field)
+                .and_then(|m| m.get(&doc_seq))
+                .cloned()
                 .unwrap_or_default()
         })
         .collect()
@@ -1339,9 +1397,12 @@ mod tests {
     fn repeated_search_serves_warm_segment_from_memory_not_disk() {
         // Regression test for the "warm NVMe cache still re-parses every
         // segment on every query" bug: without an in-memory segment cache,
-        // deleting a segment's files between two searches would make the
-        // second search fail (or silently return 0 hits once `seg_dir.exists()`
-        // is false), even though nothing about the query or manifest changed.
+        // deleting `inverted.idx` between two searches would make the second
+        // search fail to score, even though nothing about the query or
+        // manifest changed. `inverted.idx` stays fully resident once a
+        // segment is cached (only `doc_store.bin`'s full field content is
+        // lazily loaded, per issue #37's follow-up) — deleting it must not
+        // affect a later search against the same cached segment.
         let dir = std::env::temp_dir().join("kosha-test-segment-cache-warm");
         let _ = std::fs::remove_dir_all(&dir);
         let ns = NamespaceId("test".into());
@@ -1367,16 +1428,19 @@ mod tests {
         assert_eq!(first.total_hits, 1, "first search should hit the segment");
 
         // Simulate the NVMe cache having evicted (or never re-fetched) this
-        // segment's files — the parsed segment should already be cached in
-        // memory from the first search, so this must not matter.
-        std::fs::remove_file(seg_dir.join("doc_store.bin")).unwrap();
+        // segment's inverted index — the parsed segment should already be
+        // cached in memory from the first search, so this must not matter.
+        // (`doc_store.bin` is deliberately left in place: full field content
+        // is now loaded lazily per query, by design — see
+        // `full_page_materialization_needs_doc_store_on_disk_but_scoring_does_not`
+        // for that half of the contract.)
         std::fs::remove_file(seg_dir.join("inverted.idx")).unwrap();
 
         let second = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
             second.total_hits, 1,
             "second search must be served from the in-memory segment cache, \
-             not re-read the (now-deleted) files from disk"
+             not re-read the (now-deleted) inverted index from disk"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1555,6 +1619,161 @@ mod tests {
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
         assert_eq!(r.results[0].doc_id.0, "d1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_page_materialization_needs_doc_store_on_disk_but_scoring_does_not() {
+        // Structural proof of the lazy doc_store contract (issue #37
+        // follow-up): opening a segment and scoring/counting hits never
+        // reads `doc_store.bin`'s full field content — only the small
+        // `doc_store.offsets` sidecar (doc_id + field_length per doc,
+        // proportional to document count, not content size). Full field
+        // content is read from disk only when a query actually materializes
+        // a result page, and only for the documents on that page.
+        let dir = std::env::temp_dir().join("kosha-test-lazy-doc-store-contract");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("t", "hello world")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 1,
+            }],
+        };
+        // Fresh searcher (no warm in-memory segment cache) so opening the
+        // segment for these searches goes through the real `try_read_doc_index`
+        // -> `DocStoreAccess::Lazy` path, not a cached `Eager` fallback from
+        // an earlier call in this test.
+        let searcher = Searcher::new(dir.clone());
+
+        // `doc_store.bin` deleted entirely, `doc_store.offsets` untouched.
+        std::fs::remove_file(seg_dir.join("doc_store.bin")).unwrap();
+
+        // max_results: 0 never materializes a page, so it must succeed and
+        // report the correct count purely from resident metadata.
+        let count_only = mk_query("hello", 0);
+        let counted = searcher
+            .search(&ns, &manifest, &count_only, None)
+            .expect("scoring/counting must not require doc_store.bin on disk");
+        assert_eq!(counted.total_hits, 1);
+        assert!(counted.results.is_empty());
+
+        // A query that actually needs to return the document correctly
+        // fails now that its full content is genuinely gone — this is the
+        // honest lazy-loading tradeoff, not a bug: the in-memory cache never
+        // held full field content in the first place, so there is nothing
+        // to silently fall back to.
+        let full_page = mk_query("hello", 10);
+        let err = searcher
+            .search(&ns, &manifest, &full_page, None)
+            .expect_err("materializing the page must surface the missing doc_store.bin");
+        assert!(matches!(err, KoshaError::Io(_)), "unexpected error: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_segment_without_offsets_sidecar_still_searches() {
+        // Backward compatibility: a segment written before `doc_store.offsets`
+        // existed (or one where the sidecar was otherwise lost) has no offset
+        // table to open lazily. `try_read_doc_index` returns `None` for a
+        // missing file, so `SegmentReader` falls back to `DocStoreAccess::Eager`
+        // — the exact full-parse behavior every segment used before lazy
+        // loading, not a degraded or partial mode.
+        let dir = std::env::temp_dir().join("kosha-test-legacy-no-offsets-sidecar");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("t", "hello world")],
+        );
+        w.add_document(
+            DocumentId("d2".into()),
+            vec![Field::text("t", "hello moon")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        std::fs::remove_file(seg_dir.join("doc_store.offsets")).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 2,
+            }],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let q = mk_query("hello", 10);
+        let r = searcher
+            .search(&ns, &manifest, &q, None)
+            .expect("missing offsets sidecar must fall back to eager parse, not fail");
+        assert_eq!(r.total_hits, 2);
+        assert_eq!(r.results.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupted_offsets_sidecar_falls_back_safely() {
+        // A `doc_store.offsets` that exists but is corrupt (truncated header,
+        // or a declared doc_count that disagrees with footer.json) must not
+        // panic or silently return wrong data — `try_read_doc_index` detects
+        // the mismatch and returns `None`, degrading to the same full-parse
+        // path as a legacy segment: slower, but still correct.
+        let dir = std::env::temp_dir().join("kosha-test-corrupted-offsets-sidecar");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("t", "hello world")],
+        );
+        w.add_document(
+            DocumentId("d2".into()),
+            vec![Field::text("t", "hello moon")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        // Corrupt the declared doc_count so it disagrees with footer.json's
+        // doc_count (2), tripping the mismatch check rather than the
+        // truncation check.
+        std::fs::write(seg_dir.join("doc_store.offsets"), 99u32.to_le_bytes()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 2,
+            }],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let q = mk_query("hello", 10);
+        let r = searcher
+            .search(&ns, &manifest, &q, None)
+            .expect("corrupt offsets sidecar must fall back safely, not panic or error");
+        assert_eq!(r.total_hits, 2);
+        assert_eq!(r.results.len(), 2);
+
+        // Also cover the truncated-header case (fewer than 4 bytes).
+        std::fs::write(seg_dir.join("doc_store.offsets"), [0u8, 1u8]).unwrap();
+        let searcher2 = Searcher::new(dir.clone());
+        let r2 = searcher2
+            .search(&ns, &manifest, &q, None)
+            .expect("truncated offsets header must fall back safely, not panic or error");
+        assert_eq!(r2.total_hits, 2);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

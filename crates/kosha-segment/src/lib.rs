@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use instant_distance::{Builder, HnswMap, Point, Search};
@@ -164,11 +165,20 @@ impl SegmentWriter {
         Ok(footer)
     }
 
+    /// Writes `doc_store.bin` (unchanged byte layout) and, alongside it,
+    /// `doc_store.offsets` — a sidecar sized to `doc_count`, not content
+    /// size, that lets `SegmentReader` open a segment without parsing every
+    /// document's full field content into memory (see `DocStoreAccess`).
+    /// Offsets are captured as a free byproduct of the same loop that
+    /// already builds `buf` in doc_seq order — no second pass.
     fn write_doc_store(&self) -> Result<(), KoshaError> {
         let mut buf = Vec::new();
+        let mut offsets_buf = Vec::new();
         let doc_count = self.doc_records.len() as u32;
         buf.extend_from_slice(&doc_count.to_le_bytes());
+        offsets_buf.extend_from_slice(&doc_count.to_le_bytes());
         for rec in &self.doc_records {
+            let record_start = buf.len() as u64;
             let id_bytes = rec.doc_id.0.as_bytes();
             buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(id_bytes);
@@ -184,8 +194,16 @@ impl SegmentWriter {
                 buf.extend_from_slice(&(val_bytes.len() as u64).to_le_bytes());
                 buf.extend_from_slice(val_bytes);
             }
+            let record_len = (buf.len() as u64 - record_start) as u32;
+
+            offsets_buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+            offsets_buf.extend_from_slice(id_bytes);
+            offsets_buf.extend_from_slice(&rec.field_length.to_le_bytes());
+            offsets_buf.extend_from_slice(&record_start.to_le_bytes());
+            offsets_buf.extend_from_slice(&record_len.to_le_bytes());
         }
         self.backend.write("doc_store.bin", &buf)?;
+        self.backend.write("doc_store.offsets", &offsets_buf)?;
         Ok(())
     }
 
@@ -309,6 +327,7 @@ impl SegmentWriter {
             term_bloom: Some(build_term_bloom(
                 self.inverted_index.keys().map(|s| s.as_str()),
             )),
+            format_version: kosha_core::SEGMENT_FORMAT_VERSION,
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -318,11 +337,46 @@ impl SegmentWriter {
 
 // ─── Segment reader ─────────────────────────────────────────────────────────
 
+/// A document's location within `doc_store.bin`, plus the small scalar
+/// fields (`doc_id`, `field_length`) that scoring needs constantly. Read
+/// from the `doc_store.offsets` sidecar — proportional to document *count*,
+/// never document *content* size.
+struct DocIndexEntry {
+    doc_id: DocumentId,
+    field_length: u32,
+    offset: u64,
+    length: u32,
+}
+
+/// How `SegmentReader` accesses document content. `Lazy` is the steady
+/// state for any segment written by the current `SegmentWriter`: only the
+/// small per-doc index is resident, and full field content is read from
+/// disk on demand (`doc_record_full`) only for documents actually
+/// materialized into a response. `Eager` is the fallback for segments
+/// written before `doc_store.offsets` existed (see `Footer::format_version`)
+/// — identical behavior/cost to what every segment paid before this change.
+enum DocStoreAccess {
+    Lazy {
+        doc_store_path: PathBuf,
+        metas: Vec<DocIndexEntry>,
+    },
+    Eager(Vec<DocRecord>),
+}
+
+/// Zero-I/O metadata for one document — the `doc_id`/`field_length` that
+/// BM25 scoring and default/`_id` sorting need, without ever touching the
+/// document's full field content on disk.
+pub struct DocMetaRef<'a> {
+    pub doc_id: &'a DocumentId,
+    pub doc_seq: u32,
+    pub field_length: u32,
+}
+
 pub struct SegmentReader {
     #[allow(dead_code)]
     segment_dir: PathBuf,
     footer: Footer,
-    pub doc_records: Vec<DocRecord>,
+    doc_store: DocStoreAccess,
     pub inverted_index: HashMap<String, Vec<Posting>>,
     pub filter_store: FilterStore,
     pub vector_store: VectorStore,
@@ -354,10 +408,18 @@ impl SegmentReader {
         } else {
             (VectorStore::default(), None)
         };
+        let footer = Self::read_footer(&segment_dir)?;
+        let doc_store = match try_read_doc_index(&segment_dir, footer.doc_count) {
+            Some(metas) => DocStoreAccess::Lazy {
+                doc_store_path: segment_dir.join("doc_store.bin"),
+                metas,
+            },
+            None => DocStoreAccess::Eager(Self::read_doc_store(&segment_dir)?),
+        };
         Ok(Self {
             segment_dir: segment_dir.clone(),
-            footer: Self::read_footer(&segment_dir)?,
-            doc_records: Self::read_doc_store(&segment_dir)?,
+            footer,
+            doc_store,
             inverted_index: Self::read_inverted_index(&segment_dir)?,
             filter_store: Self::read_filters(&segment_dir)?,
             vector_store: vs,
@@ -382,8 +444,61 @@ impl SegmentReader {
         self.inverted_index.get(term).map(|v| v.as_slice())
     }
 
-    pub fn doc_record(&self, doc_seq: u32) -> Option<&DocRecord> {
-        self.doc_records.get(doc_seq as usize)
+    /// Zero-I/O: `doc_id` + `field_length` for one document, without
+    /// touching its full field content on disk. This is all BM25 scoring
+    /// and default/`_id` sorting ever need — see `DocMetaRef`.
+    pub fn doc_meta(&self, doc_seq: u32) -> Option<DocMetaRef<'_>> {
+        match &self.doc_store {
+            DocStoreAccess::Eager(records) => records.get(doc_seq as usize).map(|r| DocMetaRef {
+                doc_id: &r.doc_id,
+                doc_seq: r.doc_seq,
+                field_length: r.field_length,
+            }),
+            DocStoreAccess::Lazy { metas, .. } => metas.get(doc_seq as usize).map(|m| DocMetaRef {
+                doc_id: &m.doc_id,
+                doc_seq,
+                field_length: m.field_length,
+            }),
+        }
+    }
+
+    /// On-demand: the document's full field content (`content` text + all
+    /// metadata). Reads and parses only this one document's byte span from
+    /// disk for `Lazy` segments — use only for documents actually being
+    /// materialized into a response, not during scoring.
+    pub fn doc_record_full(&self, doc_seq: u32) -> Result<Option<DocRecord>, KoshaError> {
+        match &self.doc_store {
+            DocStoreAccess::Eager(records) => Ok(records.get(doc_seq as usize).cloned()),
+            DocStoreAccess::Lazy {
+                doc_store_path,
+                metas,
+            } => {
+                let Some(entry) = metas.get(doc_seq as usize) else {
+                    return Ok(None);
+                };
+                let mut file = fs::File::open(doc_store_path)?;
+                file.seek(SeekFrom::Start(entry.offset))?;
+                let mut buf = vec![0u8; entry.length as usize];
+                file.read_exact(&mut buf)?;
+                let mut cursor = &buf[..];
+                Ok(Some(parse_one_doc_record(&mut cursor, doc_seq)))
+            }
+        }
+    }
+
+    /// Iterate every document's zero-I/O metadata (`doc_id`/`field_length`)
+    /// in doc_seq order.
+    pub fn iter_doc_meta(&self) -> impl Iterator<Item = DocMetaRef<'_>> + '_ {
+        (0..self.doc_count()).filter_map(move |seq| self.doc_meta(seq))
+    }
+
+    /// Iterate every document's full field content in doc_seq order.
+    /// Streams one document at a time (bounded memory) for `Lazy` segments,
+    /// rather than requiring the whole segment materialized up front — use
+    /// this instead of collecting into a `Vec<DocRecord>` when processing
+    /// every document in a segment (e.g. compaction).
+    pub fn iter_doc_records(&self) -> impl Iterator<Item = DocRecord> + '_ {
+        (0..self.doc_count()).filter_map(move |seq| self.doc_record_full(seq).ok().flatten())
     }
 
     pub fn contains_term(&self, term: &str) -> bool {
@@ -433,6 +548,54 @@ impl SegmentReader {
         Self::rewrite_term_bloom(segment_dir)
     }
 
+    /// Backfill `doc_store.offsets` for a segment written before lazy doc
+    /// loading existed, and bump `footer.json`'s `format_version` so future
+    /// opens use the `Lazy` path. Reads `doc_store.bin` once — the same
+    /// single sequential scan `read_doc_store` already does — capturing each
+    /// record's byte span as it goes, so this costs one full parse (same as
+    /// today's every-open cost) rather than two. `doc_store.bin` itself is
+    /// never rewritten.
+    ///
+    /// Directly analogous to `rewrite_filter_blooms`/`rewrite_term_bloom`: an
+    /// in-place upgrade for segments that already exist on disk, so already-
+    /// large namespaces don't have to wait for their next compaction cycle
+    /// to stop paying the full-materialization cost on every query.
+    pub fn backfill_offset_tables(segment_dir: &Path) -> Result<Footer, KoshaError> {
+        let data = fs::read(segment_dir.join("doc_store.bin"))?;
+        let mut cursor = &data[..];
+        let doc_count = if cursor.len() < 4 {
+            0
+        } else {
+            read_u32_le(&mut cursor)
+        };
+
+        let mut offsets_buf = Vec::new();
+        offsets_buf.extend_from_slice(&doc_count.to_le_bytes());
+        for doc_seq in 0..doc_count {
+            let record_start = (data.len() - cursor.len()) as u64;
+            let rec = parse_one_doc_record(&mut cursor, doc_seq);
+            let record_len = (data.len() - cursor.len()) as u64 - record_start;
+            let id_bytes = rec.doc_id.0.as_bytes();
+            offsets_buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+            offsets_buf.extend_from_slice(id_bytes);
+            offsets_buf.extend_from_slice(&rec.field_length.to_le_bytes());
+            offsets_buf.extend_from_slice(&record_start.to_le_bytes());
+            offsets_buf.extend_from_slice(&(record_len as u32).to_le_bytes());
+        }
+        fs::write(segment_dir.join("doc_store.offsets"), &offsets_buf)?;
+
+        let mut footer = Self::read_footer(segment_dir)?;
+        footer.format_version = kosha_core::SEGMENT_FORMAT_VERSION;
+        let json = serde_json::to_string_pretty(&footer)?;
+        fs::write(segment_dir.join("footer.json"), json.as_bytes())?;
+        Ok(footer)
+    }
+
+    /// Legacy full-parse path (`DocStoreAccess::Eager`) — reads the whole
+    /// `doc_store.bin` at once. Used only when the `doc_store.offsets`
+    /// sidecar is missing or fails its sanity check (see
+    /// `try_read_doc_index`); the resulting `Vec<DocRecord>` costs exactly
+    /// what every segment cost before lazy loading existed.
     fn read_doc_store(segment_dir: &Path) -> Result<Vec<DocRecord>, KoshaError> {
         let data = fs::read(segment_dir.join("doc_store.bin"))?;
         let mut cursor = &data[..];
@@ -442,42 +605,7 @@ impl SegmentReader {
         }
         let doc_count = read_u32_le(&mut cursor);
         for doc_seq in 0..doc_count {
-            let id_len = read_u32_le(&mut cursor) as usize;
-            let id_bytes = read_bytes(&mut cursor, id_len);
-            let doc_id = DocumentId(String::from_utf8_lossy(id_bytes).to_string());
-            let field_length = read_u32_le(&mut cursor);
-            let field_count = read_u32_le(&mut cursor);
-            let mut fields = Vec::with_capacity(field_count as usize);
-            for _ in 0..field_count {
-                let name_len = read_u32_le(&mut cursor) as usize;
-                let name_bytes = read_bytes(&mut cursor, name_len);
-                let name = String::from_utf8_lossy(name_bytes).to_string();
-                let field_type = match cursor[0] {
-                    0 => FieldType::Text,
-                    1 => FieldType::Keyword,
-                    2 => FieldType::Integer,
-                    3 => FieldType::Float,
-                    4 => FieldType::Date,
-                    5 => FieldType::Boolean,
-                    6 => FieldType::Vector,
-                    _ => FieldType::Text,
-                };
-                cursor = &cursor[1..];
-                let val_len = read_u64_le(&mut cursor) as usize;
-                let val_bytes = read_bytes(&mut cursor, val_len);
-                let value = String::from_utf8_lossy(val_bytes).to_string();
-                fields.push(Field {
-                    name,
-                    field_type,
-                    value,
-                });
-            }
-            records.push(DocRecord {
-                doc_id,
-                doc_seq,
-                field_length,
-                fields,
-            });
+            records.push(parse_one_doc_record(&mut cursor, doc_seq));
         }
         Ok(records)
     }
@@ -629,6 +757,114 @@ pub fn compute_aggregations(
     }
 
     results
+}
+
+/// Parse one document's record from a cursor already positioned at the
+/// start of its span in `doc_store.bin`, advancing the cursor past it.
+/// Shared by the legacy full-parse path (`read_doc_store`) and the lazy
+/// single-record path (`SegmentReader::doc_record_full`) so the two can
+/// never silently diverge in how they interpret the wire format.
+fn parse_one_doc_record(cursor: &mut &[u8], doc_seq: u32) -> DocRecord {
+    let id_len = read_u32_le(cursor) as usize;
+    let id_bytes = read_bytes(cursor, id_len);
+    let doc_id = DocumentId(String::from_utf8_lossy(id_bytes).to_string());
+    let field_length = read_u32_le(cursor);
+    let field_count = read_u32_le(cursor);
+    let mut fields = Vec::with_capacity(field_count as usize);
+    for _ in 0..field_count {
+        let name_len = read_u32_le(cursor) as usize;
+        let name_bytes = read_bytes(cursor, name_len);
+        let name = String::from_utf8_lossy(name_bytes).to_string();
+        let field_type = match cursor[0] {
+            0 => FieldType::Text,
+            1 => FieldType::Keyword,
+            2 => FieldType::Integer,
+            3 => FieldType::Float,
+            4 => FieldType::Date,
+            5 => FieldType::Boolean,
+            6 => FieldType::Vector,
+            _ => FieldType::Text,
+        };
+        *cursor = &cursor[1..];
+        let val_len = read_u64_le(cursor) as usize;
+        let val_bytes = read_bytes(cursor, val_len);
+        let value = String::from_utf8_lossy(val_bytes).to_string();
+        fields.push(Field {
+            name,
+            field_type,
+            value,
+        });
+    }
+    DocRecord {
+        doc_id,
+        doc_seq,
+        field_length,
+        fields,
+    }
+}
+
+/// Try to read `doc_store.offsets`. Returns `None` if it's missing, or if
+/// present but fails a sanity check (bad/truncated header, declared
+/// `doc_count` not matching the segment's actual footer) — either way,
+/// callers fall back to the legacy full-parse path for `doc_store.bin`
+/// rather than trusting a stale or corrupt sidecar. Never returns `Err`:
+/// a broken sidecar degrades to "slower, still correct," not a failed
+/// segment open.
+fn try_read_doc_index(segment_dir: &Path, expected_doc_count: u32) -> Option<Vec<DocIndexEntry>> {
+    let path = segment_dir.join("doc_store.offsets");
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(_) => return None, // missing sidecar: legacy segment, not an error
+    };
+    let mut cursor = &data[..];
+    if cursor.len() < 4 {
+        eprintln!(
+            "WARN: {} is truncated (missing header); falling back to full parse",
+            path.display()
+        );
+        return None;
+    }
+    let doc_count = read_u32_le(&mut cursor);
+    if doc_count != expected_doc_count {
+        eprintln!(
+            "WARN: {} declares {doc_count} doc(s) but footer.json says {expected_doc_count}; \
+             falling back to full parse",
+            path.display()
+        );
+        return None;
+    }
+    let mut entries = Vec::with_capacity(doc_count as usize);
+    for _ in 0..doc_count {
+        // Fixed minimum per entry beyond the variable-length id: field_length
+        // (4) + offset (8) + length (4) = 16, plus the 4-byte id_len prefix.
+        if cursor.len() < 4 {
+            eprintln!(
+                "WARN: {} truncated mid-record; falling back to full parse",
+                path.display()
+            );
+            return None;
+        }
+        let id_len = read_u32_le(&mut cursor) as usize;
+        if cursor.len() < id_len + 16 {
+            eprintln!(
+                "WARN: {} truncated mid-record; falling back to full parse",
+                path.display()
+            );
+            return None;
+        }
+        let id_bytes = read_bytes(&mut cursor, id_len);
+        let doc_id = DocumentId(String::from_utf8_lossy(id_bytes).to_string());
+        let field_length = read_u32_le(&mut cursor);
+        let offset = read_u64_le(&mut cursor);
+        let length = read_u32_le(&mut cursor);
+        entries.push(DocIndexEntry {
+            doc_id,
+            field_length,
+            offset,
+            length,
+        });
+    }
+    Some(entries)
 }
 
 // ─── Binary read helpers ────────────────────────────────────────────────────
@@ -895,6 +1131,47 @@ mod tests {
         let rewritten = SegmentReader::rewrite_filter_blooms(&dir).unwrap();
         let blooms = rewritten.filter_blooms.expect("blooms rebuilt");
         assert!(blooms.get("matterId").unwrap().may_contain("m42"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backfill_offset_tables_upgrades_legacy_segment() {
+        let dir = std::env::temp_dir().join("kosha-test-seg-backfill-offsets");
+        let _ = fs::remove_dir_all(&dir);
+        let mut w = SegmentWriter::new(SegmentId("test".into()), dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("content", "hello world")],
+        );
+        w.add_document(
+            DocumentId("d2".into()),
+            vec![Field::text("content", "hello moon and stars")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        // Simulate a pre-lazy-loading segment: no sidecar, format_version 0.
+        fs::remove_file(dir.join("doc_store.offsets")).unwrap();
+        let mut footer = SegmentReader::read_footer(&dir).unwrap();
+        footer.format_version = 0;
+        fs::write(
+            dir.join("footer.json"),
+            serde_json::to_string_pretty(&footer).unwrap(),
+        )
+        .unwrap();
+
+        let updated = SegmentReader::backfill_offset_tables(&dir).unwrap();
+        assert_eq!(updated.format_version, kosha_core::SEGMENT_FORMAT_VERSION);
+        assert!(dir.join("doc_store.offsets").exists());
+
+        // Reopening now takes the Lazy path, and doc_meta/doc_record_full
+        // return the same data as before the backfill.
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let d1 = r.doc_meta(0).unwrap();
+        assert_eq!(d1.doc_id.0, "d1");
+        let d2_full = r.doc_record_full(1).unwrap().unwrap();
+        assert_eq!(d2_full.doc_id.0, "d2");
+        assert_eq!(d2_full.fields[0].value, "hello moon and stars");
 
         let _ = fs::remove_dir_all(&dir);
     }
