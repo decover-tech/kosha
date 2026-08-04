@@ -4,13 +4,25 @@
 //! the staging `paragraph_index_hnsw` "contract" hit count), then times
 //! `Searcher::search` with `max_results: 5`.
 //!
-//! Before / after comparison (deferred field materialization):
+//! ## Before / after validation
+//!
+//! Criterion baselines are the source of truth for improvement claims:
 //! ```text
-//! # on the pre-fix tree:
+//! # on the pre-change tree (or after temporarily reverting the fix):
 //! cargo bench -p kosha-query --bench search_latency -- --save-baseline before
-//! # on the post-fix tree:
+//! # on the post-change tree:
 //! cargo bench -p kosha-query --bench search_latency -- --baseline before
 //! ```
+//! Criterion prints `change: time: [lo% mid% hi%]` — require a statistically
+//! significant improvement (`Performance has improved`) before landing.
+//!
+//! Validated improvements (Criterion `--baseline`, p < 0.05):
+//! - deferred materialization + `select_nth` (`warm_bm25_25053_hits_page5`):
+//!   ~28.5 ms → ~2.5 ms (**−91%**)
+//! - AND HashMap posting lookup (`warm_bm25_and_25053_hits_page5`):
+//!   ~209 ms → ~5.2 ms (**−97%**)
+//!
+//! For phase-level remaining-cost analysis see `scoring_profile`.
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -64,9 +76,9 @@ fn build_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
     (ns, manifest)
 }
 
-fn mk_query() -> SearchQuery {
+fn mk_query(text: &str) -> SearchQuery {
     SearchQuery {
-        query_text: "contract".into(),
+        query_text: text.into(),
         max_results: PAGE_SIZE,
         from: 0,
         bm25_params: Bm25Params::default(),
@@ -85,12 +97,18 @@ fn bench_search_latency(c: &mut Criterion) {
     let dir = std::env::temp_dir().join("kosha-bench-search-latency-e2e");
     let (ns, manifest) = build_corpus(&dir);
     let searcher = Searcher::new(dir.clone());
-    let query = mk_query();
+    let single = mk_query("contract");
+    // Multi-term AND — every doc contains both tokens, so intersection ≈ HIT_COUNT.
+    // This is the path that previously re-scanned postings with `.find()`.
+    let and_query = mk_query("contract dispute");
 
     // Warm the in-memory segment cache so we measure compute, not disk I/O.
-    let warm = searcher.search(&ns, &manifest, &query, None).unwrap();
+    let warm = searcher.search(&ns, &manifest, &single, None).unwrap();
     assert_eq!(warm.total_hits, HIT_COUNT);
     assert_eq!(warm.results.len(), PAGE_SIZE);
+    let warm_and = searcher.search(&ns, &manifest, &and_query, None).unwrap();
+    assert_eq!(warm_and.total_hits, HIT_COUNT);
+    assert_eq!(warm_and.results.len(), PAGE_SIZE);
 
     let mut group = c.benchmark_group("issue37_e2e_search");
     group.throughput(Throughput::Elements(HIT_COUNT as u64));
@@ -101,7 +119,21 @@ fn bench_search_latency(c: &mut Criterion) {
                 .search(
                     black_box(&ns),
                     black_box(&manifest),
-                    black_box(&query),
+                    black_box(&single),
+                    None,
+                )
+                .unwrap();
+            black_box(r.total_hits);
+            black_box(r.results.len());
+        })
+    });
+    group.bench_function("warm_bm25_and_25053_hits_page5", |b| {
+        b.iter(|| {
+            let r = searcher
+                .search(
+                    black_box(&ns),
+                    black_box(&manifest),
+                    black_box(&and_query),
                     None,
                 )
                 .unwrap();

@@ -709,46 +709,46 @@ impl Searcher {
                         }
                     }
                 } else {
-                    // Multi-term: intersect doc_ids, then score intersection.
-                    // Start with the shortest postings list for efficiency.
-                    let mut and_candidates: Vec<(u32, Vec<Vec<u32>>)> = {
-                        let shortest = term_postings.iter().min_by_key(|(_, p)| p.len()).unwrap();
-                        shortest.1.iter().map(|p| (p.doc_id, Vec::new())).collect()
-                    };
-                    let _doc_freqs: HashMap<u32, HashMap<&str, u32>> = HashMap::new();
+                    // Multi-term AND: build per-term doc→posting maps once,
+                    // intersect starting from the shortest list, then score
+                    // via O(1) lookup. The previous path rebuilt a map for
+                    // intersection but re-scanned each postings list with
+                    // `.find()` while scoring (~O(hits · postings)) — that
+                    // dominated warm multi-term latency (see scoring_profile).
+                    let term_maps: Vec<(&str, HashMap<u32, &kosha_core::Posting>, u32)> =
+                        term_postings
+                            .iter()
+                            .map(|(term, postings)| {
+                                let df = doc_frequencies.get(term).copied().unwrap_or(0);
+                                let map = postings.iter().map(|p| (p.doc_id, p)).collect();
+                                (*term, map, df)
+                            })
+                            .collect();
 
-                    // For each candidate doc, verify it appears in ALL other postings lists.
-                    for (_term, postings) in &term_postings {
-                        let term_docs: HashMap<u32, &kosha_core::Posting> =
-                            postings.iter().map(|p| (p.doc_id, p)).collect();
-                        and_candidates.retain(|(doc_id, _)| term_docs.contains_key(doc_id));
+                    let mut and_candidates: Vec<u32> = {
+                        let shortest = term_maps.iter().min_by_key(|(_, m, _)| m.len()).unwrap();
+                        shortest.1.keys().copied().collect()
+                    };
+                    for (_, map, _) in &term_maps {
+                        and_candidates.retain(|doc_id| map.contains_key(doc_id));
                         if and_candidates.is_empty() {
                             break;
                         }
-                        // Store positions for phrase matching.
-                        for (doc_id, positions) in &mut and_candidates {
-                            if let Some(posting) = term_docs.get(doc_id) {
-                                positions.push(posting.positions.clone());
-                            }
-                        }
                     }
 
-                    // Score surviving candidates.
-                    for (doc_id, _doc_positions) in &and_candidates {
-                        if let Some(doc_rec) = reader.doc_record(*doc_id) {
+                    for doc_id in and_candidates {
+                        if let Some(doc_rec) = reader.doc_record(doc_id) {
                             let mut total_score = 0.0;
-                            for (term, postings) in &term_postings {
-                                let df = doc_frequencies.get(term).copied().unwrap_or(0);
-                                let posting = postings.iter().find(|p| p.doc_id == *doc_id);
-                                if let Some(p) = posting {
+                            for (_, map, df) in &term_maps {
+                                if let Some(p) = map.get(&doc_id) {
                                     total_score += scorer.score_term(
                                         p.term_frequency,
-                                        df,
+                                        *df,
                                         doc_rec.field_length,
                                     );
                                 }
                             }
-                            scored.insert(*doc_id, total_score);
+                            scored.insert(doc_id, total_score);
                         }
                     }
                 }
@@ -1609,6 +1609,45 @@ mod tests {
             "deep bounded page (from>0) must match the equivalent slice of a full sort"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_term_and_intersects_and_scores() {
+        // Multi-term queries take the AND path (HashMap posting lookup).
+        // Docs must contain *all* terms; partial matches are excluded.
+        let dir = std::env::temp_dir().join("kosha-test-multi-term-and");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        w.add_document(
+            DocumentId("both".into()),
+            vec![Field::text("content", "contract dispute clause")],
+        );
+        w.add_document(
+            DocumentId("only-contract".into()),
+            vec![Field::text("content", "contract alone")],
+        );
+        w.add_document(
+            DocumentId("only-dispute".into()),
+            vec![Field::text("content", "dispute alone")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 3,
+            }],
+        };
+        let searcher = Searcher::new(dir.clone());
+        let r = searcher
+            .search(&ns, &manifest, &mk_query("contract dispute", 10), None)
+            .unwrap();
+        assert_eq!(r.total_hits, 1);
+        assert_eq!(r.results[0].doc_id.0, "both");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
