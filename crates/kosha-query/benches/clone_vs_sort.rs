@@ -92,7 +92,11 @@ fn sort_score_only(cands: &mut [ScoreOnlyCandidate]) {
     cands.sort_by(|a, b| score_desc_id_asc(a.score, &a.doc_id.0, b.score, &b.doc_id.0));
 }
 
-fn materialize_page(source: &[Vec<Field>], cands: &[ScoreOnlyCandidate], page: usize) -> Vec<ScoredDocument> {
+fn materialize_page(
+    source: &[Vec<Field>],
+    cands: &[ScoreOnlyCandidate],
+    page: usize,
+) -> Vec<ScoredDocument> {
     cands
         .iter()
         .take(page)
