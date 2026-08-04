@@ -2006,6 +2006,7 @@ dependencies = [
  "instant-distance",
  "kosha-core",
  "kosha-segment",
+ "rayon",
  "serde",
  "serde_json",
 ]
