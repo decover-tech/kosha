@@ -525,7 +525,7 @@ impl SegmentReader {
         let store = Self::read_filters(segment_dir)?;
         footer.filter_blooms = Some(build_filter_blooms(&store.string_fields));
         let json = serde_json::to_string_pretty(&footer)?;
-        fs::write(segment_dir.join("footer.json"), json.as_bytes())?;
+        atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
         Ok(footer)
     }
 
@@ -538,7 +538,7 @@ impl SegmentReader {
         let index = Self::read_inverted_index(segment_dir)?;
         footer.term_bloom = Some(build_term_bloom(index.keys().map(|s| s.as_str())));
         let json = serde_json::to_string_pretty(&footer)?;
-        fs::write(segment_dir.join("footer.json"), json.as_bytes())?;
+        atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
         Ok(footer)
     }
 
@@ -582,12 +582,12 @@ impl SegmentReader {
             offsets_buf.extend_from_slice(&record_start.to_le_bytes());
             offsets_buf.extend_from_slice(&(record_len as u32).to_le_bytes());
         }
-        fs::write(segment_dir.join("doc_store.offsets"), &offsets_buf)?;
+        atomic_write(&segment_dir.join("doc_store.offsets"), &offsets_buf)?;
 
         let mut footer = Self::read_footer(segment_dir)?;
         footer.format_version = kosha_core::SEGMENT_FORMAT_VERSION;
         let json = serde_json::to_string_pretty(&footer)?;
-        fs::write(segment_dir.join("footer.json"), json.as_bytes())?;
+        atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
         Ok(footer)
     }
 
@@ -865,6 +865,50 @@ fn try_read_doc_index(segment_dir: &Path, expected_doc_count: u32) -> Option<Vec
         });
     }
     Some(entries)
+}
+
+// ─── Atomic file rewrite ────────────────────────────────────────────────────
+
+/// Overwrite `path` atomically: write to a sibling temp file, then `rename`
+/// over the destination. POSIX (and Windows, via `MoveFileEx`-equivalent
+/// semantics `std::fs::rename` uses) guarantees a rename within the same
+/// directory is atomic — a concurrent reader always sees either the old
+/// complete file or the new complete one, never a truncated/partial one.
+///
+/// This matters specifically for files that get rewritten *in place* on a
+/// segment that's already published and actively being searched (unlike the
+/// original write during segment build, which completes before the segment
+/// is registered in the manifest and so can never race a reader). Plain
+/// `fs::write` truncates the destination before filling it back in, so a
+/// reader landing in that window sees a short read — for `footer.json` that
+/// surfaces as `serde_json` failing with "EOF while parsing a value" on an
+/// in-flight search.
+///
+/// The temp filename includes the PID and a per-process atomic counter so
+/// concurrent rewrites of the *same* file (e.g. two overlapping admin
+/// requests) never collide on the same temp path.
+fn atomic_write(path: &Path, data: &[u8]) -> Result<(), KoshaError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = path.parent().ok_or_else(|| {
+        KoshaError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("atomic_write: {} has no parent directory", path.display()),
+        ))
+    })?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        KoshaError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("atomic_write: {} has no file name", path.display()),
+        ))
+    })?;
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = dir.join(format!(".{file_name}.tmp.{}.{n}", std::process::id()));
+
+    fs::write(&tmp_path, data)?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 // ─── Binary read helpers ────────────────────────────────────────────────────
@@ -1195,5 +1239,61 @@ mod tests {
         // d1 appears 3 times, d2 once, d3 once
         assert_eq!(per_doc.buckets[0].key, "d1");
         assert_eq!(per_doc.buckets[0].doc_count, 3);
+    }
+
+    /// Regression test for the staging bug: a search thread calling
+    /// `read_footer` while `rewrite_term_bloom` is mid-rewrite of the same
+    /// `footer.json` must never observe a truncated file. Before the
+    /// `atomic_write` fix (plain `fs::write`, which truncates then fills),
+    /// this reproduced `serde_json` failing with "EOF while parsing a
+    /// value" under load. With rename-based atomic replace, every read sees
+    /// either the fully-old or fully-new file — asserted here by requiring
+    /// every single read across many racing iterations to succeed.
+    #[test]
+    fn concurrent_footer_rewrite_never_yields_truncated_read() {
+        let dir = std::env::temp_dir().join("kosha-test-seg-atomic-footer-race");
+        let _ = fs::remove_dir_all(&dir);
+        let seg_id = SegmentId("test".into());
+        let mut w = SegmentWriter::new(seg_id, dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("t", "quick brown fox")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let writer_dir = dir.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..200 {
+                SegmentReader::rewrite_term_bloom(&writer_dir).unwrap();
+            }
+        });
+
+        let reader_dir = dir.clone();
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0usize;
+            while reads < 200 {
+                // A racing read must always parse cleanly — either the
+                // pre-rewrite or post-rewrite footer, never a partial one.
+                SegmentReader::read_footer(&reader_dir)
+                    .expect("footer read raced a rewrite and saw a truncated file");
+                reads += 1;
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        // atomic_write's temp files must never linger after a successful run.
+        let leftover_tmp: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "leftover temp files after atomic_write: {leftover_tmp:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
