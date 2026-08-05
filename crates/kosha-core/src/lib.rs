@@ -372,12 +372,58 @@ impl LocalStorage {
     }
 }
 
+/// Overwrite `path` atomically: write to a sibling temp file, then `rename`
+/// over the destination. POSIX (and Windows, via the same
+/// `std::fs::rename`-backed semantics) guarantees a rename within one
+/// directory is atomic — a reader always sees either the old complete file
+/// or the new complete one, never a truncated/partial one.
+///
+/// `std::fs::write` (what this replaces) truncates the destination before
+/// filling it back in. That's fine for a brand-new path nobody else can see
+/// yet, but every `StorageBackend::write` call here can also be an in-place
+/// rewrite of a file that's already published and being concurrently read
+/// (a segment mid-search, a WAL file mid-recovery) — or can simply be
+/// interrupted mid-write (process kill, OOM). Either way a reader landing in
+/// the truncate-then-fill window, or a later read of a write that never
+/// finished, sees a short file. For JSON that surfaces as `serde_json`
+/// failing with "EOF while parsing a value"; for a segment's binary files it
+/// silently corrupts data that then gets faithfully copied to S3 by whatever
+/// syncs the segment afterward, baking the corruption into the source of
+/// truth. See PR #45 (`kosha-segment`'s narrower fix for the same class of
+/// bug in the footer-rewrite admin paths) for the incident this generalizes.
+///
+/// The temp filename includes the PID and a per-process atomic counter so
+/// concurrent writes to the *same* path never collide on the same temp file.
+fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), KoshaError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = path.parent().ok_or_else(|| {
+        KoshaError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("atomic_write: {} has no parent directory", path.display()),
+        ))
+    })?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        KoshaError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("atomic_write: {} has no file name", path.display()),
+        ))
+    })?;
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = dir.join(format!(".{file_name}.tmp.{}.{n}", std::process::id()));
+
+    std::fs::write(&tmp_path, data)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 impl StorageBackend for LocalStorage {
     fn read(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
         Ok(std::fs::read(self.root.join(path))?)
     }
     fn write(&self, path: &str, data: &[u8]) -> Result<(), KoshaError> {
-        Ok(std::fs::write(self.root.join(path), data)?)
+        atomic_write(&self.root.join(path), data)
     }
     fn exists(&self, path: &str) -> bool {
         self.root.join(path).exists()
@@ -1098,5 +1144,65 @@ mod tests {
             },
         };
         assert!(!segment_may_match(&must, Some(&blooms)));
+    }
+
+    /// Regression test for the staging incident this generalizes PR #45's
+    /// fix for: `SegmentWriter::finalize()` (and every other caller of
+    /// `StorageBackend::write`, e.g. WAL, the S3-hydration local cache
+    /// mirror) rewrites files through `LocalStorage::write`. A reader
+    /// racing a rewrite of the same path must never observe a
+    /// truncated/torn file — before `atomic_write`, plain `fs::write`
+    /// (truncate then fill) could hand back anywhere from 0 bytes up to a
+    /// partial mix, which is exactly how staging ended up with 0-byte
+    /// `doc_store.bin`/`footer.json` in already-published, already-synced
+    /// segments.
+    #[test]
+    fn concurrent_local_storage_write_never_yields_truncated_read() {
+        let dir = std::env::temp_dir().join("kosha-core-test-atomic-write-race");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let content_a = vec![b'a'; 5_000];
+        let content_b = vec![b'b'; 9_000];
+        LocalStorage::new(dir.clone())
+            .write("segment.bin", &content_a)
+            .unwrap();
+
+        let (writer_dir, reader_dir) = (dir.clone(), dir.clone());
+        let (a, b) = (content_a.clone(), content_b.clone());
+        let writer = std::thread::spawn(move || {
+            let backend = LocalStorage::new(writer_dir);
+            for i in 0..200 {
+                let data = if i % 2 == 0 { &a } else { &b };
+                backend.write("segment.bin", data).unwrap();
+            }
+        });
+        let reader = std::thread::spawn(move || {
+            let backend = LocalStorage::new(reader_dir);
+            for _ in 0..200 {
+                let data = backend.read("segment.bin").unwrap();
+                assert!(
+                    data == content_a || data == content_b,
+                    "read a torn/truncated write: {} bytes (expected {} or {})",
+                    data.len(),
+                    content_a.len(),
+                    content_b.len()
+                );
+            }
+        });
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "leftover temp files after atomic_write: {leftover:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
