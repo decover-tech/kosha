@@ -1296,4 +1296,57 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// Integration-level regression test for the staging incident:
+    /// `SegmentWriter::finalize()` writes `doc_store.bin`/`inverted.idx`/
+    /// `filters.bin`/`footer.json` through `LocalStorage::write`
+    /// (`kosha-core`). If a second `finalize()` targets the same segment
+    /// directory concurrently with a reader — the scenario staging hit via
+    /// a segment-id collision under rapid small flushes — a non-atomic
+    /// write there is exactly how `paragraph_index_hnsw` ended up with
+    /// permanently 0-byte `doc_store.bin`/`footer.json` in already-published
+    /// segments (that corruption then got faithfully copied to S3 by
+    /// whatever synced the segment afterward). This exercises the real
+    /// multi-file `finalize()` write sequence end to end, not just a single
+    /// file, complementing the lower-level `kosha-core` write/read test.
+    #[test]
+    fn concurrent_segment_finalize_never_yields_truncated_read() {
+        let dir = std::env::temp_dir().join("kosha-test-seg-finalize-race");
+        let _ = fs::remove_dir_all(&dir);
+
+        // Publish an initial, fully-valid segment at this path so the
+        // reader thread always has something parseable from the start.
+        let seg_id = SegmentId("test".into());
+        let mut w = SegmentWriter::new(seg_id, dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("t", "quick brown fox")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let writer_dir = dir.clone();
+        let writer = std::thread::spawn(move || {
+            for i in 0..50 {
+                let mut w = SegmentWriter::new(SegmentId("test".into()), writer_dir.clone());
+                w.add_document(
+                    DocumentId(format!("d{i}")),
+                    vec![Field::text("t", "lazy dog jumps over the fence")],
+                );
+                w.finalize(Bm25Params::default()).unwrap();
+            }
+        });
+        let reader_dir = dir.clone();
+        let reader = std::thread::spawn(move || {
+            for _ in 0..50 {
+                // A concurrent finalize() rewriting this same directory's
+                // files must never leave open() looking at a torn file.
+                SegmentReader::open(reader_dir.clone())
+                    .expect("segment open raced a concurrent finalize() and saw a torn file");
+            }
+        });
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
