@@ -1,8 +1,8 @@
 # Kosha — A Storage-Disaggregated Search Engine on S3 + SSD Cache
 
-Status: Draft v1
+Status: Draft v1.1
 Author: Ravi Tandon
-Date: 2026-07-18
+Date: 2026-08-05
 Implementation language: Rust
 
 ## 1. Summary
@@ -235,13 +235,91 @@ Iceberg/Delta Lake use for tables, applied to a search index.
 3. **Flush**: when the buffer crosses a size/time threshold (default: 512MB or 60s, whichever
    first), the ingest node builds inverted + vector + filter indices for the buffered documents,
    writes a new segment to S3, and publishes an updated manifest that adds the new segment.
-4. **Compaction**: a background worker periodically merges small segments (and drops
-   tombstoned/deleted docs) into fewer, larger ones, publishing a new manifest and marking old
-   segments for GC after a grace period (bounded by the longest manifest a query node might still
-   be holding).
+4. **Compaction**: a background worker merges *small / recent* segments (and drops
+   tombstoned/deleted docs) into fewer, larger ones under a size-tiered policy (§7.1), publishing
+   a new manifest and marking old segments for GC after a grace period (bounded by the longest
+   manifest a query node might still be holding). Compaction never holds a process-wide lock
+   across merge I/O, and never re-merges already-large segments on every pass.
 
 Deletes and updates are tombstone-based (mark-and-compact), same as Lucene/ES — there is no
 in-place mutation of a segment.
+
+### 7.1 Compaction policy & isolation
+
+Compaction is the write-path operation most likely to become an operational burden if done
+naively. The Phase-1 `compact_namespace` stopgap (admin route) merged *every* live segment into
+one while holding the process-wide indexer mutex for the full synchronous disk read+write. That
+is unacceptable as a scheduled behavior: it freezes every tenant/namespace for the duration of
+the largest merge, and it defeats lazy per-segment hydration by repeatedly rebuilding one
+ever-growing survivor.
+
+**Target properties**
+
+1. **Per-namespace isolation.** Compacting namespace A must not block reads or writes to
+   namespace B. Prefer: do not block reads/writes to A for the duration of A's merge I/O either
+   (snapshot → merge off the hot path → compare-and-swap publish).
+2. **Size-tiered / incremental merges.** Only segments below a size threshold participate as
+   merge inputs; already-large segments are left alone. Each pass merges a bounded batch (e.g.
+   at most N smallest mergeable segments), not the entire namespace.
+3. **Trigger on need, not on a blind timer.** Fire when live mergeable segment count (or total
+   mergeable bytes) crosses a threshold — e.g. `mergeable_segments >= 8` — so compaction runs
+   when it actually reduces query fan-out, not on a fixed clock regardless of load.
+4. **Out-of-process from the query/ingest path (target).** DESIGN §5's dedicated compaction
+   node role remains the end state: merge workers read segments from S3, write a new segment,
+   and publish a new manifest via CAS. In-process tiered compaction with per-namespace locking
+   is the Phase-1 bridge that makes the admin/emergency path and a future in-process scheduler
+   safe; it is not a substitute for the compaction role at scale.
+
+**In-process locking model (Phase 1)**
+
+```
+Indexer
+  └─ namespaces: map<NamespaceId, NamespaceHandle>
+                    ├─ state: Mutex<NamespaceState>   # buffer, manifest, tombstones, id_index
+                    └─ compact: Mutex<()>             # at most one compact per namespace
+```
+
+- Looking up a `NamespaceHandle` takes only a short registry lock.
+- Ingest / flush / exists / replace / delete take that namespace's `state` lock only.
+- Compaction takes `compact` for the whole operation (no concurrent compact on the same ns), but
+  holds `state` only for (a) selecting merge inputs + cloning tombstones, and (b) CAS-publishing
+  the new manifest. Merge I/O (open + `iter_doc_records` + `SegmentWriter::finalize`) runs with
+  `state` released so searches and writes against other work on that namespace can proceed against
+  the pre-compact snapshot; concurrent mutations that remove a merge input cause publish to abort
+  (or retry) rather than corrupt the manifest.
+- There is **no** process-wide `Mutex<Indexer>` on the request path.
+
+**Merge selection (size-tiered lite)**
+
+Given a namespace manifest and a `CompactionPolicy`:
+
+| Knob | Default (Phase 1) | Meaning |
+|------|-------------------|---------|
+| `max_mergeable_docs` | 50_000 | Segment with `doc_count >=` this is never a merge input |
+| `max_segments_per_merge` | 32 | Cap inputs per pass |
+| `min_mergeable_segments` | 2 | No-op unless at least this many mergeable segments exist |
+| `trigger_mergeable_segments` | 8 | `needs_compaction` becomes true at this count |
+
+Algorithm: consider segments with `doc_count < max_mergeable_docs` (and present on local disk),
+sort ascending by `doc_count`, take up to `max_segments_per_merge`. Merge those into one new
+segment; leave larger segments and non-selected small segments untouched. A separate `Full` mode
+(admin/emergency only) may still merge every local segment — it must never be what a scheduler
+calls.
+
+**Triggers & scheduling**
+
+- **Do not** schedule blind periodic full compaction against live ingest/query nodes.
+- A future in-process or compaction-role loop should call `needs_compaction(ns)` (segment-count /
+  size thresholds above) and, when true, run one tiered pass. Backoff when publish CAS fails or
+  when the node is under query load.
+- The `POST /v1/admin/compact-namespace` route remains the emergency lever; default body mode is
+  `tiered`. Pass `"mode": "full"` only for deliberate one-shot remediation.
+
+**What this deliberately leaves to the compaction node role (§5)**
+
+- Running merges on separate compute so ingest/query pods never pay merge CPU/IO.
+- Fair multi-tenant scheduling and cost controls across namespaces.
+- GC of superseded segments after the manifest-staleness window (§11).
 
 **Durability/visibility tradeoff**: a document is durable (survives any single node failure) as
 soon as its WAL append to S3 acknowledges. It becomes *queryable* once its segment is flushed and
@@ -514,9 +592,11 @@ one-time batch job reading from the existing Postgres/S3 document store and repl
   pointers) is a new stateful dependency (likely Postgres, reusing Callosum's existing database)
   and becomes a new availability-critical path for the *write* side; read-path availability should
   degrade gracefully (serve last-known-good manifest) if it's briefly unavailable.
-- **Compaction cost/scheduling**: needs a concrete policy (size-tiered vs. leveled, à la LSM
-  trees) and a cost model before it's clear compaction doesn't become the new "cluster rebalance"
-  operational burden in disguise.
+- **Compaction cost/scheduling**: ~~needs a concrete policy (size-tiered vs. leveled)~~
+  **resolved for Phase 1 in §7.1** (size-tiered lite, per-namespace locks, need-based triggers,
+  admin `full` mode as emergency-only). Still open: cost model / fair multi-tenant scheduling for
+  the dedicated compaction node role, and whether to graduate from size-tiered-lite to a true
+  leveled LSM policy once namespace size distributions are measured.
 - **Feature gaps vs. ES DSL**: confirm no other Decover consumer beyond Sage depends on
   OpenSearch aggregation/analytics features not covered by §3's non-goals before committing to
   full replacement.

@@ -1,13 +1,21 @@
+pub mod compaction;
 pub mod wal;
 
+pub use compaction::{
+    needs_compaction, CompactMode, CompactOptions, CompactResult, CompactionPolicy, MergePlan,
+};
+
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use kosha_core::{
     Bm25Params, Document, DocumentId, FilterClause, FilterStore, KoshaError, Manifest,
     ManifestEntry, NamespaceId, RangeBound, SegmentId,
 };
 use kosha_segment::SegmentWriter;
+
+use compaction::select_merge_inputs;
 
 struct NamespaceBuffer {
     #[allow(dead_code)]
@@ -17,21 +25,56 @@ struct NamespaceBuffer {
     bm25_params: Bm25Params,
 }
 
+/// Mutable per-namespace write state (DESIGN.md §7.1).
+struct NamespaceState {
+    buffer: Option<NamespaceBuffer>,
+    manifest: Manifest,
+    /// Tombstoned docs: segment_id → set of doc_seqs
+    tombstones: HashMap<SegmentId, HashSet<u32>>,
+    /// Lazy map of doc_id → flushed (segment, seq) locations.
+    /// Built on first `/exists` call; invalidated across replace/compact/restore.
+    id_index: Option<HashMap<DocumentId, Vec<(SegmentId, u32)>>>,
+    /// True once a manifest has been created or restored for this namespace.
+    /// Distinguishes "unknown namespace" from "empty namespace".
+    known: bool,
+}
+
+impl NamespaceState {
+    fn new() -> Self {
+        Self {
+            buffer: None,
+            manifest: Manifest {
+                version: 0,
+                segments: Vec::new(),
+            },
+            tombstones: HashMap::new(),
+            id_index: None,
+            known: false,
+        }
+    }
+}
+
+struct NamespaceHandle {
+    state: Mutex<NamespaceState>,
+    /// At most one compaction in flight per namespace. Held across merge I/O
+    /// while `state` is released (DESIGN.md §7.1).
+    compact: Mutex<()>,
+}
+
+/// Thread-safe indexer with per-namespace isolation (DESIGN.md §7.1).
+///
+/// Request handlers share one `Indexer` without a process-wide mutex: each
+/// namespace serializes its own mutations via [`NamespaceHandle::state`].
 pub struct Indexer {
     data_dir: PathBuf,
-    buffers: HashMap<NamespaceId, NamespaceBuffer>,
-    manifests: HashMap<NamespaceId, Manifest>,
     flush_threshold: usize,
     bm25_params: Bm25Params,
-    /// Tombstoned docs: namespace → segment_id → set of doc_seqs
-    tombstones: HashMap<NamespaceId, HashMap<SegmentId, HashSet<u32>>>,
-    /// Lazy per-namespace map of doc_id → flushed (segment, seq) locations.
-    /// Built on first `/exists` call; invalidated across replace/compact/restore.
-    id_index: HashMap<NamespaceId, HashMap<DocumentId, Vec<(SegmentId, u32)>>>,
     /// Write-Ahead Log for durability
-    wal: std::sync::Mutex<crate::wal::WalWriter>,
+    wal: Mutex<crate::wal::WalWriter>,
     /// Whether WAL is enabled
     wal_enabled: bool,
+    namespaces: Mutex<HashMap<NamespaceId, Arc<NamespaceHandle>>>,
+    compaction_policy: CompactionPolicy,
 }
 
 impl Indexer {
@@ -41,23 +84,27 @@ impl Indexer {
         let backend = Box::new(kosha_core::LocalStorage::new(wal_dir.clone()));
         let wal = crate::wal::WalWriter::new(backend, wal_dir.clone());
 
-        let mut idx = Self {
+        let idx = Self {
             data_dir,
-            buffers: HashMap::new(),
-            manifests: HashMap::new(),
             flush_threshold: 1000,
             bm25_params: Bm25Params::default(),
-            tombstones: HashMap::new(),
-            id_index: HashMap::new(),
-            wal: std::sync::Mutex::new(wal),
+            wal: Mutex::new(wal),
             wal_enabled: true,
+            namespaces: Mutex::new(HashMap::new()),
+            compaction_policy: CompactionPolicy::default(),
         };
 
         // Recover un-flushed documents from WAL on startup.
         if let Ok(records) = crate::wal::WalWriter::recover(&wal_dir) {
             for record in &records {
-                let ns = record.namespace.clone();
-                let buf = idx.buffer_mut(ns);
+                let handle = idx.ns_handle(&record.namespace);
+                let mut state = handle.state.lock().unwrap();
+                let buf = Self::buffer_mut_in(
+                    &mut state,
+                    record.namespace.clone(),
+                    &idx.data_dir,
+                    &idx.bm25_params,
+                );
                 buf.documents.extend(record.documents.clone());
             }
         }
@@ -81,14 +128,61 @@ impl Indexer {
         self
     }
 
+    pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
+        self.compaction_policy = policy;
+        self
+    }
+
+    pub fn compaction_policy(&self) -> &CompactionPolicy {
+        &self.compaction_policy
+    }
+
+    fn ns_handle(&self, namespace: &NamespaceId) -> Arc<NamespaceHandle> {
+        let mut map = self.namespaces.lock().unwrap();
+        map.entry(namespace.clone())
+            .or_insert_with(|| {
+                Arc::new(NamespaceHandle {
+                    state: Mutex::new(NamespaceState::new()),
+                    compact: Mutex::new(()),
+                })
+            })
+            .clone()
+    }
+
+    fn buffer_mut_in<'a>(
+        state: &'a mut NamespaceState,
+        namespace: NamespaceId,
+        data_dir: &Path,
+        bm25_params: &Bm25Params,
+    ) -> &'a mut NamespaceBuffer {
+        if state.buffer.is_none() {
+            let counter = if data_dir.join(&namespace.0).exists() {
+                std::fs::read_dir(data_dir.join(&namespace.0))
+                    .map(|e| e.filter_map(|e| e.ok()).count() as u64)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            state.buffer = Some(NamespaceBuffer {
+                namespace: namespace.clone(),
+                documents: Vec::new(),
+                segment_counter: counter,
+                bm25_params: bm25_params.clone(),
+            });
+        }
+        state.buffer.as_mut().unwrap()
+    }
+
     /// Delete documents matching a filter clause.
     /// Records tombstones so subsequent searches exclude them.
     pub fn delete_by_query(
-        &mut self,
+        &self,
         namespace: &NamespaceId,
         manifest: &Manifest,
         filter: &FilterClause,
     ) -> Result<usize, KoshaError> {
+        let handle = self.ns_handle(namespace);
+        let mut state = handle.state.lock().unwrap();
         let mut total = 0;
         for entry in &manifest.segments {
             let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
@@ -101,9 +195,8 @@ impl Indexer {
             let matching = crate::apply_filter_delete(filter, store, &all)?;
             if !matching.is_empty() {
                 total += matching.len();
-                self.tombstones
-                    .entry(namespace.clone())
-                    .or_default()
+                state
+                    .tombstones
                     .entry(entry.segment_id.clone())
                     .or_default()
                     .extend(matching);
@@ -116,8 +209,17 @@ impl Indexer {
     pub fn get_tombstones(
         &self,
         namespace: &NamespaceId,
-    ) -> Option<&HashMap<SegmentId, HashSet<u32>>> {
-        self.tombstones.get(namespace)
+    ) -> Option<HashMap<SegmentId, HashSet<u32>>> {
+        let map = self.namespaces.lock().unwrap();
+        let handle = map.get(namespace)?;
+        let state = handle.state.lock().unwrap();
+        if !state.known && state.tombstones.is_empty() {
+            return None;
+        }
+        if state.tombstones.is_empty() {
+            return None;
+        }
+        Some(state.tombstones.clone())
     }
 
     /// Which of `ids` already exist in the namespace (buffer or flushed segments)?
@@ -125,7 +227,7 @@ impl Indexer {
     /// Flushed lookups require local segment files (hydrated cache). Missing
     /// local files are treated as absent for that segment.
     pub fn existing_ids(
-        &mut self,
+        &self,
         namespace: &NamespaceId,
         ids: &[DocumentId],
     ) -> Result<HashSet<DocumentId>, KoshaError> {
@@ -134,8 +236,10 @@ impl Indexer {
             return Ok(found);
         }
         let wanted: HashSet<&DocumentId> = ids.iter().collect();
+        let handle = self.ns_handle(namespace);
+        let mut state = handle.state.lock().unwrap();
 
-        if let Some(buf) = self.buffers.get(namespace) {
+        if let Some(buf) = state.buffer.as_ref() {
             for doc in &buf.documents {
                 if wanted.contains(&doc.id) {
                     found.insert(doc.id.clone());
@@ -143,9 +247,8 @@ impl Indexer {
             }
         }
 
-        self.ensure_id_index(namespace)?;
-        if let Some(index) = self.id_index.get(namespace) {
-            let tombstones = self.tombstones.get(namespace);
+        Self::ensure_id_index_in(&mut state, namespace, &self.data_dir)?;
+        if let Some(index) = state.id_index.as_ref() {
             for id in ids {
                 if found.contains(id) {
                     continue;
@@ -154,8 +257,9 @@ impl Indexer {
                     continue;
                 };
                 let alive = locs.iter().any(|(seg, seq)| {
-                    !tombstones
-                        .and_then(|t| t.get(seg))
+                    !state
+                        .tombstones
+                        .get(seg)
                         .is_some_and(|set| set.contains(seq))
                 });
                 if alive {
@@ -166,43 +270,38 @@ impl Indexer {
         Ok(found)
     }
 
-    fn ensure_id_index(&mut self, namespace: &NamespaceId) -> Result<(), KoshaError> {
-        if self.id_index.contains_key(namespace) {
+    fn ensure_id_index_in(
+        state: &mut NamespaceState,
+        namespace: &NamespaceId,
+        data_dir: &Path,
+    ) -> Result<(), KoshaError> {
+        if state.id_index.is_some() {
             return Ok(());
         }
         let mut index: HashMap<DocumentId, Vec<(SegmentId, u32)>> = HashMap::new();
-        let Some(manifest) = self.manifests.get(namespace).cloned() else {
-            self.id_index.insert(namespace.clone(), index);
-            return Ok(());
-        };
-        let data_dir = self.data_dir.clone();
-        for entry in &manifest.segments {
-            let seg_dir = data_dir.join(&namespace.0).join(&entry.segment_id.0);
-            if !seg_dir.exists() {
-                continue;
-            }
-            let reader = kosha_segment::SegmentReader::open_with_options(seg_dir, false)?;
-            for meta in reader.iter_doc_meta() {
-                index
-                    .entry(meta.doc_id.clone())
-                    .or_default()
-                    .push((entry.segment_id.clone(), meta.doc_seq));
+        if state.known {
+            for entry in &state.manifest.segments {
+                let seg_dir = data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                if !seg_dir.exists() {
+                    continue;
+                }
+                let reader = kosha_segment::SegmentReader::open_with_options(seg_dir, false)?;
+                for meta in reader.iter_doc_meta() {
+                    index
+                        .entry(meta.doc_id.clone())
+                        .or_default()
+                        .push((entry.segment_id.clone(), meta.doc_seq));
+                }
             }
         }
-        self.id_index.insert(namespace.clone(), index);
+        state.id_index = Some(index);
         Ok(())
     }
 
-    fn remember_flushed_ids(
-        &mut self,
-        namespace: &NamespaceId,
-        seg_id: &SegmentId,
-        docs: &[Document],
-    ) {
-        if !self.id_index.contains_key(namespace) {
+    fn remember_flushed_ids_in(state: &mut NamespaceState, seg_id: &SegmentId, docs: &[Document]) {
+        let Some(index) = state.id_index.as_mut() else {
             return;
-        }
-        let index = self.id_index.entry(namespace.clone()).or_default();
+        };
         for (seq, doc) in docs.iter().enumerate() {
             index
                 .entry(doc.id.clone())
@@ -218,7 +317,7 @@ impl Indexer {
     /// so duplicates do not accumulate. Incoming batches are last-write-wins
     /// on `doc_id`. New ids take the fast append path.
     pub fn index_documents(
-        &mut self,
+        &self,
         namespace: NamespaceId,
         documents: Vec<Document>,
     ) -> Result<usize, KoshaError> {
@@ -230,29 +329,41 @@ impl Indexer {
 
         let ids: Vec<DocumentId> = documents.iter().map(|doc| doc.id.clone()).collect();
         let id_set: HashSet<&DocumentId> = ids.iter().collect();
+        let handle = self.ns_handle(&namespace);
 
-        // Drop buffered prior versions so a re-index before flush does not
-        // duplicate within the next segment.
-        if let Some(buf) = self.buffers.get_mut(&namespace) {
-            buf.documents.retain(|doc| !id_set.contains(&doc.id));
-        }
-
-        if self.has_flushed_ids(&namespace, &ids)? {
-            // Durable full-document replace (no field merge).
-            return self.rewrite_documents(namespace, documents, false);
-        }
-
-        // Fast path: ids are new — append like the original Phase 1 writer.
-        if self.wal_enabled {
-            if let Ok(mut wal) = self.wal.lock() {
-                wal.append(&namespace, &documents).ok();
+        {
+            let mut state = handle.state.lock().unwrap();
+            if let Some(buf) = state.buffer.as_mut() {
+                buf.documents.retain(|doc| !id_set.contains(&doc.id));
             }
-        }
+            if Self::has_flushed_ids_in(&mut state, &namespace, &self.data_dir, &ids)? {
+                drop(state);
+                return self.rewrite_documents(namespace, documents, false);
+            }
 
-        let buf = self.buffer_mut(namespace.clone());
-        buf.documents.extend(documents);
-        if buf.documents.len() >= self.flush_threshold {
-            self.flush_namespace(&namespace)?;
+            if self.wal_enabled {
+                if let Ok(mut wal) = self.wal.lock() {
+                    wal.append(&namespace, &documents).ok();
+                }
+            }
+
+            let flush_threshold = self.flush_threshold;
+            let buf = Self::buffer_mut_in(
+                &mut state,
+                namespace.clone(),
+                &self.data_dir,
+                &self.bm25_params,
+            );
+            buf.documents.extend(documents);
+            if buf.documents.len() >= flush_threshold {
+                Self::flush_namespace_in(
+                    &mut state,
+                    &namespace,
+                    &self.data_dir,
+                    self.wal_enabled,
+                    &self.wal,
+                )?;
+            }
         }
         Ok(count)
     }
@@ -265,7 +376,7 @@ impl Indexer {
     /// semantics). The rewritten manifests stop referencing the old segments,
     /// so replacements remain correct after a process restart.
     pub fn replace_documents(
-        &mut self,
+        &self,
         namespace: NamespaceId,
         documents: Vec<Document>,
     ) -> Result<usize, KoshaError> {
@@ -277,7 +388,7 @@ impl Indexer {
     /// copy (`/replace`); when false, the incoming document fully replaces it
     /// (`/index` upsert).
     fn rewrite_documents(
-        &mut self,
+        &self,
         namespace: NamespaceId,
         documents: Vec<Document>,
         merge: bool,
@@ -286,14 +397,20 @@ impl Indexer {
             return Ok(0);
         }
 
+        let handle = self.ns_handle(&namespace);
+        let mut state = handle.state.lock().unwrap();
+
         // Include buffered versions in the segment scan.
-        self.flush_namespace(&namespace)?;
+        Self::flush_namespace_in(
+            &mut state,
+            &namespace,
+            &self.data_dir,
+            self.wal_enabled,
+            &self.wal,
+        )?;
         let replacement_ids: HashSet<&str> =
             documents.iter().map(|doc| doc.id.0.as_str()).collect();
-        let manifest = self.manifests.get(&namespace).cloned().unwrap_or(Manifest {
-            version: 0,
-            segments: Vec::new(),
-        });
+        let manifest = state.manifest.clone();
         let mut replaced_segments = HashSet::new();
         let mut carried_documents = Vec::new();
         // Latest segment wins when the same id was appended more than once.
@@ -313,12 +430,12 @@ impl Indexer {
             }
 
             replaced_segments.insert(entry.segment_id.clone());
-            let tombstones = self
-                .tombstones
-                .get(&namespace)
-                .and_then(|by_segment| by_segment.get(&entry.segment_id));
+            let tombstones = state.tombstones.get(&entry.segment_id).cloned();
             for record in reader.iter_doc_records() {
-                if tombstones.is_some_and(|set| set.contains(&record.doc_seq)) {
+                if tombstones
+                    .as_ref()
+                    .is_some_and(|set| set.contains(&record.doc_seq))
+                {
                     continue;
                 }
                 if replacement_ids.contains(record.doc_id.0.as_str()) {
@@ -335,16 +452,14 @@ impl Indexer {
         }
 
         if !replaced_segments.is_empty() {
-            if let Some(current) = self.manifests.get_mut(&namespace) {
-                current
-                    .segments
-                    .retain(|entry| !replaced_segments.contains(&entry.segment_id));
-                current.version += 1;
-            }
-            if let Some(tombstones) = self.tombstones.get_mut(&namespace) {
-                for segment_id in &replaced_segments {
-                    tombstones.remove(segment_id);
-                }
+            state
+                .manifest
+                .segments
+                .retain(|entry| !replaced_segments.contains(&entry.segment_id));
+            state.manifest.version += 1;
+            state.known = true;
+            for segment_id in &replaced_segments {
+                state.tombstones.remove(segment_id);
             }
         }
 
@@ -363,11 +478,27 @@ impl Indexer {
             };
             carried_documents.push(merged);
         }
-        self.id_index.remove(&namespace);
+        state.id_index = None;
         // Bypass upsert re-entry: these ids were just removed from live
         // segments, so the append path is correct and avoids a rewrite loop.
-        self.append_documents(namespace.clone(), carried_documents)?;
-        self.flush_namespace(&namespace)?;
+        Self::append_documents_in(
+            &mut state,
+            namespace.clone(),
+            carried_documents,
+            &self.data_dir,
+            &self.bm25_params,
+            self.flush_threshold,
+            self.wal_enabled,
+            &self.wal,
+        )?;
+        Self::flush_namespace_in(
+            &mut state,
+            &namespace,
+            &self.data_dir,
+            self.wal_enabled,
+            &self.wal,
+        )?;
+        drop(state);
 
         // The manifest no longer references these immutable segments.
         for segment_id in replaced_segments {
@@ -379,56 +510,88 @@ impl Indexer {
 
     /// Append without upsert checks. Used by segment rewrite after old
     /// versions of the same ids have already been removed from the manifest.
-    fn append_documents(
-        &mut self,
+    #[allow(clippy::too_many_arguments)]
+    fn append_documents_in(
+        state: &mut NamespaceState,
         namespace: NamespaceId,
         documents: Vec<Document>,
+        data_dir: &Path,
+        bm25_params: &Bm25Params,
+        flush_threshold: usize,
+        wal_enabled: bool,
+        wal: &Mutex<crate::wal::WalWriter>,
     ) -> Result<usize, KoshaError> {
         if documents.is_empty() {
             return Ok(0);
         }
-        if self.wal_enabled {
-            if let Ok(mut wal) = self.wal.lock() {
-                wal.append(&namespace, &documents).ok();
+        if wal_enabled {
+            if let Ok(mut wal_guard) = wal.lock() {
+                wal_guard.append(&namespace, &documents).ok();
             }
         }
-        let buf = self.buffer_mut(namespace.clone());
         let count = documents.len();
-        buf.documents.extend(documents);
-        if buf.documents.len() >= self.flush_threshold {
-            self.flush_namespace(&namespace)?;
+        {
+            let buf = Self::buffer_mut_in(state, namespace.clone(), data_dir, bm25_params);
+            buf.documents.extend(documents);
+        }
+        let should_flush = state
+            .buffer
+            .as_ref()
+            .is_some_and(|b| b.documents.len() >= flush_threshold);
+        if should_flush {
+            Self::flush_namespace_in(state, &namespace, data_dir, wal_enabled, wal)?;
         }
         Ok(count)
     }
 
-    fn has_flushed_ids(
-        &mut self,
+    fn has_flushed_ids_in(
+        state: &mut NamespaceState,
         namespace: &NamespaceId,
+        data_dir: &Path,
         ids: &[DocumentId],
     ) -> Result<bool, KoshaError> {
         if ids.is_empty() {
             return Ok(false);
         }
-        self.ensure_id_index(namespace)?;
-        let Some(index) = self.id_index.get(namespace) else {
+        Self::ensure_id_index_in(state, namespace, data_dir)?;
+        let Some(index) = state.id_index.as_ref() else {
             return Ok(false);
         };
-        let tombstones = self.tombstones.get(namespace);
         Ok(ids.iter().any(|id| {
             index.get(id).is_some_and(|locs| {
                 locs.iter().any(|(seg, seq)| {
-                    !tombstones
-                        .and_then(|t| t.get(seg))
+                    !state
+                        .tombstones
+                        .get(seg)
                         .is_some_and(|set| set.contains(seq))
                 })
             })
         }))
     }
 
-    pub fn flush_namespace(&mut self, namespace: &NamespaceId) -> Result<(), KoshaError> {
-        let data_dir = self.data_dir.clone();
+    pub fn flush_namespace(&self, namespace: &NamespaceId) -> Result<(), KoshaError> {
+        let handle = self.ns_handle(namespace);
+        let mut state = handle.state.lock().unwrap();
+        Self::flush_namespace_in(
+            &mut state,
+            namespace,
+            &self.data_dir,
+            self.wal_enabled,
+            &self.wal,
+        )
+    }
+
+    fn flush_namespace_in(
+        state: &mut NamespaceState,
+        namespace: &NamespaceId,
+        data_dir: &Path,
+        wal_enabled: bool,
+        wal: &Mutex<crate::wal::WalWriter>,
+    ) -> Result<(), KoshaError> {
         let (docs, seg_id, bm25_params) = {
-            let buf = self.buffer_mut(namespace.clone());
+            let Some(buf) = state.buffer.as_mut() else {
+                return Ok(());
+            };
             if buf.documents.is_empty() {
                 return Ok(());
             }
@@ -451,103 +614,160 @@ impl Indexer {
         let footer = writer.finalize(bm25_params)?;
 
         // WAL no longer needed for flushed data.
-        if self.wal_enabled {
-            if let Ok(mut wal) = self.wal.lock() {
-                wal.clear().ok();
+        if wal_enabled {
+            if let Ok(mut wal_guard) = wal.lock() {
+                wal_guard.clear().ok();
             }
         }
 
-        self.remember_flushed_ids(namespace, &seg_id, &docs);
+        Self::remember_flushed_ids_in(state, &seg_id, &docs);
 
-        let manifest = self.manifests.entry(namespace.clone()).or_insert(Manifest {
-            version: 0,
-            segments: Vec::new(),
-        });
-        manifest.version += 1;
-        manifest.segments.push(ManifestEntry {
+        state.known = true;
+        state.manifest.version += 1;
+        state.manifest.segments.push(ManifestEntry {
             segment_id: seg_id,
             doc_count: footer.doc_count,
         });
         Ok(())
     }
 
-    /// Compact segments for a namespace: merge small segments into one.
-    /// Reads all existing segments, rebuilds a single merged segment,
-    /// and garbage-collects the old segment directories.
-    pub fn compact_namespace(&mut self, namespace: &NamespaceId) -> Result<(), KoshaError> {
-        let manifest = match self.manifests.get(namespace) {
-            Some(m) => m.clone(),
-            None => return Ok(()),
+    /// Compact a namespace using the indexer's default tiered policy.
+    pub fn compact_namespace(&self, namespace: &NamespaceId) -> Result<CompactResult, KoshaError> {
+        self.compact_namespace_with_options(
+            namespace,
+            CompactOptions::tiered(self.compaction_policy.clone()),
+        )
+    }
+
+    /// Compact a namespace under explicit options (tiered vs emergency full).
+    ///
+    /// Holds the per-namespace `compact` lock for the whole operation, but
+    /// releases `state` during merge I/O so other work on this namespace (and
+    /// every other namespace) is not blocked on disk reads/writes.
+    pub fn compact_namespace_with_options(
+        &self,
+        namespace: &NamespaceId,
+        opts: CompactOptions,
+    ) -> Result<CompactResult, KoshaError> {
+        let handle = self.ns_handle(namespace);
+        let _compact_guard = handle.compact.lock().unwrap();
+
+        let (plan, tombstones, bm25_params, segments_before) = {
+            let mut state = handle.state.lock().unwrap();
+            if !state.known {
+                return Ok(CompactResult {
+                    merged: false,
+                    segments_before: 0,
+                    segments_after: 0,
+                    segments_merged: 0,
+                });
+            }
+            let segments_before = state.manifest.segments.len();
+            let ns_dir = self.data_dir.join(&namespace.0);
+            let plan = match select_merge_inputs(&state.manifest, &opts, |seg_id| {
+                ns_dir.join(&seg_id.0).exists()
+            }) {
+                Some(p) => p,
+                None => {
+                    return Ok(CompactResult {
+                        merged: false,
+                        segments_before,
+                        segments_after: segments_before,
+                        segments_merged: 0,
+                    });
+                }
+            };
+            let mut tombstones = HashMap::new();
+            for entry in &plan.inputs {
+                if let Some(ts) = state.tombstones.get(&entry.segment_id) {
+                    tombstones.insert(entry.segment_id.clone(), ts.clone());
+                }
+            }
+            let bm25_params = state
+                .buffer
+                .as_ref()
+                .map(|b| b.bm25_params.clone())
+                .unwrap_or_else(|| self.bm25_params.clone());
+            // Ensure buffer exists so future flushes keep stable params.
+            let _ = Self::buffer_mut_in(
+                &mut state,
+                namespace.clone(),
+                &self.data_dir,
+                &self.bm25_params,
+            );
+            (plan, tombstones, bm25_params, segments_before)
         };
 
-        if manifest.segments.len() <= 1 {
-            return Ok(()); // Nothing to compact
-        }
-
-        let data_dir = self.data_dir.clone();
-        let ns_dir = data_dir.join(&namespace.0);
-
-        // Stream every surviving document straight into the new segment
-        // writer instead of collecting every source segment's full content
-        // into an `all_docs` buffer first. A namespace being compacted is,
-        // by definition, made up of segments that can each be arbitrarily
-        // large — holding all of them resident at once here would
-        // reintroduce exactly the memory-scaling problem lazy segment
-        // loading (`SegmentReader::doc_meta`/`doc_record_full`) exists to
-        // fix, just on the write path instead of the read path.
+        // ── Merge I/O with state lock released (DESIGN.md §7.1) ──────────
+        let ns_dir = self.data_dir.join(&namespace.0);
         let seg_id = SegmentId(format!(
             "{}-compact-{:x}",
             namespace.0.replace('/', "_"),
             chrono_now()
         ));
-        let seg_dir = data_dir.join(&namespace.0).join(seg_id.0.as_str());
+        let seg_dir = ns_dir.join(seg_id.0.as_str());
         let mut writer = kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir);
-        let mut old_segment_ids: Vec<SegmentId> = Vec::new();
         let mut any_docs = false;
+        let old_segment_ids = plan.input_ids();
 
-        for entry in &manifest.segments {
-            let seg_dir = ns_dir.join(&entry.segment_id.0);
-            if !seg_dir.exists() {
-                continue;
-            }
-            let reader = kosha_segment::SegmentReader::open(seg_dir)?;
-            let tombstones = self
-                .tombstones
-                .get(namespace)
-                .and_then(|t| t.get(&entry.segment_id));
-
+        for entry in &plan.inputs {
+            let reader = kosha_segment::SegmentReader::open(ns_dir.join(&entry.segment_id.0))?;
+            let ts = tombstones.get(&entry.segment_id);
             for doc_rec in reader.iter_doc_records() {
-                // Skip tombstoned docs.
-                if let Some(ts) = tombstones {
-                    if ts.contains(&doc_rec.doc_seq) {
-                        continue;
-                    }
+                if ts.is_some_and(|set| set.contains(&doc_rec.doc_seq)) {
+                    continue;
                 }
                 writer.add_document(doc_rec.doc_id, doc_rec.fields);
                 any_docs = true;
             }
-            old_segment_ids.push(entry.segment_id.clone());
         }
 
         if !any_docs {
-            return Ok(());
+            let _ = std::fs::remove_dir_all(ns_dir.join(&seg_id.0));
+            return Ok(CompactResult {
+                merged: false,
+                segments_before,
+                segments_after: segments_before,
+                segments_merged: 0,
+            });
         }
 
-        let bm25_params = self.buffer_mut(namespace.clone()).bm25_params.clone();
         let footer = writer.finalize(bm25_params)?;
 
-        // Update manifest: remove old segments, add merged segment.
-        let manifest = self.manifests.get_mut(namespace).unwrap();
-        manifest
-            .segments
-            .retain(|e| !old_segment_ids.contains(&e.segment_id));
-        manifest.version += 1;
-        manifest.segments.push(kosha_core::ManifestEntry {
-            segment_id: seg_id,
-            doc_count: footer.doc_count,
-        });
+        // ── CAS publish under state lock ─────────────────────────────────
+        {
+            let mut state = handle.state.lock().unwrap();
+            let still_present = old_segment_ids
+                .iter()
+                .all(|id| state.manifest.segments.iter().any(|e| e.segment_id == *id));
+            if !still_present {
+                // A concurrent rewrite removed an input — drop the orphan
+                // merge output rather than publishing a conflicting manifest.
+                let _ = std::fs::remove_dir_all(ns_dir.join(&seg_id.0));
+                return Ok(CompactResult {
+                    merged: false,
+                    segments_before,
+                    segments_after: state.manifest.segments.len(),
+                    segments_merged: 0,
+                });
+            }
 
-        // Garbage-collect old segment directories.
+            state
+                .manifest
+                .segments
+                .retain(|e| !old_segment_ids.contains(&e.segment_id));
+            state.manifest.version += 1;
+            state.manifest.segments.push(ManifestEntry {
+                segment_id: seg_id,
+                doc_count: footer.doc_count,
+            });
+            state.known = true;
+            for seg_id in &old_segment_ids {
+                state.tombstones.remove(seg_id);
+            }
+            state.id_index = None;
+        }
+
         for seg_id in &old_segment_ids {
             let seg_dir = ns_dir.join(&seg_id.0);
             if seg_dir.exists() {
@@ -555,19 +775,32 @@ impl Indexer {
             }
         }
 
-        // Clear tombstones for compacted segments.
-        if let Some(ts) = self.tombstones.get_mut(namespace) {
-            for seg_id in &old_segment_ids {
-                ts.remove(seg_id);
-            }
-        }
-        self.id_index.remove(namespace);
+        let segments_after = self
+            .manifest_cloned(namespace)
+            .map(|m| m.segments.len())
+            .unwrap_or(0);
 
-        Ok(())
+        Ok(CompactResult {
+            merged: true,
+            segments_before,
+            segments_after,
+            segments_merged: old_segment_ids.len(),
+        })
     }
 
-    pub fn flush_all(&mut self) -> Result<(), KoshaError> {
-        let namespaces: Vec<NamespaceId> = self.buffers.keys().cloned().collect();
+    /// Whether a scheduler should run a tiered compaction pass on `namespace`.
+    pub fn needs_compaction(&self, namespace: &NamespaceId) -> bool {
+        match self.manifest_cloned(namespace) {
+            Some(m) => needs_compaction(&m, &self.compaction_policy),
+            None => false,
+        }
+    }
+
+    pub fn flush_all(&self) -> Result<(), KoshaError> {
+        let namespaces: Vec<NamespaceId> = {
+            let map = self.namespaces.lock().unwrap();
+            map.keys().cloned().collect()
+        };
         for ns in namespaces {
             self.flush_namespace(&ns)?;
         }
@@ -580,50 +813,54 @@ impl Indexer {
     /// Also advances the namespace's segment counter past any restored
     /// segment IDs, so future flushes can't collide with segments that exist
     /// in durable storage (e.g. S3) but not on local disk.
-    pub fn restore_manifest(&mut self, namespace: NamespaceId, manifest: Manifest) {
+    pub fn restore_manifest(&self, namespace: NamespaceId, manifest: Manifest) {
+        let handle = self.ns_handle(&namespace);
+        let mut state = handle.state.lock().unwrap();
         let max_counter = manifest
             .segments
             .iter()
             .filter_map(|e| segment_flush_counter(&e.segment_id))
             .max();
         if let Some(max) = max_counter {
-            let buf = self.buffer_mut(namespace.clone());
+            let buf = Self::buffer_mut_in(
+                &mut state,
+                namespace.clone(),
+                &self.data_dir,
+                &self.bm25_params,
+            );
             buf.segment_counter = buf.segment_counter.max(max + 1);
         }
-        self.id_index.remove(&namespace);
-        self.manifests.insert(namespace, manifest);
+        state.id_index = None;
+        state.manifest = manifest;
+        state.known = true;
     }
 
-    pub fn manifest(&self, namespace: &NamespaceId) -> Option<&Manifest> {
-        self.manifests.get(namespace)
+    pub fn manifest(&self, namespace: &NamespaceId) -> Option<Manifest> {
+        self.manifest_cloned(namespace)
     }
+
     pub fn manifest_cloned(&self, namespace: &NamespaceId) -> Option<Manifest> {
-        self.manifests.get(namespace).cloned()
-    }
-    pub fn namespaces(&self) -> impl Iterator<Item = &NamespaceId> {
-        self.manifests.keys()
+        let map = self.namespaces.lock().unwrap();
+        let handle = map.get(namespace)?;
+        let state = handle.state.lock().unwrap();
+        if !state.known {
+            return None;
+        }
+        Some(state.manifest.clone())
     }
 
-    fn buffer_mut(&mut self, namespace: NamespaceId) -> &mut NamespaceBuffer {
-        if !self.buffers.contains_key(&namespace) {
-            let counter = if self.data_dir.join(&namespace.0).exists() {
-                std::fs::read_dir(self.data_dir.join(&namespace.0))
-                    .map(|e| e.filter_map(|e| e.ok()).count() as u64)
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            self.buffers.insert(
-                namespace.clone(),
-                NamespaceBuffer {
-                    namespace: namespace.clone(),
-                    documents: Vec::new(),
-                    segment_counter: counter,
-                    bm25_params: self.bm25_params.clone(),
-                },
-            );
-        }
-        self.buffers.get_mut(&namespace).unwrap()
+    pub fn namespaces(&self) -> Vec<NamespaceId> {
+        let map = self.namespaces.lock().unwrap();
+        map.iter()
+            .filter_map(|(id, handle)| {
+                let state = handle.state.lock().unwrap();
+                if state.known {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -878,7 +1115,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let ns = NamespaceId("test".into());
-        let mut idx = Indexer::new(dir.clone());
+        let idx = Indexer::new(dir.clone());
         idx.index_documents(
             ns.clone(),
             vec![
@@ -933,7 +1170,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let ns = NamespaceId("exists".into());
-        let mut idx = Indexer::new(dir.clone()).with_wal(false);
+        let idx = Indexer::new(dir.clone()).with_wal(false);
         idx.index_documents(
             ns.clone(),
             vec![Document {
@@ -976,7 +1213,7 @@ mod tests {
 
         // Index + flush, producing one persisted segment.
         let ns = NamespaceId("tenant/idx".into());
-        let mut idx = Indexer::new(dir.clone());
+        let idx = Indexer::new(dir.clone());
         idx.index_documents(
             ns.clone(),
             vec![Document {
@@ -992,7 +1229,7 @@ mod tests {
         // Simulate a restart on ephemeral storage: local segment files are
         // gone, but the control store still holds the manifest.
         let _ = std::fs::remove_dir_all(&dir);
-        let mut idx2 = Indexer::new(dir.clone());
+        let idx2 = Indexer::new(dir.clone());
         assert!(idx2.manifest(&ns).is_none());
 
         idx2.restore_manifest(ns.clone(), persisted);
@@ -1020,7 +1257,7 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-index-upsert");
         let _ = std::fs::remove_dir_all(&dir);
         let ns = NamespaceId("test".into());
-        let mut idx = Indexer::new(dir.clone()).with_wal(false);
+        let idx = Indexer::new(dir.clone()).with_wal(false);
         idx.index_documents(
             ns.clone(),
             vec![
@@ -1075,7 +1312,7 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-index-buffer-dedupe");
         let _ = std::fs::remove_dir_all(&dir);
         let ns = NamespaceId("test".into());
-        let mut idx = Indexer::new(dir.clone()).with_wal(false);
+        let idx = Indexer::new(dir.clone()).with_wal(false);
         idx.index_documents(
             ns.clone(),
             vec![Document {
@@ -1113,7 +1350,7 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-replace");
         let _ = std::fs::remove_dir_all(&dir);
         let ns = NamespaceId("test".into());
-        let mut idx = Indexer::new(dir.clone());
+        let idx = Indexer::new(dir.clone());
         idx.index_documents(
             ns.clone(),
             vec![
@@ -1167,7 +1404,7 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-replace-merge");
         let _ = std::fs::remove_dir_all(&dir);
         let ns = NamespaceId("test".into());
-        let mut idx = Indexer::new(dir.clone());
+        let idx = Indexer::new(dir.clone());
         idx.index_documents(
             ns.clone(),
             vec![Document {
@@ -1214,7 +1451,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let ns = NamespaceId("test".into());
-        let mut idx = Indexer::new(dir.clone()).with_flush_threshold(2);
+        let idx = Indexer::new(dir.clone()).with_flush_threshold(2);
 
         // Index 4 docs in batches of 2 → creates 2 segments.
         for i in 0..4 {
@@ -1231,12 +1468,15 @@ mod tests {
         // 2 flushes → 2 segments.
         assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 2);
 
-        // Compact → should merge into 1 segment.
-        idx.compact_namespace(&ns).unwrap();
+        // Compact (full) → should merge into 1 segment.
+        let result = idx
+            .compact_namespace_with_options(&ns, CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
         assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 1);
 
         // Verify all 4 docs are in the merged segment.
-        let seg_id = &idx.manifest(&ns).unwrap().segments[0].segment_id;
+        let seg_id = idx.manifest(&ns).unwrap().segments[0].segment_id.clone();
         let seg_dir = dir.join("test").join(&seg_id.0);
         assert!(seg_dir.exists());
         let reader = kosha_segment::SegmentReader::open(seg_dir).unwrap();
@@ -1244,6 +1484,148 @@ mod tests {
 
         // Old segment directories should be deleted.
         assert!(std::fs::read_dir(dir.join("test")).unwrap().count() == 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_one_namespace_does_not_block_writes_to_another() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join("kosha-test-compact-isolation");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let idx = std::sync::Arc::new(Indexer::new(dir.clone()).with_flush_threshold(2));
+        let ns_a = NamespaceId("ns-a".into());
+        let ns_b = NamespaceId("ns-b".into());
+
+        // Give A enough tiny segments that a full compact does real I/O.
+        for i in 0..40 {
+            idx.index_documents(
+                ns_a.clone(),
+                vec![Document {
+                    id: DocumentId(format!("a-{i}")),
+                    fields: vec![Field::text("title", format!("doc a {i}"))],
+                }],
+            )
+            .unwrap();
+        }
+        assert!(idx.manifest(&ns_a).unwrap().segments.len() >= 10);
+
+        let started_compact = std::sync::Arc::new(AtomicBool::new(false));
+        let finished_compact = std::sync::Arc::new(AtomicBool::new(false));
+        let idx_c = idx.clone();
+        let ns_a_c = ns_a.clone();
+        let started_c = started_compact.clone();
+        let finished_c = finished_compact.clone();
+        let compact_thread = thread::spawn(move || {
+            started_c.store(true, Ordering::SeqCst);
+            idx_c
+                .compact_namespace_with_options(&ns_a_c, CompactOptions::full())
+                .unwrap();
+            finished_c.store(true, Ordering::SeqCst);
+        });
+
+        while !started_compact.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        // While A is compacting, a write to B must complete promptly.
+        let t0 = Instant::now();
+        idx.index_documents(
+            ns_b.clone(),
+            vec![Document {
+                id: DocumentId("b-1".into()),
+                fields: vec![Field::text("title", "other namespace")],
+            }],
+        )
+        .unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "write to ns-b blocked for {elapsed:?} while ns-a compacted"
+        );
+        assert!(
+            !finished_compact.load(Ordering::SeqCst) || elapsed < Duration::from_millis(500),
+            "isolation check raced past compact completion"
+        );
+
+        compact_thread.join().unwrap();
+        assert_eq!(idx.manifest(&ns_a).unwrap().segments.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_tiered_leaves_large_segments_untouched() {
+        let dir = std::env::temp_dir().join("kosha-test-compact-tiered");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ns = NamespaceId("test".into());
+        let policy = CompactionPolicy {
+            max_mergeable_docs: 3,
+            max_segments_per_merge: 32,
+            min_mergeable_segments: 2,
+            trigger_mergeable_segments: 2,
+        };
+        let idx = Indexer::new(dir.clone())
+            .with_flush_threshold(2)
+            .with_compaction_policy(policy.clone());
+
+        // Two tiny segments (2 docs each) + one larger segment (4 docs).
+        for i in 0..4 {
+            idx.index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId(format!("small-{i}")),
+                    fields: vec![Field::text("title", format!("small {i}"))],
+                }],
+            )
+            .unwrap();
+        }
+        assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 2);
+
+        // Force a third segment above the mergeable doc threshold.
+        idx.index_documents(
+            ns.clone(),
+            vec![
+                Document {
+                    id: DocumentId("big-1".into()),
+                    fields: vec![Field::text("title", "big one")],
+                },
+                Document {
+                    id: DocumentId("big-2".into()),
+                    fields: vec![Field::text("title", "big two")],
+                },
+                Document {
+                    id: DocumentId("big-3".into()),
+                    fields: vec![Field::text("title", "big three")],
+                },
+                Document {
+                    id: DocumentId("big-4".into()),
+                    fields: vec![Field::text("title", "big four")],
+                },
+            ],
+        )
+        .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let before = idx.manifest(&ns).unwrap();
+        assert_eq!(before.segments.len(), 3);
+        assert!(before.segments.iter().any(|e| e.doc_count >= 3));
+
+        let result = idx
+            .compact_namespace_with_options(&ns, CompactOptions::tiered(policy))
+            .unwrap();
+        assert!(result.merged);
+        let after = idx.manifest(&ns).unwrap();
+        // Two small segments merge into one; the large segment remains.
+        assert_eq!(after.segments.len(), 2);
+        assert!(after.segments.iter().any(|e| e.doc_count >= 3));
+        assert!(
+            !idx.needs_compaction(&ns)
+                || after.segments.iter().filter(|e| e.doc_count < 3).count() < 2
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

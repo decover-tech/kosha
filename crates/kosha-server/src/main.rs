@@ -114,7 +114,7 @@ use kosha_write::Indexer;
 
 struct AppState {
     controller: Mutex<Box<dyn ControlStore>>,
-    indexer: Mutex<Indexer>,
+    indexer: Indexer,
     searcher: Searcher,
     /// Local segment / SSD cache root (`KOSHA_DATA_DIR`). Never authoritative
     /// when S3 is enabled — losing it is a cache-miss event only.
@@ -405,7 +405,6 @@ impl AppState {
         // indexed namespaces vanish from search after a restart. Segment
         // files are re-fetched from S3 lazily at search time
         // (`ensure_segment_local`) when local disk is ephemeral.
-        let mut indexer = indexer;
         let mut restored = 0usize;
         let mut restored_segments = 0usize;
         for ns in control_store.list_namespaces() {
@@ -425,7 +424,7 @@ impl AppState {
 
         Self {
             controller: Mutex::new(control_store),
-            indexer: Mutex::new(indexer),
+            indexer,
             searcher,
             data_dir,
             cache,
@@ -460,10 +459,7 @@ impl AppState {
     /// Persist the indexer's current manifest for a namespace into the
     /// control store, so the segment list survives restarts.
     fn persist_manifest(&self, ns: &NamespaceId) {
-        let manifest = {
-            let indexer = self.indexer.lock().unwrap();
-            indexer.manifest_cloned(ns)
-        };
+        let manifest = self.indexer.manifest_cloned(ns);
         if let Some(manifest) = manifest {
             let mut ctrl = self.controller.lock().unwrap();
             match ctrl.save_manifest(ns, &manifest) {
@@ -498,11 +494,7 @@ impl AppState {
     /// work as the segment count grows.
     #[cfg(feature = "s3")]
     fn sync_latest_segment_to_s3(&self, ns: &NamespaceId) {
-        let manifest = {
-            let indexer = self.indexer.lock().unwrap();
-            indexer.manifest_cloned(ns)
-        };
-        let Some(manifest) = manifest else {
+        let Some(manifest) = self.indexer.manifest_cloned(ns) else {
             return;
         };
         let Some(entry) = manifest.segments.last() else {
@@ -1060,7 +1052,7 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     #[cfg(feature = "s3")]
     {
         let manifest = {
-            let indexer = state.indexer.lock().unwrap();
+            let indexer = &state.indexer;
             indexer.manifest_cloned(&ns)
         };
         if let Some(manifest) = manifest {
@@ -1072,7 +1064,7 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     }
 
     let (count, manifest_changed) = {
-        let mut indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         let version_before = indexer.manifest(&ns).map(|m| m.version);
         let count = match indexer.index_documents(ns.clone(), request.documents) {
             Ok(c) => c,
@@ -1122,7 +1114,7 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
     #[cfg(feature = "s3")]
     {
         let manifest = {
-            let indexer = state.indexer.lock().unwrap();
+            let indexer = &state.indexer;
             indexer.manifest_cloned(&request.namespace)
         };
         if let Some(manifest) = manifest {
@@ -1143,7 +1135,7 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
         .map(kosha_core::DocumentId)
         .collect();
     let existing = {
-        let mut indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         match indexer.existing_ids(&request.namespace, &ids) {
             Ok(set) => set,
             Err(e) => return json_error(500, &format!("exists error: {e}")),
@@ -1179,7 +1171,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     #[cfg(feature = "s3")]
     {
         let manifest = {
-            let indexer = state.indexer.lock().unwrap();
+            let indexer = &state.indexer;
             indexer.manifest_cloned(&namespace)
         };
         if let Some(manifest) = manifest {
@@ -1191,7 +1183,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     }
 
     let count = {
-        let mut indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         match indexer.replace_documents(namespace.clone(), request.documents) {
             Ok(count) => count,
             Err(error) => return json_error(500, &format!("replacement error: {error}")),
@@ -1217,7 +1209,7 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
     let ns = req.get("namespace").cloned();
 
     {
-        let mut indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         match ns {
             Some(ref name) => {
                 let namespace = NamespaceId(name.clone());
@@ -1238,8 +1230,8 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
         Some(ref name) => state.publish_namespace(&NamespaceId(name.clone())),
         None => {
             let all: Vec<NamespaceId> = {
-                let indexer = state.indexer.lock().unwrap();
-                indexer.namespaces().cloned().collect()
+                let indexer = &state.indexer;
+                indexer.namespaces()
             };
             for ns_id in &all {
                 state.publish_namespace(ns_id);
@@ -1274,7 +1266,7 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
     };
 
     let (_manifest, count) = {
-        let mut indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         let manifest = match indexer.manifest_cloned(&ns) {
             Some(m) => m,
             None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
@@ -1295,19 +1287,17 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
 // ─── GET /stats ──────────────────────────────────────────────────────────────
 
 fn handle_stats(state: &AppState) -> String {
-    // Collect everything that needs `indexer` first, then drop the lock
-    // before touching anything else — a slow /stats call must never hold up
-    // concurrent searches' manifest lookups (both used to share this lock
-    // for the whole handler body, including a directory-tree cache-size
-    // walk that could itself take tens of seconds on a large cache).
+    // Snapshot indexer stats before the cache-size walk — that walk can take
+    // tens of seconds on a large cache and must not interleave with the
+    // per-namespace bookkeeping below.
     let (namespaces, total_docs, total_segments) = {
-        let indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         let mut namespaces: Vec<serde_json::Value> = Vec::new();
         let mut total_docs: u64 = 0;
         let mut total_segments: usize = 0;
 
         for ns in indexer.namespaces() {
-            let manifest = match indexer.manifest(ns) {
+            let manifest = match indexer.manifest(&ns) {
                 Some(m) => m,
                 None => continue,
             };
@@ -1371,12 +1361,12 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     };
 
     let (manifest, tombstones) = {
-        let indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         let m = match indexer.manifest_cloned(&ns) {
             Some(m) => m,
             None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
         };
-        let t = indexer.get_tombstones(&ns).cloned();
+        let t = indexer.get_tombstones(&ns);
         (m, t)
     };
 
@@ -1449,12 +1439,12 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     };
 
     let (manifest, tombstones) = {
-        let indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         let m = match indexer.manifest_cloned(&ns) {
             Some(m) => m,
             None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
         };
-        let t = indexer.get_tombstones(&ns).cloned();
+        let t = indexer.get_tombstones(&ns);
         (m, t)
     };
 
@@ -1549,7 +1539,7 @@ fn handle_exists_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &App
 
 fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
-    let indexer = state.indexer.lock().unwrap();
+    let indexer = &state.indexer;
     let manifest = match indexer.manifest(&NamespaceId(scoped_ns.clone())) {
         Some(m) => m,
         None => return json_error(404, &format!("namespace '{namespace}' not found")),
@@ -1581,7 +1571,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
     // Prefer the name as given (migration uses bare index names); fall back
     // to tenant-scoped lookup used by v1 routes.
     let ns = {
-        let indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         if ns_raw.contains('/') {
             let ns = NamespaceId(ns_raw.to_string());
             if indexer.manifest_cloned(&ns).is_some() {
@@ -1605,7 +1595,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
     };
 
     let manifest = {
-        let indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         indexer
             .manifest_cloned(&ns)
             .expect("namespace existence checked above")
@@ -1651,7 +1641,7 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
     // Prefer the name as given (migration uses bare index names); fall back
     // to tenant-scoped lookup used by v1 routes.
     let ns = {
-        let indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         if ns_raw.contains('/') {
             let ns = NamespaceId(ns_raw.to_string());
             if indexer.manifest_cloned(&ns).is_some() {
@@ -1675,7 +1665,7 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
     };
 
     let manifest = {
-        let indexer = state.indexer.lock().unwrap();
+        let indexer = &state.indexer;
         indexer
             .manifest_cloned(&ns)
             .expect("namespace existence checked above")
@@ -1712,23 +1702,19 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
     }))
 }
 
-/// POST /v1/admin/compact-namespace — merge every segment in a namespace
-/// into one, superseding the originals.
+/// POST /v1/admin/compact-namespace — run one compaction pass on a namespace.
 ///
-/// `compact_namespace` (kosha-write) has existed since the write path was
-/// built but was never reachable outside a unit test — nothing in the
-/// running server ever called it, so segment count for a hot namespace only
-/// ever grows. This is the manual stopgap; DESIGN.md §5's dedicated
-/// "compaction" node role (a background loop with its own policy) is the
-/// real fix and isn't implemented yet.
+/// Defaults to size-tiered compaction (DESIGN.md §7.1): only small segments
+/// are merged, under the indexer's `CompactionPolicy`. Pass
+/// `"mode": "full"` for emergency all-to-one merge. Merge I/O does not hold
+/// a process-wide indexer lock; only the target namespace's compact lock is
+/// held for the duration.
 ///
-/// Request body: {"namespace": "paragraph_index_hnsw"}
+/// Request body: {"namespace": "paragraph_index_hnsw", "mode": "tiered"|"full"}
 ///
-/// Every existing segment must hydrate locally first (compaction reads each
-/// one via `SegmentReader::open`, same requirement as backfill/rebuild
-/// above) — for a namespace with hundreds of segments this call can take
-/// a while and holds the indexer lock for the compaction itself, so callers
-/// should expect a slow, blocking response rather than pagination.
+/// Every existing segment should hydrate locally first (compaction reads each
+/// one via `SegmentReader::open`) — for a namespace with hundreds of segments
+/// this call can take a while.
 fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> String {
     let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -1738,24 +1724,33 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
         Some(n) => n,
         None => return json_error(400, "missing 'namespace'"),
     };
+    let mode = match req.get("mode").and_then(|v| v.as_str()).unwrap_or("tiered") {
+        "tiered" => kosha_write::CompactMode::Tiered,
+        "full" => kosha_write::CompactMode::Full,
+        other => {
+            return json_error(
+                400,
+                &format!("invalid mode '{other}' (expected tiered|full)"),
+            );
+        }
+    };
     // Prefer the name as given (migration uses bare index names); fall back
     // to tenant-scoped lookup used by v1 routes.
     let ns = {
-        let indexer = state.indexer.lock().unwrap();
         if ns_raw.contains('/') {
             let ns = NamespaceId(ns_raw.to_string());
-            if indexer.manifest_cloned(&ns).is_some() {
+            if state.indexer.manifest_cloned(&ns).is_some() {
                 ns
             } else {
                 return json_error(404, &format!("namespace '{}' not found", ns.0));
             }
         } else {
             let bare = NamespaceId(ns_raw.to_string());
-            if indexer.manifest_cloned(&bare).is_some() {
+            if state.indexer.manifest_cloned(&bare).is_some() {
                 bare
             } else {
                 let scoped = NamespaceId(tenant_namespace(tenant, ns_raw));
-                if indexer.manifest_cloned(&scoped).is_some() {
+                if state.indexer.manifest_cloned(&scoped).is_some() {
                     scoped
                 } else {
                     return json_error(404, &format!("namespace '{ns_raw}' not found"));
@@ -1765,8 +1760,8 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
     };
 
     let (segments_before, not_hydrated) = {
-        let indexer = state.indexer.lock().unwrap();
-        let manifest = indexer
+        let manifest = state
+            .indexer
             .manifest_cloned(&ns)
             .expect("namespace existence checked above");
         let mut not_hydrated = Vec::new();
@@ -1784,30 +1779,38 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
         (manifest.segments.len(), not_hydrated)
     };
 
-    {
-        let mut indexer = state.indexer.lock().unwrap();
-        if let Err(e) = indexer.compact_namespace(&ns) {
-            return json_error(500, &format!("compaction error: {e}"));
-        }
-    }
+    let opts = kosha_write::CompactOptions {
+        mode,
+        policy: state.indexer.compaction_policy().clone(),
+    };
+    let result = match state.indexer.compact_namespace_with_options(&ns, opts) {
+        Ok(r) => r,
+        Err(e) => return json_error(500, &format!("compaction error: {e}")),
+    };
 
     // Persist the merged manifest and upload the new segment to S3 — same
     // path a normal flush uses (sync_latest_segment_to_s3 picks up the
     // compacted segment because compact_namespace pushes it last).
-    state.publish_namespace(&ns);
+    if result.merged {
+        state.publish_namespace(&ns);
+    }
 
-    let segments_after = {
-        let indexer = state.indexer.lock().unwrap();
-        indexer
-            .manifest_cloned(&ns)
-            .map(|m| m.segments.len())
-            .unwrap_or(0)
-    };
+    let segments_after = state
+        .indexer
+        .manifest_cloned(&ns)
+        .map(|m| m.segments.len())
+        .unwrap_or(0);
 
     json_ok(&serde_json::json!({
         "namespace": ns.0,
+        "mode": match mode {
+            kosha_write::CompactMode::Tiered => "tiered",
+            kosha_write::CompactMode::Full => "full",
+        },
+        "merged": result.merged,
         "segments_before": segments_before,
         "segments_after": segments_after,
+        "segments_merged": result.segments_merged,
         "not_hydrated": not_hydrated,
     }))
 }
@@ -1993,9 +1996,7 @@ fn url_decode(input: &str) -> String {
 
 impl Drop for AppState {
     fn drop(&mut self) {
-        if let Ok(mut indexer) = self.indexer.lock() {
-            let _ = indexer.flush_all();
-        }
+        let _ = self.indexer.flush_all();
     }
 }
 
@@ -2328,36 +2329,26 @@ mod tests {
             );
         }
 
-        let before = state
-            .indexer
-            .lock()
-            .unwrap()
-            .manifest_cloned(&ns)
-            .unwrap()
-            .segments
-            .len();
+        let before = state.indexer.manifest_cloned(&ns).unwrap().segments.len();
         assert_eq!(before, 3, "expected one segment per flush");
 
         let response = route(
             "POST /v1/admin/compact-namespace HTTP/1.1\r\n",
             &HashMap::new(),
-            br#"{"namespace":"compact-ns"}"#,
+            br#"{"namespace":"compact-ns","mode":"full"}"#,
             "test",
             &state,
         );
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("\"segments_before\":3"), "{response}");
         assert!(response.contains("\"segments_after\":1"), "{response}");
+        assert!(response.contains("\"mode\":\"full\""), "{response}");
 
-        let after = state
-            .indexer
-            .lock()
-            .unwrap()
-            .manifest_cloned(&ns)
-            .unwrap()
-            .segments
-            .len();
-        assert_eq!(after, 1, "compaction should merge all segments into one");
+        let after = state.indexer.manifest_cloned(&ns).unwrap().segments.len();
+        assert_eq!(
+            after, 1,
+            "full compaction should merge all segments into one"
+        );
 
         // Every document from every pre-compaction segment must still be
         // findable — compaction must never silently drop documents.
@@ -2407,12 +2398,7 @@ mod tests {
             "test",
             &state,
         );
-        state
-            .indexer
-            .lock()
-            .unwrap()
-            .flush_namespace(&namespace)
-            .unwrap();
+        state.indexer.flush_namespace(&namespace).unwrap();
 
         let replacement = IndexRequest {
             namespace,
@@ -2479,7 +2465,7 @@ mod tests {
 
         // Trigger flush so search can read from disk.
         {
-            let mut indexer = state.indexer.lock().unwrap();
+            let indexer = &state.indexer;
             indexer.flush_namespace(&NamespaceId(ns.into())).unwrap();
         }
 
@@ -2532,7 +2518,7 @@ mod tests {
         assert!(index_resp.contains("\"indexed_count\":1"));
 
         {
-            let mut indexer = state.indexer.lock().unwrap();
+            let indexer = &state.indexer;
             indexer
                 .flush_namespace(&NamespaceId("acme-corp/my-index".into()))
                 .unwrap();

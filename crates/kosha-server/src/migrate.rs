@@ -620,7 +620,7 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
         };
         let planned = args.limit.map_or(total, |limit| limit.min(total));
         let namespace = NamespaceId(args.namespace.clone().unwrap_or_else(|| index.clone()));
-        let mut indexer = Indexer::new(data_dir.clone())
+        let indexer = Indexer::new(data_dir.clone())
             .with_wal(false)
             .with_flush_threshold(args.flush_docs);
 
