@@ -981,6 +981,10 @@ fn route(
         return handle_backfill_offset_tables(body, tenant, state);
     }
 
+    if request_line.starts_with("POST /v1/admin/compact-namespace") {
+        return handle_compact_namespace(body, tenant, state);
+    }
+
     // ── Legacy Phase 1 routes (backward compat) ────────────────────────────
     // These will be removed after DecoverAI cuts over to the v1 paths.
     if request_line.starts_with("GET /healthz") {
@@ -1708,6 +1712,106 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
     }))
 }
 
+/// POST /v1/admin/compact-namespace — merge every segment in a namespace
+/// into one, superseding the originals.
+///
+/// `compact_namespace` (kosha-write) has existed since the write path was
+/// built but was never reachable outside a unit test — nothing in the
+/// running server ever called it, so segment count for a hot namespace only
+/// ever grows. This is the manual stopgap; DESIGN.md §5's dedicated
+/// "compaction" node role (a background loop with its own policy) is the
+/// real fix and isn't implemented yet.
+///
+/// Request body: {"namespace": "paragraph_index_hnsw"}
+///
+/// Every existing segment must hydrate locally first (compaction reads each
+/// one via `SegmentReader::open`, same requirement as backfill/rebuild
+/// above) — for a namespace with hundreds of segments this call can take
+/// a while and holds the indexer lock for the compaction itself, so callers
+/// should expect a slow, blocking response rather than pagination.
+fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> String {
+    let req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+    };
+    let ns_raw = match req.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return json_error(400, "missing 'namespace'"),
+    };
+    // Prefer the name as given (migration uses bare index names); fall back
+    // to tenant-scoped lookup used by v1 routes.
+    let ns = {
+        let indexer = state.indexer.lock().unwrap();
+        if ns_raw.contains('/') {
+            let ns = NamespaceId(ns_raw.to_string());
+            if indexer.manifest_cloned(&ns).is_some() {
+                ns
+            } else {
+                return json_error(404, &format!("namespace '{}' not found", ns.0));
+            }
+        } else {
+            let bare = NamespaceId(ns_raw.to_string());
+            if indexer.manifest_cloned(&bare).is_some() {
+                bare
+            } else {
+                let scoped = NamespaceId(tenant_namespace(tenant, ns_raw));
+                if indexer.manifest_cloned(&scoped).is_some() {
+                    scoped
+                } else {
+                    return json_error(404, &format!("namespace '{ns_raw}' not found"));
+                }
+            }
+        }
+    };
+
+    let (segments_before, not_hydrated) = {
+        let indexer = state.indexer.lock().unwrap();
+        let manifest = indexer
+            .manifest_cloned(&ns)
+            .expect("namespace existence checked above");
+        let mut not_hydrated = Vec::new();
+        for entry in &manifest.segments {
+            let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
+            #[cfg(feature = "s3")]
+            state.ensure_segment_local(&seg_path);
+            // compact_namespace silently skips (and keeps unmerged) any
+            // segment that isn't present locally after this — safe, but
+            // worth surfacing so a caller knows compaction was partial.
+            if !seg_path.exists() {
+                not_hydrated.push(entry.segment_id.0.clone());
+            }
+        }
+        (manifest.segments.len(), not_hydrated)
+    };
+
+    {
+        let mut indexer = state.indexer.lock().unwrap();
+        if let Err(e) = indexer.compact_namespace(&ns) {
+            return json_error(500, &format!("compaction error: {e}"));
+        }
+    }
+
+    // Persist the merged manifest and upload the new segment to S3 — same
+    // path a normal flush uses (sync_latest_segment_to_s3 picks up the
+    // compacted segment because compact_namespace pushes it last).
+    state.publish_namespace(&ns);
+
+    let segments_after = {
+        let indexer = state.indexer.lock().unwrap();
+        indexer
+            .manifest_cloned(&ns)
+            .map(|m| m.segments.len())
+            .unwrap_or(0)
+    };
+
+    json_ok(&serde_json::json!({
+        "namespace": ns.0,
+        "segments_before": segments_before,
+        "segments_after": segments_after,
+        "not_hydrated": not_hydrated,
+    }))
+}
+
 /// POST /v1/admin/api-keys — create a new API key for a tenant.
 ///
 /// Requires existing admin API key (from KOSHA_API_KEY env var or DB).
@@ -2190,6 +2294,99 @@ mod tests {
             "{response}"
         );
         assert!(response.contains("\"missing\":[\"absent\"]"), "{response}");
+    }
+
+    #[test]
+    fn compact_namespace_endpoint_merges_segments_and_preserves_docs() {
+        let state = test_state();
+        let ns = NamespaceId("compact-ns".into());
+
+        // Three separate index+flush round trips → three segments, same as
+        // the flush-storm pattern that produced hundreds of tiny segments in
+        // production (each flush call appends exactly one segment).
+        for i in 0..3 {
+            let req = IndexRequest {
+                namespace: ns.clone(),
+                documents: vec![Document {
+                    id: DocumentId(format!("doc{i}")),
+                    fields: vec![Field::text("title", format!("segment number {i}"))],
+                }],
+            };
+            route(
+                "POST /index HTTP/1.1\r\n",
+                &HashMap::new(),
+                &serde_json::to_vec(&req).unwrap(),
+                "test",
+                &state,
+            );
+            route(
+                "POST /flush HTTP/1.1\r\n",
+                &HashMap::new(),
+                br#"{"namespace":"compact-ns"}"#,
+                "test",
+                &state,
+            );
+        }
+
+        let before = state
+            .indexer
+            .lock()
+            .unwrap()
+            .manifest_cloned(&ns)
+            .unwrap()
+            .segments
+            .len();
+        assert_eq!(before, 3, "expected one segment per flush");
+
+        let response = route(
+            "POST /v1/admin/compact-namespace HTTP/1.1\r\n",
+            &HashMap::new(),
+            br#"{"namespace":"compact-ns"}"#,
+            "test",
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("\"segments_before\":3"), "{response}");
+        assert!(response.contains("\"segments_after\":1"), "{response}");
+
+        let after = state
+            .indexer
+            .lock()
+            .unwrap()
+            .manifest_cloned(&ns)
+            .unwrap()
+            .segments
+            .len();
+        assert_eq!(after, 1, "compaction should merge all segments into one");
+
+        // Every document from every pre-compaction segment must still be
+        // findable — compaction must never silently drop documents.
+        for i in 0..3 {
+            let search = route(
+                &format!("GET /search?ns=compact-ns&q=segment+number+{i} HTTP/1.1\r\n"),
+                &HashMap::new(),
+                b"",
+                "test",
+                &state,
+            );
+            assert!(
+                search.contains(&format!("\"doc{i}\"")),
+                "doc{i} missing after compaction: {search}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_namespace_endpoint_404s_for_unknown_namespace() {
+        let state = test_state();
+        let response = route(
+            "POST /v1/admin/compact-namespace HTTP/1.1\r\n",
+            &HashMap::new(),
+            br#"{"namespace":"does-not-exist"}"#,
+            "test",
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
     }
 
     #[test]
