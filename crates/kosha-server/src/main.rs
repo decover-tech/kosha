@@ -651,24 +651,39 @@ impl AppState {
             .collect()
     }
 
-    /// Ensure a single file within a segment dir is local (e.g. `footer.json`).
+    /// Ensure one named file (e.g. `footer.json`) is local for every segment
+    /// in `seg_paths`, in a single fanned-out batch rather than one S3 GET
+    /// per segment.
+    ///
+    /// This is the bloom-prune prefetch used by `hydrate_segments_for_search`
+    /// before it decides which segments are even worth fully hydrating. The
+    /// file name is already known (unlike `ensure_segments_local`, which
+    /// lists each segment's directory first), so this skips straight to
+    /// `read_many` — no per-segment `s3.list()` round trip either.
     #[cfg(feature = "s3")]
-    fn ensure_file_local(&self, seg_path: &Path, file_name: &str) {
-        let local = seg_path.join(file_name);
-        if local.exists() {
-            return;
-        }
+    fn ensure_files_local(&self, seg_paths: &[PathBuf], file_name: &str) {
         let Some(ref s3) = self.s3_storage else {
             return;
         };
-        let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+
+        let mut logical_paths: Vec<String> = Vec::new();
+        for seg_path in seg_paths {
+            if seg_path.join(file_name).exists() {
+                continue;
+            }
+            let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+                continue;
+            };
+            logical_paths.push(format!("{}/{file_name}", rel_path.to_string_lossy()));
+        }
+
+        if logical_paths.is_empty() {
             return;
-        };
-        let logical = format!("{}/{file_name}", rel_path.to_string_lossy());
-        match s3.read(&logical) {
-            Ok(_) => self.cache.note_external_write(&logical),
-            Err(e) => {
-                eprintln!("WARN: S3 download failed for {logical}: {e}");
+        }
+        for (path, result) in s3.read_many(&logical_paths, self.hydrate_concurrency) {
+            match result {
+                Ok(_) => self.cache.note_external_write(&path),
+                Err(e) => eprintln!("WARN: S3 download failed for {path}: {e}"),
             }
         }
     }
@@ -687,11 +702,26 @@ impl AppState {
         query: &SearchQuery,
     ) -> Vec<String> {
         let term_prune = term_bloom_prune_for_query(query);
+        let needs_bloom_check = query.filter.is_some() || term_prune.is_some();
+        let all_seg_paths: Vec<PathBuf> = manifest
+            .segments
+            .iter()
+            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .collect();
+
+        // Prefetch every segment's footer.json in one batch before checking
+        // any bloom filter — one `ensure_file_local` call per segment here
+        // used to mean one sequential, unbatched S3 GET per segment just to
+        // decide whether a segment was even worth fully hydrating. For a
+        // namespace with hundreds of segments that turned every search into
+        // hundreds of sequential round trips before scoring ever started.
+        if needs_bloom_check {
+            self.ensure_files_local(&all_seg_paths, "footer.json");
+        }
+
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
-        for entry in &manifest.segments {
-            let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
-            if query.filter.is_some() || term_prune.is_some() {
-                self.ensure_file_local(&seg_path, "footer.json");
+        for seg_path in all_seg_paths {
+            if needs_bloom_check {
                 if let Ok(footer) = SegmentReader::read_footer(&seg_path) {
                     if let Some(ref filter) = query.filter {
                         if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
