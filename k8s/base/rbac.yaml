@@ -42,6 +42,13 @@ rules:
   - apiGroups: [""]
     resources: ["services", "configmaps", "secrets", "serviceaccounts", "pods"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Added for kosha-query's HPA (base/hpa-query.yaml) — the query/ingest
+  # split was this repo's first use of a HorizontalPodAutoscaler, so this
+  # grant never existed before. `kubectl apply -k` needs `get` (to diff the
+  # existing object) in addition to create/update/patch.
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
