@@ -403,8 +403,8 @@ impl AppState {
         // ── Restore manifests from the control store ───────────────────────
         // The Indexer starts empty on every boot; without this, previously
         // indexed namespaces vanish from search after a restart. Segment
-        // files are re-fetched from S3 lazily at search time
-        // (`ensure_segment_local`) when local disk is ephemeral.
+        // files are re-fetched from S3 lazily at search/write time
+        // (`ensure_segments_local`) when local disk is ephemeral.
         let mut restored = 0usize;
         let mut restored_segments = 0usize;
         for ns in control_store.list_namespaces() {
@@ -531,14 +531,6 @@ impl AppState {
                 }
             }
         }
-    }
-
-    /// Ensure a segment is available locally (download from S3 on cache miss).
-    /// Returns `true` if the segment is actually complete afterward.
-    #[cfg(feature = "s3")]
-    fn ensure_segment_local(&self, seg_path: &Path) -> bool {
-        self.ensure_segments_local(std::slice::from_ref(&seg_path.to_path_buf()))
-            .is_empty()
     }
 
     /// The files that must all be present for a segment to be usable by the
@@ -1049,6 +1041,10 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
 
     // Upsert may rewrite immutable segments that hold prior versions of the
     // same ids, so materialize any S3-backed segment directories first.
+    // Batched across the whole manifest in one fanned-out call rather than
+    // one `ensure_segment_local` round trip per segment — for a namespace
+    // with hundreds of segments the per-segment loop turned every index
+    // call into hundreds of sequential S3 list+GET round trips.
     #[cfg(feature = "s3")]
     {
         let manifest = {
@@ -1056,10 +1052,12 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
             indexer.manifest_cloned(&ns)
         };
         if let Some(manifest) = manifest {
-            for entry in &manifest.segments {
-                let path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
-                state.ensure_segment_local(&path);
-            }
+            let paths: Vec<PathBuf> = manifest
+                .segments
+                .iter()
+                .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
+                .collect();
+            state.ensure_segments_local(&paths);
         }
     }
 
@@ -1110,7 +1108,9 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
     };
 
     // Existence scans immutable segments, so materialize any S3-backed
-    // segment directories before entering the indexer lock.
+    // segment directories before entering the indexer lock. Batched across
+    // the whole manifest — see handle_index for why this isn't a per-segment
+    // loop.
     #[cfg(feature = "s3")]
     {
         let manifest = {
@@ -1118,13 +1118,17 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
             indexer.manifest_cloned(&request.namespace)
         };
         if let Some(manifest) = manifest {
-            for entry in &manifest.segments {
-                let path = state
-                    .data_dir
-                    .join(&request.namespace.0)
-                    .join(&entry.segment_id.0);
-                state.ensure_segment_local(&path);
-            }
+            let paths: Vec<PathBuf> = manifest
+                .segments
+                .iter()
+                .map(|entry| {
+                    state
+                        .data_dir
+                        .join(&request.namespace.0)
+                        .join(&entry.segment_id.0)
+                })
+                .collect();
+            state.ensure_segments_local(&paths);
         }
     }
 
@@ -1167,7 +1171,9 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     let namespace = request.namespace;
 
     // Replacement scans immutable segments, so materialize any S3-backed
-    // segment directories before entering the indexer lock.
+    // segment directories before entering the indexer lock. Batched across
+    // the whole manifest — see handle_index for why this isn't a per-segment
+    // loop.
     #[cfg(feature = "s3")]
     {
         let manifest = {
@@ -1175,10 +1181,12 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
             indexer.manifest_cloned(&namespace)
         };
         if let Some(manifest) = manifest {
-            for entry in &manifest.segments {
-                let path = state.data_dir.join(&namespace.0).join(&entry.segment_id.0);
-                state.ensure_segment_local(&path);
-            }
+            let paths: Vec<PathBuf> = manifest
+                .segments
+                .iter()
+                .map(|entry| state.data_dir.join(&namespace.0).join(&entry.segment_id.0))
+                .collect();
+            state.ensure_segments_local(&paths);
         }
     }
 
@@ -1601,21 +1609,28 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
             .expect("namespace existence checked above")
     };
 
+    // Hydrate every segment in one fanned-out batch rather than one
+    // ensure_segment_local round trip per segment — see handle_index.
+    let seg_paths: Vec<PathBuf> = manifest
+        .segments
+        .iter()
+        .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
+        .collect();
+    #[cfg(feature = "s3")]
+    state.ensure_segments_local(&seg_paths);
+
     let mut rebuilt = 0usize;
     let mut errors = Vec::new();
-    for entry in &manifest.segments {
-        let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
-        #[cfg(feature = "s3")]
-        state.ensure_segment_local(&seg_path);
+    for (entry, seg_path) in manifest.segments.iter().zip(seg_paths.iter()) {
         if !seg_path.exists() {
             errors.push(format!("{}: segment not local", entry.segment_id.0));
             continue;
         }
-        match SegmentReader::rewrite_footer_blooms(&seg_path) {
+        match SegmentReader::rewrite_footer_blooms(seg_path) {
             Ok(_) => {
                 rebuilt += 1;
                 #[cfg(feature = "s3")]
-                state.sync_file_to_s3(&seg_path, "footer.json");
+                state.sync_file_to_s3(seg_path, "footer.json");
             }
             Err(e) => errors.push(format!("{}: {e}", entry.segment_id.0)),
         }
@@ -1671,23 +1686,30 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
             .expect("namespace existence checked above")
     };
 
+    // Hydrate every segment in one fanned-out batch rather than one
+    // ensure_segment_local round trip per segment — see handle_index.
+    let seg_paths: Vec<PathBuf> = manifest
+        .segments
+        .iter()
+        .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
+        .collect();
+    #[cfg(feature = "s3")]
+    state.ensure_segments_local(&seg_paths);
+
     let mut backfilled = 0usize;
     let mut errors = Vec::new();
-    for entry in &manifest.segments {
-        let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
-        #[cfg(feature = "s3")]
-        state.ensure_segment_local(&seg_path);
+    for (entry, seg_path) in manifest.segments.iter().zip(seg_paths.iter()) {
         if !seg_path.exists() {
             errors.push(format!("{}: segment not local", entry.segment_id.0));
             continue;
         }
-        match SegmentReader::backfill_offset_tables(&seg_path) {
+        match SegmentReader::backfill_offset_tables(seg_path) {
             Ok(_) => {
                 backfilled += 1;
                 #[cfg(feature = "s3")]
                 {
-                    state.sync_file_to_s3(&seg_path, "doc_store.offsets");
-                    state.sync_file_to_s3(&seg_path, "footer.json");
+                    state.sync_file_to_s3(seg_path, "doc_store.offsets");
+                    state.sync_file_to_s3(seg_path, "footer.json");
                 }
             }
             Err(e) => errors.push(format!("{}: {e}", entry.segment_id.0)),
@@ -1764,18 +1786,28 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
             .indexer
             .manifest_cloned(&ns)
             .expect("namespace existence checked above");
-        let mut not_hydrated = Vec::new();
-        for entry in &manifest.segments {
-            let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
-            #[cfg(feature = "s3")]
-            state.ensure_segment_local(&seg_path);
-            // compact_namespace silently skips (and keeps unmerged) any
-            // segment that isn't present locally after this — safe, but
-            // worth surfacing so a caller knows compaction was partial.
-            if !seg_path.exists() {
-                not_hydrated.push(entry.segment_id.0.clone());
-            }
-        }
+        // Hydrate every segment in one fanned-out batch rather than one
+        // ensure_segment_local round trip per segment — see handle_index.
+        // This was the actual bottleneck behind this endpoint's own
+        // timeouts: 441 sequential S3 round trips before compaction could
+        // even start reading anything.
+        let seg_paths: Vec<PathBuf> = manifest
+            .segments
+            .iter()
+            .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .collect();
+        #[cfg(feature = "s3")]
+        state.ensure_segments_local(&seg_paths);
+        // compact_namespace silently skips (and keeps unmerged) any segment
+        // that isn't present locally after this — safe, but worth surfacing
+        // so a caller knows compaction was partial.
+        let not_hydrated: Vec<String> = manifest
+            .segments
+            .iter()
+            .zip(seg_paths.iter())
+            .filter(|(_, p)| !p.exists())
+            .map(|(entry, _)| entry.segment_id.0.clone())
+            .collect();
         (manifest.segments.len(), not_hydrated)
     };
 
