@@ -678,14 +678,35 @@ impl AppState {
         }
 
         if logical_paths.is_empty() {
+            eprintln!(
+                "DEBUG: ensure_files_local({file_name}): nothing to fetch, all local already"
+            );
             return;
         }
+        eprintln!(
+            "DEBUG: ensure_files_local({file_name}): fetching {} files, concurrency={}",
+            logical_paths.len(),
+            self.hydrate_concurrency
+        );
+        let t0 = std::time::Instant::now();
+        let mut ok = 0usize;
+        let mut err = 0usize;
         for (path, result) in s3.read_many(&logical_paths, self.hydrate_concurrency) {
             match result {
-                Ok(_) => self.cache.note_external_write(&path),
-                Err(e) => eprintln!("WARN: S3 download failed for {path}: {e}"),
+                Ok(_) => {
+                    self.cache.note_external_write(&path);
+                    ok += 1;
+                }
+                Err(e) => {
+                    err += 1;
+                    eprintln!("WARN: S3 download failed for {path}: {e}");
+                }
             }
         }
+        eprintln!(
+            "DEBUG: ensure_files_local({file_name}): read_many done in {:?}, ok={ok} err={err}",
+            t0.elapsed()
+        );
     }
 
     /// Hydrate only segments that might match the query (footer filter + term
@@ -716,9 +737,19 @@ impl AppState {
         // namespace with hundreds of segments that turned every search into
         // hundreds of sequential round trips before scoring ever started.
         if needs_bloom_check {
+            eprintln!(
+                "DEBUG: hydrate_segments_for_search: prefetching footer.json for {} segments",
+                all_seg_paths.len()
+            );
+            let t0 = std::time::Instant::now();
             self.ensure_files_local(&all_seg_paths, "footer.json");
+            eprintln!(
+                "DEBUG: hydrate_segments_for_search: footer prefetch done in {:?}",
+                t0.elapsed()
+            );
         }
 
+        let t0 = std::time::Instant::now();
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         for seg_path in all_seg_paths {
             if needs_bloom_check {
@@ -737,7 +768,18 @@ impl AppState {
             }
             to_hydrate.push(seg_path);
         }
-        self.ensure_segments_local(&to_hydrate)
+        eprintln!(
+            "DEBUG: hydrate_segments_for_search: bloom-check loop done in {:?}, {} segments survived to hydrate",
+            t0.elapsed(),
+            to_hydrate.len()
+        );
+        let t0 = std::time::Instant::now();
+        let result = self.ensure_segments_local(&to_hydrate);
+        eprintln!(
+            "DEBUG: hydrate_segments_for_search: final ensure_segments_local done in {:?}",
+            t0.elapsed()
+        );
+        result
     }
 
     /// Upload a single file from a local segment dir to S3.
