@@ -1,0 +1,12 @@
+# Conservative placeholder, matching this overlay's existing pattern of
+# leaving prod unsized until real usage data exists (see base/deployment.yaml
+# — prod has no resources patch either, for the same reason). Requires the
+# cluster's metrics-server to be healthy to do anything real.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kosha-query
+  namespace: kosha
+spec:
+  minReplicas: 1
+  maxReplicas: 2

@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kosha-ingest-service
+  namespace: kosha
+spec:
+  # Internal-only by convention, not a client-facing endpoint. This is the
+  # forwarding target query pods use for write-path requests (see main.rs),
+  # and an optional direct-access path for admin/migration scripts that want
+  # to bypass the proxy hop. Clients should always talk to kosha-service.
+  selector:
+    app: kosha
+    role: ingest
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: grpc
+      port: 50051
+      targetPort: 50051

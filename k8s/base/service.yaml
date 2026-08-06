@@ -4,8 +4,15 @@ metadata:
   name: kosha-service
   namespace: kosha
 spec:
+  # Client-facing endpoint — the only one sage/pandora/celery need to know
+  # about, for both reads and writes, like a single OpenSearch cluster
+  # endpoint. Backed by the query tier (deployment-query.yaml): query pods
+  # handle reads locally and transparently forward writes to the single
+  # ingest pod (see main.rs's request routing). Do not point this at the
+  # ingest Deployment directly — see kosha-ingest-service for that.
   selector:
     app: kosha
+    role: query
   ports:
     - name: http
       port: 8080

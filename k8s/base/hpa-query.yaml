@@ -1,0 +1,23 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kosha-query
+  namespace: kosha
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: kosha-query
+  # Base ships a no-op placeholder — stage/prod overlays patch real
+  # min/max/target values. Requires the cluster's metrics-server to be
+  # healthy (`kubectl top pods -n kosha` returning real numbers); confirm
+  # that in isolation before relying on this to scale anything.
+  minReplicas: 1
+  maxReplicas: 1
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

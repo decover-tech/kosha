@@ -7,7 +7,11 @@ metadata:
   name: kosha-config
   namespace: kosha
 data:
-  KOSHA_ROLE: "query"
+  # KOSHA_ROLE is intentionally NOT set here — it differs per Deployment
+  # (ingest vs query) and is set explicitly at the container level in
+  # deployment.yaml / deployment-query.yaml instead, where an explicit `env`
+  # entry overrides this shared envFrom. Setting it here would silently
+  # apply to both and require every reader to know the override exists.
   KOSHA_HTTP_PORT: "8080"
   KOSHA_DATA_DIR: /var/cache/kosha/data
   KOSHA_CACHE_DIR: /var/cache/kosha

@@ -7,6 +7,9 @@ resources:
   - configmap.yaml
   - deployment.yaml
   - service.yaml
+  - service-ingest.yaml
+  - deployment-query.yaml
+  - hpa-query.yaml
 
 # rbac.yaml is intentionally NOT listed here. It grants the CI deploy role
 # its own permissions — Kubernetes' RBAC escalation check correctly forbids

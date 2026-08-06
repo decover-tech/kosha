@@ -19,6 +19,7 @@ resources:
 patches:
   - path: configmap-patch.yaml
   - path: serviceaccount-patch.yaml
+  - path: hpa-query-patch.yaml
 
 images:
   - name: kosha
