@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kosha-query
+  namespace: kosha
+  labels:
+    app: kosha
+    role: query
+spec:
+  # Bootstrap value only — the HPA (hpa-query.yaml) takes ownership of this
+  # field once applied.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kosha
+      role: query
+  # Stateless, interchangeable pods — no hostPath collision risk like the
+  # ingest Deployment, so a normal rolling update is safe and gives
+  # zero-downtime scaling instead of Recreate's brief gap.
+  strategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: kosha
+        role: query
+    spec:
+      serviceAccountName: kosha
+      # Deliberately NOT on the dedicated NVMe/Karpenter pool — that pool is
+      # already near capacity from the single ingest pod, and scheduling N
+      # query replicas there risks starving ingest. General node pool only.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    role: query
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: kosha
+          image: kosha
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 50051
+              name: grpc
+          envFrom:
+            - configMapRef:
+                name: kosha-config
+          env:
+            - name: KOSHA_ROLE
+              value: query
+            # Forwarding target for write-path requests — see main.rs's
+            # request routing. Unused/irrelevant on the ingest Deployment.
+            - name: KOSHA_INGEST_HOST
+              value: http://kosha-ingest-service.kosha.svc.cluster.local:8080
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: database-url
+            - name: KOSHA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: bootstrap-api-key
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            # Placeholder — overridden by stage/prod overlay patches. Base
+            # stays small/no-op like the rest of this file's defaults.
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+              ephemeral-storage: "1Gi"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+              ephemeral-storage: "8Gi"
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/kosha
+      volumes:
+        # No hostPath here — this tier is stateless and interchangeable, so
+        # each pod's cache is a private, disposable emptyDir. A cold start
+        # re-hydrates from the Postgres manifest + S3 segments (batched,
+        # ~15-20s for a full namespace post PR#48/#49) rather than being
+        # tied to a specific node like the ingest pod's instance store.
+        - name: cache
+          emptyDir: {}

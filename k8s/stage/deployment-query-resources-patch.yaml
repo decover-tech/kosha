@@ -1,0 +1,29 @@
+# Starting point for the query tier's per-pod sizing — validate against a
+# real concurrent-search load test rather than treating these as final.
+# Once search-only CPU contention is spread across N pods instead of all
+# fighting for one pod's rayon thread pool, per-pod CPU can be smaller while
+# aggregate throughput goes up.
+#
+# imagePullPolicy: Always for the same reason as deployment-resources-patch.yaml
+# — staging's floating :main tag means kubelet's tag-based image cache check
+# is not enough; this Deployment shares that same image reference.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kosha-query
+  namespace: kosha
+spec:
+  template:
+    spec:
+      containers:
+        - name: kosha
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"
+              ephemeral-storage: "5Gi"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              ephemeral-storage: "20Gi"
+              memory: "8Gi"

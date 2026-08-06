@@ -551,6 +551,14 @@ one-time batch job reading from the existing Postgres/S3 document store and repl
 
 - **Scaling**: query and ingest node pools scale independently and horizontally (stateless →
   standard autoscaling on CPU/queue depth). No shard rebalancing operation exists in this design.
+  **Doc/reality gap, not yet resolved**: "ingest scales horizontally" is not actually true as
+  implemented — `kosha-write::Indexer` allocates each namespace's next segment ID from an
+  in-memory-only counter with no cross-pod coordination, so two ingest pods writing the same
+  namespace concurrently can pick the same ID and silently clobber each other's data. The k8s
+  split (`k8s/README.md`'s "Query/ingest split" section) keeps ingest pinned to exactly one
+  replica for this reason. Query does scale horizontally as described here; ingest doesn't yet —
+  making it safe to do so would need a coordinated segment-ID allocator (e.g. backed by Postgres),
+  which is out of scope for now.
 - **Cost**: steady-state cost ≈ S3 storage + GET/PUT volume + compute node-hours actually running,
   which tracks real usage instead of provisioned-for-peak cluster capacity. Idle namespaces cost
   only their S3 bytes.

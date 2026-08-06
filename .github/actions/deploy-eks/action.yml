@@ -160,5 +160,15 @@ runs:
         kustomize edit add patch --path env-wire-patch.yaml
 
         kubectl apply -k .
-        kubectl -n kosha rollout restart deployment/kosha
-        kubectl -n kosha rollout status deployment/kosha --timeout=5m
+
+        # Two Deployments now: the single pinned ingest pod and the
+        # horizontally-scaled query tier. Restart both, then wait on both —
+        # `shell: bash` steps in this action already run with `set -e`
+        # (GitHub Actions' documented default), so a failed rollout on
+        # either one fails this step.
+        for d in kosha kosha-query; do
+          kubectl -n kosha rollout restart "deployment/$d"
+        done
+        for d in kosha kosha-query; do
+          kubectl -n kosha rollout status "deployment/$d" --timeout=5m
+        done

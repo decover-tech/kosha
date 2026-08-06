@@ -5,8 +5,13 @@ metadata:
   namespace: kosha
   labels:
     app: kosha
+    role: ingest
 spec:
   replicas: 1
+  # selector.matchLabels is immutable post-creation — kept as the original
+  # bare `app: kosha` so this change stays purely additive. `role: ingest`
+  # only needs to exist on the pod template (a superset of the selector is
+  # allowed) for kosha-ingest-service to pick it up.
   selector:
     matchLabels:
       app: kosha
@@ -14,12 +19,17 @@ spec:
   # kosha pods must never share a node — a rolling update's surge pod would
   # write the same host directory as the outgoing pod. Recreate trades a few
   # seconds of downtime for that guarantee; already a single replica anyway.
+  # This pod is the single, pinned write target — see deployment-query.yaml
+  # for the horizontally-scaled, stateless read tier and main.rs's request
+  # forwarding for how writes always land here regardless of which pod a
+  # client's request first reaches.
   strategy:
     type: Recreate
   template:
     metadata:
       labels:
         app: kosha
+        role: ingest
     spec:
       serviceAccountName: kosha
       # Land only on the Karpenter-managed kosha NVMe pool. The label is
@@ -44,6 +54,8 @@ spec:
             - configMapRef:
                 name: kosha-config
           env:
+            - name: KOSHA_ROLE
+              value: ingest
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

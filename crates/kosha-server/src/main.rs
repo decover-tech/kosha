@@ -147,6 +147,17 @@ struct AppState {
     /// `KOSHA_MAX_CONCURRENT_HYDRATIONS`, default 4.
     #[cfg(feature = "s3")]
     hydration_semaphore: Semaphore,
+    /// `KOSHA_INGEST_HOST` — set only on query-role pods (deployment-query.yaml).
+    /// When present, write-path requests this pod receives are forwarded here
+    /// instead of executed locally — see `is_write_path`/`forward_to_ingest`.
+    /// `None` on the ingest pod itself, which never forwards.
+    ingest_host: Option<String>,
+    /// Built once, lazily, only when `ingest_host` is set — no cost on the
+    /// ingest pod. Bounded timeout, no built-in retry: a failed forward
+    /// (e.g. the ingest pod mid-`Recreate` restart) fails fast and relies on
+    /// the *caller's* own retry logic (kosha_client already has
+    /// max_retries/retry_on_timeout), rather than retrying twice.
+    write_http_client: Option<reqwest::blocking::Client>,
 }
 
 /// Per-segment single-flight completion signal used by
@@ -422,6 +433,23 @@ impl AppState {
             cache.total_size()
         );
 
+        let ingest_host = std::env::var("KOSHA_INGEST_HOST")
+            .ok()
+            .filter(|h| !h.is_empty());
+        let write_http_client = ingest_host.as_ref().map(|h| {
+            println!("write-path requests will be forwarded to ingest at {h}");
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(
+                    std::env::var("KOSHA_INGEST_PROXY_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|n| *n > 0)
+                        .unwrap_or(30),
+                ))
+                .build()
+                .expect("failed to build ingest-forwarding HTTP client")
+        });
+
         Self {
             controller: Mutex::new(control_store),
             indexer,
@@ -453,6 +481,8 @@ impl AppState {
                     .filter(|n| *n > 0)
                     .unwrap_or(4),
             ),
+            ingest_host,
+            write_http_client,
         }
     }
 
@@ -900,7 +930,18 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         }
     };
 
-    let response = route(&request_line, &headers, &body, &tenant, state);
+    // ── Query/ingest role routing ────────────────────────────────────────
+    // A query-role pod (KOSHA_INGEST_HOST set) forwards write-path requests
+    // to the single ingest pod instead of executing them locally — see
+    // is_write_path/forward_to_ingest. Every other request (all reads, and
+    // everything on the ingest pod itself, which never forwards) is handled
+    // locally exactly as before this existed.
+    let response = match (&state.ingest_host, &state.write_http_client) {
+        (Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
+            forward_to_ingest(client, ingest_host, &request_line, &headers, &body)
+        }
+        _ => route(&request_line, &headers, &body, &tenant, state),
+    };
     stream.write_all(response.as_bytes()).ok();
     Ok(())
 }
@@ -939,6 +980,106 @@ fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
             "missing API key — use Authorization: Bearer <key> or X-Api-Key header",
         )),
     }
+}
+
+/// True for every write-mutating route `route()` dispatches to a
+/// mutation-performing handler (index/flush/replace/delete/admin) — the set
+/// a query pod forwards to `KOSHA_INGEST_HOST` instead of handling locally.
+/// False for read-only routes (search/exists/stats/healthz), which every
+/// pod always handles itself.
+///
+/// **Keep this in sync with `route()`'s own dispatch table below** — this
+/// intentionally mirrors it rather than sharing one lookup, since `route()`
+/// needs to actually execute the matched handler while this only needs a
+/// yes/no classification before a handler ever runs. If a new write route
+/// is added to `route()`, add its prefix here too.
+fn is_write_path(request_line: &str) -> bool {
+    // v1 tenant-scoped write routes.
+    if extract_namespace(request_line, "POST /v1/namespaces/", "/documents").is_some() {
+        return true;
+    }
+    if extract_namespace(request_line, "POST /v1/namespaces/", "/flush").is_some() {
+        return true;
+    }
+    if extract_namespace(request_line, "POST /v1/namespaces/", "/delete").is_some() {
+        return true;
+    }
+    // v1 admin routes — all mutate segment/manifest state.
+    if request_line.starts_with("POST /v1/admin/") {
+        return true;
+    }
+    // Legacy (pre-v1) write routes.
+    if request_line.starts_with("POST /index")
+        || request_line.starts_with("POST /replace")
+        || request_line.starts_with("POST /flush")
+        || request_line.starts_with("POST /delete")
+    {
+        return true;
+    }
+    // Everything else — /search, /exists, /stats, /healthz, and their v1
+    // equivalents — is read-only.
+    false
+}
+
+/// Forward a write-path request to the single ingest pod, verbatim, and
+/// relay its response back exactly as received. Used only by query-role
+/// pods (`AppState::ingest_host`/`write_http_client` are `None` on the
+/// ingest pod itself, which never calls this).
+///
+/// Single attempt, bounded timeout, no retry here — if the ingest pod is
+/// mid-`Recreate` restart this fails fast with a clear error; the caller's
+/// own retry logic (kosha_client's max_retries/retry_on_timeout) is what
+/// recovers, exactly as it would against a single pod restarting today.
+fn forward_to_ingest(
+    client: &reqwest::blocking::Client,
+    ingest_host: &str,
+    request_line: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> String {
+    let Some((method, path)) = parse_method_and_path(request_line) else {
+        return json_error(400, "malformed request line");
+    };
+
+    let url = format!("{}{}", ingest_host.trim_end_matches('/'), path);
+    let mut req = client.request(
+        method
+            .parse::<reqwest::Method>()
+            .unwrap_or(reqwest::Method::POST),
+        &url,
+    );
+    for (k, v) in headers {
+        // Host/content-length are set by reqwest itself from the URL/body;
+        // forwarding the original values would just be wrong for the new
+        // destination.
+        if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        req = req.header(k, v);
+    }
+    if !body.is_empty() {
+        req = req.body(body.to_vec());
+    }
+
+    match req.send() {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let upstream_body = resp.text().unwrap_or_default();
+            raw_response(status, &upstream_body)
+        }
+        Err(e) => json_error(
+            503,
+            &format!("forward to ingest ({ingest_host}) failed: {e}"),
+        ),
+    }
+}
+
+/// Parse `"METHOD /path HTTP/1.1\r\n"` into `("METHOD", "/path")`.
+fn parse_method_and_path(request_line: &str) -> Option<(&str, &str)> {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    Some((method, path))
 }
 
 fn route(
@@ -2038,6 +2179,33 @@ fn json_error_body(status_code: u16, message: &str) -> String {
     )
 }
 
+/// Build a raw HTTP response with an arbitrary status code and a body
+/// relayed verbatim (not re-serialized) — used by `forward_to_ingest` to
+/// pass through the ingest pod's actual status/body untouched. Unlike
+/// `json_error`, which always wraps its message in `{"error": ...}`, this
+/// must not alter the body at all: some existing clients (e.g. kosha_client)
+/// key off specific status codes like 404 in their own error handling, so
+/// silently coercing an unrecognized code to 500 the way `json_error`'s
+/// fallback does would be a real correctness bug for a proxy specifically.
+fn raw_response(status_code: u16, body: &str) -> String {
+    let reason = match status_code {
+        200 => "OK",
+        201 => "Created",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        409 => "Conflict",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Response",
+    };
+    format!(
+        "HTTP/1.1 {status_code} {reason}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 /// Minimal URL decoder: decodes %XX and + → space.
 fn url_decode(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
@@ -2113,6 +2281,154 @@ mod tests {
         let msg = hydration_failed_message(&many);
         assert!(msg.contains("15 segment(s)"));
         assert!(msg.contains("(+5 more)"));
+    }
+
+    /// Every write route `route()` actually dispatches to a mutating
+    /// handler must also be classified `true` here — this is the drift risk
+    /// called out in `is_write_path`'s own doc comment. If this test starts
+    /// failing after adding a new write route to `route()`, that's the
+    /// signal to update `is_write_path` too, not to weaken this test.
+    #[test]
+    fn is_write_path_matches_every_mutating_route() {
+        for line in [
+            "POST /v1/namespaces/foo/documents HTTP/1.1\r\n",
+            "POST /v1/namespaces/foo/flush HTTP/1.1\r\n",
+            "POST /v1/namespaces/foo/delete HTTP/1.1\r\n",
+            "POST /v1/admin/api-keys HTTP/1.1\r\n",
+            "POST /v1/admin/rebuild-filter-blooms HTTP/1.1\r\n",
+            "POST /v1/admin/backfill-offset-tables HTTP/1.1\r\n",
+            "POST /v1/admin/compact-namespace HTTP/1.1\r\n",
+            "POST /index HTTP/1.1\r\n",
+            "POST /replace HTTP/1.1\r\n",
+            "POST /flush HTTP/1.1\r\n",
+            "POST /delete HTTP/1.1\r\n",
+        ] {
+            assert!(is_write_path(line), "expected write-path: {line:?}");
+        }
+    }
+
+    #[test]
+    fn is_write_path_excludes_every_read_route() {
+        for line in [
+            "GET /v1/healthz HTTP/1.1\r\n",
+            "GET /healthz HTTP/1.1\r\n",
+            "POST /v1/namespaces/foo/search HTTP/1.1\r\n",
+            "POST /v1/namespaces/foo/exists HTTP/1.1\r\n",
+            "GET /v1/stats HTTP/1.1\r\n",
+            "GET /v1/namespaces/foo/stats HTTP/1.1\r\n",
+            "GET /search?ns=foo&q=bar HTTP/1.1\r\n",
+            "POST /search HTTP/1.1\r\n",
+            "POST /exists HTTP/1.1\r\n",
+            "GET /stats HTTP/1.1\r\n",
+        ] {
+            assert!(!is_write_path(line), "expected read-path: {line:?}");
+        }
+    }
+
+    #[test]
+    fn raw_response_relays_arbitrary_status_and_body_verbatim() {
+        let body = r#"{"indexed_count":5,"namespace":"foo"}"#;
+        let resp = raw_response(200, body);
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+        assert!(resp.ends_with(body), "{resp}");
+
+        // The specific regression this exists to prevent: json_error's
+        // fallback silently coerces any unrecognized code to 500, which
+        // would be wrong for a proxy relaying a real upstream 404 —
+        // kosha_client's own error handling branches on exactly that code.
+        let not_found = raw_response(404, r#"{"error":"namespace 'x' not found"}"#);
+        assert!(
+            not_found.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{not_found}"
+        );
+
+        // An upstream code this function has no reason phrase for must
+        // still relay the real numeric code, not silently become 500.
+        let unmapped = raw_response(418, r#"{"error":"teapot"}"#);
+        assert!(unmapped.starts_with("HTTP/1.1 418 "), "{unmapped}");
+    }
+
+    /// End-to-end over a real socket: a fake "ingest" server that always
+    /// answers 201 with a fixed body, and forward_to_ingest against it.
+    /// Exercises the actual reqwest path, not just the pure classifier
+    /// above — this is the only place in this file's tests that spins up a
+    /// second TCP listener to stand in for a peer service.
+    #[test]
+    fn forward_to_ingest_relays_method_path_and_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_request_line = Arc::new(Mutex::new(String::new()));
+        let seen_body = Arc::new(Mutex::new(Vec::new()));
+        let (rl_clone, body_clone) = (Arc::clone(&seen_request_line), Arc::clone(&seen_body));
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            *rl_clone.lock().unwrap() = request_line;
+
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.trim_end().split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 {
+                reader.read_exact(&mut body).unwrap();
+            }
+            *body_clone.lock().unwrap() = body;
+
+            let mut stream = stream;
+            let resp_body = r#"{"indexed_count":1,"namespace":"foo"}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 201 Created\r\ncontent-length: {}\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "Bearer test-key".to_string());
+        let body = br#"{"namespace":"foo","documents":[]}"#;
+        let response = forward_to_ingest(
+            &client,
+            &format!("http://{addr}"),
+            "POST /index HTTP/1.1\r\n",
+            &headers,
+            body,
+        );
+
+        server.join().unwrap();
+        assert_eq!(
+            *seen_request_line.lock().unwrap(),
+            "POST /index HTTP/1.1\r\n"
+        );
+        assert_eq!(*seen_body.lock().unwrap(), body.to_vec());
+        assert!(
+            response.starts_with("HTTP/1.1 201 Created\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.ends_with(r#"{"indexed_count":1,"namespace":"foo"}"#),
+            "{response}"
+        );
     }
 
     // ── Segment hydration coalescing ────────────────────────────────────

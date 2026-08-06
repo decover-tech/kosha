@@ -5,11 +5,50 @@ namespace. Manifests stay product-generic: no customer account names,
 bucket names, or IAM role ARNs are committed here.
 
     k8s/
-      base/     Namespace, ServiceAccount, ConfigMap, Deployment, Service —
-                env-agnostic defaults only (includes kosha NVMe node-pool
-                scheduling; see below)
+      base/     Namespace, ServiceAccount, ConfigMap, two Deployments
+                (kosha = ingest, kosha-query = query), two Services
+                (kosha-service, kosha-ingest-service), an HPA for the query
+                tier — env-agnostic defaults only (includes kosha NVMe
+                node-pool scheduling for the ingest Deployment; see below)
       stage/    floating `:main` image tag + larger memory for warm hydration
       prod/     versioned release image tag
+
+## Query/ingest split and request routing
+
+Kosha runs as two Deployments sharing one binary, differentiated by
+`KOSHA_ROLE` (set explicitly per-Deployment, overriding the shared
+ConfigMap):
+
+- **`kosha`** (`role: ingest`) — the single, pinned write target. Exactly
+  one replica, on the dedicated NVMe pool (see below). Two pods writing the
+  same namespace concurrently could each pick the same next segment ID and
+  silently clobber each other's data (`kosha-write::Indexer`'s segment
+  counter has no cross-pod coordination) — this Deployment must never scale
+  beyond 1.
+- **`kosha-query`** (`role: query`) — stateless, horizontally-scaled reads.
+  No hostPath, no NVMe pinning, an `emptyDir` cache that cold-starts from
+  the Postgres manifest + S3 segments (bounded, ~15-20s for a full
+  namespace). Scaled by `hpa-query.yaml` on CPU utilization — requires the
+  cluster's metrics-server to actually be healthy (`kubectl top pods -n
+  kosha` returning real numbers, not `FailedGetResourceMetric`) or the HPA
+  is a no-op.
+
+**Clients only ever need `kosha-service`** — for both reads and writes,
+exactly like a single OpenSearch cluster endpoint. `kosha-service` selects
+`role: query`; a query pod handles reads itself and *transparently forwards*
+write-path requests (`/index`, `/flush`, `/replace`, `/delete`,
+`/v1/admin/*`) to `kosha-ingest-service` (which selects `role: ingest`),
+relaying the response back verbatim. See `crates/kosha-server/src/main.rs`'s
+`is_write_path`/`forward_to_ingest` for the implementation — `KOSHA_ROLE`
+being decorative (read but never branched on) was true until this existed;
+now it gates this one thing. `kosha-ingest-service` is not meant for direct
+client use; it exists as the forwarding target and an optional bypass for
+admin/migration scripts.
+
+One extra internal network hop per write (client → query pod → ingest pod
+→ back) is the accepted tradeoff for zero client-side routing logic and no
+cross-repo config change. Writes aren't the CPU bottleneck here — search
+scoring is — so this is cheap.
 
 ## Contract with the infra / deploy environment
 
@@ -17,7 +56,8 @@ bucket names, or IAM role ARNs are committed here.
 |-------|--------------|-------------------------|
 | K8s namespace | `kosha` | — |
 | ServiceAccount | `kosha` | IRSA annotation |
-| Service DNS | `kosha-service.kosha.svc.cluster.local` | — |
+| Service DNS (client-facing) | `kosha-service.kosha.svc.cluster.local` | — |
+| Service DNS (internal, ingest-only) | `kosha-ingest-service.kosha.svc.cluster.local` | — |
 | S3 bucket / prefix | — | `KOSHA_S3_BUCKET`, `KOSHA_S3_PREFIX` |
 | AWS region | — | `KOSHA_AWS_REGION` (default `us-east-1`) |
 | IRSA role ARN | — | `KOSHA_IRSA_ROLE_ARN` |
@@ -28,12 +68,18 @@ Customer-specific staging/prod wiring (bucket names, role ARNs, cluster
 names) lives in **infra Terraform outputs** and **GitHub Environment
 secrets** for this repo's deploy workflows — not in these YAML files.
 
-Clients reach Kosha at `http://kosha-service.kosha.svc.cluster.local:8080`.
+Clients reach Kosha at `http://kosha-service.kosha.svc.cluster.local:8080` —
+for both reads and writes; see the split section above for why this hasn't
+changed despite Kosha now running as two Deployments.
 
 ## The kosha node pool (Karpenter, NVMe instance store)
 
-Kosha runs on a dedicated Karpenter pool whose nodes have a local NVMe
-instance store, formatted and mounted at `/var/lib/kosha-cache` by the
+This section is about the **ingest Deployment only** (`base/deployment.yaml`,
+`role: ingest`). The query tier (`base/deployment-query.yaml`) deliberately
+does not use this pool or a hostPath cache — see the split section above.
+
+The ingest pod runs on a dedicated Karpenter pool whose nodes have a local
+NVMe instance store, formatted and mounted at `/var/lib/kosha-cache` by the
 `EC2NodeClass` user-data. `base/deployment.yaml` is pinned to that pool:
 
 - `nodeSelector: kosha.dev/instance-store: nvme` — the label is unique to
@@ -46,12 +92,16 @@ instance store, formatted and mounted at `/var/lib/kosha-cache` by the
 
 Consequences worth knowing:
 
-- **`strategy: Recreate`.** Two kosha pods must never share a node, or a
+- **`strategy: Recreate`.** Two ingest pods must never share a node, or a
   rolling update's surge pod would write the same host directory as the
-  outgoing pod. Recreate costs a few seconds of downtime per deploy; the
-  Deployment is a single replica regardless. If Kosha ever needs >1
-  replica, add a `requiredDuringSchedulingIgnoredDuringExecution` pod
-  anti-affinity on `app: kosha` over `kubernetes.io/hostname` instead.
+  outgoing pod. Recreate costs a few seconds of downtime per deploy; this
+  Deployment stays a single replica permanently — see the split section
+  above for why (uncoordinated segment-counter writes, not just a
+  hostPath scheduling detail). The historical note this replaced said "if
+  Kosha ever needs >1 replica, add pod anti-affinity instead" — that's now
+  answered by the query tier existing as a *separate* Deployment with its
+  own `preferredDuringSchedulingIgnoredDuringExecution` anti-affinity
+  (`deployment-query.yaml`), not by scaling this one.
 - **Cache capacity is the node's, not the pod's.** hostPath usage is not
   tracked by the kubelet, so `ephemeral-storage` requests/limits are sized
   for the container filesystem only (logs, `/tmp`) — deliberately small, so
@@ -72,7 +122,9 @@ Consequences worth knowing:
 1. Reads Environment secrets (DB URL, API key, S3, IRSA, cluster)
 2. `kustomize edit set image` + generates `kosha-secret`
 3. Patches ConfigMap / ServiceAccount with the env-specific S3 + IRSA values
-4. `kubectl apply -k` and rolls out `deployment/kosha` in namespace `kosha`
+4. `kubectl apply -k` and rolls out **both** `deployment/kosha` (ingest) and
+   `deployment/kosha-query` (query) in namespace `kosha`, waiting on each in
+   turn — a failed rollout on either one fails the deploy.
 
 ### Required GitHub Environment secrets
 

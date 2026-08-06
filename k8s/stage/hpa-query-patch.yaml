@@ -1,0 +1,11 @@
+# Requires the cluster's metrics-server to be healthy before this does
+# anything real — confirm `kubectl top pods -n kosha` returns numbers, not
+# FailedGetResourceMetric, before relying on scale-up/scale-down behavior.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kosha-query
+  namespace: kosha
+spec:
+  minReplicas: 2
+  maxReplicas: 6
