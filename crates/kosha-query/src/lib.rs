@@ -959,17 +959,11 @@ impl Searcher {
         // output Vec no matter which thread finishes first, so the reduce
         // below is deterministic and behavior-identical to the old
         // sequential loop, just faster.
-        eprintln!(
-            "DEBUG: search: about to score {} segments in parallel",
-            manifest.segments.len()
-        );
-        let search_t0 = std::time::Instant::now();
         let segment_outputs: Vec<SegmentOutput> = manifest
             .segments
             .par_iter()
             .map(|entry| {
-                let seg_t0 = std::time::Instant::now();
-                let result = self.score_segment(
+                self.score_segment(
                     namespace,
                     entry,
                     query,
@@ -977,24 +971,12 @@ impl Searcher {
                     term_prune.as_ref(),
                     &sort_value_fields,
                     tombstones,
-                );
-                let elapsed = seg_t0.elapsed();
-                if elapsed.as_millis() > 200 {
-                    eprintln!(
-                        "DEBUG: SLOW segment {} took {:?}",
-                        entry.segment_id.0, elapsed
-                    );
-                }
-                result
+                )
             })
             .collect::<Result<Vec<Option<SegmentOutput>>, KoshaError>>()?
             .into_iter()
             .flatten()
             .collect();
-        eprintln!(
-            "DEBUG: search: all segments scored in {:?}",
-            search_t0.elapsed()
-        );
 
         let mut candidates: Vec<HitCandidate> = Vec::new();
         let mut all_aggs: HashMap<String, AggregationResults> = HashMap::new();
