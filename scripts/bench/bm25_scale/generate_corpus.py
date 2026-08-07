@@ -19,14 +19,22 @@ Output: NDJSON shards under --out-dir (one doc per line: {"id", "text"}),
 plus a queries.txt file (one query per line) sampled from the same
 vocabulary/frequency distribution, for query_bench.py to replay.
 
+Pass --s3-uri to also upload the corpus (via `aws s3 sync`) once generation
+finishes, and record the resulting handle in manifest.json (key "s3_uri") —
+so a ~9GB/10M-doc corpus doesn't have to be regenerated for a re-run, and
+the location is discoverable from the manifest rather than tribal knowledge.
+There's no default bucket baked in here: pass the full s3:// URI explicitly.
+
 Usage:
     python3 generate_corpus.py --out-dir /data/bm25-10m --docs 10_000_000 \\
-        --avg-bytes 900 --seed 42
+        --avg-bytes 900 --seed 42 \\
+        --s3-uri s3://decoverai-nonprod-kosha-bench/bm25-scale/10M-docs-900b-seed42
 """
 
 import argparse
 import json
 import math
+import subprocess
 import time
 from pathlib import Path
 
@@ -74,6 +82,11 @@ def main() -> None:
         help="NDJSON lines per output file, for parallel/resumable loading",
     )
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--s3-uri",
+        default=None,
+        help="if set, `aws s3 sync --out-dir` here after generation and record it in manifest.json",
+    )
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -157,10 +170,24 @@ def main() -> None:
         "seed": args.seed,
         "shards": n_shards,
         "num_queries": NUM_QUERIES,
+        "s3_uri": None,  # filled in below if --s3-uri was passed
     }
+
+    if args.s3_uri:
+        print(f"uploading corpus to {args.s3_uri} ...")
+        t_up = time.time()
+        subprocess.run(
+            ["aws", "s3", "sync", str(args.out_dir), args.s3_uri, "--only-show-errors"],
+            check=True,
+        )
+        manifest["s3_uri"] = args.s3_uri
+        print(f"upload done in {time.time() - t_up:.1f}s -> {args.s3_uri}")
+
     (args.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"done: {docs_written:,} docs, {bytes_written / 1e9:.2f}GB, {n_shards} shards")
     print(f"manifest: {args.out_dir / 'manifest.json'}")
+    if manifest["s3_uri"]:
+        print(f"s3 handle: {manifest['s3_uri']}")
 
 
 if __name__ == "__main__":
