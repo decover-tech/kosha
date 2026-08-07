@@ -22,6 +22,21 @@
 # imagePullPolicy: Always for the same reason as deployment-resources-patch.yaml
 # — staging's floating :main tag means kubelet's tag-based image cache check
 # is not enough; this Deployment shares that same image reference.
+#
+# KOSHA_CACHE_MAX_BYTES added after a separate incident: this Deployment's
+# on-disk segment cache is an emptyDir (base/deployment-query.yaml — unlike
+# the ingest Deployment's hostPath NVMe volume, which the kubelet does NOT
+# count against ephemeral-storage). Left unset, that cache is unbounded, so
+# it — not KOSHA_SEGMENT_CACHE_MAX_BYTES above, which only bounds the
+# in-memory parsed-segment cache — is what actually consumes the pod's 20Gi
+# ephemeral-storage limit. A benchmark against a ~22GB single namespace
+# (10M docs) filled it, and pods got Kubernetes-Evicted ("ephemeral local
+# storage usage exceeds the total limit of containers 20Gi") rather than
+# gracefully LRU-evicting, repeatedly, which also starved capacity for
+# unrelated namespaces sharing the same pods. 12GiB leaves 8Gi (40%)
+# headroom on the 20Gi limit for everything else on the container
+# filesystem (logs, /tmp, transient hydration staging before files land in
+# the cache dir).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -41,6 +56,11 @@ spec:
             # gracefully instead of the pod getting OOMKilled.
             - name: KOSHA_SEGMENT_CACHE_MAX_BYTES
               value: "10737418240"
+            # ~12GiB on-disk cache budget, well under the 20Gi
+            # ephemeral-storage limit (see comment above) — the cache's own
+            # LRU eviction is what should bite first, not a pod eviction.
+            - name: KOSHA_CACHE_MAX_BYTES
+              value: "12884901888"
           resources:
             requests:
               cpu: "2"

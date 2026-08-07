@@ -354,7 +354,19 @@ impl AppState {
             .ok()
             .and_then(|v| v.parse().ok());
         let cache = Cache::with_max_bytes(data_dir.clone(), cache_max_bytes);
-        let indexer = Indexer::new(data_dir.clone());
+        // `KOSHA_FLUSH_THRESHOLD`: docs buffered per namespace before an
+        // auto-flush writes a new immutable segment (kosha-write's
+        // Indexer::index_documents). Default (1000) is tuned for steady-state
+        // production write volume, not bulk backfills — at that threshold a
+        // 10M-doc load produces ~10k segments before any compaction. Bulk
+        // loaders (and migrate.rs's offline --flush-docs, default 20000)
+        // should raise this so fewer, larger segments get created.
+        let flush_threshold: usize = std::env::var("KOSHA_FLUSH_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1000);
+        let indexer = Indexer::new(data_dir.clone()).with_flush_threshold(flush_threshold);
 
         // `KOSHA_SEGMENT_CACHE_CAPACITY` / `KOSHA_SEGMENT_CACHE_MAX_BYTES`:
         // how many parsed segments the searcher keeps resident in memory
