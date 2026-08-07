@@ -4,6 +4,21 @@
 # fighting for one pod's rayon thread pool, per-pod CPU can be smaller while
 # aggregate throughput goes up.
 #
+# Memory bumped 4Gi/8Gi -> 8Gi/16Gi after the first load test OOMKilled a
+# query pod (exit 137). Root cause: KOSHA_SEGMENT_CACHE_MAX_BYTES is a
+# ConfigMap-wide value (40GiB) sized for the old single ingest pod's 56Gi
+# limit — inherited as-is by the much smaller query pods, so the in-process
+# cache had no reason to evict before the *container* cgroup limit killed
+# it. Measured directly against the ingest pod (56Gi headroom, so safe to
+# observe): one cold /search hydrating paragraph_index_hnsw's full 258
+# segments alone costs ~6.5GiB RSS. 8Gi left ~1.5GiB for everything else
+# (process baseline, other namespaces' cached segments, per-request
+# working memory under concurrency) — not enough margin. 16Gi + the
+# KOSHA_SEGMENT_CACHE_MAX_BYTES override below (well under the container
+# limit, so the cache's own LRU eviction is what bites first, not the OOM
+# killer) is this round's fix; revisit with more load-test data if the
+# corpus grows.
+#
 # imagePullPolicy: Always for the same reason as deployment-resources-patch.yaml
 # — staging's floating :main tag means kubelet's tag-based image cache check
 # is not enough; this Deployment shares that same image reference.
@@ -18,12 +33,20 @@ spec:
       containers:
         - name: kosha
           imagePullPolicy: Always
+          env:
+            # Overrides the ConfigMap's 40GiB value (see comment above) —
+            # explicit container env wins over envFrom on key collision.
+            # ~10GiB leaves ~6GiB of the 16Gi limit for process baseline +
+            # concurrent per-request working memory, so the cache evicts
+            # gracefully instead of the pod getting OOMKilled.
+            - name: KOSHA_SEGMENT_CACHE_MAX_BYTES
+              value: "10737418240"
           resources:
             requests:
               cpu: "2"
               ephemeral-storage: "5Gi"
-              memory: "4Gi"
+              memory: "8Gi"
             limits:
               cpu: "4"
               ephemeral-storage: "20Gi"
-              memory: "8Gi"
+              memory: "16Gi"
