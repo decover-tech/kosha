@@ -285,12 +285,20 @@ impl S3Storage {
     /// latencies rather than N.
     ///
     /// Returns one `(logical_path, result)` pair per input path, in
-    /// completion order (not input order).
+    /// completion order (not input order). Success carries no payload —
+    /// the file's bytes live on disk (under the local cache root), never in
+    /// the return value. They used to: every completed download's `Vec<u8>`
+    /// was retained in the results vec for the lifetime of the whole batch,
+    /// so one large hydration (hundreds of files) buffered the entire
+    /// batch's bytes in memory at once — unbounded by any budget, and
+    /// entirely wasted, since both callers discard the payload and only
+    /// look at success/failure. That transient was a direct contributor to
+    /// query-pod OOMs on cold hydration.
     pub fn read_many(
         &self,
         paths: &[String],
         max_concurrent: usize,
-    ) -> Vec<(String, Result<Vec<u8>, KoshaError>)> {
+    ) -> Vec<(String, Result<(), KoshaError>)> {
         if paths.is_empty() {
             return Vec::new();
         }
@@ -304,7 +312,7 @@ impl S3Storage {
         self.rt.block_on(async move {
             let mut set = tokio::task::JoinSet::new();
             let spawn_next =
-                |set: &mut tokio::task::JoinSet<(String, Result<Vec<u8>, KoshaError>)>,
+                |set: &mut tokio::task::JoinSet<(String, Result<(), KoshaError>)>,
                  pending: &mut std::collections::VecDeque<String>| {
                     let Some(path) = pending.pop_front() else {
                         return;
@@ -403,19 +411,35 @@ impl S3Storage {
     }
 }
 
-/// Fetch one logical path for [`S3Storage::read_many`]: serve from local
-/// disk if already present, otherwise GET from S3 and persist before
-/// returning the bytes.
+/// Fetch one logical path for [`S3Storage::read_many`]: no-op if already
+/// present on local disk, otherwise stream the S3 GET body straight to the
+/// local file.
+///
+/// Memory profile matters here — this runs up to `max_concurrent` times in
+/// parallel during cold hydration. The old implementation `collect()`ed the
+/// whole body into RAM, wrote it, and then **cloned it again** to satisfy a
+/// `Vec<u8>` return type no caller ever read (and, when the file was
+/// already local, read the entire file into RAM just to discard it). Now
+/// peak per-file memory is the stream's copy buffer, not the file size —
+/// which for `vector.idx` files can be hundreds of MB each.
+///
+/// The download goes to a `.partial` temp name and is renamed into place on
+/// success, so a crash mid-stream can't leave a truncated file that
+/// `local_path.exists()` (and `segment_is_complete`) would mistake for a
+/// finished download. The old whole-buffer `fs::write` had the same
+/// non-atomicity, just a smaller window.
 async fn fetch_one(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
     local_root: &Path,
     path: &str,
-) -> Result<Vec<u8>, KoshaError> {
+) -> Result<(), KoshaError> {
+    use tokio::io::AsyncWriteExt as _;
+
     let local_path = local_root.join(path);
     if local_path.exists() {
-        return tokio::fs::read(&local_path).await.map_err(KoshaError::Io);
+        return Ok(());
     }
 
     let s3_key = join_s3_key(prefix, path);
@@ -427,21 +451,32 @@ async fn fetch_one(
         .send()
         .await
         .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?;
-    let bytes = resp
-        .body
-        .collect()
-        .await
-        .map_err(|e| KoshaError::NotFound(format!("S3 read body: {e}")))?
-        .into_bytes();
 
     if let Some(parent) = local_path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    tokio::fs::write(&local_path, &bytes)
+
+    // Suffix the temp name with the task's address-unique path hash? Not
+    // needed: read_many single-flights per logical path via the caller's
+    // in-flight registry, and concurrent *processes* never share this disk.
+    let tmp_path = local_path.with_extension("partial");
+    let mut reader = resp.body.into_async_read();
+    let mut file = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(KoshaError::Io)?;
+    let copy_result = tokio::io::copy(&mut reader, &mut file).await;
+    if let Err(e) = copy_result {
+        drop(file);
+        tokio::fs::remove_file(&tmp_path).await.ok();
+        return Err(KoshaError::NotFound(format!("S3 read body: {e}")));
+    }
+    file.flush().await.map_err(KoshaError::Io)?;
+    drop(file);
+    tokio::fs::rename(&tmp_path, &local_path)
         .await
         .map_err(KoshaError::Io)?;
 
-    Ok(bytes.to_vec())
+    Ok(())
 }
 
 impl StorageBackend for S3Storage {
