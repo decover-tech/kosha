@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
@@ -25,6 +26,222 @@ pub const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = 64;
 /// this just re-parses on a cache miss (slower, still correct) rather than
 /// growing the cache without bound.
 pub const DEFAULT_SEGMENT_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Default live-bytes watermark, as a multiple of the segment cache's byte
+/// budget (see [`MemoryLedger`]). Live bytes exceed the cache budget exactly
+/// when in-flight requests pin segments beyond what the idle cache would
+/// hold, so "2× the cache budget" means: roughly one full extra cache's
+/// worth of concurrently-pinned segments before new searches start queueing.
+pub const DEFAULT_LIVE_BYTES_FACTOR: u64 = 2;
+
+/// Default time a search waits for live segment memory to free up before
+/// being shed with [`KoshaError::Overloaded`] (see [`MemoryLedger::admit`]).
+pub const DEFAULT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(15);
+
+// ─── Live-memory ledger & admission control ─────────────────────────────────
+//
+// The segment cache below bounds *idle* memory: segments kept resident
+// between requests. It cannot bound *live* memory — segments pinned by
+// `Arc` clones held by in-flight requests. Evicting a pinned entry from the
+// cache removes it from the cache's bookkeeping but frees nothing: the
+// request's own `Arc` keeps the parsed segment (including `doc_store.bin`'s
+// heap copy) alive until the request finishes. Under concurrent broad
+// queries (nothing to bloom-prune → every segment in the manifest pinned per
+// request), N in-flight requests can pin N × cache-budget worth of real
+// memory while the cache's own accounting reads "under budget" — which is
+// exactly the staging OOM pattern this ledger exists to fix.
+//
+// The fix is two-fold:
+//   1. Truthful accounting: every opened segment is wrapped in a
+//      [`TrackedSegment`] whose `Drop` decrements `live` — so `live` is the
+//      real footprint of all referenced segments, cache-held or not, and
+//      only drops when memory is actually freed.
+//   2. Admission control: [`Searcher::search`] estimates the bytes it will
+//      newly load and reserves them via [`MemoryLedger::admit`] before
+//      scoring. Over the watermark, it first evicts idle cache entries,
+//      then blocks until in-flight searches release memory, then sheds the
+//      request with [`KoshaError::Overloaded`] (HTTP 429 at the server —
+//      the Python client's existing retry/backoff handles it). Blocking
+//      happens only on the request thread at search entry, never inside
+//      rayon workers, so the scoring pool can't deadlock on itself.
+//
+// Lock-order invariant: cache locks (`entries`/`recency`) may be held while
+// taking the ledger lock (dropping an evicted `TrackedSegment` does this),
+// but never the reverse — `admit` releases the ledger lock before asking the
+// cache to evict.
+
+struct LedgerState {
+    /// Bytes of all currently-referenced (constructed, not-yet-dropped)
+    /// [`TrackedSegment`]s — cache-resident or pinned by in-flight requests.
+    live: u64,
+    /// Bytes reserved by admitted-but-still-loading searches. Moves to
+    /// `live` as segments actually open (see [`AdmissionPermit::consume`]);
+    /// any remainder is returned when the permit drops.
+    reserved: u64,
+    /// Number of admitted searches whose permits are still alive. The
+    /// anti-starvation rule keys off this: a search is always admitted when
+    /// no other permit is outstanding, however large its estimate — the
+    /// watermark bounds concurrent *pile-up*, not single-query size, so one
+    /// oversized query degrades exactly as it did before this ledger existed
+    /// (LRU thrash) instead of deadlocking or being permanently rejected.
+    active: usize,
+}
+
+pub struct MemoryLedger {
+    state: Mutex<LedgerState>,
+    cv: Condvar,
+    max_live_bytes: u64,
+    admission_timeout: Duration,
+}
+
+impl MemoryLedger {
+    fn new(max_live_bytes: u64, admission_timeout: Duration) -> Self {
+        Self {
+            state: Mutex::new(LedgerState {
+                live: 0,
+                reserved: 0,
+                active: 0,
+            }),
+            cv: Condvar::new(),
+            max_live_bytes,
+            admission_timeout,
+        }
+    }
+
+    fn add_live(&self, bytes: u64) {
+        let mut st = self.state.lock().unwrap();
+        st.live = st.live.saturating_add(bytes);
+    }
+
+    fn release_live(&self, bytes: u64) {
+        let mut st = self.state.lock().unwrap();
+        st.live = st.live.saturating_sub(bytes);
+        drop(st);
+        self.cv.notify_all();
+    }
+
+    /// Reserve `estimate` bytes for a search, blocking (bounded) if that
+    /// would push `live + reserved` past the watermark. `evict_idle(needed)`
+    /// is invoked (with the ledger lock *released* — see the lock-order
+    /// invariant above) to ask the cache to free idle entries first.
+    fn admit(
+        self: &Arc<Self>,
+        estimate: u64,
+        evict_idle: impl Fn(u64),
+    ) -> Result<AdmissionPermit, KoshaError> {
+        let deadline = Instant::now() + self.admission_timeout;
+        let mut tried_evict = false;
+        let mut st = self.state.lock().unwrap();
+        loop {
+            let committed = st.live.saturating_add(st.reserved);
+            let fits = committed.saturating_add(estimate) <= self.max_live_bytes;
+            // Anti-starvation: alone (no other admitted search) after one
+            // eviction attempt → admit regardless of size. See
+            // `LedgerState::active`.
+            if fits || (st.active == 0 && tried_evict) {
+                st.reserved = st.reserved.saturating_add(estimate);
+                st.active += 1;
+                return Ok(AdmissionPermit {
+                    ledger: Arc::clone(self),
+                    remaining: Mutex::new(estimate),
+                });
+            }
+            if !tried_evict {
+                let needed = committed
+                    .saturating_add(estimate)
+                    .saturating_sub(self.max_live_bytes);
+                drop(st);
+                evict_idle(needed);
+                tried_evict = true;
+                st = self.state.lock().unwrap();
+                continue;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(KoshaError::Overloaded(format!(
+                    "search needs ~{estimate} more live segment bytes but \
+                     {committed} of the {} watermark are already pinned by \
+                     {} in-flight search(es); nothing freed within {:?} — \
+                     retry with backoff",
+                    self.max_live_bytes, st.active, self.admission_timeout,
+                )));
+            }
+            let (guard, _timeout) = self.cv.wait_timeout(st, deadline - now).unwrap();
+            st = guard;
+        }
+    }
+}
+
+/// A parsed segment plus its ledger accounting: constructing one records its
+/// bytes as live; dropping the last `Arc` to it releases them. This is what
+/// makes [`MemoryLedger::state`]'s `live` truthful — the bytes stay counted
+/// exactly as long as *anything* (cache or in-flight request) can still
+/// reach the parsed data, and are released exactly when the allocation is.
+pub struct TrackedSegment {
+    reader: SegmentReader,
+    bytes: u64,
+    ledger: Arc<MemoryLedger>,
+}
+
+impl TrackedSegment {
+    fn new(reader: SegmentReader, bytes: u64, ledger: Arc<MemoryLedger>) -> Self {
+        ledger.add_live(bytes);
+        Self {
+            reader,
+            bytes,
+            ledger,
+        }
+    }
+}
+
+impl std::ops::Deref for TrackedSegment {
+    type Target = SegmentReader;
+    fn deref(&self) -> &SegmentReader {
+        &self.reader
+    }
+}
+
+impl Drop for TrackedSegment {
+    fn drop(&mut self) {
+        self.ledger.release_live(self.bytes);
+    }
+}
+
+/// RAII handle for an admitted search's byte reservation. As segments
+/// actually open, their bytes move from "reserved" to "live" via
+/// [`Self::consume`]; whatever reservation is left (segments that turned
+/// out to be bloom-pruned, cache hits raced in by a concurrent search, …)
+/// is returned when the permit drops at the end of the search.
+pub struct AdmissionPermit {
+    ledger: Arc<MemoryLedger>,
+    remaining: Mutex<u64>,
+}
+
+impl AdmissionPermit {
+    fn consume(&self, bytes: u64) {
+        let mut remaining = self.remaining.lock().unwrap();
+        let take = (*remaining).min(bytes);
+        *remaining -= take;
+        drop(remaining);
+        if take > 0 {
+            let mut st = self.ledger.state.lock().unwrap();
+            st.reserved = st.reserved.saturating_sub(take);
+            // No notify: the matching `live` increase (TrackedSegment::new)
+            // keeps committed bytes net-unchanged, so no waiter can newly fit.
+        }
+    }
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        let remaining = *self.remaining.lock().unwrap();
+        let mut st = self.ledger.state.lock().unwrap();
+        st.reserved = st.reserved.saturating_sub(remaining);
+        st.active = st.active.saturating_sub(1);
+        drop(st);
+        self.ledger.cv.notify_all();
+    }
+}
 
 /// In-memory LRU cache of parsed segments, keyed by
 /// `(namespace, segment_id, load_vectors)`.
@@ -54,7 +271,7 @@ type SegmentCacheKey = (String, String, bool);
 struct SegmentCache {
     capacity: usize,
     max_bytes: u64,
-    entries: Mutex<HashMap<SegmentCacheKey, (Arc<SegmentReader>, u64)>>,
+    entries: Mutex<HashMap<SegmentCacheKey, (Arc<TrackedSegment>, u64)>>,
     recency: Mutex<VecDeque<SegmentCacheKey>>,
     total_bytes: AtomicU64,
 }
@@ -78,7 +295,7 @@ impl SegmentCache {
         recency.push_back(key.clone());
     }
 
-    fn get(&self, key: &SegmentCacheKey) -> Option<Arc<SegmentReader>> {
+    fn get(&self, key: &SegmentCacheKey) -> Option<Arc<TrackedSegment>> {
         let hit = self
             .entries
             .lock()
@@ -91,26 +308,87 @@ impl SegmentCache {
         hit
     }
 
-    fn insert(&self, key: SegmentCacheKey, reader: Arc<SegmentReader>, approx_bytes: u64) {
+    fn contains(&self, key: &SegmentCacheKey) -> bool {
+        self.entries.lock().unwrap().contains_key(key)
+    }
+
+    fn insert(&self, key: SegmentCacheKey, reader: Arc<TrackedSegment>, approx_bytes: u64) {
         {
             let mut entries = self.entries.lock().unwrap();
             entries.insert(key.clone(), (reader, approx_bytes));
         }
         self.total_bytes.fetch_add(approx_bytes, Ordering::Relaxed);
         self.touch(&key);
+        self.enforce_budget();
+    }
 
+    /// Evict idle LRU entries until the cache is back under both its entry
+    /// and byte budgets, or no idle entries remain. Called after every
+    /// insert and at the start of every search — the latter catches
+    /// segments that were pinned by in-flight requests at insert time
+    /// (skipped below) and have since become idle.
+    fn enforce_budget(&self) {
+        self.evict_idle_until(|len, total, _freed| len <= self.capacity && total <= self.max_bytes);
+    }
+
+    /// Evict idle LRU entries until at least `needed` bytes have been
+    /// freed, or no idle entries remain. Used by admission (see
+    /// [`MemoryLedger::admit`]) to free idle memory before making a search
+    /// wait on in-flight releases.
+    fn evict_idle(&self, needed: u64) {
+        self.evict_idle_until(|_len, _total, freed| freed >= needed);
+    }
+
+    /// Shared eviction walk: pop LRU-order entries, evicting the *idle*
+    /// ones (strong_count == 1 — the cache's own `Arc` is the only
+    /// reference) until `done(len, total_bytes, freed)` says stop.
+    ///
+    /// Entries pinned by in-flight requests are skipped with their recency
+    /// order preserved: removing them from the cache would free no memory
+    /// (the request's `Arc` keeps the parsed segment alive regardless)
+    /// while forfeiting reuse — the pre-ledger version of this cache did
+    /// exactly that, which is why its byte accounting drifted from real
+    /// memory under concurrent load. If everything left is pinned, stop:
+    /// bounding pinned memory is the admission gate's job, not eviction's.
+    fn evict_idle_until(&self, done: impl Fn(usize, u64, u64) -> bool) -> u64 {
+        let mut freed = 0u64;
+        let mut recency = self.recency.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap();
+        let mut pinned: Vec<SegmentCacheKey> = Vec::new();
         loop {
-            let over_capacity = self.entries.lock().unwrap().len() > self.capacity;
-            let over_budget = self.total_bytes.load(Ordering::Relaxed) > self.max_bytes;
-            if !over_capacity && !over_budget {
+            let total = self.total_bytes.load(Ordering::Relaxed);
+            if done(entries.len(), total, freed) {
                 break;
             }
-            let oldest = self.recency.lock().unwrap().pop_front();
-            let Some(oldest_key) = oldest else { break };
-            if let Some((_, size)) = self.entries.lock().unwrap().remove(&oldest_key) {
-                self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+            let Some(oldest_key) = recency.pop_front() else {
+                break;
+            };
+            match entries
+                .get(&oldest_key)
+                .map(|(arc, _)| Arc::strong_count(arc) == 1)
+            {
+                // Stale recency key (entry already gone) — just drop it.
+                None => {}
+                Some(true) => {
+                    if let Some((_, size)) = entries.remove(&oldest_key) {
+                        // The Arc drops here → TrackedSegment::drop → ledger
+                        // lock. Safe per the lock-order invariant: cache
+                        // locks may be held while taking the ledger lock,
+                        // never the reverse.
+                        self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                        freed = freed.saturating_add(size);
+                    }
+                }
+                Some(false) => pinned.push(oldest_key),
             }
         }
+        // Restore skipped (pinned) entries to the front, preserving their
+        // original LRU order — they're still the oldest, just untouchable
+        // right now.
+        for key in pinned.into_iter().rev() {
+            recency.push_front(key);
+        }
+        freed
     }
 }
 
@@ -531,6 +809,7 @@ pub fn flat_knn(query_vector: &[f32], vectors: &[(u32, Vec<f32>)], k: usize) -> 
 pub struct Searcher {
     data_dir: PathBuf,
     segment_cache: SegmentCache,
+    ledger: Arc<MemoryLedger>,
 }
 
 impl Searcher {
@@ -552,32 +831,65 @@ impl Searcher {
     /// Like [`Searcher::new`], with explicit control over both the entry
     /// count and the approximate byte budget for the in-memory segment
     /// cache (see [`SegmentCache`] — the byte budget is the one that
-    /// actually bounds worst-case memory; count alone does not).
+    /// actually bounds worst-case memory; count alone does not). The live
+    /// watermark defaults to [`DEFAULT_LIVE_BYTES_FACTOR`] × `max_bytes`.
     pub fn with_segment_cache_limits(data_dir: PathBuf, capacity: usize, max_bytes: u64) -> Self {
+        Self::with_memory_limits(
+            data_dir,
+            capacity,
+            max_bytes,
+            max_bytes.saturating_mul(DEFAULT_LIVE_BYTES_FACTOR),
+            DEFAULT_ADMISSION_TIMEOUT,
+        )
+    }
+
+    /// Full control: cache entry cap, cache byte budget, live-bytes
+    /// watermark, and admission timeout (see [`MemoryLedger`] for what the
+    /// last two govern and why they exist).
+    pub fn with_memory_limits(
+        data_dir: PathBuf,
+        capacity: usize,
+        max_bytes: u64,
+        max_live_bytes: u64,
+        admission_timeout: Duration,
+    ) -> Self {
         Self {
             data_dir,
             segment_cache: SegmentCache::new(capacity, max_bytes),
+            ledger: Arc::new(MemoryLedger::new(max_live_bytes, admission_timeout)),
         }
     }
 
     /// Return the cached parsed segment for `(namespace, segment_id,
-    /// load_vectors)`, opening and caching it on miss.
+    /// load_vectors)`, opening and caching it on miss. On a miss, the
+    /// opened segment's bytes are recorded as live in the ledger (via
+    /// [`TrackedSegment::new`]) and consumed from the search's admission
+    /// reservation, keeping committed bytes net-unchanged.
     fn open_segment(
         &self,
         namespace: &str,
         segment_id: &str,
         seg_dir: PathBuf,
         load_vectors: bool,
-    ) -> Result<Arc<SegmentReader>, KoshaError> {
+        permit: Option<&AdmissionPermit>,
+    ) -> Result<Arc<TrackedSegment>, KoshaError> {
         let key = (namespace.to_string(), segment_id.to_string(), load_vectors);
         if let Some(cached) = self.segment_cache.get(&key) {
             return Ok(cached);
         }
         let approx_bytes = approx_segment_bytes(&seg_dir, load_vectors);
-        let reader = Arc::new(SegmentReader::open_with_options(seg_dir, load_vectors)?);
+        let reader = SegmentReader::open_with_options(seg_dir, load_vectors)?;
+        let tracked = Arc::new(TrackedSegment::new(
+            reader,
+            approx_bytes,
+            Arc::clone(&self.ledger),
+        ));
+        if let Some(permit) = permit {
+            permit.consume(approx_bytes);
+        }
         self.segment_cache
-            .insert(key, Arc::clone(&reader), approx_bytes);
-        Ok(reader)
+            .insert(key, Arc::clone(&tracked), approx_bytes);
+        Ok(tracked)
     }
 
     /// Score one manifest segment against `query`: open it (bloom-pruning
@@ -603,6 +915,7 @@ impl Searcher {
         tombstones: Option<
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
+        permit: &AdmissionPermit,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
         let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
         if !seg_dir.exists() {
@@ -640,6 +953,7 @@ impl Searcher {
             &entry.segment_id.0,
             seg_dir,
             query.knn.is_some(),
+            Some(permit),
         )?;
         let total_docs = reader.doc_count();
         let store = &reader.filter_store;
@@ -931,6 +1245,43 @@ impl Searcher {
             });
         }
 
+        // Lazy budget enforcement: segments that were pinned by in-flight
+        // requests at insert time (and so skipped by eviction — see
+        // `SegmentCache::evict_idle_until`) get another look now that those
+        // requests may have finished. Cheap when already under budget.
+        self.segment_cache.enforce_budget();
+
+        // ── Admission (see `MemoryLedger`) ──
+        // Estimate the incremental live bytes this search can add: the
+        // on-disk footprint of every manifest segment that's present
+        // locally but not already in the in-memory cache. Deliberately
+        // conservative — bloom pruning may skip some of these without ever
+        // opening them; the unconsumed reservation is returned when the
+        // permit drops at the end of this search. The broad, unfiltered
+        // queries this gate exists for prune nothing, so for exactly the
+        // dangerous case the estimate is accurate.
+        let load_vectors = query.knn.is_some();
+        let estimate: u64 = manifest
+            .segments
+            .iter()
+            .map(|entry| {
+                let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                let key = (
+                    namespace.0.clone(),
+                    entry.segment_id.0.clone(),
+                    load_vectors,
+                );
+                if seg_dir.exists() && !self.segment_cache.contains(&key) {
+                    approx_segment_bytes(&seg_dir, load_vectors)
+                } else {
+                    0
+                }
+            })
+            .sum();
+        let permit = self
+            .ledger
+            .admit(estimate, |needed| self.segment_cache.evict_idle(needed))?;
+
         let query_terms = tokenize(&query.query_text);
         let phrase_terms_for_prune = query.match_phrase.as_ref().map(|mp| tokenize(&mp.phrase));
         // Term-bloom prune before open. Wildcard expansion needs the segment
@@ -971,6 +1322,7 @@ impl Searcher {
                     term_prune.as_ref(),
                     &sort_value_fields,
                     tombstones,
+                    &permit,
                 )
             })
             .collect::<Result<Vec<Option<SegmentOutput>>, KoshaError>>()?
@@ -1122,8 +1474,10 @@ struct HitCandidate {
     /// The segment this hit came from. An `Arc` clone rather than an index
     /// into a shared `Vec` — segments are scored in parallel (see
     /// [`Searcher::score_segment`]), so there's no single ordered `Vec` of
-    /// readers to index into by the time candidates are merged.
-    reader: Arc<SegmentReader>,
+    /// readers to index into by the time candidates are merged. This clone
+    /// is also what pins the segment's memory as live in the
+    /// [`MemoryLedger`] until the search finishes materializing its page.
+    reader: Arc<TrackedSegment>,
     doc_seq: u32,
     doc_id: DocumentId,
     score: f64,
@@ -1411,6 +1765,210 @@ mod tests {
             match_phrase: None,
             knn: None,
         }
+    }
+
+    /// Write a one-document segment containing `text` and return its dir.
+    fn mk_segment(root: &std::path::Path, ns: &str, seg: &str, text: &str) -> PathBuf {
+        let seg_dir = root.join(ns).join(seg);
+        let mut w = SegmentWriter::new(SegmentId(seg.into()), seg_dir.clone());
+        w.add_document(
+            DocumentId(format!("{seg}-d1")),
+            vec![Field::text("t", text)],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+        seg_dir
+    }
+
+    fn ledger_snapshot(searcher: &Searcher) -> (u64, u64, usize) {
+        let st = searcher.ledger.state.lock().unwrap();
+        (st.live, st.reserved, st.active)
+    }
+
+    #[test]
+    fn eviction_skips_segments_pinned_by_inflight_references() {
+        // The pre-ledger cache evicted purely by LRU order: an entry whose
+        // Arc was still held by an in-flight request would be dropped from
+        // the cache's bookkeeping while its memory stayed fully alive —
+        // "eviction" that freed nothing. Now eviction must skip pinned
+        // entries (freeing them is impossible) and evict idle ones instead.
+        let dir = std::env::temp_dir().join("kosha-test-evict-skips-pinned");
+        let _ = std::fs::remove_dir_all(&dir);
+        let s1_dir = mk_segment(&dir, "test", "s1", "alpha");
+        let s2_dir = mk_segment(&dir, "test", "s2", "alpha");
+
+        // Byte budget of zero: every insert immediately wants to evict
+        // everything evictable.
+        let searcher = Searcher::with_segment_cache_limits(dir.clone(), 10, 0);
+
+        // Open s1 and keep the Arc — simulating an in-flight request.
+        let pinned = searcher
+            .open_segment("test", "s1", s1_dir, false, None)
+            .unwrap();
+        // Opening s2 triggers insert-time eviction. At that instant *both*
+        // entries are pinned (s1 by our Arc, s2 by open_segment's
+        // own about-to-be-returned Arc), so nothing can be freed yet —
+        // enforcement is lazy by design and re-runs at the next
+        // opportunity. Drop s2's returned Arc and re-enforce: now s2 is
+        // idle (evictable) while s1 stays pinned.
+        drop(
+            searcher
+                .open_segment("test", "s2", s2_dir, false, None)
+                .unwrap(),
+        );
+        searcher.segment_cache.enforce_budget();
+
+        let key1 = ("test".to_string(), "s1".to_string(), false);
+        let key2 = ("test".to_string(), "s2".to_string(), false);
+        assert!(
+            searcher.segment_cache.contains(&key1),
+            "pinned segment must not be evicted — removing it frees nothing"
+        );
+        assert!(
+            !searcher.segment_cache.contains(&key2),
+            "idle segment should have been evicted to chase the byte budget"
+        );
+
+        // Once the in-flight reference drops, enforcement evicts s1 too.
+        drop(pinned);
+        searcher.segment_cache.enforce_budget();
+        assert!(
+            !searcher.segment_cache.contains(&key1),
+            "segment must become evictable once no request pins it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_bytes_follow_real_references_not_cache_bookkeeping() {
+        // `live` must reflect actual referenced memory: counted while the
+        // cache or any request can reach the segment, released only when
+        // the last Arc drops.
+        let dir = std::env::temp_dir().join("kosha-test-live-bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+        let s1_dir = mk_segment(&dir, "test", "s1", "alpha");
+        let s1_bytes = approx_segment_bytes(&s1_dir, false);
+        assert!(s1_bytes > 0);
+
+        let searcher = Searcher::with_segment_cache_limits(dir.clone(), 10, u64::MAX);
+        let held = searcher
+            .open_segment("test", "s1", s1_dir, false, None)
+            .unwrap();
+        assert_eq!(ledger_snapshot(&searcher).0, s1_bytes);
+
+        // Dropping the request's Arc alone frees nothing (cache still
+        // holds it) — live must not move.
+        drop(held);
+        assert_eq!(ledger_snapshot(&searcher).0, s1_bytes);
+
+        // Evicting the now-idle entry drops the last Arc → live returns to
+        // zero, i.e. eviction and actual memory release now coincide.
+        searcher.segment_cache.evict_idle(u64::MAX);
+        assert_eq!(ledger_snapshot(&searcher).0, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admission_sheds_search_when_live_memory_stays_pinned() {
+        // With another search's reservation filling the watermark and
+        // nothing evictable, a new search must come back Overloaded after
+        // the admission timeout instead of piling on (the staging OOM
+        // pattern: concurrent broad queries each pinning the whole
+        // namespace).
+        let dir = std::env::temp_dir().join("kosha-test-admission-sheds");
+        let _ = std::fs::remove_dir_all(&dir);
+        mk_segment(&dir, "test", "s1", "alpha");
+
+        let searcher = Searcher::with_memory_limits(
+            dir.clone(),
+            10,
+            u64::MAX,
+            1, // watermark of one byte — any reservation fills it
+            Duration::from_millis(50),
+        );
+        // Simulate an admitted in-flight search holding the watermark.
+        let outstanding = searcher.ledger.admit(1, |_| {}).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 1,
+            }],
+        };
+        let result = searcher.search(
+            &NamespaceId("test".into()),
+            &manifest,
+            &mk_query("alpha", 10),
+            None,
+        );
+        assert!(
+            matches!(result, Err(KoshaError::Overloaded(_))),
+            "expected Overloaded, got {result:?}"
+        );
+
+        // Once the outstanding permit releases, the same search is admitted.
+        drop(outstanding);
+        let result = searcher
+            .search(
+                &NamespaceId("test".into()),
+                &manifest,
+                &mk_query("alpha", 10),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.total_hits, 1);
+
+        // Reservations must be fully returned once searches finish.
+        let (_, reserved, active) = ledger_snapshot(&searcher);
+        assert_eq!((reserved, active), (0, 0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_search_larger_than_watermark_still_admitted() {
+        // Anti-starvation: the watermark bounds concurrent pile-up, not
+        // single-query size. A lone search over a namespace bigger than the
+        // watermark must degrade like the pre-ledger code (LRU churn), not
+        // be rejected or wait forever.
+        let dir = std::env::temp_dir().join("kosha-test-admission-lone");
+        let _ = std::fs::remove_dir_all(&dir);
+        mk_segment(&dir, "test", "s1", "alpha");
+        mk_segment(&dir, "test", "s2", "alpha");
+
+        let searcher = Searcher::with_memory_limits(
+            dir.clone(),
+            10,
+            u64::MAX,
+            1, // both segments together vastly exceed this
+            Duration::from_millis(50),
+        );
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![
+                ManifestEntry {
+                    segment_id: SegmentId("s1".into()),
+                    doc_count: 1,
+                },
+                ManifestEntry {
+                    segment_id: SegmentId("s2".into()),
+                    doc_count: 1,
+                },
+            ],
+        };
+        let result = searcher
+            .search(
+                &NamespaceId("test".into()),
+                &manifest,
+                &mk_query("alpha", 10),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.total_hits, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
