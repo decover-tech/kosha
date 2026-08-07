@@ -431,7 +431,12 @@ impl Indexer {
 
             replaced_segments.insert(entry.segment_id.clone());
             let tombstones = state.tombstones.get(&entry.segment_id).cloned();
+            // `?`: same reasoning as compact_namespace_with_options — a doc
+            // that fails to read must abort the rewrite, not be silently
+            // excluded from carried_documents (that would durably drop it
+            // from the namespace once the rewritten segment is published).
             for record in reader.iter_doc_records() {
+                let record = record?;
                 if tombstones
                     .as_ref()
                     .is_some_and(|set| set.contains(&record.doc_seq))
@@ -713,7 +718,15 @@ impl Indexer {
         for entry in &plan.inputs {
             let reader = kosha_segment::SegmentReader::open(ns_dir.join(&entry.segment_id.0))?;
             let ts = tombstones.get(&entry.segment_id);
+            // `?` here is deliberate: a doc that fails to read must abort
+            // the whole compaction, not just be skipped from the merge
+            // output — see `iter_doc_records`'s doc comment for the
+            // incident this silent-drop used to cause. Nothing has been
+            // written to `seg_dir` yet at this point (finalize() hasn't run
+            // and add_document only builds in-memory state), so aborting
+            // here leaves no partial output on disk to clean up.
             for doc_rec in reader.iter_doc_records() {
+                let doc_rec = doc_rec?;
                 if ts.is_some_and(|set| set.contains(&doc_rec.doc_seq)) {
                     continue;
                 }
@@ -1289,7 +1302,10 @@ mod tests {
             dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
         )
         .unwrap();
-        let records: Vec<_> = reader.iter_doc_records().collect();
+        let records: Vec<_> = reader
+            .iter_doc_records()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(records.len(), 2);
         let by_id: HashMap<_, _> = records
             .iter()
@@ -1338,7 +1354,10 @@ mod tests {
             dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
         )
         .unwrap();
-        let records: Vec<_> = reader.iter_doc_records().collect();
+        let records: Vec<_> = reader
+            .iter_doc_records()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].fields[0].value, "second");
 
@@ -1386,7 +1405,10 @@ mod tests {
             dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
         )
         .unwrap();
-        let records: Vec<_> = reader.iter_doc_records().collect();
+        let records: Vec<_> = reader
+            .iter_doc_records()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(records.len(), 2);
         let values: HashMap<_, _> = records
             .iter()
@@ -1432,7 +1454,10 @@ mod tests {
             dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
         )
         .unwrap();
-        let records: Vec<_> = reader.iter_doc_records().collect();
+        let records: Vec<_> = reader
+            .iter_doc_records()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(records.len(), 1);
         let fields: HashMap<_, _> = records[0]
             .fields
@@ -1484,6 +1509,55 @@ mod tests {
 
         // Old segment directories should be deleted.
         assert!(std::fs::read_dir(dir.join("test")).unwrap().count() == 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the production incident this fixes: tiered compaction
+    /// silently lost ~0.24% of a 10M-doc corpus across several rounds, with
+    /// every round reporting success — traced to `iter_doc_records`
+    /// silently dropping any doc whose read failed instead of surfacing an
+    /// error (see that method's doc comment). A doc read failure mid-merge
+    /// must now abort the whole compaction attempt instead of quietly
+    /// publishing a smaller merged segment.
+    #[test]
+    fn compact_aborts_instead_of_silently_losing_docs_on_read_failure() {
+        let dir = std::env::temp_dir().join("kosha-test-compact-read-failure");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ns = NamespaceId("test".into());
+        let idx = Indexer::new(dir.clone()).with_flush_threshold(2);
+
+        for i in 0..4 {
+            idx.index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId(format!("d{}", i + 1)),
+                    fields: vec![Field::text("title", format!("doc number {}", i + 1))],
+                }],
+            )
+            .unwrap();
+        }
+        assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 2);
+
+        // Corrupt one input segment's doc_store.bin (truncate out the last
+        // record's bytes, same technique as kosha-segment's
+        // iter_doc_records_surfaces_read_failures_instead_of_dropping_them)
+        // so a read fails partway through the merge.
+        let seg_id = idx.manifest(&ns).unwrap().segments[0].segment_id.clone();
+        let doc_store_path = dir.join("test").join(&seg_id.0).join("doc_store.bin");
+        let full = std::fs::read(&doc_store_path).unwrap();
+        std::fs::write(&doc_store_path, &full[..full.len() - 5]).unwrap();
+
+        let result = idx.compact_namespace_with_options(&ns, CompactOptions::full());
+        assert!(
+            result.is_err(),
+            "a doc read failure mid-merge must abort compaction loudly, not publish a smaller \
+             merged segment: {result:?}"
+        );
+
+        // Nothing published: the namespace's segment list is untouched.
+        assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
