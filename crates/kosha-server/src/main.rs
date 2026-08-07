@@ -14,9 +14,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(feature = "s3")]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(feature = "s3")]
-use std::sync::Condvar;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// Map of valid API keys → tenant id.
@@ -153,6 +151,15 @@ struct AppState {
     /// `KOSHA_MAX_CONCURRENT_HYDRATIONS`, default 4.
     #[cfg(feature = "s3")]
     hydration_semaphore: Semaphore,
+    /// Ceiling on concurrent `/search` executions
+    /// (`KOSHA_MAX_CONCURRENT_SEARCHES`, default 8). Complements the
+    /// searcher's own live-bytes admission gate (`kosha_query::MemoryLedger`):
+    /// the ledger bounds pinned *segment* memory, while this bounds the
+    /// per-request working memory the ledger can't see (candidate vectors,
+    /// scoring buffers) and keeps rayon from timeslicing across an unbounded
+    /// number of concurrent scoring passes. Thread-per-connection means
+    /// excess searches queue here rather than all running at once.
+    search_semaphore: Semaphore,
     /// `KOSHA_INGEST_HOST` — set only on query-role pods (deployment-query.yaml).
     /// When present, write-path requests this pod receives are forwarded here
     /// instead of executed locally — see `is_write_path`/`forward_to_ingest`.
@@ -181,20 +188,18 @@ struct SegmentFetch {
 
 /// Minimal counting semaphore built on `Mutex`/`Condvar`.
 ///
-/// The hydration path in this file is synchronous from the caller's point of
-/// view — `ensure_segments_local` runs on the request-handling thread and
-/// blocks on `S3Storage::read_many`'s own `Runtime::block_on` — so a blocking
-/// semaphore matches the rest of the file's concurrency model. (`std` has no
-/// built-in semaphore; pulling in `tokio::sync::Semaphore` would mean adding
-/// the `sync` feature to a crate that otherwise only uses tokio internally,
-/// behind a blocking boundary, to run S3 SDK futures.)
-#[cfg(feature = "s3")]
+/// Both users of this (S3 hydration, search admission) are synchronous from
+/// the caller's point of view — they run on the request-handling thread —
+/// so a blocking semaphore matches the rest of the file's concurrency
+/// model. (`std` has no built-in semaphore; pulling in
+/// `tokio::sync::Semaphore` would mean adding the `sync` feature to a crate
+/// that otherwise only uses tokio internally, behind a blocking boundary,
+/// to run S3 SDK futures.)
 struct Semaphore {
     permits: Mutex<usize>,
     cv: Condvar,
 }
 
-#[cfg(feature = "s3")]
 impl Semaphore {
     fn new(permits: usize) -> Self {
         Self {
@@ -215,12 +220,10 @@ impl Semaphore {
     }
 }
 
-#[cfg(feature = "s3")]
 struct SemaphorePermit<'a> {
     sem: &'a Semaphore,
 }
 
-#[cfg(feature = "s3")]
 impl Drop for SemaphorePermit<'_> {
     fn drop(&mut self) {
         let mut permits = self.sem.permits.lock().unwrap();
@@ -378,20 +381,42 @@ impl AppState {
         // shot (nothing to bloom-prune), well under a generous count cap,
         // while still exhausting the container's memory if those segments
         // are individually large.
-        let segment_cache_capacity: Option<usize> = std::env::var("KOSHA_SEGMENT_CACHE_CAPACITY")
+        let segment_cache_capacity: usize = std::env::var("KOSHA_SEGMENT_CACHE_CAPACITY")
             .ok()
-            .and_then(|v| v.parse().ok());
-        let segment_cache_max_bytes: Option<u64> = std::env::var("KOSHA_SEGMENT_CACHE_MAX_BYTES")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(kosha_query::DEFAULT_SEGMENT_CACHE_CAPACITY);
+        let segment_cache_max_bytes: u64 = std::env::var("KOSHA_SEGMENT_CACHE_MAX_BYTES")
             .ok()
-            .and_then(|v| v.parse().ok());
-        let searcher = match (segment_cache_capacity, segment_cache_max_bytes) {
-            (None, None) => Searcher::new(data_dir.clone()),
-            (capacity, max_bytes) => Searcher::with_segment_cache_limits(
-                data_dir.clone(),
-                capacity.unwrap_or(kosha_query::DEFAULT_SEGMENT_CACHE_CAPACITY),
-                max_bytes.unwrap_or(kosha_query::DEFAULT_SEGMENT_CACHE_MAX_BYTES),
-            ),
-        };
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(kosha_query::DEFAULT_SEGMENT_CACHE_MAX_BYTES);
+        // `KOSHA_SEGMENT_LIVE_MAX_BYTES`: watermark for *live* segment
+        // memory — cache-resident plus pinned by in-flight searches. This
+        // is what actually bounds RSS under concurrent broad queries; the
+        // cache budget above only bounds idle memory (see
+        // `kosha_query::MemoryLedger` for the staging OOM this fixes).
+        // Default: 2× the cache budget. Size it below the container memory
+        // limit minus process baseline + working-memory headroom.
+        let segment_live_max_bytes: u64 = std::env::var("KOSHA_SEGMENT_LIVE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                segment_cache_max_bytes.saturating_mul(kosha_query::DEFAULT_LIVE_BYTES_FACTOR)
+            });
+        // `KOSHA_ADMISSION_TIMEOUT_MS`: how long a search waits for live
+        // memory to free up before being shed with HTTP 429 (which
+        // kosha_client's retry/backoff already handles).
+        let admission_timeout = std::env::var("KOSHA_ADMISSION_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(kosha_query::DEFAULT_ADMISSION_TIMEOUT);
+        let searcher = Searcher::with_memory_limits(
+            data_dir.clone(),
+            segment_cache_capacity,
+            segment_cache_max_bytes,
+            segment_live_max_bytes,
+            admission_timeout,
+        );
 
         #[cfg(feature = "s3")]
         let s3_storage = {
@@ -547,6 +572,13 @@ impl AppState {
                     .and_then(|v| v.parse().ok())
                     .filter(|n| *n > 0)
                     .unwrap_or(4),
+            ),
+            search_semaphore: Semaphore::new(
+                std::env::var("KOSHA_MAX_CONCURRENT_SEARCHES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or(8),
             ),
             ingest_host,
             write_http_client,
@@ -1681,12 +1713,16 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         }
     }
 
+    // Bound concurrent scoring passes — see `AppState::search_semaphore`.
+    // Acquired after hydration (which has its own ceiling) so a search
+    // waiting on S3 doesn't also hold a scoring slot.
+    let _slot = state.search_semaphore.acquire();
     match state
         .searcher
         .search(&ns, &manifest, &query, tombstones.as_ref())
     {
         Ok(result) => json_ok(&result),
-        Err(e) => json_error(500, &format!("search error: {e}")),
+        Err(e) => search_error_response(&e),
     }
 }
 
@@ -1758,12 +1794,16 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         }
     }
 
+    // Bound concurrent scoring passes — see `AppState::search_semaphore`.
+    // Acquired after hydration (which has its own ceiling) so a search
+    // waiting on S3 doesn't also hold a scoring slot.
+    let _slot = state.search_semaphore.acquire();
     match state
         .searcher
         .search(&ns, &manifest, &query, tombstones.as_ref())
     {
         Ok(result) => json_ok(&result),
-        Err(e) => json_error(500, &format!("search error: {e}")),
+        Err(e) => search_error_response(&e),
     }
 }
 
@@ -2273,11 +2313,22 @@ fn json_ok<T: serde::Serialize>(value: &T) -> String {
     )
 }
 
+/// Map a search failure onto the right HTTP status: load-shedding
+/// (`KoshaError::Overloaded`, see `kosha_query::MemoryLedger`) is a
+/// transient 429 the client should retry with backoff, not a 500.
+fn search_error_response(e: &KoshaError) -> String {
+    match e {
+        KoshaError::Overloaded(_) => json_error(429, &format!("search overloaded: {e}")),
+        _ => json_error(500, &format!("search error: {e}")),
+    }
+}
+
 fn json_error(status_code: u16, message: &str) -> String {
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",
         404 => "404 Not Found",
+        429 => "429 Too Many Requests",
         500 => "500 Internal Server Error",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",

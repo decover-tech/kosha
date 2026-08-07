@@ -13,11 +13,18 @@
 # observe): one cold /search hydrating paragraph_index_hnsw's full 258
 # segments alone costs ~6.5GiB RSS. 8Gi left ~1.5GiB for everything else
 # (process baseline, other namespaces' cached segments, per-request
-# working memory under concurrency) — not enough margin. 16Gi + the
-# KOSHA_SEGMENT_CACHE_MAX_BYTES override below (well under the container
-# limit, so the cache's own LRU eviction is what bites first, not the OOM
-# killer) is this round's fix; revisit with more load-test data if the
-# corpus grows.
+# working memory under concurrency) — not enough margin.
+#
+# The cache budget alone then proved insufficient under *concurrent* broad
+# queries: the cache bounds idle memory, but segments pinned by in-flight
+# requests' Arc references are unevictable, so N overlapping full-namespace
+# searches could pin N × cache-budget of real memory past any configured
+# number (pods kept OOMKilling at 16Gi, needed an emergency live bump to
+# 24Gi). The durable fix is the live-bytes admission gate in kosha-query
+# (`MemoryLedger`): KOSHA_SEGMENT_LIVE_MAX_BYTES below caps cache-resident
+# + request-pinned segment memory together, queueing (then 429-shedding)
+# searches that would exceed it — so 16Gi is enough again and the 24Gi
+# emergency value is deliberately NOT carried forward.
 #
 # imagePullPolicy: Always for the same reason as deployment-resources-patch.yaml
 # — staging's floating :main tag means kubelet's tag-based image cache check
@@ -60,6 +67,17 @@ spec:
             # ephemeral-storage limit (see comment above) — the cache's own
             # LRU eviction is what should bite first, not a pod eviction.
             - name: KOSHA_CACHE_MAX_BYTES
+              value: "12884901888"
+            # Live-bytes watermark (cache-resident + pinned by in-flight
+            # searches — see kosha_query::MemoryLedger). Must be set
+            # explicitly here: the code default is 2× the cache budget
+            # (20GiB), which exceeds the 16Gi container limit. 12GiB leaves
+            # ~4GiB of the limit for process baseline + working memory of
+            # the (KOSHA_MAX_CONCURRENT_SEARCHES, default 8) concurrent
+            # scoring passes. Same 12GiB figure as KOSHA_CACHE_MAX_BYTES
+            # above by coincidence, not by coupling — that one bounds disk
+            # (emptyDir/ephemeral-storage), this one bounds RAM.
+            - name: KOSHA_SEGMENT_LIVE_MAX_BYTES
               value: "12884901888"
           resources:
             requests:
