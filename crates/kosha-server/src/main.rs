@@ -126,6 +126,12 @@ struct AppState {
     /// (`KOSHA_HYDRATE_CONCURRENCY`, default 16). See `ensure_segments_local`.
     #[cfg(feature = "s3")]
     hydrate_concurrency: usize,
+    /// Byte ceiling on how much a single hydration batch will queue for
+    /// concurrent S3 download at once (`KOSHA_HYDRATE_BYTE_BUDGET`, default
+    /// 1GiB). Unlike `hydrate_concurrency` (file count), this bounds actual
+    /// memory — see `hydrate_from_s3_budgeted`/`chunk_by_byte_budget`.
+    #[cfg(feature = "s3")]
+    hydrate_byte_budget: u64,
     /// Segments currently being hydrated from S3, keyed by local segment
     /// path. Guards against every concurrent request against a cold
     /// namespace independently re-fetching the same segments — see
@@ -292,6 +298,44 @@ fn wait_for(waiting: &[Arc<SegmentFetch>]) {
     }
 }
 
+/// Greedily group `(path, size)` pairs into batches whose total projected
+/// size doesn't exceed `budget`, preserving input order — used by
+/// `hydrate_from_s3_budgeted` so one hydration request can't queue more
+/// than `budget` bytes of concurrent S3 fetches at once.
+///
+/// A single file larger than `budget` still gets its own (necessarily
+/// over-budget) chunk rather than being starved forever: the budget bounds
+/// how much *extra* concurrent work piles up around it, not any individual
+/// file's unavoidable size. An empty `files` returns no chunks.
+#[cfg(feature = "s3")]
+fn chunk_by_byte_budget(files: &[(String, u64)], budget: u64) -> Vec<Vec<(String, u64)>> {
+    let mut chunks: Vec<Vec<(String, u64)>> = Vec::new();
+    let mut current: Vec<(String, u64)> = Vec::new();
+    let mut current_size: u64 = 0;
+
+    for (path, size) in files {
+        if !current.is_empty() && current_size.saturating_add(*size) > budget {
+            chunks.push(std::mem::take(&mut current));
+            current_size = 0;
+        }
+        current_size = current_size.saturating_add(*size);
+        current.push((path.clone(), *size));
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Whether a segment file named `name` belongs in a hydration fetch list,
+/// given whether the caller needs vectors. Factored out of
+/// `ensure_segments_local` so the "skip vector.idx" rule has a direct unit
+/// test instead of needing a real `S3Storage` to exercise.
+#[cfg(feature = "s3")]
+fn hydration_wants_file(name: &str, needs_vectors: bool) -> bool {
+    needs_vectors || name != "vector.idx"
+}
+
 impl AppState {
     fn new(data_dir: PathBuf) -> Self {
         std::fs::create_dir_all(&data_dir).ok();
@@ -313,7 +357,19 @@ impl AppState {
             .ok()
             .and_then(|v| v.parse().ok());
         let cache = Cache::with_max_bytes(data_dir.clone(), cache_max_bytes);
-        let indexer = Indexer::new(data_dir.clone());
+        // `KOSHA_FLUSH_THRESHOLD`: docs buffered per namespace before an
+        // auto-flush writes a new immutable segment (kosha-write's
+        // Indexer::index_documents). Default (1000) is tuned for steady-state
+        // production write volume, not bulk backfills — at that threshold a
+        // 10M-doc load produces ~10k segments before any compaction. Bulk
+        // loaders (and migrate.rs's offline --flush-docs, default 20000)
+        // should raise this so fewer, larger segments get created.
+        let flush_threshold: usize = std::env::var("KOSHA_FLUSH_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1000);
+        let indexer = Indexer::new(data_dir.clone()).with_flush_threshold(flush_threshold);
 
         // `KOSHA_SEGMENT_CACHE_CAPACITY` / `KOSHA_SEGMENT_CACHE_MAX_BYTES`:
         // how many parsed segments the searcher keeps resident in memory
@@ -490,6 +546,17 @@ impl AppState {
                 .and_then(|v| v.parse().ok())
                 .filter(|n| *n > 0)
                 .unwrap_or(16),
+            // 1GiB default: with the default KOSHA_MAX_CONCURRENT_HYDRATIONS
+            // (4), worst case is 4 owner batches × 1GiB = 4GiB of hydration
+            // buffers at once — comfortable inside the query pod's 16Gi
+            // limit (deployment-query-resources-patch.yaml) alongside
+            // KOSHA_SEGMENT_CACHE_MAX_BYTES and process baseline.
+            #[cfg(feature = "s3")]
+            hydrate_byte_budget: std::env::var("KOSHA_HYDRATE_BYTE_BUDGET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(1024 * 1024 * 1024),
             #[cfg(feature = "s3")]
             in_flight_segments: Mutex::new(HashMap::new()),
             // Each hydration operation can itself fan out up to
@@ -643,8 +710,20 @@ impl AppState {
     /// recheck the owner uses — so a failed fetch is visible to waiters too,
     /// not silently treated as success. `hydration_semaphore` additionally
     /// bounds how many *owner* hydration batches run at once, server-wide.
+    ///
+    /// `needs_vectors` gates whether each segment's `vector.idx` is fetched
+    /// at all. It's deliberately excluded from `REQUIRED_SEGMENT_FILES`
+    /// (lexical queries never load it — see that const's doc comment), but
+    /// until now `ensure_segments_local` still fetched it unconditionally
+    /// anyway, because it just downloaded whatever S3 listed for each
+    /// segment. For a vector-bearing namespace `vector.idx` is the largest
+    /// file per segment by a wide margin, so every non-knn search — which
+    /// is all current traffic — was paying to hydrate a file it was
+    /// guaranteed never to open. Pass `true` from any caller that must
+    /// preserve a segment's full fidelity (index/replace/compact/admin
+    /// rewrite paths); the search path passes `query.knn.is_some()`.
     #[cfg(feature = "s3")]
-    fn ensure_segments_local(&self, seg_paths: &[PathBuf]) -> Vec<String> {
+    fn ensure_segments_local(&self, seg_paths: &[PathBuf], needs_vectors: bool) -> Vec<String> {
         let Some(ref s3) = self.s3_storage else {
             return Vec::new();
         };
@@ -661,15 +740,20 @@ impl AppState {
             // waiters below get to run.
             let _permit = self.hydration_semaphore.acquire();
 
-            let mut logical_paths: Vec<String> = Vec::new();
+            let mut logical_paths: Vec<(String, u64)> = Vec::new();
             for (seg_path, _) in &owned {
                 let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
                     continue;
                 };
                 let s3_prefix = rel_path.to_string_lossy().into_owned();
-                match s3.list(&s3_prefix) {
+                match s3.list_with_sizes(&s3_prefix) {
                     Ok(files) if !files.is_empty() => {
-                        logical_paths.extend(files.iter().map(|f| format!("{s3_prefix}/{f}")));
+                        logical_paths.extend(
+                            files
+                                .into_iter()
+                                .filter(|(name, _size)| hydration_wants_file(name, needs_vectors))
+                                .map(|(name, size)| (format!("{s3_prefix}/{name}"), size)),
+                        );
                     }
                     Ok(_) => {
                         eprintln!("WARN: no S3 objects found for segment {s3_prefix}");
@@ -682,21 +766,13 @@ impl AppState {
 
             if !logical_paths.is_empty() {
                 println!(
-                    "cache miss: hydrating {} file(s) across {} segment(s) from S3 (fan-out={})",
+                    "cache miss: hydrating {} file(s) across {} segment(s) from S3 (fan-out={}, byte-budget={})",
                     logical_paths.len(),
                     owned.len(),
-                    self.hydrate_concurrency
+                    self.hydrate_concurrency,
+                    self.hydrate_byte_budget
                 );
-                for (path, result) in s3.read_many(&logical_paths, self.hydrate_concurrency) {
-                    match result {
-                        // read_many already persisted the bytes to disk (same
-                        // root dir as `self.cache`); just tell the cache's
-                        // size/LRU accounting about the new file instead of
-                        // re-writing it.
-                        Ok(_) => self.cache.note_external_write(&path),
-                        Err(e) => eprintln!("WARN: S3 download failed for {path}: {e}"),
-                    }
-                }
+                self.hydrate_from_s3_budgeted(s3, &logical_paths);
             }
 
             drop(_permit);
@@ -711,6 +787,38 @@ impl AppState {
             .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
             .map(|p| p.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs from
+    /// S3, chunked so no single `read_many` call is ever asked to hold more
+    /// than `hydrate_byte_budget` bytes' worth of files concurrently
+    /// in-flight.
+    ///
+    /// `hydrate_concurrency` alone bounds *file count* in flight, not
+    /// memory — a batch of `hydrate_concurrency` (default 16) large HNSW
+    /// vector files is a very different footprint than 16 footer.jsons, and
+    /// nothing before this compared a batch's actual byte size against the
+    /// pod's memory before firing it off. Sizes come from `list_with_sizes`'
+    /// S3-reported object sizes, projected ahead of any fetch — this is the
+    /// one dimension none of the other hydration knobs
+    /// (`KOSHA_HYDRATE_CONCURRENCY`, `KOSHA_MAX_CONCURRENT_HYDRATIONS`) or
+    /// cache knobs (`KOSHA_CACHE_MAX_BYTES`, `KOSHA_SEGMENT_CACHE_MAX_BYTES`)
+    /// bound.
+    #[cfg(feature = "s3")]
+    fn hydrate_from_s3_budgeted(&self, s3: &s3_storage::S3Storage, files: &[(String, u64)]) {
+        for chunk in chunk_by_byte_budget(files, self.hydrate_byte_budget) {
+            let paths: Vec<String> = chunk.into_iter().map(|(path, _size)| path).collect();
+            for (path, result) in s3.read_many(&paths, self.hydrate_concurrency) {
+                match result {
+                    // read_many already persisted the bytes to disk (same
+                    // root dir as `self.cache`); just tell the cache's
+                    // size/LRU accounting about the new file instead of
+                    // re-writing it.
+                    Ok(()) => self.cache.note_external_write(&path),
+                    Err(e) => eprintln!("WARN: S3 download failed for {path}: {e}"),
+                }
+            }
+        }
     }
 
     /// Ensure one named file (e.g. `footer.json`) is local for every segment
@@ -799,7 +907,10 @@ impl AppState {
             }
             to_hydrate.push(seg_path);
         }
-        self.ensure_segments_local(&to_hydrate)
+        // Only a knn query ever opens a segment's vector.idx (see
+        // REQUIRED_SEGMENT_FILES's doc comment) — every other query is
+        // lexical-only, so there's no reason to pay for hydrating it.
+        self.ensure_segments_local(&to_hydrate, query.knn.is_some())
     }
 
     /// Upload a single file from a local segment dir to S3.
@@ -1260,7 +1371,11 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
                 .iter()
                 .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
                 .collect();
-            state.ensure_segments_local(&paths);
+            // Rewrite/lookup paths must see a segment's full fidelity,
+            // including vectors — unlike the search path, there's no
+            // per-call signal here for whether vectors matter, so always
+            // fetch them.
+            state.ensure_segments_local(&paths, true);
         }
     }
 
@@ -1331,7 +1446,11 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
                         .join(&entry.segment_id.0)
                 })
                 .collect();
-            state.ensure_segments_local(&paths);
+            // Rewrite/lookup paths must see a segment's full fidelity,
+            // including vectors — unlike the search path, there's no
+            // per-call signal here for whether vectors matter, so always
+            // fetch them.
+            state.ensure_segments_local(&paths, true);
         }
     }
 
@@ -1389,7 +1508,11 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
                 .iter()
                 .map(|entry| state.data_dir.join(&namespace.0).join(&entry.segment_id.0))
                 .collect();
-            state.ensure_segments_local(&paths);
+            // Rewrite/lookup paths must see a segment's full fidelity,
+            // including vectors — unlike the search path, there's no
+            // per-call signal here for whether vectors matter, so always
+            // fetch them.
+            state.ensure_segments_local(&paths, true);
         }
     }
 
@@ -1828,7 +1951,8 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
         .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
         .collect();
     #[cfg(feature = "s3")]
-    state.ensure_segments_local(&seg_paths);
+    // Admin routes rewrite or merge segments — must preserve vectors.
+    state.ensure_segments_local(&seg_paths, true);
 
     let mut rebuilt = 0usize;
     let mut errors = Vec::new();
@@ -1905,7 +2029,8 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
         .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
         .collect();
     #[cfg(feature = "s3")]
-    state.ensure_segments_local(&seg_paths);
+    // Admin routes rewrite or merge segments — must preserve vectors.
+    state.ensure_segments_local(&seg_paths, true);
 
     let mut backfilled = 0usize;
     let mut errors = Vec::new();
@@ -2008,7 +2133,8 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
             .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
             .collect();
         #[cfg(feature = "s3")]
-        state.ensure_segments_local(&seg_paths);
+        // Admin routes rewrite or merge segments — must preserve vectors.
+        state.ensure_segments_local(&seg_paths, true);
         // compact_namespace silently skips (and keeps unmerged) any segment
         // that isn't present locally after this — safe, but worth surfacing
         // so a caller knows compaction was partial.
@@ -2316,6 +2442,74 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn hydration_wants_file_skips_vector_idx_unless_needed() {
+        assert!(
+            !hydration_wants_file("vector.idx", false),
+            "a query that doesn't need vectors must not fetch vector.idx"
+        );
+        assert!(
+            hydration_wants_file("vector.idx", true),
+            "a knn query must still fetch vector.idx"
+        );
+        for f in [
+            "footer.json",
+            "doc_store.bin",
+            "inverted.idx",
+            "filters.bin",
+        ] {
+            assert!(
+                hydration_wants_file(f, false),
+                "{f} must always be fetched regardless of needs_vectors"
+            );
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn chunk_by_byte_budget_keeps_each_chunk_at_or_under_budget() {
+        let files = vec![
+            ("a".to_string(), 40u64),
+            ("b".to_string(), 40u64),
+            ("c".to_string(), 40u64),
+            ("d".to_string(), 10u64),
+        ];
+        let chunks = chunk_by_byte_budget(&files, 100);
+
+        // a+b = 80 (fits), +c would be 120 (over budget) so c starts a new
+        // chunk; c+d = 50 (fits).
+        assert_eq!(
+            chunks,
+            vec![
+                vec![("a".to_string(), 40), ("b".to_string(), 40)],
+                vec![("c".to_string(), 40), ("d".to_string(), 10)],
+            ]
+        );
+        for chunk in &chunks {
+            let total: u64 = chunk.iter().map(|(_, size)| size).sum();
+            assert!(total <= 100, "chunk total {total} exceeded budget");
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn chunk_by_byte_budget_never_starves_a_single_oversized_file() {
+        let files = vec![("huge".to_string(), 500u64)];
+        let chunks = chunk_by_byte_budget(&files, 100);
+        assert_eq!(
+            chunks,
+            vec![vec![("huge".to_string(), 500)]],
+            "a file bigger than the whole budget must still get its own chunk, not be dropped"
+        );
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn chunk_by_byte_budget_empty_input_yields_no_chunks() {
+        assert!(chunk_by_byte_budget(&[], 100).is_empty());
     }
 
     #[cfg(feature = "s3")]
