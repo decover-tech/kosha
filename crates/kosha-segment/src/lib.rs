@@ -618,7 +618,6 @@ pub struct DocMetaRef<'a> {
 }
 
 pub struct SegmentReader {
-    #[allow(dead_code)]
     segment_dir: PathBuf,
     footer: Footer,
     doc_store: DocStoreAccess,
@@ -748,8 +747,34 @@ impl SegmentReader {
     /// rather than requiring the whole segment materialized up front — use
     /// this instead of collecting into a `Vec<DocRecord>` when processing
     /// every document in a segment (e.g. compaction).
-    pub fn iter_doc_records(&self) -> impl Iterator<Item = DocRecord> + '_ {
-        (0..self.doc_count()).filter_map(move |seq| self.doc_record_full(seq).ok().flatten())
+    ///
+    /// Yields `Err` for any `doc_seq` in `0..doc_count()` that fails to
+    /// produce a record — a read/parse error, or (shouldn't happen, but
+    /// checked rather than assumed) `doc_count` disagreeing with the actual
+    /// number of stored records.
+    ///
+    /// Bug history: this used to be `impl Iterator<Item = DocRecord>` that
+    /// silently `filter_map`'d any such failure away. Compaction
+    /// (`kosha-write::compact_namespace_with_options`) and `/replace`
+    /// (`rewrite_documents`) both drive this to rebuild a segment from every
+    /// document in their inputs — silently dropping a doc here meant it
+    /// just didn't exist in the merge/rewrite output, with no error and no
+    /// log line. That's the mechanism behind a real production incident:
+    /// ~0.24% of a 10M-doc benchmark corpus vanished across several tiered
+    /// compaction rounds, with every round reporting success. Every caller
+    /// must now propagate `Err` (e.g. via `?`) instead of continuing past
+    /// it, so a read failure aborts the operation loudly rather than
+    /// quietly shrinking the corpus.
+    pub fn iter_doc_records(&self) -> impl Iterator<Item = Result<DocRecord, KoshaError>> + '_ {
+        (0..self.doc_count()).map(move |seq| match self.doc_record_full(seq) {
+            Ok(Some(rec)) => Ok(rec),
+            Ok(None) => Err(KoshaError::NotFound(format!(
+                "doc_seq {seq} missing from doc_store in segment {:?} (doc_count={})",
+                self.segment_dir,
+                self.doc_count()
+            ))),
+            Err(e) => Err(e),
+        })
     }
 
     pub fn contains_term(&self, term: &str) -> bool {
@@ -1485,6 +1510,61 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].positions, vec![0]);
         assert_eq!(p[1].positions, vec![0, 3]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the bug this fixes: `iter_doc_records` used to
+    /// silently drop any `doc_seq` whose read failed instead of surfacing
+    /// it — see that method's doc comment for the incident this caused
+    /// (compaction quietly losing ~0.24% of a 10M-doc corpus, no crash, no
+    /// error). Truncating `doc_store.bin` out from under an intact
+    /// `doc_store.offsets` reproduces a read failure for the last document
+    /// without touching anything else.
+    #[test]
+    fn iter_doc_records_surfaces_read_failures_instead_of_dropping_them() {
+        let dir = std::env::temp_dir().join("kosha-test-iter-doc-records-error");
+        let _ = fs::remove_dir_all(&dir);
+        let seg_id = SegmentId("test".into());
+        let mut w = SegmentWriter::new(seg_id.clone(), dir.clone());
+        for i in 0..5 {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![Field::text("t", format!("doc number {i}"))],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+
+        // doc_store.offsets (built alongside doc_store.bin, still intact)
+        // still claims a byte range for the last document that no longer
+        // exists once doc_store.bin is truncated — doc_record_full's
+        // read_exact for that doc_seq must now fail.
+        let doc_store_path = dir.join("doc_store.bin");
+        let full = fs::read(&doc_store_path).unwrap();
+        fs::write(&doc_store_path, &full[..full.len() - 5]).unwrap();
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert_eq!(
+            r.doc_count(),
+            5,
+            "footer/offsets are untouched by the truncation"
+        );
+
+        let results: Vec<_> = r.iter_doc_records().collect();
+        assert_eq!(
+            results.len(),
+            5,
+            "the iterator must still produce one item per doc_seq — Err, not a gap"
+        );
+        assert!(
+            results.iter().any(|res| res.is_err()),
+            "the doc whose bytes were truncated away must surface as Err"
+        );
+        assert_eq!(
+            results.iter().filter(|res| res.is_ok()).count(),
+            4,
+            "every doc_seq unaffected by the truncation must still read fine"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
