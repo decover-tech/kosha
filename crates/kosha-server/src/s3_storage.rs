@@ -286,11 +286,21 @@ impl S3Storage {
     ///
     /// Returns one `(logical_path, result)` pair per input path, in
     /// completion order (not input order).
+    ///
+    /// Callers only ever need success/failure plus the file `fetch_one`
+    /// leaves on disk — never the bytes themselves (`ensure_segments_local`
+    /// just tells `Cache` a file landed; nothing here parses a segment).
+    /// Returning `Result<(), _>` instead of `Result<Vec<u8>, _>` avoids two
+    /// costs that scaled with the batch: the extra copy inside `fetch_one`
+    /// just to hand back an owned `Vec<u8>` nobody read, and the resulting
+    /// `results` vec holding every fetched file's full bytes in memory at
+    /// once for the batch's whole lifetime (this function doesn't return
+    /// until every spawned fetch has completed).
     pub fn read_many(
         &self,
         paths: &[String],
         max_concurrent: usize,
-    ) -> Vec<(String, Result<Vec<u8>, KoshaError>)> {
+    ) -> Vec<(String, Result<(), KoshaError>)> {
         if paths.is_empty() {
             return Vec::new();
         }
@@ -304,7 +314,7 @@ impl S3Storage {
         self.rt.block_on(async move {
             let mut set = tokio::task::JoinSet::new();
             let spawn_next =
-                |set: &mut tokio::task::JoinSet<(String, Result<Vec<u8>, KoshaError>)>,
+                |set: &mut tokio::task::JoinSet<(String, Result<(), KoshaError>)>,
                  pending: &mut std::collections::VecDeque<String>| {
                     let Some(path) = pending.pop_front() else {
                         return;
@@ -366,8 +376,11 @@ impl S3Storage {
         Ok(data)
     }
 
-    /// List object key basenames under a logical (unprefixed) directory path.
-    fn list_remote(&self, path: &str) -> Result<Vec<String>, KoshaError> {
+    /// List object key basenames (and sizes) under a logical (unprefixed)
+    /// directory path directly from S3, no local fallback — see the public
+    /// `list_with_sizes`, the only caller. Sizes are 0 if S3 didn't report
+    /// one (`Object::size()` is optional per the SDK).
+    fn list_remote_with_sizes(&self, path: &str) -> Result<Vec<(String, u64)>, KoshaError> {
         let mut prefix = self.s3_key(path);
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
@@ -385,7 +398,7 @@ impl S3Storage {
                 .await
                 .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
 
-            let mut names = Vec::new();
+            let mut out = Vec::new();
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
                     let relative = key
@@ -394,28 +407,60 @@ impl S3Storage {
                         .trim_start_matches('/');
                     // Only immediate children (files), not nested paths.
                     if !relative.is_empty() && !relative.contains('/') {
-                        names.push(relative.to_string());
+                        let size = obj.size().unwrap_or(0).max(0) as u64;
+                        out.push((relative.to_string(), size));
                     }
                 }
             }
-            Ok(names)
+            Ok(out)
         })
+    }
+
+    /// Like the `StorageBackend::list` trait method (same remote-first,
+    /// local-fallback behavior for cold nodes), but also returns each
+    /// entry's size in bytes — see `list_remote_with_sizes`.
+    ///
+    /// Local-fallback entries report size 0, which is correct for
+    /// budgeting purposes even though it's not their real on-disk size:
+    /// the fallback only fires when S3 has nothing to list, meaning these
+    /// files are already present locally and `fetch_one` will skip
+    /// downloading them entirely (see its own local-existence check) — so
+    /// their actual *fetch* cost really is zero.
+    ///
+    /// Used by `ensure_segments_local` to project a hydration batch's total
+    /// size before fetching anything, so the batch can be chunked to a byte
+    /// budget instead of firing off every file at once regardless of size.
+    pub fn list_with_sizes(&self, path: &str) -> Result<Vec<(String, u64)>, KoshaError> {
+        // Prefer remote listing so cold nodes (empty local disk) can discover
+        // segment files after a restart. Fall back to local on list failure.
+        match self.list_remote_with_sizes(path) {
+            Ok(entries) if !entries.is_empty() => Ok(entries),
+            Ok(_) => local_list_with_zero_sizes(&self.local, path),
+            Err(e) => {
+                eprintln!("WARN: S3 list failed for '{path}': {e}; falling back to local");
+                local_list_with_zero_sizes(&self.local, path)
+            }
+        }
     }
 }
 
 /// Fetch one logical path for [`S3Storage::read_many`]: serve from local
-/// disk if already present, otherwise GET from S3 and persist before
-/// returning the bytes.
+/// disk if already present, otherwise GET from S3 and persist it there.
+///
+/// Returns `()`, not the fetched bytes — every caller of `read_many` only
+/// ever wants "is this file on disk now," so a cache hit here is a pure
+/// existence check (no read at all), and a cache miss doesn't pay for an
+/// extra copy into an owned `Vec<u8>` nobody was going to read either.
 async fn fetch_one(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
     local_root: &Path,
     path: &str,
-) -> Result<Vec<u8>, KoshaError> {
+) -> Result<(), KoshaError> {
     let local_path = local_root.join(path);
     if local_path.exists() {
-        return tokio::fs::read(&local_path).await.map_err(KoshaError::Io);
+        return Ok(());
     }
 
     let s3_key = join_s3_key(prefix, path);
@@ -441,7 +486,7 @@ async fn fetch_one(
         .await
         .map_err(KoshaError::Io)?;
 
-    Ok(bytes.to_vec())
+    Ok(())
 }
 
 impl StorageBackend for S3Storage {
@@ -484,21 +529,27 @@ impl StorageBackend for S3Storage {
     }
 
     fn list(&self, path: &str) -> Result<Vec<String>, KoshaError> {
-        // Prefer remote listing so cold nodes (empty local disk) can discover
-        // segment files after a restart. Fall back to local on list failure.
-        match self.list_remote(path) {
-            Ok(names) if !names.is_empty() => Ok(names),
-            Ok(_) => self.local.list(path),
-            Err(e) => {
-                eprintln!("WARN: S3 list failed for '{path}': {e}; falling back to local");
-                self.local.list(path)
-            }
-        }
+        Ok(self
+            .list_with_sizes(path)?
+            .into_iter()
+            .map(|(name, _size)| name)
+            .collect())
     }
 
     fn create_dir_all(&self, path: &str) -> Result<(), KoshaError> {
         self.local.create_dir_all(path)
     }
+}
+
+fn local_list_with_zero_sizes(
+    local: &LocalStorage,
+    path: &str,
+) -> Result<Vec<(String, u64)>, KoshaError> {
+    Ok(local
+        .list(path)?
+        .into_iter()
+        .map(|name| (name, 0))
+        .collect())
 }
 
 #[cfg(test)]
