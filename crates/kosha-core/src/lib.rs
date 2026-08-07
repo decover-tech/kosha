@@ -133,7 +133,7 @@ pub struct Document {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Term(pub String);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Posting {
     pub doc_id: u32,
     pub term_frequency: u32,
@@ -525,14 +525,19 @@ pub struct Footer {
     /// assume that sidecar is present or trustworthy even if it happens to
     /// exist on disk. `1` means the writer emitted `doc_store.offsets`
     /// alongside `doc_store.bin`, enabling lazy per-document loading instead
-    /// of parsing the whole segment into memory to open it.
+    /// of parsing the whole segment into memory to open it. `2` means
+    /// `inverted.idx` is in the v2 table-of-contents layout
+    /// (`kosha_segment::LazyInvertedIndex`), read lazily with zero parsing
+    /// at open. Informational for `inverted.idx` — that file self-describes
+    /// via a magic prefix, and readers fall back to the v1 stream parse for
+    /// older segments regardless of this number.
     #[serde(default)]
     pub format_version: u32,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
 /// `Footer::format_version`.
-pub const SEGMENT_FORMAT_VERSION: u32 = 1;
+pub const SEGMENT_FORMAT_VERSION: u32 = 2;
 
 // ─── Bloom filter (segment pruning) ────────────────────────────────────────
 

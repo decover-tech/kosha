@@ -230,8 +230,12 @@ fn bench_scoring_profile(c: &mut Criterion) {
         reader.bm25_params().clone(),
     );
 
-    let contract = reader.postings("contract").expect("contract postings");
-    let dispute = reader.postings("dispute").expect("dispute postings");
+    // `postings()` returns a `Cow` since the lazy inverted-index change —
+    // bind the (possibly owned) data once, then use plain slices below.
+    let contract_data = reader.postings("contract").expect("contract postings");
+    let dispute_data = reader.postings("dispute").expect("dispute postings");
+    let contract: &[Posting] = &contract_data;
+    let dispute: &[Posting] = &dispute_data;
     assert!(contract.len() >= HIT_COUNT);
     assert!(dispute.len() >= HIT_COUNT);
 
