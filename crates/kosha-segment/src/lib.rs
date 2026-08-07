@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -207,27 +208,58 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// Write `inverted.idx` in the v2 table-of-contents layout (see
+    /// [`LazyInvertedIndex`] for the format and why it exists). The legacy
+    /// v1 stream layout is no longer written; readers keep a fallback parse
+    /// for segments already on disk/S3.
     fn write_inverted_index(&self) -> Result<(), KoshaError> {
         let mut terms: Vec<&String> = self.inverted_index.keys().collect();
+        // Sorted term order is load-bearing: the reader binary-searches the
+        // term table (see `LazyInvertedIndex::find`).
         terms.sort();
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&(terms.len() as u32).to_le_bytes());
-        for term_str in terms {
-            let postings = &self.inverted_index[term_str];
-            let term_bytes = term_str.as_bytes();
-            buf.extend_from_slice(&(term_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(term_bytes);
-            buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
+
+        // Serialize the string pool and postings region first, recording
+        // each term's spans, so the table can be emitted with absolute file
+        // offsets (no region math at decode time).
+        let mut pool: Vec<u8> = Vec::new();
+        let mut postings_buf: Vec<u8> = Vec::new();
+        // (term_off_in_pool, term_len, postings_off_in_region, postings_len)
+        let mut entries: Vec<(u64, u32, u64, u32)> = Vec::with_capacity(terms.len());
+        for term_str in &terms {
+            let postings = &self.inverted_index[*term_str];
+            let term_off = pool.len() as u64;
+            pool.extend_from_slice(term_str.as_bytes());
+            let p_off = postings_buf.len() as u64;
+            postings_buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
             for posting in postings {
-                buf.extend_from_slice(&posting.doc_id.to_le_bytes());
-                buf.extend_from_slice(&posting.term_frequency.to_le_bytes());
-                buf.extend_from_slice(&(posting.positions.len() as u32).to_le_bytes());
+                postings_buf.extend_from_slice(&posting.doc_id.to_le_bytes());
+                postings_buf.extend_from_slice(&posting.term_frequency.to_le_bytes());
+                postings_buf.extend_from_slice(&(posting.positions.len() as u32).to_le_bytes());
                 for &pos in &posting.positions {
-                    buf.extend_from_slice(&pos.to_le_bytes());
+                    postings_buf.extend_from_slice(&pos.to_le_bytes());
                 }
             }
+            let p_len = (postings_buf.len() as u64 - p_off) as u32;
+            entries.push((term_off, term_str.len() as u32, p_off, p_len));
         }
+
+        let table_len = entries.len() as u64 * INVERTED_TABLE_ENTRY_LEN as u64;
+        let pool_base = INVERTED_HEADER_LEN as u64 + table_len;
+        let postings_base = pool_base + pool.len() as u64;
+
+        let mut buf = Vec::with_capacity(postings_base as usize + postings_buf.len());
+        buf.extend_from_slice(&INVERTED_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&INVERTED_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        for (term_off, term_len, p_off, p_len) in entries {
+            buf.extend_from_slice(&(pool_base + term_off).to_le_bytes());
+            buf.extend_from_slice(&term_len.to_le_bytes());
+            buf.extend_from_slice(&(postings_base + p_off).to_le_bytes());
+            buf.extend_from_slice(&p_len.to_le_bytes());
+        }
+        buf.extend_from_slice(&pool);
+        buf.extend_from_slice(&postings_buf);
         self.backend.write("inverted.idx", &buf)?;
         Ok(())
     }
@@ -335,6 +367,219 @@ impl SegmentWriter {
     }
 }
 
+// ─── Inverted index format (v2: lazy, zero-parse-at-open) ───────────────────
+
+/// Magic prefix of a v2 `inverted.idx` ("KINV" bytes, little-endian u32).
+/// A legacy (v1) file starts with its term count instead — colliding with
+/// this value would require ~1.26 billion distinct terms in one segment, so
+/// the magic doubles as the format discriminator for the read-side fallback.
+pub const INVERTED_MAGIC: u32 = u32::from_le_bytes(*b"KINV");
+/// Current version stamped after the magic. Bump on any layout change.
+pub const INVERTED_VERSION: u32 = 2;
+/// magic + version + term_count + reserved, 4 bytes each.
+const INVERTED_HEADER_LEN: usize = 16;
+/// term_off u64 + term_len u32 + postings_off u64 + postings_len u32.
+const INVERTED_TABLE_ENTRY_LEN: usize = 24;
+
+/// v2 `inverted.idx` layout — a table of contents instead of a stream:
+///
+/// ```text
+/// header   magic:u32  version:u32  term_count:u32  reserved:u32
+/// table    term_count × { term_off:u64  term_len:u32
+///                          postings_off:u64  postings_len:u32 }
+/// pool     all term strings back to back, in sorted term order
+/// postings per term: count:u32, then count × { doc_id:u32  tf:u32
+///                          npos:u32  npos × pos:u32 }
+/// ```
+///
+/// All offsets are absolute within the file; the table is sorted by term
+/// (byte order — the writer sorts), so lookup is a binary search comparing
+/// pool slices, with zero parsing at open.
+///
+/// Why: the legacy stream layout forced `SegmentReader` to materialize the
+/// *entire* vocabulary at open — a `String` per term plus a `Vec<Posting>`
+/// per term plus a heap `Vec<u32>` per posting — even though a BM25 query
+/// touches only its handful of query terms. For a prose corpus that eager
+/// parse was the dominant resident cost of an open segment (bigger than the
+/// file itself, from per-allocation overhead) and the dominant open-time
+/// CPU. Here the whole file stays as one contiguous buffer (resident cost
+/// == on-disk cost, which also makes `approx_segment_bytes`' on-disk proxy
+/// exact for this file), and postings decode on demand, per queried term,
+/// as a transient per-query cost.
+///
+/// All reads are bounds-checked; the table (spans + term UTF-8) is
+/// validated once at open so per-query decode can't walk off the buffer.
+pub struct LazyInvertedIndex {
+    data: Vec<u8>,
+    term_count: usize,
+}
+
+/// Checked little-endian u32 read that advances the cursor.
+fn take_u32(buf: &mut &[u8]) -> Option<u32> {
+    let (head, rest) = buf.split_first_chunk::<4>()?;
+    *buf = rest;
+    Some(u32::from_le_bytes(*head))
+}
+
+impl LazyInvertedIndex {
+    /// Does this buffer carry the v2 magic? (`false` → legacy v1 stream.)
+    fn detect(data: &[u8]) -> bool {
+        data.len() >= INVERTED_HEADER_LEN && data[0..4] == INVERTED_MAGIC.to_le_bytes()
+    }
+
+    /// Validate the header and the full term table (span bounds and term
+    /// UTF-8) once, so every later accessor can trust the table. One cheap
+    /// pass over fixed-width entries — no postings are touched.
+    fn from_bytes(data: Vec<u8>) -> Result<Self, KoshaError> {
+        let corrupt = |msg: &str| KoshaError::CorruptSegment(format!("inverted.idx: {msg}"));
+        if !Self::detect(&data) {
+            return Err(corrupt("missing v2 magic"));
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != INVERTED_VERSION {
+            return Err(corrupt(&format!("unsupported version {version}")));
+        }
+        let term_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let table_end = INVERTED_HEADER_LEN
+            .checked_add(
+                term_count
+                    .checked_mul(INVERTED_TABLE_ENTRY_LEN)
+                    .ok_or_else(|| corrupt("term table length overflows"))?,
+            )
+            .ok_or_else(|| corrupt("term table length overflows"))?;
+        if table_end > data.len() {
+            return Err(corrupt("term table extends past end of file"));
+        }
+        let index = Self { data, term_count };
+        for i in 0..term_count {
+            let (term_off, term_len, p_off, p_len) = index.raw_entry(i);
+            let term_end = term_off
+                .checked_add(term_len)
+                .filter(|&e| e <= index.data.len());
+            let postings_end = p_off.checked_add(p_len).filter(|&e| e <= index.data.len());
+            if term_end.is_none() || postings_end.is_none() {
+                return Err(corrupt(&format!("table entry {i} out of bounds")));
+            }
+            if std::str::from_utf8(&index.data[term_off..term_off + term_len]).is_err() {
+                return Err(corrupt(&format!("table entry {i} term is not UTF-8")));
+            }
+        }
+        Ok(index)
+    }
+
+    /// Raw table entry `i` as `(term_off, term_len, postings_off,
+    /// postings_len)` in file-absolute byte offsets. Caller must have
+    /// `i < term_count`; spans are validated by `from_bytes`.
+    fn raw_entry(&self, i: usize) -> (usize, usize, usize, usize) {
+        let base = INVERTED_HEADER_LEN + i * INVERTED_TABLE_ENTRY_LEN;
+        let e = &self.data[base..base + INVERTED_TABLE_ENTRY_LEN];
+        (
+            u64::from_le_bytes(e[0..8].try_into().unwrap()) as usize,
+            u32::from_le_bytes(e[8..12].try_into().unwrap()) as usize,
+            u64::from_le_bytes(e[12..20].try_into().unwrap()) as usize,
+            u32::from_le_bytes(e[20..24].try_into().unwrap()) as usize,
+        )
+    }
+
+    /// Term `i`'s string, zero-copy from the pool. UTF-8 validated at open.
+    fn term_at(&self, i: usize) -> &str {
+        let (off, len, _, _) = self.raw_entry(i);
+        std::str::from_utf8(&self.data[off..off + len]).unwrap_or_default()
+    }
+
+    /// Binary search over the (sorted) term table.
+    fn find(&self, term: &str) -> Option<usize> {
+        let mut lo = 0usize;
+        let mut hi = self.term_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.term_at(mid).cmp(term) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
+    }
+
+    fn contains_term(&self, term: &str) -> bool {
+        self.find(term).is_some()
+    }
+
+    /// All terms in sorted order (the table's physical order), zero-copy.
+    fn all_terms(&self) -> Vec<&str> {
+        (0..self.term_count).map(|i| self.term_at(i)).collect()
+    }
+
+    /// Decode one term's postings on demand. `None` for absent terms.
+    /// Decoding is fully bounds-checked: a corrupt postings region (which
+    /// open-time validation deliberately doesn't scan — that would be the
+    /// eager parse this format exists to avoid) yields `None` rather than
+    /// a panic in a scoring thread.
+    fn postings(&self, term: &str) -> Option<Vec<Posting>> {
+        let i = self.find(term)?;
+        let (_, _, p_off, p_len) = self.raw_entry(i);
+        let mut buf = &self.data[p_off..p_off + p_len];
+        let count = take_u32(&mut buf)? as usize;
+        // Guard Vec::with_capacity against a corrupt count: a posting is at
+        // least 12 bytes, so cap by what the span could physically hold.
+        let mut postings = Vec::with_capacity(count.min(buf.len() / 12 + 1));
+        for _ in 0..count {
+            let doc_id = take_u32(&mut buf)?;
+            let term_frequency = take_u32(&mut buf)?;
+            let npos = take_u32(&mut buf)? as usize;
+            let mut positions = Vec::with_capacity(npos.min(buf.len() / 4 + 1));
+            for _ in 0..npos {
+                positions.push(take_u32(&mut buf)?);
+            }
+            postings.push(Posting {
+                doc_id,
+                term_frequency,
+                positions,
+            });
+        }
+        Some(postings)
+    }
+}
+
+/// How `SegmentReader` accesses the inverted index. `Lazy` is the steady
+/// state for any segment written by the current `SegmentWriter` (v2 layout,
+/// see [`LazyInvertedIndex`]); `Eager` is the fallback for legacy v1
+/// segments already on disk/S3 — identical behavior and cost to what every
+/// segment paid before this change. Mirrors [`DocStoreAccess`].
+enum InvertedAccess {
+    Lazy(LazyInvertedIndex),
+    Eager(HashMap<String, Vec<Posting>>),
+}
+
+impl InvertedAccess {
+    fn postings(&self, term: &str) -> Option<Cow<'_, [Posting]>> {
+        match self {
+            Self::Eager(map) => map.get(term).map(|v| Cow::Borrowed(v.as_slice())),
+            Self::Lazy(lazy) => lazy.postings(term).map(Cow::Owned),
+        }
+    }
+
+    fn contains_term(&self, term: &str) -> bool {
+        match self {
+            Self::Eager(map) => map.contains_key(term),
+            Self::Lazy(lazy) => lazy.contains_term(term),
+        }
+    }
+
+    fn all_terms(&self) -> Vec<&str> {
+        match self {
+            Self::Eager(map) => {
+                let mut terms: Vec<&String> = map.keys().collect();
+                terms.sort();
+                terms.into_iter().map(|s| s.as_str()).collect()
+            }
+            // The v2 table is written in sorted order — no sort needed.
+            Self::Lazy(lazy) => lazy.all_terms(),
+        }
+    }
+}
+
 // ─── Segment reader ─────────────────────────────────────────────────────────
 
 /// A document's location within `doc_store.bin`, plus the small scalar
@@ -377,7 +622,7 @@ pub struct SegmentReader {
     segment_dir: PathBuf,
     footer: Footer,
     doc_store: DocStoreAccess,
-    pub inverted_index: HashMap<String, Vec<Posting>>,
+    inverted: InvertedAccess,
     pub filter_store: FilterStore,
     pub vector_store: VectorStore,
     pub hnsw_map: Option<HnswMap<CosinePoint, u32>>,
@@ -420,7 +665,7 @@ impl SegmentReader {
             segment_dir: segment_dir.clone(),
             footer,
             doc_store,
-            inverted_index: Self::read_inverted_index(&segment_dir)?,
+            inverted: Self::read_inverted(&segment_dir)?,
             filter_store: Self::read_filters(&segment_dir)?,
             vector_store: vs,
             hnsw_map: hm,
@@ -440,8 +685,14 @@ impl SegmentReader {
         &self.footer.bm25_params
     }
 
-    pub fn postings(&self, term: &str) -> Option<&[Posting]> {
-        self.inverted_index.get(term).map(|v| v.as_slice())
+    /// Postings for one term. `Cow` because the two storage formats differ
+    /// in what they can hand out: legacy (v1) segments hold the whole index
+    /// parsed in memory and lend a borrow, v2 segments decode this term's
+    /// postings on demand from the raw file buffer and return them owned
+    /// (see [`LazyInvertedIndex`]). Call once per term per query and hold
+    /// the result — don't re-fetch per document.
+    pub fn postings(&self, term: &str) -> Option<Cow<'_, [Posting]>> {
+        self.inverted.postings(term)
     }
 
     /// Zero-I/O: `doc_id` + `field_length` for one document, without
@@ -502,13 +753,13 @@ impl SegmentReader {
     }
 
     pub fn contains_term(&self, term: &str) -> bool {
-        self.inverted_index.contains_key(term)
+        self.inverted.contains_term(term)
     }
 
+    /// All terms in sorted order. Zero-copy for v2 segments (borrows the
+    /// term pool); allocates only the pointer Vec.
     pub fn all_terms(&self) -> Vec<&str> {
-        let mut terms: Vec<&String> = self.inverted_index.keys().collect();
-        terms.sort();
-        terms.into_iter().map(|s| s.as_str()).collect()
+        self.inverted.all_terms()
     }
 
     /// Read `footer.json` without opening the rest of the segment.
@@ -535,8 +786,8 @@ impl SegmentReader {
     /// blooms existed.
     pub fn rewrite_term_bloom(segment_dir: &Path) -> Result<Footer, KoshaError> {
         let mut footer = Self::read_footer(segment_dir)?;
-        let index = Self::read_inverted_index(segment_dir)?;
-        footer.term_bloom = Some(build_term_bloom(index.keys().map(|s| s.as_str())));
+        let inverted = Self::read_inverted(segment_dir)?;
+        footer.term_bloom = Some(build_term_bloom(inverted.all_terms()));
         let json = serde_json::to_string_pretty(&footer)?;
         atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
         Ok(footer)
@@ -610,14 +861,26 @@ impl SegmentReader {
         Ok(records)
     }
 
-    fn read_inverted_index(
-        segment_dir: &Path,
-    ) -> Result<HashMap<String, Vec<Posting>>, KoshaError> {
+    /// Read `inverted.idx` in whichever format it's in: v2 (magic-prefixed
+    /// table of contents) opens lazily with zero parsing; anything else is
+    /// parsed eagerly via the legacy v1 stream layout — the exact cost every
+    /// segment paid before v2 existed.
+    fn read_inverted(segment_dir: &Path) -> Result<InvertedAccess, KoshaError> {
         let data = fs::read(segment_dir.join("inverted.idx"))?;
-        let mut cursor = &data[..];
+        if LazyInvertedIndex::detect(&data) {
+            return Ok(InvertedAccess::Lazy(LazyInvertedIndex::from_bytes(data)?));
+        }
+        Ok(InvertedAccess::Eager(Self::parse_legacy_inverted(&data)))
+    }
+
+    /// Legacy (v1) `inverted.idx` stream parse: term count, then per term
+    /// `len/bytes/df/postings_count` + inline postings. Fully materializes
+    /// the vocabulary — kept only for segments written before v2.
+    fn parse_legacy_inverted(data: &[u8]) -> HashMap<String, Vec<Posting>> {
+        let mut cursor = data;
         let mut index = HashMap::new();
         if cursor.len() < 4 {
-            return Ok(index);
+            return index;
         }
         let term_count = read_u32_le(&mut cursor);
         for _ in 0..term_count {
@@ -643,7 +906,7 @@ impl SegmentReader {
             }
             index.insert(term, postings);
         }
-        Ok(index)
+        index
     }
 
     fn read_vectors(segment_dir: &Path) -> Result<VectorStore, KoshaError> {
@@ -1012,6 +1275,180 @@ fn days_to_date(mut days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serialize an inverted index in the legacy v1 stream layout — the
+    /// exact bytes `write_inverted_index` produced before v2 — so the
+    /// fallback path can be tested against segments that predate the
+    /// format change.
+    fn serialize_legacy_inverted(index: &HashMap<String, Vec<Posting>>) -> Vec<u8> {
+        let mut terms: Vec<&String> = index.keys().collect();
+        terms.sort();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(terms.len() as u32).to_le_bytes());
+        for term_str in terms {
+            let postings = &index[term_str];
+            let term_bytes = term_str.as_bytes();
+            buf.extend_from_slice(&(term_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(term_bytes);
+            // v1 wrote the postings count twice (df + count).
+            buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
+            for posting in postings {
+                buf.extend_from_slice(&posting.doc_id.to_le_bytes());
+                buf.extend_from_slice(&posting.term_frequency.to_le_bytes());
+                buf.extend_from_slice(&(posting.positions.len() as u32).to_le_bytes());
+                for &pos in &posting.positions {
+                    buf.extend_from_slice(&pos.to_le_bytes());
+                }
+            }
+        }
+        buf
+    }
+
+    /// Build a two-doc segment and return (dir, the writer's in-memory
+    /// inverted index captured before finalize) for fidelity comparisons.
+    fn write_inverted_fixture(dir: &Path) -> HashMap<String, Vec<Posting>> {
+        let _ = fs::remove_dir_all(dir);
+        let mut w = SegmentWriter::new(SegmentId("test".into()), dir.to_path_buf());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("t", "quick brown fox jumps")],
+        );
+        w.add_document(
+            DocumentId("d2".into()),
+            vec![Field::text("t", "quick fox is quick indeed")],
+        );
+        let expected = w.inverted_index.clone();
+        w.finalize(Bm25Params::default()).unwrap();
+        expected
+    }
+
+    #[test]
+    fn v2_lazy_inverted_roundtrips_identically_to_writer_state() {
+        // The lazy on-demand decode must return byte-for-byte the same
+        // postings (doc ids, tfs, positions, order) the writer held in
+        // memory — for every term, plus sorted all_terms and negative
+        // lookups.
+        let dir = std::env::temp_dir().join("kosha-test-inverted-v2-roundtrip");
+        let expected = write_inverted_fixture(&dir);
+
+        // Sanity: the file on disk really is v2.
+        let raw = fs::read(dir.join("inverted.idx")).unwrap();
+        assert!(
+            LazyInvertedIndex::detect(&raw),
+            "writer should emit the v2 magic-prefixed layout"
+        );
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(
+            matches!(r.inverted, InvertedAccess::Lazy(_)),
+            "v2 file must open on the lazy path"
+        );
+        for (term, postings) in &expected {
+            let got = r
+                .postings(term)
+                .unwrap_or_else(|| panic!("missing term {term}"));
+            assert_eq!(&*got, postings.as_slice(), "postings mismatch for {term}");
+            assert!(r.contains_term(term));
+        }
+        let mut expected_terms: Vec<&str> = expected.keys().map(|s| s.as_str()).collect();
+        expected_terms.sort();
+        assert_eq!(r.all_terms(), expected_terms);
+        assert!(r.postings("absent-term").is_none());
+        assert!(!r.contains_term("absent-term"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_v1_inverted_still_opens_via_eager_fallback() {
+        // Segments already on disk/S3 keep the v1 stream layout — the
+        // reader must detect the missing magic and fall back to the eager
+        // parse with identical query results.
+        let dir = std::env::temp_dir().join("kosha-test-inverted-v1-fallback");
+        let expected = write_inverted_fixture(&dir);
+
+        // Overwrite the v2 file with the same index serialized as v1.
+        fs::write(
+            dir.join("inverted.idx"),
+            serialize_legacy_inverted(&expected),
+        )
+        .unwrap();
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(
+            matches!(r.inverted, InvertedAccess::Eager(_)),
+            "v1 file must open on the eager fallback path"
+        );
+        for (term, postings) in &expected {
+            let got = r
+                .postings(term)
+                .unwrap_or_else(|| panic!("missing term {term}"));
+            assert_eq!(&*got, postings.as_slice(), "postings mismatch for {term}");
+        }
+        let mut expected_terms: Vec<&str> = expected.keys().map(|s| s.as_str()).collect();
+        expected_terms.sort();
+        assert_eq!(r.all_terms(), expected_terms);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_inverted_with_truncated_table_is_a_clean_corrupt_error() {
+        // A v2 header whose term table extends past EOF must fail open
+        // with CorruptSegment — never a panic, never silent garbage.
+        let dir = std::env::temp_dir().join("kosha-test-inverted-v2-truncated");
+        write_inverted_fixture(&dir);
+
+        let raw = fs::read(dir.join("inverted.idx")).unwrap();
+        // Keep the header (claiming the full term count) but cut the file
+        // off in the middle of the term table.
+        fs::write(dir.join("inverted.idx"), &raw[..INVERTED_HEADER_LEN + 3]).unwrap();
+
+        match SegmentReader::open(dir.clone()) {
+            Err(KoshaError::CorruptSegment(msg)) => {
+                assert!(msg.contains("inverted.idx"), "unexpected message: {msg}")
+            }
+            Err(other) => panic!("expected CorruptSegment, got {other}"),
+            Ok(_) => panic!("expected CorruptSegment, got a successful open"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_inverted_corrupt_postings_region_degrades_to_missing_term() {
+        // Open-time validation deliberately covers only the table (scanning
+        // the postings region would be the eager parse v2 exists to avoid).
+        // A corrupt postings span must therefore surface at decode time as
+        // a bounds-checked None — not a panic inside a scoring thread.
+        let dir = std::env::temp_dir().join("kosha-test-inverted-v2-bad-postings");
+        let expected = write_inverted_fixture(&dir);
+
+        let mut raw = fs::read(dir.join("inverted.idx")).unwrap();
+        // Corrupt the first postings blob's count field to a huge value the
+        // span can't physically hold. The first table entry's postings_off
+        // is at header + 12, as a u64.
+        let p_off_pos = INVERTED_HEADER_LEN + 12;
+        let p_off = u64::from_le_bytes(raw[p_off_pos..p_off_pos + 8].try_into().unwrap()) as usize;
+        raw[p_off..p_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(dir.join("inverted.idx"), &raw).unwrap();
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let first_term = r.all_terms()[0].to_string();
+        assert!(
+            r.postings(&first_term).is_none(),
+            "corrupt postings must decode to None, not panic or garbage"
+        );
+        // Other terms' postings are untouched and must still decode.
+        let last_term = r.all_terms().last().unwrap().to_string();
+        assert_eq!(
+            &*r.postings(&last_term).unwrap(),
+            expected[&last_term].as_slice()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn tokenize_with_positions_works() {

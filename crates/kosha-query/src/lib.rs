@@ -999,10 +999,15 @@ impl Searcher {
                 &effective_terms
             };
 
-            let term_postings: Vec<(&str, &[kosha_core::Posting])> = terms_for_bm25
-                .iter()
-                .filter_map(|t| reader.postings(t).map(|p| (t.as_str(), p)))
-                .collect();
+            // `Cow`: legacy segments lend a borrow into their parsed map;
+            // v2 segments decode this term's postings on demand (owned) —
+            // see `SegmentReader::postings`. Fetched once per term here and
+            // held for the whole scoring pass either way.
+            let term_postings: Vec<(&str, std::borrow::Cow<'_, [kosha_core::Posting]>)> =
+                terms_for_bm25
+                    .iter()
+                    .filter_map(|t| reader.postings(t).map(|p| (t.as_str(), p)))
+                    .collect();
 
             let mut doc_frequencies: HashMap<&str, u32> = HashMap::new();
             for (t, p) in &term_postings {
@@ -1018,7 +1023,7 @@ impl Searcher {
                 // OR mode (wildcard, phrase, or single term): score any matching doc.
                 for (term, postings) in &term_postings {
                     let df = doc_frequencies.get(term).copied().unwrap_or(0);
-                    for posting in *postings {
+                    for posting in postings.iter() {
                         if let Some(meta) = reader.doc_meta(posting.doc_id) {
                             let score =
                                 scorer.score_term(posting.term_frequency, df, meta.field_length);
@@ -1070,15 +1075,17 @@ impl Searcher {
             // Apply phrase matching (filter out docs that don't match the phrase).
             if let Some((ref phrase_terms, slop)) = phrase_match {
                 // Fetch each phrase term's postings once (not once per
-                // candidate doc) and index by doc_id for O(1) lookup —
-                // matters more once `postings()` can become an on-demand
-                // read in a later milestone, but is a real redundant-work
-                // fix even today.
-                let phrase_postings: Vec<HashMap<u32, &[u32]>> = phrase_terms
+                // candidate doc) and index by doc_id for O(1) lookup.
+                // `postings()` is now an on-demand decode for v2 segments,
+                // so the once-per-term discipline matters for real: the
+                // decoded `Cow`s are bound first (they must outlive the
+                // maps, which borrow position slices out of them).
+                let phrase_postings_data: Vec<Option<std::borrow::Cow<'_, [kosha_core::Posting]>>> =
+                    phrase_terms.iter().map(|pt| reader.postings(pt)).collect();
+                let phrase_postings: Vec<HashMap<u32, &[u32]>> = phrase_postings_data
                     .iter()
-                    .map(|pt| {
-                        reader
-                            .postings(pt)
+                    .map(|data| {
+                        data.as_ref()
                             .map(|postings| {
                                 postings
                                     .iter()
