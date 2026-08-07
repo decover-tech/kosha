@@ -611,8 +611,29 @@ impl AppState {
     /// recheck the owner uses — so a failed fetch is visible to waiters too,
     /// not silently treated as success. `hydration_semaphore` additionally
     /// bounds how many *owner* hydration batches run at once, server-wide.
+    ///
+    /// `include_vectors` controls whether `vector.idx` is fetched. It is by
+    /// far the largest file in a vector-bearing segment (raw f32, ~4KB per
+    /// 1024-dim vector — routinely dwarfing the lexical files combined), and
+    /// lexical/BM25 queries never read it (`open_with_options` with
+    /// `load_vectors=false`, and `REQUIRED_SEGMENT_FILES` deliberately
+    /// excludes it). Fetching it anyway is what let a single cold BM25
+    /// search allocate multi-GB hydration batches and OOM the query pod.
+    /// Pass `false` for lexical-only searches; everything else (knn
+    /// searches, and every write/rewrite/compaction path, which must never
+    /// drop vector data when rewriting a segment) passes `true`.
+    ///
+    /// When `include_vectors` is true, segments that were previously
+    /// hydrated lexically (core files local, `vector.idx` not) get their
+    /// `vector.idx` backfilled too — without this, a knn query after a
+    /// lexical one would silently search zero vectors, because
+    /// `read_vectors` treats a missing file as an empty store. For segments
+    /// that genuinely have no vectors in S3 the backfill attempt fails with
+    /// a WARN each time (we can't tell "not yet fetched" from "never
+    /// existed" without a LIST); acceptable while knn traffic is nil,
+    /// revisit if that becomes noisy.
     #[cfg(feature = "s3")]
-    fn ensure_segments_local(&self, seg_paths: &[PathBuf]) -> Vec<String> {
+    fn ensure_segments_local(&self, seg_paths: &[PathBuf], include_vectors: bool) -> Vec<String> {
         let Some(ref s3) = self.s3_storage else {
             return Vec::new();
         };
@@ -637,7 +658,12 @@ impl AppState {
                 let s3_prefix = rel_path.to_string_lossy().into_owned();
                 match s3.list(&s3_prefix) {
                     Ok(files) if !files.is_empty() => {
-                        logical_paths.extend(files.iter().map(|f| format!("{s3_prefix}/{f}")));
+                        logical_paths.extend(
+                            files
+                                .iter()
+                                .filter(|f| include_vectors || f.as_str() != "vector.idx")
+                                .map(|f| format!("{s3_prefix}/{f}")),
+                        );
                     }
                     Ok(_) => {
                         eprintln!("WARN: no S3 objects found for segment {s3_prefix}");
@@ -672,6 +698,20 @@ impl AppState {
         }
 
         wait_for(&waiting);
+
+        // Backfill vector.idx for segments hydrated by an earlier
+        // lexical-only pass (core-complete, so `partition_for_hydration`
+        // skipped them above). See the `include_vectors` doc comment.
+        if include_vectors {
+            let missing_vectors: Vec<PathBuf> = seg_paths
+                .iter()
+                .filter(|p| Self::segment_is_complete(p) && !p.join("vector.idx").exists())
+                .cloned()
+                .collect();
+            if !missing_vectors.is_empty() {
+                self.ensure_files_local(&missing_vectors, "vector.idx");
+            }
+        }
 
         seg_paths
             .iter()
@@ -767,7 +807,10 @@ impl AppState {
             }
             to_hydrate.push(seg_path);
         }
-        self.ensure_segments_local(&to_hydrate)
+        // Only knn searches need vector.idx — see ensure_segments_local's
+        // include_vectors doc. Lexical searches skip the (dominant) vector
+        // payload entirely.
+        self.ensure_segments_local(&to_hydrate, query.knn.is_some())
     }
 
     /// Upload a single file from a local segment dir to S3.
@@ -1228,7 +1271,7 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
                 .iter()
                 .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
                 .collect();
-            state.ensure_segments_local(&paths);
+            state.ensure_segments_local(&paths, true);
         }
     }
 
@@ -1299,7 +1342,7 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
                         .join(&entry.segment_id.0)
                 })
                 .collect();
-            state.ensure_segments_local(&paths);
+            state.ensure_segments_local(&paths, true);
         }
     }
 
@@ -1357,7 +1400,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
                 .iter()
                 .map(|entry| state.data_dir.join(&namespace.0).join(&entry.segment_id.0))
                 .collect();
-            state.ensure_segments_local(&paths);
+            state.ensure_segments_local(&paths, true);
         }
     }
 
@@ -1788,7 +1831,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
         .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
         .collect();
     #[cfg(feature = "s3")]
-    state.ensure_segments_local(&seg_paths);
+    state.ensure_segments_local(&seg_paths, true);
 
     let mut rebuilt = 0usize;
     let mut errors = Vec::new();
@@ -1865,7 +1908,7 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
         .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
         .collect();
     #[cfg(feature = "s3")]
-    state.ensure_segments_local(&seg_paths);
+    state.ensure_segments_local(&seg_paths, true);
 
     let mut backfilled = 0usize;
     let mut errors = Vec::new();
@@ -1968,7 +2011,7 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
             .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
             .collect();
         #[cfg(feature = "s3")]
-        state.ensure_segments_local(&seg_paths);
+        state.ensure_segments_local(&seg_paths, true);
         // compact_namespace silently skips (and keeps unmerged) any segment
         // that isn't present locally after this — safe, but worth surfacing
         // so a caller knows compaction was partial.
