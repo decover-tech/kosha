@@ -218,6 +218,35 @@ struct AppState {
     /// Namespaces with an offsets-backfill job currently running — one job
     /// per namespace at a time.
     backfill_jobs: Mutex<std::collections::HashSet<String>>,
+    /// Namespace-level cached hydration verdict (Tier 1 O2). Keyed by
+    /// `(namespace, manifest_version)`: every search request currently
+    /// pays per-segment freshness/existence checks inside
+    /// `hydrate_segments_for_search` — footer prefetch, bloom-prune,
+    /// scoring-set file checks, posting-blob checks — even for a fully-
+    /// warm namespace where the entire result is "all local." For a 1M-
+    /// doc namespace with 17 segments that's ~17 `is_file` syscalls per
+    /// file type per query — 15–130 ms of zero-fetch overhead per warm
+    /// query, a hard floor OpenSearch doesn't pay.
+    ///
+    /// The verdict is keyed by manifest version (`manifest.version: u64`)
+    /// so it's *automatically* invalidated the moment a new segment
+    /// publishes — no manual invalidation on compaction or flush, no TTL
+    /// guessing. After hydration confirms every scoring-set file is local
+    /// (on a cold namespace) the verdict is set to `true` for that
+    /// `(namespace, version)` pair, and subsequent warm requests short-
+    /// circuit `hydrate_segments_for_search` entirely. Failure safety:
+    /// if a disk-cache eviction removes a segment's scoring file after
+    /// the verdict is cached, the search itself returns an IO error
+    /// (`open_segment` fails to open `inverted.idx`), the caller's
+    /// existing 503 + client retry path kicks in, and the verdict is
+    /// invalidated on the error path here so the next request re-checks
+    /// and re-hydrates the missing file. The collection grows
+    /// unboundedly in principle (one entry per manifest bump per
+    /// namespace) but each is a `(u64, u64)` tuple — 16 bytes — and
+    /// manifest versions roll slowly enough that even a long-lived pod
+    /// holds at most low-thousands entries; per-query cost is a single
+    /// `HashMap` lookup, vs. 17 syscalls on the legacy path.
+    completed_hydrations: Mutex<HashMap<(String, u64), bool>>,
     /// Readiness-gated warmup (Tier 1 O2): when `KOSHA_WARMUP_NAMESPACES`
     /// is set, a background thread prefetches the scoring-set files
     /// (`footer.json` + `inverted.idx` + `doc_store.offsets` [+ `filters.bin`/
@@ -892,6 +921,7 @@ impl AppState {
             internal_auth_key,
             self_ref: Weak::new(),
             backfill_jobs: Mutex::new(std::collections::HashSet::new()),
+            completed_hydrations: Mutex::new(HashMap::new()),
             // Warmup starts ready; `spawn_warmup` flips `false` only when
             // there's configured work to do (and back to `true` on
             // completion / fail-open). See the field's doc comment.
@@ -2744,7 +2774,40 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     let t_hydrate = Instant::now();
     #[cfg(feature = "s3")]
     let hydration = {
-        let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
+        // Namespace-level cached hydration verdict (Tier 1 O2): skip
+        // `hydrate_segments_for_search` entirely when we've already
+        // confirmed — for this `(namespace, manifest_version)` pair — that
+        // every scoring-set file is local. The verdict is invalidated
+        // automatically when a new segment publishes (manifest versions are
+        // bumped at publish time), and explicitly on any search error
+        // below (a disk-cache eviction could remove a scoring file after
+        // the verdict was cached). On a fully-warm namespace this collapses
+        // the 15–130 ms per-query hydration-check floor to a single
+        // HashMap lookup.
+        let verdict_key = (ns.0.clone(), manifest.version);
+        let cached_complete = state
+            .completed_hydrations
+            .lock()
+            .unwrap()
+            .get(&verdict_key)
+            .copied()
+            .unwrap_or(false);
+        let outcome = if cached_complete {
+            HydrationOutcome::default()
+        } else {
+            let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
+            // Cache the verdict on success: all segments are local for
+            // this manifest version, so future warm queries skip the
+            // whole hydration pass.
+            if outcome.missing.is_empty() {
+                state
+                    .completed_hydrations
+                    .lock()
+                    .unwrap()
+                    .insert(verdict_key, true);
+            }
+            outcome
+        };
         if !outcome.missing.is_empty() {
             return json_error(503, &hydration_failed_message(&outcome.missing));
         }
@@ -2801,7 +2864,22 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             );
             json_ok(&result)
         }
-        Err(e) => search_error_response(&e),
+        Err(e) => {
+            // A search failure (segment file IO error after eviction, or
+            // admission shedding) likely means the cached hydration verdict
+            // is stale: a scoring-set file we recorded as "all local" is no
+            // longer there. Invalidate the verdict so the retry's
+            // `hydrate_segments_for_search` actually re-checks physical
+            // existence and re-fetches what's missing instead of trusting
+            // the cache and failing again.
+            #[cfg(feature = "s3")]
+            state
+                .completed_hydrations
+                .lock()
+                .unwrap()
+                .remove(&(ns.0.clone(), manifest.version));
+            search_error_response(&e)
+        }
     }
 }
 
@@ -2868,7 +2946,29 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     let t_hydrate = Instant::now();
     #[cfg(feature = "s3")]
     let hydration = {
-        let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
+        // Same cached-verdict short-circuit as `handle_search_post` —
+        // see that function for the rationale (Tier 1 O2).
+        let verdict_key = (ns.0.clone(), manifest.version);
+        let cached_complete = state
+            .completed_hydrations
+            .lock()
+            .unwrap()
+            .get(&verdict_key)
+            .copied()
+            .unwrap_or(false);
+        let outcome = if cached_complete {
+            HydrationOutcome::default()
+        } else {
+            let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
+            if outcome.missing.is_empty() {
+                state
+                    .completed_hydrations
+                    .lock()
+                    .unwrap()
+                    .insert(verdict_key, true);
+            }
+            outcome
+        };
         if !outcome.missing.is_empty() {
             return json_error(503, &hydration_failed_message(&outcome.missing));
         }
@@ -2921,7 +3021,18 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
             );
             json_ok(&result)
         }
-        Err(e) => search_error_response(&e),
+        Err(e) => {
+            // Same verdict invalidation as `handle_search_post` — see
+            // that function for the rationale (a stale verdict could
+            // cause the retry to also skip hydration and fail again).
+            #[cfg(feature = "s3")]
+            state
+                .completed_hydrations
+                .lock()
+                .unwrap()
+                .remove(&(ns.0.clone(), manifest.version));
+            search_error_response(&e)
+        }
     }
 }
 

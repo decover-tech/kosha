@@ -508,6 +508,28 @@ impl Bm25Scorer {
         let tf_component = (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * doc_len / avgdl));
         idf * tf_component
     }
+
+    /// Block-max upper bound for [`Self::score_term`] over a block of
+    /// postings: returns the highest BM25 score any single doc in the block
+    /// could achieve, given the maximum term frequency (`max_tf`) and the
+    /// minimum field length (`min_field_length`) in the block. Because
+    /// BM25's tf component is monotonically increasing in tf and the
+    /// length-normalization term `(1 − b + b · dl / avgdl)` grows with
+    /// `dl` (increasing the denominator → decreasing the score), the
+    /// highest-possible score of any doc in the block is obtained with
+    /// `tf = max_tf` and `dl = min_field_length` — even if no single doc
+    /// combines the two (the doc with max tf may have a long field_length).
+    /// That's what makes this a valid *upper bound* for the whole block,
+    /// so the WAND early-termination can safely skip any block whose UB <
+    /// the current top-k threshold (no later candidate can overtake the
+    /// kth-best score so far).
+    pub fn block_max_score(&self, max_tf: u32, doc_frequency: u32, min_field_length: u32) -> f64 {
+        // Drop the max-tf / min-field-length combination onto the existing
+        // formula — the same math as `score_term`, with `tf` replaced by
+        // `max_tf` (a maximum) and `dl` replaced by `min_field_length` (a
+        // minimum). The result is ≥ any individual doc's score.
+        self.score_term(max_tf, doc_frequency, min_field_length)
+    }
 }
 
 // ─── Wildcard matcher ───────────────────────────────────────────────────────
@@ -1127,6 +1149,181 @@ impl Searcher {
                 &effective_terms
             };
 
+            // ── Block-max WAND early termination for single-term BM25 queries ──
+            //
+            // The largest remaining lever on the warm path. A broad Zipfian
+            // term like "the" scores 10⁵–10⁶ candidate docs per segment in
+            // full, but only the top-`from + max_results` ever reach the
+            // page. Lucene/Elasticsearch prunes blocks whose maximum
+            // achievable score can't reach the running top-k threshold; this
+            // is the same pruning applied at Kosha's grain (per segment, per
+            // block of 128 postings, BM25-fitted via the
+            // [`Bm25Scorer::block_max_score`] upper bound). The Zipfian
+            // shape of real terms means a handful of high-tf / short-len docs
+            // form a high threshold early, and the long tail of
+            // low-tf / long-len docs lives in blocks whose UB falls below it
+            // — blocks that would take the bulk of `score_ms` today are
+            // skipped entirely. `total_hits` is exact in this path: it's
+            // the term's document frequency in the segment (
+            // `postings.len()`), reported via `SegmentOutput::total_hits`
+            // down-channel — the user-visible count stays correct while
+            // candidates.len() drops from N to ≤ `from + max_results`.
+            //
+            // Guard conditions each have a why-not:
+            //   * multi-term OR/AND: per-term block-max is a per-term UB
+            //     but the total score sums across matching terms — a block
+            //     that can't reach top-k on this term could still place docs
+            //     via another term. The full WAND algorithm coordinates
+            //     blocks across terms (cursor-aligned); leave that for a
+            //     follow-up.
+            //   * wildcard: expands to N unknown terms whose per-term block
+            //     boundaries don't align.
+            //   * phrase / filter / aggs / search_after / custom sort / knn:
+            //     each adds post-scoring work that the full path already
+            //     handles and that the early-termination path would
+            //     silently short-circuit (agg slices, filter comparisons,
+            //     phrase re-ranking, knn-only hybrid merge, …).
+            //   * tombstones: even a sparse tombstone set changes `total_hits`
+            //     by some-doc subtraction — fording a fall-back to the full
+            //     path where total_hits = candidates.len() remains exact.
+            let segment_has_tombstones = tombstones.is_some_and(|t| {
+                t.get(&entry.segment_id)
+                    .is_some_and(|seqs| !seqs.is_empty())
+            });
+            let can_block_max_wand = effective_terms.len() == 1
+                && !is_wildcard_mode
+                && phrase_tokenized.is_none()
+                && query.filter.is_none()
+                && query.knn.is_none()
+                && query.search_after.as_ref().is_none_or(|a| a.is_empty())
+                && sort_value_fields.is_empty()
+                && query.aggs.is_empty()
+                && !segment_has_tombstones;
+            if can_block_max_wand {
+                let term = &effective_terms[0];
+                let Some(postings) = reader.postings(term) else {
+                    // Term not in this segment — contributed zero docs.
+                    return Ok(Some(SegmentOutput {
+                        candidates: Vec::new(),
+                        aggs: HashMap::new(),
+                        total_hits: 0,
+                    }));
+                };
+                let df = postings.len() as u32;
+                let total_hits = postings.len();
+
+                // `from` deep pagination still needs `from + max_results`
+                // candidates per segment to slot the page correctly after
+                // the cross-segment sort — the bounded-topk test's
+                // `from=20, max_results=5` would otherwise have only 5
+                // candidates and an empty page.
+                let effective_k = query.from.saturating_add(query.max_results);
+                if effective_k == 0 {
+                    // Pure count-only: skip all scoring; total_hits IS df.
+                    return Ok(Some(SegmentOutput {
+                        candidates: Vec::new(),
+                        aggs: HashMap::new(),
+                        total_hits,
+                    }));
+                }
+
+                const BLOCK_SIZE: usize = 128;
+                let mut topk: Vec<(f64, u32, DocumentId)> = Vec::with_capacity(effective_k + 1);
+
+                for block in postings.chunks(BLOCK_SIZE) {
+                    // Pull max_tf + min_field_length for the block by a
+                    // single cheap pass over the small in-block postings
+                    // slice — `reader.doc_meta` is an in-memory array
+                    // index (no I/O), `BLOCK_SIZE` is 128 so the pass is
+                    // ~µs even on the hottest term. The result is the
+                    // block's per-doc score ceiling, used as the WAND
+                    // pivot for skip/score below.
+                    let mut max_tf = 0u32;
+                    let mut min_fl = u32::MAX;
+                    for posting in block {
+                        if posting.term_frequency > max_tf {
+                            max_tf = posting.term_frequency;
+                        }
+                        if let Some(meta) = reader.doc_meta(posting.doc_id) {
+                            if meta.field_length < min_fl {
+                                min_fl = meta.field_length;
+                            }
+                        }
+                    }
+                    if min_fl == u32::MAX {
+                        // block had no resolvable metas — skip it as
+                        // unscorable, treating it as "can't reach" to
+                        // avoid an UB of +inf leaking past the threshold.
+                        continue;
+                    }
+                    // Upper bound for any doc's BM25 score in this block.
+                    let block_ub = scorer.block_max_score(max_tf, df, min_fl);
+
+                    // WAND pivot test: skip the block entirely iff we
+                    // already hold `effective_k` candidates AND the best
+                    // candidate score in the block can't reach the
+                    // current k-th-best. The threshold rises monotonically
+                    // as higher-scoring docs land in `topk`, so later
+                    // buckets face progressively tighter UBs — the long
+                    // tail of low-tf high-dl docs falls off fast for
+                    // Zipfian terms.
+                    if topk.len() >= effective_k && block_ub <= topk[effective_k - 1].0 {
+                        continue;
+                    }
+                    // Score every doc in the block; maintain a sorted-
+                    // descending top-(effective_k) vector. Insertion at
+                    // k=10–40 is O(k) — cheaper than the BM25 itself,
+                    // and the entire topk copy never exceeds `effective_k`
+                    // elements.
+                    for posting in block {
+                        let doc_seq = posting.doc_id;
+                        if let Some(meta) = reader.doc_meta(doc_seq) {
+                            let score =
+                                scorer.score_term(posting.term_frequency, df, meta.field_length);
+                            if topk.len() < effective_k {
+                                topk.push((score, doc_seq, DocumentId(meta.doc_id.to_owned())));
+                                if topk.len() == effective_k {
+                                    topk.sort_by(|a, b| {
+                                        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                                    });
+                                }
+                            } else if score > topk[effective_k - 1].0 {
+                                topk[effective_k - 1] =
+                                    (score, doc_seq, DocumentId(meta.doc_id.to_owned()));
+                                // Bubble the replaced last element up.
+                                let mut i = effective_k - 1;
+                                while i > 0 && topk[i].0 > topk[i - 1].0 {
+                                    topk.swap(i, i - 1);
+                                    i -= 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Build the segment's `HitCandidate`s straight from the
+                // topk vec — no intermediate `seg_hits` HashMap, no clone
+                // of every scored doc's doc_id (only the `effective_k` that
+                // survive get a `DocumentId` allocation, vs. all N in the
+                // old path). Each carries an `Arc::clone` of the segment so
+                // the materialize pass can fetch full fields later.
+                let mut candidates = Vec::with_capacity(topk.len());
+                for (score, doc_seq, doc_id) in topk {
+                    candidates.push(HitCandidate {
+                        reader: Arc::clone(&reader),
+                        doc_seq,
+                        doc_id,
+                        score,
+                        sort_values: Vec::new(),
+                    });
+                }
+                return Ok(Some(SegmentOutput {
+                    candidates,
+                    aggs: HashMap::new(),
+                    total_hits,
+                }));
+            }
+
             // `PostingsRef`: legacy segments lend a borrow into their parsed
             // map; v2 segments hand out a shared Arc of the on-demand decode
             // — see `SegmentReader::postings`. Fetched once per term here
@@ -1371,7 +1568,16 @@ impl Searcher {
             }
         }
 
-        Ok(Some(SegmentOutput { candidates, aggs }))
+        // Overall count of non-tombstoned, filter-passing, query-matching docs
+        // in this segment — `candidates.len()` captures exactly this set
+        // for the general scoring path. Computed before the move below.
+        let total_hits = candidates.len();
+
+        Ok(Some(SegmentOutput {
+            candidates,
+            aggs,
+            total_hits,
+        }))
     }
 
     pub fn search(
@@ -1549,8 +1755,20 @@ impl Searcher {
 
         let mut candidates: Vec<HitCandidate> = Vec::new();
         let mut all_aggs: HashMap<String, AggregationResults> = HashMap::new();
+        // Total hits summed across segments. Replaces the old
+        // `candidates.len()` base. The block-max WAND early-termination
+        // path returns only the top-`from+max_results` candidates but
+        // still reports the segment's true total (the term document
+        // frequency) here, so the user-visible `total_hits` field stays
+        // exact while the candidates vectors only carry the page-relevant
+        // tail of the ranking. The general scoring path sets
+        // `SegmentOutput::total_hits = candidates.len()`, so the
+        // behavior-identical old semantics hold for every query that
+        // doesn't take the early-termination fast path.
+        let mut total_hits: usize = 0;
         for output in segment_outputs {
             candidates.extend(output.candidates);
+            total_hits += output.total_hits;
             // Last-segment-wins per agg name, same reduction the old
             // sequential loop did via repeated `all_aggs.insert(...)`.
             // `segment_outputs` is in manifest order, so this is
@@ -1605,7 +1823,6 @@ impl Searcher {
             }
         }
 
-        let total_hits = candidates.len();
         let from = page_start.min(candidates.len());
         let to = (from + query.max_results).min(candidates.len());
 
@@ -1740,9 +1957,19 @@ struct HitCandidate {
 /// One segment's independent contribution to a query: its scored candidates
 /// and its own aggregation results. Produced by [`Searcher::score_segment`]
 /// and merged by [`Searcher::search`] after all segments have been scored.
+///
+/// `total_hits` is this segment's total number of matching docs that would
+/// have been scored under the *full* (non-pruned) scoring pass — decoupled
+/// from `candidates.len()` so the block-max WAND early-termination path can
+/// return only the top-`from + max_results` candidates while still reporting
+/// the true total hit count (the doc frequency of the single query term)
+/// down-channel. The general (non-early-termination) path sets it to
+/// `candidates.len()`, preserving its previous behavior exactly —
+/// early-termination is the only path where the two diverge.
 struct SegmentOutput {
     candidates: Vec<HitCandidate>,
     aggs: HashMap<String, AggregationResults>,
+    total_hits: usize,
 }
 
 fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
