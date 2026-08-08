@@ -119,3 +119,80 @@ In priority order (full rationale in chat/PR discussion):
    pay the full synchronous cold-hydration cost.
 9. **Metrics on hydration volume / cache headroom / eviction rate** — this
    failure mode was invisible until pods started dying.
+
+---
+
+# Addendum: post-fix re-run attempt (2026-08-07, PR #59 deployed)
+
+Re-ran the pipeline against staging with #59's fixes live (vector.idx skip,
+streamed downloads, KOSHA_HYDRATE_BYTE_BUDGET=1GiB default). Outcome: **#59's
+OOM fixes are validated — query pods never OOMed all night at 16Gi under
+loads that previously killed them within seconds** (byte-budgeted chunked
+hydration visible in logs). But no clean warm/cold percentile table exists
+yet, for two reasons: five newly-found platform bugs (below), and — decisive
+for the final attempt — a concurrent indexing+search workload against
+`paragraph_index_hnsw` saturated both the ingest pod (6.7/7 cores, segment
+count 1,100+) and the single benchmark query pod's disk cache (LRU war
+between the 26.9GB bench namespace and 15.7GB of paragraph_index_hnsw),
+making any measurement a measurement of contention. The benchmark corpus,
+namespace (`bm25-bench-10m-v2`), and harness all remain in place for a
+re-run on quiet infra.
+
+Measured before contention took over:
+- **Cold hydration throughput ~9.9GB/min (~165MB/s)** from S3, memory-stable
+  (~1.4-2.4GB RSS during hydration vs OOM-at-16Gi before #59).
+- **Cold-first-query cost is architectural**: a broad query hydrates the
+  whole ~27GB namespace before answering (~3-5 min best case) — vs
+  turbopuffer's per-query object-storage reads (their cold p50 = 316ms).
+  Kosha has no comparable "cold percentile" today; its cold story is
+  "namespace warm-up," and should be benchmarked as such (time-to-first-OK +
+  post-warm-up percentiles).
+
+## New bugs found during the re-run (in severity order)
+
+1. **S3 segment durability gap (data-loss risk).** Only the latest flushed
+   segment is synced to S3 per publish (`sync_latest_segment_to_s3`); under
+   the loader's 8-way concurrent batches, 174 of 376 segments were never
+   uploaded — they existed only on the ingest node's NVMe. An ingest node
+   loss = permanent loss of those segments. Worked around via a one-off
+   hostPath→S3 sync from a helper pod. Fix: sync every flushed segment
+   (queue per flush), plus a reconciliation sweep comparing manifest vs S3.
+2. **Tiered compaction silently loses documents.** 10,000,000 →
+   9,975,781 (−24,219, 0.24%) across 4 clean tiered rounds, no crash, no
+   error — reproducible (previous run lost a near-identical 24,310, then
+   attributed to an OOM; this run had no OOM). ~6k docs vanish per
+   32-segment merge round. Needs a unit test asserting merge output
+   doc-count equals input.
+3. **30s HTTP io-timeout makes cold namespaces unqueryable.** Any query
+   outliving `KOSHA_HTTP_IO_TIMEOUT_SECS` (default 30) gets its socket
+   dropped with no error response (client sees RemoteDisconnected), while
+   the server keeps hydrating. Cold queries against 10M-doc namespaces need
+   minutes. Fix: 503 + Retry-After (or progress heartbeat) instead of a
+   silent drop; reconsider the default.
+4. **Hydration S3 GETs have no retry.** Throttled GETs during fan-out
+   bursts WARN and leave the segment incomplete until a future query
+   re-triggers hydration; convergence to a fully-hydrated namespace is
+   flaky. Fix: bounded retries with backoff in `fetch_one`.
+5. **Disk-cache LRU evicts files that in-flight hydration still needs.**
+   When the working set ≈ `KOSHA_CACHE_MAX_BYTES`, eviction deletes
+   just-hydrated files of the same namespace while its tail hydrates —
+   observed incomplete-segment counts climbing 37→128→193 instead of
+   converging. Same class of fix as #58's pinned-aware in-memory eviction,
+   applied to the disk cache: never evict files pinned by an in-flight
+   hydration/request, and fail admission instead when the budget can't hold
+   the request's working set.
+
+Also observed (env, not engine): staging spot-instance reclaims + Karpenter
+consolidation repeatedly killed pods mid-hydration (each replacement
+restarts hydration from zero — no cross-pod cache reuse; the
+`karpenter.sh/do-not-disrupt` annotation stops consolidation but not spot
+reclaims), and a single shared staging deployment cannot isolate a
+benchmark from tenant traffic (CPU, disk cache, and S3 bandwidth are
+pod-global).
+
+## Standing comparison (unchanged)
+
+OpenSearch (2× r8g.large.search, same corpus/queries/protocol): warm
+**12.3/24.8/62.1ms**, "cold" (cache-clear only) **18.5/38.2/98.1ms** —
+tpuf-benchmark reference: warm 13/18/29ms, cold 316/381/559ms. Kosha warm
+percentiles: pending a quiet-infra re-run.

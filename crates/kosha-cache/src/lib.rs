@@ -9,7 +9,7 @@
 //! (segment directories written/read by the indexer and searcher). Keys are
 //! relative paths like `{namespace}/{segment_id}/doc_store.bin`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -40,6 +40,15 @@ pub struct Cache {
     /// Cache keys ordered oldest-touched (front) to most-recently-touched
     /// (back). Touched on both read and write.
     recency: Mutex<VecDeque<String>>,
+    /// Ref-counted set of keys currently in use by an in-flight operation
+    /// (e.g. a hydration batch still writing later files for the same
+    /// segment, or a request actively reading one) — see `pin`/`unpin`.
+    /// `enforce_limit` never evicts a pinned key, however stale: evicting a
+    /// file something still needs doesn't free anything real (the owner
+    /// just re-fetches it), and if an operation's own later writes evict
+    /// its own earlier ones, the operation can spin without ever
+    /// converging — see `pin`'s doc comment for the incident this closes.
+    pinned: Mutex<HashMap<String, usize>>,
 }
 
 impl Cache {
@@ -60,6 +69,7 @@ impl Cache {
             max_bytes,
             total_bytes: AtomicU64::new(total_bytes),
             recency: Mutex::new(recency),
+            pinned: Mutex::new(HashMap::new()),
         };
         cache.enforce_limit();
         cache
@@ -127,7 +137,52 @@ impl Cache {
         recency.push_back(key.to_string());
     }
 
-    /// Evict least-recently-used files until `total_bytes` is within bound.
+    /// Mark `key` as in-use by an in-flight operation — `enforce_limit`
+    /// skips pinned entries regardless of age. Ref-counted: nested or
+    /// concurrent pins on the same key (e.g. two hydration batches that
+    /// both touch a shared file) are safe, and the key only becomes
+    /// evictable again once every `pin` has a matching `unpin`.
+    ///
+    /// Typical use: pin every file in a hydration batch before fetching
+    /// any of them, unpin them all once the batch (not just one file) is
+    /// done — so a later file's write in the same batch can never evict an
+    /// earlier file's write from the same batch. Without this, a working
+    /// set close to `max_bytes` could make hydration spin: each new file
+    /// written evicts an already-hydrated one, so the segment never
+    /// finishes converging (observed in production as an incomplete-
+    /// segment count climbing — 37→128→193 — instead of shrinking).
+    pub fn pin(&self, key: &str) {
+        *self
+            .pinned
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// Release one pin taken by `pin`. A mismatched call (unpinning a key
+    /// that isn't pinned) is a silent no-op rather than a panic — cleanup/
+    /// error paths must be able to call this unconditionally.
+    pub fn unpin(&self, key: &str) {
+        let mut pinned = self.pinned.lock().unwrap();
+        if let Some(count) = pinned.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                pinned.remove(key);
+            }
+        }
+    }
+
+    /// True if `key` currently has at least one outstanding pin.
+    pub fn is_pinned(&self, key: &str) -> bool {
+        self.pinned.lock().unwrap().contains_key(key)
+    }
+
+    /// Evict least-recently-used, *unpinned* files until `total_bytes` is
+    /// within bound. Pinned entries (see `pin`) are never chosen as a
+    /// victim, however stale; if every remaining entry is pinned, eviction
+    /// stops even while still over budget — the same "nothing safe left to
+    /// evict" fallback as a single file bigger than the whole bound.
     fn enforce_limit(&self) {
         let Some(max) = self.max_bytes else {
             return;
@@ -136,12 +191,15 @@ impl Cache {
             if self.total_bytes.load(Ordering::Relaxed) <= max {
                 return;
             }
-            let oldest = {
-                let mut recency = self.recency.lock().unwrap();
-                recency.pop_front()
+            let victim = {
+                let recency = self.recency.lock().unwrap();
+                let pinned = self.pinned.lock().unwrap();
+                recency
+                    .iter()
+                    .find(|key| !pinned.contains_key(key.as_str()))
+                    .cloned()
             };
-            let Some(key) = oldest else {
-                // Nothing left to evict (single file bigger than the bound).
+            let Some(key) = victim else {
                 return;
             };
             let _ = self.evict(&key);
@@ -385,6 +443,108 @@ mod tests {
         assert!(cache.total_size() <= 100);
         assert!(cache.get("first").is_none());
         assert!(cache.get("second").is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the BM25 benchmark re-run's bug #5
+    /// (`scripts/bench/bm25_scale/RESULTS.md`): "disk-cache LRU evicts
+    /// files that in-flight hydration still needs." "first" is oldest and
+    /// would normally be the LRU victim (as in
+    /// `eviction_bounds_total_size_lru_first`), but it's pinned here — the
+    /// sweep must skip it and fall through to "second" (next-oldest,
+    /// unpinned) instead of either evicting a pinned key or refusing to
+    /// evict anything at all.
+    #[test]
+    fn pinned_entries_are_skipped_in_favor_of_the_next_oldest_unpinned_entry() {
+        let dir = std::env::temp_dir().join("kosha-test-cache-pin");
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_max_bytes(dir.clone(), Some(200));
+
+        cache.put_bytes("first", &[0u8; 60]).unwrap();
+        cache.pin("first");
+        cache.put_bytes("second", &[0u8; 60]).unwrap();
+        cache.put_bytes("third", &[0u8; 60]).unwrap();
+        // Total so far: 180, under 200 — no eviction yet.
+        assert!(cache.get("first").is_some());
+        assert!(cache.get("second").is_some());
+        assert!(cache.get("third").is_some());
+
+        // Pushes total to 240 > 200: "first" is oldest but pinned, so
+        // "second" (next-oldest, unpinned) must be the one evicted instead.
+        cache.put_bytes("fourth", &[0u8; 60]).unwrap();
+        assert!(
+            cache.get("first").is_some(),
+            "a pinned entry must survive eviction even though it's the oldest"
+        );
+        assert!(
+            cache.get("second").is_none(),
+            "eviction must fall through to the next-oldest *unpinned* entry"
+        );
+        assert!(cache.get("third").is_some());
+        assert!(cache.get("fourth").is_some());
+
+        // Once unpinned, "first" becomes evictable again like any other
+        // stale entry — pinning isn't a permanent exemption.
+        cache.unpin("first");
+        cache.put_bytes("fifth", &[0u8; 60]).unwrap();
+        assert!(
+            cache.get("first").is_none(),
+            "unpinning must restore normal LRU eligibility"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// When *everything* remaining is pinned, eviction must give up rather
+    /// than evict a pinned key — the same "nothing safe left to evict"
+    /// fallback as a single file bigger than the whole bound.
+    #[test]
+    fn enforce_limit_stops_when_every_remaining_entry_is_pinned() {
+        let dir = std::env::temp_dir().join("kosha-test-cache-pin-all");
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_max_bytes(dir.clone(), Some(100));
+
+        // Pin both keys *before* writing them — `pin` doesn't require the
+        // key to exist yet, and pinning after the write that would trigger
+        // eviction is too late (enforce_limit runs synchronously inside
+        // that same write, before a subsequent `pin` call could land).
+        cache.pin("first");
+        cache.pin("second");
+        cache.put_bytes("first", &[0u8; 60]).unwrap();
+        cache.put_bytes("second", &[0u8; 60]).unwrap();
+        // Total is 120 > 100, but both entries are pinned — nothing evictable.
+        assert!(cache.total_size() > 100);
+        assert!(cache.get("first").is_some());
+        assert!(cache.get("second").is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pin_is_ref_counted_and_unpin_is_safe_on_an_unpinned_key() {
+        let dir = std::env::temp_dir().join("kosha-test-cache-pin-refcount");
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_max_bytes(dir.clone(), Some(100));
+
+        cache.put_bytes("first", &[0u8; 60]).unwrap();
+        cache.pin("first");
+        cache.pin("first"); // two concurrent pins on the same key
+        cache.unpin("first"); // only one released — still pinned
+        assert!(cache.is_pinned("first"));
+
+        cache.put_bytes("second", &[0u8; 60]).unwrap();
+        assert!(
+            cache.get("first").is_some(),
+            "one remaining pin must still block eviction"
+        );
+
+        cache.unpin("first"); // second (matching) release
+        assert!(!cache.is_pinned("first"));
+
+        // Unpinning an already-unpinned (or never-pinned) key must not panic.
+        cache.unpin("first");
+        cache.unpin("never-pinned-key");
 
         let _ = fs::remove_dir_all(&dir);
     }

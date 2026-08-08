@@ -416,6 +416,21 @@ impl S3Storage {
         })
     }
 
+    /// Whether S3 actually has *any* object under `logical_dir` — a
+    /// ground-truth durability check, unlike `StorageBackend::exists`
+    /// (which only checks local disk) or `list_with_sizes`/`list` (which
+    /// fall back to local on an empty S3 listing, so they can't distinguish
+    /// "durable in S3" from "only ever existed on this node's disk"). Used
+    /// by the ingest-pod boot-time reconciliation sweep (`AppState::new`)
+    /// to find segments that a prior process crashed or raced before
+    /// uploading — see `sync_unsynced_segments_to_s3`'s doc comment for the
+    /// incident this closes.
+    pub fn segment_durable_in_s3(&self, logical_dir: &str) -> bool {
+        self.list_remote_with_sizes(logical_dir)
+            .map(|entries| !entries.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Like the `StorageBackend::list` trait method (same remote-first,
     /// local-fallback behavior for cold nodes), but also returns each
     /// entry's size in bytes — see `list_remote_with_sizes`.
@@ -444,8 +459,77 @@ impl S3Storage {
     }
 }
 
+/// Bounded retries for one S3 GET, exponential backoff starting at 100ms.
+///
+/// Fixes: a throttled/transient GET during a hydration fan-out burst used
+/// to WARN once and give up, leaving that segment permanently incomplete
+/// until some *future* query happened to re-trigger hydration for it —
+/// convergence to a fully-hydrated namespace was flaky, worse the busier
+/// S3 was (i.e. worse exactly when hydration fan-out is largest). 4
+/// attempts total, ~100+200+400ms of backoff between them — enough to ride
+/// out a brief throttle without turning a genuinely-missing/permission-
+/// denied object into a long hang.
+const FETCH_MAX_ATTEMPTS: u32 = 4;
+
+/// The backoff delay before each retry (not the initial attempt) — a plain
+/// `Vec` rather than inlined into `get_object_with_retry`'s loop so the
+/// schedule itself (attempt count, doubling, starting value) has a direct,
+/// network-free unit test.
+fn retry_backoff_schedule() -> Vec<std::time::Duration> {
+    let mut delay = std::time::Duration::from_millis(100);
+    let mut schedule = Vec::new();
+    for _ in 1..FETCH_MAX_ATTEMPTS {
+        schedule.push(delay);
+        delay *= 2;
+    }
+    schedule
+}
+
+async fn get_object_with_retry(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> Result<aws_sdk_s3::primitives::AggregatedBytes, KoshaError> {
+    let mut backoffs = retry_backoff_schedule().into_iter();
+    let mut last_err = None;
+    for attempt in 1..=FETCH_MAX_ATTEMPTS {
+        let result: Result<_, KoshaError> = async {
+            let resp = client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?;
+            resp.body
+                .collect()
+                .await
+                .map_err(|e| KoshaError::NotFound(format!("S3 read body: {e}")))
+        }
+        .await;
+
+        match result {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                if let Some(delay) = backoffs.next() {
+                    eprintln!(
+                        "WARN: S3 get_object for {key} failed (attempt {attempt}/{FETCH_MAX_ATTEMPTS}): \
+                         {e}; retrying in {delay:?}"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    // Loop only exits without an early return once every attempt failed —
+    // last_err is always Some(_) at that point.
+    Err(last_err.expect("at least one attempt runs, so an exhausted loop always has an error"))
+}
+
 /// Fetch one logical path for [`S3Storage::read_many`]: serve from local
-/// disk if already present, otherwise GET from S3 and persist it there.
+/// disk if already present, otherwise GET from S3 (with bounded retry —
+/// see [`get_object_with_retry`]) and persist it there.
 ///
 /// Returns `()`, not the fetched bytes — every caller of `read_many` only
 /// ever wants "is this file on disk now," so a cache hit here is a pure
@@ -464,25 +548,12 @@ async fn fetch_one(
     }
 
     let s3_key = join_s3_key(prefix, path);
-
-    let resp = client
-        .get_object()
-        .bucket(bucket)
-        .key(&s3_key)
-        .send()
-        .await
-        .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?;
-    let bytes = resp
-        .body
-        .collect()
-        .await
-        .map_err(|e| KoshaError::NotFound(format!("S3 read body: {e}")))?
-        .into_bytes();
+    let bytes = get_object_with_retry(client, bucket, &s3_key).await?;
 
     if let Some(parent) = local_path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    tokio::fs::write(&local_path, &bytes)
+    tokio::fs::write(&local_path, bytes.into_bytes())
         .await
         .map_err(KoshaError::Io)?;
 
@@ -555,6 +626,27 @@ fn local_list_with_zero_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the BM25 benchmark re-run's bug #4
+    /// (`scripts/bench/bm25_scale/RESULTS.md`): "hydration S3 GETs have no
+    /// retry." A throttled/transient GET during a fan-out burst used to
+    /// WARN once and leave the segment permanently incomplete. This checks
+    /// the schedule `get_object_with_retry` actually retries against
+    /// (attempt count, doubling, starting value) without needing a live S3
+    /// endpoint.
+    #[test]
+    fn retry_backoff_schedule_doubles_from_100ms_for_three_retries() {
+        let schedule = retry_backoff_schedule();
+        assert_eq!(
+            schedule,
+            vec![
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(200),
+                std::time::Duration::from_millis(400),
+            ],
+            "FETCH_MAX_ATTEMPTS=4 total attempts means 3 retries between them"
+        );
+    }
 
     #[test]
     fn s3_key_joins_prefix() {

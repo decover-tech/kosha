@@ -132,6 +132,16 @@ struct AppState {
     /// memory — see `hydrate_from_s3_budgeted`/`chunk_by_byte_budget`.
     #[cfg(feature = "s3")]
     hydrate_byte_budget: u64,
+    /// Segments this process has confirmed are durably uploaded to S3 (every
+    /// file present, not just the local directory) — see
+    /// `sync_unsynced_segments_to_s3`. Keyed by `(namespace, segment_id)`
+    /// rather than local path since it's checked before the segment
+    /// necessarily has a local directory reference at hand in every caller.
+    /// Populated by the boot-time reconciliation sweep and by every
+    /// successful `sync_to_s3` thereafter; never removed (segments are
+    /// immutable, so once durable, always durable).
+    #[cfg(feature = "s3")]
+    synced_segments: Mutex<std::collections::HashSet<(NamespaceId, kosha_core::SegmentId)>>,
     /// Segments currently being hydrated from S3, keyed by local segment
     /// path. Guards against every concurrent request against a cold
     /// namespace independently re-fetching the same segments — see
@@ -349,6 +359,73 @@ fn hydration_wants_file(name: &str, needs_vectors: bool) -> bool {
     needs_vectors || name != "vector.idx"
 }
 
+/// Segments in `manifest` not yet recorded as synced in `synced`, in
+/// manifest order.
+///
+/// Pure/testable half of `sync_unsynced_segments_to_s3`'s fix: the bug it
+/// closes was re-deriving "the segment(s) to sync" from the manifest as
+/// just "whichever one is last" on every call, which under concurrent
+/// flushes could skip segments a *different* concurrent publish call also
+/// thought weren't its job. Driving the decision off a durable synced-set
+/// instead — "everything not yet recorded, regardless of position" — is
+/// what this function tests in isolation from any actual S3 I/O.
+#[cfg(feature = "s3")]
+fn segments_needing_sync<'a>(
+    manifest: &'a kosha_core::Manifest,
+    synced: &std::collections::HashSet<(NamespaceId, kosha_core::SegmentId)>,
+    ns: &NamespaceId,
+) -> Vec<&'a kosha_core::ManifestEntry> {
+    manifest
+        .segments
+        .iter()
+        .filter(|e| !synced.contains(&(ns.clone(), e.segment_id.clone())))
+        .collect()
+}
+
+/// Upload every file in `seg_dir` to S3. Returns `true` only if every file
+/// uploaded successfully — a partial upload must not be treated as durable.
+///
+/// Free function (not an `AppState` method) so both `AppState::sync_to_s3`
+/// and the boot-time reconciliation sweep in `AppState::new` — which runs
+/// before `self` exists — can share it.
+#[cfg(feature = "s3")]
+fn sync_segment_dir_to_s3(s3: &s3_storage::S3Storage, data_dir: &Path, seg_dir: &Path) -> bool {
+    if !seg_dir.exists() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(seg_dir) else {
+        return false;
+    };
+    let mut all_ok = true;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let rel = seg_dir
+            .strip_prefix(data_dir)
+            .unwrap_or(seg_dir)
+            .to_string_lossy();
+        let s3_path = format!("{rel}/{name}");
+        match std::fs::read(&path) {
+            Ok(data) => {
+                if let Err(e) = s3.write(&s3_path, &data) {
+                    eprintln!("WARN: S3 upload failed for {s3_path}: {e}");
+                    all_ok = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("WARN: failed to read {s3_path} for upload: {e}");
+                all_ok = false;
+            }
+        }
+    }
+    all_ok
+}
+
 impl AppState {
     fn new(data_dir: PathBuf) -> Self {
         std::fs::create_dir_all(&data_dir).ok();
@@ -510,12 +587,66 @@ impl AppState {
         // indexed namespaces vanish from search after a restart. Segment
         // files are re-fetched from S3 lazily at search/write time
         // (`ensure_segments_local`) when local disk is ephemeral.
+        //
+        // Query pods forward every write elsewhere (KOSHA_INGEST_HOST set)
+        // and so never call publish_namespace/sync_to_s3 themselves — only
+        // the ingest pod needs `synced_segments` seeded at all. Gating the
+        // reconciliation sweep below on that (rather than running it
+        // unconditionally on every pod) avoids adding S3 list_objects_v2
+        // calls per segment to every query-pod boot/HPA scale-out, which
+        // would work directly against the "gate readiness on actual
+        // warmth" goal.
+        #[cfg(feature = "s3")]
+        let is_ingest_role = std::env::var("KOSHA_INGEST_HOST")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .is_none();
+        #[cfg(feature = "s3")]
+        let mut synced_segments = std::collections::HashSet::new();
         let mut restored = 0usize;
         let mut restored_segments = 0usize;
+        #[cfg(feature = "s3")]
+        let mut reconciled_missing = 0usize;
         for ns in control_store.list_namespaces() {
             if let Some(manifest) = control_store.manifest_cloned(&ns) {
                 if !manifest.segments.is_empty() {
                     restored_segments += manifest.segments.len();
+
+                    // ── Boot-time S3 durability reconciliation ──────────
+                    // Closes the gap `sync_unsynced_segments_to_s3`'s doc
+                    // comment describes for data already affected by it
+                    // before this fix: a segment this process never
+                    // confirmed as uploaded (fresh in-memory
+                    // `synced_segments`, always empty at boot) gets a
+                    // ground-truth S3 check here rather than waiting for
+                    // this namespace's *next* flush to notice — which, for
+                    // an otherwise-idle namespace, might be never.
+                    #[cfg(feature = "s3")]
+                    if is_ingest_role {
+                        if let Some(ref s3) = s3_storage {
+                            for entry in &manifest.segments {
+                                let rel = format!("{}/{}", ns.0, entry.segment_id.0);
+                                if s3.segment_durable_in_s3(&rel) {
+                                    synced_segments.insert((ns.clone(), entry.segment_id.clone()));
+                                    continue;
+                                }
+                                let seg_path = data_dir.join(&ns.0).join(&entry.segment_id.0);
+                                if sync_segment_dir_to_s3(s3, &data_dir, &seg_path) {
+                                    synced_segments.insert((ns.clone(), entry.segment_id.clone()));
+                                    reconciled_missing += 1;
+                                    println!(
+                                        "reconciliation: uploaded segment missing from S3: {rel}"
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "WARN: reconciliation found segment {rel} durable in \
+                                         neither S3 nor local disk — data loss, cannot recover"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     indexer.restore_manifest(ns, manifest);
                     restored += 1;
                 }
@@ -526,6 +657,13 @@ impl AppState {
             cache.root().display(),
             cache.total_size()
         );
+        #[cfg(feature = "s3")]
+        if reconciled_missing > 0 {
+            println!(
+                "reconciliation: uploaded {reconciled_missing} segment(s) that were missing \
+                 from S3 at boot"
+            );
+        }
 
         let ingest_host = std::env::var("KOSHA_INGEST_HOST")
             .ok()
@@ -570,6 +708,8 @@ impl AppState {
                 .and_then(|v| v.parse().ok())
                 .filter(|n| *n > 0)
                 .unwrap_or(1024 * 1024 * 1024),
+            #[cfg(feature = "s3")]
+            synced_segments: Mutex::new(synced_segments),
             #[cfg(feature = "s3")]
             in_flight_segments: Mutex::new(HashMap::new()),
             // Each hydration operation can itself fan out up to
@@ -621,58 +761,71 @@ impl AppState {
         }
     }
 
-    /// After a flush: persist the manifest and upload the new segment to S3.
+    /// After a flush: persist the manifest and upload any not-yet-synced
+    /// segment(s) to S3.
     fn publish_namespace(&self, ns: &NamespaceId) {
         self.persist_manifest(ns);
         #[cfg(feature = "s3")]
-        self.sync_latest_segment_to_s3(ns);
+        self.sync_unsynced_segments_to_s3(ns);
     }
 
-    /// Upload only the newest segment for `ns` to S3.
+    /// Upload every segment in `ns`'s current manifest that this process
+    /// hasn't already durably synced to S3.
     ///
-    /// Segments are immutable and every flush publishes immediately after
-    /// appending exactly one segment, so re-uploading the full manifest on
-    /// each flush is unnecessary and turns a bulk backfill into O(n²) S3
-    /// work as the segment count grows.
+    /// Used to upload only `manifest.segments.last()` — correct for one
+    /// flush at a time, but not under concurrent flushes: the bulk loader's
+    /// N-way concurrent batches can each trigger an auto-flush, and two
+    /// `publish_namespace` calls racing each other can both read the
+    /// manifest *after* both flushes appended, so both see the same
+    /// segment as "last" — whichever segment got superseded as "last" by a
+    /// later append before its own publish call ran was never uploaded by
+    /// anyone. This is what caused 174 of 376 segments in a real benchmark
+    /// run to exist only on the ingest node's local disk: an ingest node
+    /// loss would have been a permanent, silent loss of that data.
+    ///
+    /// Tracking exactly which segments this process has already uploaded
+    /// (`synced_segments`) and re-scanning the whole current manifest on
+    /// every publish call closes the race: whichever call runs — first,
+    /// last, concurrently with others — picks up everything still
+    /// outstanding, and steady-state (one flush at a time) still only
+    /// re-examines one new segment per call, same cost as before.
     #[cfg(feature = "s3")]
-    fn sync_latest_segment_to_s3(&self, ns: &NamespaceId) {
+    fn sync_unsynced_segments_to_s3(&self, ns: &NamespaceId) {
         let Some(manifest) = self.indexer.manifest_cloned(ns) else {
             return;
         };
-        let Some(entry) = manifest.segments.last() else {
-            return;
+        let pending: Vec<kosha_core::SegmentId> = {
+            let synced = self.synced_segments.lock().unwrap();
+            segments_needing_sync(&manifest, &synced, ns)
+                .into_iter()
+                .map(|e| e.segment_id.clone())
+                .collect()
         };
-        let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
-        self.sync_to_s3(&seg_path);
-    }
-
-    /// Sync a segment directory to S3 (after flush).
-    #[cfg(feature = "s3")]
-    fn sync_to_s3(&self, seg_dir: &PathBuf) {
-        if let Some(ref s3) = self.s3_storage {
-            if !seg_dir.exists() {
-                return;
-            }
-            if let Ok(entries) = std::fs::read_dir(seg_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            let rel = seg_dir
-                                .strip_prefix(&self.data_dir)
-                                .unwrap_or(seg_dir)
-                                .to_string_lossy();
-                            let s3_path = format!("{rel}/{name}");
-                            if let Ok(data) = std::fs::read(&path) {
-                                if let Err(e) = s3.write(&s3_path, &data) {
-                                    eprintln!("WARN: S3 upload failed for {s3_path}: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
+        for segment_id in pending {
+            let seg_path = self.data_dir.join(&ns.0).join(&segment_id.0);
+            // Only mark synced on full success — a partial failure (some
+            // files uploaded, some didn't) must be retried by a future
+            // publish call, never treated as durable.
+            if self.sync_to_s3(&seg_path) {
+                self.synced_segments
+                    .lock()
+                    .unwrap()
+                    .insert((ns.clone(), segment_id));
             }
         }
+    }
+
+    /// Sync a segment directory to S3. Returns `true` only if every file in
+    /// the directory uploaded successfully — callers use this to decide
+    /// whether the segment is now durable (see `sync_unsynced_segments_to_s3`
+    /// and the boot-time reconciliation sweep in `AppState::new`); a partial
+    /// upload must not be recorded as done.
+    #[cfg(feature = "s3")]
+    fn sync_to_s3(&self, seg_dir: &Path) -> bool {
+        let Some(ref s3) = self.s3_storage else {
+            return false;
+        };
+        sync_segment_dir_to_s3(s3, &self.data_dir, seg_dir)
     }
 
     /// The files that must all be present for a segment to be usable by the
@@ -792,7 +945,21 @@ impl AppState {
                 );
                 outcome.files_fetched += logical_paths.len();
                 outcome.bytes_fetched += logical_paths.iter().map(|(_, size)| size).sum::<u64>();
+                // Pin every file in this batch for its whole duration —
+                // otherwise a later file's write in the *same* batch can
+                // evict an earlier file's write from the same batch once
+                // the working set gets close to KOSHA_CACHE_MAX_BYTES,
+                // which makes hydration spin without ever converging
+                // (observed in production as an incomplete-segment count
+                // climbing — 37→128→193 — instead of shrinking). Unpinned
+                // unconditionally afterward regardless of outcome.
+                for (path, _) in &logical_paths {
+                    self.cache.pin(path);
+                }
                 self.hydrate_from_s3_budgeted(s3, &logical_paths);
+                for (path, _) in &logical_paths {
+                    self.cache.unpin(path);
+                }
             }
 
             drop(_permit);
@@ -1012,10 +1179,28 @@ fn main() {
     let role = std::env::var("KOSHA_ROLE").unwrap_or_else(|_| "query".into());
     let port = std::env::var("KOSHA_HTTP_PORT").unwrap_or_else(|_| "8080".into());
     let data_dir = std::env::var("KOSHA_DATA_DIR").unwrap_or_else(|_| "/var/lib/kosha/data".into());
+    // `set_read_timeout`/`set_write_timeout` (see `serve`) are per-syscall,
+    // not a connection-lifetime budget — a handler that takes far longer
+    // than this to produce a response still delivers it fine, as long as
+    // the read of the request and the write of the response each
+    // individually complete within the window (see
+    // `slow_handler_still_delivers_its_response_after_short_io_timeout_elapses`).
+    // So this isn't a per-request processing deadline; it only needs to
+    // bound how long a stalled/malicious client can hold a handler thread
+    // hostage (the original motivation — see `stalled_connection_does_not_
+    // block_healthz`). 30s was tuned for that, not for how long a cold
+    // namespace's first query can legitimately take: a broad search that
+    // has to hydrate an entire large namespace from S3 can take minutes
+    // (~3-5 min observed for a ~27GB namespace), and every read/write on
+    // that connection was still individually fast — so 30s was never
+    // actually the bottleneck for *this* case, but see this file's
+    // "Follow-ups" note in the BM25 benchmark RESULTS.md for the more
+    // fundamental fix (a fast, honest 503 + Retry-After / progress signal
+    // instead of a client just waiting in silence either way).
     let io_timeout_secs: u64 = std::env::var("KOSHA_HTTP_IO_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
+        .unwrap_or(300);
     let addr = format!("0.0.0.0:{port}");
 
     let state = Arc::new(AppState::new(PathBuf::from(data_dir.clone())));
@@ -2558,6 +2743,50 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Regression for the S3 durability gap this fixes: 174 of 376
+    /// segments in a real benchmark run were never uploaded because
+    /// `publish_namespace` used to sync only `manifest.segments.last()` —
+    /// under concurrent flushes, two publish calls could both see a
+    /// different segment as "last" and each assume the other one wasn't
+    /// theirs to upload. Driving sync off a durable synced-set instead must
+    /// find *every* not-yet-synced segment, not just whichever is newest.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn segments_needing_sync_finds_everything_not_yet_recorded_synced() {
+        let ns = NamespaceId("bench".into());
+        let manifest = kosha_core::Manifest {
+            version: 3,
+            segments: vec![
+                kosha_core::ManifestEntry {
+                    segment_id: kosha_core::SegmentId("seg-1".into()),
+                    doc_count: 10,
+                },
+                kosha_core::ManifestEntry {
+                    segment_id: kosha_core::SegmentId("seg-2".into()),
+                    doc_count: 10,
+                },
+                kosha_core::ManifestEntry {
+                    segment_id: kosha_core::SegmentId("seg-3".into()),
+                    doc_count: 10,
+                },
+            ],
+        };
+        // Simulate: an earlier publish call already confirmed seg-2
+        // synced (e.g. it was "last" at the time it ran), but seg-1 and
+        // seg-3 — including seg-3, the segment that's actually "last" in
+        // the current manifest — are still outstanding.
+        let mut synced = std::collections::HashSet::new();
+        synced.insert((ns.clone(), kosha_core::SegmentId("seg-2".into())));
+
+        let pending = segments_needing_sync(&manifest, &synced, &ns);
+        let pending_ids: Vec<&str> = pending.iter().map(|e| e.segment_id.0.as_str()).collect();
+        assert_eq!(
+            pending_ids,
+            vec!["seg-1", "seg-3"],
+            "must find every unsynced segment (including non-'last' seg-1), not just the newest"
+        );
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn hydration_wants_file_skips_vector_idx_unless_needed() {
@@ -3405,6 +3634,56 @@ mod tests {
         let mut resp = String::new();
         s.read_to_string(&mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "response: {resp}");
+    }
+
+    /// Regression/documentation for the BM25 benchmark re-run's bug #3
+    /// (`scripts/bench/bm25_scale/RESULTS.md`): "30s HTTP io-timeout makes
+    /// cold namespaces unqueryable." `serve` sets `set_read_timeout`/
+    /// `set_write_timeout` once, right after `accept()` — this confirms
+    /// that's a per-syscall timeout, not a connection-lifetime budget: a
+    /// handler that takes far longer than `io_timeout` to produce a
+    /// response must still deliver it, as long as the write of the
+    /// response itself (once finally invoked) completes within the window.
+    /// If a future change made this a cumulative per-connection deadline
+    /// instead, cold queries against large namespaces would go back to
+    /// being silently dropped with no response — exactly the incident this
+    /// guards against.
+    #[test]
+    fn slow_handler_still_delivers_its_response_after_short_io_timeout_elapses() {
+        use std::io::Read;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let io_timeout = Duration::from_millis(200);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                stream.set_read_timeout(Some(io_timeout)).ok();
+                stream.set_write_timeout(Some(io_timeout)).ok();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    // Stand-in for a cold-hydration search: work that
+                    // outlives io_timeout many times over, with no socket
+                    // I/O at all while it runs.
+                    std::thread::sleep(io_timeout * 5);
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+                });
+            }
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(b"GET /slow HTTP/1.1\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK"),
+            "a slow-to-produce response must still arrive, not be silently dropped: {resp:?}"
+        );
     }
 
     fn parse(response: &str) -> (&str, &str, &str) {
