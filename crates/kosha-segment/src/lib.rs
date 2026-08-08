@@ -854,6 +854,14 @@ impl SegmentReader {
     pub fn footer(&self) -> &Footer {
         &self.footer
     }
+    /// The segment's on-disk directory (`{data_dir}/{namespace}/{segment_id}`).
+    /// Used by the query path to identify which segments hold the materialize
+    /// page hits, so `doc_store.bin` can be fetched on demand for just those
+    /// segments instead of being hydrated for the whole manifest up front —
+    /// see `Searcher::search_with_doc_store_hydrator`.
+    pub fn segment_dir(&self) -> &Path {
+        &self.segment_dir
+    }
     pub fn doc_count(&self) -> u32 {
         self.footer.doc_count
     }

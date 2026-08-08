@@ -39,3 +39,17 @@ CREATE TABLE IF NOT EXISTS kosha.api_keys (
 -- Index for looking up keys by tenant (admin listings).
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant
     ON kosha.api_keys (tenant_id);
+
+-- ── Cross-replica segment hydration leases ──────────────────────────────────
+-- One row per segment file currently being hydrated from S3 by some query
+-- replica. See kosha-control's `hydration_lease` module (postgres feature)
+-- for the claim/release protocol this backs, and kosha-server's
+-- `ensure_segments_local`/`hydrate_files` for how it's used. `expires_at`
+-- bounds how long a claim survives a replica that crashed or stalled
+-- mid-fetch before another replica may take over.
+CREATE TABLE IF NOT EXISTS kosha.hydration_leases (
+    segment_key TEXT PRIMARY KEY,          -- relative path, e.g. "ns/seg-1/doc_store.bin"
+    owner_addr  TEXT NOT NULL,             -- "host:port" of the owning replica
+    claimed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at  TIMESTAMPTZ NOT NULL
+);
