@@ -1845,6 +1845,30 @@ impl AppState {
         outcome
     }
 
+    /// Per-query posting-blob ensure for the cached-verdict fast path: the
+    /// namespace-level verdict can never cover posting blobs, because they
+    /// are fetched per query term (each term hashes to one of the
+    /// [`kosha_segment::POSTING_BLOB_SHARDS`] shard files). Sub-ms when the
+    /// shards are already local.
+    #[cfg(feature = "s3")]
+    fn ensure_query_posting_blobs(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+        query: &SearchQuery,
+    ) -> HydrationOutcome {
+        let posting_files = posting_blob_files_for_query(query);
+        if posting_files.is_empty() {
+            return HydrationOutcome::default();
+        }
+        let seg_paths: Vec<PathBuf> = manifest
+            .segments
+            .iter()
+            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .collect();
+        self.ensure_posting_blobs_local(&seg_paths, &posting_files)
+    }
+
     #[cfg(feature = "s3")]
     fn ensure_posting_blobs_local(
         &self,
@@ -2805,12 +2829,22 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             .copied()
             .unwrap_or(false);
         let outcome = if cached_complete {
-            HydrationOutcome::default()
+            // The cached verdict can only ever cover the *static* scoring
+            // set (footers/TOCs/offsets/filters). Posting blobs are fetched
+            // per query — each term hashes to one of the 256 shard files —
+            // so a namespace can be "fully hydrated" for every query seen
+            // so far and still lack the shard a fresh term needs. Skipping
+            // this ensure silently scored fresh terms against absent
+            // shards as zero hits (non-deterministically per pod). It is
+            // sub-ms when the shards are already local: one metadata stat
+            // per term-shard per split segment.
+            state.ensure_query_posting_blobs(&ns, &manifest, &query)
         } else {
             let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
-            // Cache the verdict on success: all segments are local for
-            // this manifest version, so future warm queries skip the
-            // whole hydration pass.
+            // Cache the verdict on success: the static scoring set is
+            // local for this manifest version, so future warm queries
+            // skip the per-segment static checks (posting blobs are
+            // still ensured per query above).
             if outcome.missing.is_empty() {
                 state
                     .completed_hydrations
@@ -2969,7 +3003,9 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
             .copied()
             .unwrap_or(false);
         let outcome = if cached_complete {
-            HydrationOutcome::default()
+            // Posting blobs are per-query and outside the cached verdict —
+            // see `handle_search_post` for the full rationale.
+            state.ensure_query_posting_blobs(&ns, &manifest, &query)
         } else {
             let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
             if outcome.missing.is_empty() {
