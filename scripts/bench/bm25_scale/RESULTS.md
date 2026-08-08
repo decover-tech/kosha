@@ -298,3 +298,42 @@ Key phase data for the next optimization round:
   (`POST /v1/admin/backfill-offset-tables`, async/resumable since #68) is
   the migration tool; run it for any namespace still showing
   baseline-like cold bytes.
+
+---
+
+# Addendum: ranged-GET page materialization micro-benchmark (2026-08-07)
+
+Backlog item #2 after scoring-set-only hydration shipped: the materialize
+phase still fetched the **whole** `doc_store.bin` for every segment holding
+a page hit (white_river_paragraph: up to 10 × 295 MB for a 10-hit page →
+materialize = 15.7 s, and those bytes also had to fit under the 20 Gi
+ephemeral-storage limit). The offsets sidecar already knows each hit's
+exact byte span, so materialize now asks for just those spans as S3 ranged
+GETs (`Range: bytes=…`), and `doc_store.bin` never lands on disk at all.
+
+Measured with the local loop, fattened so doc stores dominate
+(`--segs 8 --docs 5000 --words 700` → 40k docs ≈ 4.9 KB each, ~24 MB
+doc store/segment, same corpus reused for both builds; query `"the"`,
+`max_results=10`, 3 cold runs each):
+
+| build | cold materialize (3 runs) | bytes fetched at materialize | cold total (median) |
+|---|---|---|---|
+| main @ `2084816` (whole-file) | 561 / 1503 / 2448 ms | ~190 MB (8 doc stores) | 20,987 ms |
+| ranged-GET branch | 29 / 71 / 180 ms | **41.3 KB** (10 ranged GETs) | 16,296 ms |
+
+**Cold materialize: ~21× faster at the median, ~4,600× fewer bytes** — and
+this is against loopback MinIO, which flatters the whole-file baseline;
+against real S3 with 295 MB objects the gap is what separates 15.7 s from
+one parallel round of KB-sized GETs (tens of ms). Just as important for
+white_river_paragraph: the materialize working set no longer includes doc
+stores, so page materialization can't contribute to the
+ephemeral-storage-eviction loop no matter how large the doc stores grow.
+
+**Trade-off (measured):** warm-path materialize was ~1.5–3 ms when the
+cold query left whole doc stores on local disk; it is now 15–115 ms,
+because every page re-fetches its spans remotely (nothing is persisted —
+deliberately, since a partial `doc_store.bin` on disk would read as
+complete to every existence check). Server-side warm total: 5–10 ms →
+18–121 ms locally. If that ever matters for hot namespaces, the follow-up
+is a small in-memory LRU of materialized doc records keyed by
+`(segment, doc_seq)` — not persisting partial files.

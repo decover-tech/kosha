@@ -1181,6 +1181,38 @@ impl AppState {
         (files, bytes)
     }
 
+    /// Server half of the [`kosha_query::DocStoreHydrator`] contract: fetch
+    /// each materialize-page hit's exact `doc_store.bin` byte span as an S3
+    /// ranged GET (see `S3Storage::read_ranges`). Index-aligned with
+    /// `spans`; `None` marks a failed fetch (the searcher falls back to a
+    /// local read, surfacing the real error if the file is truly absent).
+    ///
+    /// Deliberately outside the disk cache, hydration leases, and the
+    /// hydration semaphore: span bytes are KBs scoped to one in-flight
+    /// response — never persisted (a partial `doc_store.bin` on disk would
+    /// read as complete to every existence check), and small enough that
+    /// cross-replica dedup would cost more coordination than it saves.
+    #[cfg(feature = "s3")]
+    fn fetch_doc_spans(&self, spans: &[kosha_query::DocSpan]) -> Vec<Option<Vec<u8>>> {
+        let Some(ref s3) = self.s3_storage else {
+            return vec![None; spans.len()];
+        };
+        let ranges: Vec<(String, u64, u32)> = spans
+            .iter()
+            .map(|span| {
+                let logical = span
+                    .segment_dir
+                    .strip_prefix(&self.data_dir)
+                    .map(|rel| format!("{}/doc_store.bin", rel.to_string_lossy()))
+                    // Unstrippable path → empty key → that span fails and
+                    // falls back, same as any other fetch error.
+                    .unwrap_or_default();
+                (logical, span.offset, span.length)
+            })
+            .collect();
+        s3.read_ranges(&ranges, self.scoring_hydrate_concurrency)
+    }
+
     /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs into
     /// the local cache, using cross-replica lease coordination when it's
     /// configured (`hydration_leases`) so a segment cold across the whole
@@ -1376,6 +1408,7 @@ impl AppState {
         let term_prune = term_bloom_prune_for_query(query);
         let needs_bloom_check = query.filter.is_some() || term_prune.is_some();
         let needs_vectors = query.knn.is_some();
+        let needs_filters = query_needs_filter_store(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
@@ -1408,7 +1441,8 @@ impl AppState {
             }
             to_hydrate.push(seg_path);
         }
-        let mut outcome = self.ensure_scoring_files_local(&to_hydrate, needs_vectors);
+        let mut outcome =
+            self.ensure_scoring_files_local(&to_hydrate, needs_vectors, needs_filters);
         outcome.files_fetched += footer_files;
         outcome.bytes_fetched += footer_bytes;
         outcome
@@ -1425,11 +1459,18 @@ impl AppState {
     /// which is the *full* set used by the compaction/merge path (those read
     /// every document and must have `doc_store.bin`).
     #[cfg(feature = "s3")]
-    fn segment_is_scoring_complete(seg_path: &Path, needs_vectors: bool) -> bool {
-        for f in ["footer.json", "inverted.idx", "filters.bin"] {
+    fn segment_is_scoring_complete(
+        seg_path: &Path,
+        needs_vectors: bool,
+        needs_filters: bool,
+    ) -> bool {
+        for f in ["footer.json", "inverted.idx"] {
             if !seg_path.join(f).is_file() {
                 return false;
             }
+        }
+        if needs_filters && !seg_path.join("filters.bin").is_file() {
+            return false;
         }
         let doc_access_ok = seg_path.join("doc_store.offsets").is_file()
             || seg_path.join("doc_store.bin").is_file();
@@ -1461,6 +1502,7 @@ impl AppState {
         &self,
         seg_paths: &[PathBuf],
         needs_vectors: bool,
+        needs_filters: bool,
     ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
             return HydrationOutcome::default();
@@ -1468,7 +1510,7 @@ impl AppState {
 
         let mut outcome = HydrationOutcome::default();
         let (owned, waiting) = partition_for_hydration(&self.in_flight_segments, seg_paths, |p| {
-            Self::segment_is_scoring_complete(p, needs_vectors)
+            Self::segment_is_scoring_complete(p, needs_vectors, needs_filters)
         });
 
         if !owned.is_empty() {
@@ -1489,10 +1531,13 @@ impl AppState {
                 // Always-needed scoring files (footer.json was prefetched,
                 // but include it for completeness / resilience to a warm
                 // footer being evicted between the prefetch and here).
-                for f in ["footer.json", "inverted.idx", "filters.bin"] {
+                for f in ["footer.json", "inverted.idx"] {
                     if !seg_path.join(f).exists() {
                         logical_paths.push((format!("{s3_prefix}/{f}"), 0));
                     }
+                }
+                if needs_filters && !seg_path.join("filters.bin").exists() {
+                    logical_paths.push((format!("{s3_prefix}/filters.bin"), 0));
                 }
 
                 // doc_store: Lazy segments need only the offsets sidecar;
@@ -1550,7 +1595,7 @@ impl AppState {
 
         outcome.missing = seg_paths
             .iter()
-            .filter(|p| !Self::segment_is_scoring_complete(p, needs_vectors))
+            .filter(|p| !Self::segment_is_scoring_complete(p, needs_vectors, needs_filters))
             .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
@@ -2407,22 +2452,28 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     let _slot = state.search_semaphore.acquire();
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
 
-    // On-demand `doc_store.bin` for the materialize page: scoring hydrated
-    // only the offsets sidecar for Lazy segments, so the searcher asks back
-    // for `doc_store.bin` per segment holding a returned hit — bounded by
-    // page size, not manifest size.
+    // Ranged-GET page materialization: scoring hydrated only the offsets
+    // sidecar for Lazy segments, and that sidecar already knows each hit's
+    // exact byte span — so the searcher asks back for just those spans. A
+    // 10-hit page costs ~10 KB-sized ranged GETs instead of up to 10 whole
+    // multi-hundred-MB doc stores, and `doc_store.bin` never lands on disk.
     #[cfg(feature = "s3")]
-    let ensure_doc_store = |segs: &[PathBuf]| {
-        let (files, bytes) = state.ensure_files_local(segs, "doc_store.bin");
-        if files > 0 {
+    let fetch_page_spans = |spans: &[kosha_query::DocSpan]| -> Vec<Option<Vec<u8>>> {
+        let t0 = Instant::now();
+        let results = state.fetch_doc_spans(spans);
+        let fetched = results.iter().flatten().count();
+        let bytes: usize = results.iter().flatten().map(Vec::len).sum();
+        if fetched > 0 {
             println!(
-                "page hydrate: fetched {files} doc store(s) ({:.1} MB)",
-                bytes as f64 / (1024.0 * 1024.0),
+                "page hydrate: {fetched} ranged doc GET(s) ({:.1} KB, {:.1} ms)",
+                bytes as f64 / 1024.0,
+                t0.elapsed().as_secs_f64() * 1e3,
             );
         }
+        results
     };
     #[cfg(feature = "s3")]
-    let doc_store_hydrator: DocStoreHydrator<'_> = Some(&ensure_doc_store);
+    let doc_store_hydrator: DocStoreHydrator<'_> = Some(&fetch_page_spans);
     #[cfg(not(feature = "s3"))]
     let doc_store_hydrator: DocStoreHydrator<'_> = None;
 
@@ -2528,20 +2579,25 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     let _slot = state.search_semaphore.acquire();
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
 
-    // On-demand `doc_store.bin` for the materialize page — see
-    // `handle_search_post` for the rationale.
+    // Ranged-GET page materialization — see `handle_search_post` for the
+    // rationale.
     #[cfg(feature = "s3")]
-    let ensure_doc_store = |segs: &[PathBuf]| {
-        let (files, bytes) = state.ensure_files_local(segs, "doc_store.bin");
-        if files > 0 {
+    let fetch_page_spans = |spans: &[kosha_query::DocSpan]| -> Vec<Option<Vec<u8>>> {
+        let t0 = Instant::now();
+        let results = state.fetch_doc_spans(spans);
+        let fetched = results.iter().flatten().count();
+        let bytes: usize = results.iter().flatten().map(Vec::len).sum();
+        if fetched > 0 {
             println!(
-                "page hydrate: fetched {files} doc store(s) ({:.1} MB)",
-                bytes as f64 / (1024.0 * 1024.0),
+                "page hydrate: {fetched} ranged doc GET(s) ({:.1} KB, {:.1} ms)",
+                bytes as f64 / 1024.0,
+                t0.elapsed().as_secs_f64() * 1e3,
             );
         }
+        results
     };
     #[cfg(feature = "s3")]
-    let doc_store_hydrator: DocStoreHydrator<'_> = Some(&ensure_doc_store);
+    let doc_store_hydrator: DocStoreHydrator<'_> = Some(&fetch_page_spans);
     #[cfg(not(feature = "s3"))]
     let doc_store_hydrator: DocStoreHydrator<'_> = None;
 
@@ -3101,6 +3157,20 @@ fn term_bloom_prune_for_query(query: &SearchQuery) -> Option<(Vec<String>, TermB
     }
 }
 
+/// Whether scoring/materialization needs `filters.bin`. Broad lexical
+/// queries with default score/_id ranking do not: they use only postings,
+/// doc metadata, and page doc stores.
+#[cfg(feature = "s3")]
+fn query_needs_filter_store(query: &SearchQuery) -> bool {
+    query.filter.is_some()
+        || !query.aggs.is_empty()
+        || query.sort.iter().any(|spec| {
+            spec.fields
+                .keys()
+                .any(|field| field != "_score" && field != "_id")
+        })
+}
+
 /// Error message for a search that can't proceed because hydrating one or
 /// more required segments from S3 failed — returning results anyway would
 /// silently look like "0 hits" for a namespace that actually has data.
@@ -3467,30 +3537,34 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false),
+            !AppState::segment_is_scoring_complete(&dir, false, false),
             "empty dir must not be scoring-complete"
         );
 
-        for f in [
-            "footer.json",
-            "inverted.idx",
-            "filters.bin",
-            "doc_store.offsets",
-        ] {
+        for f in ["footer.json", "inverted.idx", "doc_store.offsets"] {
             fs::write(dir.join(f), b"x").unwrap();
         }
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false),
-            "offsets sidecar (no doc_store.bin) must be lexical scoring-complete"
+            AppState::segment_is_scoring_complete(&dir, false, false),
+            "offsets sidecar (no doc_store.bin, no filters.bin) must be broad lexical scoring-complete"
         );
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, true),
+            !AppState::segment_is_scoring_complete(&dir, false, true),
+            "queries using filters/sorts/aggs must still require filters.bin"
+        );
+        fs::write(dir.join("filters.bin"), b"x").unwrap();
+        assert!(
+            AppState::segment_is_scoring_complete(&dir, false, true),
+            "filters.bin present must make filter/sort/agg queries scoring-complete"
+        );
+        assert!(
+            !AppState::segment_is_scoring_complete(&dir, true, true),
             "kNN scoring-complete must require vector.idx (still missing)"
         );
 
         fs::write(dir.join("vector.idx"), b"x").unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, true),
+            AppState::segment_is_scoring_complete(&dir, true, true),
             "vector.idx present must make it kNN scoring-complete"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -3509,12 +3583,12 @@ mod tests {
             fs::write(legacy.join(f), b"x").unwrap();
         }
         assert!(
-            AppState::segment_is_scoring_complete(&legacy, false),
+            AppState::segment_is_scoring_complete(&legacy, false, true),
             "legacy segment with doc_store.bin (no offsets) must be scoring-complete"
         );
         fs::remove_file(legacy.join("doc_store.bin")).unwrap();
         assert!(
-            !AppState::segment_is_scoring_complete(&legacy, false),
+            !AppState::segment_is_scoring_complete(&legacy, false, true),
             "legacy segment without offsets and without doc_store.bin is not scorable"
         );
         let _ = fs::remove_dir_all(&legacy);
