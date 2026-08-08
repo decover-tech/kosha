@@ -81,7 +81,7 @@ spec:
                   key: bootstrap-api-key
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10

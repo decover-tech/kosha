@@ -12,7 +12,7 @@ use kosha_core::{
     FieldType, FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry, NamespaceId,
     ScoredDocument, SearchQuery, SearchResult, SortSpec, TermBloomMode,
 };
-use kosha_segment::{tokenize, SegmentReader};
+use kosha_segment::{tokenize, PostingsMemoryAccount, SegmentReader};
 
 /// One materialize-page hit's exact byte span within its segment's
 /// `doc_store.bin`, as reported by the offsets sidecar
@@ -195,6 +195,37 @@ impl MemoryLedger {
             }
             let (guard, _timeout) = self.cv.wait_timeout(st, deadline - now).unwrap();
             st = guard;
+        }
+    }
+}
+
+/// Live-bytes accounting for decoded postings caches (Tier 1 O6).
+///
+/// The postings cache lives inside the segment (per [`PostingsCache`]),
+/// grows after open as queries decode hot terms, and was previously
+/// invisible to this ledger's `live` watermark (`kosha-segment`'s "Not yet
+/// counted" follow-up). Wiring insert/evict/drop deltas here makes aggregate
+/// decoded-postings memory across all open segments count toward admission:
+/// a hot-term or wildcard workload that grows many per-segment caches past
+/// the watermark now blocks/sheds instead of silently walking into an OOM.
+///
+/// Delegates to the same `add_live`/`release_live` the `TrackedSegment`
+/// open-time accounting uses, so postings bytes and parsed-segment bytes
+/// share one `live` counter and one watermark — exactly the safety the
+/// per-segment cap alone couldn't provide at fleet scale.
+impl PostingsMemoryAccount for MemoryLedger {
+    fn add_postings(&self, bytes: u64) {
+        if bytes > 0 {
+            self.add_live(bytes);
+        }
+    }
+    fn release_postings(&self, bytes: u64) {
+        if bytes > 0 {
+            self.release_live(bytes);
+            // `release_live` notifies per release; aggregating many small
+            // releases from a single cache drop would over-notify, but the
+            // cache's snapshot-then-report discipline means one release per
+            // drop, not per evicted entry — so this stays cheap.
         }
     }
 }
@@ -946,7 +977,20 @@ impl Searcher {
         }
         let t_open = Instant::now();
         let approx_bytes = approx_segment_bytes(&seg_dir, load_vectors);
-        let reader = SegmentReader::open_with_footer_options(seg_dir, load_vectors, footer)?;
+        // Wire the segment's decoded-postings cache into the live-bytes
+        // ledger (Tier 1 O6): every insert/evict/drop delta in the segment's
+        // `PostingsCache` is reported through this `Arc<dyn …>`, so
+        // aggregate decoded-postings memory across all open segments counts
+        // toward the admission watermark — the fleet-scale safety the
+        // per-segment cap alone couldn't provide.
+        let postings_account: Arc<dyn PostingsMemoryAccount + Send + Sync> =
+            self.ledger.clone();
+        let reader = SegmentReader::open_with_footer_options(
+            seg_dir,
+            load_vectors,
+            footer,
+            Some(postings_account),
+        )?;
         let tracked = Arc::new(TrackedSegment::new(
             reader,
             approx_bytes,

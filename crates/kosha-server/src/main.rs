@@ -218,6 +218,24 @@ struct AppState {
     /// Namespaces with an offsets-backfill job currently running — one job
     /// per namespace at a time.
     backfill_jobs: Mutex<std::collections::HashSet<String>>,
+    /// Readiness-gated warmup (Tier 1 O2): when `KOSHA_WARMUP_NAMESPACES`
+    /// is set, a background thread prefetches the scoring-set files
+    /// (`footer.json` + `inverted.idx` + `doc_store.offsets` [+ `filters.bin`/
+    /// `vector.idx` per an empty query]) for each listed namespace before the
+    /// pod is marked ready. `warmup_complete` flips to `true` exactly once
+    /// per process, after the warmup pass (success or fail-open — a cold
+    /// fallback still works, only the first-query latency is at stake).
+    ///
+    /// `/readyz` returns 503 while this is `false` and a warmup is in
+    /// flight; `true` (or no configured warmup) returns 200. `/healthz`,
+    /// used for *liveness*, stays always-200 so the restart loop is never
+    /// influenced by a long warmup — the cold-pod incident class from
+    /// RESULTS.md that HPA scale-out kept adding replicas in.
+    warmup_complete: Arc<std::sync::atomic::AtomicBool>,
+    /// Warmup configuration captured at boot: the list of namespaces to
+    /// prefetch, empty when warmup is disabled. Kept on `AppState` so the
+    /// `/readyz` handler can report what's pending.
+    warmup_namespaces: Vec<String>,
     /// `KOSHA_INGEST_HOST` — set only on query-role pods (deployment-query.yaml).
     /// When present, write-path requests this pod receives are forwarded here
     /// instead of executed locally — see `is_write_path`/`forward_to_ingest`.
@@ -782,6 +800,31 @@ impl AppState {
             .ok()
             .filter(|k| !k.is_empty());
 
+        // `KOSHA_WARMUP_NAMESPACES` (Tier 1 O2): a comma-separated list of
+        // namespaces this query pod prefetches the scoring set for before
+        // marking itself ready. Empty (or S3 disabled) → no warmup, pod is
+        // ready immediately. The thread that does the actual fetch is
+        // spawned by `spawn_warmup` from `main`, *after* state construction
+        // (it needs the live `Arc<AppState>`); `warmup_complete` starts
+        // `true` and only flips to `false` when there's work to do.
+        let warmup_namespaces: Vec<String> = std::env::var("KOSHA_WARMUP_NAMESPACES")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !warmup_namespaces.is_empty() {
+            println!(
+                "warmup: configured for {} namespace(s): {}",
+                warmup_namespaces.len(),
+                warmup_namespaces.join(", ")
+            );
+        }
+
         Self {
             controller: Mutex::new(control_store),
             indexer,
@@ -849,6 +892,11 @@ impl AppState {
             internal_auth_key,
             self_ref: Weak::new(),
             backfill_jobs: Mutex::new(std::collections::HashSet::new()),
+            // Warmup starts ready; `spawn_warmup` flips `false` only when
+            // there's configured work to do (and back to `true` on
+            // completion / fail-open). See the field's doc comment.
+            warmup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            warmup_namespaces,
             ingest_host,
             write_http_client,
         }
@@ -862,6 +910,118 @@ impl AppState {
             state.self_ref = weak.clone();
             state
         })
+    }
+
+    /// Kick off the readiness-gated warmup pass (Tier 1 O2), if one is
+    /// configured. Called from `main` after `new_shared`, *before* `serve`,
+    /// so the listener is bound but `/readyz` stays 503 until the prefetch
+    /// finishes — keeping HPA-scaled pods out of the Service endpoints
+    /// while they're still cold-thrashing (the staging incident class in
+    /// RESULTS.md).
+    ///
+    /// Fail-open throughout: a warmup pass that errors leaves
+    /// `warmup_complete` flipped to `true` either way at the end — a cold
+    /// first query still works via the live `hydrate_segments_for_search`
+    /// path, only its latency is at stake, never correctness.
+    fn spawn_warmup(self: &Arc<Self>) {
+        if self.warmup_namespaces.is_empty() {
+            return;
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            // No durable tier → nothing to prefetch; pod is ready as-is.
+            return;
+        }
+        #[cfg(feature = "s3")]
+        {
+            self.warmup_complete
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let state = Arc::clone(self);
+            std::thread::Builder::new()
+                .name("kosha-warmup".into())
+                .spawn(move || state.run_warmup())
+                .expect("failed to spawn warmup thread");
+        }
+    }
+
+    /// Readiness-gate predicate used by the `/readyz` handler: true when no
+    /// warmup is configured or it has finished (success or fail-open). Not a
+    /// health signal — liveness stays on `/healthz`.
+    fn is_ready(&self) -> bool {
+        self.warmup_complete
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "s3")]
+    fn run_warmup(&self) {
+        let start = std::time::Instant::now();
+        let total = self.warmup_namespaces.len();
+        for (idx, ns_name) in self.warmup_namespaces.iter().enumerate() {
+            let ns = NamespaceId(ns_name.clone());
+            let (manifest, tombstones) = {
+                let Some(m) = self.indexer.manifest_cloned(&ns) else {
+                    eprintln!(
+                        "warmup: namespace '{ns_name}' not found in control plane; skipping"
+                    );
+                    continue;
+                };
+                let t = self.indexer.get_tombstones(&ns);
+                (m, t)
+            };
+            if manifest.segments.is_empty() {
+                println!("warmup: '{ns_name}' has no segments; nothing to prefetch");
+                continue;
+            }
+            // Empty query → bloom-prune is a no-op, no posting blobs or
+            // doc spans are fetched — just the scoring scaffolding
+            // (footer.json + inverted.idx + doc_store.offsets) for every
+            // segment in the manifest. The first real query then pays
+            // only for its term shards + page doc spans.
+            let query = kosha_core::SearchQuery {
+                query_text: String::new(),
+                max_results: 0,
+                bm25_params: kosha_core::Bm25Params { k1: 1.2, b: 0.75 },
+                from: 0,
+                filter: None,
+                sort: Vec::new(),
+                search_after: None,
+                highlight: None,
+                aggs: std::collections::HashMap::new(),
+                wildcard: None,
+                match_phrase: None,
+                knn: None,
+            };
+            let t_ns = std::time::Instant::now();
+            let outcome = self.hydrate_segments_for_search(&ns, &manifest, &query);
+            let _ = tombstones;
+            let dur = t_ns.elapsed();
+            if outcome.missing.is_empty() {
+                println!(
+                    "warmup: [{}/{}] '{ns_name}' ready: fetched {} file(s), {:.1} MB in {:.1}s",
+                    idx + 1,
+                    total,
+                    outcome.files_fetched,
+                    outcome.bytes_fetched as f64 / (1024.0 * 1024.0),
+                    dur.as_secs_f64(),
+                );
+            } else {
+                eprintln!(
+                    "warn: warmup: [{}/{}] '{ns_name}' partial — {} segment(s) still missing \
+                     after fetch ({:.1}s); live cold-query fallback (HTTP 503 + client retry) \
+                     will cover the rest",
+                    idx + 1,
+                    total,
+                    outcome.missing.len(),
+                    dur.as_secs_f64(),
+                );
+            }
+        }
+        self.warmup_complete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        println!(
+            "warmup: complete in {:.1}s — pod is ready",
+            start.elapsed().as_secs_f64()
+        );
     }
 
     /// Persist the indexer's current manifest for a namespace into the
@@ -1117,18 +1277,62 @@ impl AppState {
         files: &[(String, u64)],
         concurrency: usize,
     ) {
-        for chunk in chunk_by_byte_budget(files, self.hydrate_byte_budget) {
+        let chunks = chunk_by_byte_budget(files, self.hydrate_byte_budget);
+        let total_chunks = chunks.len();
+        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
             let paths: Vec<String> = chunk.into_iter().map(|(path, _size)| path).collect();
-            for (path, result) in s3.read_many(&paths, concurrency) {
+            let t_chunk = Instant::now();
+            let results = s3.read_many(&paths, concurrency);
+            // Aggregate per-file timing into the cold-read "next lever"
+            // instrument (plan Tier 1 O13): rank-orders GET vs write vs
+            // fan-out so the *next* change (raise concurrency vs skip bytes
+            // vs reduce writes) is chosen from data, not guess. `cached`
+            // files (already local) and failures are tracked separately.
+            let mut fetched = 0u64;
+            let mut bytes = 0u64;
+            let mut get_sum = 0.0f64;
+            let mut write_sum = 0.0f64;
+            let mut get_max = 0.0f64;
+            let mut cached = 0u64;
+            let mut failed = 0u64;
+            for (path, result) in &results {
                 match result {
-                    // read_many already persisted the bytes to disk (same
-                    // root dir as `self.cache`); just tell the cache's
-                    // size/LRU accounting about the new file instead of
-                    // re-writing it.
-                    Ok(()) => self.cache.note_external_write(&path),
-                    Err(e) => eprintln!("WARN: S3 download failed for {path}: {e}"),
+                    Ok(stats) => {
+                        if stats.cached {
+                            cached += 1;
+                        } else {
+                            fetched += 1;
+                            bytes += stats.bytes;
+                            get_sum += stats.get_ms;
+                            write_sum += stats.write_ms;
+                            if stats.get_ms > get_max {
+                                get_max = stats.get_ms;
+                            }
+                        }
+                        self.cache.note_external_write(path);
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("WARN: S3 download failed for {path}: {e}");
+                    }
                 }
             }
+            let wall_ms = t_chunk.elapsed().as_secs_f64() * 1e3;
+            println!(
+                "hydrate_files timing: chunk={}/{} fetched={} cached={} failed={} \
+                 bytes={:.1}MB wall_ms={:.1} get_ms={:.1}(max={:.1}) write_ms={:.1} concurrency={}",
+                chunk_idx + 1,
+                total_chunks,
+                fetched,
+                cached,
+                failed,
+                bytes as f64 / (1024.0 * 1024.0),
+                wall_ms,
+                get_sum,
+                get_max,
+                write_sum,
+                concurrency,
+            );
         }
     }
 
@@ -1795,6 +1999,10 @@ fn main() {
     let addr = format!("0.0.0.0:{port}");
 
     let state = AppState::new_shared(PathBuf::from(data_dir.clone()));
+    // Bind the listener first so a slow warmup doesn't delay the port;
+    // `/readyz` keeps HPA/kube endpoints from sending traffic while it
+    // runs (Tier 1 O2). Liveness (`/healthz`) is unaffected.
+    state.spawn_warmup();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     println!("kosha-server role={role} listening on {addr} data_dir={data_dir}");
 
@@ -1876,6 +2084,32 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         stream
             .write_all(json_ok(&serde_json::json!({"status": "ok"})).as_bytes())
             .ok();
+        return Ok(());
+    }
+
+    // `/readyz` (Tier 1 O2): distinct from `/healthz` (liveness — always
+    // 200) so a query pod mid cold-read-warmup stays alive-but-not-ready
+    // and HPA/kube endpoints remove it from Service rotation until its
+    // configured hot namespaces are prefetched. Probes hit this
+    // unauthenticated, same as `/healthz`.
+    if request_line.starts_with("GET /readyz") || request_line.starts_with("GET /v1/readyz") {
+        if state.is_ready() {
+            stream
+                .write_all(json_ok(&serde_json::json!({"status": "ready"})).as_bytes())
+                .ok();
+        } else {
+            let body = serde_json::json!({
+                "status": "warming",
+                "warmup_namespaces": state.warmup_namespaces,
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: {}\r\n\
+                 content-type: application/json\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).ok();
+        }
         return Ok(());
     }
 
