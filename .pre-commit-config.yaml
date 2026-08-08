@@ -1,5 +1,13 @@
 # Install with: pre-commit install
 # See https://pre-commit.com for usage.
+#
+# `default_install_hook_types` ensures `pre-commit install` also wires up the
+# `prepare-commit-msg` hook used by `kosha-bench-commit-msg` below (which
+# appends the segment_memory cold/warm latency section to each commit). Older
+# clones installed before this option was added need a one-time:
+#   pre-commit install --hook-type prepare-commit-msg
+default_install_hook_types: [pre-commit, prepare-commit-msg]
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -27,3 +35,17 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+
+      # Appends a `---kosha-bench---` section with the current cold + warm
+      # latency from the segment_memory microbench to the commit message
+      # before it is sealed. See scripts/commit_bench_section.sh. Mirrored by
+      # .github/workflows/pre-commit.yml (which amends the same section onto
+      # the PR head commit). Never blocks the commit on a bench failure.
+      - id: kosha-bench-commit-msg
+        name: append segment_memory cold/warm latency section to commit message
+        entry: scripts/commit_bench_section.sh hook
+        language: system
+        stages: [prepare-commit-msg]
+        pass_filenames: false
+        always_run: true
+        minimum_pre_commit_version: "3.2.0"

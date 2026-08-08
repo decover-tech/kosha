@@ -1,0 +1,81 @@
+name: pre-commit
+
+# A "pre-commit" gate that runs the `segment_memory` microbench on each PR,
+# takes the v2 (lazy) cold + warm latency rows, and appends an idempotent
+# `---kosha-bench---` section to the PR head commit message (amending it and
+# force-pushing back to the PR branch). Mirrors the local
+# `kosha-bench-commit-msg` prepare-commit-msg hook in .pre-commit-config.yaml.
+#
+# Skips itself out of the loop: if HEAD already carries the markers (because
+# we just appended the section last run, or because the developer's local
+# hook already did), `scripts/commit_bench_section.sh amend` exits 5 (no-op)
+# and we never push, so the synchronize re-trigger terminates.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+# Don't cancel an in-flight amend/push on the same PR branch — a winning dev
+# push may have already advanced HEAD past the SHA we just amended.
+concurrency:
+  group: pre-commit-${{ github.event.pull_request.head.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # required to force-push the amended commit back to the PR branch
+
+jobs:
+  bench-amend:
+    name: append latency section to PR head commit
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # We push back to the PR branch — only possible for PRs from the same
+    # repo (we can't rewrite commits on a fork).
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run segment_memory, amend HEAD, force-push
+        env:
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          sha_before="$(git rev-parse HEAD)"
+
+          # amend: 0 = amended, 5 = no-op (markers already on HEAD), other = fail.
+          set +e
+          scripts/commit_bench_section.sh amend
+          rc=$?
+          set -e
+          case "$rc" in
+            0) ;;  # amended — fall through to the push below
+            5) echo "kosha bench section already present on HEAD — no amend."; exit 0 ;;
+            *) echo "amend failed (rc=$rc)"; exit "$rc" ;;
+          esac
+
+          sha_after="$(git rev-parse HEAD)"
+          if [ "$sha_before" = "$sha_after" ]; then
+            echo "amend reported success but HEAD SHA unchanged — nothing to push."
+            exit 0
+          fi
+
+          echo "force-pushing amended commit: $sha_before -> $sha_after"
+          # --force-with-lease verifies that the remote ref is still at the
+          # SHA GitHub reported for this event; aborts if another push (e.g.
+          # the dev rebased) advanced the branch underneath us.
+          git push --force-with-lease="refs/heads/$PR_HEAD_REF:$PR_HEAD_SHA" \
+                   origin "$sha_after:refs/heads/$PR_HEAD_REF"
