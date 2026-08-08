@@ -196,3 +196,75 @@ OpenSearch (2× r8g.large.search, same corpus/queries/protocol): warm
 **12.3/24.8/62.1ms**, "cold" (cache-clear only) **18.5/38.2/98.1ms** —
 tpuf-benchmark reference: warm 13/18/29ms, cold 316/381/559ms. Kosha warm
 percentiles: pending a quiet-infra re-run.
+
+---
+
+# Addendum: cold-read baseline (2026-08-08, per-phase instrumentation deployed)
+
+Per-request phase timing (`search timing:` log line — hydrate ms/files/MB,
+queue, admit, score, materialize, cold-vs-cached opens) shipped via PR #63
+and captured with `scripts/capture_cold_baseline.sh` (staging) and
+`scripts/bench/cold_read_local.py` (laptop loop against the repo compose
+stack: MinIO + Postgres). Query text `"the"` (broad, minimal bloom pruning),
+`max_results=10`, fully-cold query tier per run (rollout restart wipes
+emptyDir + in-memory caches).
+
+## Staging results
+
+| namespace | docs / segs | cold | warm |
+|---|---|---|---|
+| `paragraph_index_hnsw_v2` | 99k / 99 | **14.4 s** (converged, 1 attempt) | 33 ms |
+| `paragraph_index_hnsw` | 1.05M / 1103 | **does not converge** | n/a |
+| `white_river_paragraph` | 1.17M / 59 | **does not converge + evicts pods** | n/a |
+| `bm25-bench-10m-v2` | 9.98M / 376 | not attempted (~27 GB working set — strictly worse by the same math) | n/a |
+
+**Converging case breakdown** (`paragraph_index_hnsw_v2`, server-side):
+
+```
+cold: total=13800ms  hydrate=12436ms (90%, 495 files, 2755MB ≈ 222MB/s)
+      score=1360ms (99 cold opens, Σopen=5361ms ≈ 54ms/segment)
+      materialize=2.9ms
+warm: total=33ms     hydrate=0 files  score=11ms  (all 99 opens cached)
+```
+
+**Non-convergence detail.** `paragraph_index_hnsw`: the lexical scoring
+working set (doc stores up to 265 MB/segment, all present in S3) exceeds
+`KOSHA_CACHE_MAX_BYTES` (12 GiB) — the disk LRU reaches a stable
+equilibrium where the same 18 segments are evicted every hydration round;
+every attempt 503s forever. `white_river_paragraph` is worse: its working
+set exceeds the pod's **20 Gi ephemeral-storage limit outright**, so the
+kubelet evicted the pod mid-hydration twice
+(`Evicted: ephemeral local storage usage exceeds the total limit of
+containers 20Gi`) — an eviction→rehydrate→eviction loop that also wipes
+warm caches for unrelated tenant traffic. The app-level LRU cannot help in
+either case: every file on disk is needed by the one in-flight search, so
+nothing is legally evictable.
+
+**Headline: cold read on every production-scale staging namespace is
+currently impossible at any latency.** Scoring-set-only hydration (skip
+`doc_store.bin` — ~70–85% of non-vector segment bytes; fetch it only for
+the top-k page's segments at materialize time) is therefore a correctness
+fix for cold reads, not just a latency optimization.
+
+Also surfaced by the instrumentation:
+- **Footers are fetched twice** on a cold namespace: once by the
+  bloom-prune prefetch, then again inside the full-segment fetch (495
+  files = 99 footers + 99×4 — the segment fetch doesn't exclude the
+  already-local footer). ~300 redundant GETs on a 1103-segment namespace.
+- **Cold opens cost ~54 ms/segment** even with the v2 lazy inverted index
+  (Σopen 5.4 s across 99 segments) — remaining eager work is the filters
+  parse and the per-doc `doc_store.offsets` metas (heap `String` per doc);
+  the arena treatment is the known follow-up.
+- Warm client wall through `kubectl port-forward` measured ~300 ms vs
+  33 ms server-side — port-forward overhead; don't quote client walls from
+  this harness as service latency.
+
+## Local loop (laptop, MinIO — for fast iteration)
+
+8 segs × 2000 docs (Zipf-ish ~900 B docs): cold ≈ **700 ms**, hydrate =
+99% of it (57.8 MB / 48 files); warm ≈ 3 ms. The bytes/files and
+convergence signals reproduce the staging structure exactly and iterate in
+~30 s, so scoring-set-only hydration (and later compression) get validated
+locally first: expected post-fix numbers are ~15–30% of today's hydrate MB
+and 4 fewer files per segment, plus `--budget` below working-set size
+flipping from non-convergent to convergent.

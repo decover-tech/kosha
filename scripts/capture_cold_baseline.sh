@@ -26,13 +26,28 @@ QUERY_TEXT=${QUERY_TEXT:-the}
 say() { printf '\n=== %s ===\n' "$*"; }
 
 port_forward() {
-  kubectl -n "$NS_K8S" port-forward svc/kosha-service "$LOCAL_PORT:8080" >/dev/null 2>&1 &
-  PF_PID=$!
-  trap 'kill "$PF_PID" 2>/dev/null || true' EXIT
-  # Wait for the tunnel.
-  for _ in $(seq 1 30); do
-    curl -sf -o /dev/null "http://127.0.0.1:$LOCAL_PORT/healthz" && return 0
-    sleep 1
+  # Tear down any previous tunnel FULLY (kill + reap) before binding a new
+  # one — respawning while the old kubectl still holds the local port makes
+  # the new one exit instantly and every health check after that fails.
+  if [ -n "${PF_PID:-}" ]; then
+    kill "$PF_PID" 2>/dev/null || true
+    wait "$PF_PID" 2>/dev/null || true
+  fi
+  local tries=0
+  while [ "$tries" -lt 5 ]; do
+    tries=$((tries + 1))
+    kubectl -n "$NS_K8S" port-forward svc/kosha-service "$LOCAL_PORT:8080" >/dev/null 2>&1 &
+    PF_PID=$!
+    trap 'kill "$PF_PID" 2>/dev/null || true' EXIT
+    for _ in $(seq 1 15); do
+      # kubectl already dead (port busy, apiserver hiccup) → respawn.
+      kill -0 "$PF_PID" 2>/dev/null || break
+      curl -sf -o /dev/null "http://127.0.0.1:$LOCAL_PORT/healthz" && return 0
+      sleep 1
+    done
+    kill "$PF_PID" 2>/dev/null || true
+    wait "$PF_PID" 2>/dev/null || true
+    sleep 2
   done
   echo "port-forward to kosha-service never became ready" >&2
   exit 1
@@ -51,13 +66,24 @@ search_once() {
   t0=$(python3 -c 'import time; print(time.time())')
   while :; do
     attempts=$((attempts + 1))
+    # `|| code=000`: curl's own nonzero exit (connection reset — kubectl
+    # port-forward regularly severs long-lived request streams — or
+    # --max-time) must be a retryable outcome, not a silent set -e death.
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 600 \
       -H "Authorization: Bearer $KOSHA_API_KEY" \
       -H 'Content-Type: application/json' \
       -X POST "http://127.0.0.1:$LOCAL_PORT/search" \
-      -d "{\"namespace\": \"$ns\", \"query_text\": \"$QUERY_TEXT\", \"max_results\": 10}")
+      -d "{\"namespace\": \"$ns\", \"query_text\": \"$QUERY_TEXT\", \"max_results\": 10}") || code=000
     [ "$code" = 200 ] && break
-    if [ "$code" != 503 ] || [ "$attempts" -ge 30 ]; then
+    if [ "$code" = 000 ]; then
+      # Connection-level failure: the port-forward may be dead — rebuild it
+      # (port_forward tears down the old tunnel itself).
+      port_forward
+    elif [ "$code" != 503 ]; then
+      echo "  $label: giving up — HTTP $code after $attempts attempt(s)" >&2
+      return 1
+    fi
+    if [ "$attempts" -ge 30 ]; then
       echo "  $label: giving up — HTTP $code after $attempts attempt(s)" >&2
       return 1
     fi
