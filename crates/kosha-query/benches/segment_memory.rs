@@ -17,10 +17,20 @@
 //! cargo bench -p kosha-query --bench segment_memory
 //! # bigger corpus:
 //! KOSHA_BENCH_SEGS=16 KOSHA_BENCH_DOCS=8000 cargo bench -p kosha-query --bench segment_memory
+//! # CI-grade percentiles (p50/p90/p99 need real sample counts):
+//! KOSHA_BENCH_COLD_ITERS=25 KOSHA_BENCH_WARM_ITERS=200 \
+//!   KOSHA_BENCH_JSON=/tmp/bench.json cargo bench -p kosha-query --bench segment_memory
 //! ```
 //!
 //! The corpus is deterministic (fixed-seed LCG, Zipf-ish vocabulary), so
 //! numbers are comparable run to run on the same machine.
+//!
+//! `KOSHA_BENCH_JSON=<path>` additionally writes a machine-readable report
+//! (p50/p90/p99 per metric, both formats) consumed by
+//! `scripts/bench/compare_pr.py` in the `bench-compare` workflow, which
+//! benches a PR's merge-base and head back to back and comments the
+//! before/after table on the PR. The stdout table is unchanged (and is what
+//! `scripts/commit_bench_section.sh` parses).
 
 use std::alloc::System;
 use std::collections::HashMap;
@@ -198,16 +208,43 @@ fn mk_query(text: &str) -> SearchQuery {
     }
 }
 
-fn median_ms(mut samples: Vec<f64>) -> f64 {
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    samples[samples.len() / 2]
+/// Latency distribution summary over one metric's samples (nearest-rank
+/// percentiles). With small sample counts (the local-hook defaults) p90/p99
+/// degrade toward the max — `n` is carried so downstream consumers can tell.
+#[derive(Clone, Copy)]
+struct Dist {
+    n: usize,
+    p50: f64,
+    p90: f64,
+    p99: f64,
+}
+
+impl Dist {
+    fn from_samples(mut samples: Vec<f64>) -> Dist {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |p: f64| {
+            let rank = ((p / 100.0) * samples.len() as f64).ceil() as usize;
+            samples[rank.saturating_sub(1).min(samples.len() - 1)]
+        };
+        Dist {
+            n: samples.len(),
+            p50: pct(50.0),
+            p90: pct(90.0),
+            p99: pct(99.0),
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({ "n": self.n, "p50": self.p50, "p90": self.p90, "p99": self.p99 })
+    }
 }
 
 struct FormatReport {
-    open_ms: f64,
+    open: Dist,
     open_bytes: usize,
-    cold_broad_ms: f64,
-    warm: Vec<(&'static str, f64)>,
+    cold_broad: Dist,
+    /// (table label, JSON key, distribution) per warm query shape.
+    warm: Vec<(&'static str, &'static str, Dist)>,
 }
 
 fn measure_format(root: &Path, ns: &NamespaceId, manifest: &Manifest) -> FormatReport {
@@ -234,14 +271,18 @@ fn measure_format(root: &Path, ns: &NamespaceId, manifest: &Manifest) -> FormatR
 
     // Cold end-to-end broad query: fresh Searcher (empty cache), every
     // segment opened inside the search itself.
+    let cold_iters = env_usize("KOSHA_BENCH_COLD_ITERS", 3);
     let mut cold_samples = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..cold_iters {
         let searcher = Searcher::new(root.to_path_buf());
         let t = Instant::now();
         let r = searcher
             .search(ns, manifest, &mk_query("the"), None)
             .unwrap();
         cold_samples.push(t.elapsed().as_secs_f64() * 1e3);
+        // A zero-hit broad query means the read path is broken, and a broken
+        // read path benches *faster* — fail loudly instead (cf. PR #83).
+        assert!(r.total_hits > 0, "cold broad query returned 0 hits");
         black_box(r.total_hits);
     }
 
@@ -260,28 +301,34 @@ fn measure_format(root: &Path, ns: &NamespaceId, manifest: &Manifest) -> FormatR
         pattern: "w1*".into(),
         case_insensitive: true,
     });
-    let shapes: Vec<(&'static str, SearchQuery)> = vec![
-        ("warm broad (\"the\")", mk_query("the")),
-        ("warm 2-term AND", mk_query("contract dispute")),
-        ("warm phrase", phrase),
-        ("warm wildcard w1*", wildcard),
+    let shapes: Vec<(&'static str, &'static str, SearchQuery)> = vec![
+        ("warm broad (\"the\")", "broad", mk_query("the")),
+        (
+            "warm 2-term AND",
+            "two_term_and",
+            mk_query("contract dispute"),
+        ),
+        ("warm phrase", "phrase", phrase),
+        ("warm wildcard w1*", "wildcard_w1", wildcard),
     ];
-    for (label, query) in shapes {
+    let warm_iters = env_usize("KOSHA_BENCH_WARM_ITERS", 5);
+    for (label, key, query) in shapes {
         searcher.search(ns, manifest, &query, None).unwrap(); // warmup
         let mut samples = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..warm_iters {
             let t = Instant::now();
             let r = searcher.search(ns, manifest, &query, None).unwrap();
             samples.push(t.elapsed().as_secs_f64() * 1e3);
+            assert!(r.total_hits > 0, "{label} returned 0 hits");
             black_box(r.total_hits);
         }
-        warm.push((label, median_ms(samples)));
+        warm.push((label, key, Dist::from_samples(samples)));
     }
 
     FormatReport {
-        open_ms: median_ms(open_samples),
+        open: Dist::from_samples(open_samples),
         open_bytes,
-        cold_broad_ms: median_ms(cold_samples),
+        cold_broad: Dist::from_samples(cold_samples),
         warm,
     }
 }
@@ -373,9 +420,9 @@ fn main() {
     println!(
         "{:<28} {:>12.1}ms {:>12.1}ms {:>7.1}x",
         "open all segments",
-        v1.open_ms,
-        v2.open_ms,
-        ratio(v1.open_ms, v2.open_ms)
+        v1.open.p50,
+        v2.open.p50,
+        ratio(v1.open.p50, v2.open.p50)
     );
     println!(
         "{:<28} {:>11.1}MiB {:>11.1}MiB {:>7.1}x",
@@ -387,17 +434,41 @@ fn main() {
     println!(
         "{:<28} {:>12.1}ms {:>12.1}ms {:>7.1}x",
         "cold broad (\"the\")",
-        v1.cold_broad_ms,
-        v2.cold_broad_ms,
-        ratio(v1.cold_broad_ms, v2.cold_broad_ms)
+        v1.cold_broad.p50,
+        v2.cold_broad.p50,
+        ratio(v1.cold_broad.p50, v2.cold_broad.p50)
     );
-    for ((label, v1_ms), (_, v2_ms)) in v1.warm.iter().zip(v2.warm.iter()) {
+    for ((label, _, v1_d), (_, _, v2_d)) in v1.warm.iter().zip(v2.warm.iter()) {
         println!(
             "{:<28} {:>12.2}ms {:>12.2}ms {:>7.1}x",
             label,
-            v1_ms,
-            v2_ms,
-            ratio(*v1_ms, *v2_ms)
+            v1_d.p50,
+            v2_d.p50,
+            ratio(v1_d.p50, v2_d.p50)
         );
+    }
+
+    if let Ok(path) = std::env::var("KOSHA_BENCH_JSON") {
+        let format_json = |r: &FormatReport| {
+            let warm: serde_json::Map<String, serde_json::Value> = r
+                .warm
+                .iter()
+                .map(|(_, key, d)| (key.to_string(), d.json()))
+                .collect();
+            serde_json::json!({
+                "open_ms": r.open.json(),
+                "open_bytes": r.open_bytes,
+                "cold_broad_ms": r.cold_broad.json(),
+                "warm_ms": warm,
+            })
+        };
+        let report = serde_json::json!({
+            "schema": 1,
+            "corpus": { "segs": segs, "docs": docs, "vocab": vocab },
+            "formats": { "v1": format_json(&v1), "v2": format_json(&v2) },
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap())
+            .unwrap_or_else(|e| panic!("write KOSHA_BENCH_JSON={path}: {e}"));
+        eprintln!("wrote JSON report to {path}");
     }
 }

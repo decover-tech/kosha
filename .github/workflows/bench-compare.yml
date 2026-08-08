@@ -1,0 +1,136 @@
+name: bench-compare
+
+# Before/after microbenchmark gate for every PR headed to main: runs the
+# `segment_memory` bench twice on the SAME runner, back to back —
+#
+#   before = HEAD^1 of the PR's test-merge commit (the main tip this PR
+#            would merge onto)
+#   after  = the test-merge commit itself (main + this PR's changes)
+#
+# — then posts/updates one sticky PR comment with cold + warm p50/p90/p99
+# and the before→after delta per percentile (scripts/bench/compare_pr.py).
+#
+# Deliberately NOT cached across runs: a baseline measured on a different
+# runner machine would make the delta cross-machine noise. Both runs always
+# happen fresh on one machine; only compile time is cached (rust-cache).
+#
+# The "before" build compiles the base tree but OVERLAYS the PR head's copy
+# of the bench source, so both sides emit the same JSON schema (and so a PR
+# improving the bench itself still gets a baseline). If the overlaid bench
+# doesn't compile against the base tree (PR changed an API the bench uses),
+# we fall back to the base's own bench; if that produces no JSON either,
+# the comment degrades to PR-only numbers.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+
+# New pushes supersede in-flight comparisons — unlike pre-commit.yml's amend
+# job there is no push-back here, so cancelling is safe.
+concurrency:
+  group: bench-compare-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write   # sticky results comment
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compare-script-tests:
+    name: compare_pr.py unit tests
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 scripts/bench/test_compare_pr.py
+
+  bench-compare:
+    name: bench merge-base vs head, comment on PR
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+    # The results comment needs a writable token, which fork PRs don't get.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need HEAD^1 for the baseline worktree
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # p50/p90/p99 need real sample counts; the bench's local-hook defaults
+      # (3 cold / 5 warm) are only meant for the commit-msg hook's median.
+      - name: Bench baseline (main side of the test merge)
+        env:
+          KOSHA_BENCH_COLD_ITERS: "25"
+          KOSHA_BENCH_WARM_ITERS: "200"
+        run: |
+          set -euo pipefail
+          base_sha="$(git rev-parse HEAD^1)"
+          echo "base_sha=$base_sha" >> "$GITHUB_ENV"
+
+          git worktree add --detach "$RUNNER_TEMP/base-tree" "$base_sha"
+          cp crates/kosha-query/benches/segment_memory.rs \
+             "$RUNNER_TEMP/base-tree/crates/kosha-query/benches/segment_memory.rs"
+
+          # Share one target dir so dependency compilation is done once and
+          # rust-cache covers both builds.
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          cd "$RUNNER_TEMP/base-tree"
+          if ! KOSHA_BENCH_JSON="$RUNNER_TEMP/base.json" \
+               cargo bench -p kosha-query --bench segment_memory; then
+            echo "::warning::head's bench source failed against the base tree — retrying with the base's own bench"
+            git checkout -- crates/kosha-query/benches/segment_memory.rs
+            KOSHA_BENCH_JSON="$RUNNER_TEMP/base.json" \
+              cargo bench -p kosha-query --bench segment_memory || \
+              echo "::warning::baseline bench failed — comment will be PR-only"
+          fi
+
+      - name: Bench PR head (test-merge commit)
+        env:
+          KOSHA_BENCH_COLD_ITERS: "25"
+          KOSHA_BENCH_WARM_ITERS: "200"
+        run: |
+          set -euo pipefail
+          KOSHA_BENCH_JSON="$RUNNER_TEMP/head.json" \
+            cargo bench -p kosha-query --bench segment_memory
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Render + post sticky comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/bench/compare_pr.py \
+            --base "$RUNNER_TEMP/base.json" \
+            --head "$RUNNER_TEMP/head.json" \
+            --base-sha "$base_sha" \
+            --head-sha "$HEAD_SHA" \
+            --out "$RUNNER_TEMP/comment.md"
+
+          marker='<!-- kosha-bench-compare -->'
+          cid="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+                   --paginate \
+                   --jq "[.[] | select(.body | startswith(\"$marker\")) | .id][0] // empty")"
+          if [ -n "$cid" ]; then
+            echo "updating existing bench comment $cid"
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" \
+              -F "body=@$RUNNER_TEMP/comment.md" > /dev/null
+          else
+            echo "creating bench comment"
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+              -F "body=@$RUNNER_TEMP/comment.md" > /dev/null
+          fi
