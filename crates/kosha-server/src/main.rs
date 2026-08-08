@@ -1415,19 +1415,35 @@ impl AppState {
             .iter()
             .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
             .collect();
+        let paths_with_manifest_footer: std::collections::HashSet<PathBuf> = manifest
+            .segments
+            .iter()
+            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_some())
+            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .collect();
 
-        // Always footer-first: footer.json is tiny, and in addition to the
-        // bloom prune we now need `Footer::format_version` to decide whether
-        // a segment is Lazy-capable (skip `doc_store.bin`, fetch the offsets
-        // sidecar) or legacy Eager (`doc_store.bin` is required for open).
-        // This also keeps the bloom-prune prefetch batched — one fan-out for
-        // every footer, not one sequential GET per segment.
-        let (footer_files, footer_bytes) = self.ensure_files_local(&all_seg_paths, "footer.json");
+        let missing_manifest_footer_paths: Vec<PathBuf> = manifest
+            .segments
+            .iter()
+            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
+            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .collect();
+
+        // New manifests carry the search footer metadata inline, so cold
+        // search can skip the footer-first S3 phase entirely. Legacy
+        // manifests fall back to hydrating footer.json for pruning and
+        // format detection.
+        let (footer_files, footer_bytes) =
+            self.ensure_files_local(&missing_manifest_footer_paths, "footer.json");
 
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
-        for seg_path in all_seg_paths {
+        for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
             if needs_bloom_check {
-                if let Ok(footer) = SegmentReader::read_footer(&seg_path) {
+                let footer = manifest
+                    .segment_footer(&entry.segment_id)
+                    .cloned()
+                    .or_else(|| SegmentReader::read_footer(&seg_path).ok());
+                if let Some(footer) = footer.as_ref() {
                     if let Some(ref filter) = query.filter {
                         if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
                             continue;
@@ -1442,8 +1458,12 @@ impl AppState {
             }
             to_hydrate.push(seg_path);
         }
-        let mut outcome =
-            self.ensure_scoring_files_local(&to_hydrate, needs_vectors, needs_filters);
+        let mut outcome = self.ensure_scoring_files_local(
+            &to_hydrate,
+            needs_vectors,
+            needs_filters,
+            &paths_with_manifest_footer,
+        );
         let postings_outcome = self.ensure_posting_blobs_local(&to_hydrate, &posting_files);
         outcome.files_fetched += postings_outcome.files_fetched;
         outcome.bytes_fetched += postings_outcome.bytes_fetched;
@@ -1468,11 +1488,13 @@ impl AppState {
         seg_path: &Path,
         needs_vectors: bool,
         needs_filters: bool,
+        has_manifest_footer: bool,
     ) -> bool {
-        for f in ["footer.json", "inverted.idx"] {
-            if !seg_path.join(f).is_file() {
-                return false;
-            }
+        if !has_manifest_footer && !seg_path.join("footer.json").is_file() {
+            return false;
+        }
+        if !seg_path.join("inverted.idx").is_file() {
+            return false;
         }
         if needs_filters && !seg_path.join("filters.bin").is_file() {
             return false;
@@ -1508,6 +1530,7 @@ impl AppState {
         seg_paths: &[PathBuf],
         needs_vectors: bool,
         needs_filters: bool,
+        paths_with_manifest_footer: &std::collections::HashSet<PathBuf>,
     ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
             return HydrationOutcome::default();
@@ -1515,7 +1538,12 @@ impl AppState {
 
         let mut outcome = HydrationOutcome::default();
         let (owned, waiting) = partition_for_hydration(&self.in_flight_segments, seg_paths, |p| {
-            Self::segment_is_scoring_complete(p, needs_vectors, needs_filters)
+            Self::segment_is_scoring_complete(
+                p,
+                needs_vectors,
+                needs_filters,
+                paths_with_manifest_footer.contains(p),
+            )
         });
 
         if !owned.is_empty() {
@@ -1533,13 +1561,15 @@ impl AppState {
                 };
                 let s3_prefix = rel_path.to_string_lossy().into_owned();
 
-                // Always-needed scoring files (footer.json was prefetched,
-                // but include it for completeness / resilience to a warm
-                // footer being evicted between the prefetch and here).
-                for f in ["footer.json", "inverted.idx"] {
-                    if !seg_path.join(f).exists() {
-                        logical_paths.push((format!("{s3_prefix}/{f}"), 0));
-                    }
+                // `footer.json` is needed only for legacy manifests that do
+                // not carry a footer snapshot.
+                if !paths_with_manifest_footer.contains(seg_path)
+                    && !seg_path.join("footer.json").exists()
+                {
+                    logical_paths.push((format!("{s3_prefix}/footer.json"), 0));
+                }
+                if !seg_path.join("inverted.idx").exists() {
+                    logical_paths.push((format!("{s3_prefix}/inverted.idx"), 0));
                 }
                 if needs_filters && !seg_path.join("filters.bin").exists() {
                     logical_paths.push((format!("{s3_prefix}/filters.bin"), 0));
@@ -1556,6 +1586,7 @@ impl AppState {
                 // silently re-fetching all their doc stores.
                 let has_offsets = seg_path.join("doc_store.offsets").exists();
                 let lazy_capable = has_offsets
+                    || paths_with_manifest_footer.contains(seg_path)
                     || SegmentReader::read_footer(seg_path)
                         .map(|ft| ft.format_version >= 1)
                         .unwrap_or(false);
@@ -1600,7 +1631,14 @@ impl AppState {
 
         outcome.missing = seg_paths
             .iter()
-            .filter(|p| !Self::segment_is_scoring_complete(p, needs_vectors, needs_filters))
+            .filter(|p| {
+                !Self::segment_is_scoring_complete(
+                    p,
+                    needs_vectors,
+                    needs_filters,
+                    paths_with_manifest_footer.contains(*p),
+                )
+            })
             .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
@@ -3530,6 +3568,7 @@ mod tests {
                     doc_count: 10,
                 },
             ],
+            segment_footers: Default::default(),
         };
         // Simulate: an earlier publish call already confirmed seg-2
         // synced (e.g. it was "last" at the time it ran), but seg-1 and

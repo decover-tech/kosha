@@ -152,6 +152,7 @@ mod tests {
         Manifest {
             version: 1,
             segments,
+            segment_footers: Default::default(),
         }
     }
 

@@ -836,6 +836,23 @@ pub struct ManifestEntry {
 pub struct Manifest {
     pub version: u64,
     pub segments: Vec<ManifestEntry>,
+    /// Optional per-segment footer snapshot for search-time pruning/open.
+    ///
+    /// Older persisted manifests do not contain this field; readers fall
+    /// back to `footer.json` when an entry is missing.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub segment_footers: HashMap<SegmentId, Footer>,
+}
+
+impl Manifest {
+    pub fn segment_footer(&self, segment_id: &SegmentId) -> Option<&Footer> {
+        self.segment_footers.get(segment_id)
+    }
+
+    pub fn remember_segment_footer(&mut self, footer: Footer) {
+        self.segment_footers
+            .insert(footer.segment_id.clone(), footer);
+    }
 }
 
 // ─── kNN query ────────────────────────────────────────────────────────────

@@ -932,6 +932,7 @@ impl Searcher {
         segment_id: &str,
         seg_dir: PathBuf,
         load_vectors: bool,
+        footer: Option<kosha_core::Footer>,
         permit: Option<&AdmissionPermit>,
         stats: Option<&OpenStatsCollector>,
     ) -> Result<Arc<TrackedSegment>, KoshaError> {
@@ -944,7 +945,7 @@ impl Searcher {
         }
         let t_open = Instant::now();
         let approx_bytes = approx_segment_bytes(&seg_dir, load_vectors);
-        let reader = SegmentReader::open_with_options(seg_dir, load_vectors)?;
+        let reader = SegmentReader::open_with_footer_options(seg_dir, load_vectors, footer)?;
         let tracked = Arc::new(TrackedSegment::new(
             reader,
             approx_bytes,
@@ -987,6 +988,7 @@ impl Searcher {
         tombstones: Option<
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
+        manifest_footer: Option<&kosha_core::Footer>,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
@@ -997,7 +999,10 @@ impl Searcher {
 
         // Prune via footer blooms before opening inverted/filters/vectors.
         if query.filter.is_some() || term_prune.is_some() {
-            if let Ok(footer) = SegmentReader::read_footer(&seg_dir) {
+            let footer = manifest_footer
+                .cloned()
+                .or_else(|| SegmentReader::read_footer(&seg_dir).ok());
+            if let Some(footer) = footer.as_ref() {
                 if let Some(ref filter) = query.filter {
                     if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
                         return Ok(None);
@@ -1026,6 +1031,7 @@ impl Searcher {
             &entry.segment_id.0,
             seg_dir,
             query.knn.is_some(),
+            manifest_footer.cloned(),
             Some(permit),
             Some(open_stats),
         )?;
@@ -1477,6 +1483,7 @@ impl Searcher {
             .segments
             .par_iter()
             .map(|entry| {
+                let manifest_footer = manifest.segment_footer(&entry.segment_id);
                 self.score_segment(
                     namespace,
                     entry,
@@ -1485,6 +1492,7 @@ impl Searcher {
                     term_prune.as_ref(),
                     &sort_value_fields,
                     tombstones,
+                    manifest_footer,
                     &permit,
                     &open_stats,
                 )
@@ -2019,7 +2027,7 @@ mod tests {
 
         // Open s1 and keep the Arc — simulating an in-flight request.
         let pinned = searcher
-            .open_segment("test", "s1", s1_dir, false, None, None)
+            .open_segment("test", "s1", s1_dir, false, None, None, None)
             .unwrap();
         // Opening s2 triggers insert-time eviction. At that instant *both*
         // entries are pinned (s1 by our Arc, s2 by open_segment's
@@ -2029,7 +2037,7 @@ mod tests {
         // idle (evictable) while s1 stays pinned.
         drop(
             searcher
-                .open_segment("test", "s2", s2_dir, false, None, None)
+                .open_segment("test", "s2", s2_dir, false, None, None, None)
                 .unwrap(),
         );
         searcher.segment_cache.enforce_budget();
@@ -2069,7 +2077,7 @@ mod tests {
 
         let searcher = Searcher::with_segment_cache_limits(dir.clone(), 10, u64::MAX);
         let held = searcher
-            .open_segment("test", "s1", s1_dir, false, None, None)
+            .open_segment("test", "s1", s1_dir, false, None, None, None)
             .unwrap();
         assert_eq!(ledger_snapshot(&searcher).0, s1_bytes);
 
@@ -2113,6 +2121,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: 1,
             }],
+            segment_footers: Default::default(),
         };
         let result = searcher.search(
             &NamespaceId("test".into()),
@@ -2162,6 +2171,7 @@ mod tests {
                     doc_count: 1,
                 },
             ],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -2224,6 +2234,7 @@ mod tests {
                     doc_count: 1,
                 },
             ],
+            segment_footers: Default::default(),
         };
         let result = searcher
             .search(
@@ -2326,6 +2337,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: 1,
             }],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -2408,6 +2420,7 @@ mod tests {
                     doc_count: 1,
                 },
             ],
+            segment_footers: Default::default(),
         };
 
         // Generous entry-count cap (10) but a byte budget that fits s1 alone,
@@ -2461,6 +2474,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: 2,
             }],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -2512,6 +2526,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: 2,
             }],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
@@ -2554,6 +2569,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: 1,
             }],
+            segment_footers: Default::default(),
         };
         // Fresh searcher (no warm in-memory segment cache) so opening the
         // segment for these searches goes through the real `try_read_doc_index`
@@ -2626,6 +2642,7 @@ mod tests {
                     doc_count: 1,
                 })
                 .collect(),
+            segment_footers: Default::default(),
         };
         // Fresh searcher so each segment is actually opened (Lazy), not
         // served from a warm cache populated by an earlier call here.
@@ -2731,6 +2748,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: 2,
             }],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -2776,6 +2794,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: 2,
             }],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -2829,6 +2848,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: n as u32,
             }],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -2921,6 +2941,7 @@ mod tests {
                     doc_count: 1,
                 },
             ],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -2960,6 +2981,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: 3,
             }],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -3004,6 +3026,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: n as u32,
             }],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -3048,6 +3071,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: 3,
             }],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -3111,6 +3135,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: 5,
             }],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut id_sort = std::collections::HashMap::new();
@@ -3210,6 +3235,7 @@ mod tests {
                     doc_count: 1,
                 },
             ],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -3288,6 +3314,7 @@ mod tests {
         let manifest = Manifest {
             version: 1,
             segments: manifest_segments,
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -3353,6 +3380,7 @@ mod tests {
                 segment_id: SegmentId("s1".into()),
                 doc_count: 1,
             }],
+            segment_footers: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {

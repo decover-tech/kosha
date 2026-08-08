@@ -1135,6 +1135,17 @@ impl SegmentReader {
     /// both for that case is what keeps keyword search latency independent of
     /// embedding volume.
     pub fn open_with_options(segment_dir: PathBuf, load_vectors: bool) -> Result<Self, KoshaError> {
+        Self::open_with_footer_options(segment_dir, load_vectors, None)
+    }
+
+    /// Opens a segment with an already-known footer. Search can source the
+    /// footer from the manifest and avoid hydrating `footer.json` on cold
+    /// S3 reads; non-search callers keep using `open_with_options`.
+    pub fn open_with_footer_options(
+        segment_dir: PathBuf,
+        load_vectors: bool,
+        footer: Option<Footer>,
+    ) -> Result<Self, KoshaError> {
         let (vs, hm) = if load_vectors {
             let vs = Self::read_vectors(&segment_dir)?;
             let hm = build_hnsw(&vs.vectors).map(|(m, _)| m);
@@ -1142,7 +1153,10 @@ impl SegmentReader {
         } else {
             (VectorStore::default(), None)
         };
-        let footer = Self::read_footer(&segment_dir)?;
+        let footer = match footer {
+            Some(footer) => footer,
+            None => Self::read_footer(&segment_dir)?,
+        };
         let doc_store = match try_read_doc_index(&segment_dir, footer.doc_count) {
             Some(index) => DocStoreAccess::Lazy {
                 doc_store_path: segment_dir.join("doc_store.bin"),

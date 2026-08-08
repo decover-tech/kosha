@@ -46,6 +46,7 @@ impl NamespaceState {
             manifest: Manifest {
                 version: 0,
                 segments: Vec::new(),
+                segment_footers: Default::default(),
             },
             tombstones: HashMap::new(),
             id_index: None,
@@ -633,6 +634,7 @@ impl Indexer {
             segment_id: seg_id,
             doc_count: footer.doc_count,
         });
+        state.manifest.remember_segment_footer(footer);
         Ok(())
     }
 
@@ -774,9 +776,11 @@ impl Indexer {
                 segment_id: seg_id,
                 doc_count: footer.doc_count,
             });
+            state.manifest.remember_segment_footer(footer);
             state.known = true;
             for seg_id in &old_segment_ids {
                 state.tombstones.remove(seg_id);
+                state.manifest.segment_footers.remove(seg_id);
             }
             state.id_index = None;
         }
