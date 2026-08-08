@@ -337,3 +337,36 @@ complete to every existence check). Server-side warm total: 5–10 ms →
 18–121 ms locally. If that ever matters for hot namespaces, the follow-up
 is a small in-memory LRU of materialized doc records keyed by
 `(segment, doc_seq)` — not persisting partial files.
+---
+
+# Addendum: cold-read round 3 (2026-08-08 — filters skip, ranged-GET materialize, postings blobs)
+
+Deployed: #70+#72 (lazy filters + skip `filters.bin` hydration for broad
+queries + cache-poisoning fix), #74 (ranged-GET page materialization via
+the offsets sidecar), #75 (inverted postings split into blobs). All rounds
+single-attempt, fully-cold query tier.
+
+| namespace | round 2 | round 3 | phase deltas |
+|---|---|---|---|
+| `white_river_paragraph` | 60.4 s | **6.8 s (9×)** | hydrate 35.5→2.8 s (6075→1241 MB — filters out of the fetch), materialize 15.7→**0.23 s** (ranged-GET, 69×), score 8.5→3.1 s |
+| `paragraph_index_hnsw` | 18.9 s | **13.7 s** | hydrate 11.2→8.7 s (2816→1170 MB), score 7.0→4.4 s, Σopen 11.9→7.1 s |
+| `paragraph_index_hnsw_v2` | 4.85 s | **3.5 s** | bytes 277→118 MB, materialize 1.6→0.16 s |
+
+Cumulative from the original baseline: white_river **impossible → 6.8 s**
+(cold) / 0.2 s (warm); paragraph_index_hnsw **impossible → 13.7 s** /
+0.6 s; v2 **14.4 s → 3.5 s** / 0.12 s.
+
+What the remaining phase data points at, in order:
+
+1. **Per-segment footer GETs are now the dominant file count** — 1103 of
+   `paragraph_index_hnsw`'s 1717 cold GETs (64%) are footers, and even its
+   *warm* hydrate check costs ~400 ms of per-segment stats. A
+   namespace-level `segments.meta` object (blooms + doc counts + format
+   versions, one GET) is the next hydrate lever.
+2. **Compaction** — 1103 segments for 1M docs multiplies every remaining
+   per-segment cost (blocked on the tiered doc-loss bug).
+3. **Postings compression** — remaining scoring-set bytes (1170 MB on
+   `paragraph_index_hnsw`) are mostly postings.
+4. **Residual open cost** — white_river still Σ12 s across 59 opens
+   (~204 ms/seg) with filters lazy; the remaining eager work (inverted
+   blob read + offsets arena parse) is the tail.
