@@ -350,13 +350,28 @@ fn chunk_by_byte_budget(files: &[(String, u64)], budget: u64) -> Vec<Vec<(String
     chunks
 }
 
-/// Whether a segment file named `name` belongs in a hydration fetch list,
-/// given whether the caller needs vectors. Factored out of
-/// `ensure_segments_local` so the "skip vector.idx" rule has a direct unit
-/// test instead of needing a real `S3Storage` to exercise.
+/// Whether a segment file named `name` belongs in a hydration fetch list.
+/// Factored out of `ensure_segments_local` so the skip rules have direct
+/// unit tests instead of needing a real `S3Storage` to exercise.
+///
+/// - `vector.idx` is fetched only when the caller needs vectors (knn).
+/// - `doc_store.bin` is skipped when `skip_doc_store` — scoring-set-only
+///   hydration: scoring reads `doc_store.offsets` (doc ids + field
+///   lengths), never the store itself; the store is fetched lazily for
+///   only the segments holding the returned page's hits (see the
+///   `DocStoreMissing` retry in the search handlers). Doc stores measured
+///   ~70–85% of non-vector segment bytes on staging, and skipping them is
+///   what lets namespaces whose full working set exceeds the disk budget
+///   (or the pod's ephemeral-storage limit) cold-read at all.
 #[cfg(feature = "s3")]
-fn hydration_wants_file(name: &str, needs_vectors: bool) -> bool {
-    needs_vectors || name != "vector.idx"
+fn hydration_wants_file(name: &str, needs_vectors: bool, skip_doc_store: bool) -> bool {
+    if !needs_vectors && name == "vector.idx" {
+        return false;
+    }
+    if skip_doc_store && name == "doc_store.bin" {
+        return false;
+    }
+    true
 }
 
 /// Segments in `manifest` not yet recorded as synced in `synced`, in
@@ -847,6 +862,21 @@ impl AppState {
             .all(|f| seg_path.join(f).is_file())
     }
 
+    /// Completeness for the *scoring* phase of a search: everything except
+    /// `doc_store.bin`, provided `doc_store.offsets` is present (the lazy
+    /// doc-store path serves `doc_id`/`field_length` from the sidecar
+    /// without ever opening the store). A legacy segment with no offsets
+    /// sidecar falls back to the eager doc-store parse at open, so for it
+    /// the store itself is still required.
+    #[cfg(feature = "s3")]
+    fn segment_is_scoring_complete(seg_path: &Path) -> bool {
+        let core = ["footer.json", "inverted.idx", "filters.bin"]
+            .iter()
+            .all(|f| seg_path.join(f).is_file());
+        core && (seg_path.join("doc_store.offsets").is_file()
+            || seg_path.join("doc_store.bin").is_file())
+    }
+
     /// Ensure every listed segment directory is available locally, fanning
     /// out S3 downloads for all of them (and all their files) as a single
     /// batch instead of hydrating segment-by-segment, file-by-file.
@@ -893,17 +923,24 @@ impl AppState {
         &self,
         seg_paths: &[PathBuf],
         needs_vectors: bool,
+        scoring_only: bool,
     ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
             return HydrationOutcome::default();
         };
 
+        // Search-path hydration only needs the scoring set (see
+        // `hydration_wants_file`); compaction/migration/admin callers read
+        // full documents and keep requiring everything.
+        let is_complete: fn(&Path) -> bool = if scoring_only {
+            Self::segment_is_scoring_complete
+        } else {
+            Self::segment_is_complete
+        };
+
         let mut outcome = HydrationOutcome::default();
-        let (owned, waiting) = partition_for_hydration(
-            &self.in_flight_segments,
-            seg_paths,
-            Self::segment_is_complete,
-        );
+        let (owned, waiting) =
+            partition_for_hydration(&self.in_flight_segments, seg_paths, is_complete);
 
         if !owned.is_empty() {
             // Bound total concurrent hydration *operations* server-wide —
@@ -919,10 +956,27 @@ impl AppState {
                 let s3_prefix = rel_path.to_string_lossy().into_owned();
                 match s3.list_with_sizes(&s3_prefix) {
                     Ok(files) if !files.is_empty() => {
+                        // Skipping the doc store is only safe when the
+                        // offsets sidecar exists — a legacy segment without
+                        // one eager-parses doc_store.bin at open.
+                        let has_offsets = files.iter().any(|(n, _)| n == "doc_store.offsets");
+                        let skip_doc_store = scoring_only && has_offsets;
                         logical_paths.extend(
                             files
                                 .into_iter()
-                                .filter(|(name, _size)| hydration_wants_file(name, needs_vectors))
+                                .filter(|(name, _size)| {
+                                    hydration_wants_file(name, needs_vectors, skip_doc_store)
+                                })
+                                // Don't re-download files already local at
+                                // the right size — the bloom-prune prefetch
+                                // already fetched every footer.json, which
+                                // used to be fetched a second time here
+                                // (measured: 99 of 495 cold GETs redundant).
+                                .filter(|(name, size)| {
+                                    std::fs::metadata(seg_path.join(name))
+                                        .map(|m| m.len() != *size)
+                                        .unwrap_or(true)
+                                })
                                 .map(|(name, size)| (format!("{s3_prefix}/{name}"), size)),
                         );
                     }
@@ -970,7 +1024,7 @@ impl AppState {
 
         outcome.missing = seg_paths
             .iter()
-            .filter(|p| !Self::segment_is_complete(p))
+            .filter(|p| !is_complete(p))
             .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
@@ -1114,7 +1168,7 @@ impl AppState {
         // Only a knn query ever opens a segment's vector.idx (see
         // REQUIRED_SEGMENT_FILES's doc comment) — every other query is
         // lexical-only, so there's no reason to pay for hydrating it.
-        let mut outcome = self.ensure_segments_local(&to_hydrate, query.knn.is_some());
+        let mut outcome = self.ensure_segments_local(&to_hydrate, query.knn.is_some(), true);
         outcome.files_fetched += footer_files;
         outcome.bytes_fetched += footer_bytes;
         outcome
@@ -1600,7 +1654,7 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
             // including vectors — unlike the search path, there's no
             // per-call signal here for whether vectors matter, so always
             // fetch them.
-            state.ensure_segments_local(&paths, true);
+            state.ensure_segments_local(&paths, true, false);
         }
     }
 
@@ -1675,7 +1729,7 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
             // including vectors — unlike the search path, there's no
             // per-call signal here for whether vectors matter, so always
             // fetch them.
-            state.ensure_segments_local(&paths, true);
+            state.ensure_segments_local(&paths, true, false);
         }
     }
 
@@ -1737,7 +1791,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
             // including vectors — unlike the search path, there's no
             // per-call signal here for whether vectors matter, so always
             // fetch them.
-            state.ensure_segments_local(&paths, true);
+            state.ensure_segments_local(&paths, true, false);
         }
     }
 
@@ -1949,22 +2003,46 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     let t_queue = Instant::now();
     let _slot = state.search_semaphore.acquire();
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
-    match state
-        .searcher
-        .search_with_stats(&ns, &manifest, &query, tombstones.as_ref())
-    {
-        Ok((result, phases)) => {
-            log_search_timing(
-                &ns,
-                &hydration,
-                hydrate_ms,
-                queue_ms,
-                &phases,
-                result.total_hits,
-            );
-            json_ok(&result)
+    // Scoring-set-only hydration fetches no doc stores up front — when page
+    // materialization reports which segments the returned page actually
+    // needs (`DocStoreMissing`), fetch exactly those doc stores and retry.
+    // The retry re-scores warm (cached segments, ms-scale), so the round
+    // trip costs one bounded S3 fetch of ≤page-size doc stores instead of
+    // hydrating every segment's store cold. Two fetch rounds bound the loop
+    // (a second round can only happen if a fetch partially failed).
+    let mut fetch_rounds = 0;
+    loop {
+        match state
+            .searcher
+            .search_with_stats(&ns, &manifest, &query, tombstones.as_ref())
+        {
+            Ok((result, phases)) => {
+                log_search_timing(
+                    &ns,
+                    &hydration,
+                    hydrate_ms,
+                    queue_ms,
+                    &phases,
+                    result.total_hits,
+                );
+                return json_ok(&result);
+            }
+            #[cfg(feature = "s3")]
+            Err(KoshaError::DocStoreMissing(segs)) if fetch_rounds < 2 => {
+                fetch_rounds += 1;
+                let paths: Vec<PathBuf> = segs
+                    .iter()
+                    .map(|s| state.data_dir.join(&ns.0).join(s))
+                    .collect();
+                let (files, bytes) = state.ensure_files_local(&paths, "doc_store.bin");
+                println!(
+                    "page hydrate: fetched {files} doc store(s) ({:.1} MB) for ns={} round {fetch_rounds}",
+                    bytes as f64 / (1024.0 * 1024.0),
+                    ns.0,
+                );
+            }
+            Err(e) => return search_error_response(&e),
         }
-        Err(e) => search_error_response(&e),
     }
 }
 
@@ -2047,22 +2125,46 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     let t_queue = Instant::now();
     let _slot = state.search_semaphore.acquire();
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
-    match state
-        .searcher
-        .search_with_stats(&ns, &manifest, &query, tombstones.as_ref())
-    {
-        Ok((result, phases)) => {
-            log_search_timing(
-                &ns,
-                &hydration,
-                hydrate_ms,
-                queue_ms,
-                &phases,
-                result.total_hits,
-            );
-            json_ok(&result)
+    // Scoring-set-only hydration fetches no doc stores up front — when page
+    // materialization reports which segments the returned page actually
+    // needs (`DocStoreMissing`), fetch exactly those doc stores and retry.
+    // The retry re-scores warm (cached segments, ms-scale), so the round
+    // trip costs one bounded S3 fetch of ≤page-size doc stores instead of
+    // hydrating every segment's store cold. Two fetch rounds bound the loop
+    // (a second round can only happen if a fetch partially failed).
+    let mut fetch_rounds = 0;
+    loop {
+        match state
+            .searcher
+            .search_with_stats(&ns, &manifest, &query, tombstones.as_ref())
+        {
+            Ok((result, phases)) => {
+                log_search_timing(
+                    &ns,
+                    &hydration,
+                    hydrate_ms,
+                    queue_ms,
+                    &phases,
+                    result.total_hits,
+                );
+                return json_ok(&result);
+            }
+            #[cfg(feature = "s3")]
+            Err(KoshaError::DocStoreMissing(segs)) if fetch_rounds < 2 => {
+                fetch_rounds += 1;
+                let paths: Vec<PathBuf> = segs
+                    .iter()
+                    .map(|s| state.data_dir.join(&ns.0).join(s))
+                    .collect();
+                let (files, bytes) = state.ensure_files_local(&paths, "doc_store.bin");
+                println!(
+                    "page hydrate: fetched {files} doc store(s) ({:.1} MB) for ns={} round {fetch_rounds}",
+                    bytes as f64 / (1024.0 * 1024.0),
+                    ns.0,
+                );
+            }
+            Err(e) => return search_error_response(&e),
         }
-        Err(e) => search_error_response(&e),
     }
 }
 
@@ -2211,7 +2313,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
         .collect();
     #[cfg(feature = "s3")]
     // Admin routes rewrite or merge segments — must preserve vectors.
-    state.ensure_segments_local(&seg_paths, true);
+    state.ensure_segments_local(&seg_paths, true, false);
 
     let mut rebuilt = 0usize;
     let mut errors = Vec::new();
@@ -2289,7 +2391,7 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
         .collect();
     #[cfg(feature = "s3")]
     // Admin routes rewrite or merge segments — must preserve vectors.
-    state.ensure_segments_local(&seg_paths, true);
+    state.ensure_segments_local(&seg_paths, true, false);
 
     let mut backfilled = 0usize;
     let mut errors = Vec::new();
@@ -2393,7 +2495,7 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
             .collect();
         #[cfg(feature = "s3")]
         // Admin routes rewrite or merge segments — must preserve vectors.
-        state.ensure_segments_local(&seg_paths, true);
+        state.ensure_segments_local(&seg_paths, true, false);
         // compact_namespace silently skips (and keeps unmerged) any segment
         // that isn't present locally after this — safe, but worth surfacing
         // so a caller knows compaction was partial.
@@ -2791,11 +2893,11 @@ mod tests {
     #[test]
     fn hydration_wants_file_skips_vector_idx_unless_needed() {
         assert!(
-            !hydration_wants_file("vector.idx", false),
+            !hydration_wants_file("vector.idx", false, false),
             "a query that doesn't need vectors must not fetch vector.idx"
         );
         assert!(
-            hydration_wants_file("vector.idx", true),
+            hydration_wants_file("vector.idx", true, false),
             "a knn query must still fetch vector.idx"
         );
         for f in [
@@ -2805,10 +2907,67 @@ mod tests {
             "filters.bin",
         ] {
             assert!(
-                hydration_wants_file(f, false),
+                hydration_wants_file(f, false, false),
                 "{f} must always be fetched regardless of needs_vectors"
             );
         }
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn hydration_wants_file_skips_doc_store_when_scoring_only() {
+        assert!(
+            !hydration_wants_file("doc_store.bin", false, true),
+            "scoring-only hydration must not fetch the doc store"
+        );
+        // Everything scoring actually reads is still fetched.
+        for f in [
+            "footer.json",
+            "inverted.idx",
+            "filters.bin",
+            "doc_store.offsets",
+        ] {
+            assert!(
+                hydration_wants_file(f, false, true),
+                "{f} is part of the scoring set and must be fetched"
+            );
+        }
+        // The skips compose: knn scoring-only wants vectors, not doc store.
+        assert!(hydration_wants_file("vector.idx", true, true));
+        assert!(!hydration_wants_file("vector.idx", false, true));
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn scoring_complete_needs_offsets_or_doc_store_but_not_both() {
+        let dir = std::env::temp_dir().join("kosha-test-scoring-complete");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        for f in ["footer.json", "inverted.idx", "filters.bin"] {
+            fs::write(dir.join(f), b"x").unwrap();
+        }
+        assert!(
+            !AppState::segment_is_scoring_complete(&dir),
+            "no offsets and no doc store: scoring can't resolve doc ids / field lengths"
+        );
+
+        // Modern segment: the offsets sidecar alone is enough — scoring
+        // never opens the store itself.
+        fs::write(dir.join("doc_store.offsets"), b"x").unwrap();
+        assert!(AppState::segment_is_scoring_complete(&dir));
+        assert!(
+            !AppState::segment_is_complete(&dir),
+            "full completeness (compaction/admin) must still require the doc store"
+        );
+
+        // Legacy segment (no sidecar): doc_store.bin is required, because
+        // open falls back to the eager doc-store parse.
+        fs::remove_file(dir.join("doc_store.offsets")).unwrap();
+        fs::write(dir.join("doc_store.bin"), b"x").unwrap();
+        assert!(AppState::segment_is_scoring_complete(&dir));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "s3")]

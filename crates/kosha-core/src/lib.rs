@@ -952,6 +952,12 @@ pub enum KoshaError {
     /// Transient by construction — callers should retry with backoff, which
     /// the Python `kosha_client` already does. Maps to HTTP 429.
     Overloaded(String),
+    /// Page materialization needs these segments' `doc_store.bin`, which is
+    /// not present locally. Expected under scoring-set-only hydration
+    /// (search-path hydration deliberately skips doc stores); the server
+    /// reacts by fetching exactly these segments' doc stores and retrying
+    /// the search — never surfaced to clients in normal operation.
+    DocStoreMissing(Vec<String>),
 }
 
 impl std::fmt::Display for KoshaError {
@@ -965,6 +971,9 @@ impl std::fmt::Display for KoshaError {
             Self::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
             Self::CorruptSegment(msg) => write!(f, "corrupt segment data: {msg}"),
             Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
+            Self::DocStoreMissing(segs) => {
+                write!(f, "doc store missing for segment(s): {}", segs.join(", "))
+            }
         }
     }
 }
