@@ -57,6 +57,18 @@ spec:
             # request routing. Unused/irrelevant on the ingest Deployment.
             - name: KOSHA_INGEST_HOST
               value: http://kosha-ingest-service.kosha.svc.cluster.local:8080
+            # Own pod IP, published to the Postgres hydration-lease table
+            # when this pod wins a cross-replica S3-fetch claim, so other
+            # replicas that lose the race know where to pull the bytes from
+            # instead of independently re-fetching from S3 — see main.rs's
+            # `hydrate_files_coordinated`/`fetch_from_peer` and
+            # kosha-control's `hydration_lease` module. EKS's VPC CNI gives
+            # pods routable IPs on the flat pod network, so no headless
+            # Service is needed for this pod-to-pod traffic.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

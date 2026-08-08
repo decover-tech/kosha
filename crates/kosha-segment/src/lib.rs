@@ -854,6 +854,14 @@ impl SegmentReader {
     pub fn footer(&self) -> &Footer {
         &self.footer
     }
+    /// The segment's on-disk directory (`{data_dir}/{namespace}/{segment_id}`).
+    /// Used by the query path to identify which segments hold the materialize
+    /// page hits, so `doc_store.bin` can be fetched on demand for just those
+    /// segments instead of being hydrated for the whole manifest up front —
+    /// see `Searcher::search_with_doc_store_hydrator`.
+    pub fn segment_dir(&self) -> &Path {
+        &self.segment_dir
+    }
     pub fn doc_count(&self) -> u32 {
         self.footer.doc_count
     }
@@ -906,22 +914,7 @@ impl SegmentReader {
                 let Some(entry) = metas.get(doc_seq as usize) else {
                     return Ok(None);
                 };
-                let mut file = match fs::File::open(doc_store_path) {
-                    Ok(f) => f,
-                    // Scoring-set-only hydration deliberately leaves
-                    // doc_store.bin unfetched — a typed miss lets the
-                    // server fetch exactly this segment's doc store and
-                    // retry, instead of surfacing a generic I/O 500.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        let seg = doc_store_path
-                            .parent()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| doc_store_path.display().to_string());
-                        return Err(KoshaError::DocStoreMissing(vec![seg]));
-                    }
-                    Err(e) => return Err(e.into()),
-                };
+                let mut file = fs::File::open(doc_store_path)?;
                 file.seek(SeekFrom::Start(entry.offset))?;
                 let mut buf = vec![0u8; entry.length as usize];
                 file.read_exact(&mut buf)?;

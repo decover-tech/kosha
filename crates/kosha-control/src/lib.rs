@@ -15,6 +15,12 @@ mod postgres;
 #[cfg(feature = "postgres")]
 pub use postgres::PgStore;
 
+#[cfg(feature = "postgres")]
+mod hydration_lease;
+
+#[cfg(feature = "postgres")]
+pub use hydration_lease::{HydrationLease, HydrationLeaseStore};
+
 /// In-memory namespace registry and manifest store.
 ///
 /// Tracks namespaces and their current segment manifests. Not internally

@@ -14,6 +14,13 @@ use kosha_core::{
 };
 use kosha_segment::{tokenize, SegmentReader};
 
+/// Optional callback the searcher invokes to ensure `doc_store.bin` is local
+/// for the segments that hold the materialize page hits — the on-demand half
+/// of scoring-set-only hydration. See
+/// [`Searcher::search_with_doc_store_hydrator`]. `None` materializes straight
+/// from disk (warm / local-dev, where `doc_store.bin` is already present).
+pub type DocStoreHydrator<'a> = Option<&'a dyn Fn(&[PathBuf])>;
+
 /// Default number of parsed segments kept resident in memory (see
 /// [`SegmentCache`]). Segments are immutable once written (DESIGN.md §6.2),
 /// so caching a parsed segment indefinitely is safe — the only reason to
@@ -1290,7 +1297,7 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
     ) -> Result<SearchResult, KoshaError> {
-        self.search_with_stats(namespace, manifest, query, tombstones)
+        self.search_inner(namespace, manifest, query, tombstones, None)
             .map(|(result, _stats)| result)
     }
 
@@ -1305,6 +1312,44 @@ impl Searcher {
         tombstones: Option<
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
+    ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
+        self.search_inner(namespace, manifest, query, tombstones, None)
+    }
+
+    /// Like [`Searcher::search_with_stats`], but with an optional callback
+    /// the searcher invokes to ensure `doc_store.bin` is local for the
+    /// segments that hold the materialize page hits — after scoring/ranking
+    /// and before field materialization.
+    ///
+    /// This is the on-demand half of scoring-set-only hydration: a cold
+    /// search hydrates the small scoring set (footer + inverted + filters +
+    /// `doc_store.offsets`) up front and skips the bulk `doc_store.bin`
+    /// entirely; only the segments contributing to the returned page then
+    /// get their `doc_store.bin` fetched, via this callback. Pass `None` to
+    /// materialize straight from disk (the warm / local-dev path where
+    /// `doc_store.bin` is already present).
+    pub fn search_with_doc_store_hydrator(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
+        hydrator: DocStoreHydrator<'_>,
+    ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
+        self.search_inner(namespace, manifest, query, tombstones, hydrator)
+    }
+
+    fn search_inner(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
+        doc_store_hydrator: DocStoreHydrator<'_>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
         let mut phase_stats = SearchPhaseStats::default();
         if manifest.segments.is_empty() {
@@ -1490,28 +1535,34 @@ impl Searcher {
             }
         }
 
+        // On-demand `doc_store.bin` for the materialize page (scoring-set-
+        // only hydration): a cold search hydrated just the offsets sidecar
+        // for Lazy segments, so `doc_store.bin` is absent until now. Fetch
+        // it only for the segments that actually hold the returned page —
+        // at most `from + max_results` distinct segments, not the whole
+        // manifest — so the bytes read scale with page size, not hit count.
+        // Idempotent: the server's `ensure_files_local` skips files already
+        // present, so warm segments and legacy (Eager) segments already
+        // carrying `doc_store.bin` are no-ops.
+        if let Some(ensure_doc_store) = doc_store_hydrator {
+            let mut page_seg_paths: Vec<PathBuf> = Vec::new();
+            for cand in &candidates[from..to] {
+                let p = cand.reader.segment_dir().to_path_buf();
+                if !page_seg_paths.contains(&p) {
+                    page_seg_paths.push(p);
+                }
+            }
+            if !page_seg_paths.is_empty() {
+                ensure_doc_store(&page_seg_paths);
+            }
+        }
+
         // Materialize fields / highlights only for the returned page — the
         // only place a `Lazy` segment's full field content is ever read
         // from disk (one seek+read per document, not the whole segment).
         let mut page = Vec::with_capacity(to - from);
-        // Under scoring-set-only hydration, doc stores are fetched lazily —
-        // collect every page segment whose doc store is absent (not just the
-        // first) so the server can fetch them all in one round and retry.
-        let mut missing_doc_stores: Vec<String> = Vec::new();
         for cand in &candidates[from..to] {
-            let doc_rec = match cand.reader.doc_record_full(cand.doc_seq) {
-                Ok(rec) => rec,
-                Err(KoshaError::DocStoreMissing(segs)) => {
-                    for seg in segs {
-                        if !missing_doc_stores.contains(&seg) {
-                            missing_doc_stores.push(seg);
-                        }
-                    }
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            let Some(doc_rec) = doc_rec else {
+            let Some(doc_rec) = cand.reader.doc_record_full(cand.doc_seq)? else {
                 continue;
             };
             let mut doc = ScoredDocument {
@@ -1544,9 +1595,6 @@ impl Searcher {
                 }
             }
             page.push(doc);
-        }
-        if !missing_doc_stores.is_empty() {
-            return Err(KoshaError::DocStoreMissing(missing_doc_stores));
         }
 
         // Merge aggregations across segments.
@@ -2035,76 +2083,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_doc_store_scores_fine_and_reports_page_segments_to_fetch() {
-        // Scoring-set-only hydration: a segment without doc_store.bin (but
-        // with the offsets sidecar) must score normally — the store is only
-        // touched at page materialization, which reports exactly which
-        // segments' stores to fetch via DocStoreMissing, and succeeds once
-        // they're back.
-        let dir = std::env::temp_dir().join("kosha-test-docstore-missing");
-        let _ = std::fs::remove_dir_all(&dir);
-        let s1_dir = mk_segment(&dir, "test", "s1", "alpha beta");
-        let s2_dir = mk_segment(&dir, "test", "s2", "alpha beta");
-        let manifest = Manifest {
-            version: 1,
-            segments: vec![
-                ManifestEntry {
-                    segment_id: SegmentId("s1".into()),
-                    doc_count: 1,
-                },
-                ManifestEntry {
-                    segment_id: SegmentId("s2".into()),
-                    doc_count: 1,
-                },
-            ],
-        };
-        // Simulate scoring-only hydration: stash s1's doc store elsewhere.
-        let stash = dir.join("s1-doc_store.bin");
-        std::fs::rename(s1_dir.join("doc_store.bin"), &stash).unwrap();
-
-        let searcher = Searcher::new(dir.clone());
-        let err = searcher
-            .search(
-                &NamespaceId("test".into()),
-                &manifest,
-                &mk_query("alpha", 10),
-                None,
-            )
-            .unwrap_err();
-        match err {
-            KoshaError::DocStoreMissing(segs) => {
-                assert_eq!(
-                    segs,
-                    vec!["s1".to_string()],
-                    "must name exactly the missing segment"
-                );
-            }
-            other => panic!("expected DocStoreMissing, got {other}"),
-        }
-
-        // "Fetch" the doc store back (what the server's retry does) — the
-        // same searcher (warm caches) must now materialize the full page.
-        std::fs::rename(&stash, s1_dir.join("doc_store.bin")).unwrap();
-        let result = searcher
-            .search(
-                &NamespaceId("test".into()),
-                &manifest,
-                &mk_query("alpha", 10),
-                None,
-            )
-            .unwrap();
-        assert_eq!(result.total_hits, 2);
-        assert_eq!(
-            result.results.len(),
-            2,
-            "both docs materialize after the fetch"
-        );
-        let _ = s2_dir;
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn search_with_stats_reports_phase_timings_and_open_counts() {
         let dir = std::env::temp_dir().join("kosha-test-search-stats");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2533,18 +2511,114 @@ mod tests {
         assert_eq!(counted.total_hits, 1);
         assert!(counted.results.is_empty());
 
-        // A query that actually needs to return the document reports the
-        // miss as the *typed* DocStoreMissing (naming the segment) rather
-        // than a generic I/O error — under scoring-set-only hydration a
-        // locally-absent doc store is an expected, recoverable state the
-        // server answers by fetching that segment's store and retrying.
+        // A query that actually needs to return the document correctly
+        // fails now that its full content is genuinely gone — this is the
+        // honest lazy-loading tradeoff, not a bug: the in-memory cache never
+        // held full field content in the first place, so there is nothing
+        // to silently fall back to.
         let full_page = mk_query("hello", 10);
         let err = searcher
             .search(&ns, &manifest, &full_page, None)
             .expect_err("materializing the page must surface the missing doc_store.bin");
+        assert!(matches!(err, KoshaError::Io(_)), "unexpected error: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_with_doc_store_hydrator_fetches_only_page_segments_on_demand() {
+        // Scoring-set-only hydration contract: a cold search has only the
+        // offsets sidecar locally, so `doc_store.bin` is fetched on demand —
+        // via the hydrator callback — for *only* the segments holding the
+        // returned page, not the whole manifest. Includes a non-matching
+        // segment that must never be requested, and a count-only call that
+        // must not invoke the hydrator at all.
+        let dir = std::env::temp_dir().join("kosha-test-doc-store-on-demand");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+
+        let build_seg = |id: &str, doc_id: &str, text: &str| {
+            let seg_dir = dir.join(&ns.0).join(id);
+            let mut w = SegmentWriter::new(SegmentId(id.into()), seg_dir.clone());
+            w.add_document(DocumentId(doc_id.into()), vec![Field::text("t", text)]);
+            w.finalize(Bm25Params::default()).unwrap();
+            // Back up doc_store.bin, then remove it to model scoring-set-only
+            // hydration: offsets sidecar present, doc_store.bin absent.
+            let bin = seg_dir.join("doc_store.bin");
+            std::fs::copy(&bin, seg_dir.join("doc_store.bin.bak")).unwrap();
+            std::fs::remove_file(&bin).unwrap();
+            seg_dir
+        };
+
+        let _s1 = build_seg("s1", "d1", "hello world");
+        let _s2 = build_seg("s2", "d2", "hello moon");
+        let s3 = build_seg("s3", "d3", "completely unrelated"); // no hit
+
+        let manifest = Manifest {
+            version: 1,
+            segments: ["s1", "s2", "s3"]
+                .into_iter()
+                .map(|id| ManifestEntry {
+                    segment_id: SegmentId(id.into()),
+                    doc_count: 1,
+                })
+                .collect(),
+        };
+        // Fresh searcher so each segment is actually opened (Lazy), not
+        // served from a warm cache populated by an earlier call here.
+        let searcher = Searcher::new(dir.clone());
+
+        let requested: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let requested_clone = Arc::clone(&requested);
+        let restore = move |segs: &[PathBuf]| {
+            for p in segs {
+                let bak = p.join("doc_store.bin.bak");
+                let bin = p.join("doc_store.bin");
+                if !bin.exists() && bak.exists() {
+                    std::fs::copy(&bak, &bin).unwrap();
+                }
+                requested_clone.lock().unwrap().push(p.clone());
+            }
+        };
+
+        let q = mk_query("hello", 5);
+        let r = searcher
+            .search_with_doc_store_hydrator(&ns, &manifest, &q, None, Some(&restore))
+            .map(|(result, _stats)| result)
+            .expect("materialize must succeed after the hydrator restores doc_store.bin");
+        assert_eq!(r.total_hits, 2);
+        assert_eq!(r.results.len(), 2);
+        // Fields were genuinely materialized from the restored doc_store.bin.
+        assert!(r.results.iter().any(|d| d.doc_id.0 == "d1"));
+        assert!(r.results.iter().any(|d| d.doc_id.0 == "d2"));
+
+        // Exactly the two page-bearing segments were requested; the
+        // non-matching s3 segment must never reach the hydrator.
+        let req = requested.lock().unwrap();
+        assert_eq!(
+            req.len(),
+            2,
+            "expected exactly the 2 page segments, got {req:?}"
+        );
         assert!(
-            matches!(&err, KoshaError::DocStoreMissing(segs) if segs == &vec!["s1".to_string()]),
-            "unexpected error: {err}"
+            req.iter().all(|p| p != &s3),
+            "non-matching segment s3 was hydrated"
+        );
+        drop(req);
+
+        // A count-only query materializes no page → hydrator untouched.
+        let before = requested.lock().unwrap().len();
+        let count_only = mk_query("hello", 0);
+        let counted = searcher
+            .search_with_doc_store_hydrator(&ns, &manifest, &count_only, None, Some(&restore))
+            .map(|(result, _stats)| result)
+            .unwrap();
+        assert_eq!(counted.total_hits, 2);
+        assert!(counted.results.is_empty());
+        assert_eq!(
+            requested.lock().unwrap().len(),
+            before,
+            "count-only query must not trigger doc_store hydration"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
