@@ -1090,10 +1090,8 @@ impl Searcher {
             // map; v2 segments hand out a shared Arc of the on-demand decode
             // — see `SegmentReader::postings`. Fetched once per term here
             // and held for the whole scoring pass either way.
-            let term_postings: Vec<(&str, kosha_segment::PostingsRef<'_>)> = terms_for_bm25
-                .iter()
-                .filter_map(|t| reader.postings(t).map(|p| (t.as_str(), p)))
-                .collect();
+            let term_postings: Vec<(&str, kosha_segment::PostingsRef<'_>)> =
+                reader.postings_for_terms(terms_for_bm25);
 
             let mut doc_frequencies: HashMap<&str, u32> = HashMap::new();
             for (t, p) in &term_postings {
