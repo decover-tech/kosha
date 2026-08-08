@@ -833,14 +833,37 @@ pub struct DocMetaRef<'a> {
 /// the parsed form is an additional cost paid only by segments whose
 /// filters are actually exercised.
 struct LazyFilters {
-    raw: Vec<u8>,
+    segment_dir: PathBuf,
     parsed: OnceLock<FilterStore>,
 }
 
 impl LazyFilters {
+    /// Read + parse `filters.bin` on first use — from disk *at use time*,
+    /// not from bytes captured at open. This matters under filters-skipping
+    /// hydration: a broad query can open (and cache) a segment while
+    /// `filters.bin` isn't local yet; a later filtered query hydrates the
+    /// file and then hits the *cached* reader — snapshotting raw bytes at
+    /// open would have frozen that reader's filters as empty forever,
+    /// silently matching nothing. Reading at use time sees the
+    /// now-hydrated file. (It also means broad queries keep zero filter
+    /// bytes resident.)
     fn get(&self) -> &FilterStore {
-        self.parsed
-            .get_or_init(|| SegmentReader::parse_filters(&self.raw))
+        self.parsed.get_or_init(|| {
+            let raw = SegmentReader::read_filters_raw(&self.segment_dir);
+            if raw.is_empty() {
+                // The writer always emits filters.bin (even with zero
+                // fields, the header is present) — an empty read here
+                // means the file isn't local, i.e. a hydration/eviction
+                // gap, not a segment without filters. Parse yields an
+                // empty store either way; make the abnormal case loud
+                // instead of silently matching nothing.
+                eprintln!(
+                    "WARN: filters.bin missing/empty at first use for {} —                      filtered queries against this segment will match nothing                      until it is re-opened with the file present",
+                    self.segment_dir.display()
+                );
+            }
+            SegmentReader::parse_filters(&raw)
+        })
     }
 }
 
@@ -893,7 +916,7 @@ impl SegmentReader {
             doc_store,
             inverted: Self::read_inverted(&segment_dir)?,
             filters: LazyFilters {
-                raw: Self::read_filters_raw(&segment_dir),
+                segment_dir: segment_dir.clone(),
                 parsed: OnceLock::new(),
             },
             vector_store: vs,
@@ -1820,6 +1843,43 @@ mod tests {
         assert!(
             r.filters.parsed.get().is_some(),
             "first filter_store() call materializes the parse"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_reader_sees_filters_hydrated_after_open() {
+        // Regression for the filters-skipping-hydration composition bug: a
+        // broad query opens (and caches) a segment while filters.bin isn't
+        // local; a later filtered query hydrates the file and reuses the
+        // cached reader. Snapshotting filters.bin's bytes at open would
+        // freeze that reader's filters as empty forever — silently matching
+        // nothing. The reader must read the file at first *use* instead.
+        let dir = std::env::temp_dir().join("kosha-test-filters-hydrated-late");
+        let _ = fs::remove_dir_all(&dir);
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![
+                Field::text("t", "hello world"),
+                Field::keyword("tag", "alpha"),
+            ],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        // Simulate scoring-only hydration: filters.bin not local at open.
+        let stash = dir.join("filters.bin.stash");
+        fs::rename(dir.join("filters.bin"), &stash).unwrap();
+        let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(r.filters.parsed.get().is_none());
+
+        // "Hydrate" the file, then use the SAME (cached) reader.
+        fs::rename(&stash, dir.join("filters.bin")).unwrap();
+        let store = r.filter_store();
+        assert!(
+            store.string_fields.contains_key("tag"),
+            "cached reader must see filters.bin hydrated after it was opened"
         );
 
         let _ = fs::remove_dir_all(&dir);
