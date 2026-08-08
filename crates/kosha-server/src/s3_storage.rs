@@ -344,6 +344,69 @@ impl S3Storage {
         })
     }
 
+    /// Ranged-read counterpart of `read_many` for page materialization:
+    /// fetch each `(logical_path, offset, length)` span as an S3 ranged GET
+    /// (`Range: bytes=offset-offset+length-1`) — KBs per span instead of
+    /// the whole multi-hundred-MB object — with the same concurrent fan-out
+    /// and bounded retry as whole-file fetches. Nothing is persisted to the
+    /// local cache: span bytes belong to exactly one in-flight response.
+    ///
+    /// Returns one entry per input span, index-aligned; `None` for a span
+    /// whose fetch failed after retries (already WARN-logged here). A span
+    /// whose file is already fully local is served from disk instead — a
+    /// concurrent whole-file hydration may have landed it since the caller
+    /// decided to go ranged.
+    pub fn read_ranges(
+        &self,
+        ranges: &[(String, u64, u32)],
+        max_concurrent: usize,
+    ) -> Vec<Option<Vec<u8>>> {
+        if ranges.is_empty() {
+            return Vec::new();
+        }
+        let local_root = self.local.root.clone();
+        let bucket = self.bucket.clone();
+        let prefix = self.prefix.clone();
+        let client = self.client.clone();
+        let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
+
+        self.rt.block_on(async move {
+            let mut set = tokio::task::JoinSet::new();
+            for (idx, (path, offset, length)) in ranges.iter().enumerate() {
+                let (client, bucket, prefix) = (client.clone(), bucket.clone(), prefix.clone());
+                let local_root = local_root.clone();
+                let path = path.clone();
+                let (offset, length) = (*offset, *length);
+                let limit = std::sync::Arc::clone(&limit);
+                set.spawn(async move {
+                    let _permit = limit.acquire_owned().await;
+                    let result = fetch_range_one(
+                        &client,
+                        &bucket,
+                        &prefix,
+                        &local_root,
+                        &path,
+                        offset,
+                        length,
+                    )
+                    .await;
+                    (idx, path, result)
+                });
+            }
+
+            let mut out: Vec<Option<Vec<u8>>> = vec![None; ranges.len()];
+            while let Some(joined) = set.join_next().await {
+                if let Ok((idx, path, result)) = joined {
+                    match result {
+                        Ok(bytes) => out[idx] = Some(bytes),
+                        Err(e) => eprintln!("WARN: ranged GET of {path} failed: {e}"),
+                    }
+                }
+            }
+            out
+        })
+    }
+
     /// Download a file from S3 to local cache.
     fn download_from_s3(&self, s3_key: &str, local_path: &Path) -> Result<Vec<u8>, KoshaError> {
         let client = self.client.clone();
@@ -490,6 +553,19 @@ async fn get_object_with_retry(
     bucket: &str,
     key: &str,
 ) -> Result<aws_sdk_s3::primitives::AggregatedBytes, KoshaError> {
+    get_object_with_retry_ranged(client, bucket, key, None).await
+}
+
+/// `get_object_with_retry` with an optional HTTP `Range` header value
+/// (e.g. `bytes=0-1023`) — `None` fetches the whole object. One function so
+/// ranged page-materialize GETs share the whole-file path's retry/backoff
+/// behavior instead of growing their own.
+async fn get_object_with_retry_ranged(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    range: Option<&str>,
+) -> Result<aws_sdk_s3::primitives::AggregatedBytes, KoshaError> {
     let mut backoffs = retry_backoff_schedule().into_iter();
     let mut last_err = None;
     for attempt in 1..=FETCH_MAX_ATTEMPTS {
@@ -498,6 +574,7 @@ async fn get_object_with_retry(
                 .get_object()
                 .bucket(bucket)
                 .key(key)
+                .set_range(range.map(str::to_string))
                 .send()
                 .await
                 .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?;
@@ -558,6 +635,55 @@ async fn fetch_one(
         .map_err(KoshaError::Io)?;
 
     Ok(())
+}
+
+/// Fetch one exact byte span for [`S3Storage::read_ranges`]: serve it from
+/// the local file when the whole object is already on disk, otherwise as an
+/// S3 ranged GET. Returns the span's bytes — never persisted locally (a
+/// partial `doc_store.bin` on disk would read as a complete file to every
+/// existence check in the hydration path).
+async fn fetch_range_one(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    local_root: &Path,
+    path: &str,
+    offset: u64,
+    length: u32,
+) -> Result<Vec<u8>, KoshaError> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+
+    let local_path = local_root.join(path);
+    if local_path.exists() {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut file = tokio::fs::File::open(&local_path)
+            .await
+            .map_err(KoshaError::Io)?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(KoshaError::Io)?;
+        let mut buf = vec![0u8; length as usize];
+        file.read_exact(&mut buf).await.map_err(KoshaError::Io)?;
+        return Ok(buf);
+    }
+
+    let s3_key = join_s3_key(prefix, path);
+    let range = format!("bytes={}-{}", offset, offset + length as u64 - 1);
+    let bytes = get_object_with_retry_ranged(client, bucket, &s3_key, Some(&range))
+        .await?
+        .into_bytes();
+    // A short response means the range ran past EOF — the offsets sidecar
+    // and the remote object disagree. Parsing it would be garbage; fail so
+    // the caller's fallback (local read) surfaces a real error instead.
+    if bytes.len() != length as usize {
+        return Err(KoshaError::NotFound(format!(
+            "ranged GET {s3_key} [{range}] returned {} bytes, expected {length}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes.to_vec())
 }
 
 impl StorageBackend for S3Storage {
