@@ -356,6 +356,14 @@ impl S3Storage {
     /// whose file is already fully local is served from disk instead — a
     /// concurrent whole-file hydration may have landed it since the caller
     /// decided to go ranged.
+    ///
+    /// Currently unused by the search path — that switched to Option A
+    /// (whole-file `doc_store.bin` per page-segment, persisted) to make warm
+    /// reads local. Kept as a pub API for the future Option B refinement
+    /// (per-segment sparse span cache: cold-bytes + warm-local) and any
+    /// other caller that wants ranged S3 reads; gated `allow(dead_code)`
+    /// accordingly so clippy stays clean.
+    #[allow(dead_code)]
     pub fn read_ranges(
         &self,
         ranges: &[(String, u64, u32)],
@@ -673,6 +681,11 @@ async fn fetch_one(
 /// S3 ranged GET. Returns the span's bytes — never persisted locally (a
 /// partial `doc_store.bin` on disk would read as a complete file to every
 /// existence check in the hydration path).
+///
+/// Currently unused (see `read_ranges` — search path switched to Option A).
+/// Kept + `allow(dead_code)` as the ranged-read primitive for the future
+/// Option B sparse span cache.
+#[allow(dead_code)]
 async fn fetch_range_one(
     client: &aws_sdk_s3::Client,
     bucket: &str,
