@@ -581,6 +581,24 @@ fn postings_cache_max_bytes() -> usize {
     })
 }
 
+/// Optional live-memory account the segment's per-segment postings LRU
+/// reports its resident bytes to (Tier 1 O6). The decoded form of postings
+/// lives outside the on-disk format (the per-query `PostingsCache`), so
+/// `MemoryLedger`'s `approx_segment_bytes` never saw it — and a hot-term or
+/// wildcard workload can grow aggregate decoded bytes across many open
+/// segments without any admission signal. Wiring insert/evict deltas in
+/// here closes that gap: aggregate postings memory now counts toward the
+/// query pod's live-bytes watermark.
+///
+/// Methods are `u64` deltas (`add` for a positive insertion, `release` for
+/// a negative eviction/drop); the implementor is expected to fold them into
+/// its own accounting atomically. `Send + Sync` so an `Arc<dyn …>` can
+/// thread through `InvertedAccess` and into rayon-scored segments.
+pub trait PostingsMemoryAccount: Send + Sync {
+    fn add_postings(&self, bytes: u64);
+    fn release_postings(&self, bytes: u64);
+}
+
 /// Small per-segment LRU of decoded postings, keyed by term-table index.
 ///
 /// The lazy v2 format trades resident memory for a per-query decode — the
@@ -597,12 +615,14 @@ fn postings_cache_max_bytes() -> usize {
 /// invalidates postings an in-flight query still holds. Approximate entry
 /// cost: `count × size_of::<Posting>()` + 4 bytes per position.
 ///
-/// Not yet counted by kosha-query's `MemoryLedger` — bounded per segment
-/// here instead; wiring it into the ledger's per-segment `approx_bytes` is
-/// a follow-up.
+/// Resident bytes are reported to the optional [`PostingsMemoryAccount`]
+/// (insert adds, evict and drop release), so a fleet of open segments'
+/// aggregate decoded postings counts toward the query pod's live-bytes
+/// watermark — bounded by admission, not just the per-segment cap here.
 struct PostingsCache {
     max_bytes: usize,
     state: Mutex<PostingsCacheState>,
+    account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -621,10 +641,14 @@ struct PostingsCacheState {
 const POSTINGS_CACHE_MISS_RING: usize = 256;
 
 impl PostingsCache {
-    fn new(max_bytes: usize) -> Self {
+    fn new(
+        max_bytes: usize,
+        account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+    ) -> Self {
         Self {
             max_bytes,
             state: Mutex::new(PostingsCacheState::default()),
+            account,
         }
     }
 
@@ -673,17 +697,69 @@ impl PostingsCache {
         if self.max_bytes == 0 || bytes > self.max_bytes {
             return;
         }
-        let mut st = self.state.lock().unwrap();
-        if st.entries.insert(term_index, (postings, bytes)).is_none() {
-            st.recency.push_back(term_index);
-            st.total_bytes += bytes;
+        // Capture what changed in resident bytes while holding the cache
+        // lock, then report add/release deltas to the live-bytes account
+        // *after* releasing it — the account (kosha-query's `MemoryLedger`)
+        // takes its own lock, and the established lock-order invariant is
+        // "cache locks may be held while taking the ledger lock, never the
+        // reverse." Reporting outside the cache lock keeps that direction
+        // clean and avoids any reentrancy if `add_postings` ever touches
+        // the same segment's cache.
+        let to_add: u64 = bytes as u64;
+        let mut to_release: Vec<u64> = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap();
+            match st.entries.insert(term_index, (postings, bytes)) {
+                None => {
+                    st.recency.push_back(term_index);
+                    st.total_bytes += bytes;
+                }
+                Some((_, old_bytes)) => {
+                    // Replacing an existing entry: its old resident bytes
+                    // were previously reported as added; release them, and
+                    // the new bytes get added below.
+                    st.total_bytes = st.total_bytes - old_bytes + bytes;
+                    to_release.push(old_bytes as u64);
+                }
+            }
+            while st.total_bytes > self.max_bytes {
+                let Some(oldest) = st.recency.pop_front() else {
+                    break;
+                };
+                if let Some((_, size)) = st.entries.remove(&oldest) {
+                    st.total_bytes -= size;
+                    to_release.push(size as u64);
+                }
+            }
         }
-        while st.total_bytes > self.max_bytes {
-            let Some(oldest) = st.recency.pop_front() else {
-                break;
-            };
-            if let Some((_, size)) = st.entries.remove(&oldest) {
-                st.total_bytes -= size;
+        if let Some(account) = &self.account {
+            for r in &to_release {
+                account.release_postings(*r);
+            }
+            if to_add > 0 {
+                account.add_postings(to_add);
+            }
+        }
+    }
+}
+
+impl Drop for PostingsCache {
+    fn drop(&mut self) {
+        // Release whatever this segment's postings cache still holds to the
+        // live-bytes account, so `MemoryLedger::live` stays truthful as the
+        // owning `SegmentReader` (and its caches) go away — see the trait
+        // doc. Snapshot under the lock, report outside (same lock-order
+        // discipline as `insert`).
+        let total: u64 = self
+            .state
+            .lock()
+            .unwrap()
+            .total_bytes
+            .try_into()
+            .unwrap_or(0);
+        if total > 0 {
+            if let Some(account) = &self.account {
+                account.release_postings(total);
             }
         }
     }
@@ -729,7 +805,10 @@ impl LazyInvertedIndex {
     /// Validate the header and the full term table (span bounds and term
     /// UTF-8) once, so every later accessor can trust the table. One cheap
     /// pass over fixed-width entries — no postings are touched.
-    fn from_bytes(data: Vec<u8>) -> Result<Self, KoshaError> {
+    fn from_bytes(
+        data: Vec<u8>,
+        account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+    ) -> Result<Self, KoshaError> {
         let corrupt = |msg: &str| KoshaError::CorruptSegment(format!("inverted.idx: {msg}"));
         if !Self::detect(&data) {
             return Err(corrupt("missing v2 magic"));
@@ -752,7 +831,7 @@ impl LazyInvertedIndex {
         let index = Self {
             data,
             term_count,
-            cache: PostingsCache::new(postings_cache_max_bytes()),
+            cache: PostingsCache::new(postings_cache_max_bytes(), account),
         };
         for i in 0..term_count {
             let (term_off, term_len, p_off, p_len) = index.raw_entry(i);
@@ -928,7 +1007,11 @@ impl SplitInvertedIndex {
         version == FIXED_SPLIT_INVERTED_VERSION || version == SPLIT_INVERTED_VERSION
     }
 
-    fn from_bytes(data: Vec<u8>, segment_dir: PathBuf) -> Result<Self, KoshaError> {
+    fn from_bytes(
+        data: Vec<u8>,
+        segment_dir: PathBuf,
+        account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+    ) -> Result<Self, KoshaError> {
         let corrupt = |msg: &str| KoshaError::CorruptSegment(format!("split inverted.idx: {msg}"));
         if !Self::detect(&data) {
             return Err(corrupt("missing split v3 header"));
@@ -959,7 +1042,7 @@ impl SplitInvertedIndex {
             segment_dir,
             term_count,
             encoding,
-            cache: PostingsCache::new(postings_cache_max_bytes()),
+            cache: PostingsCache::new(postings_cache_max_bytes(), account),
         };
         for i in 0..term_count {
             let (term_off, term_len, blob_id, _, _) = index.raw_entry(i);
@@ -1300,16 +1383,24 @@ impl SegmentReader {
     /// both for that case is what keeps keyword search latency independent of
     /// embedding volume.
     pub fn open_with_options(segment_dir: PathBuf, load_vectors: bool) -> Result<Self, KoshaError> {
-        Self::open_with_footer_options(segment_dir, load_vectors, None)
+        Self::open_with_footer_options(segment_dir, load_vectors, None, None)
     }
 
     /// Opens a segment with an already-known footer. Search can source the
     /// footer from the manifest and avoid hydrating `footer.json` on cold
     /// S3 reads; non-search callers keep using `open_with_options`.
+    ///
+    /// `postings_account` is an optional live-bytes sink the segment's
+    /// decoded-postings cache reports its resident bytes to (Tier 1 O6) —
+    /// the query path passes a handle to its `MemoryLedger` so aggregate
+    /// decoded-postings memory counts toward the admission watermark; admin
+    /// paths (merge/compaction/tests) pass `None` and the per-segment cap
+    /// alone bounds the cache.
     pub fn open_with_footer_options(
         segment_dir: PathBuf,
         load_vectors: bool,
         footer: Option<Footer>,
+        postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
     ) -> Result<Self, KoshaError> {
         let (vs, hm) = if load_vectors {
             let vs = Self::read_vectors(&segment_dir)?;
@@ -1333,7 +1424,7 @@ impl SegmentReader {
             segment_dir: segment_dir.clone(),
             footer,
             doc_store,
-            inverted: Self::read_inverted(&segment_dir)?,
+            inverted: Self::read_inverted(&segment_dir, postings_account)?,
             filters: LazyFilters {
                 segment_dir: segment_dir.clone(),
                 parsed: OnceLock::new(),
@@ -1560,7 +1651,7 @@ impl SegmentReader {
     /// blooms existed.
     pub fn rewrite_term_bloom(segment_dir: &Path) -> Result<Footer, KoshaError> {
         let mut footer = Self::read_footer(segment_dir)?;
-        let inverted = Self::read_inverted(segment_dir)?;
+        let inverted = Self::read_inverted(segment_dir, None)?;
         footer.term_bloom = Some(build_term_bloom(inverted.all_terms()));
         let json = serde_json::to_string_pretty(&footer)?;
         atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
@@ -1639,16 +1730,22 @@ impl SegmentReader {
     /// table of contents) opens lazily with zero parsing; anything else is
     /// parsed eagerly via the legacy v1 stream layout — the exact cost every
     /// segment paid before v2 existed.
-    fn read_inverted(segment_dir: &Path) -> Result<InvertedAccess, KoshaError> {
+    fn read_inverted(
+        segment_dir: &Path,
+        account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+    ) -> Result<InvertedAccess, KoshaError> {
         let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
         if SplitInvertedIndex::detect(&data) {
             return Ok(InvertedAccess::Split(SplitInvertedIndex::from_bytes(
                 data,
                 segment_dir.to_path_buf(),
+                account,
             )?));
         }
         if LazyInvertedIndex::detect(&data) {
-            return Ok(InvertedAccess::Lazy(LazyInvertedIndex::from_bytes(data)?));
+            return Ok(InvertedAccess::Lazy(LazyInvertedIndex::from_bytes(
+                data, account,
+            )?));
         }
         Ok(InvertedAccess::Eager(Self::parse_legacy_inverted(&data)))
     }
@@ -2477,7 +2574,7 @@ mod tests {
 
         // Budget-eviction behavior on the cache itself: two entries whose
         // combined size exceeds the budget can't both stay resident.
-        let cache = PostingsCache::new(100);
+        let cache = PostingsCache::new(100, None);
         let big = Arc::new(vec![Posting {
             doc_id: 1,
             term_frequency: 1,

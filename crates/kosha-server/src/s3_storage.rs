@@ -300,7 +300,7 @@ impl S3Storage {
         &self,
         paths: &[String],
         max_concurrent: usize,
-    ) -> Vec<(String, Result<(), KoshaError>)> {
+    ) -> Vec<(String, Result<FetchStats, KoshaError>)> {
         if paths.is_empty() {
             return Vec::new();
         }
@@ -314,7 +314,7 @@ impl S3Storage {
         self.rt.block_on(async move {
             let mut set = tokio::task::JoinSet::new();
             let spawn_next =
-                |set: &mut tokio::task::JoinSet<(String, Result<(), KoshaError>)>,
+                |set: &mut tokio::task::JoinSet<(String, Result<FetchStats, KoshaError>)>,
                  pending: &mut std::collections::VecDeque<String>| {
                     let Some(path) = pending.pop_front() else {
                         return;
@@ -604,37 +604,68 @@ async fn get_object_with_retry_ranged(
     Err(last_err.expect("at least one attempt runs, so an exhausted loop always has an error"))
 }
 
+/// Per-file timing for [`S3Storage::read_many`]: rank-orders where the
+/// wall-clock of a hydration batch goes. `get_ms` covers the whole S3 GET
+/// (including bounded retry/backoff), `write_ms` the `tokio::fs::write`.
+/// `bytes` is the decompressed object length; `cached` marks a no-op local
+/// hit (every field but `cached` is zero then). Aggregated by
+/// `hydrate_from_s3_budgeted` into the greppable `hydrate_files timing:`
+/// line — the cold-read plan's "next lever" instrument: is cold wall-clock
+/// GET-bound, write-bound, or fan-out-bound?
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FetchStats {
+    pub get_ms: f64,
+    pub write_ms: f64,
+    pub bytes: u64,
+    pub cached: bool,
+}
+
 /// Fetch one logical path for [`S3Storage::read_many`]: serve from local
 /// disk if already present, otherwise GET from S3 (with bounded retry —
 /// see [`get_object_with_retry`]) and persist it there.
 ///
-/// Returns `()`, not the fetched bytes — every caller of `read_many` only
-/// ever wants "is this file on disk now," so a cache hit here is a pure
-/// existence check (no read at all), and a cache miss doesn't pay for an
-/// extra copy into an owned `Vec<u8>` nobody was going to read either.
+/// Returns [`FetchStats`], not the bytes — every caller of `read_many` only
+/// ever wants "is this file on disk now" plus rank-ordering timing, so a
+/// cache hit here is a pure existence check (no read at all), and a cache
+/// miss doesn't pay for an extra copy into an owned `Vec<u8>` nobody was
+/// going to read either.
 async fn fetch_one(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
     local_root: &Path,
     path: &str,
-) -> Result<(), KoshaError> {
+) -> Result<FetchStats, KoshaError> {
     let local_path = local_root.join(path);
     if local_path.exists() {
-        return Ok(());
+        return Ok(FetchStats {
+            cached: true,
+            ..Default::default()
+        });
     }
 
     let s3_key = join_s3_key(prefix, path);
+    let t_get = std::time::Instant::now();
     let bytes = get_object_with_retry(client, bucket, &s3_key).await?;
+    let get_ms = t_get.elapsed().as_secs_f64() * 1e3;
+    let raw = bytes.into_bytes();
+    let n = raw.len() as u64;
 
     if let Some(parent) = local_path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    tokio::fs::write(&local_path, bytes.into_bytes())
+    let t_write = std::time::Instant::now();
+    tokio::fs::write(&local_path, raw)
         .await
         .map_err(KoshaError::Io)?;
+    let write_ms = t_write.elapsed().as_secs_f64() * 1e3;
 
-    Ok(())
+    Ok(FetchStats {
+        get_ms,
+        write_ms,
+        bytes: n,
+        cached: false,
+    })
 }
 
 /// Fetch one exact byte span for [`S3Storage::read_ranges`]: serve it from
