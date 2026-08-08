@@ -14,7 +14,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(feature = "s3")]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// Map of valid API keys → tenant id.
@@ -133,6 +133,16 @@ struct AppState {
     /// memory — see `hydrate_from_s3_budgeted`/`chunk_by_byte_budget`.
     #[cfg(feature = "s3")]
     hydrate_byte_budget: u64,
+    /// GET fan-out for known-small-file hydration — the scoring set,
+    /// footer prefetch, and page doc stores (`ensure_scoring_files_local`
+    /// / `ensure_files_local`). Separate from `hydrate_concurrency`
+    /// (default 16), which was sized for full-segment fetches with
+    /// multi-hundred-MB doc stores: small-object S3 throughput is
+    /// latency-bound, so a cold scoring fetch of hundreds of ~1-50MB files
+    /// wants a much wider fan-out than a batch of doc stores does.
+    /// `KOSHA_SCORING_HYDRATE_CONCURRENCY`, default 64.
+    #[cfg(feature = "s3")]
+    scoring_hydrate_concurrency: usize,
     /// Segments this process has confirmed are durably uploaded to S3 (every
     /// file present, not just the local directory) — see
     /// `sync_unsynced_segments_to_s3`. Keyed by `(namespace, segment_id)`
@@ -200,6 +210,14 @@ struct AppState {
     /// (falls back to S3, same as an unset `own_addr`).
     #[cfg(all(feature = "s3", feature = "postgres"))]
     internal_auth_key: Option<String>,
+    /// Weak self-reference so request handlers can hand an owning `Arc` to
+    /// background job threads (see `handle_backfill_offset_tables`). Set by
+    /// `new_shared` (the only constructor `main` uses); a bare `new` leaves
+    /// it dangling and background jobs refuse to start.
+    self_ref: Weak<AppState>,
+    /// Namespaces with an offsets-backfill job currently running — one job
+    /// per namespace at a time.
+    backfill_jobs: Mutex<std::collections::HashSet<String>>,
     /// `KOSHA_INGEST_HOST` — set only on query-role pods (deployment-query.yaml).
     /// When present, write-path requests this pod receives are forwarded here
     /// instead of executed locally — see `is_write_path`/`forward_to_ingest`.
@@ -791,6 +809,12 @@ impl AppState {
                 .filter(|n| *n > 0)
                 .unwrap_or(1024 * 1024 * 1024),
             #[cfg(feature = "s3")]
+            scoring_hydrate_concurrency: std::env::var("KOSHA_SCORING_HYDRATE_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(64),
+            #[cfg(feature = "s3")]
             synced_segments: Mutex::new(synced_segments),
             #[cfg(feature = "s3")]
             in_flight_segments: Mutex::new(HashMap::new()),
@@ -823,9 +847,21 @@ impl AppState {
             peer_http_client,
             #[cfg(all(feature = "s3", feature = "postgres"))]
             internal_auth_key,
+            self_ref: Weak::new(),
+            backfill_jobs: Mutex::new(std::collections::HashSet::new()),
             ingest_host,
             write_http_client,
         }
+    }
+
+    /// Construct inside an `Arc` with `self_ref` wired up — the constructor
+    /// `main` uses so handlers can spawn background jobs that own the state.
+    fn new_shared(data_dir: PathBuf) -> Arc<Self> {
+        Arc::new_cyclic(|weak| {
+            let mut state = Self::new(data_dir);
+            state.self_ref = weak.clone();
+            state
+        })
     }
 
     /// Persist the indexer's current manifest for a namespace into the
@@ -1038,8 +1074,10 @@ impl AppState {
                 // Routed through `hydrate_files`, which pins the batch
                 // against cache eviction for its whole duration (#62's
                 // convergence fix) and coordinates the fetch across
-                // replicas when the lease store is configured.
-                self.hydrate_files(s3, &logical_paths);
+                // replicas when the lease store is configured. Full-segment
+                // fetches keep the conservative fan-out — batches here can
+                // include multi-hundred-MB doc stores.
+                self.hydrate_files(s3, &logical_paths, self.hydrate_concurrency);
             }
 
             drop(_permit);
@@ -1073,10 +1111,15 @@ impl AppState {
     /// cache knobs (`KOSHA_CACHE_MAX_BYTES`, `KOSHA_SEGMENT_CACHE_MAX_BYTES`)
     /// bound.
     #[cfg(feature = "s3")]
-    fn hydrate_from_s3_budgeted(&self, s3: &s3_storage::S3Storage, files: &[(String, u64)]) {
+    fn hydrate_from_s3_budgeted(
+        &self,
+        s3: &s3_storage::S3Storage,
+        files: &[(String, u64)],
+        concurrency: usize,
+    ) {
         for chunk in chunk_by_byte_budget(files, self.hydrate_byte_budget) {
             let paths: Vec<String> = chunk.into_iter().map(|(path, _size)| path).collect();
-            for (path, result) in s3.read_many(&paths, self.hydrate_concurrency) {
+            for (path, result) in s3.read_many(&paths, concurrency) {
                 match result {
                     // read_many already persisted the bytes to disk (same
                     // root dir as `self.cache`); just tell the cache's
@@ -1123,7 +1166,7 @@ impl AppState {
         if logical_paths.is_empty() {
             return (0, 0);
         }
-        self.hydrate_files(s3, &logical_paths);
+        self.hydrate_files(s3, &logical_paths, self.scoring_hydrate_concurrency);
         // Bytes counted post-fetch from local metadata (sizes weren't known
         // up front); already-local files were filtered out above so this
         // counts only what this call actually moved.
@@ -1157,7 +1200,12 @@ impl AppState {
     /// climbing 37→128→193 instead of shrinking). Unpinned unconditionally
     /// afterward regardless of outcome.
     #[cfg(feature = "s3")]
-    fn hydrate_files(&self, s3: &s3_storage::S3Storage, files: &[(String, u64)]) {
+    fn hydrate_files(
+        &self,
+        s3: &s3_storage::S3Storage,
+        files: &[(String, u64)],
+        concurrency: usize,
+    ) {
         if files.is_empty() {
             return;
         }
@@ -1167,14 +1215,14 @@ impl AppState {
         #[cfg(feature = "postgres")]
         {
             if let (Some(leases), Some(own_addr)) = (&self.hydration_leases, &self.own_addr) {
-                self.hydrate_files_coordinated(s3, files, leases, own_addr);
+                self.hydrate_files_coordinated(s3, files, leases, own_addr, concurrency);
                 for (path, _) in files {
                     self.cache.unpin(path);
                 }
                 return;
             }
         }
-        self.hydrate_from_s3_budgeted(s3, files);
+        self.hydrate_from_s3_budgeted(s3, files, concurrency);
         for (path, _) in files {
             self.cache.unpin(path);
         }
@@ -1192,6 +1240,7 @@ impl AppState {
         files: &[(String, u64)],
         leases: &kosha_control::HydrationLeaseStore,
         own_addr: &str,
+        concurrency: usize,
     ) {
         // Comfortably longer than a single-file S3 GET + local write should
         // ever take, so a lease only outlives its owner when that owner has
@@ -1232,7 +1281,7 @@ impl AppState {
 
         // Owned (plus peer-fallback) paths go straight to S3, through the
         // same byte-budgeted chunking as uncoordinated hydration.
-        self.hydrate_from_s3_budgeted(s3, &fetch_from_s3);
+        self.hydrate_from_s3_budgeted(s3, &fetch_from_s3, concurrency);
 
         // Release only after our own fetch attempt is done (success or
         // failure) — releasing earlier could let a waiter's peer-fetch land
@@ -1476,12 +1525,12 @@ impl AppState {
             if !logical_paths.is_empty() {
                 println!(
                     "cache miss: hydrating {} scoring file(s) across {} segment(s) \
-                     (fan-out={}); doc_store.bin deferred to page materialize for Lazy segments",
+                     (fan-out={}); doc stores deferred to page materialize for Lazy segments",
                     logical_paths.len(),
                     owned.len(),
-                    self.hydrate_concurrency
+                    self.scoring_hydrate_concurrency
                 );
-                self.hydrate_files(s3, &logical_paths);
+                self.hydrate_files(s3, &logical_paths, self.scoring_hydrate_concurrency);
                 // Bytes counted post-fetch (sizes weren't known up front);
                 // every path here was absent before the fetch, so this
                 // counts only what this call actually moved.
@@ -1591,7 +1640,7 @@ fn main() {
         .unwrap_or(300);
     let addr = format!("0.0.0.0:{port}");
 
-    let state = Arc::new(AppState::new(PathBuf::from(data_dir.clone())));
+    let state = AppState::new_shared(PathBuf::from(data_dir.clone()));
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     println!("kosha-server role={role} listening on {addr} data_dir={data_dir}");
 
@@ -2731,43 +2780,105 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
             .manifest_cloned(&ns)
             .expect("namespace existence checked above")
     };
+    let total = manifest.segments.len();
 
-    // Hydrate every segment in one fanned-out batch rather than one
-    // ensure_segment_local round trip per segment — see handle_index.
-    let seg_paths: Vec<PathBuf> = manifest
-        .segments
-        .iter()
-        .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
-        .collect();
-    #[cfg(feature = "s3")]
-    // Admin routes rewrite or merge segments — must preserve vectors.
-    state.ensure_segments_local(&seg_paths, true);
-
-    let mut backfilled = 0usize;
-    let mut errors = Vec::new();
-    for (entry, seg_path) in manifest.segments.iter().zip(seg_paths.iter()) {
-        if !seg_path.exists() {
-            errors.push(format!("{}: segment not local", entry.segment_id.0));
-            continue;
-        }
-        match SegmentReader::backfill_offset_tables(seg_path) {
-            Ok(_) => {
-                backfilled += 1;
-                #[cfg(feature = "s3")]
-                {
-                    state.sync_file_to_s3(seg_path, "doc_store.offsets");
-                    state.sync_file_to_s3(seg_path, "footer.json");
-                }
-            }
-            Err(e) => errors.push(format!("{}: {e}", entry.segment_id.0)),
+    // The work runs on a background thread: hydrating + parsing a legacy
+    // namespace's doc stores takes minutes — far past the query→ingest
+    // forward proxy's timeout and the HTTP io timeout, which is why the
+    // previous synchronous version always answered into a dead socket with
+    // no way to observe what happened.
+    let Some(job_state) = state.self_ref.upgrade() else {
+        return json_error(500, "server not initialized for background jobs");
+    };
+    {
+        let mut jobs = state.backfill_jobs.lock().unwrap();
+        if !jobs.insert(ns.0.clone()) {
+            return json_ok(&serde_json::json!({
+                "namespace": ns.0,
+                "status": "already_running",
+                "segments": total,
+            }));
         }
     }
 
+    let job_ns = ns.clone();
+    std::thread::spawn(move || {
+        let state = job_state;
+        let ns = job_ns;
+        let mut done = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+        for (i, entry) in manifest.segments.iter().enumerate() {
+            let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
+
+            // Resumable: a segment whose sidecar already reached S3 is done —
+            // re-running after a crash/restart only pays for the remainder.
+            #[cfg(feature = "s3")]
+            let already_done = state
+                .s3_storage
+                .as_ref()
+                .map(|s3| {
+                    let rel = format!("{}/{}", ns.0, entry.segment_id.0);
+                    s3.list_with_sizes(&rel)
+                        .map(|files| files.iter().any(|(n, _)| n == "doc_store.offsets"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            #[cfg(not(feature = "s3"))]
+            let already_done = seg_path.join("doc_store.offsets").is_file();
+            if already_done {
+                skipped += 1;
+                continue;
+            }
+
+            // Per-segment fetch of only the two files the backfill actually
+            // reads (doc_store.bin to derive spans, footer.json to bump
+            // format_version) — not the whole segment, and not the whole
+            // namespace up front: bounded disk pressure, and the cache can
+            // evict processed segments while later ones stream in.
+            #[cfg(feature = "s3")]
+            {
+                state.ensure_files_local(std::slice::from_ref(&seg_path), "footer.json");
+                state.ensure_files_local(std::slice::from_ref(&seg_path), "doc_store.bin");
+            }
+
+            match SegmentReader::backfill_offset_tables(&seg_path) {
+                Ok(_) => {
+                    #[cfg(feature = "s3")]
+                    {
+                        state.sync_file_to_s3(&seg_path, "doc_store.offsets");
+                        state.sync_file_to_s3(&seg_path, "footer.json");
+                    }
+                    done += 1;
+                    println!(
+                        "backfill progress: ns={} segment={} ({}/{total}) ok",
+                        ns.0,
+                        entry.segment_id.0,
+                        i + 1,
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    eprintln!(
+                        "WARN: backfill failed: ns={} segment={} ({}/{total}): {e}",
+                        ns.0,
+                        entry.segment_id.0,
+                        i + 1,
+                    );
+                }
+            }
+        }
+        println!(
+            "backfill complete: ns={} backfilled={done} skipped={skipped} failed={failed} total={total}",
+            ns.0,
+        );
+        state.backfill_jobs.lock().unwrap().remove(&ns.0);
+    });
+
     json_ok(&serde_json::json!({
         "namespace": ns.0,
-        "segments": manifest.segments.len(),
-        "backfilled": backfilled,
-        "errors": errors,
+        "status": "started",
+        "segments": total,
     }))
 }
 
