@@ -1377,6 +1377,7 @@ impl AppState {
         let needs_bloom_check = query.filter.is_some() || term_prune.is_some();
         let needs_vectors = query.knn.is_some();
         let needs_filters = query_needs_filter_store(query);
+        let posting_files = posting_blob_files_for_query(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
@@ -1411,6 +1412,10 @@ impl AppState {
         }
         let mut outcome =
             self.ensure_scoring_files_local(&to_hydrate, needs_vectors, needs_filters);
+        let postings_outcome = self.ensure_posting_blobs_local(&to_hydrate, &posting_files);
+        outcome.files_fetched += postings_outcome.files_fetched;
+        outcome.bytes_fetched += postings_outcome.bytes_fetched;
+        outcome.missing.extend(postings_outcome.missing);
         outcome.files_fetched += footer_files;
         outcome.bytes_fetched += footer_bytes;
         outcome
@@ -1566,6 +1571,72 @@ impl AppState {
             .filter(|p| !Self::segment_is_scoring_complete(p, needs_vectors, needs_filters))
             .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
             .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        outcome
+    }
+
+    #[cfg(feature = "s3")]
+    fn ensure_posting_blobs_local(
+        &self,
+        seg_paths: &[PathBuf],
+        posting_files: &[String],
+    ) -> HydrationOutcome {
+        let Some(ref s3) = self.s3_storage else {
+            return HydrationOutcome::default();
+        };
+        if posting_files.is_empty() {
+            return HydrationOutcome::default();
+        }
+
+        let _permit = self.hydration_semaphore.acquire();
+        let mut logical_paths: Vec<(String, u64)> = Vec::new();
+        for seg_path in seg_paths {
+            if !kosha_segment::inverted_uses_posting_blobs(seg_path) {
+                continue;
+            }
+            let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+                continue;
+            };
+            let s3_prefix = rel_path.to_string_lossy();
+            for file_name in posting_files {
+                if !seg_path.join(file_name).exists() {
+                    logical_paths.push((format!("{s3_prefix}/{file_name}"), 0));
+                }
+            }
+        }
+
+        let mut outcome = HydrationOutcome::default();
+        if !logical_paths.is_empty() {
+            println!(
+                "cache miss: hydrating {} posting blob(s) across {} segment(s) (fan-out={})",
+                logical_paths.len(),
+                seg_paths.len(),
+                self.scoring_hydrate_concurrency
+            );
+            self.hydrate_files(s3, &logical_paths, self.scoring_hydrate_concurrency);
+            for (path, _) in &logical_paths {
+                if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
+                    outcome.files_fetched += 1;
+                    outcome.bytes_fetched += m.len();
+                }
+            }
+        }
+
+        outcome.missing = seg_paths
+            .iter()
+            .filter(|seg_path| kosha_segment::inverted_uses_posting_blobs(seg_path))
+            .flat_map(|seg_path| {
+                posting_files.iter().filter_map(move |file_name| {
+                    let path = seg_path.join(file_name);
+                    if path.is_file() {
+                        None
+                    } else {
+                        path.strip_prefix(&self.data_dir)
+                            .ok()
+                            .map(|p| p.to_string_lossy().into_owned())
+                    }
+                })
+            })
             .collect();
         outcome
     }
@@ -3126,6 +3197,26 @@ fn query_needs_filter_store(query: &SearchQuery) -> bool {
                 .keys()
                 .any(|field| field != "_score" && field != "_id")
         })
+}
+
+#[cfg(feature = "s3")]
+fn posting_blob_files_for_query(query: &SearchQuery) -> Vec<String> {
+    if query.wildcard.is_some() {
+        return kosha_segment::all_posting_blob_files();
+    }
+
+    let mut files = std::collections::HashSet::new();
+    for term in tokenize(&query.query_text) {
+        files.insert(kosha_segment::posting_blob_file_for_term(&term));
+    }
+    if let Some(ref phrase) = query.match_phrase {
+        for term in tokenize(&phrase.phrase) {
+            files.insert(kosha_segment::posting_blob_file_for_term(&term));
+        }
+    }
+    let mut files: Vec<String> = files.into_iter().collect();
+    files.sort();
+    files
 }
 
 /// Error message for a search that can't proceed because hydrating one or
