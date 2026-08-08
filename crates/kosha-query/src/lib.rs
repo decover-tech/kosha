@@ -1010,7 +1010,13 @@ impl Searcher {
             Some(open_stats),
         )?;
         let total_docs = reader.doc_count();
-        let store = reader.filter_store();
+        let needs_filter_store =
+            query.filter.is_some() || !sort_value_fields.is_empty() || !query.aggs.is_empty();
+        let filter_store = if needs_filter_store {
+            Some(reader.filter_store())
+        } else {
+            None
+        };
         let scorer = Bm25Scorer::new(
             total_docs,
             reader.avg_field_length(),
@@ -1177,7 +1183,11 @@ impl Searcher {
             // dropped hits from earlier segments.
             let passed_filter: Option<HashSet<u32>> = if let Some(ref clause) = query.filter {
                 let filter_candidates: HashSet<u32> = scored.keys().copied().collect();
-                Some(FilterApplier::apply(clause, store, &filter_candidates)?)
+                Some(FilterApplier::apply(
+                    clause,
+                    filter_store.expect("query.filter requires filter_store"),
+                    &filter_candidates,
+                )?)
             } else {
                 None
             };
@@ -1197,8 +1207,11 @@ impl Searcher {
             }
         } else if has_only_filter {
             let all_candidates: HashSet<u32> = (0..total_docs).collect();
-            let passed =
-                FilterApplier::apply(query.filter.as_ref().unwrap(), store, &all_candidates)?;
+            let passed = FilterApplier::apply(
+                query.filter.as_ref().unwrap(),
+                filter_store.expect("filter-only query requires filter_store"),
+                &all_candidates,
+            )?;
             for doc_seq in passed {
                 if is_tombstoned(doc_seq) {
                     continue;
@@ -1251,7 +1264,10 @@ impl Searcher {
         let sort_value_maps = if sort_value_fields.is_empty() {
             HashMap::new()
         } else {
-            build_sort_value_maps(store, sort_value_fields)
+            build_sort_value_maps(
+                filter_store.expect("custom sort requires filter_store"),
+                sort_value_fields,
+            )
         };
         let mut candidates = Vec::with_capacity(seg_hits.len());
         for (doc_seq, (score, doc_id)) in seg_hits {
@@ -1272,6 +1288,7 @@ impl Searcher {
         // ── Aggregations (this segment's own contribution only) ──
         let mut aggs = HashMap::new();
         for (agg_name, agg) in &query.aggs {
+            let store = filter_store.expect("aggregations require filter_store");
             match agg {
                 Aggregation::Terms { terms } => {
                     let result = compute_single_aggregation(store, &terms.field);

@@ -1376,6 +1376,7 @@ impl AppState {
         let term_prune = term_bloom_prune_for_query(query);
         let needs_bloom_check = query.filter.is_some() || term_prune.is_some();
         let needs_vectors = query.knn.is_some();
+        let needs_filters = query_needs_filter_store(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
@@ -1408,7 +1409,8 @@ impl AppState {
             }
             to_hydrate.push(seg_path);
         }
-        let mut outcome = self.ensure_scoring_files_local(&to_hydrate, needs_vectors);
+        let mut outcome =
+            self.ensure_scoring_files_local(&to_hydrate, needs_vectors, needs_filters);
         outcome.files_fetched += footer_files;
         outcome.bytes_fetched += footer_bytes;
         outcome
@@ -1425,11 +1427,18 @@ impl AppState {
     /// which is the *full* set used by the compaction/merge path (those read
     /// every document and must have `doc_store.bin`).
     #[cfg(feature = "s3")]
-    fn segment_is_scoring_complete(seg_path: &Path, needs_vectors: bool) -> bool {
-        for f in ["footer.json", "inverted.idx", "filters.bin"] {
+    fn segment_is_scoring_complete(
+        seg_path: &Path,
+        needs_vectors: bool,
+        needs_filters: bool,
+    ) -> bool {
+        for f in ["footer.json", "inverted.idx"] {
             if !seg_path.join(f).is_file() {
                 return false;
             }
+        }
+        if needs_filters && !seg_path.join("filters.bin").is_file() {
+            return false;
         }
         let doc_access_ok = seg_path.join("doc_store.offsets").is_file()
             || seg_path.join("doc_store.bin").is_file();
@@ -1461,6 +1470,7 @@ impl AppState {
         &self,
         seg_paths: &[PathBuf],
         needs_vectors: bool,
+        needs_filters: bool,
     ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
             return HydrationOutcome::default();
@@ -1468,7 +1478,7 @@ impl AppState {
 
         let mut outcome = HydrationOutcome::default();
         let (owned, waiting) = partition_for_hydration(&self.in_flight_segments, seg_paths, |p| {
-            Self::segment_is_scoring_complete(p, needs_vectors)
+            Self::segment_is_scoring_complete(p, needs_vectors, needs_filters)
         });
 
         if !owned.is_empty() {
@@ -1489,10 +1499,13 @@ impl AppState {
                 // Always-needed scoring files (footer.json was prefetched,
                 // but include it for completeness / resilience to a warm
                 // footer being evicted between the prefetch and here).
-                for f in ["footer.json", "inverted.idx", "filters.bin"] {
+                for f in ["footer.json", "inverted.idx"] {
                     if !seg_path.join(f).exists() {
                         logical_paths.push((format!("{s3_prefix}/{f}"), 0));
                     }
+                }
+                if needs_filters && !seg_path.join("filters.bin").exists() {
+                    logical_paths.push((format!("{s3_prefix}/filters.bin"), 0));
                 }
 
                 // doc_store: Lazy segments need only the offsets sidecar;
@@ -1550,7 +1563,7 @@ impl AppState {
 
         outcome.missing = seg_paths
             .iter()
-            .filter(|p| !Self::segment_is_scoring_complete(p, needs_vectors))
+            .filter(|p| !Self::segment_is_scoring_complete(p, needs_vectors, needs_filters))
             .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
@@ -3101,6 +3114,20 @@ fn term_bloom_prune_for_query(query: &SearchQuery) -> Option<(Vec<String>, TermB
     }
 }
 
+/// Whether scoring/materialization needs `filters.bin`. Broad lexical
+/// queries with default score/_id ranking do not: they use only postings,
+/// doc metadata, and page doc stores.
+#[cfg(feature = "s3")]
+fn query_needs_filter_store(query: &SearchQuery) -> bool {
+    query.filter.is_some()
+        || !query.aggs.is_empty()
+        || query.sort.iter().any(|spec| {
+            spec.fields
+                .keys()
+                .any(|field| field != "_score" && field != "_id")
+        })
+}
+
 /// Error message for a search that can't proceed because hydrating one or
 /// more required segments from S3 failed — returning results anyway would
 /// silently look like "0 hits" for a namespace that actually has data.
@@ -3467,30 +3494,34 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false),
+            !AppState::segment_is_scoring_complete(&dir, false, false),
             "empty dir must not be scoring-complete"
         );
 
-        for f in [
-            "footer.json",
-            "inverted.idx",
-            "filters.bin",
-            "doc_store.offsets",
-        ] {
+        for f in ["footer.json", "inverted.idx", "doc_store.offsets"] {
             fs::write(dir.join(f), b"x").unwrap();
         }
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false),
-            "offsets sidecar (no doc_store.bin) must be lexical scoring-complete"
+            AppState::segment_is_scoring_complete(&dir, false, false),
+            "offsets sidecar (no doc_store.bin, no filters.bin) must be broad lexical scoring-complete"
         );
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, true),
+            !AppState::segment_is_scoring_complete(&dir, false, true),
+            "queries using filters/sorts/aggs must still require filters.bin"
+        );
+        fs::write(dir.join("filters.bin"), b"x").unwrap();
+        assert!(
+            AppState::segment_is_scoring_complete(&dir, false, true),
+            "filters.bin present must make filter/sort/agg queries scoring-complete"
+        );
+        assert!(
+            !AppState::segment_is_scoring_complete(&dir, true, true),
             "kNN scoring-complete must require vector.idx (still missing)"
         );
 
         fs::write(dir.join("vector.idx"), b"x").unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, true),
+            AppState::segment_is_scoring_complete(&dir, true, true),
             "vector.idx present must make it kNN scoring-complete"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -3509,12 +3540,12 @@ mod tests {
             fs::write(legacy.join(f), b"x").unwrap();
         }
         assert!(
-            AppState::segment_is_scoring_complete(&legacy, false),
+            AppState::segment_is_scoring_complete(&legacy, false, true),
             "legacy segment with doc_store.bin (no offsets) must be scoring-complete"
         );
         fs::remove_file(legacy.join("doc_store.bin")).unwrap();
         assert!(
-            !AppState::segment_is_scoring_complete(&legacy, false),
+            !AppState::segment_is_scoring_complete(&legacy, false, true),
             "legacy segment without offsets and without doc_store.bin is not scorable"
         );
         let _ = fs::remove_dir_all(&legacy);
