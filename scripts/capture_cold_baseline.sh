@@ -60,9 +60,9 @@ echo "$STATS_JSON" | python3 -c '
 import json, sys
 stats = json.load(sys.stdin)
 rows = sorted(stats.get("namespaces", []), key=lambda r: -r.get("documents", 0))
-print(f"{'namespace':<50} {'documents':>12} {'segments':>9}")
+print("%-50s %12s %9s" % ("namespace", "documents", "segments"))
 for r in rows[:15]:
-    print(f"{r['namespace']:<50} {r['documents']:>12} {r['segments']:>9}")
+    print("%-50s %12d %9d" % (r["namespace"], r["documents"], r["segments"]))
 '
 
 if [ "$#" -gt 0 ]; then
@@ -97,8 +97,10 @@ for ns in "${TARGETS[@]}"; do
   search_once "$ns" warm-2
 
   say "server-side phase breakdown ($ns)"
-  # --since-time scopes to this round; all query pods, cold line first.
-  kubectl -n "$NS_K8S" logs deployment/kosha-query --since-time="$MEASURE_START" --all-containers 2>/dev/null \
+  # --since-time scopes to this round. Label selector (not deployment/) so
+  # every query replica's logs are scanned — the search lands on whichever
+  # pod the Service picked. --tail=-1 because selector logs default to 10.
+  kubectl -n "$NS_K8S" logs -l app=kosha,role=query --since-time="$MEASURE_START" --tail=-1 --prefix 2>/dev/null \
     | grep "search timing:" | grep "ns=$ns" || echo "  (no timing lines found — check pod logs manually)"
 done
 
