@@ -133,6 +133,16 @@ struct AppState {
     /// memory — see `hydrate_from_s3_budgeted`/`chunk_by_byte_budget`.
     #[cfg(feature = "s3")]
     hydrate_byte_budget: u64,
+    /// GET fan-out for known-small-file hydration — the scoring set,
+    /// footer prefetch, and page doc stores (`ensure_scoring_files_local`
+    /// / `ensure_files_local`). Separate from `hydrate_concurrency`
+    /// (default 16), which was sized for full-segment fetches with
+    /// multi-hundred-MB doc stores: small-object S3 throughput is
+    /// latency-bound, so a cold scoring fetch of hundreds of ~1-50MB files
+    /// wants a much wider fan-out than a batch of doc stores does.
+    /// `KOSHA_SCORING_HYDRATE_CONCURRENCY`, default 64.
+    #[cfg(feature = "s3")]
+    scoring_hydrate_concurrency: usize,
     /// Segments this process has confirmed are durably uploaded to S3 (every
     /// file present, not just the local directory) — see
     /// `sync_unsynced_segments_to_s3`. Keyed by `(namespace, segment_id)`
@@ -791,6 +801,12 @@ impl AppState {
                 .filter(|n| *n > 0)
                 .unwrap_or(1024 * 1024 * 1024),
             #[cfg(feature = "s3")]
+            scoring_hydrate_concurrency: std::env::var("KOSHA_SCORING_HYDRATE_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(64),
+            #[cfg(feature = "s3")]
             synced_segments: Mutex::new(synced_segments),
             #[cfg(feature = "s3")]
             in_flight_segments: Mutex::new(HashMap::new()),
@@ -1038,8 +1054,10 @@ impl AppState {
                 // Routed through `hydrate_files`, which pins the batch
                 // against cache eviction for its whole duration (#62's
                 // convergence fix) and coordinates the fetch across
-                // replicas when the lease store is configured.
-                self.hydrate_files(s3, &logical_paths);
+                // replicas when the lease store is configured. Full-segment
+                // fetches keep the conservative fan-out — batches here can
+                // include multi-hundred-MB doc stores.
+                self.hydrate_files(s3, &logical_paths, self.hydrate_concurrency);
             }
 
             drop(_permit);
@@ -1073,10 +1091,15 @@ impl AppState {
     /// cache knobs (`KOSHA_CACHE_MAX_BYTES`, `KOSHA_SEGMENT_CACHE_MAX_BYTES`)
     /// bound.
     #[cfg(feature = "s3")]
-    fn hydrate_from_s3_budgeted(&self, s3: &s3_storage::S3Storage, files: &[(String, u64)]) {
+    fn hydrate_from_s3_budgeted(
+        &self,
+        s3: &s3_storage::S3Storage,
+        files: &[(String, u64)],
+        concurrency: usize,
+    ) {
         for chunk in chunk_by_byte_budget(files, self.hydrate_byte_budget) {
             let paths: Vec<String> = chunk.into_iter().map(|(path, _size)| path).collect();
-            for (path, result) in s3.read_many(&paths, self.hydrate_concurrency) {
+            for (path, result) in s3.read_many(&paths, concurrency) {
                 match result {
                     // read_many already persisted the bytes to disk (same
                     // root dir as `self.cache`); just tell the cache's
@@ -1123,7 +1146,7 @@ impl AppState {
         if logical_paths.is_empty() {
             return (0, 0);
         }
-        self.hydrate_files(s3, &logical_paths);
+        self.hydrate_files(s3, &logical_paths, self.scoring_hydrate_concurrency);
         // Bytes counted post-fetch from local metadata (sizes weren't known
         // up front); already-local files were filtered out above so this
         // counts only what this call actually moved.
@@ -1157,7 +1180,12 @@ impl AppState {
     /// climbing 37→128→193 instead of shrinking). Unpinned unconditionally
     /// afterward regardless of outcome.
     #[cfg(feature = "s3")]
-    fn hydrate_files(&self, s3: &s3_storage::S3Storage, files: &[(String, u64)]) {
+    fn hydrate_files(
+        &self,
+        s3: &s3_storage::S3Storage,
+        files: &[(String, u64)],
+        concurrency: usize,
+    ) {
         if files.is_empty() {
             return;
         }
@@ -1167,14 +1195,14 @@ impl AppState {
         #[cfg(feature = "postgres")]
         {
             if let (Some(leases), Some(own_addr)) = (&self.hydration_leases, &self.own_addr) {
-                self.hydrate_files_coordinated(s3, files, leases, own_addr);
+                self.hydrate_files_coordinated(s3, files, leases, own_addr, concurrency);
                 for (path, _) in files {
                     self.cache.unpin(path);
                 }
                 return;
             }
         }
-        self.hydrate_from_s3_budgeted(s3, files);
+        self.hydrate_from_s3_budgeted(s3, files, concurrency);
         for (path, _) in files {
             self.cache.unpin(path);
         }
@@ -1192,6 +1220,7 @@ impl AppState {
         files: &[(String, u64)],
         leases: &kosha_control::HydrationLeaseStore,
         own_addr: &str,
+        concurrency: usize,
     ) {
         // Comfortably longer than a single-file S3 GET + local write should
         // ever take, so a lease only outlives its owner when that owner has
@@ -1232,7 +1261,7 @@ impl AppState {
 
         // Owned (plus peer-fallback) paths go straight to S3, through the
         // same byte-budgeted chunking as uncoordinated hydration.
-        self.hydrate_from_s3_budgeted(s3, &fetch_from_s3);
+        self.hydrate_from_s3_budgeted(s3, &fetch_from_s3, concurrency);
 
         // Release only after our own fetch attempt is done (success or
         // failure) — releasing earlier could let a waiter's peer-fetch land
@@ -1476,12 +1505,12 @@ impl AppState {
             if !logical_paths.is_empty() {
                 println!(
                     "cache miss: hydrating {} scoring file(s) across {} segment(s) \
-                     (fan-out={}); doc_store.bin deferred to page materialize for Lazy segments",
+                     (fan-out={}); doc stores deferred to page materialize for Lazy segments",
                     logical_paths.len(),
                     owned.len(),
-                    self.hydrate_concurrency
+                    self.scoring_hydrate_concurrency
                 );
-                self.hydrate_files(s3, &logical_paths);
+                self.hydrate_files(s3, &logical_paths, self.scoring_hydrate_concurrency);
                 // Bytes counted post-fetch (sizes weren't known up front);
                 // every path here was absent before the fetch, so this
                 // counts only what this call actually moved.
