@@ -1010,7 +1010,7 @@ impl Searcher {
             Some(open_stats),
         )?;
         let total_docs = reader.doc_count();
-        let store = &reader.filter_store;
+        let store = reader.filter_store();
         let scorer = Bm25Scorer::new(
             total_docs,
             reader.avg_field_length(),
@@ -1192,7 +1192,7 @@ impl Searcher {
                     }
                 }
                 if let Some(meta) = reader.doc_meta(doc_seq) {
-                    seg_hits.insert(doc_seq, (score, meta.doc_id.clone()));
+                    seg_hits.insert(doc_seq, (score, DocumentId(meta.doc_id.to_owned())));
                 }
             }
         } else if has_only_filter {
@@ -1205,7 +1205,7 @@ impl Searcher {
                 }
                 if let Some(meta) = reader.doc_meta(doc_seq) {
                     let score = scorer.score_term(1, total_docs, meta.field_length);
-                    seg_hits.insert(doc_seq, (score, meta.doc_id.clone()));
+                    seg_hits.insert(doc_seq, (score, DocumentId(meta.doc_id.to_owned())));
                 }
             }
         }
@@ -1238,7 +1238,10 @@ impl Searcher {
                             continue;
                         }
                         if let Some(meta) = reader.doc_meta(doc_seq) {
-                            seg_hits.insert(doc_seq, ((score + 1.0) * 10.0, meta.doc_id.clone()));
+                            seg_hits.insert(
+                                doc_seq,
+                                ((score + 1.0) * 10.0, DocumentId(meta.doc_id.to_owned())),
+                            );
                         }
                     }
                 }

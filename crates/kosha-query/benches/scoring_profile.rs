@@ -169,7 +169,7 @@ fn collect_candidates(reader: &SegmentReader, scored: &HashMap<u32, f64>) -> Vec
     for (&doc_seq, &score) in scored {
         if let Some(meta) = reader.doc_meta(doc_seq) {
             cands.push(Cand {
-                doc_id: meta.doc_id.clone(),
+                doc_id: DocumentId(meta.doc_id.to_owned()),
                 score,
                 doc_seq,
             });

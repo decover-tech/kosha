@@ -190,7 +190,7 @@ impl Indexer {
                 continue;
             }
             let reader = kosha_segment::SegmentReader::open(seg_dir)?;
-            let store = &reader.filter_store;
+            let store = reader.filter_store();
             let all: HashSet<u32> = (0..reader.doc_count()).collect();
             let matching = crate::apply_filter_delete(filter, store, &all)?;
             if !matching.is_empty() {
@@ -288,7 +288,7 @@ impl Indexer {
                 let reader = kosha_segment::SegmentReader::open_with_options(seg_dir, false)?;
                 for meta in reader.iter_doc_meta() {
                     index
-                        .entry(meta.doc_id.clone())
+                        .entry(DocumentId(meta.doc_id.to_owned()))
                         .or_default()
                         .push((entry.segment_id.clone(), meta.doc_seq));
                 }
@@ -424,7 +424,7 @@ impl Indexer {
             let reader = kosha_segment::SegmentReader::open(seg_dir)?;
             if !reader
                 .iter_doc_meta()
-                .any(|meta| replacement_ids.contains(meta.doc_id.0.as_str()))
+                .any(|meta| replacement_ids.contains(meta.doc_id))
             {
                 continue;
             }
