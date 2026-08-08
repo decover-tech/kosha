@@ -402,7 +402,7 @@ pub const SPLIT_INVERTED_VERSION: u32 = 3;
 pub const COMPRESSED_INVERTED_MAGIC: u32 = u32::from_le_bytes(*b"KIZC");
 const COMPRESSED_INVERTED_VERSION: u32 = 1;
 const COMPRESSED_INVERTED_HEADER_LEN: usize = 16;
-const INVERTED_COMPRESSION_LEVEL: i32 = 3;
+const INVERTED_COMPRESSION_LEVEL: i32 = 1;
 /// magic + version + term_count + reserved, 4 bytes each.
 const INVERTED_HEADER_LEN: usize = 16;
 /// term_off u64 + term_len u32 + postings_off u64 + postings_len u32.
