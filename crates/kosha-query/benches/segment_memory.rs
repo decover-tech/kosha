@@ -298,6 +298,35 @@ fn dir_file_bytes(root: &Path, ns: &NamespaceId, manifest: &Manifest, file: &str
         .sum()
 }
 
+fn inverted_artifact_bytes(root: &Path, ns: &NamespaceId, manifest: &Manifest) -> u64 {
+    manifest
+        .segments
+        .iter()
+        .map(|e| {
+            let seg_dir = root.join(&ns.0).join(&e.segment_id.0);
+            let toc = std::fs::metadata(seg_dir.join("inverted.idx"))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let postings = std::fs::read_dir(&seg_dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("postings-") && name.ends_with(".bin") {
+                        entry.metadata().ok().map(|m| m.len())
+                    } else {
+                        None
+                    }
+                })
+                .sum::<u64>();
+            toc + postings
+        })
+        .sum()
+}
+
 fn mb(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -317,7 +346,7 @@ fn main() {
     let manifest = build_corpus(&v2_root, &ns, segs, docs, vocab);
     build_v1_twin(&v2_root, &v1_root, &ns, &manifest);
 
-    let inv_v2 = dir_file_bytes(&v2_root, &ns, &manifest, "inverted.idx");
+    let inv_v2 = inverted_artifact_bytes(&v2_root, &ns, &manifest);
     let inv_v1 = dir_file_bytes(&v1_root, &ns, &manifest, "inverted.idx");
 
     eprintln!("measuring v1 (eager) …");
@@ -332,7 +361,7 @@ fn main() {
         segs * docs
     );
     println!(
-        "inverted.idx on disk: v1 {:.1} MiB | v2 {:.1} MiB",
+        "inverted artifacts on disk: v1 {:.1} MiB | v2 {:.1} MiB",
         inv_v1 as f64 / (1024.0 * 1024.0),
         inv_v2 as f64 / (1024.0 * 1024.0)
     );

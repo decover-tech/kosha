@@ -234,15 +234,7 @@ impl SegmentWriter {
             let blob_id = posting_blob_id_for_term(term_str) as u32;
             let blob = &mut posting_blobs[blob_id as usize];
             let p_off = blob.len() as u64;
-            blob.extend_from_slice(&(postings.len() as u32).to_le_bytes());
-            for posting in postings {
-                blob.extend_from_slice(&posting.doc_id.to_le_bytes());
-                blob.extend_from_slice(&posting.term_frequency.to_le_bytes());
-                blob.extend_from_slice(&(posting.positions.len() as u32).to_le_bytes());
-                for &pos in &posting.positions {
-                    blob.extend_from_slice(&pos.to_le_bytes());
-                }
-            }
+            write_postings_varint_delta(blob, postings);
             let p_len = (blob.len() as u64 - p_off) as u32;
             entries.push((term_off, term_str.len() as u32, blob_id, p_off, p_len));
         }
@@ -391,9 +383,12 @@ impl SegmentWriter {
 pub const INVERTED_MAGIC: u32 = u32::from_le_bytes(*b"KINV");
 /// Inline-lazy version: table + term pool + postings all in `inverted.idx`.
 const INLINE_INVERTED_VERSION: u32 = 2;
-/// Split version: table + term pool in `inverted.idx`, postings in
+/// Fixed-width split version: table + term pool in `inverted.idx`, postings in
 /// `postings-*.bin` shard files.
-pub const SPLIT_INVERTED_VERSION: u32 = 3;
+const FIXED_SPLIT_INVERTED_VERSION: u32 = 3;
+/// Varint/delta split version: same table as v3, with posting blobs encoded
+/// as varints and delta-coded doc ids/positions.
+pub const SPLIT_INVERTED_VERSION: u32 = 4;
 /// Wrapper magic for a zstd-compressed inverted artifact — applied
 /// independently to the TOC (`inverted.idx`) and to each posting blob
 /// shard, so lazy per-shard fetch/decode is unchanged. The wrapped bytes
@@ -402,7 +397,7 @@ pub const SPLIT_INVERTED_VERSION: u32 = 3;
 pub const COMPRESSED_INVERTED_MAGIC: u32 = u32::from_le_bytes(*b"KIZC");
 const COMPRESSED_INVERTED_VERSION: u32 = 1;
 const COMPRESSED_INVERTED_HEADER_LEN: usize = 16;
-const INVERTED_COMPRESSION_LEVEL: i32 = 3;
+const INVERTED_COMPRESSION_LEVEL: i32 = 1;
 /// magic + version + term_count + reserved, 4 bytes each.
 const INVERTED_HEADER_LEN: usize = 16;
 /// term_off u64 + term_len u32 + postings_off u64 + postings_len u32.
@@ -439,9 +434,11 @@ pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
     let Ok(data) = fs::read(segment_dir.join("inverted.idx")) else {
         return false;
     };
-    data.len() >= INVERTED_HEADER_LEN
-        && data[0..4] == INVERTED_MAGIC.to_le_bytes()
-        && u32::from_le_bytes(data[4..8].try_into().unwrap()) == SPLIT_INVERTED_VERSION
+    if data.len() < INVERTED_HEADER_LEN || data[0..4] != INVERTED_MAGIC.to_le_bytes() {
+        return false;
+    }
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    version == FIXED_SPLIT_INVERTED_VERSION || version == SPLIT_INVERTED_VERSION
 }
 
 /// v2 `inverted.idx` layout — a table of contents instead of a stream:
@@ -483,7 +480,14 @@ pub struct SplitInvertedIndex {
     data: Vec<u8>,
     segment_dir: PathBuf,
     term_count: usize,
+    encoding: SplitPostingsEncoding,
     cache: PostingsCache,
+}
+
+#[derive(Clone, Copy)]
+enum SplitPostingsEncoding {
+    Fixed32,
+    VarintDelta,
 }
 
 /// Checked little-endian u32 read that advances the cursor.
@@ -491,6 +495,29 @@ fn take_u32(buf: &mut &[u8]) -> Option<u32> {
     let (head, rest) = buf.split_first_chunk::<4>()?;
     *buf = rest;
     Some(u32::from_le_bytes(*head))
+}
+
+fn put_var_u32(out: &mut Vec<u8>, mut value: u32) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn take_var_u32(buf: &mut &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    let mut shift = 0u32;
+    for _ in 0..5 {
+        let (&byte, rest) = buf.split_first()?;
+        *buf = rest;
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+    }
+    None
 }
 
 fn maybe_compress_inverted(raw: &[u8]) -> Vec<u8> {
@@ -846,11 +873,59 @@ fn decode_postings_bytes(mut buf: &[u8]) -> Option<(Vec<Posting>, usize)> {
 /// offset within the blob, span length, admit-to-cache).
 type PendingBlobReads<'a> = Vec<(usize, &'a str, usize, usize, bool)>;
 
+fn write_postings_varint_delta(out: &mut Vec<u8>, postings: &[Posting]) {
+    put_var_u32(out, postings.len() as u32);
+    let mut prev_doc_id = 0u32;
+    for posting in postings {
+        put_var_u32(out, posting.doc_id.wrapping_sub(prev_doc_id));
+        prev_doc_id = posting.doc_id;
+        put_var_u32(out, posting.term_frequency);
+        put_var_u32(out, posting.positions.len() as u32);
+        let mut prev_pos = 0u32;
+        for &pos in &posting.positions {
+            put_var_u32(out, pos.wrapping_sub(prev_pos));
+            prev_pos = pos;
+        }
+    }
+}
+
+fn decode_postings_varint_delta_bytes(mut buf: &[u8]) -> Option<(Vec<Posting>, usize)> {
+    let count = take_var_u32(&mut buf)? as usize;
+    let mut postings = Vec::with_capacity(count);
+    let mut position_count = 0usize;
+    let mut prev_doc_id = 0u32;
+    for _ in 0..count {
+        let doc_delta = take_var_u32(&mut buf)?;
+        let doc_id = prev_doc_id.wrapping_add(doc_delta);
+        prev_doc_id = doc_id;
+        let term_frequency = take_var_u32(&mut buf)?;
+        let npos = take_var_u32(&mut buf)? as usize;
+        let mut positions = Vec::with_capacity(npos);
+        let mut prev_pos = 0u32;
+        for _ in 0..npos {
+            let pos_delta = take_var_u32(&mut buf)?;
+            let pos = prev_pos.wrapping_add(pos_delta);
+            prev_pos = pos;
+            positions.push(pos);
+        }
+        position_count += positions.len();
+        postings.push(Posting {
+            doc_id,
+            term_frequency,
+            positions,
+        });
+    }
+    let approx_bytes = postings.len() * std::mem::size_of::<Posting>() + position_count * 4;
+    Some((postings, approx_bytes))
+}
+
 impl SplitInvertedIndex {
     fn detect(data: &[u8]) -> bool {
-        data.len() >= INVERTED_HEADER_LEN
-            && data[0..4] == INVERTED_MAGIC.to_le_bytes()
-            && u32::from_le_bytes(data[4..8].try_into().unwrap()) == SPLIT_INVERTED_VERSION
+        if data.len() < INVERTED_HEADER_LEN || data[0..4] != INVERTED_MAGIC.to_le_bytes() {
+            return false;
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        version == FIXED_SPLIT_INVERTED_VERSION || version == SPLIT_INVERTED_VERSION
     }
 
     fn from_bytes(data: Vec<u8>, segment_dir: PathBuf) -> Result<Self, KoshaError> {
@@ -858,6 +933,12 @@ impl SplitInvertedIndex {
         if !Self::detect(&data) {
             return Err(corrupt("missing split v3 header"));
         }
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let encoding = match version {
+            FIXED_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::Fixed32,
+            SPLIT_INVERTED_VERSION => SplitPostingsEncoding::VarintDelta,
+            _ => return Err(corrupt(&format!("unsupported version {version}"))),
+        };
         let term_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
         let shard_count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
         if shard_count != POSTING_BLOB_SHARDS {
@@ -877,6 +958,7 @@ impl SplitInvertedIndex {
             data,
             segment_dir,
             term_count,
+            encoding,
             cache: PostingsCache::new(postings_cache_max_bytes()),
         };
         for i in 0..term_count {
@@ -978,8 +1060,13 @@ impl SplitInvertedIndex {
                 let Some(p_end) = p_off.checked_add(p_len).filter(|&e| e <= blob.len()) else {
                     continue;
                 };
-                let Some((postings, approx_bytes)) = decode_postings_bytes(&blob[p_off..p_end])
-                else {
+                let decoded = match self.encoding {
+                    SplitPostingsEncoding::Fixed32 => decode_postings_bytes(&blob[p_off..p_end]),
+                    SplitPostingsEncoding::VarintDelta => {
+                        decode_postings_varint_delta_bytes(&blob[p_off..p_end])
+                    }
+                };
+                let Some((postings, approx_bytes)) = decoded else {
                     continue;
                 };
                 let arc = Arc::new(postings);
@@ -997,7 +1084,12 @@ impl SplitInvertedIndex {
         let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
         let blob = self.read_posting_blob(blob_id)?;
         let p_end = p_off.checked_add(p_len).filter(|&e| e <= blob.len())?;
-        decode_postings_bytes(&blob[p_off..p_end])
+        match self.encoding {
+            SplitPostingsEncoding::Fixed32 => decode_postings_bytes(&blob[p_off..p_end]),
+            SplitPostingsEncoding::VarintDelta => {
+                decode_postings_varint_delta_bytes(&blob[p_off..p_end])
+            }
+        }
     }
 
     fn read_posting_blob(&self, blob_id: usize) -> Option<Vec<u8>> {
@@ -2052,6 +2144,62 @@ mod tests {
         buf
     }
 
+    fn write_fixed_split_inverted(dir: &Path, index: &HashMap<String, Vec<Posting>>) {
+        let mut terms: Vec<&String> = index.keys().collect();
+        terms.sort();
+
+        let mut pool: Vec<u8> = Vec::new();
+        let mut posting_blobs: Vec<Vec<u8>> =
+            (0..POSTING_BLOB_SHARDS).map(|_| Vec::new()).collect();
+        let mut entries: Vec<(u64, u32, u32, u64, u32)> = Vec::with_capacity(terms.len());
+        for term_str in &terms {
+            let postings = &index[*term_str];
+            let term_off = pool.len() as u64;
+            pool.extend_from_slice(term_str.as_bytes());
+            let blob_id = posting_blob_id_for_term(term_str) as u32;
+            let blob = &mut posting_blobs[blob_id as usize];
+            let p_off = blob.len() as u64;
+            blob.extend_from_slice(&(postings.len() as u32).to_le_bytes());
+            for posting in postings {
+                blob.extend_from_slice(&posting.doc_id.to_le_bytes());
+                blob.extend_from_slice(&posting.term_frequency.to_le_bytes());
+                blob.extend_from_slice(&(posting.positions.len() as u32).to_le_bytes());
+                for &pos in &posting.positions {
+                    blob.extend_from_slice(&pos.to_le_bytes());
+                }
+            }
+            let p_len = (blob.len() as u64 - p_off) as u32;
+            entries.push((term_off, term_str.len() as u32, blob_id, p_off, p_len));
+        }
+
+        let table_len = entries.len() as u64 * SPLIT_INVERTED_TABLE_ENTRY_LEN as u64;
+        let pool_base = INVERTED_HEADER_LEN as u64 + table_len;
+        let mut buf = Vec::with_capacity(pool_base as usize + pool.len());
+        buf.extend_from_slice(&INVERTED_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&FIXED_SPLIT_INVERTED_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(POSTING_BLOB_SHARDS as u32).to_le_bytes());
+        for (term_off, term_len, blob_id, p_off, p_len) in entries {
+            buf.extend_from_slice(&(pool_base + term_off).to_le_bytes());
+            buf.extend_from_slice(&term_len.to_le_bytes());
+            buf.extend_from_slice(&blob_id.to_le_bytes());
+            buf.extend_from_slice(&p_off.to_le_bytes());
+            buf.extend_from_slice(&p_len.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        buf.extend_from_slice(&pool);
+        fs::write(dir.join("inverted.idx"), maybe_compress_inverted(&buf)).unwrap();
+        for (blob_id, blob) in posting_blobs.into_iter().enumerate() {
+            if !blob.is_empty() {
+                fs::write(
+                    dir.join(posting_blob_file_for_id(blob_id)),
+                    maybe_compress_inverted(&blob),
+                )
+                .unwrap();
+            }
+        }
+    }
+
     /// Build a two-doc segment and return (dir, the writer's in-memory
     /// inverted index captured before finalize) for fidelity comparisons.
     fn write_inverted_fixture(dir: &Path) -> HashMap<String, Vec<Posting>> {
@@ -2079,17 +2227,17 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-inverted-v2-roundtrip");
         let expected = write_inverted_fixture(&dir);
 
-        // Sanity: the file on disk really is split v3.
+        // Sanity: the file on disk really is split v4.
         let raw = fs::read(dir.join("inverted.idx")).unwrap();
         assert!(
             SplitInvertedIndex::detect(&raw),
-            "writer should emit the split v3 magic-prefixed layout"
+            "writer should emit the split v4 magic-prefixed layout"
         );
 
         let r = SegmentReader::open(dir.clone()).unwrap();
         assert!(
             matches!(r.inverted, InvertedAccess::Split(_)),
-            "split v3 file must open on the split lazy path"
+            "split v4 file must open on the split lazy path"
         );
         for (term, postings) in &expected {
             let got = r
@@ -2105,6 +2253,47 @@ mod tests {
         assert!(!r.contains_term("absent-term"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fixed_split_v3_inverted_still_opens() {
+        let dir = std::env::temp_dir().join("kosha-test-inverted-v3-fallback");
+        let expected = write_inverted_fixture(&dir);
+        write_fixed_split_inverted(&dir, &expected);
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(
+            matches!(r.inverted, InvertedAccess::Split(_)),
+            "v3 split file must still open on the split path"
+        );
+        for (term, postings) in &expected {
+            let got = r
+                .postings(term)
+                .unwrap_or_else(|| panic!("missing term {term}"));
+            assert_eq!(&*got, postings.as_slice(), "postings mismatch for {term}");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn varint_delta_postings_roundtrip() {
+        let postings = vec![
+            Posting {
+                doc_id: 7,
+                term_frequency: 2,
+                positions: vec![3, 9],
+            },
+            Posting {
+                doc_id: 31,
+                term_frequency: 3,
+                positions: vec![1, 4, 12],
+            },
+        ];
+        let mut encoded = Vec::new();
+        write_postings_varint_delta(&mut encoded, &postings);
+        let (decoded, _) = decode_postings_varint_delta_bytes(&encoded).unwrap();
+        assert_eq!(decoded, postings);
     }
 
     #[test]
