@@ -264,11 +264,16 @@ impl SegmentWriter {
             buf.extend_from_slice(&0u32.to_le_bytes());
         }
         buf.extend_from_slice(&pool);
-        self.backend.write("inverted.idx", &buf)?;
+        // TOC and every posting blob are wrapped independently (see
+        // `maybe_compress_inverted`) so the lazy per-shard fetch/decode
+        // semantics are unchanged — each artifact self-describes.
+        let encoded = maybe_compress_inverted(&buf);
+        self.backend.write("inverted.idx", &encoded)?;
         for (blob_id, blob) in posting_blobs.into_iter().enumerate() {
             if !blob.is_empty() {
+                let encoded = maybe_compress_inverted(&blob);
                 self.backend
-                    .write(&posting_blob_file_for_id(blob_id), &blob)?;
+                    .write(&posting_blob_file_for_id(blob_id), &encoded)?;
             }
         }
         Ok(())
@@ -389,6 +394,15 @@ const INLINE_INVERTED_VERSION: u32 = 2;
 /// Split version: table + term pool in `inverted.idx`, postings in
 /// `postings-*.bin` shard files.
 pub const SPLIT_INVERTED_VERSION: u32 = 3;
+/// Wrapper magic for a zstd-compressed inverted artifact — applied
+/// independently to the TOC (`inverted.idx`) and to each posting blob
+/// shard, so lazy per-shard fetch/decode is unchanged. The wrapped bytes
+/// are the regular uncompressed layout; one decompression at read
+/// restores them and every downstream code path is oblivious.
+pub const COMPRESSED_INVERTED_MAGIC: u32 = u32::from_le_bytes(*b"KIZC");
+const COMPRESSED_INVERTED_VERSION: u32 = 1;
+const COMPRESSED_INVERTED_HEADER_LEN: usize = 16;
+const INVERTED_COMPRESSION_LEVEL: i32 = 3;
 /// magic + version + term_count + reserved, 4 bytes each.
 const INVERTED_HEADER_LEN: usize = 16;
 /// term_off u64 + term_len u32 + postings_off u64 + postings_len u32.
@@ -477,6 +491,53 @@ fn take_u32(buf: &mut &[u8]) -> Option<u32> {
     let (head, rest) = buf.split_first_chunk::<4>()?;
     *buf = rest;
     Some(u32::from_le_bytes(*head))
+}
+
+fn maybe_compress_inverted(raw: &[u8]) -> Vec<u8> {
+    // Small test/admin segments are not worth wrapping; this also keeps
+    // tiny fixtures readable as plain `KINV` in tests and diagnostics.
+    if raw.len() < 4096 {
+        return raw.to_vec();
+    }
+    match zstd::bulk::compress(raw, INVERTED_COMPRESSION_LEVEL) {
+        Ok(compressed) if compressed.len() + COMPRESSED_INVERTED_HEADER_LEN < raw.len() => {
+            wrap_compressed_inverted(raw.len(), &compressed)
+        }
+        _ => raw.to_vec(),
+    }
+}
+
+fn wrap_compressed_inverted(uncompressed_len: usize, compressed: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(COMPRESSED_INVERTED_HEADER_LEN + compressed.len());
+    out.extend_from_slice(&COMPRESSED_INVERTED_MAGIC.to_le_bytes());
+    out.extend_from_slice(&COMPRESSED_INVERTED_VERSION.to_le_bytes());
+    out.extend_from_slice(&(uncompressed_len as u64).to_le_bytes());
+    out.extend_from_slice(compressed);
+    out
+}
+
+fn read_inverted_payload(data: Vec<u8>) -> Result<Vec<u8>, KoshaError> {
+    if data.len() < COMPRESSED_INVERTED_HEADER_LEN
+        || data[0..4] != COMPRESSED_INVERTED_MAGIC.to_le_bytes()
+    {
+        return Ok(data);
+    }
+
+    let corrupt = |msg: &str| KoshaError::CorruptSegment(format!("compressed inverted.idx: {msg}"));
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if version != COMPRESSED_INVERTED_VERSION {
+        return Err(corrupt(&format!("unsupported version {version}")));
+    }
+    let uncompressed_len = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let max_len: usize = uncompressed_len
+        .try_into()
+        .map_err(|_| corrupt("uncompressed length overflows usize"))?;
+    let decoded = zstd::bulk::decompress(&data[COMPRESSED_INVERTED_HEADER_LEN..], max_len)
+        .map_err(|e| corrupt(&format!("decompress failed: {e}")))?;
+    if decoded.len() != max_len {
+        return Err(corrupt("decompressed length mismatch"));
+    }
+    Ok(decoded)
 }
 
 /// Per-segment byte budget for [`PostingsCache`]
@@ -887,7 +948,11 @@ impl SplitInvertedIndex {
 
     fn decode_postings(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
         let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
-        let blob = fs::read(self.segment_dir.join(posting_blob_file_for_id(blob_id))).ok()?;
+        // Whole-shard read (and, when wrapped, whole-shard decompress) per
+        // cache miss — the PostingsCache amortizes repeat lookups, and the
+        // spans in the TOC refer to the *uncompressed* shard layout.
+        let raw = fs::read(self.segment_dir.join(posting_blob_file_for_id(blob_id))).ok()?;
+        let blob = read_inverted_payload(raw).ok()?;
         let p_end = p_off.checked_add(p_len).filter(|&e| e <= blob.len())?;
         decode_postings_bytes(&blob[p_off..p_end])
     }
@@ -1386,7 +1451,7 @@ impl SegmentReader {
     /// parsed eagerly via the legacy v1 stream layout — the exact cost every
     /// segment paid before v2 existed.
     fn read_inverted(segment_dir: &Path) -> Result<InvertedAccess, KoshaError> {
-        let data = fs::read(segment_dir.join("inverted.idx"))?;
+        let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
         if SplitInvertedIndex::detect(&data) {
             return Ok(InvertedAccess::Split(SplitInvertedIndex::from_bytes(
                 data,
@@ -1960,6 +2025,47 @@ mod tests {
         assert!(
             matches!(r.inverted, InvertedAccess::Lazy(_)),
             "inline v2 file must still open on the lazy fallback path"
+        );
+        for (term, postings) in &expected {
+            let got = r
+                .postings(term)
+                .unwrap_or_else(|| panic!("missing term {term}"));
+            assert_eq!(&*got, postings.as_slice(), "postings mismatch for {term}");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compressed_toc_and_blobs_roundtrip_through_split_reader() {
+        // The zstd wrapper applies independently to the TOC and to each
+        // posting blob shard; the reader must unwrap both transparently
+        // and serve identical postings.
+        let dir = std::env::temp_dir().join("kosha-test-inverted-compressed");
+        let expected = write_inverted_fixture(&dir);
+
+        // Force-wrap every artifact, bypassing maybe_compress_inverted's
+        // small-file threshold so tiny fixtures still exercise the path.
+        let mut wrapped = 0;
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name == "inverted.idx" || name.starts_with("postings-") {
+                let raw = fs::read(&path).unwrap();
+                let compressed = zstd::bulk::compress(&raw, INVERTED_COMPRESSION_LEVEL).unwrap();
+                fs::write(&path, wrap_compressed_inverted(raw.len(), &compressed)).unwrap();
+                wrapped += 1;
+            }
+        }
+        assert!(
+            wrapped >= 2,
+            "fixture must have a TOC and at least one blob"
+        );
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(
+            matches!(r.inverted, InvertedAccess::Split(_)),
+            "compressed TOC must unwrap onto the split path"
         );
         for (term, postings) in &expected {
             let got = r
