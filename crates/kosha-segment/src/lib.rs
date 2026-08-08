@@ -1007,6 +1007,55 @@ impl SegmentReader {
         }
     }
 
+    /// The document's exact byte span within `doc_store.bin`, from the
+    /// offsets sidecar — `None` for out-of-range `doc_seq` or `Eager`
+    /// (legacy) segments, whose records are already fully resident. This is
+    /// what lets a remote store serve one document with a ranged read of
+    /// `length` bytes instead of shipping the whole doc store.
+    pub fn doc_span(&self, doc_seq: u32) -> Option<(u64, u32)> {
+        match &self.doc_store {
+            DocStoreAccess::Eager(_) => None,
+            DocStoreAccess::Lazy { index, .. } => {
+                let entry = index.entries.get(doc_seq as usize)?;
+                Some((entry.offset, entry.length))
+            }
+        }
+    }
+
+    /// Whether `doc_record_full` can be served without any remote fetch:
+    /// `Eager` segments hold every record in memory; `Lazy` segments need
+    /// `doc_store.bin` present on local disk.
+    pub fn has_local_doc_store(&self) -> bool {
+        match &self.doc_store {
+            DocStoreAccess::Eager(_) => true,
+            DocStoreAccess::Lazy { doc_store_path, .. } => doc_store_path.exists(),
+        }
+    }
+
+    /// Parse one document's full record from bytes fetched elsewhere — the
+    /// remote-ranged-read counterpart of `doc_record_full`. `bytes` must be
+    /// exactly the span [`Self::doc_span`] reported for this `doc_seq`
+    /// (checked: a wrong-length buffer means the caller fetched the wrong
+    /// range, and a "successful" parse of it would be garbage).
+    pub fn doc_record_from_bytes(
+        &self,
+        doc_seq: u32,
+        bytes: &[u8],
+    ) -> Result<Option<DocRecord>, KoshaError> {
+        let Some((_, length)) = self.doc_span(doc_seq) else {
+            return Ok(None);
+        };
+        if bytes.len() != length as usize {
+            return Err(KoshaError::NotFound(format!(
+                "doc_seq {doc_seq} span is {length} bytes but caller supplied {} in segment {:?}",
+                bytes.len(),
+                self.segment_dir
+            )));
+        }
+        let mut cursor = bytes;
+        Ok(Some(parse_one_doc_record(&mut cursor, doc_seq)))
+    }
+
     /// Iterate every document's zero-I/O metadata (`doc_id`/`field_length`)
     /// in doc_seq order.
     pub fn iter_doc_meta(&self) -> impl Iterator<Item = DocMetaRef<'_>> + '_ {
@@ -1911,6 +1960,79 @@ mod tests {
             assert_eq!(meta.doc_seq, i);
         }
         assert!(r.doc_meta(50).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doc_span_bytes_parse_identically_to_local_reads() {
+        // The ranged-read contract: for every doc, slicing exactly
+        // `doc_span` out of `doc_store.bin` and parsing it via
+        // `doc_record_from_bytes` must equal `doc_record_full`'s local
+        // read — this is what page materialization fetches over a ranged
+        // S3 GET instead of the whole doc store.
+        let dir = std::env::temp_dir().join("kosha-test-doc-span-ranged");
+        let _ = fs::remove_dir_all(&dir);
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        for i in 0..20 {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![
+                    Field::text("content", format!("hello world {}", "pad ".repeat(i * 3))),
+                    Field::keyword("tag", if i % 2 == 0 { "even" } else { "odd" }),
+                ],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(matches!(r.doc_store, DocStoreAccess::Lazy { .. }));
+        assert!(r.has_local_doc_store());
+
+        let store = fs::read(dir.join("doc_store.bin")).unwrap();
+        let mut spans = Vec::new();
+        for i in 0..20u32 {
+            let (offset, length) = r.doc_span(i).unwrap();
+            let bytes = &store[offset as usize..(offset + length as u64) as usize];
+            spans.push((i, bytes.to_vec()));
+            let from_bytes = r.doc_record_from_bytes(i, bytes).unwrap().unwrap();
+            let from_disk = r.doc_record_full(i).unwrap().unwrap();
+            assert_eq!(from_bytes.doc_id, from_disk.doc_id);
+            assert_eq!(from_bytes.field_length, from_disk.field_length);
+            assert_eq!(from_bytes.fields.len(), from_disk.fields.len());
+            for (a, b) in from_bytes.fields.iter().zip(from_disk.fields.iter()) {
+                assert_eq!(a.name, b.name);
+                assert_eq!(a.value, b.value);
+                assert_eq!(a.field_type, b.field_type);
+            }
+        }
+        assert!(r.doc_span(20).is_none(), "out-of-range doc_seq");
+
+        // Wrong-length buffer = wrong range fetched — must error, not parse
+        // garbage.
+        let (_, len0) = r.doc_span(0).unwrap();
+        assert!(r
+            .doc_record_from_bytes(0, &store[..len0 as usize + 1])
+            .is_err());
+
+        // With doc_store.bin gone (scoring-set-only hydration), the reader
+        // knows it can't serve locally, but remotely-fetched span bytes
+        // still materialize every doc.
+        fs::remove_file(dir.join("doc_store.bin")).unwrap();
+        assert!(!r.has_local_doc_store());
+        for (i, bytes) in &spans {
+            let rec = r.doc_record_from_bytes(*i, bytes).unwrap().unwrap();
+            assert_eq!(rec.doc_id.0, format!("d{i}"));
+        }
+
+        // Legacy Eager open (no offsets sidecar): spans don't exist, but
+        // records are fully resident so no remote fetch is ever needed.
+        fs::write(dir.join("doc_store.bin"), &store).unwrap();
+        fs::remove_file(dir.join("doc_store.offsets")).unwrap();
+        let legacy = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(matches!(legacy.doc_store, DocStoreAccess::Eager(_)));
+        assert!(legacy.doc_span(0).is_none());
+        assert!(legacy.has_local_doc_store());
 
         let _ = fs::remove_dir_all(&dir);
     }
