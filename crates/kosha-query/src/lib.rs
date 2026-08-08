@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -806,6 +806,40 @@ pub fn flat_knn(query_vector: &[f32], vectors: &[(u32, Vec<f32>)], k: usize) -> 
     scores
 }
 
+/// Per-request phase timings for one `search` call — the query-side half of
+/// the cold-read instrumentation (the server adds hydration wall time and
+/// bytes on top). Wall-clock phases are disjoint; `open_total_ms` is summed
+/// across rayon workers, so it can legitimately exceed `score_wall_ms` under
+/// parallelism — read it together with `open_cold` as "average cold-open
+/// cost", not as a wall-clock share.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SearchPhaseStats {
+    /// Admission-gate wait (`MemoryLedger::admit`) plus the byte-estimate
+    /// pass. Near-zero unless the pod is shedding load.
+    pub admit_wall_ms: f64,
+    /// The parallel per-segment scoring pass, cold segment opens included.
+    pub score_wall_ms: f64,
+    /// Sort / top-k selection / page materialization (the only phase that
+    /// touches `doc_store.bin`).
+    pub materialize_wall_ms: f64,
+    /// Segments opened cold (in-memory segment-cache miss) vs served from
+    /// the cache.
+    pub open_cold: usize,
+    pub open_cached: usize,
+    /// Summed wall time of the cold opens above, across rayon workers.
+    pub open_total_ms: f64,
+}
+
+/// Shared-atomic collector threaded through the parallel scoring pass to
+/// build [`SearchPhaseStats`] (open counts/time come from inside
+/// `open_segment`, which runs concurrently per segment).
+#[derive(Default)]
+struct OpenStatsCollector {
+    cold: AtomicUsize,
+    cached: AtomicUsize,
+    open_nanos: AtomicU64,
+}
+
 pub struct Searcher {
     data_dir: PathBuf,
     segment_cache: SegmentCache,
@@ -872,11 +906,16 @@ impl Searcher {
         seg_dir: PathBuf,
         load_vectors: bool,
         permit: Option<&AdmissionPermit>,
+        stats: Option<&OpenStatsCollector>,
     ) -> Result<Arc<TrackedSegment>, KoshaError> {
         let key = (namespace.to_string(), segment_id.to_string(), load_vectors);
         if let Some(cached) = self.segment_cache.get(&key) {
+            if let Some(stats) = stats {
+                stats.cached.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(cached);
         }
+        let t_open = Instant::now();
         let approx_bytes = approx_segment_bytes(&seg_dir, load_vectors);
         let reader = SegmentReader::open_with_options(seg_dir, load_vectors)?;
         let tracked = Arc::new(TrackedSegment::new(
@@ -884,6 +923,12 @@ impl Searcher {
             approx_bytes,
             Arc::clone(&self.ledger),
         ));
+        if let Some(stats) = stats {
+            stats.cold.fetch_add(1, Ordering::Relaxed);
+            stats
+                .open_nanos
+                .fetch_add(t_open.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         if let Some(permit) = permit {
             permit.consume(approx_bytes);
         }
@@ -916,6 +961,7 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
         permit: &AdmissionPermit,
+        open_stats: &OpenStatsCollector,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
         let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
         if !seg_dir.exists() {
@@ -954,6 +1000,7 @@ impl Searcher {
             seg_dir,
             query.knn.is_some(),
             Some(permit),
+            Some(open_stats),
         )?;
         let total_docs = reader.doc_count();
         let store = &reader.filter_store;
@@ -999,15 +1046,14 @@ impl Searcher {
                 &effective_terms
             };
 
-            // `Cow`: legacy segments lend a borrow into their parsed map;
-            // v2 segments decode this term's postings on demand (owned) —
-            // see `SegmentReader::postings`. Fetched once per term here and
-            // held for the whole scoring pass either way.
-            let term_postings: Vec<(&str, std::borrow::Cow<'_, [kosha_core::Posting]>)> =
-                terms_for_bm25
-                    .iter()
-                    .filter_map(|t| reader.postings(t).map(|p| (t.as_str(), p)))
-                    .collect();
+            // `PostingsRef`: legacy segments lend a borrow into their parsed
+            // map; v2 segments hand out a shared Arc of the on-demand decode
+            // — see `SegmentReader::postings`. Fetched once per term here
+            // and held for the whole scoring pass either way.
+            let term_postings: Vec<(&str, kosha_segment::PostingsRef<'_>)> = terms_for_bm25
+                .iter()
+                .filter_map(|t| reader.postings(t).map(|p| (t.as_str(), p)))
+                .collect();
 
             let mut doc_frequencies: HashMap<&str, u32> = HashMap::new();
             for (t, p) in &term_postings {
@@ -1076,11 +1122,11 @@ impl Searcher {
             if let Some((ref phrase_terms, slop)) = phrase_match {
                 // Fetch each phrase term's postings once (not once per
                 // candidate doc) and index by doc_id for O(1) lookup.
-                // `postings()` is now an on-demand decode for v2 segments,
-                // so the once-per-term discipline matters for real: the
-                // decoded `Cow`s are bound first (they must outlive the
-                // maps, which borrow position slices out of them).
-                let phrase_postings_data: Vec<Option<std::borrow::Cow<'_, [kosha_core::Posting]>>> =
+                // `postings()` is an on-demand decode for v2 segments, so
+                // the once-per-term discipline matters for real: the decoded
+                // handles are bound first (they must outlive the maps, which
+                // borrow position slices out of them).
+                let phrase_postings_data: Vec<Option<kosha_segment::PostingsRef<'_>>> =
                     phrase_terms.iter().map(|pt| reader.postings(pt)).collect();
                 let phrase_postings: Vec<HashMap<u32, &[u32]>> = phrase_postings_data
                     .iter()
@@ -1244,13 +1290,34 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
     ) -> Result<SearchResult, KoshaError> {
+        self.search_with_stats(namespace, manifest, query, tombstones)
+            .map(|(result, _stats)| result)
+    }
+
+    /// Like [`Searcher::search`], additionally returning per-phase timings
+    /// (see [`SearchPhaseStats`]) so the server can log a per-request
+    /// cold-read breakdown without a profiler attached.
+    pub fn search_with_stats(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
+    ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
+        let mut phase_stats = SearchPhaseStats::default();
         if manifest.segments.is_empty() {
-            return Ok(SearchResult {
-                results: Vec::new(),
-                total_hits: 0,
-                aggregations: None,
-            });
+            return Ok((
+                SearchResult {
+                    results: Vec::new(),
+                    total_hits: 0,
+                    aggregations: None,
+                },
+                phase_stats,
+            ));
         }
+        let t_admit = Instant::now();
 
         // Lazy budget enforcement: segments that were pinned by in-flight
         // requests at insert time (and so skipped by eviction — see
@@ -1288,6 +1355,7 @@ impl Searcher {
         let permit = self
             .ledger
             .admit(estimate, |needed| self.segment_cache.evict_idle(needed))?;
+        phase_stats.admit_wall_ms = t_admit.elapsed().as_secs_f64() * 1e3;
 
         let query_terms = tokenize(&query.query_text);
         let phrase_terms_for_prune = query.match_phrase.as_ref().map(|mp| tokenize(&mp.phrase));
@@ -1317,6 +1385,8 @@ impl Searcher {
         // output Vec no matter which thread finishes first, so the reduce
         // below is deterministic and behavior-identical to the old
         // sequential loop, just faster.
+        let open_stats = OpenStatsCollector::default();
+        let t_score = Instant::now();
         let segment_outputs: Vec<SegmentOutput> = manifest
             .segments
             .par_iter()
@@ -1330,12 +1400,18 @@ impl Searcher {
                     &sort_value_fields,
                     tombstones,
                     &permit,
+                    &open_stats,
                 )
             })
             .collect::<Result<Vec<Option<SegmentOutput>>, KoshaError>>()?
             .into_iter()
             .flatten()
             .collect();
+        phase_stats.score_wall_ms = t_score.elapsed().as_secs_f64() * 1e3;
+        phase_stats.open_cold = open_stats.cold.load(Ordering::Relaxed);
+        phase_stats.open_cached = open_stats.cached.load(Ordering::Relaxed);
+        phase_stats.open_total_ms = open_stats.open_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        let t_materialize = Instant::now();
 
         let mut candidates: Vec<HitCandidate> = Vec::new();
         let mut all_aggs: HashMap<String, AggregationResults> = HashMap::new();
@@ -1467,11 +1543,16 @@ impl Searcher {
             }))
         };
 
-        Ok(SearchResult {
-            results: page,
-            total_hits,
-            aggregations: merged_aggs,
-        })
+        phase_stats.materialize_wall_ms = t_materialize.elapsed().as_secs_f64() * 1e3;
+
+        Ok((
+            SearchResult {
+                results: page,
+                total_hits,
+                aggregations: merged_aggs,
+            },
+            phase_stats,
+        ))
     }
 }
 
@@ -1809,7 +1890,7 @@ mod tests {
 
         // Open s1 and keep the Arc — simulating an in-flight request.
         let pinned = searcher
-            .open_segment("test", "s1", s1_dir, false, None)
+            .open_segment("test", "s1", s1_dir, false, None, None)
             .unwrap();
         // Opening s2 triggers insert-time eviction. At that instant *both*
         // entries are pinned (s1 by our Arc, s2 by open_segment's
@@ -1819,7 +1900,7 @@ mod tests {
         // idle (evictable) while s1 stays pinned.
         drop(
             searcher
-                .open_segment("test", "s2", s2_dir, false, None)
+                .open_segment("test", "s2", s2_dir, false, None, None)
                 .unwrap(),
         );
         searcher.segment_cache.enforce_budget();
@@ -1859,7 +1940,7 @@ mod tests {
 
         let searcher = Searcher::with_segment_cache_limits(dir.clone(), 10, u64::MAX);
         let held = searcher
-            .open_segment("test", "s1", s1_dir, false, None)
+            .open_segment("test", "s1", s1_dir, false, None, None)
             .unwrap();
         assert_eq!(ledger_snapshot(&searcher).0, s1_bytes);
 
@@ -1930,6 +2011,56 @@ mod tests {
         // Reservations must be fully returned once searches finish.
         let (_, reserved, active) = ledger_snapshot(&searcher);
         assert_eq!((reserved, active), (0, 0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_with_stats_reports_phase_timings_and_open_counts() {
+        let dir = std::env::temp_dir().join("kosha-test-search-stats");
+        let _ = std::fs::remove_dir_all(&dir);
+        mk_segment(&dir, "test", "s1", "alpha beta");
+        mk_segment(&dir, "test", "s2", "alpha beta");
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![
+                ManifestEntry {
+                    segment_id: SegmentId("s1".into()),
+                    doc_count: 1,
+                },
+                ManifestEntry {
+                    segment_id: SegmentId("s2".into()),
+                    doc_count: 1,
+                },
+            ],
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        // Cold: both segments must be counted as cold opens.
+        let (result, stats) = searcher
+            .search_with_stats(
+                &NamespaceId("test".into()),
+                &manifest,
+                &mk_query("alpha", 10),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.total_hits, 2);
+        assert_eq!((stats.open_cold, stats.open_cached), (2, 0));
+        assert!(stats.score_wall_ms > 0.0);
+        assert!(stats.open_total_ms > 0.0);
+
+        // Warm: same search must be all cache hits, zero cold opens.
+        let (_, stats) = searcher
+            .search_with_stats(
+                &NamespaceId("test".into()),
+                &manifest,
+                &mk_query("alpha", 10),
+                None,
+            )
+            .unwrap();
+        assert_eq!((stats.open_cold, stats.open_cached), (0, 2));
+        assert_eq!(stats.open_total_ms, 0.0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

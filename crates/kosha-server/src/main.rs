@@ -15,7 +15,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Map of valid API keys → tenant id.
 ///
@@ -240,6 +240,19 @@ impl Drop for SemaphorePermit<'_> {
         *permits += 1;
         self.sem.cv.notify_one();
     }
+}
+
+/// What one hydration pass actually did: which segments are still
+/// incomplete, and how much this request pulled from S3. Bytes/files count
+/// only this caller's owned fetches — segments another in-flight request
+/// was already downloading contribute wait time (visible in the caller's
+/// hydrate wall clock), not bytes. Not cfg-gated so non-S3 builds can log
+/// zeroed hydration fields through the same code path.
+#[derive(Default)]
+struct HydrationOutcome {
+    missing: Vec<String>,
+    files_fetched: usize,
+    bytes_fetched: u64,
 }
 
 /// Segments this caller must fetch itself, paired with the completion
@@ -876,11 +889,16 @@ impl AppState {
     /// preserve a segment's full fidelity (index/replace/compact/admin
     /// rewrite paths); the search path passes `query.knn.is_some()`.
     #[cfg(feature = "s3")]
-    fn ensure_segments_local(&self, seg_paths: &[PathBuf], needs_vectors: bool) -> Vec<String> {
+    fn ensure_segments_local(
+        &self,
+        seg_paths: &[PathBuf],
+        needs_vectors: bool,
+    ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
-            return Vec::new();
+            return HydrationOutcome::default();
         };
 
+        let mut outcome = HydrationOutcome::default();
         let (owned, waiting) = partition_for_hydration(
             &self.in_flight_segments,
             seg_paths,
@@ -925,6 +943,8 @@ impl AppState {
                     self.hydrate_concurrency,
                     self.hydrate_byte_budget
                 );
+                outcome.files_fetched += logical_paths.len();
+                outcome.bytes_fetched += logical_paths.iter().map(|(_, size)| size).sum::<u64>();
                 // Pin every file in this batch for its whole duration —
                 // otherwise a later file's write in the *same* batch can
                 // evict an earlier file's write from the same batch once
@@ -948,12 +968,13 @@ impl AppState {
 
         wait_for(&waiting);
 
-        seg_paths
+        outcome.missing = seg_paths
             .iter()
             .filter(|p| !Self::segment_is_complete(p))
             .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
             .map(|p| p.to_string_lossy().into_owned())
-            .collect()
+            .collect();
+        outcome
     }
 
     /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs from
@@ -998,9 +1019,11 @@ impl AppState {
     /// lists each segment's directory first), so this skips straight to
     /// `read_many` — no per-segment `s3.list()` round trip either.
     #[cfg(feature = "s3")]
-    fn ensure_files_local(&self, seg_paths: &[PathBuf], file_name: &str) {
+    /// Returns `(files_fetched, bytes_fetched)` — already-local files cost
+    /// nothing and aren't counted.
+    fn ensure_files_local(&self, seg_paths: &[PathBuf], file_name: &str) -> (usize, u64) {
         let Some(ref s3) = self.s3_storage else {
-            return;
+            return (0, 0);
         };
 
         let mut logical_paths: Vec<String> = Vec::new();
@@ -1015,20 +1038,32 @@ impl AppState {
         }
 
         if logical_paths.is_empty() {
-            return;
+            return (0, 0);
         }
+        let mut files = 0usize;
+        let mut bytes = 0u64;
         for (path, result) in s3.read_many(&logical_paths, self.hydrate_concurrency) {
             match result {
-                Ok(_) => self.cache.note_external_write(&path),
+                Ok(_) => {
+                    self.cache.note_external_write(&path);
+                    files += 1;
+                    // read_many wrote the file locally; its size is the
+                    // bytes this fetch actually moved.
+                    bytes += std::fs::metadata(self.data_dir.join(&path))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                }
                 Err(e) => eprintln!("WARN: S3 download failed for {path}: {e}"),
             }
         }
+        (files, bytes)
     }
 
     /// Hydrate only segments that might match the query (footer filter + term
-    /// bloom prune first). Returns the relative paths of segments that are
-    /// still incomplete after hydration was attempted — see
-    /// `ensure_segments_local`. An empty result means every segment the
+    /// bloom prune first). Returns a [`HydrationOutcome`]: the relative paths
+    /// of segments still incomplete after hydration was attempted (see
+    /// `ensure_segments_local`) plus how many files/bytes this request
+    /// actually pulled from S3. An empty `missing` means every segment the
     /// search actually needs is present; a non-empty one means the caller
     /// must not proceed with the search as if the corpus were complete.
     #[cfg(feature = "s3")]
@@ -1037,7 +1072,7 @@ impl AppState {
         ns: &NamespaceId,
         manifest: &kosha_core::Manifest,
         query: &SearchQuery,
-    ) -> Vec<String> {
+    ) -> HydrationOutcome {
         let term_prune = term_bloom_prune_for_query(query);
         let needs_bloom_check = query.filter.is_some() || term_prune.is_some();
         let all_seg_paths: Vec<PathBuf> = manifest
@@ -1052,9 +1087,11 @@ impl AppState {
         // decide whether a segment was even worth fully hydrating. For a
         // namespace with hundreds of segments that turned every search into
         // hundreds of sequential round trips before scoring ever started.
-        if needs_bloom_check {
-            self.ensure_files_local(&all_seg_paths, "footer.json");
-        }
+        let (footer_files, footer_bytes) = if needs_bloom_check {
+            self.ensure_files_local(&all_seg_paths, "footer.json")
+        } else {
+            (0, 0)
+        };
 
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         for seg_path in all_seg_paths {
@@ -1077,7 +1114,10 @@ impl AppState {
         // Only a knn query ever opens a segment's vector.idx (see
         // REQUIRED_SEGMENT_FILES's doc comment) — every other query is
         // lexical-only, so there's no reason to pay for hydrating it.
-        self.ensure_segments_local(&to_hydrate, query.knn.is_some())
+        let mut outcome = self.ensure_segments_local(&to_hydrate, query.knn.is_some());
+        outcome.files_fetched += footer_files;
+        outcome.bytes_fetched += footer_bytes;
+        outcome
     }
 
     /// Upload a single file from a local segment dir to S3.
@@ -1890,23 +1930,40 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     };
 
     // Footer-first hydrate: bloom-prune before downloading full segments.
+    let t_hydrate = Instant::now();
     #[cfg(feature = "s3")]
-    {
-        let missing = state.hydrate_segments_for_search(&ns, &manifest, &query);
-        if !missing.is_empty() {
-            return json_error(503, &hydration_failed_message(&missing));
+    let hydration = {
+        let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
+        if !outcome.missing.is_empty() {
+            return json_error(503, &hydration_failed_message(&outcome.missing));
         }
-    }
+        outcome
+    };
+    #[cfg(not(feature = "s3"))]
+    let hydration = HydrationOutcome::default();
+    let hydrate_ms = t_hydrate.elapsed().as_secs_f64() * 1e3;
 
     // Bound concurrent scoring passes — see `AppState::search_semaphore`.
     // Acquired after hydration (which has its own ceiling) so a search
     // waiting on S3 doesn't also hold a scoring slot.
+    let t_queue = Instant::now();
     let _slot = state.search_semaphore.acquire();
+    let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
     match state
         .searcher
-        .search(&ns, &manifest, &query, tombstones.as_ref())
+        .search_with_stats(&ns, &manifest, &query, tombstones.as_ref())
     {
-        Ok(result) => json_ok(&result),
+        Ok((result, phases)) => {
+            log_search_timing(
+                &ns,
+                &hydration,
+                hydrate_ms,
+                queue_ms,
+                &phases,
+                result.total_hits,
+            );
+            json_ok(&result)
+        }
         Err(e) => search_error_response(&e),
     }
 }
@@ -1971,23 +2028,40 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         (m, t)
     };
 
+    let t_hydrate = Instant::now();
     #[cfg(feature = "s3")]
-    {
-        let missing = state.hydrate_segments_for_search(&ns, &manifest, &query);
-        if !missing.is_empty() {
-            return json_error(503, &hydration_failed_message(&missing));
+    let hydration = {
+        let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
+        if !outcome.missing.is_empty() {
+            return json_error(503, &hydration_failed_message(&outcome.missing));
         }
-    }
+        outcome
+    };
+    #[cfg(not(feature = "s3"))]
+    let hydration = HydrationOutcome::default();
+    let hydrate_ms = t_hydrate.elapsed().as_secs_f64() * 1e3;
 
     // Bound concurrent scoring passes — see `AppState::search_semaphore`.
     // Acquired after hydration (which has its own ceiling) so a search
     // waiting on S3 doesn't also hold a scoring slot.
+    let t_queue = Instant::now();
     let _slot = state.search_semaphore.acquire();
+    let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
     match state
         .searcher
-        .search(&ns, &manifest, &query, tombstones.as_ref())
+        .search_with_stats(&ns, &manifest, &query, tombstones.as_ref())
     {
-        Ok(result) => json_ok(&result),
+        Ok((result, phases)) => {
+            log_search_timing(
+                &ns,
+                &hydration,
+                hydrate_ms,
+                queue_ms,
+                &phases,
+                result.total_hits,
+            );
+            json_ok(&result)
+        }
         Err(e) => search_error_response(&e),
     }
 }
@@ -2496,6 +2570,46 @@ fn json_ok<T: serde::Serialize>(value: &T) -> String {
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+/// One structured line per search request — the cold-read baseline
+/// instrument (Day 1 of the cold-read plan). Greppable as
+/// `search timing:`; every phase is wall-clock ms except `open_total_ms`
+/// (summed across rayon workers — read with `opens_cold` as average
+/// cold-open cost). `hydrate_files`/`hydrate_mb` count only this request's
+/// own S3 fetches; a fully-warm NVMe cache logs 0/0.0 with a small
+/// residual `hydrate_ms` (local existence checks).
+fn log_search_timing(
+    ns: &NamespaceId,
+    hydration: &HydrationOutcome,
+    hydrate_ms: f64,
+    queue_ms: f64,
+    phases: &kosha_query::SearchPhaseStats,
+    total_hits: usize,
+) {
+    let total_ms = hydrate_ms
+        + queue_ms
+        + phases.admit_wall_ms
+        + phases.score_wall_ms
+        + phases.materialize_wall_ms;
+    println!(
+        "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
+         hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} score_ms={:.1} \
+         materialize_ms={:.1} opens_cold={} opens_cached={} open_total_ms={:.1} hits={}",
+        ns.0,
+        total_ms,
+        hydrate_ms,
+        hydration.files_fetched,
+        hydration.bytes_fetched as f64 / (1024.0 * 1024.0),
+        queue_ms,
+        phases.admit_wall_ms,
+        phases.score_wall_ms,
+        phases.materialize_wall_ms,
+        phases.open_cold,
+        phases.open_cached,
+        phases.open_total_ms,
+        total_hits,
+    );
 }
 
 /// Map a search failure onto the right HTTP status: load-shedding

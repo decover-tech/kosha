@@ -1,8 +1,8 @@
-use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use instant_distance::{Builder, HnswMap, Point, Search};
 use kosha_core::{
@@ -412,6 +412,8 @@ const INVERTED_TABLE_ENTRY_LEN: usize = 24;
 pub struct LazyInvertedIndex {
     data: Vec<u8>,
     term_count: usize,
+    /// Decoded-postings LRU — see [`PostingsCache`].
+    cache: PostingsCache,
 }
 
 /// Checked little-endian u32 read that advances the cursor.
@@ -419,6 +421,159 @@ fn take_u32(buf: &mut &[u8]) -> Option<u32> {
     let (head, rest) = buf.split_first_chunk::<4>()?;
     *buf = rest;
     Some(u32::from_le_bytes(*head))
+}
+
+/// Per-segment byte budget for [`PostingsCache`]
+/// (`KOSHA_POSTINGS_CACHE_MAX_BYTES`, default 4 MiB, `0` disables). Read
+/// once — segments are opened frequently and this must not cost an env
+/// lookup per open.
+fn postings_cache_max_bytes() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("KOSHA_POSTINGS_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4 * 1024 * 1024)
+    })
+}
+
+/// Small per-segment LRU of decoded postings, keyed by term-table index.
+///
+/// The lazy v2 format trades resident memory for a per-query decode — the
+/// right trade for the vocabulary at large, but a hot query term ("the")
+/// then re-decodes its (large) postings on every query, and a wildcard
+/// expanding to thousands of terms re-decodes a big slice of the index per
+/// query. Caching the *decoded form of recently-queried terms only* keeps
+/// the v1 warm-path amortization for exactly the hot subset, while the
+/// cold/open/resident wins of the lazy format stand: the budget is a few
+/// MiB per segment (see [`postings_cache_max_bytes`]), not the whole
+/// vocabulary.
+///
+/// Entries are `Arc`s, so a hit is a pointer clone and eviction never
+/// invalidates postings an in-flight query still holds. Approximate entry
+/// cost: `count × size_of::<Posting>()` + 4 bytes per position.
+///
+/// Not yet counted by kosha-query's `MemoryLedger` — bounded per segment
+/// here instead; wiring it into the ledger's per-segment `approx_bytes` is
+/// a follow-up.
+struct PostingsCache {
+    max_bytes: usize,
+    state: Mutex<PostingsCacheState>,
+}
+
+#[derive(Default)]
+struct PostingsCacheState {
+    entries: HashMap<usize, (Arc<Vec<Posting>>, usize)>,
+    recency: VecDeque<usize>,
+    total_bytes: usize,
+    /// Recently-missed term indices (bounded ring) for second-touch
+    /// admission — see [`PostingsCache::admit_on_miss`].
+    recent_misses: VecDeque<usize>,
+}
+
+/// Capacity of the second-touch admission ring. Big enough to remember a
+/// realistic hot working set between queries; small enough that a wildcard
+/// blast writing thousands of one-shot entries through it costs nothing.
+const POSTINGS_CACHE_MISS_RING: usize = 256;
+
+impl PostingsCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            state: Mutex::new(PostingsCacheState::default()),
+        }
+    }
+
+    fn get(&self, term_index: usize) -> Option<Arc<Vec<Posting>>> {
+        if self.max_bytes == 0 {
+            return None;
+        }
+        let mut st = self.state.lock().unwrap();
+        let hit = st.entries.get(&term_index).map(|(p, _)| Arc::clone(p));
+        if hit.is_some() {
+            if let Some(pos) = st.recency.iter().position(|k| *k == term_index) {
+                st.recency.remove(pos);
+            }
+            st.recency.push_back(term_index);
+        }
+        hit
+    }
+
+    /// Second-touch admission, recorded on a cache miss: returns whether
+    /// this term was *already* missed recently (→ caller should cache the
+    /// decode), and remembers the miss either way.
+    ///
+    /// Why not cache every decode: a wildcard query expanding to thousands
+    /// of terms would write its entire one-shot working set through the
+    /// cache each time — evicting the genuinely hot terms and paying
+    /// insert/evict churn for entries that are never reused. Requiring a
+    /// second miss within the ring's horizon filters exactly that traffic:
+    /// hot query terms recur and get admitted on their second lookup;
+    /// wildcard blasts pass through without disturbing anything.
+    fn admit_on_miss(&self, term_index: usize) -> bool {
+        let mut st = self.state.lock().unwrap();
+        if let Some(pos) = st.recent_misses.iter().position(|k| *k == term_index) {
+            st.recent_misses.remove(pos);
+            return true;
+        }
+        if st.recent_misses.len() >= POSTINGS_CACHE_MISS_RING {
+            st.recent_misses.pop_front();
+        }
+        st.recent_misses.push_back(term_index);
+        false
+    }
+
+    fn insert(&self, term_index: usize, postings: Arc<Vec<Posting>>, bytes: usize) {
+        // An entry bigger than the whole budget would evict everything and
+        // then itself churn on every query — don't cache it at all.
+        if self.max_bytes == 0 || bytes > self.max_bytes {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        if st.entries.insert(term_index, (postings, bytes)).is_none() {
+            st.recency.push_back(term_index);
+            st.total_bytes += bytes;
+        }
+        while st.total_bytes > self.max_bytes {
+            let Some(oldest) = st.recency.pop_front() else {
+                break;
+            };
+            if let Some((_, size)) = st.entries.remove(&oldest) {
+                st.total_bytes -= size;
+            }
+        }
+    }
+}
+
+/// Postings handle returned by [`SegmentReader::postings`]. Derefs to
+/// `[Posting]`, so call sites treat it as a slice regardless of the
+/// underlying storage: legacy (v1) segments lend a borrow into their parsed
+/// map; v2 segments hand out a shared `Arc` of the on-demand decode (a
+/// pointer clone on a [`PostingsCache`] hit).
+pub enum PostingsRef<'a> {
+    Borrowed(&'a [Posting]),
+    Shared(Arc<Vec<Posting>>),
+}
+
+impl std::ops::Deref for PostingsRef<'_> {
+    type Target = [Posting];
+    fn deref(&self) -> &[Posting] {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Shared(a) => a.as_slice(),
+        }
+    }
+}
+
+impl PostingsRef<'_> {
+    /// Owned copy of the postings — clones unless this is the sole
+    /// reference to a shared decode.
+    pub fn into_owned(self) -> Vec<Posting> {
+        match self {
+            Self::Borrowed(s) => s.to_vec(),
+            Self::Shared(a) => Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()),
+        }
+    }
 }
 
 impl LazyInvertedIndex {
@@ -450,7 +605,11 @@ impl LazyInvertedIndex {
         if table_end > data.len() {
             return Err(corrupt("term table extends past end of file"));
         }
-        let index = Self { data, term_count };
+        let index = Self {
+            data,
+            term_count,
+            cache: PostingsCache::new(postings_cache_max_bytes()),
+        };
         for i in 0..term_count {
             let (term_off, term_len, p_off, p_len) = index.raw_entry(i);
             let term_end = term_off
@@ -511,19 +670,38 @@ impl LazyInvertedIndex {
         (0..self.term_count).map(|i| self.term_at(i)).collect()
     }
 
-    /// Decode one term's postings on demand. `None` for absent terms.
-    /// Decoding is fully bounds-checked: a corrupt postings region (which
-    /// open-time validation deliberately doesn't scan — that would be the
-    /// eager parse this format exists to avoid) yields `None` rather than
-    /// a panic in a scoring thread.
-    fn postings(&self, term: &str) -> Option<Vec<Posting>> {
+    /// Postings for one term: a shared handle to the decoded form, served
+    /// from the per-segment LRU when the term was queried recently (a
+    /// pointer clone), decoded on demand otherwise. `None` for absent
+    /// terms.
+    fn postings(&self, term: &str) -> Option<Arc<Vec<Posting>>> {
         let i = self.find(term)?;
+        if let Some(hit) = self.cache.get(i) {
+            return Some(hit);
+        }
+        let admit = self.cache.admit_on_miss(i);
+        let (postings, approx_bytes) = self.decode_postings(i)?;
+        let arc = Arc::new(postings);
+        if admit {
+            self.cache.insert(i, Arc::clone(&arc), approx_bytes);
+        }
+        Some(arc)
+    }
+
+    /// Decode term `i`'s postings, returning them with their approximate
+    /// in-memory cost (for the cache's byte budget). Decoding is fully
+    /// bounds-checked: a corrupt postings region (which open-time
+    /// validation deliberately doesn't scan — that would be the eager parse
+    /// this format exists to avoid) yields `None` rather than a panic in a
+    /// scoring thread.
+    fn decode_postings(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
         let (_, _, p_off, p_len) = self.raw_entry(i);
         let mut buf = &self.data[p_off..p_off + p_len];
         let count = take_u32(&mut buf)? as usize;
         // Guard Vec::with_capacity against a corrupt count: a posting is at
         // least 12 bytes, so cap by what the span could physically hold.
         let mut postings = Vec::with_capacity(count.min(buf.len() / 12 + 1));
+        let mut position_count = 0usize;
         for _ in 0..count {
             let doc_id = take_u32(&mut buf)?;
             let term_frequency = take_u32(&mut buf)?;
@@ -532,13 +710,15 @@ impl LazyInvertedIndex {
             for _ in 0..npos {
                 positions.push(take_u32(&mut buf)?);
             }
+            position_count += positions.len();
             postings.push(Posting {
                 doc_id,
                 term_frequency,
                 positions,
             });
         }
-        Some(postings)
+        let approx_bytes = postings.len() * std::mem::size_of::<Posting>() + position_count * 4;
+        Some((postings, approx_bytes))
     }
 }
 
@@ -553,10 +733,10 @@ enum InvertedAccess {
 }
 
 impl InvertedAccess {
-    fn postings(&self, term: &str) -> Option<Cow<'_, [Posting]>> {
+    fn postings(&self, term: &str) -> Option<PostingsRef<'_>> {
         match self {
-            Self::Eager(map) => map.get(term).map(|v| Cow::Borrowed(v.as_slice())),
-            Self::Lazy(lazy) => lazy.postings(term).map(Cow::Owned),
+            Self::Eager(map) => map.get(term).map(|v| PostingsRef::Borrowed(v.as_slice())),
+            Self::Lazy(lazy) => lazy.postings(term).map(PostingsRef::Shared),
         }
     }
 
@@ -684,13 +864,13 @@ impl SegmentReader {
         &self.footer.bm25_params
     }
 
-    /// Postings for one term. `Cow` because the two storage formats differ
-    /// in what they can hand out: legacy (v1) segments hold the whole index
-    /// parsed in memory and lend a borrow, v2 segments decode this term's
-    /// postings on demand from the raw file buffer and return them owned
-    /// (see [`LazyInvertedIndex`]). Call once per term per query and hold
-    /// the result — don't re-fetch per document.
-    pub fn postings(&self, term: &str) -> Option<Cow<'_, [Posting]>> {
+    /// Postings for one term, as a slice-deref handle (see [`PostingsRef`]):
+    /// legacy (v1) segments lend a borrow into their parsed map; v2 segments
+    /// hand out a shared `Arc` of the on-demand decode, served from a small
+    /// per-segment LRU when the term was queried recently (see
+    /// [`PostingsCache`]). Call once per term per query and hold the
+    /// result — don't re-fetch per document.
+    pub fn postings(&self, term: &str) -> Option<PostingsRef<'_>> {
         self.inverted.postings(term)
     }
 
@@ -1437,6 +1617,61 @@ mod tests {
             Err(other) => panic!("expected CorruptSegment, got {other}"),
             Ok(_) => panic!("expected CorruptSegment, got a successful open"),
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_postings_cache_serves_shared_decode_and_respects_budget() {
+        // Repeated lookups of the same term must return the same shared
+        // decode (pointer-equal Arc — the warm-path amortization the cache
+        // exists for), and the byte budget must actually evict.
+        let dir = std::env::temp_dir().join("kosha-test-postings-cache");
+        write_inverted_fixture(&dir);
+        let r = SegmentReader::open(dir.clone()).unwrap();
+
+        // Second-touch admission: lookup 1 records the miss (no insert),
+        // lookup 2 misses again → admitted and cached, lookup 3 hits.
+        let first = r.postings("quick").unwrap();
+        let second = r.postings("quick").unwrap();
+        if let (PostingsRef::Shared(a), PostingsRef::Shared(b)) = (&first, &second) {
+            assert!(
+                !Arc::ptr_eq(a, b),
+                "first two lookups are both misses under second-touch admission"
+            );
+        } else {
+            panic!("v2 segment must return shared postings handles");
+        }
+        let third = r.postings("quick").unwrap();
+        match (&second, &third) {
+            (PostingsRef::Shared(a), PostingsRef::Shared(b)) => {
+                assert!(
+                    Arc::ptr_eq(a, b),
+                    "third lookup must be a cache hit sharing the admitted decode"
+                );
+            }
+            _ => panic!("v2 segment must return shared postings handles"),
+        }
+
+        // Budget-eviction behavior on the cache itself: two entries whose
+        // combined size exceeds the budget can't both stay resident.
+        let cache = PostingsCache::new(100);
+        let big = Arc::new(vec![Posting {
+            doc_id: 1,
+            term_frequency: 1,
+            positions: vec![0],
+        }]);
+        cache.insert(0, Arc::clone(&big), 60);
+        cache.insert(1, Arc::clone(&big), 60);
+        assert!(
+            cache.get(0).is_none(),
+            "oldest entry must be evicted once the byte budget is exceeded"
+        );
+        assert!(cache.get(1).is_some());
+        // An entry larger than the whole budget is never cached (it would
+        // evict everything and still churn).
+        cache.insert(2, big, 1000);
+        assert!(cache.get(2).is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

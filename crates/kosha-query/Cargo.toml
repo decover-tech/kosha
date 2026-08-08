@@ -17,6 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+cap = "0.1.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
@@ -29,4 +30,8 @@ harness = false
 
 [[bench]]
 name = "scoring_profile"
+harness = false
+
+[[bench]]
+name = "segment_memory"
 harness = false
