@@ -631,6 +631,7 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
         let existing = store.manifest_cloned(&namespace).unwrap_or(Manifest {
             version: 0,
             segments: Vec::new(),
+            segment_footers: Default::default(),
         });
         // Restore to advance segment IDs beyond an existing/partial run.
         // Replace mode: Publisher publishes only this run's segments.

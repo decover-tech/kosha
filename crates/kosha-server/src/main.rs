@@ -3667,34 +3667,43 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false, false),
+            !AppState::segment_is_scoring_complete(&dir, false, false, false),
             "empty dir must not be scoring-complete"
         );
 
-        for f in ["footer.json", "inverted.idx", "doc_store.offsets"] {
+        for f in ["inverted.idx", "doc_store.offsets"] {
             fs::write(dir.join(f), b"x").unwrap();
         }
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false, false),
+            !AppState::segment_is_scoring_complete(&dir, false, false, false),
+            "without a manifest footer, footer.json on disk is still required"
+        );
+        assert!(
+            AppState::segment_is_scoring_complete(&dir, false, false, true),
+            "a manifest footer snapshot must stand in for a missing footer.json"
+        );
+        fs::write(dir.join("footer.json"), b"x").unwrap();
+        assert!(
+            AppState::segment_is_scoring_complete(&dir, false, false, false),
             "offsets sidecar (no doc_store.bin, no filters.bin) must be broad lexical scoring-complete"
         );
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false, true),
+            !AppState::segment_is_scoring_complete(&dir, false, true, false),
             "queries using filters/sorts/aggs must still require filters.bin"
         );
         fs::write(dir.join("filters.bin"), b"x").unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false, true),
+            AppState::segment_is_scoring_complete(&dir, false, true, false),
             "filters.bin present must make filter/sort/agg queries scoring-complete"
         );
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, true, true),
+            !AppState::segment_is_scoring_complete(&dir, true, true, false),
             "kNN scoring-complete must require vector.idx (still missing)"
         );
 
         fs::write(dir.join("vector.idx"), b"x").unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, true, true),
+            AppState::segment_is_scoring_complete(&dir, true, true, false),
             "vector.idx present must make it kNN scoring-complete"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -3713,12 +3722,12 @@ mod tests {
             fs::write(legacy.join(f), b"x").unwrap();
         }
         assert!(
-            AppState::segment_is_scoring_complete(&legacy, false, true),
+            AppState::segment_is_scoring_complete(&legacy, false, true, false),
             "legacy segment with doc_store.bin (no offsets) must be scoring-complete"
         );
         fs::remove_file(legacy.join("doc_store.bin")).unwrap();
         assert!(
-            !AppState::segment_is_scoring_complete(&legacy, false, true),
+            !AppState::segment_is_scoring_complete(&legacy, false, true, false),
             "legacy segment without offsets and without doc_store.bin is not scorable"
         );
         let _ = fs::remove_dir_all(&legacy);

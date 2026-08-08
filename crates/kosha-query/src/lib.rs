@@ -926,6 +926,7 @@ impl Searcher {
     /// opened segment's bytes are recorded as live in the ledger (via
     /// [`TrackedSegment::new`]) and consumed from the search's admission
     /// reservation, keeping committed bytes net-unchanged.
+    #[allow(clippy::too_many_arguments)]
     fn open_segment(
         &self,
         namespace: &str,
