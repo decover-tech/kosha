@@ -842,6 +842,10 @@ fn decode_postings_bytes(mut buf: &[u8]) -> Option<(Vec<Posting>, usize)> {
     Some((postings, approx_bytes))
 }
 
+/// Cache-miss postings reads pending against one blob: (entry index, term,
+/// offset within the blob, span length, admit-to-cache).
+type PendingBlobReads<'a> = Vec<(usize, &'a str, usize, usize, bool)>;
+
 impl SplitInvertedIndex {
     fn detect(data: &[u8]) -> bool {
         data.len() >= INVERTED_HEADER_LEN
@@ -948,7 +952,7 @@ impl SplitInvertedIndex {
 
     fn postings_for_terms<'a>(&'a self, terms: &'a [String]) -> Vec<(&'a str, Arc<Vec<Posting>>)> {
         let mut out = Vec::with_capacity(terms.len());
-        let mut by_blob: HashMap<usize, Vec<(usize, &'a str, usize, usize, bool)>> = HashMap::new();
+        let mut by_blob: HashMap<usize, PendingBlobReads<'a>> = HashMap::new();
 
         for term in terms {
             let Some(i) = self.find(term) else {
