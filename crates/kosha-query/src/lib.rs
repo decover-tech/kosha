@@ -14,32 +14,30 @@ use kosha_core::{
 };
 use kosha_segment::{tokenize, PostingsMemoryAccount, SegmentReader};
 
-/// One materialize-page hit's exact byte span within its segment's
-/// `doc_store.bin`, as reported by the offsets sidecar
-/// (`SegmentReader::doc_span`) — the unit of on-demand doc-store fetching.
-/// A 10-hit page asks for ~10 spans of a few KB each, never a whole
-/// multi-hundred-MB doc store.
-#[derive(Debug, Clone)]
-pub struct DocSpan {
-    /// The segment's on-disk directory (`{data_dir}/{namespace}/{segment_id}`)
-    /// — the hydrator derives the remote `doc_store.bin` key from it.
-    pub segment_dir: PathBuf,
-    pub doc_seq: u32,
-    /// Absolute byte offset of the record within `doc_store.bin`.
-    pub offset: u64,
-    /// Exact record length in bytes.
-    pub length: u32,
-}
-
-/// Optional callback the searcher invokes to fetch the materialize page's
-/// doc-store byte spans — the on-demand half of scoring-set-only hydration.
-/// Returns one entry per requested span, index-aligned with the input;
-/// `None` for a span that couldn't be fetched (the searcher then falls back
-/// to a local disk read, which surfaces the underlying error if the file
-/// really is absent). See [`Searcher::search_with_doc_store_hydrator`].
-/// Pass `None` (no callback) to materialize straight from disk — the warm /
-/// local-dev path where `doc_store.bin` is already present.
-pub type DocStoreHydrator<'a> = Option<&'a dyn Fn(&[DocSpan]) -> Vec<Option<Vec<u8>>>>;
+/// Optional callback the searcher invokes to ensure `doc_store.bin` is
+/// present locally for the segments holding the materialize page — the
+/// on-demand half of scoring-set-only hydration (Option A: fetch the whole
+/// `doc_store.bin` per page-segment on first miss, persist it via the disk
+/// cache, then serve page reads from local disk on every subsequent warm
+/// query). See [`Searcher::search_with_doc_store_hydrator`].
+///
+/// Each element of the input slice is a segment directory path
+/// (`{data_dir}/{namespace}/{segment_id}`) whose `doc_store.bin` is absent
+/// or partial on local disk; the implementor fetches and persists the whole
+/// file for each, idempotently (already-local segments are no-ops). Pass
+/// `None` to materialize straight from disk — the warm / local-dev path
+/// where `doc_store.bin` is already present.
+///
+/// Why whole-file per-segment instead of per-doc ranged GETs: a ranged GET
+/// per page document means *every* warm query re-pays N S3 round-trips
+/// (~350 ms p50 at 8 QPS / topk=10 against 1M docs), because span bytes are
+/// never persisted (a partial `doc_store.bin` would mis-read as complete to
+/// the hydration existence check). Fetching the whole file once per
+/// page-segment turns that into one round-trip per segment on the *first*
+/// warm query, then zero round-trips thereafter — warm falls to the local
+/// seek cost (~ms). Per-doc span reads remain available as a future Option B
+/// refinement (a per-segment sparse span cache), but are not the warm path.
+pub type DocStoreHydrator<'a> = Option<&'a dyn Fn(&[PathBuf])>;
 
 /// Default number of parsed segments kept resident in memory (see
 /// [`SegmentCache`]). Segments are immutable once written (DESIGN.md §6.2),
@@ -1626,55 +1624,42 @@ impl Searcher {
             }
         }
 
-        // On-demand doc-store bytes for the materialize page (scoring-set-
-        // only hydration): a cold search hydrated just the offsets sidecar
-        // for Lazy segments, so `doc_store.bin` is absent until now. The
-        // sidecar already knows each hit's exact byte span, so ask the
-        // hydrator for only those spans — a page of hits costs KBs of
-        // ranged reads, never a whole multi-hundred-MB doc store, and
-        // nothing doc-store-sized ever has to land on local disk. Spans are
-        // requested only for hits whose segment can't serve a local read
-        // (`has_local_doc_store`): warm segments and legacy (Eager)
-        // segments skip the callback entirely.
-        let mut span_bytes: HashMap<usize, Vec<u8>> = HashMap::new();
-        if let Some(fetch_spans) = doc_store_hydrator {
-            let mut spans: Vec<DocSpan> = Vec::new();
-            let mut span_cand_idx: Vec<usize> = Vec::new();
-            for (idx, cand) in candidates[from..to].iter().enumerate() {
+        // On-demand `doc_store.bin` for the materialize page (Option A): a cold
+        // search hydrated just the offsets sidecar for Lazy segments, so
+        // `doc_store.bin` is absent until now. Collect the *distinct segment
+        // directories* among the page hits whose local `doc_store.bin` is
+        // missing, ask the hydrator to fetch & persist the whole file for
+        // each once, then materialize the page via the standard local
+        // seek+read path (`doc_record_full`). After this first warm query
+        // per page-segment, the file is on disk and `has_local_doc_store`
+        // short-circuits the callback on every subsequent warm query —
+        // warm page reads become sub-millisecond local seeks instead of
+        // N per-doc S3 ranged GETs every time.
+        if let Some(ensure_doc_store) = doc_store_hydrator {
+            let mut page_seg_paths: Vec<PathBuf> = Vec::new();
+            for cand in &candidates[from..to] {
                 if cand.reader.has_local_doc_store() {
                     continue;
                 }
-                if let Some((offset, length)) = cand.reader.doc_span(cand.doc_seq) {
-                    spans.push(DocSpan {
-                        segment_dir: cand.reader.segment_dir().to_path_buf(),
-                        doc_seq: cand.doc_seq,
-                        offset,
-                        length,
-                    });
-                    span_cand_idx.push(idx);
+                let p = cand.reader.segment_dir().to_path_buf();
+                if !page_seg_paths.contains(&p) {
+                    page_seg_paths.push(p);
                 }
             }
-            if !spans.is_empty() {
-                let fetched = fetch_spans(&spans);
-                for (i, bytes) in fetched.into_iter().enumerate() {
-                    if let (Some(bytes), Some(&idx)) = (bytes, span_cand_idx.get(i)) {
-                        span_bytes.insert(idx, bytes);
-                    }
-                }
+            if !page_seg_paths.is_empty() {
+                ensure_doc_store(&page_seg_paths);
             }
         }
 
-        // Materialize fields / highlights only for the returned page — from
-        // the ranged bytes fetched above when present, else the only place a
-        // `Lazy` segment's full field content is ever read from disk (one
-        // seek+read per document, not the whole segment).
+        // Materialize fields / highlights only for the returned page — the
+        // only place a `Lazy` segment's full field content is ever read
+        // from disk (one seek+read per document, not the whole segment).
+        // `doc_store.bin` is now guaranteed local for every page-segment
+        // (either it pre-existed, or the hydrator just persisted it above),
+        // so `doc_record_full` succeeds without any further S3 round-trip.
         let mut page = Vec::with_capacity(to - from);
-        for (idx, cand) in candidates[from..to].iter().enumerate() {
-            let doc_rec = match span_bytes.get(&idx) {
-                Some(bytes) => cand.reader.doc_record_from_bytes(cand.doc_seq, bytes)?,
-                None => cand.reader.doc_record_full(cand.doc_seq)?,
-            };
-            let Some(doc_rec) = doc_rec else {
+        for cand in &candidates[from..to] {
+            let Some(doc_rec) = cand.reader.doc_record_full(cand.doc_seq)? else {
                 continue;
             };
             let mut doc = ScoredDocument {
@@ -2647,13 +2632,15 @@ mod tests {
 
     #[test]
     fn search_with_doc_store_hydrator_fetches_only_page_segments_on_demand() {
-        // Scoring-set-only hydration contract: a cold search has only the
-        // offsets sidecar locally, so each page hit's exact doc-store byte
-        // span is fetched on demand — via the hydrator callback — for
-        // *only* the hits in the returned page, not the whole manifest,
-        // and `doc_store.bin` itself never lands on disk. Includes a
-        // non-matching segment that must never be requested, and a
-        // count-only call that must not invoke the hydrator at all.
+        // Scoring-set-only hydration contract (Option A): a cold search has
+        // only the offsets sidecar locally, so the hydrator is asked to
+        // fetch & persist the **whole `doc_store.bin`** for each distinct
+        // segment holding a page hit — once per segment, never per doc.
+        // Includes a non-matching segment that must never be requested, a
+        // count-only call that must not invoke the hydrator at all, and the
+        // key warm-path assertion: a second identical query must skip the
+        // hydrator entirely because the file is now local (the 350 ms → ~ms
+        // warm-latency win).
         let dir = std::env::temp_dir().join("kosha-test-doc-store-on-demand");
         let _ = std::fs::remove_dir_all(&dir);
         let ns = NamespaceId("test".into());
@@ -2690,53 +2677,40 @@ mod tests {
         // served from a warm cache populated by an earlier call here.
         let searcher = Searcher::new(dir.clone());
 
-        let requested: Arc<Mutex<Vec<DocSpan>>> = Arc::new(Mutex::new(Vec::new()));
+        let requested: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
         let requested_clone = Arc::clone(&requested);
-        // Serve each requested span from the backed-up doc store — the
-        // test-side stand-in for an S3 ranged GET.
-        let serve_spans = move |spans: &[DocSpan]| -> Vec<Option<Vec<u8>>> {
-            spans
-                .iter()
-                .map(|span| {
-                    requested_clone.lock().unwrap().push(span.clone());
-                    let store = std::fs::read(span.segment_dir.join("doc_store.bin.bak")).ok()?;
-                    let start = span.offset as usize;
-                    store
-                        .get(start..start + span.length as usize)
-                        .map(<[u8]>::to_vec)
-                })
-                .collect()
+        // Test-side stand-in for an S3 whole-file fetch of `doc_store.bin`:
+        // restore the backed-up file to its on-disk path so the segment's
+        // local `doc_record_full` seek+read succeeds, exactly as it would
+        // after the real hydrator's `ensure_files_local` lands the file.
+        let ensure_doc_store = move |segs: &[PathBuf]| {
+            for seg in segs {
+                requested_clone.lock().unwrap().push(seg.clone());
+                let _ = std::fs::copy(seg.join("doc_store.bin.bak"), seg.join("doc_store.bin"));
+            }
         };
 
         let q = mk_query("hello", 5);
         let r = searcher
-            .search_with_doc_store_hydrator(&ns, &manifest, &q, None, Some(&serve_spans))
+            .search_with_doc_store_hydrator(&ns, &manifest, &q, None, Some(&ensure_doc_store))
             .map(|(result, _stats)| result)
-            .expect("materialize must succeed from hydrator-served span bytes");
+            .expect("materialize must succeed from hydrator-persisted doc_store");
         assert_eq!(r.total_hits, 2);
         assert_eq!(r.results.len(), 2);
-        // Fields were genuinely materialized from the served span bytes.
         assert!(r.results.iter().any(|d| d.doc_id.0 == "d1"));
         assert!(r.results.iter().any(|d| d.doc_id.0 == "d2"));
-        // The whole point of ranged materialization: the bulk doc store
-        // never lands on disk.
-        for id in ["s1", "s2", "s3"] {
-            assert!(
-                !dir.join(&ns.0).join(id).join("doc_store.bin").exists(),
-                "doc_store.bin must never be fetched whole ({id})"
-            );
-        }
 
-        // Exactly the two page hits' spans were requested; the
+        // Exactly the two page-hits' *segments* were requested (one path
+        // each — Option A dedups by segment, not per doc); the
         // non-matching s3 segment must never reach the hydrator.
         let req = requested.lock().unwrap();
         assert_eq!(
             req.len(),
             2,
-            "expected exactly the 2 page hits, got {req:?}"
+            "expected exactly the 2 page-hit segment paths, got {req:?}"
         );
         assert!(
-            req.iter().all(|span| span.segment_dir != s3),
+            req.iter().all(|p| *p != s3),
             "non-matching segment s3 was hydrated"
         );
         drop(req);
@@ -2745,7 +2719,13 @@ mod tests {
         let before = requested.lock().unwrap().len();
         let count_only = mk_query("hello", 0);
         let counted = searcher
-            .search_with_doc_store_hydrator(&ns, &manifest, &count_only, None, Some(&serve_spans))
+            .search_with_doc_store_hydrator(
+                &ns,
+                &manifest,
+                &count_only,
+                None,
+                Some(&ensure_doc_store),
+            )
             .map(|(result, _stats)| result)
             .unwrap();
         assert_eq!(counted.total_hits, 2);
@@ -2754,6 +2734,22 @@ mod tests {
             requested.lock().unwrap().len(),
             before,
             "count-only query must not trigger doc_store hydration"
+        );
+
+        // Warm-path assertion (the whole point of Option A): a second
+        // identical query skips the hydrator entirely because
+        // `doc_store.bin` is now persisted for both page-hit segments.
+        let before_warm = requested.lock().unwrap().len();
+        let r2 = searcher
+            .search_with_doc_store_hydrator(&ns, &manifest, &q, None, Some(&ensure_doc_store))
+            .map(|(result, _stats)| result)
+            .expect("warm query must materialize from local doc_store");
+        assert_eq!(r2.total_hits, 2);
+        assert_eq!(r2.results.len(), 2);
+        assert_eq!(
+            requested.lock().unwrap().len(),
+            before_warm,
+            "warm query must NOT re-invoke the hydrator — doc_store.bin is now local"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
