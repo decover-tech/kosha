@@ -39,3 +39,7 @@ harness = false
 [[bench]]
 name = "warm_materialize"
 harness = false
+
+[[bench]]
+name = "topk_blockmax"
+harness = false
