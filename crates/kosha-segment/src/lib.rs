@@ -766,11 +766,34 @@ impl InvertedAccess {
 /// fields (`doc_id`, `field_length`) that scoring needs constantly. Read
 /// from the `doc_store.offsets` sidecar — proportional to document *count*,
 /// never document *content* size.
+///
+/// Doc ids live in [`DocIndex::ids_pool`], one contiguous allocation for
+/// the whole segment, not a heap `String` per document: a 1M-doc namespace
+/// used to pay ~1M small allocations (plus per-`String` header overhead)
+/// just to open its offsets sidecars — measured as a first-class share of
+/// cold `open_total_ms` on staging.
 struct DocIndexEntry {
-    doc_id: DocumentId,
+    id_off: u32,
+    id_len: u32,
     field_length: u32,
     offset: u64,
     length: u32,
+}
+
+/// Arena-backed per-document index parsed from `doc_store.offsets`.
+struct DocIndex {
+    /// Every document's id, concatenated. Entries slice into this by
+    /// `(id_off, id_len)` — see [`DocIndex::id`].
+    ids_pool: String,
+    entries: Vec<DocIndexEntry>,
+}
+
+impl DocIndex {
+    fn id(&self, doc_seq: usize) -> Option<&str> {
+        let e = self.entries.get(doc_seq)?;
+        self.ids_pool
+            .get(e.id_off as usize..(e.id_off + e.id_len) as usize)
+    }
 }
 
 /// How `SegmentReader` accesses document content. `Lazy` is the steady
@@ -783,7 +806,7 @@ struct DocIndexEntry {
 enum DocStoreAccess {
     Lazy {
         doc_store_path: PathBuf,
-        metas: Vec<DocIndexEntry>,
+        index: DocIndex,
     },
     Eager(Vec<DocRecord>),
 }
@@ -792,9 +815,33 @@ enum DocStoreAccess {
 /// BM25 scoring and default/`_id` sorting need, without ever touching the
 /// document's full field content on disk.
 pub struct DocMetaRef<'a> {
-    pub doc_id: &'a DocumentId,
+    /// Borrowed from the segment's contiguous id pool (Lazy) or the eager
+    /// doc record (legacy) — `&str` rather than `&DocumentId` so the Lazy
+    /// path never materializes a `DocumentId` per document.
+    pub doc_id: &'a str,
     pub doc_seq: u32,
     pub field_length: u32,
+}
+
+/// `filters.bin` held raw, parsed on first use. Filter columns are only
+/// touched by queries that actually filter, aggregate, or sort by field
+/// values — a broad lexical query never does — yet the eager parse at open
+/// was a first-class share of cold open time (staging: 50MB filters.bin
+/// per segment on the worst namespace ≈ 529ms/segment opens). The raw
+/// buffer's size is what `approx_segment_bytes` already budgets (on-disk
+/// size of filters.bin), so the memory ledger's accounting is unchanged;
+/// the parsed form is an additional cost paid only by segments whose
+/// filters are actually exercised.
+struct LazyFilters {
+    raw: Vec<u8>,
+    parsed: OnceLock<FilterStore>,
+}
+
+impl LazyFilters {
+    fn get(&self) -> &FilterStore {
+        self.parsed
+            .get_or_init(|| SegmentReader::parse_filters(&self.raw))
+    }
 }
 
 pub struct SegmentReader {
@@ -802,7 +849,7 @@ pub struct SegmentReader {
     footer: Footer,
     doc_store: DocStoreAccess,
     inverted: InvertedAccess,
-    pub filter_store: FilterStore,
+    filters: LazyFilters,
     pub vector_store: VectorStore,
     pub hnsw_map: Option<HnswMap<CosinePoint, u32>>,
 }
@@ -834,9 +881,9 @@ impl SegmentReader {
         };
         let footer = Self::read_footer(&segment_dir)?;
         let doc_store = match try_read_doc_index(&segment_dir, footer.doc_count) {
-            Some(metas) => DocStoreAccess::Lazy {
+            Some(index) => DocStoreAccess::Lazy {
                 doc_store_path: segment_dir.join("doc_store.bin"),
-                metas,
+                index,
             },
             None => DocStoreAccess::Eager(Self::read_doc_store(&segment_dir)?),
         };
@@ -845,10 +892,20 @@ impl SegmentReader {
             footer,
             doc_store,
             inverted: Self::read_inverted(&segment_dir)?,
-            filter_store: Self::read_filters(&segment_dir)?,
+            filters: LazyFilters {
+                raw: Self::read_filters_raw(&segment_dir),
+                parsed: OnceLock::new(),
+            },
             vector_store: vs,
             hnsw_map: hm,
         })
+    }
+
+    /// The segment's filter columns, parsed on first use (see
+    /// [`LazyFilters`]). Queries without filters/aggregations/field sorts
+    /// never call this, and never pay the parse.
+    pub fn filter_store(&self) -> &FilterStore {
+        self.filters.get()
     }
 
     pub fn footer(&self) -> &Footer {
@@ -888,15 +945,18 @@ impl SegmentReader {
     pub fn doc_meta(&self, doc_seq: u32) -> Option<DocMetaRef<'_>> {
         match &self.doc_store {
             DocStoreAccess::Eager(records) => records.get(doc_seq as usize).map(|r| DocMetaRef {
-                doc_id: &r.doc_id,
+                doc_id: &r.doc_id.0,
                 doc_seq: r.doc_seq,
                 field_length: r.field_length,
             }),
-            DocStoreAccess::Lazy { metas, .. } => metas.get(doc_seq as usize).map(|m| DocMetaRef {
-                doc_id: &m.doc_id,
-                doc_seq,
-                field_length: m.field_length,
-            }),
+            DocStoreAccess::Lazy { index, .. } => {
+                let entry = index.entries.get(doc_seq as usize)?;
+                Some(DocMetaRef {
+                    doc_id: index.id(doc_seq as usize)?,
+                    doc_seq,
+                    field_length: entry.field_length,
+                })
+            }
         }
     }
 
@@ -909,9 +969,9 @@ impl SegmentReader {
             DocStoreAccess::Eager(records) => Ok(records.get(doc_seq as usize).cloned()),
             DocStoreAccess::Lazy {
                 doc_store_path,
-                metas,
+                index,
             } => {
-                let Some(entry) = metas.get(doc_seq as usize) else {
+                let Some(entry) = index.entries.get(doc_seq as usize) else {
                     return Ok(None);
                 };
                 let mut file = fs::File::open(doc_store_path)?;
@@ -1149,16 +1209,26 @@ impl SegmentReader {
         })
     }
 
+    /// Raw bytes of `filters.bin` — empty when the file is absent (a
+    /// segment with no filter fields). Parsing is deferred to first use;
+    /// see [`LazyFilters`].
+    fn read_filters_raw(segment_dir: &Path) -> Vec<u8> {
+        fs::read(segment_dir.join("filters.bin")).unwrap_or_default()
+    }
+
+    /// Eagerly read + parse `filters.bin` — the pre-lazy behavior, kept for
+    /// the bloom-rewrite admin path which always needs the parsed form.
     fn read_filters(segment_dir: &Path) -> Result<FilterStore, KoshaError> {
-        let path = segment_dir.join("filters.bin");
-        if !path.exists() {
-            return Ok(FilterStore::default());
-        }
-        let data = fs::read(&path)?;
-        let mut cursor = &data[..];
+        Ok(Self::parse_filters(&Self::read_filters_raw(segment_dir)))
+    }
+
+    /// Parse filter columns from raw `filters.bin` bytes. Empty/short input
+    /// (absent file) yields an empty store.
+    fn parse_filters(data: &[u8]) -> FilterStore {
+        let mut cursor = data;
         let mut store = FilterStore::default();
         if cursor.len() < 4 {
-            return Ok(store);
+            return store;
         }
         let field_count = read_u32_le(&mut cursor);
         for _ in 0..field_count {
@@ -1196,7 +1266,7 @@ impl SegmentReader {
                 _ => {}
             }
         }
-        Ok(store)
+        store
     }
 }
 
@@ -1286,7 +1356,7 @@ fn parse_one_doc_record(cursor: &mut &[u8], doc_seq: u32) -> DocRecord {
 /// rather than trusting a stale or corrupt sidecar. Never returns `Err`:
 /// a broken sidecar degrades to "slower, still correct," not a failed
 /// segment open.
-fn try_read_doc_index(segment_dir: &Path, expected_doc_count: u32) -> Option<Vec<DocIndexEntry>> {
+fn try_read_doc_index(segment_dir: &Path, expected_doc_count: u32) -> Option<DocIndex> {
     let path = segment_dir.join("doc_store.offsets");
     let data = match fs::read(&path) {
         Ok(data) => data,
@@ -1310,6 +1380,7 @@ fn try_read_doc_index(segment_dir: &Path, expected_doc_count: u32) -> Option<Vec
         return None;
     }
     let mut entries = Vec::with_capacity(doc_count as usize);
+    let mut ids_pool = String::new();
     for _ in 0..doc_count {
         // Fixed minimum per entry beyond the variable-length id: field_length
         // (4) + offset (8) + length (4) = 16, plus the 4-byte id_len prefix.
@@ -1329,18 +1400,22 @@ fn try_read_doc_index(segment_dir: &Path, expected_doc_count: u32) -> Option<Vec
             return None;
         }
         let id_bytes = read_bytes(&mut cursor, id_len);
-        let doc_id = DocumentId(String::from_utf8_lossy(id_bytes).to_string());
+        let id_off = ids_pool.len() as u32;
+        ids_pool.push_str(&String::from_utf8_lossy(id_bytes));
+        let id_len = ids_pool.len() as u32 - id_off;
         let field_length = read_u32_le(&mut cursor);
         let offset = read_u64_le(&mut cursor);
         let length = read_u32_le(&mut cursor);
         entries.push(DocIndexEntry {
-            doc_id,
+            id_off,
+            id_len,
             field_length,
             offset,
             length,
         });
     }
-    Some(entries)
+    ids_pool.shrink_to_fit();
+    Some(DocIndex { ids_pool, entries })
 }
 
 // ─── Atomic file rewrite ────────────────────────────────────────────────────
@@ -1719,6 +1794,68 @@ mod tests {
     }
 
     #[test]
+    fn filters_parse_lazily_on_first_use() {
+        // Opening a segment must not parse filters.bin — only a query that
+        // actually filters/aggregates/sorts-by-value pays that cost (the
+        // eager parse was ~529ms/segment on the worst staging namespace).
+        let dir = std::env::temp_dir().join("kosha-test-lazy-filters");
+        let _ = fs::remove_dir_all(&dir);
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![
+                Field::text("t", "hello world"),
+                Field::keyword("tag", "alpha"),
+            ],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(
+            r.filters.parsed.get().is_none(),
+            "open must not have parsed filters.bin"
+        );
+        let store = r.filter_store();
+        assert!(store.string_fields.contains_key("tag"));
+        assert!(
+            r.filters.parsed.get().is_some(),
+            "first filter_store() call materializes the parse"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doc_meta_ids_come_from_the_arena_correctly() {
+        // The offsets sidecar's per-doc ids live in one contiguous pool —
+        // every doc's id must slice back out exactly, in order.
+        let dir = std::env::temp_dir().join("kosha-test-docid-arena");
+        let _ = fs::remove_dir_all(&dir);
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        for i in 0..50 {
+            w.add_document(
+                DocumentId(format!("doc-{i}-{}", "x".repeat(i % 7))),
+                vec![Field::text("t", "hello")],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(matches!(r.doc_store, DocStoreAccess::Lazy { .. }));
+        for i in 0..50u32 {
+            let meta = r.doc_meta(i).unwrap();
+            assert_eq!(
+                meta.doc_id,
+                format!("doc-{i}-{}", "x".repeat(i as usize % 7))
+            );
+            assert_eq!(meta.doc_seq, i);
+        }
+        assert!(r.doc_meta(50).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tokenize_with_positions_works() {
         let r = tokenize_with_positions("quick brown fox");
         assert_eq!(
@@ -1972,7 +2109,7 @@ mod tests {
         // return the same data as before the backfill.
         let r = SegmentReader::open(dir.clone()).unwrap();
         let d1 = r.doc_meta(0).unwrap();
-        assert_eq!(d1.doc_id.0, "d1");
+        assert_eq!(d1.doc_id, "d1");
         let d2_full = r.doc_record_full(1).unwrap().unwrap();
         assert_eq!(d2_full.doc_id.0, "d2");
         assert_eq!(d2_full.fields[0].value, "hello moon and stars");
