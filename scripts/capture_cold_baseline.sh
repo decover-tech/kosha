@@ -41,16 +41,31 @@ port_forward() {
 kcurl() { curl -sf -H "Authorization: Bearer $KOSHA_API_KEY" "$@"; }
 
 search_once() {
+  # Retries on 503 like the real kosha_client does: a cold search against a
+  # big namespace legitimately 503s while hydration converges across
+  # attempts ("incomplete segments" shrinking each round). Cold read from
+  # the client's perspective is therefore retry-until-200 — total wall
+  # across attempts is the number that matters.
   local ns=$1 label=$2
-  local t0 t1
+  local t0 t1 code attempts=0
   t0=$(python3 -c 'import time; print(time.time())')
-  kcurl -X POST "http://127.0.0.1:$LOCAL_PORT/search" \
-    -H 'Content-Type: application/json' \
-    -d "{\"namespace\": \"$ns\", \"query_text\": \"$QUERY_TEXT\", \"max_results\": 10}" \
-    -o /dev/null
+  while :; do
+    attempts=$((attempts + 1))
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 600 \
+      -H "Authorization: Bearer $KOSHA_API_KEY" \
+      -H 'Content-Type: application/json' \
+      -X POST "http://127.0.0.1:$LOCAL_PORT/search" \
+      -d "{\"namespace\": \"$ns\", \"query_text\": \"$QUERY_TEXT\", \"max_results\": 10}")
+    [ "$code" = 200 ] && break
+    if [ "$code" != 503 ] || [ "$attempts" -ge 30 ]; then
+      echo "  $label: giving up — HTTP $code after $attempts attempt(s)" >&2
+      return 1
+    fi
+    sleep 2
+  done
   t1=$(python3 -c 'import time; print(time.time())')
-  printf '  %-12s client wall: %6.0f ms\n' "$label" \
-    "$(python3 -c "print(($t1 - $t0) * 1000)")"
+  printf '  %-12s client wall: %8.0f ms  (%d attempt(s))\n' "$label" \
+    "$(python3 -c "print(($t1 - $t0) * 1000)")" "$attempts"
 }
 
 say "resolving target namespaces"
