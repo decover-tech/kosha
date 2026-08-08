@@ -1576,7 +1576,26 @@ impl SegmentReader {
     pub fn has_local_doc_store(&self) -> bool {
         match &self.doc_store {
             DocStoreAccess::Eager(_) => true,
-            DocStoreAccess::Lazy { doc_store_path, .. } => doc_store_path.exists(),
+            DocStoreAccess::Lazy {
+                doc_store_path,
+                index,
+            } => {
+                // Existence alone is not enough: an interrupted hydration
+                // write can leave a zero-byte or truncated `doc_store.bin`
+                // on disk, and treating it as present makes every
+                // materialize of a doc past the truncation point fail
+                // ("failed to fill whole buffer") forever. The offsets
+                // sidecar knows the exact expected file size — the last
+                // record's end — so validate against it.
+                let expected = index
+                    .entries
+                    .last()
+                    .map(|e| e.offset + e.length as u64)
+                    .unwrap_or(0);
+                std::fs::metadata(doc_store_path)
+                    .map(|m| m.len() >= expected && m.len() > 0)
+                    .unwrap_or(false)
+            }
         }
     }
 
@@ -2784,6 +2803,43 @@ mod tests {
             assert_eq!(meta.doc_seq, i);
         }
         assert!(r.doc_meta(50).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn has_local_doc_store_rejects_truncated_and_empty_files() {
+        // Regression: an interrupted hydration write can leave a zero-byte
+        // or truncated `doc_store.bin` on disk. Existence-as-presence made
+        // the searcher skip the hydrator and fail every materialize of a
+        // doc past the truncation point ("failed to fill whole buffer"),
+        // permanently. The offsets sidecar knows the expected file size —
+        // presence must be validated against it.
+        let dir = std::env::temp_dir().join("kosha-test-doc-store-truncation");
+        write_inverted_fixture(&dir);
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(r.has_local_doc_store(), "intact file must read as present");
+
+        let bin = dir.join("doc_store.bin");
+        let full = fs::read(&bin).unwrap();
+
+        fs::write(&bin, &full[..full.len() / 2]).unwrap();
+        assert!(
+            !r.has_local_doc_store(),
+            "truncated doc_store.bin must read as absent"
+        );
+
+        fs::write(&bin, b"").unwrap();
+        assert!(
+            !r.has_local_doc_store(),
+            "zero-byte doc_store.bin must read as absent"
+        );
+
+        fs::write(&bin, &full).unwrap();
+        assert!(
+            r.has_local_doc_store(),
+            "restored file must read as present again"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -645,11 +645,18 @@ async fn fetch_one(
     path: &str,
 ) -> Result<FetchStats, KoshaError> {
     let local_path = local_root.join(path);
-    if local_path.exists() {
-        return Ok(FetchStats {
-            cached: true,
-            ..Default::default()
-        });
+    // A zero-byte file is never a valid segment artifact — it's the residue
+    // of an interrupted non-atomic write (pre-atomic-rename builds) and must
+    // be refetched, not served as "cached": callers treat existence as
+    // completeness, so serving it poisons every downstream read.
+    match tokio::fs::metadata(&local_path).await {
+        Ok(m) if m.len() > 0 => {
+            return Ok(FetchStats {
+                cached: true,
+                ..Default::default()
+            });
+        }
+        _ => {}
     }
 
     let s3_key = join_s3_key(prefix, path);
@@ -662,10 +669,28 @@ async fn fetch_one(
     if let Some(parent) = local_path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
+    // Write to a uniquely-named temp file and atomically rename into place:
+    // readers must never observe a created-but-unwritten or partially
+    // written file (concurrent searches read these paths the moment they
+    // exist), and a fetch cancelled mid-write must leave nothing behind at
+    // the final path. Unique suffix so two racing fetches of the same file
+    // can't interleave writes into one temp file — both write complete
+    // files, renames are atomic, either winner is valid.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp_path = local_path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let t_write = std::time::Instant::now();
-    tokio::fs::write(&local_path, raw)
-        .await
-        .map_err(KoshaError::Io)?;
+    if let Err(e) = tokio::fs::write(&tmp_path, raw).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(KoshaError::Io(e));
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, &local_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(KoshaError::Io(e));
+    }
     let write_ms = t_write.elapsed().as_secs_f64() * 1e3;
 
     Ok(FetchStats {
