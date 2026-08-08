@@ -960,9 +960,7 @@ impl AppState {
             let ns = NamespaceId(ns_name.clone());
             let (manifest, tombstones) = {
                 let Some(m) = self.indexer.manifest_cloned(&ns) else {
-                    eprintln!(
-                        "warmup: namespace '{ns_name}' not found in control plane; skipping"
-                    );
+                    eprintln!("warmup: namespace '{ns_name}' not found in control plane; skipping");
                     continue;
                 };
                 let t = self.indexer.get_tombstones(&ns);

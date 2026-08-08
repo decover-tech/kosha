@@ -983,8 +983,7 @@ impl Searcher {
         // aggregate decoded-postings memory across all open segments counts
         // toward the admission watermark — the fleet-scale safety the
         // per-segment cap alone couldn't provide.
-        let postings_account: Arc<dyn PostingsMemoryAccount + Send + Sync> =
-            self.ledger.clone();
+        let postings_account: Arc<dyn PostingsMemoryAccount + Send + Sync> = self.ledger.clone();
         let reader = SegmentReader::open_with_footer_options(
             seg_dir,
             load_vectors,

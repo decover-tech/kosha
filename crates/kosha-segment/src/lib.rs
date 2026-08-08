@@ -641,7 +641,10 @@ struct PostingsCacheState {
 const POSTINGS_CACHE_MISS_RING: usize = 256;
 
 impl PostingsCache {
-    fn new(max_bytes: usize, account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>) -> Self {
+    fn new(
+        max_bytes: usize,
+        account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+    ) -> Self {
         Self {
             max_bytes,
             state: Mutex::new(PostingsCacheState::default()),
@@ -1740,7 +1743,9 @@ impl SegmentReader {
             )?));
         }
         if LazyInvertedIndex::detect(&data) {
-            return Ok(InvertedAccess::Lazy(LazyInvertedIndex::from_bytes(data, account)?));
+            return Ok(InvertedAccess::Lazy(LazyInvertedIndex::from_bytes(
+                data, account,
+            )?));
         }
         Ok(InvertedAccess::Eager(Self::parse_legacy_inverted(&data)))
     }

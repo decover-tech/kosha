@@ -638,7 +638,10 @@ async fn fetch_one(
 ) -> Result<FetchStats, KoshaError> {
     let local_path = local_root.join(path);
     if local_path.exists() {
-        return Ok(FetchStats { cached: true, ..Default::default() });
+        return Ok(FetchStats {
+            cached: true,
+            ..Default::default()
+        });
     }
 
     let s3_key = join_s3_key(prefix, path);
@@ -657,7 +660,12 @@ async fn fetch_one(
         .map_err(KoshaError::Io)?;
     let write_ms = t_write.elapsed().as_secs_f64() * 1e3;
 
-    Ok(FetchStats { get_ms, write_ms, bytes: n, cached: false })
+    Ok(FetchStats {
+        get_ms,
+        write_ms,
+        bytes: n,
+        cached: false,
+    })
 }
 
 /// Fetch one exact byte span for [`S3Storage::read_ranges`]: serve it from
