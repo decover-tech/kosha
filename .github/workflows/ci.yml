@@ -73,6 +73,16 @@ jobs:
       - name: Run unit tests
         run: python -m pytest tests/ -q
 
+  # Regression tests for the commit_bench_section.sh hook + amend driver
+  # (scripts/test_commit_bench_section.sh). Uses a cargo shim so no real
+  # cargo bench is invoked — fast and deterministic.
+  bench-hook:
+    name: bench hook tests
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/test_commit_bench_section.sh
+
   # The Dockerfile is a release artifact (deployed as `kosha:latest`) — never
   # let it break on main.
   docker:

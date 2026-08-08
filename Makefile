@@ -9,11 +9,12 @@
 #   make rust-test        — run Rust tests
 #   make rust-build       — build Rust binary
 #   make client-python-test — run Python client unit tests
+#   make bench-hook-test   — run commit_bench_section.sh regression tests
 #   make migration-job-manifest — regen the ES→Kosha staging backfill Job YAML
 #   make all              — lint + gen + build + test
 #
 
-.PHONY: proto-lint proto-gen openapi gen gen/python gen/go rust-test rust-build client-python-test all
+.PHONY: proto-lint proto-gen openapi gen gen/python gen/go rust-test rust-build client-python-test bench-hook-test all
 
 # ── Proto ──────────────────────────────────────────────────────────────────
 
@@ -71,6 +72,11 @@ rust-test:
 
 rust-build:
 	cargo build --release
+
+# ── Bench commit-msg hook tests ─────────────────────────────────────────────
+
+bench-hook-test:
+	bash scripts/test_commit_bench_section.sh
 
 # ── Database ──────────────────────────────────────────────────────────────
 #

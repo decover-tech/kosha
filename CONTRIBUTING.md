@@ -11,7 +11,16 @@ a skeleton and most functionality lands with the implementation plan epics
    up automatically.
 2. Install Docker (for the local MinIO S3 stand-in and image builds).
 3. (Recommended) `pip install pre-commit && pre-commit install` to run the
-   formatting/lint gates on every commit.
+   formatting/lint gates on every commit. The config enables both the
+   `pre-commit` and `prepare-commit-msg` hook types (see
+   `default_install_hook_types` in `.pre-commit-config.yaml`), so the
+   `kosha-bench-commit-msg` hook also wires up — it appends an idempotent
+   `---kosha-bench---` section with the current cold + warm latency from the
+   `segment_memory` microbench to each commit message before it is sealed
+   (see `scripts/commit_bench_section.sh`). The same section is appended in
+   CI by `.github/workflows/pre-commit.yml` (see below). A one-time
+   `pre-commit install --hook-type prepare-commit-msg` is enough on clones
+   that pre-date this option; failures never block the commit.
 
 ## Before opening a PR
 
@@ -22,6 +31,13 @@ All of these are CI gates — run them locally first:
     cargo test --all-features
     make client-python-test      # if you touched clients/python
     docker build -t kosha:ci .   # if you touched the Dockerfile or build config
+
+The `pre-commit` workflow (`.github/workflows/pre-commit.yml`, fires on
+`pull_request`) re-runs the `segment_memory` microbench in CI, amends the PR
+head commit with the same `---kosha-bench---` latency section the local
+hook produces, and force-pushes back to the PR branch. The append is
+idempotent (the workflow no-ops if the markers are already on HEAD), so the
+synchronize re-trigger from its own push terminates after one round.
 
 ## Conventions
 
