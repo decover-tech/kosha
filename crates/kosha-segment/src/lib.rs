@@ -1918,7 +1918,7 @@ mod tests {
             w.add_document(
                 DocumentId(format!("d{i}")),
                 vec![
-                    Field::text("content", &format!("hello world {}", "pad ".repeat(i * 3))),
+                    Field::text("content", format!("hello world {}", "pad ".repeat(i * 3))),
                     Field::keyword("tag", if i % 2 == 0 { "even" } else { "odd" }),
                 ],
             );
