@@ -51,6 +51,7 @@ impl Controller {
             Manifest {
                 version: 0,
                 segments: Vec::new(),
+                segment_footers: Default::default(),
             },
         );
         Ok(())
@@ -65,6 +66,7 @@ impl Controller {
                 Manifest {
                     version: 0,
                     segments: Vec::new(),
+                    segment_footers: Default::default(),
                 },
             );
         }
@@ -222,6 +224,7 @@ mod tests {
                     segment_id: kosha_core::SegmentId("tenant_idx-000000".into()),
                     doc_count: 7,
                 }],
+                segment_footers: Default::default(),
             },
         )
         .unwrap();
@@ -235,6 +238,7 @@ mod tests {
             &Manifest {
                 version: 4,
                 segments: vec![],
+                segment_footers: Default::default(),
             },
         )
         .unwrap();
@@ -257,6 +261,7 @@ mod tests {
                 segment_id: kosha_core::SegmentId("seg-001".into()),
                 doc_count: 10,
             }],
+            segment_footers: Default::default(),
         };
 
         // CAS with version 0 → should succeed (initial version is 0).
@@ -271,6 +276,7 @@ mod tests {
         let manifest_v2 = Manifest {
             version: 2,
             segments: vec![],
+            segment_footers: Default::default(),
         };
         assert!(ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2).is_err());
     }

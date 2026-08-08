@@ -869,6 +869,10 @@ fn decode_postings_bytes(mut buf: &[u8]) -> Option<(Vec<Posting>, usize)> {
     Some((postings, approx_bytes))
 }
 
+/// Cache-miss postings reads pending against one blob: (entry index, term,
+/// offset within the blob, span length, admit-to-cache).
+type PendingBlobReads<'a> = Vec<(usize, &'a str, usize, usize, bool)>;
+
 fn write_postings_varint_delta(out: &mut Vec<u8>, postings: &[Posting]) {
     put_var_u32(out, postings.len() as u32);
     let mut prev_doc_id = 0u32;
@@ -1028,13 +1032,57 @@ impl SplitInvertedIndex {
         Some(arc)
     }
 
+    fn postings_for_terms<'a>(&'a self, terms: &'a [String]) -> Vec<(&'a str, Arc<Vec<Posting>>)> {
+        let mut out = Vec::with_capacity(terms.len());
+        let mut by_blob: HashMap<usize, PendingBlobReads<'a>> = HashMap::new();
+
+        for term in terms {
+            let Some(i) = self.find(term) else {
+                continue;
+            };
+            if let Some(hit) = self.cache.get(i) {
+                out.push((term.as_str(), hit));
+                continue;
+            }
+            let admit = self.cache.admit_on_miss(i);
+            let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
+            by_blob
+                .entry(blob_id)
+                .or_default()
+                .push((i, term.as_str(), p_off, p_len, admit));
+        }
+
+        for (blob_id, spans) in by_blob {
+            let Some(blob) = self.read_posting_blob(blob_id) else {
+                continue;
+            };
+            for (i, term, p_off, p_len, admit) in spans {
+                let Some(p_end) = p_off.checked_add(p_len).filter(|&e| e <= blob.len()) else {
+                    continue;
+                };
+                let decoded = match self.encoding {
+                    SplitPostingsEncoding::Fixed32 => decode_postings_bytes(&blob[p_off..p_end]),
+                    SplitPostingsEncoding::VarintDelta => {
+                        decode_postings_varint_delta_bytes(&blob[p_off..p_end])
+                    }
+                };
+                let Some((postings, approx_bytes)) = decoded else {
+                    continue;
+                };
+                let arc = Arc::new(postings);
+                if admit {
+                    self.cache.insert(i, Arc::clone(&arc), approx_bytes);
+                }
+                out.push((term, arc));
+            }
+        }
+
+        out
+    }
+
     fn decode_postings(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
         let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
-        // Whole-shard read (and, when wrapped, whole-shard decompress) per
-        // cache miss — the PostingsCache amortizes repeat lookups, and the
-        // spans in the TOC refer to the *uncompressed* shard layout.
-        let raw = fs::read(self.segment_dir.join(posting_blob_file_for_id(blob_id))).ok()?;
-        let blob = read_inverted_payload(raw).ok()?;
+        let blob = self.read_posting_blob(blob_id)?;
         let p_end = p_off.checked_add(p_len).filter(|&e| e <= blob.len())?;
         match self.encoding {
             SplitPostingsEncoding::Fixed32 => decode_postings_bytes(&blob[p_off..p_end]),
@@ -1042,6 +1090,12 @@ impl SplitInvertedIndex {
                 decode_postings_varint_delta_bytes(&blob[p_off..p_end])
             }
         }
+    }
+
+    fn read_posting_blob(&self, blob_id: usize) -> Option<Vec<u8>> {
+        // Spans in the TOC refer to the uncompressed shard layout.
+        let raw = fs::read(self.segment_dir.join(posting_blob_file_for_id(blob_id))).ok()?;
+        read_inverted_payload(raw).ok()
     }
 }
 
@@ -1062,6 +1116,30 @@ impl InvertedAccess {
             Self::Eager(map) => map.get(term).map(|v| PostingsRef::Borrowed(v.as_slice())),
             Self::Lazy(lazy) => lazy.postings(term).map(PostingsRef::Shared),
             Self::Split(split) => split.postings(term).map(PostingsRef::Shared),
+        }
+    }
+
+    fn postings_for_terms<'a>(&'a self, terms: &'a [String]) -> Vec<(&'a str, PostingsRef<'a>)> {
+        match self {
+            Self::Eager(map) => terms
+                .iter()
+                .filter_map(|term| {
+                    map.get(term)
+                        .map(|v| (term.as_str(), PostingsRef::Borrowed(v.as_slice())))
+                })
+                .collect(),
+            Self::Lazy(lazy) => terms
+                .iter()
+                .filter_map(|term| {
+                    lazy.postings(term)
+                        .map(|p| (term.as_str(), PostingsRef::Shared(p)))
+                })
+                .collect(),
+            Self::Split(split) => split
+                .postings_for_terms(terms)
+                .into_iter()
+                .map(|(term, p)| (term, PostingsRef::Shared(p)))
+                .collect(),
         }
     }
 
@@ -1222,6 +1300,17 @@ impl SegmentReader {
     /// both for that case is what keeps keyword search latency independent of
     /// embedding volume.
     pub fn open_with_options(segment_dir: PathBuf, load_vectors: bool) -> Result<Self, KoshaError> {
+        Self::open_with_footer_options(segment_dir, load_vectors, None)
+    }
+
+    /// Opens a segment with an already-known footer. Search can source the
+    /// footer from the manifest and avoid hydrating `footer.json` on cold
+    /// S3 reads; non-search callers keep using `open_with_options`.
+    pub fn open_with_footer_options(
+        segment_dir: PathBuf,
+        load_vectors: bool,
+        footer: Option<Footer>,
+    ) -> Result<Self, KoshaError> {
         let (vs, hm) = if load_vectors {
             let vs = Self::read_vectors(&segment_dir)?;
             let hm = build_hnsw(&vs.vectors).map(|(m, _)| m);
@@ -1229,7 +1318,10 @@ impl SegmentReader {
         } else {
             (VectorStore::default(), None)
         };
-        let footer = Self::read_footer(&segment_dir)?;
+        let footer = match footer {
+            Some(footer) => footer,
+            None => Self::read_footer(&segment_dir)?,
+        };
         let doc_store = match try_read_doc_index(&segment_dir, footer.doc_count) {
             Some(index) => DocStoreAccess::Lazy {
                 doc_store_path: segment_dir.join("doc_store.bin"),
@@ -1287,6 +1379,16 @@ impl SegmentReader {
     /// result — don't re-fetch per document.
     pub fn postings(&self, term: &str) -> Option<PostingsRef<'_>> {
         self.inverted.postings(term)
+    }
+
+    /// Fetch postings for a batch of terms. Split-postings segments group
+    /// the batch by posting shard so wildcard expansions read/decompress
+    /// each shard once instead of once per matching term.
+    pub fn postings_for_terms<'a>(
+        &'a self,
+        terms: &'a [String],
+    ) -> Vec<(&'a str, PostingsRef<'a>)> {
+        self.inverted.postings_for_terms(terms)
     }
 
     /// Zero-I/O: `doc_id` + `field_length` for one document, without
@@ -2257,6 +2359,30 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing term {term}"));
             assert_eq!(&*got, postings.as_slice(), "postings mismatch for {term}");
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn postings_for_terms_matches_individual_lookup() {
+        let dir = std::env::temp_dir().join("kosha-test-postings-batch");
+        let expected = write_inverted_fixture(&dir);
+        let r = SegmentReader::open(dir.clone()).unwrap();
+
+        let terms = vec![
+            "quick".to_string(),
+            "brown".to_string(),
+            "missing".to_string(),
+        ];
+        let batch = r.postings_for_terms(&terms);
+        let got: HashMap<&str, Vec<Posting>> = batch
+            .into_iter()
+            .map(|(term, postings)| (term, postings.into_owned()))
+            .collect();
+
+        assert_eq!(got.get("quick"), expected.get("quick"));
+        assert_eq!(got.get("brown"), expected.get("brown"));
+        assert!(!got.contains_key("missing"));
 
         let _ = fs::remove_dir_all(&dir);
     }

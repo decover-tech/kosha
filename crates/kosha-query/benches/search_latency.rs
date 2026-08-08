@@ -77,6 +77,7 @@ fn build_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             segment_id: SegmentId("s1".into()),
             doc_count: HIT_COUNT as u32,
         }],
+        segment_footers: Default::default(),
     };
     (ns, manifest)
 }
@@ -133,6 +134,7 @@ fn build_term_bloom_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
         Manifest {
             version: 1,
             segments: entries,
+            segment_footers: Default::default(),
         },
     )
 }
@@ -177,6 +179,7 @@ fn build_broad_query_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
         Manifest {
             version: 1,
             segments: entries,
+            segment_footers: Default::default(),
         },
     )
 }

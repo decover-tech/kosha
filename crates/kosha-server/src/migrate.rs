@@ -529,6 +529,7 @@ impl Publisher {
             PublishMode::Replace => Manifest {
                 version: existing.version,
                 segments: Vec::new(),
+                segment_footers: Default::default(),
             },
             PublishMode::Append => existing.clone(),
         };
@@ -554,6 +555,9 @@ impl Publisher {
             self.s3.sync_segment_dir(&logical_dir)?;
             self.replacement.version += 1;
             self.replacement.segments.push(entry.clone());
+            if let Some(footer) = manifest.segment_footer(&entry.segment_id).cloned() {
+                self.replacement.remember_segment_footer(footer);
+            }
             self.store.save_manifest(namespace, &self.replacement)?;
             let local_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
             if let Err(error) = std::fs::remove_dir_all(&local_dir) {
@@ -627,6 +631,7 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
         let existing = store.manifest_cloned(&namespace).unwrap_or(Manifest {
             version: 0,
             segments: Vec::new(),
+            segment_footers: Default::default(),
         });
         // Restore to advance segment IDs beyond an existing/partial run.
         // Replace mode: Publisher publishes only this run's segments.

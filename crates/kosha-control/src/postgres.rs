@@ -5,7 +5,9 @@
 //!
 //! Tables live in a `kosha` schema — see `migrations/001_create_kosha_tables.sql`.
 
-use kosha_core::{ControlStore, KoshaError, Manifest, ManifestEntry, NamespaceId, SegmentId};
+use kosha_core::{
+    ControlStore, Footer, KoshaError, Manifest, ManifestEntry, NamespaceId, SegmentId,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
@@ -27,6 +29,8 @@ pub struct PgStore {
 struct SegmentEntry {
     segment_id: String,
     doc_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    footer: Option<Footer>,
 }
 
 impl PgStore {
@@ -215,16 +219,23 @@ impl ControlStore for PgStore {
 
             let (version, segments_json) = row?;
             let entries: Vec<SegmentEntry> = serde_json::from_str(&segments_json).ok()?;
-            Some(Manifest {
+            let mut manifest = Manifest {
                 version: version as u64,
                 segments: entries
-                    .into_iter()
+                    .iter()
                     .map(|e| ManifestEntry {
-                        segment_id: SegmentId(e.segment_id),
+                        segment_id: SegmentId(e.segment_id.clone()),
                         doc_count: e.doc_count,
                     })
                     .collect(),
-            })
+                segment_footers: Default::default(),
+            };
+            for entry in entries {
+                if let Some(footer) = entry.footer {
+                    manifest.remember_segment_footer(footer);
+                }
+            }
+            Some(manifest)
         })
     }
 
@@ -238,6 +249,7 @@ impl ControlStore for PgStore {
                 .map(|s| SegmentEntry {
                     segment_id: s.segment_id.0.clone(),
                     doc_count: s.doc_count,
+                    footer: manifest.segment_footer(&s.segment_id).cloned(),
                 })
                 .collect::<Vec<_>>(),
         )
@@ -283,6 +295,7 @@ impl ControlStore for PgStore {
                 .map(|s| SegmentEntry {
                     segment_id: s.segment_id.0.clone(),
                     doc_count: s.doc_count,
+                    footer: new_manifest.segment_footer(&s.segment_id).cloned(),
                 })
                 .collect::<Vec<_>>(),
         )
