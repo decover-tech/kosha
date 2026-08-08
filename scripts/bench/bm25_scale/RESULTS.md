@@ -268,3 +268,33 @@ convergence signals reproduce the staging structure exactly and iterate in
 locally first: expected post-fix numbers are ~15–30% of today's hydrate MB
 and 4 fewer files per segment, plus `--budget` below working-set size
 flipping from non-convergent to convergent.
+
+---
+
+# Addendum: cold-read optimization results (2026-08-08, full stack deployed)
+
+Scoring-set-only hydration + page-scoped doc-store fetch (#67), the
+resumable offsets-backfill job + `KOSHA_SCORING_HYDRATE_CONCURRENCY=64`
+(#68), and the offsets migration run for every legacy namespace.
+
+| namespace | baseline | scoring-set @ fan-out 16 | + offsets + fan-out 64 | warm |
+|---|---|---|---|---|
+| `white_river_paragraph` (1.17M docs / 59 segs) | impossible — kubelet evicted pods mid-hydration | impossible (legacy fallback: no offsets sidecars in S3) | **60.4 s — first-ever converging cold read** | 0.19 s |
+| `paragraph_index_hnsw` (1.05M docs / 1103 segs) | impossible — 12 GiB budget LRU war | 27.0 s | **18.9 s** | 0.28 s |
+| `paragraph_index_hnsw_v2` (99k docs / 99 segs) | 14.4 s | 11.8 s (legacy fallback) | **4.85 s** — hydrate bytes 2753 → 277 MB (10×) | 0.03 s |
+
+Key phase data for the next optimization round:
+
+- **Cold opens dominate white_river**: Σopen 31.2 s (529 ms/segment — its
+  `filters.bin` is 50 MB/segment, eagerly parsed at open). Next lever:
+  arena doc-id metas + lazy/dictionary-encoded filters.
+- **Page materialization fetches whole doc stores**: white_river
+  materialize = 15.7 s (up to 10 × 295 MB files for a 10-hit page). The
+  offsets sidecar already knows each hit's byte span → ranged GETs.
+- `paragraph_index_hnsw` hydrate 19.2 → 11.2 s from fan-out 64 alone;
+  1103 of its 2024 cold GETs are footers → namespace-level meta object.
+- Legacy-namespace caveat: the scoring-set path only applies where
+  `doc_store.offsets` exists in S3. The backfill route
+  (`POST /v1/admin/backfill-offset-tables`, async/resumable since #68) is
+  the migration tool; run it for any namespace still showing
+  baseline-like cold bytes.
