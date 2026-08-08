@@ -1181,6 +1181,38 @@ impl AppState {
         (files, bytes)
     }
 
+    /// Server half of the [`kosha_query::DocStoreHydrator`] contract: fetch
+    /// each materialize-page hit's exact `doc_store.bin` byte span as an S3
+    /// ranged GET (see `S3Storage::read_ranges`). Index-aligned with
+    /// `spans`; `None` marks a failed fetch (the searcher falls back to a
+    /// local read, surfacing the real error if the file is truly absent).
+    ///
+    /// Deliberately outside the disk cache, hydration leases, and the
+    /// hydration semaphore: span bytes are KBs scoped to one in-flight
+    /// response — never persisted (a partial `doc_store.bin` on disk would
+    /// read as complete to every existence check), and small enough that
+    /// cross-replica dedup would cost more coordination than it saves.
+    #[cfg(feature = "s3")]
+    fn fetch_doc_spans(&self, spans: &[kosha_query::DocSpan]) -> Vec<Option<Vec<u8>>> {
+        let Some(ref s3) = self.s3_storage else {
+            return vec![None; spans.len()];
+        };
+        let ranges: Vec<(String, u64, u32)> = spans
+            .iter()
+            .map(|span| {
+                let logical = span
+                    .segment_dir
+                    .strip_prefix(&self.data_dir)
+                    .map(|rel| format!("{}/doc_store.bin", rel.to_string_lossy()))
+                    // Unstrippable path → empty key → that span fails and
+                    // falls back, same as any other fetch error.
+                    .unwrap_or_default();
+                (logical, span.offset, span.length)
+            })
+            .collect();
+        s3.read_ranges(&ranges, self.scoring_hydrate_concurrency)
+    }
+
     /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs into
     /// the local cache, using cross-replica lease coordination when it's
     /// configured (`hydration_leases`) so a segment cold across the whole
@@ -1377,6 +1409,7 @@ impl AppState {
         let needs_bloom_check = query.filter.is_some() || term_prune.is_some();
         let needs_vectors = query.knn.is_some();
         let needs_filters = query_needs_filter_store(query);
+        let posting_files = posting_blob_files_for_query(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
@@ -1411,6 +1444,10 @@ impl AppState {
         }
         let mut outcome =
             self.ensure_scoring_files_local(&to_hydrate, needs_vectors, needs_filters);
+        let postings_outcome = self.ensure_posting_blobs_local(&to_hydrate, &posting_files);
+        outcome.files_fetched += postings_outcome.files_fetched;
+        outcome.bytes_fetched += postings_outcome.bytes_fetched;
+        outcome.missing.extend(postings_outcome.missing);
         outcome.files_fetched += footer_files;
         outcome.bytes_fetched += footer_bytes;
         outcome
@@ -1566,6 +1603,72 @@ impl AppState {
             .filter(|p| !Self::segment_is_scoring_complete(p, needs_vectors, needs_filters))
             .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
             .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        outcome
+    }
+
+    #[cfg(feature = "s3")]
+    fn ensure_posting_blobs_local(
+        &self,
+        seg_paths: &[PathBuf],
+        posting_files: &[String],
+    ) -> HydrationOutcome {
+        let Some(ref s3) = self.s3_storage else {
+            return HydrationOutcome::default();
+        };
+        if posting_files.is_empty() {
+            return HydrationOutcome::default();
+        }
+
+        let _permit = self.hydration_semaphore.acquire();
+        let mut logical_paths: Vec<(String, u64)> = Vec::new();
+        for seg_path in seg_paths {
+            if !kosha_segment::inverted_uses_posting_blobs(seg_path) {
+                continue;
+            }
+            let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+                continue;
+            };
+            let s3_prefix = rel_path.to_string_lossy();
+            for file_name in posting_files {
+                if !seg_path.join(file_name).exists() {
+                    logical_paths.push((format!("{s3_prefix}/{file_name}"), 0));
+                }
+            }
+        }
+
+        let mut outcome = HydrationOutcome::default();
+        if !logical_paths.is_empty() {
+            println!(
+                "cache miss: hydrating {} posting blob(s) across {} segment(s) (fan-out={})",
+                logical_paths.len(),
+                seg_paths.len(),
+                self.scoring_hydrate_concurrency
+            );
+            self.hydrate_files(s3, &logical_paths, self.scoring_hydrate_concurrency);
+            for (path, _) in &logical_paths {
+                if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
+                    outcome.files_fetched += 1;
+                    outcome.bytes_fetched += m.len();
+                }
+            }
+        }
+
+        outcome.missing = seg_paths
+            .iter()
+            .filter(|seg_path| kosha_segment::inverted_uses_posting_blobs(seg_path))
+            .flat_map(|seg_path| {
+                posting_files.iter().filter_map(move |file_name| {
+                    let path = seg_path.join(file_name);
+                    if path.is_file() {
+                        None
+                    } else {
+                        path.strip_prefix(&self.data_dir)
+                            .ok()
+                            .map(|p| p.to_string_lossy().into_owned())
+                    }
+                })
+            })
             .collect();
         outcome
     }
@@ -2420,22 +2523,28 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     let _slot = state.search_semaphore.acquire();
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
 
-    // On-demand `doc_store.bin` for the materialize page: scoring hydrated
-    // only the offsets sidecar for Lazy segments, so the searcher asks back
-    // for `doc_store.bin` per segment holding a returned hit — bounded by
-    // page size, not manifest size.
+    // Ranged-GET page materialization: scoring hydrated only the offsets
+    // sidecar for Lazy segments, and that sidecar already knows each hit's
+    // exact byte span — so the searcher asks back for just those spans. A
+    // 10-hit page costs ~10 KB-sized ranged GETs instead of up to 10 whole
+    // multi-hundred-MB doc stores, and `doc_store.bin` never lands on disk.
     #[cfg(feature = "s3")]
-    let ensure_doc_store = |segs: &[PathBuf]| {
-        let (files, bytes) = state.ensure_files_local(segs, "doc_store.bin");
-        if files > 0 {
+    let fetch_page_spans = |spans: &[kosha_query::DocSpan]| -> Vec<Option<Vec<u8>>> {
+        let t0 = Instant::now();
+        let results = state.fetch_doc_spans(spans);
+        let fetched = results.iter().flatten().count();
+        let bytes: usize = results.iter().flatten().map(Vec::len).sum();
+        if fetched > 0 {
             println!(
-                "page hydrate: fetched {files} doc store(s) ({:.1} MB)",
-                bytes as f64 / (1024.0 * 1024.0),
+                "page hydrate: {fetched} ranged doc GET(s) ({:.1} KB, {:.1} ms)",
+                bytes as f64 / 1024.0,
+                t0.elapsed().as_secs_f64() * 1e3,
             );
         }
+        results
     };
     #[cfg(feature = "s3")]
-    let doc_store_hydrator: DocStoreHydrator<'_> = Some(&ensure_doc_store);
+    let doc_store_hydrator: DocStoreHydrator<'_> = Some(&fetch_page_spans);
     #[cfg(not(feature = "s3"))]
     let doc_store_hydrator: DocStoreHydrator<'_> = None;
 
@@ -2541,20 +2650,25 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     let _slot = state.search_semaphore.acquire();
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
 
-    // On-demand `doc_store.bin` for the materialize page — see
-    // `handle_search_post` for the rationale.
+    // Ranged-GET page materialization — see `handle_search_post` for the
+    // rationale.
     #[cfg(feature = "s3")]
-    let ensure_doc_store = |segs: &[PathBuf]| {
-        let (files, bytes) = state.ensure_files_local(segs, "doc_store.bin");
-        if files > 0 {
+    let fetch_page_spans = |spans: &[kosha_query::DocSpan]| -> Vec<Option<Vec<u8>>> {
+        let t0 = Instant::now();
+        let results = state.fetch_doc_spans(spans);
+        let fetched = results.iter().flatten().count();
+        let bytes: usize = results.iter().flatten().map(Vec::len).sum();
+        if fetched > 0 {
             println!(
-                "page hydrate: fetched {files} doc store(s) ({:.1} MB)",
-                bytes as f64 / (1024.0 * 1024.0),
+                "page hydrate: {fetched} ranged doc GET(s) ({:.1} KB, {:.1} ms)",
+                bytes as f64 / 1024.0,
+                t0.elapsed().as_secs_f64() * 1e3,
             );
         }
+        results
     };
     #[cfg(feature = "s3")]
-    let doc_store_hydrator: DocStoreHydrator<'_> = Some(&ensure_doc_store);
+    let doc_store_hydrator: DocStoreHydrator<'_> = Some(&fetch_page_spans);
     #[cfg(not(feature = "s3"))]
     let doc_store_hydrator: DocStoreHydrator<'_> = None;
 
@@ -3126,6 +3240,26 @@ fn query_needs_filter_store(query: &SearchQuery) -> bool {
                 .keys()
                 .any(|field| field != "_score" && field != "_id")
         })
+}
+
+#[cfg(feature = "s3")]
+fn posting_blob_files_for_query(query: &SearchQuery) -> Vec<String> {
+    if query.wildcard.is_some() {
+        return kosha_segment::all_posting_blob_files();
+    }
+
+    let mut files = std::collections::HashSet::new();
+    for term in tokenize(&query.query_text) {
+        files.insert(kosha_segment::posting_blob_file_for_term(&term));
+    }
+    if let Some(ref phrase) = query.match_phrase {
+        for term in tokenize(&phrase.phrase) {
+            files.insert(kosha_segment::posting_blob_file_for_term(&term));
+        }
+    }
+    let mut files: Vec<String> = files.into_iter().collect();
+    files.sort();
+    files
 }
 
 /// Error message for a search that can't proceed because hydrating one or

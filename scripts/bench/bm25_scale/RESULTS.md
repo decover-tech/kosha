@@ -268,3 +268,105 @@ convergence signals reproduce the staging structure exactly and iterate in
 locally first: expected post-fix numbers are ~15–30% of today's hydrate MB
 and 4 fewer files per segment, plus `--budget` below working-set size
 flipping from non-convergent to convergent.
+
+---
+
+# Addendum: cold-read optimization results (2026-08-08, full stack deployed)
+
+Scoring-set-only hydration + page-scoped doc-store fetch (#67), the
+resumable offsets-backfill job + `KOSHA_SCORING_HYDRATE_CONCURRENCY=64`
+(#68), and the offsets migration run for every legacy namespace.
+
+| namespace | baseline | scoring-set @ fan-out 16 | + offsets + fan-out 64 | warm |
+|---|---|---|---|---|
+| `white_river_paragraph` (1.17M docs / 59 segs) | impossible — kubelet evicted pods mid-hydration | impossible (legacy fallback: no offsets sidecars in S3) | **60.4 s — first-ever converging cold read** | 0.19 s |
+| `paragraph_index_hnsw` (1.05M docs / 1103 segs) | impossible — 12 GiB budget LRU war | 27.0 s | **18.9 s** | 0.28 s |
+| `paragraph_index_hnsw_v2` (99k docs / 99 segs) | 14.4 s | 11.8 s (legacy fallback) | **4.85 s** — hydrate bytes 2753 → 277 MB (10×) | 0.03 s |
+
+Key phase data for the next optimization round:
+
+- **Cold opens dominate white_river**: Σopen 31.2 s (529 ms/segment — its
+  `filters.bin` is 50 MB/segment, eagerly parsed at open). Next lever:
+  arena doc-id metas + lazy/dictionary-encoded filters.
+- **Page materialization fetches whole doc stores**: white_river
+  materialize = 15.7 s (up to 10 × 295 MB files for a 10-hit page). The
+  offsets sidecar already knows each hit's byte span → ranged GETs.
+- `paragraph_index_hnsw` hydrate 19.2 → 11.2 s from fan-out 64 alone;
+  1103 of its 2024 cold GETs are footers → namespace-level meta object.
+- Legacy-namespace caveat: the scoring-set path only applies where
+  `doc_store.offsets` exists in S3. The backfill route
+  (`POST /v1/admin/backfill-offset-tables`, async/resumable since #68) is
+  the migration tool; run it for any namespace still showing
+  baseline-like cold bytes.
+
+---
+
+# Addendum: ranged-GET page materialization micro-benchmark (2026-08-07)
+
+Backlog item #2 after scoring-set-only hydration shipped: the materialize
+phase still fetched the **whole** `doc_store.bin` for every segment holding
+a page hit (white_river_paragraph: up to 10 × 295 MB for a 10-hit page →
+materialize = 15.7 s, and those bytes also had to fit under the 20 Gi
+ephemeral-storage limit). The offsets sidecar already knows each hit's
+exact byte span, so materialize now asks for just those spans as S3 ranged
+GETs (`Range: bytes=…`), and `doc_store.bin` never lands on disk at all.
+
+Measured with the local loop, fattened so doc stores dominate
+(`--segs 8 --docs 5000 --words 700` → 40k docs ≈ 4.9 KB each, ~24 MB
+doc store/segment, same corpus reused for both builds; query `"the"`,
+`max_results=10`, 3 cold runs each):
+
+| build | cold materialize (3 runs) | bytes fetched at materialize | cold total (median) |
+|---|---|---|---|
+| main @ `2084816` (whole-file) | 561 / 1503 / 2448 ms | ~190 MB (8 doc stores) | 20,987 ms |
+| ranged-GET branch | 29 / 71 / 180 ms | **41.3 KB** (10 ranged GETs) | 16,296 ms |
+
+**Cold materialize: ~21× faster at the median, ~4,600× fewer bytes** — and
+this is against loopback MinIO, which flatters the whole-file baseline;
+against real S3 with 295 MB objects the gap is what separates 15.7 s from
+one parallel round of KB-sized GETs (tens of ms). Just as important for
+white_river_paragraph: the materialize working set no longer includes doc
+stores, so page materialization can't contribute to the
+ephemeral-storage-eviction loop no matter how large the doc stores grow.
+
+**Trade-off (measured):** warm-path materialize was ~1.5–3 ms when the
+cold query left whole doc stores on local disk; it is now 15–115 ms,
+because every page re-fetches its spans remotely (nothing is persisted —
+deliberately, since a partial `doc_store.bin` on disk would read as
+complete to every existence check). Server-side warm total: 5–10 ms →
+18–121 ms locally. If that ever matters for hot namespaces, the follow-up
+is a small in-memory LRU of materialized doc records keyed by
+`(segment, doc_seq)` — not persisting partial files.
+---
+
+# Addendum: cold-read round 3 (2026-08-08 — filters skip, ranged-GET materialize, postings blobs)
+
+Deployed: #70+#72 (lazy filters + skip `filters.bin` hydration for broad
+queries + cache-poisoning fix), #74 (ranged-GET page materialization via
+the offsets sidecar), #75 (inverted postings split into blobs). All rounds
+single-attempt, fully-cold query tier.
+
+| namespace | round 2 | round 3 | phase deltas |
+|---|---|---|---|
+| `white_river_paragraph` | 60.4 s | **6.8 s (9×)** | hydrate 35.5→2.8 s (6075→1241 MB — filters out of the fetch), materialize 15.7→**0.23 s** (ranged-GET, 69×), score 8.5→3.1 s |
+| `paragraph_index_hnsw` | 18.9 s | **13.7 s** | hydrate 11.2→8.7 s (2816→1170 MB), score 7.0→4.4 s, Σopen 11.9→7.1 s |
+| `paragraph_index_hnsw_v2` | 4.85 s | **3.5 s** | bytes 277→118 MB, materialize 1.6→0.16 s |
+
+Cumulative from the original baseline: white_river **impossible → 6.8 s**
+(cold) / 0.2 s (warm); paragraph_index_hnsw **impossible → 13.7 s** /
+0.6 s; v2 **14.4 s → 3.5 s** / 0.12 s.
+
+What the remaining phase data points at, in order:
+
+1. **Per-segment footer GETs are now the dominant file count** — 1103 of
+   `paragraph_index_hnsw`'s 1717 cold GETs (64%) are footers, and even its
+   *warm* hydrate check costs ~400 ms of per-segment stats. A
+   namespace-level `segments.meta` object (blooms + doc counts + format
+   versions, one GET) is the next hydrate lever.
+2. **Compaction** — 1103 segments for 1M docs multiplies every remaining
+   per-segment cost (blocked on the tiered doc-loss bug).
+3. **Postings compression** — remaining scoring-set bytes (1170 MB on
+   `paragraph_index_hnsw`) are mostly postings.
+4. **Residual open cost** — white_river still Σ12 s across 59 opens
+   (~204 ms/seg) with filters lazy; the remaining eager work (inverted
+   blob read + offsets arena parse) is the tail.

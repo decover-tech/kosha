@@ -208,60 +208,74 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// Write `inverted.idx` in the v2 table-of-contents layout (see
+    /// Write `inverted.idx` in the v3 table-of-contents layout (see
     /// [`LazyInvertedIndex`] for the format and why it exists). The legacy
-    /// v1 stream layout is no longer written; readers keep a fallback parse
-    /// for segments already on disk/S3.
+    /// v1 stream layout and inline v2 layout are still readable for
+    /// segments already on disk/S3.
     fn write_inverted_index(&self) -> Result<(), KoshaError> {
         let mut terms: Vec<&String> = self.inverted_index.keys().collect();
         // Sorted term order is load-bearing: the reader binary-searches the
         // term table (see `LazyInvertedIndex::find`).
         terms.sort();
 
-        // Serialize the string pool and postings region first, recording
-        // each term's spans, so the table can be emitted with absolute file
-        // offsets (no region math at decode time).
+        // Serialize the string pool and sharded postings blobs first,
+        // recording each term's spans. Query nodes can then hydrate just
+        // the TOC (`inverted.idx`) plus the query-term shard(s), not every
+        // term's postings in the segment.
         let mut pool: Vec<u8> = Vec::new();
-        let mut postings_buf: Vec<u8> = Vec::new();
-        // (term_off_in_pool, term_len, postings_off_in_region, postings_len)
-        let mut entries: Vec<(u64, u32, u64, u32)> = Vec::with_capacity(terms.len());
+        let mut posting_blobs: Vec<Vec<u8>> =
+            (0..POSTING_BLOB_SHARDS).map(|_| Vec::new()).collect();
+        // (term_off_in_pool, term_len, blob_id, postings_off_in_blob, postings_len)
+        let mut entries: Vec<(u64, u32, u32, u64, u32)> = Vec::with_capacity(terms.len());
         for term_str in &terms {
             let postings = &self.inverted_index[*term_str];
             let term_off = pool.len() as u64;
             pool.extend_from_slice(term_str.as_bytes());
-            let p_off = postings_buf.len() as u64;
-            postings_buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
+            let blob_id = posting_blob_id_for_term(term_str) as u32;
+            let blob = &mut posting_blobs[blob_id as usize];
+            let p_off = blob.len() as u64;
+            blob.extend_from_slice(&(postings.len() as u32).to_le_bytes());
             for posting in postings {
-                postings_buf.extend_from_slice(&posting.doc_id.to_le_bytes());
-                postings_buf.extend_from_slice(&posting.term_frequency.to_le_bytes());
-                postings_buf.extend_from_slice(&(posting.positions.len() as u32).to_le_bytes());
+                blob.extend_from_slice(&posting.doc_id.to_le_bytes());
+                blob.extend_from_slice(&posting.term_frequency.to_le_bytes());
+                blob.extend_from_slice(&(posting.positions.len() as u32).to_le_bytes());
                 for &pos in &posting.positions {
-                    postings_buf.extend_from_slice(&pos.to_le_bytes());
+                    blob.extend_from_slice(&pos.to_le_bytes());
                 }
             }
-            let p_len = (postings_buf.len() as u64 - p_off) as u32;
-            entries.push((term_off, term_str.len() as u32, p_off, p_len));
+            let p_len = (blob.len() as u64 - p_off) as u32;
+            entries.push((term_off, term_str.len() as u32, blob_id, p_off, p_len));
         }
 
-        let table_len = entries.len() as u64 * INVERTED_TABLE_ENTRY_LEN as u64;
+        let table_len = entries.len() as u64 * SPLIT_INVERTED_TABLE_ENTRY_LEN as u64;
         let pool_base = INVERTED_HEADER_LEN as u64 + table_len;
-        let postings_base = pool_base + pool.len() as u64;
 
-        let mut buf = Vec::with_capacity(postings_base as usize + postings_buf.len());
+        let mut buf = Vec::with_capacity(pool_base as usize + pool.len());
         buf.extend_from_slice(&INVERTED_MAGIC.to_le_bytes());
-        buf.extend_from_slice(&INVERTED_VERSION.to_le_bytes());
+        buf.extend_from_slice(&SPLIT_INVERTED_VERSION.to_le_bytes());
         buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        for (term_off, term_len, p_off, p_len) in entries {
+        buf.extend_from_slice(&(POSTING_BLOB_SHARDS as u32).to_le_bytes());
+        for (term_off, term_len, blob_id, p_off, p_len) in entries {
             buf.extend_from_slice(&(pool_base + term_off).to_le_bytes());
             buf.extend_from_slice(&term_len.to_le_bytes());
-            buf.extend_from_slice(&(postings_base + p_off).to_le_bytes());
+            buf.extend_from_slice(&blob_id.to_le_bytes());
+            buf.extend_from_slice(&p_off.to_le_bytes());
             buf.extend_from_slice(&p_len.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
         }
         buf.extend_from_slice(&pool);
-        buf.extend_from_slice(&postings_buf);
+        // TOC and every posting blob are wrapped independently (see
+        // `maybe_compress_inverted`) so the lazy per-shard fetch/decode
+        // semantics are unchanged — each artifact self-describes.
         let encoded = maybe_compress_inverted(&buf);
         self.backend.write("inverted.idx", &encoded)?;
+        for (blob_id, blob) in posting_blobs.into_iter().enumerate() {
+            if !blob.is_empty() {
+                let encoded = maybe_compress_inverted(&blob);
+                self.backend
+                    .write(&posting_blob_file_for_id(blob_id), &encoded)?;
+            }
+        }
         Ok(())
     }
 
@@ -375,11 +389,16 @@ impl SegmentWriter {
 /// this value would require ~1.26 billion distinct terms in one segment, so
 /// the magic doubles as the format discriminator for the read-side fallback.
 pub const INVERTED_MAGIC: u32 = u32::from_le_bytes(*b"KINV");
-/// Current version stamped after the magic. Bump on any layout change.
-pub const INVERTED_VERSION: u32 = 2;
-/// Wrapper magic for a compressed `inverted.idx` payload. The uncompressed
-/// bytes are still the regular v2 `KINV` layout, so existing lazy lookup
-/// code stays unchanged after one cold-open decompression.
+/// Inline-lazy version: table + term pool + postings all in `inverted.idx`.
+const INLINE_INVERTED_VERSION: u32 = 2;
+/// Split version: table + term pool in `inverted.idx`, postings in
+/// `postings-*.bin` shard files.
+pub const SPLIT_INVERTED_VERSION: u32 = 3;
+/// Wrapper magic for a zstd-compressed inverted artifact — applied
+/// independently to the TOC (`inverted.idx`) and to each posting blob
+/// shard, so lazy per-shard fetch/decode is unchanged. The wrapped bytes
+/// are the regular uncompressed layout; one decompression at read
+/// restores them and every downstream code path is oblivious.
 pub const COMPRESSED_INVERTED_MAGIC: u32 = u32::from_le_bytes(*b"KIZC");
 const COMPRESSED_INVERTED_VERSION: u32 = 1;
 const COMPRESSED_INVERTED_HEADER_LEN: usize = 16;
@@ -388,6 +407,42 @@ const INVERTED_COMPRESSION_LEVEL: i32 = 3;
 const INVERTED_HEADER_LEN: usize = 16;
 /// term_off u64 + term_len u32 + postings_off u64 + postings_len u32.
 const INVERTED_TABLE_ENTRY_LEN: usize = 24;
+/// term_off u64 + term_len u32 + blob_id u32 + postings_off u64 +
+/// postings_len u32 + reserved u32.
+const SPLIT_INVERTED_TABLE_ENTRY_LEN: usize = 32;
+pub const POSTING_BLOB_SHARDS: usize = 256;
+
+fn posting_blob_id_for_term(term: &str) -> usize {
+    let mut hash: u32 = 2_166_136_261;
+    for byte in term.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    (hash as usize) % POSTING_BLOB_SHARDS
+}
+
+fn posting_blob_file_for_id(blob_id: usize) -> String {
+    format!("postings-{blob_id:02x}.bin")
+}
+
+pub fn posting_blob_file_for_term(term: &str) -> String {
+    posting_blob_file_for_id(posting_blob_id_for_term(term))
+}
+
+pub fn all_posting_blob_files() -> Vec<String> {
+    (0..POSTING_BLOB_SHARDS)
+        .map(posting_blob_file_for_id)
+        .collect()
+}
+
+pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
+    let Ok(data) = fs::read(segment_dir.join("inverted.idx")) else {
+        return false;
+    };
+    data.len() >= INVERTED_HEADER_LEN
+        && data[0..4] == INVERTED_MAGIC.to_le_bytes()
+        && u32::from_le_bytes(data[4..8].try_into().unwrap()) == SPLIT_INVERTED_VERSION
+}
 
 /// v2 `inverted.idx` layout — a table of contents instead of a stream:
 ///
@@ -421,6 +476,13 @@ pub struct LazyInvertedIndex {
     data: Vec<u8>,
     term_count: usize,
     /// Decoded-postings LRU — see [`PostingsCache`].
+    cache: PostingsCache,
+}
+
+pub struct SplitInvertedIndex {
+    data: Vec<u8>,
+    segment_dir: PathBuf,
+    term_count: usize,
     cache: PostingsCache,
 }
 
@@ -646,7 +708,7 @@ impl LazyInvertedIndex {
             return Err(corrupt("missing v2 magic"));
         }
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != INVERTED_VERSION {
+        if version != INLINE_INVERTED_VERSION {
             return Err(corrupt(&format!("unsupported version {version}")));
         }
         let term_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
@@ -751,29 +813,148 @@ impl LazyInvertedIndex {
     /// scoring thread.
     fn decode_postings(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
         let (_, _, p_off, p_len) = self.raw_entry(i);
-        let mut buf = &self.data[p_off..p_off + p_len];
-        let count = take_u32(&mut buf)? as usize;
-        // Guard Vec::with_capacity against a corrupt count: a posting is at
-        // least 12 bytes, so cap by what the span could physically hold.
-        let mut postings = Vec::with_capacity(count.min(buf.len() / 12 + 1));
-        let mut position_count = 0usize;
-        for _ in 0..count {
-            let doc_id = take_u32(&mut buf)?;
-            let term_frequency = take_u32(&mut buf)?;
-            let npos = take_u32(&mut buf)? as usize;
-            let mut positions = Vec::with_capacity(npos.min(buf.len() / 4 + 1));
-            for _ in 0..npos {
-                positions.push(take_u32(&mut buf)?);
-            }
-            position_count += positions.len();
-            postings.push(Posting {
-                doc_id,
-                term_frequency,
-                positions,
-            });
+        decode_postings_bytes(&self.data[p_off..p_off + p_len])
+    }
+}
+
+fn decode_postings_bytes(mut buf: &[u8]) -> Option<(Vec<Posting>, usize)> {
+    let count = take_u32(&mut buf)? as usize;
+    // Guard Vec::with_capacity against a corrupt count: a posting is at
+    // least 12 bytes, so cap by what the span could physically hold.
+    let mut postings = Vec::with_capacity(count.min(buf.len() / 12 + 1));
+    let mut position_count = 0usize;
+    for _ in 0..count {
+        let doc_id = take_u32(&mut buf)?;
+        let term_frequency = take_u32(&mut buf)?;
+        let npos = take_u32(&mut buf)? as usize;
+        let mut positions = Vec::with_capacity(npos.min(buf.len() / 4 + 1));
+        for _ in 0..npos {
+            positions.push(take_u32(&mut buf)?);
         }
-        let approx_bytes = postings.len() * std::mem::size_of::<Posting>() + position_count * 4;
-        Some((postings, approx_bytes))
+        position_count += positions.len();
+        postings.push(Posting {
+            doc_id,
+            term_frequency,
+            positions,
+        });
+    }
+    let approx_bytes = postings.len() * std::mem::size_of::<Posting>() + position_count * 4;
+    Some((postings, approx_bytes))
+}
+
+impl SplitInvertedIndex {
+    fn detect(data: &[u8]) -> bool {
+        data.len() >= INVERTED_HEADER_LEN
+            && data[0..4] == INVERTED_MAGIC.to_le_bytes()
+            && u32::from_le_bytes(data[4..8].try_into().unwrap()) == SPLIT_INVERTED_VERSION
+    }
+
+    fn from_bytes(data: Vec<u8>, segment_dir: PathBuf) -> Result<Self, KoshaError> {
+        let corrupt = |msg: &str| KoshaError::CorruptSegment(format!("split inverted.idx: {msg}"));
+        if !Self::detect(&data) {
+            return Err(corrupt("missing split v3 header"));
+        }
+        let term_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let shard_count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+        if shard_count != POSTING_BLOB_SHARDS {
+            return Err(corrupt(&format!("unsupported shard count {shard_count}")));
+        }
+        let table_end = INVERTED_HEADER_LEN
+            .checked_add(
+                term_count
+                    .checked_mul(SPLIT_INVERTED_TABLE_ENTRY_LEN)
+                    .ok_or_else(|| corrupt("term table length overflows"))?,
+            )
+            .ok_or_else(|| corrupt("term table length overflows"))?;
+        if table_end > data.len() {
+            return Err(corrupt("term table extends past end of file"));
+        }
+        let index = Self {
+            data,
+            segment_dir,
+            term_count,
+            cache: PostingsCache::new(postings_cache_max_bytes()),
+        };
+        for i in 0..term_count {
+            let (term_off, term_len, blob_id, _, _) = index.raw_entry(i);
+            if blob_id >= POSTING_BLOB_SHARDS {
+                return Err(corrupt(&format!("table entry {i} has invalid blob id")));
+            }
+            let Some(term_end) = term_off
+                .checked_add(term_len)
+                .filter(|&e| e <= index.data.len())
+            else {
+                return Err(corrupt(&format!("table entry {i} term out of bounds")));
+            };
+            if std::str::from_utf8(&index.data[term_off..term_end]).is_err() {
+                return Err(corrupt(&format!("table entry {i} term is not UTF-8")));
+            }
+        }
+        Ok(index)
+    }
+
+    fn raw_entry(&self, i: usize) -> (usize, usize, usize, usize, usize) {
+        let base = INVERTED_HEADER_LEN + i * SPLIT_INVERTED_TABLE_ENTRY_LEN;
+        let e = &self.data[base..base + SPLIT_INVERTED_TABLE_ENTRY_LEN];
+        (
+            u64::from_le_bytes(e[0..8].try_into().unwrap()) as usize,
+            u32::from_le_bytes(e[8..12].try_into().unwrap()) as usize,
+            u32::from_le_bytes(e[12..16].try_into().unwrap()) as usize,
+            u64::from_le_bytes(e[16..24].try_into().unwrap()) as usize,
+            u32::from_le_bytes(e[24..28].try_into().unwrap()) as usize,
+        )
+    }
+
+    fn term_at(&self, i: usize) -> &str {
+        let (off, len, _, _, _) = self.raw_entry(i);
+        std::str::from_utf8(&self.data[off..off + len]).unwrap_or_default()
+    }
+
+    fn find(&self, term: &str) -> Option<usize> {
+        let mut lo = 0usize;
+        let mut hi = self.term_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.term_at(mid).cmp(term) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
+    }
+
+    fn contains_term(&self, term: &str) -> bool {
+        self.find(term).is_some()
+    }
+
+    fn all_terms(&self) -> Vec<&str> {
+        (0..self.term_count).map(|i| self.term_at(i)).collect()
+    }
+
+    fn postings(&self, term: &str) -> Option<Arc<Vec<Posting>>> {
+        let i = self.find(term)?;
+        if let Some(hit) = self.cache.get(i) {
+            return Some(hit);
+        }
+        let admit = self.cache.admit_on_miss(i);
+        let (postings, approx_bytes) = self.decode_postings(i)?;
+        let arc = Arc::new(postings);
+        if admit {
+            self.cache.insert(i, Arc::clone(&arc), approx_bytes);
+        }
+        Some(arc)
+    }
+
+    fn decode_postings(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
+        let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
+        // Whole-shard read (and, when wrapped, whole-shard decompress) per
+        // cache miss — the PostingsCache amortizes repeat lookups, and the
+        // spans in the TOC refer to the *uncompressed* shard layout.
+        let raw = fs::read(self.segment_dir.join(posting_blob_file_for_id(blob_id))).ok()?;
+        let blob = read_inverted_payload(raw).ok()?;
+        let p_end = p_off.checked_add(p_len).filter(|&e| e <= blob.len())?;
+        decode_postings_bytes(&blob[p_off..p_end])
     }
 }
 
@@ -784,6 +965,7 @@ impl LazyInvertedIndex {
 /// segment paid before this change. Mirrors [`DocStoreAccess`].
 enum InvertedAccess {
     Lazy(LazyInvertedIndex),
+    Split(SplitInvertedIndex),
     Eager(HashMap<String, Vec<Posting>>),
 }
 
@@ -792,6 +974,7 @@ impl InvertedAccess {
         match self {
             Self::Eager(map) => map.get(term).map(|v| PostingsRef::Borrowed(v.as_slice())),
             Self::Lazy(lazy) => lazy.postings(term).map(PostingsRef::Shared),
+            Self::Split(split) => split.postings(term).map(PostingsRef::Shared),
         }
     }
 
@@ -799,6 +982,7 @@ impl InvertedAccess {
         match self {
             Self::Eager(map) => map.contains_key(term),
             Self::Lazy(lazy) => lazy.contains_term(term),
+            Self::Split(split) => split.contains_term(term),
         }
     }
 
@@ -811,6 +995,7 @@ impl InvertedAccess {
             }
             // The v2 table is written in sorted order — no sort needed.
             Self::Lazy(lazy) => lazy.all_terms(),
+            Self::Split(split) => split.all_terms(),
         }
     }
 }
@@ -888,14 +1073,37 @@ pub struct DocMetaRef<'a> {
 /// the parsed form is an additional cost paid only by segments whose
 /// filters are actually exercised.
 struct LazyFilters {
-    raw: Vec<u8>,
+    segment_dir: PathBuf,
     parsed: OnceLock<FilterStore>,
 }
 
 impl LazyFilters {
+    /// Read + parse `filters.bin` on first use — from disk *at use time*,
+    /// not from bytes captured at open. This matters under filters-skipping
+    /// hydration: a broad query can open (and cache) a segment while
+    /// `filters.bin` isn't local yet; a later filtered query hydrates the
+    /// file and then hits the *cached* reader — snapshotting raw bytes at
+    /// open would have frozen that reader's filters as empty forever,
+    /// silently matching nothing. Reading at use time sees the
+    /// now-hydrated file. (It also means broad queries keep zero filter
+    /// bytes resident.)
     fn get(&self) -> &FilterStore {
-        self.parsed
-            .get_or_init(|| SegmentReader::parse_filters(&self.raw))
+        self.parsed.get_or_init(|| {
+            let raw = SegmentReader::read_filters_raw(&self.segment_dir);
+            if raw.is_empty() {
+                // The writer always emits filters.bin (even with zero
+                // fields, the header is present) — an empty read here
+                // means the file isn't local, i.e. a hydration/eviction
+                // gap, not a segment without filters. Parse yields an
+                // empty store either way; make the abnormal case loud
+                // instead of silently matching nothing.
+                eprintln!(
+                    "WARN: filters.bin missing/empty at first use for {} —                      filtered queries against this segment will match nothing                      until it is re-opened with the file present",
+                    self.segment_dir.display()
+                );
+            }
+            SegmentReader::parse_filters(&raw)
+        })
     }
 }
 
@@ -948,7 +1156,7 @@ impl SegmentReader {
             doc_store,
             inverted: Self::read_inverted(&segment_dir)?,
             filters: LazyFilters {
-                raw: Self::read_filters_raw(&segment_dir),
+                segment_dir: segment_dir.clone(),
                 parsed: OnceLock::new(),
             },
             vector_store: vs,
@@ -1037,6 +1245,55 @@ impl SegmentReader {
                 Ok(Some(parse_one_doc_record(&mut cursor, doc_seq)))
             }
         }
+    }
+
+    /// The document's exact byte span within `doc_store.bin`, from the
+    /// offsets sidecar — `None` for out-of-range `doc_seq` or `Eager`
+    /// (legacy) segments, whose records are already fully resident. This is
+    /// what lets a remote store serve one document with a ranged read of
+    /// `length` bytes instead of shipping the whole doc store.
+    pub fn doc_span(&self, doc_seq: u32) -> Option<(u64, u32)> {
+        match &self.doc_store {
+            DocStoreAccess::Eager(_) => None,
+            DocStoreAccess::Lazy { index, .. } => {
+                let entry = index.entries.get(doc_seq as usize)?;
+                Some((entry.offset, entry.length))
+            }
+        }
+    }
+
+    /// Whether `doc_record_full` can be served without any remote fetch:
+    /// `Eager` segments hold every record in memory; `Lazy` segments need
+    /// `doc_store.bin` present on local disk.
+    pub fn has_local_doc_store(&self) -> bool {
+        match &self.doc_store {
+            DocStoreAccess::Eager(_) => true,
+            DocStoreAccess::Lazy { doc_store_path, .. } => doc_store_path.exists(),
+        }
+    }
+
+    /// Parse one document's full record from bytes fetched elsewhere — the
+    /// remote-ranged-read counterpart of `doc_record_full`. `bytes` must be
+    /// exactly the span [`Self::doc_span`] reported for this `doc_seq`
+    /// (checked: a wrong-length buffer means the caller fetched the wrong
+    /// range, and a "successful" parse of it would be garbage).
+    pub fn doc_record_from_bytes(
+        &self,
+        doc_seq: u32,
+        bytes: &[u8],
+    ) -> Result<Option<DocRecord>, KoshaError> {
+        let Some((_, length)) = self.doc_span(doc_seq) else {
+            return Ok(None);
+        };
+        if bytes.len() != length as usize {
+            return Err(KoshaError::NotFound(format!(
+                "doc_seq {doc_seq} span is {length} bytes but caller supplied {} in segment {:?}",
+                bytes.len(),
+                self.segment_dir
+            )));
+        }
+        let mut cursor = bytes;
+        Ok(Some(parse_one_doc_record(&mut cursor, doc_seq)))
     }
 
     /// Iterate every document's zero-I/O metadata (`doc_id`/`field_length`)
@@ -1195,6 +1452,12 @@ impl SegmentReader {
     /// segment paid before v2 existed.
     fn read_inverted(segment_dir: &Path) -> Result<InvertedAccess, KoshaError> {
         let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
+        if SplitInvertedIndex::detect(&data) {
+            return Ok(InvertedAccess::Split(SplitInvertedIndex::from_bytes(
+                data,
+                segment_dir.to_path_buf(),
+            )?));
+        }
         if LazyInvertedIndex::detect(&data) {
             return Ok(InvertedAccess::Lazy(LazyInvertedIndex::from_bytes(data)?));
         }
@@ -1648,6 +1911,50 @@ mod tests {
         buf
     }
 
+    fn serialize_inline_v2_inverted(index: &HashMap<String, Vec<Posting>>) -> Vec<u8> {
+        let mut terms: Vec<&String> = index.keys().collect();
+        terms.sort();
+
+        let mut pool: Vec<u8> = Vec::new();
+        let mut postings_buf: Vec<u8> = Vec::new();
+        let mut entries: Vec<(u64, u32, u64, u32)> = Vec::with_capacity(terms.len());
+        for term_str in &terms {
+            let postings = &index[*term_str];
+            let term_off = pool.len() as u64;
+            pool.extend_from_slice(term_str.as_bytes());
+            let p_off = postings_buf.len() as u64;
+            postings_buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
+            for posting in postings {
+                postings_buf.extend_from_slice(&posting.doc_id.to_le_bytes());
+                postings_buf.extend_from_slice(&posting.term_frequency.to_le_bytes());
+                postings_buf.extend_from_slice(&(posting.positions.len() as u32).to_le_bytes());
+                for &pos in &posting.positions {
+                    postings_buf.extend_from_slice(&pos.to_le_bytes());
+                }
+            }
+            let p_len = (postings_buf.len() as u64 - p_off) as u32;
+            entries.push((term_off, term_str.len() as u32, p_off, p_len));
+        }
+
+        let table_len = entries.len() as u64 * INVERTED_TABLE_ENTRY_LEN as u64;
+        let pool_base = INVERTED_HEADER_LEN as u64 + table_len;
+        let postings_base = pool_base + pool.len() as u64;
+        let mut buf = Vec::with_capacity(postings_base as usize + postings_buf.len());
+        buf.extend_from_slice(&INVERTED_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&INLINE_INVERTED_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        for (term_off, term_len, p_off, p_len) in entries {
+            buf.extend_from_slice(&(pool_base + term_off).to_le_bytes());
+            buf.extend_from_slice(&term_len.to_le_bytes());
+            buf.extend_from_slice(&(postings_base + p_off).to_le_bytes());
+            buf.extend_from_slice(&p_len.to_le_bytes());
+        }
+        buf.extend_from_slice(&pool);
+        buf.extend_from_slice(&postings_buf);
+        buf
+    }
+
     /// Build a two-doc segment and return (dir, the writer's in-memory
     /// inverted index captured before finalize) for fidelity comparisons.
     fn write_inverted_fixture(dir: &Path) -> HashMap<String, Vec<Posting>> {
@@ -1667,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_lazy_inverted_roundtrips_identically_to_writer_state() {
+    fn split_inverted_roundtrips_identically_to_writer_state() {
         // The lazy on-demand decode must return byte-for-byte the same
         // postings (doc ids, tfs, positions, order) the writer held in
         // memory — for every term, plus sorted all_terms and negative
@@ -1675,17 +1982,17 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-inverted-v2-roundtrip");
         let expected = write_inverted_fixture(&dir);
 
-        // Sanity: the file on disk really is v2.
+        // Sanity: the file on disk really is split v3.
         let raw = fs::read(dir.join("inverted.idx")).unwrap();
         assert!(
-            LazyInvertedIndex::detect(&raw),
-            "writer should emit the v2 magic-prefixed layout"
+            SplitInvertedIndex::detect(&raw),
+            "writer should emit the split v3 magic-prefixed layout"
         );
 
         let r = SegmentReader::open(dir.clone()).unwrap();
         assert!(
-            matches!(r.inverted, InvertedAccess::Lazy(_)),
-            "v2 file must open on the lazy path"
+            matches!(r.inverted, InvertedAccess::Split(_)),
+            "split v3 file must open on the split lazy path"
         );
         for (term, postings) in &expected {
             let got = r
@@ -1704,26 +2011,61 @@ mod tests {
     }
 
     #[test]
-    fn compressed_v2_inverted_roundtrips_through_lazy_reader() {
-        let dir = std::env::temp_dir().join("kosha-test-inverted-v2-compressed");
+    fn inline_v2_inverted_still_opens_via_lazy_fallback() {
+        let dir = std::env::temp_dir().join("kosha-test-inverted-v2-fallback");
         let expected = write_inverted_fixture(&dir);
 
-        let raw = fs::read(dir.join("inverted.idx")).unwrap();
-        assert!(
-            LazyInvertedIndex::detect(&raw),
-            "fixture starts as an uncompressed v2 payload"
-        );
-        let compressed = zstd::bulk::compress(&raw, INVERTED_COMPRESSION_LEVEL).unwrap();
         fs::write(
             dir.join("inverted.idx"),
-            wrap_compressed_inverted(raw.len(), &compressed),
+            serialize_inline_v2_inverted(&expected),
         )
         .unwrap();
 
         let r = SegmentReader::open(dir.clone()).unwrap();
         assert!(
             matches!(r.inverted, InvertedAccess::Lazy(_)),
-            "compressed v2 wrapper must unwrap onto the lazy path"
+            "inline v2 file must still open on the lazy fallback path"
+        );
+        for (term, postings) in &expected {
+            let got = r
+                .postings(term)
+                .unwrap_or_else(|| panic!("missing term {term}"));
+            assert_eq!(&*got, postings.as_slice(), "postings mismatch for {term}");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compressed_toc_and_blobs_roundtrip_through_split_reader() {
+        // The zstd wrapper applies independently to the TOC and to each
+        // posting blob shard; the reader must unwrap both transparently
+        // and serve identical postings.
+        let dir = std::env::temp_dir().join("kosha-test-inverted-compressed");
+        let expected = write_inverted_fixture(&dir);
+
+        // Force-wrap every artifact, bypassing maybe_compress_inverted's
+        // small-file threshold so tiny fixtures still exercise the path.
+        let mut wrapped = 0;
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name == "inverted.idx" || name.starts_with("postings-") {
+                let raw = fs::read(&path).unwrap();
+                let compressed = zstd::bulk::compress(&raw, INVERTED_COMPRESSION_LEVEL).unwrap();
+                fs::write(&path, wrap_compressed_inverted(raw.len(), &compressed)).unwrap();
+                wrapped += 1;
+            }
+        }
+        assert!(
+            wrapped >= 2,
+            "fixture must have a TOC and at least one blob"
+        );
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(
+            matches!(r.inverted, InvertedAccess::Split(_)),
+            "compressed TOC must unwrap onto the split path"
         );
         for (term, postings) in &expected {
             let got = r
@@ -1855,6 +2197,11 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-inverted-v2-bad-postings");
         let expected = write_inverted_fixture(&dir);
 
+        fs::write(
+            dir.join("inverted.idx"),
+            serialize_inline_v2_inverted(&expected),
+        )
+        .unwrap();
         let mut raw = fs::read(dir.join("inverted.idx")).unwrap();
         // Corrupt the first postings blob's count field to a huge value the
         // span can't physically hold. The first table entry's postings_off
@@ -1913,6 +2260,43 @@ mod tests {
     }
 
     #[test]
+    fn cached_reader_sees_filters_hydrated_after_open() {
+        // Regression for the filters-skipping-hydration composition bug: a
+        // broad query opens (and caches) a segment while filters.bin isn't
+        // local; a later filtered query hydrates the file and reuses the
+        // cached reader. Snapshotting filters.bin's bytes at open would
+        // freeze that reader's filters as empty forever — silently matching
+        // nothing. The reader must read the file at first *use* instead.
+        let dir = std::env::temp_dir().join("kosha-test-filters-hydrated-late");
+        let _ = fs::remove_dir_all(&dir);
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![
+                Field::text("t", "hello world"),
+                Field::keyword("tag", "alpha"),
+            ],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        // Simulate scoring-only hydration: filters.bin not local at open.
+        let stash = dir.join("filters.bin.stash");
+        fs::rename(dir.join("filters.bin"), &stash).unwrap();
+        let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(r.filters.parsed.get().is_none());
+
+        // "Hydrate" the file, then use the SAME (cached) reader.
+        fs::rename(&stash, dir.join("filters.bin")).unwrap();
+        let store = r.filter_store();
+        assert!(
+            store.string_fields.contains_key("tag"),
+            "cached reader must see filters.bin hydrated after it was opened"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn doc_meta_ids_come_from_the_arena_correctly() {
         // The offsets sidecar's per-doc ids live in one contiguous pool —
         // every doc's id must slice back out exactly, in order.
@@ -1938,6 +2322,79 @@ mod tests {
             assert_eq!(meta.doc_seq, i);
         }
         assert!(r.doc_meta(50).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doc_span_bytes_parse_identically_to_local_reads() {
+        // The ranged-read contract: for every doc, slicing exactly
+        // `doc_span` out of `doc_store.bin` and parsing it via
+        // `doc_record_from_bytes` must equal `doc_record_full`'s local
+        // read — this is what page materialization fetches over a ranged
+        // S3 GET instead of the whole doc store.
+        let dir = std::env::temp_dir().join("kosha-test-doc-span-ranged");
+        let _ = fs::remove_dir_all(&dir);
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        for i in 0..20 {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![
+                    Field::text("content", format!("hello world {}", "pad ".repeat(i * 3))),
+                    Field::keyword("tag", if i % 2 == 0 { "even" } else { "odd" }),
+                ],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(matches!(r.doc_store, DocStoreAccess::Lazy { .. }));
+        assert!(r.has_local_doc_store());
+
+        let store = fs::read(dir.join("doc_store.bin")).unwrap();
+        let mut spans = Vec::new();
+        for i in 0..20u32 {
+            let (offset, length) = r.doc_span(i).unwrap();
+            let bytes = &store[offset as usize..(offset + length as u64) as usize];
+            spans.push((i, bytes.to_vec()));
+            let from_bytes = r.doc_record_from_bytes(i, bytes).unwrap().unwrap();
+            let from_disk = r.doc_record_full(i).unwrap().unwrap();
+            assert_eq!(from_bytes.doc_id, from_disk.doc_id);
+            assert_eq!(from_bytes.field_length, from_disk.field_length);
+            assert_eq!(from_bytes.fields.len(), from_disk.fields.len());
+            for (a, b) in from_bytes.fields.iter().zip(from_disk.fields.iter()) {
+                assert_eq!(a.name, b.name);
+                assert_eq!(a.value, b.value);
+                assert_eq!(a.field_type, b.field_type);
+            }
+        }
+        assert!(r.doc_span(20).is_none(), "out-of-range doc_seq");
+
+        // Wrong-length buffer = wrong range fetched — must error, not parse
+        // garbage.
+        let (_, len0) = r.doc_span(0).unwrap();
+        assert!(r
+            .doc_record_from_bytes(0, &store[..len0 as usize + 1])
+            .is_err());
+
+        // With doc_store.bin gone (scoring-set-only hydration), the reader
+        // knows it can't serve locally, but remotely-fetched span bytes
+        // still materialize every doc.
+        fs::remove_file(dir.join("doc_store.bin")).unwrap();
+        assert!(!r.has_local_doc_store());
+        for (i, bytes) in &spans {
+            let rec = r.doc_record_from_bytes(*i, bytes).unwrap().unwrap();
+            assert_eq!(rec.doc_id.0, format!("d{i}"));
+        }
+
+        // Legacy Eager open (no offsets sidecar): spans don't exist, but
+        // records are fully resident so no remote fetch is ever needed.
+        fs::write(dir.join("doc_store.bin"), &store).unwrap();
+        fs::remove_file(dir.join("doc_store.offsets")).unwrap();
+        let legacy = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(matches!(legacy.doc_store, DocStoreAccess::Eager(_)));
+        assert!(legacy.doc_span(0).is_none());
+        assert!(legacy.has_local_doc_store());
 
         let _ = fs::remove_dir_all(&dir);
     }
