@@ -431,14 +431,42 @@ pub fn all_posting_blob_files() -> Vec<String> {
 }
 
 pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
-    let Ok(data) = fs::read(segment_dir.join("inverted.idx")) else {
+    let Some(header) = read_inverted_header(&segment_dir.join("inverted.idx")) else {
         return false;
     };
-    if data.len() < INVERTED_HEADER_LEN || data[0..4] != INVERTED_MAGIC.to_le_bytes() {
+    if header[0..4] != INVERTED_MAGIC.to_le_bytes() {
         return false;
     }
-    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
     version == FIXED_SPLIT_INVERTED_VERSION || version == SPLIT_INVERTED_VERSION
+}
+
+/// First [`INVERTED_HEADER_LEN`] bytes of the *logical* (uncompressed)
+/// inverted TOC. Raw files are read directly; KIZC-wrapped files
+/// stream-decode only enough of the zstd frame to fill the header. The
+/// hydration path calls this per segment per search to decide whether
+/// `postings-*.bin` shards must be fetched, so it must never pay a
+/// whole-file read or decompress — treating the wrapper as "not a split
+/// index" here is what silently skipped posting-blob hydration and scored
+/// compressed cold segments to zero hits.
+fn read_inverted_header(path: &Path) -> Option<[u8; INVERTED_HEADER_LEN]> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).ok()?;
+    let mut outer = [0u8; COMPRESSED_INVERTED_HEADER_LEN];
+    file.read_exact(&mut outer).ok()?;
+    if outer[0..4] != COMPRESSED_INVERTED_MAGIC.to_le_bytes() {
+        let mut header = [0u8; INVERTED_HEADER_LEN];
+        header.copy_from_slice(&outer[..INVERTED_HEADER_LEN]);
+        return Some(header);
+    }
+    if u32::from_le_bytes(outer[4..8].try_into().unwrap()) != COMPRESSED_INVERTED_VERSION {
+        return None;
+    }
+    let mut header = [0u8; INVERTED_HEADER_LEN];
+    let mut decoder = zstd::stream::read::Decoder::new(file).ok()?;
+    decoder.read_exact(&mut header).ok()?;
+    Some(header)
 }
 
 /// v2 `inverted.idx` layout — a table of contents instead of a stream:
@@ -2359,6 +2387,33 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing term {term}"));
             assert_eq!(&*got, postings.as_slice(), "postings mismatch for {term}");
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn posting_blob_gate_detects_compressed_toc() {
+        // Regression: the server's hydration path asks
+        // `inverted_uses_posting_blobs` before fetching `postings-*.bin`
+        // from object storage, and filters its missing-file guard on the
+        // same answer. A KIZC-wrapped TOC must still read as a split
+        // index — returning false made hydration skip every posting blob
+        // and cold searches silently scored zero hits.
+        let dir = std::env::temp_dir().join("kosha-test-posting-blob-gate");
+        write_inverted_fixture(&dir);
+        assert!(
+            inverted_uses_posting_blobs(&dir),
+            "raw split TOC must be detected"
+        );
+
+        let path = dir.join("inverted.idx");
+        let raw = fs::read(&path).unwrap();
+        let compressed = zstd::bulk::compress(&raw, INVERTED_COMPRESSION_LEVEL).unwrap();
+        fs::write(&path, wrap_compressed_inverted(raw.len(), &compressed)).unwrap();
+        assert!(
+            inverted_uses_posting_blobs(&dir),
+            "KIZC-wrapped split TOC must be detected"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
