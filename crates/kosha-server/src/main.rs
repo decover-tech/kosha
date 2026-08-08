@@ -1353,7 +1353,7 @@ impl AppState {
 
         let mut logical_paths: Vec<(String, u64)> = Vec::new();
         for seg_path in seg_paths {
-            if seg_path.join(file_name).exists() {
+            if file_present_nonempty(&seg_path.join(file_name)) {
                 continue;
             }
             let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
@@ -1660,21 +1660,21 @@ impl AppState {
         needs_filters: bool,
         has_manifest_footer: bool,
     ) -> bool {
-        if !has_manifest_footer && !seg_path.join("footer.json").is_file() {
+        if !has_manifest_footer && !file_present_nonempty(&seg_path.join("footer.json")) {
             return false;
         }
-        if !seg_path.join("inverted.idx").is_file() {
+        if !file_present_nonempty(&seg_path.join("inverted.idx")) {
             return false;
         }
-        if needs_filters && !seg_path.join("filters.bin").is_file() {
+        if needs_filters && !file_present_nonempty(&seg_path.join("filters.bin")) {
             return false;
         }
-        let doc_access_ok = seg_path.join("doc_store.offsets").is_file()
-            || seg_path.join("doc_store.bin").is_file();
+        let doc_access_ok = file_present_nonempty(&seg_path.join("doc_store.offsets"))
+            || file_present_nonempty(&seg_path.join("doc_store.bin"));
         if !doc_access_ok {
             return false;
         }
-        if needs_vectors && !seg_path.join("vector.idx").is_file() {
+        if needs_vectors && !file_present_nonempty(&seg_path.join("vector.idx")) {
             return false;
         }
         true
@@ -1734,14 +1734,14 @@ impl AppState {
                 // `footer.json` is needed only for legacy manifests that do
                 // not carry a footer snapshot.
                 if !paths_with_manifest_footer.contains(seg_path)
-                    && !seg_path.join("footer.json").exists()
+                    && !file_present_nonempty(&seg_path.join("footer.json"))
                 {
                     logical_paths.push((format!("{s3_prefix}/footer.json"), 0));
                 }
-                if !seg_path.join("inverted.idx").exists() {
+                if !file_present_nonempty(&seg_path.join("inverted.idx")) {
                     logical_paths.push((format!("{s3_prefix}/inverted.idx"), 0));
                 }
-                if needs_filters && !seg_path.join("filters.bin").exists() {
+                if needs_filters && !file_present_nonempty(&seg_path.join("filters.bin")) {
                     logical_paths.push((format!("{s3_prefix}/filters.bin"), 0));
                 }
 
@@ -1754,7 +1754,7 @@ impl AppState {
                 // every format change (it's already 2 for the lazy inverted
                 // index) and would misclassify every v1 segment as legacy,
                 // silently re-fetching all their doc stores.
-                let has_offsets = seg_path.join("doc_store.offsets").exists();
+                let has_offsets = file_present_nonempty(&seg_path.join("doc_store.offsets"));
                 let lazy_capable = has_offsets
                     || paths_with_manifest_footer.contains(seg_path)
                     || SegmentReader::read_footer(seg_path)
@@ -1764,11 +1764,11 @@ impl AppState {
                     if !has_offsets {
                         logical_paths.push((format!("{s3_prefix}/doc_store.offsets"), 0));
                     }
-                } else if !seg_path.join("doc_store.bin").exists() {
+                } else if !file_present_nonempty(&seg_path.join("doc_store.bin")) {
                     logical_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
                 }
 
-                if needs_vectors && !seg_path.join("vector.idx").exists() {
+                if needs_vectors && !file_present_nonempty(&seg_path.join("vector.idx")) {
                     logical_paths.push((format!("{s3_prefix}/vector.idx"), 0));
                 }
             }
@@ -1839,7 +1839,7 @@ impl AppState {
             };
             let s3_prefix = rel_path.to_string_lossy();
             for file_name in posting_files {
-                if !seg_path.join(file_name).exists() {
+                if !file_present_nonempty(&seg_path.join(file_name)) {
                     logical_paths.push((format!("{s3_prefix}/{file_name}"), 0));
                 }
             }
@@ -1868,7 +1868,7 @@ impl AppState {
             .flat_map(|seg_path| {
                 posting_files.iter().filter_map(move |file_name| {
                     let path = seg_path.join(file_name);
-                    if path.is_file() {
+                    if file_present_nonempty(&path) {
                         None
                     } else {
                         path.strip_prefix(&self.data_dir)
@@ -1907,6 +1907,18 @@ impl AppState {
 }
 
 /// Redact the password portion of a Postgres URL for logs.
+/// Whether a segment artifact is present *and usable* on local disk. Bare
+/// existence is not enough for hydration decisions: interrupted non-atomic
+/// writes (pre-atomic-rename builds) could leave zero-byte files behind, and
+/// no valid segment artifact is ever empty — treating one as present makes
+/// every hydration layer skip the refetch and every reader fail forever.
+#[cfg(feature = "s3")]
+fn file_present_nonempty(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
 fn redact_database_url(url: &str) -> String {
     // postgresql://user:password@host/db → postgresql://user:***@host/db
     if let Some((scheme_user, rest)) = url.split_once("://") {
