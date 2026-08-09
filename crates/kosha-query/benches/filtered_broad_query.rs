@@ -90,6 +90,7 @@ fn main() {
         knn: None,
         exact_total_hits: None,
         total_hits_cap: None,
+        operator: None,
     };
 
     // Warm the segment cache.
