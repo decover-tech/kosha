@@ -449,3 +449,68 @@ repo (m7i.8xlarge ~$2/hr — destroy after each round). Corpus fetch:
 `fetch_msmarco.py --out-dir /data/corpus --docs 10000000` (~40 min).
 Raw artifacts: results JSONs + per-phase server logs archived with the
 benchmark session.
+
+---
+
+# Addendum: 10M MSMarco round 2 — multi-term WAND + v5 skip-split (2026-08-09)
+
+Same corpus, queries, protocol, and hardware as the round-1 addendum
+above; engine now main @ #94 (`2dd7ae1`: #93 multi-term block-max WAND
+leapfrog join + #94 v5 skip-split postings — positions out of the scoring
+decode, write-time per-block upper bounds). Segments rewritten in v5
+(10,000,000 docs, 167 segments, 23GB working set, all in S3). Parity/
+hardening fixes #95/#96 landed after this image was built; they are
+semantics fixes with negligible latency impact.
+
+## Headline: tpuf's 8 QPS spec is now sustainable
+
+Round 1 could not run 8 QPS at all (32 cores saturated at ~6.4 QPS,
+queues diverged to 230+ seconds). Round 2 holds 8.00 QPS for the full 30
+minutes of each phase — 14,401/14,401 requests, zero errors, both phases:
+
+| 8 QPS, topk=10, 30min | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| tpuf published — warm | 13ms | 18ms | 29ms | — |
+| **Kosha warm** | **449ms** | 1,374ms | 2,295ms | 4.5s |
+| tpuf published — cold | 316ms | 381ms | 559ms | — |
+| **Kosha cold (wipe + 30m window)** | **431ms** | 1,218ms | 4,641ms | 8.8s |
+
+Round-over-round at the sustainable-rate comparison point: warm p50
+304ms @4QPS (round 1, pre-WAND) vs 449ms @8QPS (round 2 — at 2× the
+load, near saturation). Correctness invariant held: zero-hit rate 33.2%
+in both phases, identical to round 1's AND-semantics rate — the
+optimizations changed latency, not results. Warm phase hydrated **0
+bytes**; cold hydrated 4.1GB of 23GB lazily, first-minute p50 3.1s
+converging to warm within minutes.
+
+## Where the remaining 34× lives (server-side, all 14,401 warm requests)
+
+| phase | p50 | p90 | p99 |
+|---|---|---|---|
+| score (leapfrog intersection walk) | 323ms | 956ms | 1,655ms |
+| hydrate (per-query blob presence checks) | 86ms | 92ms | 101ms |
+| queue | 0ms | 248ms | 893ms |
+| admit | 2ms | 68ms | 765ms |
+| materialize | 0.1ms | 0.1ms | 0.2ms |
+
+1. **`score_ms` is no longer BM25 math — it's the intersection walk.**
+   v5 already stripped positions and made block UBs free; the cost is
+   advancing cursors through stopword-scale lists to *enumerate* the AND
+   intersection, which exact `total_hits` makes mandatory (a 3-hit
+   intersection can cost ~900ms of walking). The unlock is **capped
+   counts** (ES `track_total_hits`-style: exact to 10k, `gte` beyond) —
+   with the cap, the join can early-terminate once the page is stable,
+   and MaxScore-class term partitioning becomes applicable. Plausibly
+   5–15× on broad queries.
+2. **`hydrate_ms` is a flat ~86–92ms/query tax** — per-query
+   posting-blob existence stats scaling with segments × terms (167 × ~5
+   ≈ 800+ metadata stats). A per-`(namespace, manifest-version, shard)`
+   presence cache removes ~20% of p50 outright.
+3. **Queue/admit only appear at p90+** — saturation artifacts that
+   shrink as service time drops.
+4. **167 segments multiply fixed per-query costs** — compaction to ~16
+   large segments (blocked on the tiered doc-loss bug) trims cursor
+   setup, TOC lookups, and fan-out overhead.
+
+Trajectory: unrunnable → 100× off (round 1 @4QPS) → 34× off at full
+spec, in two days, with every remaining contributor named and owned.
