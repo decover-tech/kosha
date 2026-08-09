@@ -133,6 +133,7 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         exact_total_hits: None,
         total_hits_cap: None,
         operator: None,
+        no_cache: None,
     }
 }
 

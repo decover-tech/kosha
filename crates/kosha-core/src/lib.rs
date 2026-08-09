@@ -942,6 +942,12 @@ pub struct SearchQuery {
     /// just without OR's speed advantage. See [`QueryOperator`].
     #[serde(default)]
     pub operator: Option<QueryOperator>,
+    /// Bypass the server's whole-response result cache for this request:
+    /// the search executes in full and its response is not stored. For
+    /// measurement and read-after-write tests. `None`/`false` = normal
+    /// caching (when the engine has it enabled).
+    #[serde(default)]
+    pub no_cache: Option<bool>,
 }
 
 /// See `SearchQuery.operator`.
