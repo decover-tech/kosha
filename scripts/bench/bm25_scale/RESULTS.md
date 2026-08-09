@@ -514,3 +514,60 @@ converging to warm within minutes.
 
 Trajectory: unrunnable → 100× off (round 1 @4QPS) → 34× off at full
 spec, in two days, with every remaining contributor named and owned.
+
+---
+
+# Addendum: 10M MSMarco round 4 — presence cache + capped counts A/B (2026-08-09)
+
+Engine: main @ #103 (adds #99 posting-blob presence cache, #100 capped
+total_hits, #103 join early-termination). Same corpus/protocol/VM as
+rounds 2. Three 30-minute 8 QPS phases, 14,401/14,401 each, zero errors,
+**zero-hit rate 33.2% in all three phases** (invariant intact).
+
+| 8 QPS, topk=10 | p50 | p90 | p99 |
+|---|---|---|---|
+| warm, capped counts (new default) | 361ms | 1,017ms | 1,814ms |
+| warm, exact counts (`KOSHA_EXACT_TOTAL_HITS=1`) | 333ms | 987ms | 1,726ms |
+| cold, capped (wipe + 30m window) | 355ms | 1,067ms | 5,100ms |
+| round 2 reference (warm) | 449ms | 1,374ms | 2,295ms |
+
+## Findings
+
+1. **R2→R4 warm p50 −21–26% — attributable to the presence cache
+   (#99)**, which cut the per-query blob-check tax 86→~39ms and, by
+   moving the box off the saturation cliff, erased the p90 queueing term
+   entirely (248ms→0).
+2. **Approximate counting bought ~nothing**: the capped-vs-exact phase
+   gap (361 vs 333) is run-order page-cache bias, not signal. A paired
+   probe (same warm process, interleaved per-request `exact_total_hits`
+   flips, 8 pairs × 24 queries incl. forced-ET via `total_hits_cap=100`)
+   measured **mean delta −0.1ms / +0.3ms** — ET is statistically
+   invisible. Root cause: counting was never the cost. The per-segment
+   10k budget is effectively never reached (needs a ~1.67M-doc total
+   intersection), and even when forced, the post-page-stable walk tail
+   is negligible — **intersection discovery over stopword-scale lists is
+   the cost**, and no counting rule touches it. #103's semantics (caps,
+   `gte`) remain the API win; its exit machinery is confirmed harmless.
+3. **~Half of phase latency is concurrency contention, not service
+   time**: the probe's individually-timed queries cost 68–175ms on the
+   same warm server whose 8 QPS phase p50 is 361ms. Single-query warm
+   service is already ~100–150ms; the rest is CPU overlap between
+   concurrent rayon-parallel searches.
+
+## Revised leverage order (full roadmap doc in the session artifact)
+
+1. **Query-result cache** — the benchmark protocol repeats each of
+   1,677 queries ~8.6× per phase; any engine with a result LRU serves
+   warm mostly from cache (a plausible component of turbopuffer's 13ms).
+   Legitimate production feature; must be benchmarked cache-on AND
+   cache-off separately.
+2. **Impact-ordered threshold bootstrapping** — BoundedTopK fills in
+   doc_seq order, so the pruning floor stays weak for thousands of
+   postings; visiting the driving term's blocks in descending stored-UB
+   order makes the floor lethal after ~k docs. The biggest k=10-specific
+   delta vs Lucene-class engines.
+3. **Global score floor across segments + per-segment max-score skip**
+   — per-segment top-k floors are independent today; sharing one floor
+   lets hot segments disqualify entire other segments unopened.
+4. **Rarest-first join ordering; OR-mode ranking; compaction** — as per
+   the roadmap; OR-mode remains the structural answer to discovery cost.
