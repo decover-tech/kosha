@@ -1205,7 +1205,14 @@ impl Searcher {
                 && query.search_after.as_ref().is_none_or(|a| a.is_empty())
                 && sort_value_fields.is_empty()
                 && query.aggs.is_empty()
-                && !segment_has_tombstones;
+                && !segment_has_tombstones
+                // The leapfrog join's gallop is only correct on strictly
+                // ascending postings. Every current writer format
+                // guarantees that; legacy v1 Eager segments parse an
+                // external stream with no ordering validation, so they take
+                // the order-agnostic general path (a debug_assert alone
+                // would let a release build silently drop hits).
+                && reader.has_ordered_postings();
             if can_block_max_wand {
                 // Terms absent from this segment are omitted (not treated as
                 // empty lists) — mirroring the general path, whose AND
@@ -1258,8 +1265,9 @@ impl Searcher {
                         // The block's per-doc score ceiling. v5 reads it
                         // straight from the skip entry — no posting decode,
                         // no doc_meta pass. Legacy formats recompute it by
-                        // the same in-block scan as before (`doc_meta` is an
-                        // in-memory array index; 128 entries is ~µs).
+                        // decoding the block and scanning doc_meta (shared
+                        // fallback logic with `TermCursor::block_upper_bound`
+                        // via `block_bounds`).
                         let stored = source.stored_summary(block);
                         let (max_tf, min_fl) = match stored {
                             Some(summary) => summary,
@@ -1267,40 +1275,38 @@ impl Searcher {
                                 if !source.read_block(block, &mut buf) {
                                     continue;
                                 }
-                                let mut max_tf = 0u32;
-                                let mut min_fl = u32::MAX;
-                                for sp in &buf {
-                                    max_tf = max_tf.max(sp.term_frequency);
-                                    if let Some(meta) = reader.doc_meta(sp.doc_id) {
-                                        min_fl = min_fl.min(meta.field_length);
-                                    }
-                                }
-                                if min_fl == u32::MAX {
+                                let Some(bounds) = block_bounds(&buf, &reader) else {
                                     // block had no resolvable metas — skip it
                                     // as unscorable, treating it as "can't
                                     // reach" to avoid an UB of +inf leaking
                                     // past the threshold.
                                     continue;
-                                }
-                                (max_tf, min_fl)
+                                };
+                                bounds
                             }
                         };
+                        // Upper bound for any doc's BM25 score in this block.
                         let block_ub = scorer.block_max_score(max_tf, df, min_fl);
 
                         // WAND pivot test: skip the block entirely iff we
                         // already hold `effective_k` candidates AND the best
-                        // candidate score in the block can't reach the
-                        // current k-th-best. The threshold rises monotonically
-                        // as higher-scoring docs land in `topk`, so later
-                        // buckets face progressively tighter UBs — the long
-                        // tail of low-tf high-dl docs falls off fast for
-                        // Zipfian terms. On v5 a skipped block was never
-                        // decoded in the first place.
-                        if topk.is_full() && block_ub <= topk.floor() {
+                        // candidate score in the block can't beat the
+                        // current k-th-best. Strictly below only: a block
+                        // whose ceiling ties the floor can still win the
+                        // page under the (score desc, doc_id asc) total
+                        // order the merge uses, so it must be scored. The
+                        // threshold rises monotonically as higher-scoring
+                        // docs land in `topk`, so later buckets face
+                        // progressively tighter UBs — the long tail of
+                        // low-tf high-dl docs falls off fast for Zipfian
+                        // terms. On v5 a skipped block was never decoded in
+                        // the first place.
+                        if topk.is_full() && block_ub < topk.floor() {
                             continue;
                         }
                         // v5: only a block that survived the pivot test is
-                        // ever varint-decoded (legacy already decoded above).
+                        // ever varint-decoded (legacy already decoded above
+                        // to compute bounds).
                         if stored.is_some() && !source.read_block(block, &mut buf) {
                             continue;
                         }
@@ -1308,9 +1314,7 @@ impl Searcher {
                             if let Some(meta) = reader.doc_meta(sp.doc_id) {
                                 let score =
                                     scorer.score_term(sp.term_frequency, df, meta.field_length);
-                                topk.insert(score, sp.doc_id, || {
-                                    DocumentId(meta.doc_id.to_owned())
-                                });
+                                topk.insert(score, sp.doc_id, meta.doc_id);
                             }
                         }
                     }
@@ -1323,9 +1327,12 @@ impl Searcher {
                 }
 
                 // ── Multi-term block-max AND: leapfrog join ──
-                // Cursors stay in query-term order so the per-doc score
-                // summation runs in the same order as the general path's
-                // `term_maps` loop — bit-identical floats, identical ties.
+                // `scoring_postings_for_terms` (and its `postings_for_terms`
+                // fallback) guarantee requested-term order — they emit into
+                // per-term slots, never HashMap iteration order — so the
+                // per-doc score summation below runs in the same
+                // deterministic order as the general path's `term_maps`
+                // loop: identical float rounding, identical ties.
                 let mut cursors: Vec<TermCursor<'_>> =
                     sources.iter().map(TermCursor::new).collect();
 
@@ -1358,18 +1365,24 @@ impl Searcher {
 
                     // Every cursor sits on `candidate`: an intersection
                     // member. Count it unconditionally — total_hits must
-                    // stay exact — then score it only if its summed
+                    // stay exact, and it must count postings-intersection
+                    // membership exactly like the single-present-term arm's
+                    // `postings.len()` does (meta resolvability affects
+                    // whether a doc can be *scored*, never whether it is
+                    // *counted*) — then score it only if its summed
                     // per-term block ceiling says it could still make the
                     // page.
-                    if let Some(meta) = reader.doc_meta(candidate) {
-                        total_hits += 1;
-                        if effective_k > 0 {
+                    total_hits += 1;
+                    if effective_k > 0 {
+                        if let Some(meta) = reader.doc_meta(candidate) {
                             let prune = topk.is_full() && {
                                 let mut ub = 0.0;
                                 for cursor in cursors.iter_mut() {
                                     ub += cursor.block_upper_bound(&scorer, &reader);
                                 }
-                                ub <= topk.floor()
+                                // Strict: a doc whose ceiling ties the
+                                // floor can still win by doc_id tiebreak.
+                                ub < topk.floor()
                             };
                             if !prune {
                                 let mut score = 0.0;
@@ -1381,9 +1394,7 @@ impl Searcher {
                                         meta.field_length,
                                     );
                                 }
-                                topk.insert(score, candidate, || {
-                                    DocumentId(meta.doc_id.to_owned())
-                                });
+                                topk.insert(score, candidate, meta.doc_id);
                             }
                         }
                     }
@@ -2115,6 +2126,42 @@ impl<'a> ScoringBlocks<'a> {
     }
 }
 
+/// One pass over a decoded (≤[`SCORING_BLOCK_LEN`]) block of scoring
+/// postings collecting `(max_tf, min_field_length)` — the inputs to
+/// [`Bm25Scorer::block_max_score`]. `None` when no posting in the block has
+/// resolvable doc meta (such a block can't contribute score, so callers
+/// treat its ceiling as unreachable/zero). Shared by the single-term walk's
+/// legacy-format fallback and [`TermCursor::block_upper_bound`]'s fallback,
+/// so the meta-less-block policy lives in exactly one place. v5 segments
+/// skip this entirely — their block bounds come from the stored skip
+/// summary instead.
+fn block_bounds(
+    block: &[ScoringPosting],
+    reader: &kosha_segment::SegmentReader,
+) -> Option<(u32, u32)> {
+    let mut max_tf = 0u32;
+    let mut min_fl = u32::MAX;
+    for sp in block {
+        max_tf = max_tf.max(sp.term_frequency);
+        if let Some(meta) = reader.doc_meta(sp.doc_id) {
+            min_fl = min_fl.min(meta.field_length);
+        }
+    }
+    (min_fl != u32::MAX).then_some((max_tf, min_fl))
+}
+
+/// Test/bench-only escape hatch: a one-element empty-string `search_after`
+/// fails the block-max WAND gate but, under default (score) ranking,
+/// filters nothing — `doc_id > ""` holds for every doc — so the query runs
+/// the legacy general scoring path with identical results. Both the parity
+/// tests and `benches/topk_blockmax.rs` need this incantation; keep its
+/// two load-bearing assumptions (the gate's `is_none_or(|a| a.is_empty())`
+/// check and the cursor comparison) encoded in one place.
+#[doc(hidden)]
+pub fn force_legacy_search_after() -> Option<Vec<String>> {
+    Some(vec![String::new()])
+}
+
 /// One term's cursor in the multi-term block-max AND join (see the WAND
 /// section of `score_segment`): tracks a current block (decoded into a
 /// small reusable buffer) plus an index within it, advancing by skip-table
@@ -2219,29 +2266,19 @@ impl<'a> TermCursor<'a> {
     ) -> f64 {
         if self.block != self.ub_block {
             self.ub_block = self.block;
-            let (max_tf, min_fl) = match self.source.stored_summary(self.block) {
-                Some(summary) => summary,
+            self.block_ub = match self.source.stored_summary(self.block) {
+                Some((max_tf, min_fl)) => scorer.block_max_score(max_tf, self.df, min_fl),
                 None => {
                     // The cursor sits on an intersection member inside this
-                    // block, so `buf` necessarily holds it.
-                    let mut max_tf = 0u32;
-                    let mut min_fl = u32::MAX;
-                    for sp in &self.buf {
-                        max_tf = max_tf.max(sp.term_frequency);
-                        if let Some(meta) = reader.doc_meta(sp.doc_id) {
-                            min_fl = min_fl.min(meta.field_length);
-                        }
+                    // block, so `buf` necessarily holds it. A block with no
+                    // resolvable metas can't contribute score (the scoring
+                    // pass skips meta-less docs), so its ceiling is zero.
+                    match block_bounds(&self.buf, reader) {
+                        Some((max_tf, min_fl)) => scorer.block_max_score(max_tf, self.df, min_fl),
+                        None => 0.0,
                     }
-                    if min_fl == u32::MAX {
-                        // A block with no resolvable metas can't contribute
-                        // score (the scoring pass skips meta-less docs).
-                        self.block_ub = 0.0;
-                        return 0.0;
-                    }
-                    (max_tf, min_fl)
                 }
             };
-            self.block_ub = scorer.block_max_score(max_tf, self.df, min_fl);
         }
         self.block_ub
     }
@@ -2274,30 +2311,51 @@ impl BoundedTopK {
     }
 
     /// The k-th-best score — the WAND pruning threshold. Only meaningful
-    /// when [`Self::is_full`] and `k > 0`.
+    /// when [`Self::is_full`] and `k > 0`. Callers must prune strictly
+    /// below this (`ub < floor`), never at equality: a doc tying the floor
+    /// score can still enter via the doc_id tiebreak below.
     fn floor(&self) -> f64 {
         self.entries[self.k - 1].0
     }
 
-    /// Offer one scored doc. `doc_id` is a thunk so the `DocumentId`
-    /// allocation happens only for docs that actually enter the top-k.
-    fn insert(&mut self, score: f64, doc_seq: u32, doc_id: impl FnOnce() -> DocumentId) {
+    /// The total order the global merge ranks by for default (score)
+    /// ranking: score descending, then doc_id ascending. Keeping the
+    /// bounded top-k in exactly this order is what makes the WAND path's
+    /// page identical to the legacy path's, score ties included — a
+    /// score-only comparison silently kept whichever tied doc arrived
+    /// first in doc_seq order instead.
+    fn rank(a: &(f64, u32, DocumentId), b: &(f64, u32, DocumentId)) -> std::cmp::Ordering {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.2 .0.cmp(&b.2 .0))
+    }
+
+    /// Offer one scored doc. `doc_id` is borrowed and only allocated into a
+    /// `DocumentId` when the doc actually enters the top-k.
+    fn insert(&mut self, score: f64, doc_seq: u32, doc_id: &str) {
         if self.k == 0 {
             return;
         }
         if self.entries.len() < self.k {
-            self.entries.push((score, doc_seq, doc_id()));
+            self.entries
+                .push((score, doc_seq, DocumentId(doc_id.to_owned())));
             if self.entries.len() == self.k {
-                self.entries
-                    .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                self.entries.sort_by(Self::rank);
             }
-        } else if score > self.entries[self.k - 1].0 {
-            self.entries[self.k - 1] = (score, doc_seq, doc_id());
-            // Bubble the replaced last element up.
-            let mut i = self.k - 1;
-            while i > 0 && self.entries[i].0 > self.entries[i - 1].0 {
-                self.entries.swap(i, i - 1);
-                i -= 1;
+        } else {
+            let last = &self.entries[self.k - 1];
+            let beats_floor = score > last.0 || (score == last.0 && *doc_id < *last.2 .0);
+            if beats_floor {
+                self.entries[self.k - 1] = (score, doc_seq, DocumentId(doc_id.to_owned()));
+                // Bubble the replaced last element up into rank order.
+                let mut i = self.k - 1;
+                while i > 0
+                    && Self::rank(&self.entries[i], &self.entries[i - 1])
+                        == std::cmp::Ordering::Less
+                {
+                    self.entries.swap(i, i - 1);
+                    i -= 1;
+                }
             }
         }
     }
@@ -3649,7 +3707,7 @@ mod tests {
     /// ranking are untouched. (`from` is ignored under search_after, so
     /// only compare from=0 pages through this helper.)
     fn force_legacy(mut q: SearchQuery) -> SearchQuery {
-        q.search_after = Some(vec![String::new()]);
+        q.search_after = crate::force_legacy_search_after();
         q
     }
 
@@ -3755,8 +3813,19 @@ mod tests {
         let manifest = mk_wand_corpus(&dir, &ns.0, 600);
         let searcher = Searcher::new(dir.clone());
 
+        // The reference slice comes from the LEGACY path (forced via the
+        // gate-bypass cursor) — an unbounded WAND query would exercise the
+        // same join being tested, and a systematic join bug shared by both
+        // k values would cancel out and pass. (`from` is ignored under
+        // search_after, so legacy can only supply the full sorted list,
+        // which is exactly what slicing needs.)
         let full = searcher
-            .search(&ns, &manifest, &mk_query("alpha beta", 600), None)
+            .search(
+                &ns,
+                &manifest,
+                &force_legacy(mk_query("alpha beta", 600)),
+                None,
+            )
             .unwrap();
         let mut deep = mk_query("alpha beta", 5);
         deep.from = 20;
@@ -3765,8 +3834,64 @@ mod tests {
         assert_eq!(
             page_ids(&page),
             page_ids(&full)[20..25].to_vec(),
-            "deep page must match the equivalent slice of a full sort"
+            "deep page must match the equivalent slice of a legacy full sort"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wand_page_matches_legacy_on_exact_score_ties() {
+        // Score ties are where bounded top-k selection policies diverge:
+        // the legacy path keeps every candidate and the global merge
+        // breaks ties by doc_id ascending, so the WAND paths must apply
+        // the same (score desc, doc_id asc) total order at insert time.
+        // Every doc here has IDENTICAL text (same tf, same field length →
+        // identical BM25 score), and doc_ids are assigned in REVERSE of
+        // insertion order so "first k inserted" ≠ "k smallest doc_ids" —
+        // a first-come tie policy fails this test, doc_id tiebreak passes.
+        let dir = std::env::temp_dir().join("kosha-test-wand-tie-parity");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let n = 300;
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for i in 0..n {
+            w.add_document(
+                DocumentId(format!("doc-{:04}", n - 1 - i)),
+                vec![Field::text("content", "even filler filler")],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: n as u32,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        // Single-term arm and multi-term join arm, both against legacy.
+        for text in ["even", "even filler"] {
+            let wand = searcher
+                .search(&ns, &manifest, &mk_query(text, 10), None)
+                .unwrap();
+            let legacy = searcher
+                .search(&ns, &manifest, &force_legacy(mk_query(text, 10)), None)
+                .unwrap();
+            assert_eq!(wand.total_hits, legacy.total_hits, "{text}: total_hits");
+            assert_eq!(
+                page_ids(&wand),
+                page_ids(&legacy),
+                "{text}: tied-score page must match legacy's doc_id tiebreak"
+            );
+            assert_eq!(
+                page_ids(&wand),
+                (0..10).map(|i| format!("doc-{i:04}")).collect::<Vec<_>>(),
+                "{text}: ties must resolve to the lexicographically smallest doc_ids"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

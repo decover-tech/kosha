@@ -130,24 +130,20 @@ fn median_ms(mut samples: Vec<f64>) -> f64 {
     samples[samples.len() / 2]
 }
 
-/// The block-max WAND path is enabled by default — it's the production
-/// path. To simulate the "before" behavior (every posting scored), this
-/// helper falls through to the full scoring path by injecting a filter
-/// that makes the guard fail. We use a trick: pass a wildcard override
-/// that's empty/none but instead use a phrase query to disable block-max
-/// — simpler: we use the same scorer but force each block to score every
-/// doc by passing `from = usize::MAX / 2` so `effective_k = from + max_results`
-/// is enormous, but that wouldn't change the result count. The cleanest
-/// trick is to set a placeholder filter that's `None` for the data set...
-///
-/// Actually: the simplest honest benchmark is to just run with both paths:
-///   * natural block-max guard (single term "the") — the production path
-///   * force the fallback by using two query terms ("the w42") so the
-///     guard thinks it's multi-term and uses the full scoring loop
+/// The block-max WAND path is enabled by default for single- AND
+/// multi-term queries — it's the production path. To measure the legacy
+/// general scoring path, use `kosha_query::force_legacy_search_after()`:
+/// a one-element empty-string cursor fails the WAND gate but filters
+/// nothing under default ranking. NOTE the caveat measured below: a
+/// search_after query also takes the full-sort pagination path in the
+/// caller, so end-to-end wall against a forced-legacy baseline includes a
+/// sort the real pre-WAND path never paid — scoring-phase comparisons use
+/// `score_wall_ms`, which excludes it.
 struct Row {
     total_hits: usize,
     result_count: usize,
     wall_ms: f64,
+    score_ms: f64,
 }
 
 fn main() {
@@ -169,6 +165,25 @@ fn main() {
 
     let searcher = Searcher::new(work.clone());
 
+    // The one measurement loop every section uses — timing/stats capture
+    // must stay identical across sections or the report compares
+    // different quantities.
+    let run_rows = |q: &SearchQuery| -> Vec<Row> {
+        (0..warm_iters)
+            .map(|_| {
+                let t = Instant::now();
+                let (r, stats) = searcher.search_with_stats(&ns, &manifest, q, None).unwrap();
+                let wall_ms = t.elapsed().as_secs_f64() * 1e3;
+                black_box(Row {
+                    total_hits: r.total_hits,
+                    result_count: r.results.len(),
+                    wall_ms,
+                    score_ms: stats.score_wall_ms,
+                })
+            })
+            .collect()
+    };
+
     // Warm up the segment cache.
     let _ = searcher
         .search_with_stats(&ns, &manifest, &mk_query("the", topk), None)
@@ -178,21 +193,7 @@ fn main() {
         .unwrap();
 
     // ── Block-max WAND with topk=10 (production; pruning active) ────────
-    let mut after_rows: Vec<Row> = Vec::new();
-    for _ in 0..warm_iters {
-        let q = mk_query("the", topk);
-        let t = Instant::now();
-        let (r, stats) = searcher
-            .search_with_stats(&ns, &manifest, &q, None)
-            .unwrap();
-        let wall_ms = t.elapsed().as_secs_f64() * 1e3;
-        after_rows.push(Row {
-            total_hits: r.total_hits,
-            result_count: r.results.len(),
-            wall_ms,
-        });
-        let _ = black_box(stats.score_wall_ms);
-    }
+    let after_rows = run_rows(&mk_query("the", topk));
 
     // ── Block-max WAND with topk=total_docs (no pruning — equivalent
     // to the old "score every posting" full walk) ──────────────────────
@@ -201,21 +202,7 @@ fn main() {
     // the production-before PR did. Same code path, same term, same
     // corpus; the only difference is the topk size. Hence the speedup
     // ratio is the savings block-max WAND gives on a top-10 page.
-    let mut before_rows: Vec<Row> = Vec::new();
-    for _ in 0..warm_iters {
-        let q = mk_query("the", total_docs);
-        let t = Instant::now();
-        let (r, stats) = searcher
-            .search_with_stats(&ns, &manifest, &q, None)
-            .unwrap();
-        let wall_ms = t.elapsed().as_secs_f64() * 1e3;
-        before_rows.push(Row {
-            total_hits: r.total_hits,
-            result_count: r.results.len(),
-            wall_ms,
-        });
-        let _ = black_box(stats.score_wall_ms);
-    }
+    let before_rows = run_rows(&mk_query("the", total_docs));
 
     // ── Report ───────────────────────────────────────────────────────────
     let med_after = median_ms(after_rows.iter().map(|r| r.wall_ms).collect());
@@ -280,7 +267,7 @@ fn main() {
     let mt_text = "the contract";
     let mk_legacy = |text: &str, k: usize| {
         let mut q = mk_query(text, k);
-        q.search_after = Some(vec![String::new()]);
+        q.search_after = kosha_query::force_legacy_search_after();
         q
     };
 
@@ -292,41 +279,33 @@ fn main() {
         .search_with_stats(&ns, &manifest, &mk_legacy(mt_text, topk), None)
         .unwrap();
 
-    let run_rows = |q: &SearchQuery| -> Vec<Row> {
-        (0..warm_iters)
-            .map(|_| {
-                let t = Instant::now();
-                let (r, stats) = searcher.search_with_stats(&ns, &manifest, q, None).unwrap();
-                let wall_ms = t.elapsed().as_secs_f64() * 1e3;
-                let _ = black_box(stats.score_wall_ms);
-                Row {
-                    total_hits: r.total_hits,
-                    result_count: r.results.len(),
-                    wall_ms,
-                }
-            })
-            .collect()
-    };
-
     let legacy_rows = run_rows(&mk_legacy(mt_text, topk));
     let joined_rows = run_rows(&mk_query(mt_text, topk));
     // Count cross-check only — see the comment block above.
     let nopr_rows = run_rows(&mk_query(mt_text, total_docs));
 
+    // Speedup is keyed on the SCORING phase, not end-to-end wall: the
+    // forced-legacy baseline's search_after cursor also routes the caller
+    // through a full candidate sort + linear cursor scan the real
+    // pre-WAND production path (plain from/max_results, bounded
+    // select_nth) never paid, so its wall overstates legacy cost.
+    let med_legacy_score = median_ms(legacy_rows.iter().map(|r| r.score_ms).collect());
+    let med_joined_score = median_ms(joined_rows.iter().map(|r| r.score_ms).collect());
     let med_legacy = median_ms(legacy_rows.iter().map(|r| r.wall_ms).collect());
     let med_joined = median_ms(joined_rows.iter().map(|r| r.wall_ms).collect());
 
     println!();
     println!("  Multi-term AND (\"{mt_text}\", topk={topk}):");
     println!(
-        "    legacy HashMap path   : {:>8.2} ms  (total_hits={})",
-        med_legacy, legacy_rows[0].total_hits
+        "    legacy HashMap path   : score {:>8.2} ms | wall {:>8.2} ms (incl. forced-cursor sort overhead)  (total_hits={})",
+        med_legacy_score, med_legacy, legacy_rows[0].total_hits
     );
     println!(
-        "    leapfrog block-max AND: {:>8.2} ms  (total_hits={})  speedup vs legacy = {:.2}×",
+        "    leapfrog block-max AND: score {:>8.2} ms | wall {:>8.2} ms  (total_hits={})  scoring speedup vs legacy = {:.2}×",
+        med_joined_score,
         med_joined,
         joined_rows[0].total_hits,
-        med_legacy / med_joined.max(1e-9)
+        med_legacy_score / med_joined_score.max(1e-9)
     );
     if legacy_rows[0].total_hits == joined_rows[0].total_hits
         && joined_rows[0].total_hits == nopr_rows[0].total_hits
