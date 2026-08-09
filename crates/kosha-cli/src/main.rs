@@ -85,8 +85,13 @@ enum Commands {
         #[arg(long)]
         filter: Option<String>,
         /// Full SearchQuery JSON (@file.json or inline). Overrides query/max/filter.
-        #[arg(long, conflicts_with_all = ["query", "filter"])]
+        #[arg(long, conflicts_with_all = ["query", "filter", "exact"])]
         body: Option<String>,
+        /// Force an exact total_hits count instead of the default capped
+        /// (gte) count — see SearchQuery.exact_total_hits. Set
+        /// exact_total_hits directly in --body instead when using --body.
+        #[arg(long)]
+        exact: bool,
     },
     /// Flush buffered documents to a segment
     Flush {
@@ -206,6 +211,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_results,
             filter,
             body,
+            exact,
         } => {
             if let Some(body_src) = body {
                 let body_val = read_json_arg(&body_src)?;
@@ -226,7 +232,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     wildcard: None,
                     match_phrase: None,
                     knn: None,
-                    exact_total_hits: None,
+                    exact_total_hits: exact.then_some(true),
                     total_hits_cap: None,
                 };
                 if let Some(filter_src) = filter {
@@ -509,8 +515,22 @@ fn human_stats(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `total_hits` is capped by default (see `SearchQuery.exact_total_hits`) —
+/// this prints the "+" a bare number would silently hide, so "10000" never
+/// reads as an exact count when it's actually a lower bound. Pulled out as
+/// a pure function (no I/O) so the formatting itself is unit-testable.
+fn format_total_hits_line(result: &kosha_core::SearchResult) -> String {
+    match result.total_hits_relation {
+        kosha_core::TotalHitsRelation::Eq => format!("total_hits: {}", result.total_hits),
+        kosha_core::TotalHitsRelation::Gte => format!(
+            "total_hits: {}+ (capped; pass --exact for an exact count)",
+            result.total_hits
+        ),
+    }
+}
+
 fn human_search(result: &kosha_core::SearchResult) -> Result<(), Box<dyn std::error::Error>> {
-    println!("total_hits: {}", result.total_hits);
+    println!("{}", format_total_hits_line(result));
     for hit in &result.results {
         let title = hit
             .fields
@@ -536,6 +556,44 @@ mod tests {
     #[test]
     fn clap_accepts_mvp_commands() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn format_total_hits_line_flags_capped_counts() {
+        let mk = |total_hits, relation| kosha_core::SearchResult {
+            results: Vec::new(),
+            total_hits,
+            total_hits_relation: relation,
+            aggregations: None,
+        };
+        assert_eq!(
+            format_total_hits_line(&mk(3, kosha_core::TotalHitsRelation::Eq)),
+            "total_hits: 3"
+        );
+        // A capped count must never print as a bare number — that reads as
+        // exact when it's actually a lower bound (the bug this guards).
+        let capped = format_total_hits_line(&mk(10_000, kosha_core::TotalHitsRelation::Gte));
+        assert!(capped.contains("10000+"), "{capped}");
+        assert!(capped.contains("--exact"), "{capped}");
+    }
+
+    #[test]
+    fn parses_search_exact_flag() {
+        let cli = Cli::try_parse_from([
+            "kosha",
+            "--host",
+            "http://localhost:8080",
+            "search",
+            "-n",
+            "demo",
+            "breach",
+            "--exact",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Search { exact, .. } => assert!(exact),
+            _ => panic!("expected search"),
+        }
     }
 
     #[test]
