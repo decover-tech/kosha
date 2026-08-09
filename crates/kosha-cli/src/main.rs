@@ -219,22 +219,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_value(&value, cli.json, human_search_value)?;
             } else {
                 let query_text = query.ok_or("provide a query string or --body")?;
-                let mut search = SearchQuery {
-                    query_text,
-                    max_results,
-                    from: 0,
-                    bm25_params: Default::default(),
-                    filter: None,
-                    sort: Vec::new(),
-                    search_after: None,
-                    highlight: None,
-                    aggs: Default::default(),
-                    wildcard: None,
-                    match_phrase: None,
-                    knn: None,
-                    exact_total_hits: exact.then_some(true),
-                    total_hits_cap: None,
-                };
+                let mut search = build_search_query(query_text, max_results, exact);
                 if let Some(filter_src) = filter {
                     search.filter = Some(serde_json::from_str(&filter_src)?);
                 }
@@ -548,6 +533,32 @@ fn human_search_value(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
     human_search(&result)
 }
 
+/// Build a `SearchQuery` from the non-`--body` `Search` command fields. The
+/// `exact` flag wires through to `SearchQuery.exact_total_hits` (`Some(true)`
+/// when set, `None` otherwise — deferring to the engine-wide default
+/// `KOSHA_EXACT_TOTAL_HITS`). Pulled out as a pure function (no I/O) so the
+/// `--exact` -> `SearchQuery.exact_total_hits = Some(true)` wiring — the
+/// contract `parses_search_exact_flag` only half-checked, since it stops at
+/// the clap parse — is unit-testable end to end.
+fn build_search_query(query_text: String, max_results: usize, exact: bool) -> SearchQuery {
+    SearchQuery {
+        query_text,
+        max_results,
+        from: 0,
+        bm25_params: Default::default(),
+        filter: None,
+        sort: Vec::new(),
+        search_after: None,
+        highlight: None,
+        aggs: Default::default(),
+        wildcard: None,
+        match_phrase: None,
+        knn: None,
+        exact_total_hits: exact.then_some(true),
+        total_hits_cap: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +605,39 @@ mod tests {
             Commands::Search { exact, .. } => assert!(exact),
             _ => panic!("expected search"),
         }
+    }
+
+    #[test]
+    fn build_search_query_wires_exact_flag_to_search_query() {
+        // `parses_search_exact_flag` proves clap surfaces `exact: bool`,
+        // but stops there — the actual contract is that this flag flows
+        // through `run()` -> `build_search_query` -> `SearchQuery.exact_total_hits`
+        // as `Some(true)`, which is what the `kosha search --exact` user
+        // message in `format_total_hits_line` promises ("pass --exact for
+        // an exact count"). This test closes that loop end to end without
+        // standing up a real HTTP server — exactly what the #105 review
+        // flagged as missing.
+        let with_exact = build_search_query("breach".to_string(), 5, true);
+        assert_eq!(
+            with_exact.exact_total_hits,
+            Some(true),
+            "--exact must wire to SearchQuery.exact_total_hits = Some(true)"
+        );
+        assert_eq!(with_exact.total_hits_cap, None);
+        assert_eq!(with_exact.query_text, "breach");
+        assert_eq!(with_exact.max_results, 5);
+        assert_eq!(with_exact.from, 0, "the CLI never sets `from`");
+
+        // Without `--exact`: defer to the engine-wide default. The
+        // important assertion is `None` (NOT `Some(false)`), so the engine
+        // default — which the server reads the same way — still applies.
+        let without_exact = build_search_query("breach".to_string(), 5, false);
+        assert_eq!(
+            without_exact.exact_total_hits, None,
+            "absence of --exact must defer to the engine default via None, \
+             not eagerly set Some(false)"
+        );
+        assert_eq!(without_exact.total_hits_cap, None);
     }
 
     #[test]

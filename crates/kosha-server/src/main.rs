@@ -296,6 +296,19 @@ struct AppState {
     /// (no per-request clone of a potentially-large map) and a write uses
     /// `Arc::make_mut` (copy-on-write only when a concurrent reader is
     /// still holding the old snapshot).
+    ///
+    /// Residual hazard the eviction-generation guard does *not* close: a
+    /// shard evicted *between* a presence-cache hit (snapshot taken at
+    /// request entry) and the actual `scoring_postings_for_terms` read on
+    /// the cached segment reader — `eviction_generation` won't move again
+    /// until the next eviction, and the read returns no postings for the
+    /// now-missing shard (the PR #83 silent-term-drop class), not an
+    /// error. Closing that race needs a per-read failure signal from the
+    /// segment layer, complementary to this generation guard; tracked as
+    /// follow-up work. Until it lands, correctness here depends on the
+    /// `KOSHA_CACHE_MAX_BYTES` bound being generous enough to never LRU
+    /// posting blobs of in-flight warm segments — the cache is sized for
+    /// that today, but the invariant is not enforced.
     posting_blob_presence: Mutex<PostingBlobPresenceCache>,
     /// Readiness-gated warmup (Tier 1 O2): when `KOSHA_WARMUP_NAMESPACES`
     /// is set, a background thread prefetches the scoring-set files
