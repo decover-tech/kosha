@@ -163,6 +163,14 @@ class KoshaClient:
         knn = self._extract_knn(body)
         sort = self._extract_sort(body)
         search_after = body.get("search_after") if body else None
+        # Cache bypass: OpenSearch-style request_cache=False param, a bare
+        # no_cache param, or a no_cache key in the body all map to the
+        # server's per-request no_cache flag.
+        no_cache = (
+            str(params.get("request_cache", "")).lower() == "false"
+            or bool(params.get("no_cache"))
+            or bool((body or {}).get("no_cache"))
+        )
         if search_after is not None:
             search_after = [str(v) for v in search_after]
 
@@ -233,6 +241,8 @@ class KoshaClient:
             kosha_body["knn"] = knn
         if sort:
             kosha_body["sort"] = sort
+        if no_cache:
+            kosha_body["no_cache"] = True
         if search_after:
             kosha_body["search_after"] = search_after
 

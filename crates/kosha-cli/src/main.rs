@@ -85,7 +85,7 @@ enum Commands {
         #[arg(long)]
         filter: Option<String>,
         /// Full SearchQuery JSON (@file.json or inline). Overrides query/max/filter.
-        #[arg(long, conflicts_with_all = ["query", "filter", "exact", "or"])]
+        #[arg(long, conflicts_with_all = ["query", "filter", "exact", "or", "no_cache"])]
         body: Option<String>,
         /// Force an exact total_hits count instead of the default capped
         /// (gte) count — see SearchQuery.exact_total_hits. Set
@@ -97,6 +97,11 @@ enum Commands {
         /// operator directly in --body instead when using --body.
         #[arg(long)]
         or: bool,
+        /// Bypass the server's result cache for this request (fresh
+        /// execution, response not stored) — see SearchQuery.no_cache.
+        /// Set no_cache directly in --body instead when using --body.
+        #[arg(long = "no-cache")]
+        no_cache: bool,
     },
     /// Flush buffered documents to a segment
     Flush {
@@ -218,6 +223,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             body,
             exact,
             or,
+            no_cache,
         } => {
             if let Some(body_src) = body {
                 let body_val = read_json_arg(&body_src)?;
@@ -241,7 +247,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     exact_total_hits: exact.then_some(true),
                     total_hits_cap: None,
                     operator: or.then_some(kosha_core::QueryOperator::Or),
-                    no_cache: None,
+                    no_cache: no_cache.then_some(true),
                 };
                 if let Some(filter_src) = filter {
                     search.filter = Some(serde_json::from_str(&filter_src)?);
