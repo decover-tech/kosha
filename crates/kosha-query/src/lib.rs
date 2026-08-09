@@ -1169,8 +1169,8 @@ impl Searcher {
             //     postings list, skipping whole blocks whose UB can't reach
             //     the k-th-best score. `total_hits` is exact for free —
             //     it's the term's document frequency (`postings.len()`).
-            //   * multi term (AND semantics, matching the general path): a
-            //     leapfrog cursor join over the terms' doc_seq-sorted
+            //   * multi term (AND semantics, matching the general path):
+            //     a leapfrog cursor join over the terms' doc_seq-sorted
             //     postings lists — galloping past non-intersecting
             //     stretches instead of building a doc→posting HashMap per
             //     term like the general path — with per-term block UBs
@@ -1180,7 +1180,23 @@ impl Searcher {
             //     k-th-best score is *counted but never scored*.
             //     `total_hits` stays exact because every intersection
             //     member is still visited; only the BM25 math and the
-            //     `DocumentId` allocation are skipped. See [`TermCursor`].
+            //     `DocumentId` allocation are skipped. Each alignment pass
+            //     probes cursors rarest-list-first (by df) rather than in
+            //     query-term order: `advance_to` is O(log blocks) on any
+            //     list regardless of size (the skip table already makes
+            //     "walking" a huge list as cheap as probing it), so the
+            //     only real lever left is finding a mismatch — or raising
+            //     `target` — using as few probes as possible, and a rare
+            //     term rejects or advances the candidate before a
+            //     stopword-scale one is even asked. (A fixed
+            //     smallest-list-drives / everything-else-only-probed
+            //     design was tried first — same idea taken further — but
+            //     measured *worse* on queries with several mid-frequency
+            //     terms and no standout rarest one: giving up the
+            //     round-robin's ability to raise the candidate off
+            //     whichever cursor currently knows the most outweighed the
+            //     win from not "walking" the bigger lists, which was never
+            //     costly to begin with.) See [`TermCursor`].
             //
             // Guard conditions each have a why-not:
             //   * wildcard: expands to N unknown terms whose per-term block
@@ -1346,9 +1362,22 @@ impl Searcher {
                     // per-term slots, never HashMap iteration order — so the
                     // per-doc score summation below runs in the same
                     // deterministic order as the general path's `term_maps`
-                    // loop: identical float rounding, identical ties.
+                    // loop: identical float rounding, identical ties. `cursors`
+                    // stays in that query-term order for the whole function —
+                    // only the *alignment probe order* (which cursor gets
+                    // asked first each pass) is sorted by df, tracked
+                    // separately as an index list.
                     let mut cursors: Vec<TermCursor<'_>> =
                         sources.iter().map(TermCursor::new).collect();
+
+                    // Probe/alignment order: smallest posting list first.
+                    // Ties broken by first occurrence (arbitrary — any order
+                    // is correct, this just keeps it deterministic). Checking
+                    // the rarest term first means a false candidate is
+                    // rejected — and the round below re-driven — before the
+                    // huge lists are ever touched.
+                    let mut align_order: Vec<usize> = (0..cursors.len()).collect();
+                    align_order.sort_by_key(|&i| cursors[i].df);
 
                     let mut total_hits = 0usize;
                     let mut topk = BoundedTopK::new(effective_k);
@@ -1357,12 +1386,15 @@ impl Searcher {
                         // Align every cursor on the smallest doc_seq >= `target`
                         // present in ALL lists: repeatedly raise the candidate
                         // to the highest cursor landing until one full pass
-                        // moves nothing (= every cursor agrees).
+                        // moves nothing (= every cursor agrees). Rarest-first
+                        // order means the common case — a rare term rules out
+                        // `target` outright — is caught in the first probe of
+                        // the first pass, without consulting the huge lists.
                         let mut candidate = target;
                         loop {
                             let mut moved = false;
-                            for cursor in cursors.iter_mut() {
-                                match cursor.advance_to(candidate) {
+                            for &i in &align_order {
+                                match cursors[i].advance_to(candidate) {
                                     // Some list exhausted → intersection done.
                                     None => break 'join,
                                     Some(doc) if doc > candidate => {
@@ -1376,7 +1408,6 @@ impl Searcher {
                                 break;
                             }
                         }
-
                         // Every cursor sits on `candidate`: an intersection
                         // member. Count it unconditionally — total_hits must
                         // stay exact, and it must count postings-intersection
@@ -4091,6 +4122,85 @@ mod tests {
             .unwrap();
         assert_eq!(none.total_hits, 0);
         assert!(none.results.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_term_wand_skewed_df_essential_term_drives_join() {
+        // The shape the rarest-first alignment order is for: two
+        // stopword-scale dense terms (~90%/~87% of docs) ANDed with one
+        // genuinely rare term (3 postings, chosen so all 3 also carry both
+        // dense terms — an exact, deterministic 3-doc intersection out of a
+        // 2000-doc corpus). The join must still find exactly that
+        // intersection when the rare term is probed first each pass —
+        // this test only checks the *observable* result (parity with the
+        // legacy path), not the internal probe order, since that ordering
+        // is a perf detail, not a contract.
+        let dir = std::env::temp_dir().join("kosha-test-wand-skewed-df");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let n = 2000;
+        let needle_docs = [5usize, 15, 25];
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for i in 0..n {
+            let mut words = Vec::new();
+            if i % 10 != 0 {
+                words.push("common1".to_string());
+            }
+            if i % 8 != 0 {
+                words.push("common2".to_string());
+            }
+            if needle_docs.contains(&i) {
+                words.push("needle".to_string());
+            }
+            // Distinct padding length → distinct length norms → no score ties.
+            words.extend(std::iter::repeat_n("pad".to_string(), i % 13));
+            w.add_document(
+                DocumentId(format!("doc-{i:04}")),
+                vec![Field::text("content", words.join(" "))],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: n as u32,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        for query_text in ["common1 needle", "common1 common2 needle"] {
+            let wand = searcher
+                .search(&ns, &manifest, &mk_query(query_text, 10), None)
+                .unwrap();
+            let legacy = searcher
+                .search(
+                    &ns,
+                    &manifest,
+                    &force_legacy(mk_query(query_text, 10)),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                wand.total_hits,
+                needle_docs.len(),
+                "{query_text}: the rare term bounds the exact intersection size"
+            );
+            assert_eq!(wand.total_hits, legacy.total_hits, "{query_text}");
+            assert_eq!(page_ids(&wand), page_ids(&legacy), "{query_text}");
+            for (w_doc, l_doc) in wand.results.iter().zip(legacy.results.iter()) {
+                assert!(
+                    (w_doc.score - l_doc.score).abs() < 1e-9,
+                    "{query_text}: score mismatch on {}: {} vs {}",
+                    w_doc.doc_id.0,
+                    w_doc.score,
+                    l_doc.score
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
