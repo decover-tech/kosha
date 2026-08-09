@@ -1049,6 +1049,11 @@ impl Searcher {
         entry: &ManifestEntry,
         query: &SearchQuery,
         query_terms: &[String],
+        // `Some(cap)` = capped-count mode: the multi-term join may stop
+        // counting once `cap` members are seen AND the suffix-max bound
+        // proves the page can no longer change. `None` = exact counting
+        // (v1-identical walk-to-completion).
+        count_budget: Option<usize>,
         term_prune: Option<&(Vec<String>, TermBloomMode)>,
         sort_value_fields: &[String],
         tombstones: Option<
@@ -1260,6 +1265,7 @@ impl Searcher {
                             candidates: Vec::new(),
                             aggs: HashMap::new(),
                             total_hits: 0,
+                            hits_capped: false,
                         });
                     }
 
@@ -1280,6 +1286,7 @@ impl Searcher {
                                 candidates: Vec::new(),
                                 aggs: HashMap::new(),
                                 total_hits,
+                                hits_capped: false,
                             });
                         }
 
@@ -1353,6 +1360,7 @@ impl Searcher {
                             candidates: topk.into_candidates(&reader),
                             aggs: HashMap::new(),
                             total_hits,
+                            hits_capped: false,
                         });
                     }
 
@@ -1369,6 +1377,16 @@ impl Searcher {
                     let mut total_hits = 0usize;
                     let mut topk = BoundedTopK::new(effective_k);
                     let mut target: u32 = 0;
+                    // Capped-mode early exit (V2 of the total_hits cap):
+                    // once the count budget is met and the page is full,
+                    // the join may stop IF the summed per-term suffix-max
+                    // ceilings prove no future intersection member can
+                    // displace the k-th-best. Bounds come from the v5
+                    // skip table already in memory; a term without stored
+                    // summaries (legacy format) disables the exit and the
+                    // walk stays exact, v1-style.
+                    let mut early_exit_enabled = count_budget.is_some();
+                    let mut hits_capped = false;
                     'join: loop {
                         // Align every cursor on the smallest doc_seq >= `target`
                         // present in ALL lists: repeatedly raise the candidate
@@ -1429,6 +1447,35 @@ impl Searcher {
                             }
                         }
 
+                        if early_exit_enabled
+                            && count_budget.is_some_and(|cap| total_hits >= cap)
+                            && topk.is_full()
+                        {
+                            let mut bound = 0.0;
+                            let mut have_bounds = true;
+                            for cursor in cursors.iter_mut() {
+                                match cursor.remaining_upper_bound(&scorer) {
+                                    Some(b) => bound += b,
+                                    None => {
+                                        have_bounds = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !have_bounds {
+                                // Legacy source in the join — no cheap
+                                // remaining bound; count exactly instead.
+                                early_exit_enabled = false;
+                            } else if bound < topk.floor() {
+                                // No future member can beat the page
+                                // (strict: a tie could still win by
+                                // doc_id). total_hits is now a lower
+                                // bound >= the budget.
+                                hits_capped = true;
+                                break;
+                            }
+                        }
+
                         if candidate == u32::MAX {
                             break;
                         }
@@ -1448,6 +1495,7 @@ impl Searcher {
                         candidates: topk.into_candidates(&reader),
                         aggs: HashMap::new(),
                         total_hits,
+                        hits_capped,
                     })
                 };
                 if let Some(output) = wand_attempt() {
@@ -1759,6 +1807,7 @@ impl Searcher {
             candidates,
             aggs,
             total_hits,
+            hits_capped: false,
         }))
     }
 
@@ -1906,6 +1955,17 @@ impl Searcher {
         // output Vec no matter which thread finishes first, so the reduce
         // below is deterministic and behavior-identical to the old
         // sequential loop, just faster.
+        // Resolved BEFORE scoring: capped mode lets the per-segment join
+        // stop early (see `score_segment`'s `count_budget`), exact mode
+        // keeps the v1 walk-to-completion.
+        let exact = query
+            .exact_total_hits
+            .unwrap_or_else(exact_total_hits_engine_default);
+        let cap = query
+            .total_hits_cap
+            .unwrap_or_else(total_hits_cap_engine_default);
+        let count_budget = (!exact).then_some(cap);
+
         let open_stats = OpenStatsCollector::default();
         let t_score = Instant::now();
         let segment_outputs: Vec<SegmentOutput> = manifest
@@ -1918,6 +1978,7 @@ impl Searcher {
                     entry,
                     query,
                     &query_terms,
+                    count_budget,
                     term_prune.as_ref(),
                     &sort_value_fields,
                     tombstones,
@@ -1949,9 +2010,11 @@ impl Searcher {
         // behavior-identical old semantics hold for every query that
         // doesn't take the early-termination fast path.
         let mut total_hits: usize = 0;
+        let mut any_capped = false;
         for output in segment_outputs {
             candidates.extend(output.candidates);
             total_hits += output.total_hits;
+            any_capped |= output.hits_capped;
             // Last-segment-wins per agg name, same reduction the old
             // sequential loop did via repeated `all_aggs.insert(...)`.
             // `segment_outputs` is in manifest order, so this is
@@ -1977,13 +2040,8 @@ impl Searcher {
         // walking ~10⁶ candidates and reporting "at least 10,000" for free.
         // `exact_total_hits: true` (per query, or `KOSHA_EXACT_TOTAL_HITS`
         // engine-wide) restores the old unconditional-exact behavior.
-        let exact = query
-            .exact_total_hits
-            .unwrap_or_else(exact_total_hits_engine_default);
-        let cap = query
-            .total_hits_cap
-            .unwrap_or_else(total_hits_cap_engine_default);
-        let (total_hits, total_hits_relation) = resolve_total_hits(total_hits, exact, cap);
+        let (total_hits, total_hits_relation) =
+            resolve_total_hits(total_hits, exact, cap, any_capped);
 
         // ── Sort (score-only / sort-key candidates — no full field payloads) ──
         let sort_cmp = |a: &HitCandidate, b: &HitCandidate| -> std::cmp::Ordering {
@@ -2310,9 +2368,17 @@ fn total_hits_cap_engine_default() -> usize {
 /// the uncapped number. Pulled out as a pure function (no env/query
 /// plumbing) so the capping arithmetic itself is unit-testable without a
 /// large corpus or global env-var state — see the tests below.
-fn resolve_total_hits(total_hits: usize, exact: bool, cap: usize) -> (usize, TotalHitsRelation) {
-    if !exact && total_hits > cap {
-        (cap, TotalHitsRelation::Gte)
+fn resolve_total_hits(
+    total_hits: usize,
+    exact: bool,
+    cap: usize,
+    any_capped: bool,
+) -> (usize, TotalHitsRelation) {
+    // `any_capped`: some segment stopped counting early, so `total_hits`
+    // is a lower bound even when it doesn't exceed `cap` — e.g. one
+    // segment that stopped exactly at the budget. Never set in exact mode.
+    if !exact && (total_hits > cap || any_capped) {
+        (total_hits.min(cap), TotalHitsRelation::Gte)
     } else {
         (total_hits, TotalHitsRelation::Eq)
     }
@@ -2342,6 +2408,14 @@ struct TermCursor<'a> {
     /// Block index `block_ub` was computed for (`usize::MAX` = none yet).
     ub_block: usize,
     block_ub: f64,
+    /// Lazily-built suffix maximum of the per-block score ceilings —
+    /// `suffix_max[b]` bounds any score this term can contribute in block
+    /// `b` or later. Outer `None` = not built yet; inner `None` = the
+    /// source has no stored block summaries (legacy formats), so no cheap
+    /// bound exists and capped-mode early exit must stay off. Built from
+    /// the v5 skip table already parsed in memory — one O(blocks) pass,
+    /// no format change, no I/O.
+    suffix_max: Option<Option<Vec<f64>>>,
 }
 
 impl<'a> TermCursor<'a> {
@@ -2354,6 +2428,7 @@ impl<'a> TermCursor<'a> {
             idx: 0,
             exhausted: source.block_count() == 0,
             corrupt: false,
+            suffix_max: None,
             ub_block: usize::MAX,
             block_ub: 0.0,
             source,
@@ -2417,6 +2492,43 @@ impl<'a> TermCursor<'a> {
         self.exhausted = true;
         self.corrupt = true;
         None
+    }
+
+    /// Upper bound on any score this cursor's term can contribute at or
+    /// after its CURRENT block — the lazily-built suffix maximum of the
+    /// stored per-block ceilings (see the `suffix_max` field). `None`
+    /// when the source lacks stored summaries: the caller must then
+    /// disable capped-mode early exit and keep counting exactly.
+    fn remaining_upper_bound(&mut self, scorer: &Bm25Scorer) -> Option<f64> {
+        if self.suffix_max.is_none() {
+            let n = self.source.block_count();
+            let mut arr: Vec<f64> = Vec::with_capacity(n);
+            let mut all_stored = true;
+            for b in 0..n {
+                match self.source.stored_summary(b) {
+                    Some((max_tf, min_fl)) => {
+                        arr.push(scorer.block_max_score(max_tf, self.df, min_fl));
+                    }
+                    None => {
+                        all_stored = false;
+                        break;
+                    }
+                }
+            }
+            if all_stored {
+                for i in (0..n.saturating_sub(1)).rev() {
+                    arr[i] = arr[i].max(arr[i + 1]);
+                }
+                self.suffix_max = Some(Some(arr));
+            } else {
+                self.suffix_max = Some(None);
+            }
+        }
+        self.suffix_max
+            .as_ref()
+            .and_then(|inner| inner.as_ref())
+            // A cursor past its last block contributes nothing further.
+            .map(|arr| arr.get(self.block).copied().unwrap_or(0.0))
     }
 
     /// BM25 upper bound of the cursor's current block. v5 reads the skip
@@ -2577,6 +2689,11 @@ struct SegmentOutput {
     candidates: Vec<HitCandidate>,
     aggs: HashMap<String, AggregationResults>,
     total_hits: usize,
+    /// True when the multi-term join stopped counting early under a
+    /// count budget (capped mode): `total_hits` is then a lower bound
+    /// (>= the budget), and the response relation must be `gte` even if
+    /// the summed total happens to equal the cap exactly.
+    hits_capped: bool,
 }
 
 fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
@@ -2856,23 +2973,123 @@ mod tests {
     }
 
     #[test]
+    fn capped_mode_early_exit_preserves_page_and_reports_gte() {
+        // V2 of the cap: with a count budget, the multi-term join may stop
+        // walking once the budget is met AND the suffix-max bounds prove
+        // the page can't change. The page must be IDENTICAL to an exact
+        // run's — early exit may only save counting work, never alter
+        // ranking — and the relation must be `gte` even when the reported
+        // (clamped) total equals the cap exactly.
+        let dir = std::env::temp_dir().join("kosha-test-cap-early-exit");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for i in 0..600 {
+            // Every doc matches "alpha beta", with MONOTONICALLY decaying
+            // quality: the first docs carry high tf and short lengths, the
+            // tail low tf and ever-longer padding. The top-10 settles in
+            // the first block and every later block's stored ceiling falls
+            // below the floor — the exact shape the suffix-max early exit
+            // exists for. (Padding varies within the head too so scores
+            // stay unique and ties don't mask ranking bugs.)
+            let tf = if i < 16 { 7 } else { 1 };
+            let text = format!(
+                "{} beta{}",
+                "alpha ".repeat(tf),
+                " pad".repeat(4 + i / 3 + i % 3)
+            );
+            w.add_document(
+                DocumentId(format!("doc-{i:04}")),
+                vec![Field::text("t", text)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 600,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        let mut exact_q = mk_query("alpha beta", 10);
+        exact_q.exact_total_hits = Some(true);
+        let exact = searcher.search(&ns, &manifest, &exact_q, None).unwrap();
+        assert_eq!(exact.total_hits, 600);
+        assert_eq!(exact.total_hits_relation, TotalHitsRelation::Eq);
+
+        let mut capped_q = mk_query("alpha beta", 10);
+        capped_q.exact_total_hits = Some(false);
+        capped_q.total_hits_cap = Some(50);
+        let capped = searcher.search(&ns, &manifest, &capped_q, None).unwrap();
+        assert_eq!(
+            page_ids(&capped),
+            page_ids(&exact),
+            "early exit must never change the page"
+        );
+        assert_eq!(capped.total_hits, 50, "reported total clamps to the cap");
+        assert_eq!(
+            capped.total_hits_relation,
+            TotalHitsRelation::Gte,
+            "an early-exited count is a lower bound even at exactly the cap"
+        );
+
+        // THE discriminating case: cap == the true count. v1 (clamp-only)
+        // reports (600, Eq) here — total never *exceeds* the cap. Only a
+        // genuinely fired early exit marks the count as a lower bound, so
+        // Gte proves the walk actually stopped early rather than the
+        // relation coming from the central clamp.
+        let mut at_count_q = mk_query("alpha beta", 10);
+        at_count_q.exact_total_hits = Some(false);
+        at_count_q.total_hits_cap = Some(600);
+        let at_count = searcher.search(&ns, &manifest, &at_count_q, None).unwrap();
+        assert_eq!(page_ids(&at_count), page_ids(&exact));
+        assert_eq!(
+            at_count.total_hits_relation,
+            TotalHitsRelation::Gte,
+            "cap == true count must still read gte when the exit fired — \
+             if this is Eq the join walked to completion and V2 is inert"
+        );
+
+        // Budget above the true count: the walk completes, count is exact.
+        let mut roomy_q = mk_query("alpha beta", 10);
+        roomy_q.exact_total_hits = Some(false);
+        roomy_q.total_hits_cap = Some(100_000);
+        let roomy = searcher.search(&ns, &manifest, &roomy_q, None).unwrap();
+        assert_eq!(roomy.total_hits, 600);
+        assert_eq!(roomy.total_hits_relation, TotalHitsRelation::Eq);
+        assert_eq!(page_ids(&roomy), page_ids(&exact));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn resolve_total_hits_caps_and_labels_relation() {
         // Under the cap: exact regardless of the `exact` flag.
-        assert_eq!(resolve_total_hits(5, false, 10), (5, TotalHitsRelation::Eq));
-        assert_eq!(resolve_total_hits(5, true, 10), (5, TotalHitsRelation::Eq));
+        assert_eq!(
+            resolve_total_hits(5, false, 10, false),
+            (5, TotalHitsRelation::Eq)
+        );
+        assert_eq!(
+            resolve_total_hits(5, true, 10, false),
+            (5, TotalHitsRelation::Eq)
+        );
         // At the cap exactly: still exact (only *exceeding* the cap flips
         // it — an intersection of precisely `cap` docs has nothing hidden).
         assert_eq!(
-            resolve_total_hits(10, false, 10),
+            resolve_total_hits(10, false, 10, false),
             (10, TotalHitsRelation::Eq)
         );
         // Over the cap: capped + gte, unless exact mode overrides it.
         assert_eq!(
-            resolve_total_hits(50, false, 10),
+            resolve_total_hits(50, false, 10, false),
             (10, TotalHitsRelation::Gte)
         );
         assert_eq!(
-            resolve_total_hits(50, true, 10),
+            resolve_total_hits(50, true, 10, false),
             (50, TotalHitsRelation::Eq)
         );
     }
