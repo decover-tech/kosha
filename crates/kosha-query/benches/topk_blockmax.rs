@@ -262,5 +262,82 @@ fn main() {
         );
     }
 
+    // ── Multi-term AND: leapfrog block-max join vs the legacy HashMap path ──
+    //
+    // "the contract" — two broad Zipfian terms with a large intersection,
+    // the shape that dominates MSMarco-style natural-language queries.
+    //   * legacy: the pre-WAND general path (per-term doc→posting HashMap
+    //     build + retain-intersection), forced via a search_after cursor of
+    //     one empty string — it fails the WAND gate but, under default
+    //     ranking, filters nothing (`doc_id > ""` is true for every doc),
+    //     so hit counts and ranking stay comparable. Same page size as the
+    //     production row, so the two walls are apples to apples.
+    //   * join (production): the leapfrog block-max AND, topk small.
+    //   * a third run with topk=total_docs cross-checks the exact-count
+    //     invariant; its wall time is NOT reported as a speedup — with
+    //     every hit materialized as the page it measures doc_store reads,
+    //     not traversal.
+    let mt_text = "the contract";
+    let mk_legacy = |text: &str, k: usize| {
+        let mut q = mk_query(text, k);
+        q.search_after = Some(vec![String::new()]);
+        q
+    };
+
+    // Warm the caches for the new term.
+    let _ = searcher
+        .search_with_stats(&ns, &manifest, &mk_query(mt_text, topk), None)
+        .unwrap();
+    let _ = searcher
+        .search_with_stats(&ns, &manifest, &mk_legacy(mt_text, topk), None)
+        .unwrap();
+
+    let run_rows = |q: &SearchQuery| -> Vec<Row> {
+        (0..warm_iters)
+            .map(|_| {
+                let t = Instant::now();
+                let (r, stats) = searcher.search_with_stats(&ns, &manifest, q, None).unwrap();
+                let wall_ms = t.elapsed().as_secs_f64() * 1e3;
+                let _ = black_box(stats.score_wall_ms);
+                Row {
+                    total_hits: r.total_hits,
+                    result_count: r.results.len(),
+                    wall_ms,
+                }
+            })
+            .collect()
+    };
+
+    let legacy_rows = run_rows(&mk_legacy(mt_text, topk));
+    let joined_rows = run_rows(&mk_query(mt_text, topk));
+    // Count cross-check only — see the comment block above.
+    let nopr_rows = run_rows(&mk_query(mt_text, total_docs));
+
+    let med_legacy = median_ms(legacy_rows.iter().map(|r| r.wall_ms).collect());
+    let med_joined = median_ms(joined_rows.iter().map(|r| r.wall_ms).collect());
+
+    println!();
+    println!("  Multi-term AND (\"{mt_text}\", topk={topk}):");
+    println!(
+        "    legacy HashMap path   : {:>8.2} ms  (total_hits={})",
+        med_legacy, legacy_rows[0].total_hits
+    );
+    println!(
+        "    leapfrog block-max AND: {:>8.2} ms  (total_hits={})  speedup vs legacy = {:.2}×",
+        med_joined,
+        joined_rows[0].total_hits,
+        med_legacy / med_joined.max(1e-9)
+    );
+    if legacy_rows[0].total_hits == joined_rows[0].total_hits
+        && joined_rows[0].total_hits == nopr_rows[0].total_hits
+    {
+        println!("    ✓ total_hits identical across legacy / pruned / unpruned — exact-count invariant holds");
+    } else {
+        println!(
+            "    ✗ BUG: total_hits diverges (legacy={} pruned={} unpruned={}) — the AND join is wrong",
+            legacy_rows[0].total_hits, joined_rows[0].total_hits, nopr_rows[0].total_hits
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&work);
 }

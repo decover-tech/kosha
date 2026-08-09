@@ -10,7 +10,7 @@ use kosha_core::{
     segment_may_contain_terms, segment_may_match, AggBucket, AggBucketResult, AggCompositeBucket,
     AggCompositeResult, AggMetricResult, Aggregation, AggregationResults, Bm25Params, DocumentId,
     FieldType, FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry, NamespaceId,
-    ScoredDocument, SearchQuery, SearchResult, SortSpec, TermBloomMode,
+    Posting, ScoredDocument, SearchQuery, SearchResult, SortSpec, TermBloomMode,
 };
 use kosha_segment::{tokenize, PostingsMemoryAccount, SegmentReader};
 
@@ -1149,33 +1149,38 @@ impl Searcher {
                 &effective_terms
             };
 
-            // ── Block-max WAND early termination for single-term BM25 queries ──
+            // ── Block-max WAND early termination for plain BM25 queries ──
             //
             // The largest remaining lever on the warm path. A broad Zipfian
             // term like "the" scores 10⁵–10⁶ candidate docs per segment in
             // full, but only the top-`from + max_results` ever reach the
-            // page. Lucene/Elasticsearch prunes blocks whose maximum
+            // page. Lucene/Elasticsearch prunes postings whose maximum
             // achievable score can't reach the running top-k threshold; this
             // is the same pruning applied at Kosha's grain (per segment, per
             // block of 128 postings, BM25-fitted via the
             // [`Bm25Scorer::block_max_score`] upper bound). The Zipfian
             // shape of real terms means a handful of high-tf / short-len docs
             // form a high threshold early, and the long tail of
-            // low-tf / long-len docs lives in blocks whose UB falls below it
-            // — blocks that would take the bulk of `score_ms` today are
-            // skipped entirely. `total_hits` is exact in this path: it's
-            // the term's document frequency in the segment (
-            // `postings.len()`), reported via `SegmentOutput::total_hits`
-            // down-channel — the user-visible count stays correct while
-            // candidates.len() drops from N to ≤ `from + max_results`.
+            // low-tf / long-len docs lives in blocks whose UB falls below it.
+            //
+            //   * single present term: block-by-block walk of the one
+            //     postings list, skipping whole blocks whose UB can't reach
+            //     the k-th-best score. `total_hits` is exact for free —
+            //     it's the term's document frequency (`postings.len()`).
+            //   * multi term (AND semantics, matching the general path): a
+            //     leapfrog cursor join over the terms' doc_seq-sorted
+            //     postings lists — galloping past non-intersecting
+            //     stretches instead of building a doc→posting HashMap per
+            //     term like the general path — with per-term block UBs
+            //     (computed lazily, only for blocks a cursor lands in)
+            //     summed into a per-doc ceiling: once top-k is full, an
+            //     intersection member whose summed UB can't beat the
+            //     k-th-best score is *counted but never scored*.
+            //     `total_hits` stays exact because every intersection
+            //     member is still visited; only the BM25 math and the
+            //     `DocumentId` allocation are skipped. See [`TermCursor`].
             //
             // Guard conditions each have a why-not:
-            //   * multi-term OR/AND: per-term block-max is a per-term UB
-            //     but the total score sums across matching terms — a block
-            //     that can't reach top-k on this term could still place docs
-            //     via another term. The full WAND algorithm coordinates
-            //     blocks across terms (cursor-aligned); leave that for a
-            //     follow-up.
             //   * wildcard: expands to N unknown terms whose per-term block
             //     boundaries don't align.
             //   * phrase / filter / aggs / search_after / custom sort / knn:
@@ -1190,7 +1195,7 @@ impl Searcher {
                 t.get(&entry.segment_id)
                     .is_some_and(|seqs| !seqs.is_empty())
             });
-            let can_block_max_wand = effective_terms.len() == 1
+            let can_block_max_wand = !effective_terms.is_empty()
                 && !is_wildcard_mode
                 && phrase_tokenized.is_none()
                 && query.filter.is_none()
@@ -1200,17 +1205,20 @@ impl Searcher {
                 && query.aggs.is_empty()
                 && !segment_has_tombstones;
             if can_block_max_wand {
-                let term = &effective_terms[0];
-                let Some(postings) = reader.postings(term) else {
-                    // Term not in this segment — contributed zero docs.
+                // Terms absent from this segment are omitted (not treated as
+                // empty lists) — mirroring the general path, whose AND
+                // intersection runs over whatever `postings_for_terms`
+                // returns, i.e. only the terms present in this segment.
+                let term_postings: Vec<(&str, kosha_segment::PostingsRef<'_>)> =
+                    reader.postings_for_terms(terms_for_bm25);
+                if term_postings.is_empty() {
+                    // No query term appears in this segment.
                     return Ok(Some(SegmentOutput {
                         candidates: Vec::new(),
                         aggs: HashMap::new(),
                         total_hits: 0,
                     }));
-                };
-                let df = postings.len() as u32;
-                let total_hits = postings.len();
+                }
 
                 // `from` deep pagination still needs `from + max_results`
                 // candidates per segment to slot the page correctly after
@@ -1218,107 +1226,157 @@ impl Searcher {
                 // `from=20, max_results=5` would otherwise have only 5
                 // candidates and an empty page.
                 let effective_k = query.from.saturating_add(query.max_results);
-                if effective_k == 0 {
-                    // Pure count-only: skip all scoring; total_hits IS df.
+
+                if let [(_, postings)] = term_postings.as_slice() {
+                    // ── Single present term: block-by-block walk ──
+                    let df = postings.len() as u32;
+                    let total_hits = postings.len();
+                    if effective_k == 0 {
+                        // Pure count-only: skip all scoring; total_hits IS df.
+                        return Ok(Some(SegmentOutput {
+                            candidates: Vec::new(),
+                            aggs: HashMap::new(),
+                            total_hits,
+                        }));
+                    }
+
+                    let mut topk = BoundedTopK::new(effective_k);
+                    for block in postings.chunks(WAND_BLOCK_SIZE) {
+                        // Pull max_tf + min_field_length for the block by a
+                        // single cheap pass over the small in-block postings
+                        // slice — `reader.doc_meta` is an in-memory array
+                        // index (no I/O), `WAND_BLOCK_SIZE` is 128 so the
+                        // pass is ~µs even on the hottest term. The result
+                        // is the block's per-doc score ceiling, used as the
+                        // WAND pivot for skip/score below.
+                        let mut max_tf = 0u32;
+                        let mut min_fl = u32::MAX;
+                        for posting in block {
+                            if posting.term_frequency > max_tf {
+                                max_tf = posting.term_frequency;
+                            }
+                            if let Some(meta) = reader.doc_meta(posting.doc_id) {
+                                if meta.field_length < min_fl {
+                                    min_fl = meta.field_length;
+                                }
+                            }
+                        }
+                        if min_fl == u32::MAX {
+                            // block had no resolvable metas — skip it as
+                            // unscorable, treating it as "can't reach" to
+                            // avoid an UB of +inf leaking past the threshold.
+                            continue;
+                        }
+                        // Upper bound for any doc's BM25 score in this block.
+                        let block_ub = scorer.block_max_score(max_tf, df, min_fl);
+
+                        // WAND pivot test: skip the block entirely iff we
+                        // already hold `effective_k` candidates AND the best
+                        // candidate score in the block can't reach the
+                        // current k-th-best. The threshold rises monotonically
+                        // as higher-scoring docs land in `topk`, so later
+                        // buckets face progressively tighter UBs — the long
+                        // tail of low-tf high-dl docs falls off fast for
+                        // Zipfian terms.
+                        if topk.is_full() && block_ub <= topk.floor() {
+                            continue;
+                        }
+                        for posting in block {
+                            let doc_seq = posting.doc_id;
+                            if let Some(meta) = reader.doc_meta(doc_seq) {
+                                let score = scorer.score_term(
+                                    posting.term_frequency,
+                                    df,
+                                    meta.field_length,
+                                );
+                                topk.insert(score, doc_seq, || DocumentId(meta.doc_id.to_owned()));
+                            }
+                        }
+                    }
+
                     return Ok(Some(SegmentOutput {
-                        candidates: Vec::new(),
+                        candidates: topk.into_candidates(&reader),
                         aggs: HashMap::new(),
                         total_hits,
                     }));
                 }
 
-                const BLOCK_SIZE: usize = 128;
-                let mut topk: Vec<(f64, u32, DocumentId)> = Vec::with_capacity(effective_k + 1);
+                // ── Multi-term block-max AND: leapfrog join ──
+                // Cursors stay in query-term order so the per-doc score
+                // summation runs in the same order as the general path's
+                // `term_maps` loop — bit-identical floats, identical ties.
+                let mut cursors: Vec<TermCursor<'_>> = term_postings
+                    .iter()
+                    .map(|(_, postings)| TermCursor::new(postings))
+                    .collect();
 
-                for block in postings.chunks(BLOCK_SIZE) {
-                    // Pull max_tf + min_field_length for the block by a
-                    // single cheap pass over the small in-block postings
-                    // slice — `reader.doc_meta` is an in-memory array
-                    // index (no I/O), `BLOCK_SIZE` is 128 so the pass is
-                    // ~µs even on the hottest term. The result is the
-                    // block's per-doc score ceiling, used as the WAND
-                    // pivot for skip/score below.
-                    let mut max_tf = 0u32;
-                    let mut min_fl = u32::MAX;
-                    for posting in block {
-                        if posting.term_frequency > max_tf {
-                            max_tf = posting.term_frequency;
+                let mut total_hits = 0usize;
+                let mut topk = BoundedTopK::new(effective_k);
+                let mut target: u32 = 0;
+                'join: loop {
+                    // Align every cursor on the smallest doc_seq >= `target`
+                    // present in ALL lists: repeatedly raise the candidate
+                    // to the highest cursor landing until one full pass
+                    // moves nothing (= every cursor agrees).
+                    let mut candidate = target;
+                    loop {
+                        let mut moved = false;
+                        for cursor in cursors.iter_mut() {
+                            match cursor.advance_to(candidate) {
+                                // Some list exhausted → intersection done.
+                                None => break 'join,
+                                Some(doc) if doc > candidate => {
+                                    candidate = doc;
+                                    moved = true;
+                                }
+                                Some(_) => {}
+                            }
                         }
-                        if let Some(meta) = reader.doc_meta(posting.doc_id) {
-                            if meta.field_length < min_fl {
-                                min_fl = meta.field_length;
+                        if !moved {
+                            break;
+                        }
+                    }
+
+                    // Every cursor sits on `candidate`: an intersection
+                    // member. Count it unconditionally — total_hits must
+                    // stay exact — then score it only if its summed
+                    // per-term block ceiling says it could still make the
+                    // page.
+                    if let Some(meta) = reader.doc_meta(candidate) {
+                        total_hits += 1;
+                        if effective_k > 0 {
+                            let prune = topk.is_full() && {
+                                let mut ub = 0.0;
+                                for cursor in cursors.iter_mut() {
+                                    ub += cursor.block_upper_bound(&scorer, &reader);
+                                }
+                                ub <= topk.floor()
+                            };
+                            if !prune {
+                                let mut score = 0.0;
+                                for cursor in &cursors {
+                                    let posting = cursor.current();
+                                    score += scorer.score_term(
+                                        posting.term_frequency,
+                                        cursor.df,
+                                        meta.field_length,
+                                    );
+                                }
+                                topk.insert(score, candidate, || {
+                                    DocumentId(meta.doc_id.to_owned())
+                                });
                             }
                         }
                     }
-                    if min_fl == u32::MAX {
-                        // block had no resolvable metas — skip it as
-                        // unscorable, treating it as "can't reach" to
-                        // avoid an UB of +inf leaking past the threshold.
-                        continue;
-                    }
-                    // Upper bound for any doc's BM25 score in this block.
-                    let block_ub = scorer.block_max_score(max_tf, df, min_fl);
 
-                    // WAND pivot test: skip the block entirely iff we
-                    // already hold `effective_k` candidates AND the best
-                    // candidate score in the block can't reach the
-                    // current k-th-best. The threshold rises monotonically
-                    // as higher-scoring docs land in `topk`, so later
-                    // buckets face progressively tighter UBs — the long
-                    // tail of low-tf high-dl docs falls off fast for
-                    // Zipfian terms.
-                    if topk.len() >= effective_k && block_ub <= topk[effective_k - 1].0 {
-                        continue;
+                    if candidate == u32::MAX {
+                        break;
                     }
-                    // Score every doc in the block; maintain a sorted-
-                    // descending top-(effective_k) vector. Insertion at
-                    // k=10–40 is O(k) — cheaper than the BM25 itself,
-                    // and the entire topk copy never exceeds `effective_k`
-                    // elements.
-                    for posting in block {
-                        let doc_seq = posting.doc_id;
-                        if let Some(meta) = reader.doc_meta(doc_seq) {
-                            let score =
-                                scorer.score_term(posting.term_frequency, df, meta.field_length);
-                            if topk.len() < effective_k {
-                                topk.push((score, doc_seq, DocumentId(meta.doc_id.to_owned())));
-                                if topk.len() == effective_k {
-                                    topk.sort_by(|a, b| {
-                                        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-                                    });
-                                }
-                            } else if score > topk[effective_k - 1].0 {
-                                topk[effective_k - 1] =
-                                    (score, doc_seq, DocumentId(meta.doc_id.to_owned()));
-                                // Bubble the replaced last element up.
-                                let mut i = effective_k - 1;
-                                while i > 0 && topk[i].0 > topk[i - 1].0 {
-                                    topk.swap(i, i - 1);
-                                    i -= 1;
-                                }
-                            }
-                        }
-                    }
+                    target = candidate + 1;
                 }
 
-                // Build the segment's `HitCandidate`s straight from the
-                // topk vec — no intermediate `seg_hits` HashMap, no clone
-                // of every scored doc's doc_id (only the `effective_k` that
-                // survive get a `DocumentId` allocation, vs. all N in the
-                // old path). Each carries an `Arc::clone` of the segment so
-                // the materialize pass can fetch full fields later.
-                let mut candidates = Vec::with_capacity(topk.len());
-                for (score, doc_seq, doc_id) in topk {
-                    candidates.push(HitCandidate {
-                        reader: Arc::clone(&reader),
-                        doc_seq,
-                        doc_id,
-                        score,
-                        sort_values: Vec::new(),
-                    });
-                }
                 return Ok(Some(SegmentOutput {
-                    candidates,
+                    candidates: topk.into_candidates(&reader),
                     aggs: HashMap::new(),
                     total_hits,
                 }));
@@ -1939,6 +1997,186 @@ impl Searcher {
 
 /// Lightweight hit kept through ranking; full field payloads are cloned only
 /// for the final page (see issue #37).
+/// Postings-block granularity for the block-max WAND paths: per-block
+/// `max_tf` / `min_field_length` summaries feed
+/// [`Bm25Scorer::block_max_score`] upper bounds.
+const WAND_BLOCK_SIZE: usize = 128;
+
+/// One term's postings cursor in the multi-term block-max AND join (see the
+/// WAND section of `score_segment`). Valid because postings lists are
+/// stored in ascending `doc_seq` order — the writer appends them in
+/// insertion order — which is what makes the leapfrog intersection and the
+/// gallop in [`Self::advance_to`] correct.
+struct TermCursor<'a> {
+    postings: &'a [Posting],
+    /// The term's document frequency in this segment (`postings.len()`).
+    df: u32,
+    pos: usize,
+    /// Block index `block_ub` was computed for (`usize::MAX` = none yet).
+    ub_block: usize,
+    block_ub: f64,
+}
+
+impl<'a> TermCursor<'a> {
+    fn new(postings: &'a [Posting]) -> Self {
+        debug_assert!(
+            postings.windows(2).all(|w| w[0].doc_id < w[1].doc_id),
+            "postings must be sorted by doc_seq (the writer emits them in insertion order)"
+        );
+        TermCursor {
+            postings,
+            df: postings.len() as u32,
+            pos: 0,
+            ub_block: usize::MAX,
+            block_ub: 0.0,
+        }
+    }
+
+    /// The posting the cursor sits on. Only valid directly after an
+    /// [`Self::advance_to`] that returned `Some`.
+    fn current(&self) -> &Posting {
+        &self.postings[self.pos]
+    }
+
+    /// Position on the first posting with `doc_id >= target` and return its
+    /// doc_id, or `None` when the list is exhausted. Exponential gallop
+    /// from the current position, then a binary search inside the overshoot
+    /// window — amortized O(log gap) per call, so a whole join costs
+    /// O(shortest · log(longest/shortest)) instead of O(sum of lists).
+    fn advance_to(&mut self, target: u32) -> Option<u32> {
+        let postings = self.postings;
+        if self.pos >= postings.len() {
+            return None;
+        }
+        if postings[self.pos].doc_id >= target {
+            return Some(postings[self.pos].doc_id);
+        }
+        // Invariant at loop exit: postings[pos + bound/2].doc_id < target,
+        // and either pos + bound is past the end or its doc_id >= target —
+        // so the first qualifying index lies in (pos + bound/2, pos + bound].
+        let mut bound = 1usize;
+        while self.pos + bound < postings.len() && postings[self.pos + bound].doc_id < target {
+            bound <<= 1;
+        }
+        let lo = self.pos + (bound >> 1) + 1;
+        let hi = postings.len().min(self.pos + bound + 1);
+        let idx = lo + postings[lo..hi].partition_point(|p| p.doc_id < target);
+        self.pos = idx;
+        postings.get(idx).map(|p| p.doc_id)
+    }
+
+    /// BM25 upper bound of the cursor's current 128-posting block, computed
+    /// lazily on first entry into the block and cached until the cursor
+    /// crosses into the next one — blocks the gallop jumps clean over are
+    /// never summarized at all.
+    fn block_upper_bound(
+        &mut self,
+        scorer: &Bm25Scorer,
+        reader: &kosha_segment::SegmentReader,
+    ) -> f64 {
+        let block = self.pos / WAND_BLOCK_SIZE;
+        if block != self.ub_block {
+            let start = block * WAND_BLOCK_SIZE;
+            let end = (start + WAND_BLOCK_SIZE).min(self.postings.len());
+            let mut max_tf = 0u32;
+            let mut min_fl = u32::MAX;
+            for posting in &self.postings[start..end] {
+                if posting.term_frequency > max_tf {
+                    max_tf = posting.term_frequency;
+                }
+                if let Some(meta) = reader.doc_meta(posting.doc_id) {
+                    if meta.field_length < min_fl {
+                        min_fl = meta.field_length;
+                    }
+                }
+            }
+            self.ub_block = block;
+            // A block with no resolvable metas can't contribute score (the
+            // scoring pass skips meta-less docs), so its ceiling is zero.
+            self.block_ub = if min_fl == u32::MAX {
+                0.0
+            } else {
+                scorer.block_max_score(max_tf, self.df, min_fl)
+            };
+        }
+        self.block_ub
+    }
+}
+
+/// Bounded top-k accumulator shared by the block-max WAND paths: unsorted
+/// pushes until `k` entries exist, one sort at the fill point, then O(k)
+/// bubble insertion per replacement — cheaper than a heap at page-sized k,
+/// and behavior-identical to the inline vec the single-term path shipped
+/// with. Entries are `(score, doc_seq, doc_id)`, sorted descending by score
+/// once full.
+struct BoundedTopK {
+    k: usize,
+    entries: Vec<(f64, u32, DocumentId)>,
+}
+
+impl BoundedTopK {
+    fn new(k: usize) -> Self {
+        Self {
+            // `k` derives from `from + max_results`, which callers can make
+            // arbitrarily large — cap the pre-allocation and let growth
+            // amortize past it.
+            entries: Vec::with_capacity(k.saturating_add(1).min(4096)),
+            k,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.entries.len() >= self.k
+    }
+
+    /// The k-th-best score — the WAND pruning threshold. Only meaningful
+    /// when [`Self::is_full`] and `k > 0`.
+    fn floor(&self) -> f64 {
+        self.entries[self.k - 1].0
+    }
+
+    /// Offer one scored doc. `doc_id` is a thunk so the `DocumentId`
+    /// allocation happens only for docs that actually enter the top-k.
+    fn insert(&mut self, score: f64, doc_seq: u32, doc_id: impl FnOnce() -> DocumentId) {
+        if self.k == 0 {
+            return;
+        }
+        if self.entries.len() < self.k {
+            self.entries.push((score, doc_seq, doc_id()));
+            if self.entries.len() == self.k {
+                self.entries
+                    .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        } else if score > self.entries[self.k - 1].0 {
+            self.entries[self.k - 1] = (score, doc_seq, doc_id());
+            // Bubble the replaced last element up.
+            let mut i = self.k - 1;
+            while i > 0 && self.entries[i].0 > self.entries[i - 1].0 {
+                self.entries.swap(i, i - 1);
+                i -= 1;
+            }
+        }
+    }
+
+    /// Build the segment's `HitCandidate`s straight from the top-k vec — no
+    /// intermediate `seg_hits` HashMap, no clone of every scored doc's
+    /// doc_id (only the ≤ k survivors ever got a `DocumentId` allocation).
+    /// Each carries an `Arc::clone` of the segment so the materialize pass
+    /// can fetch full fields later.
+    fn into_candidates(self, reader: &Arc<TrackedSegment>) -> Vec<HitCandidate> {
+        self.entries
+            .into_iter()
+            .map(|(score, doc_seq, doc_id)| HitCandidate {
+                reader: Arc::clone(reader),
+                doc_seq,
+                doc_id,
+                score,
+                sort_values: Vec::new(),
+            })
+            .collect()
+    }
+}
+
 struct HitCandidate {
     /// The segment this hit came from. An `Arc` clone rather than an index
     /// into a shared `Vec` — segments are scored in parallel (see
@@ -1960,12 +2198,14 @@ struct HitCandidate {
 ///
 /// `total_hits` is this segment's total number of matching docs that would
 /// have been scored under the *full* (non-pruned) scoring pass — decoupled
-/// from `candidates.len()` so the block-max WAND early-termination path can
+/// from `candidates.len()` so the block-max WAND early-termination paths can
 /// return only the top-`from + max_results` candidates while still reporting
-/// the true total hit count (the doc frequency of the single query term)
-/// down-channel. The general (non-early-termination) path sets it to
-/// `candidates.len()`, preserving its previous behavior exactly —
-/// early-termination is the only path where the two diverge.
+/// the true total hit count down-channel: the term's doc frequency on the
+/// single-term path, the exact count of intersection members visited by the
+/// leapfrog join on the multi-term AND path. The general
+/// (non-early-termination) path sets it to `candidates.len()`, preserving
+/// its previous behavior exactly — early-termination is the only place the
+/// two diverge.
 struct SegmentOutput {
     candidates: Vec<HitCandidate>,
     aggs: HashMap<String, AggregationResults>,
@@ -3254,6 +3494,277 @@ mod tests {
             .unwrap();
         assert_eq!(r.total_hits, 1);
         assert_eq!(r.results[0].doc_id.0, "both");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Force the general (pre-WAND) scoring path for a query that would
+    /// otherwise take the block-max gate: a `search_after` cursor of one
+    /// empty string fails the gate's emptiness check, while
+    /// `candidate_is_strictly_after_cursor` under default ranking reads it
+    /// as `doc_id > ""` — true for every real doc, so the result set and
+    /// ranking are untouched. (`from` is ignored under search_after, so
+    /// only compare from=0 pages through this helper.)
+    fn force_legacy(mut q: SearchQuery) -> SearchQuery {
+        q.search_after = Some(vec![String::new()]);
+        q
+    }
+
+    /// Corpus for the multi-term WAND parity tests: `n` docs that all
+    /// contain "alpha", ~2/3 contain "beta", ~1/3 contain "gamma", with
+    /// per-doc-distinct term frequencies and padded (varying) field lengths
+    /// so BM25 scores are unique and blocks get real UB spread. `n` well
+    /// above 128 forces multiple postings blocks per term.
+    fn mk_wand_corpus(dir: &std::path::Path, ns: &str, n: usize) -> Manifest {
+        let seg_dir = dir.join(ns).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for i in 0..n {
+            let mut content = format!("{}x", "alpha ".repeat(i % 7 + 1));
+            if i % 3 != 0 {
+                content.push_str(&format!(" {}", "beta ".repeat(i % 5 + 1)));
+            }
+            // Modulus independent of beta's, so "alpha beta gamma" has a
+            // real (i%3≠0 ∧ i%4==0) intersection instead of an empty one.
+            if i % 4 == 0 {
+                content.push_str(&format!(" {}", "gamma ".repeat(i % 4 + 1)));
+            }
+            // Distinct padding length → distinct length norms → no score ties.
+            content.push_str(&" pad".repeat(i % 11));
+            w.add_document(
+                DocumentId(format!("doc-{i:04}")),
+                vec![Field::text("content", content)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: n as u32,
+            }],
+            segment_footers: Default::default(),
+        }
+    }
+
+    fn page_ids(r: &SearchResult) -> Vec<String> {
+        r.results.iter().map(|d| d.doc_id.0.clone()).collect()
+    }
+
+    #[test]
+    fn multi_term_wand_matches_legacy_path_hits_ranking_and_scores() {
+        // The leapfrog block-max AND join must be observably identical to
+        // the general HashMap-intersection path it fast-paths: same
+        // total_hits (exact — the KIZC lesson: a pruning path that bends
+        // the count would look *better* while broken), same page order,
+        // same scores.
+        let dir = std::env::temp_dir().join("kosha-test-wand-parity");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let n = 600; // ≈400 "beta" postings → several 128-posting blocks
+        let manifest = mk_wand_corpus(&dir, &ns.0, n);
+        let searcher = Searcher::new(dir.clone());
+
+        for query_text in ["alpha beta", "alpha beta gamma"] {
+            let wand = searcher
+                .search(&ns, &manifest, &mk_query(query_text, 10), None)
+                .unwrap();
+            let legacy = searcher
+                .search(
+                    &ns,
+                    &manifest,
+                    &force_legacy(mk_query(query_text, 10)),
+                    None,
+                )
+                .unwrap();
+            assert!(wand.total_hits > 0, "{query_text}: corpus must intersect");
+            assert_eq!(
+                wand.total_hits, legacy.total_hits,
+                "{query_text}: pruned path must report the exact hit count"
+            );
+            assert_eq!(
+                page_ids(&wand),
+                page_ids(&legacy),
+                "{query_text}: page ranking must match the legacy path"
+            );
+            for (w_doc, l_doc) in wand.results.iter().zip(legacy.results.iter()) {
+                assert!(
+                    (w_doc.score - l_doc.score).abs() < 1e-9,
+                    "{query_text}: score mismatch on {}: {} vs {}",
+                    w_doc.doc_id.0,
+                    w_doc.score,
+                    l_doc.score
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_term_wand_deep_page_matches_full_sort_slice() {
+        // Same shape as `bounded_topk_selection_matches_full_sort_order`,
+        // but through the multi-term join: a deep page (from=20) must equal
+        // the corresponding slice of an unbounded query — proving the
+        // per-segment top-`from + max_results` bound and the block pruning
+        // don't starve deep pagination.
+        let dir = std::env::temp_dir().join("kosha-test-wand-deep-page");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_wand_corpus(&dir, &ns.0, 600);
+        let searcher = Searcher::new(dir.clone());
+
+        let full = searcher
+            .search(&ns, &manifest, &mk_query("alpha beta", 600), None)
+            .unwrap();
+        let mut deep = mk_query("alpha beta", 5);
+        deep.from = 20;
+        let page = searcher.search(&ns, &manifest, &deep, None).unwrap();
+        assert_eq!(page.total_hits, full.total_hits);
+        assert_eq!(
+            page_ids(&page),
+            page_ids(&full)[20..25].to_vec(),
+            "deep page must match the equivalent slice of a full sort"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_term_wand_absent_term_intersects_present_terms_only() {
+        // Two layers of absent-term handling, and the WAND gate must
+        // preserve both:
+        //   1. With a term bloom in the footer, an absent term AND-prunes
+        //      the whole segment before scoring — zero hits on any path.
+        //   2. Without a bloom (legacy footers, bloom false positives),
+        //      `postings_for_terms` omits the absent term and the general
+        //      path intersects only present terms — "alpha nosuchterm"
+        //      behaves like "alpha". The gate routes that one present term
+        //      through the single-term block walk; it must not treat the
+        //      absent term as an empty list and fabricate zero hits.
+        let dir = std::env::temp_dir().join("kosha-test-wand-absent-term");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_wand_corpus(&dir, &ns.0, 200);
+        let seg_dir = dir.join(&ns.0).join("s1");
+
+        // Layer 1: bloom present → segment pruned, parity at zero.
+        let searcher = Searcher::new(dir.clone());
+        let wand = searcher
+            .search(&ns, &manifest, &mk_query("alpha nosuchterm", 10), None)
+            .unwrap();
+        let legacy = searcher
+            .search(
+                &ns,
+                &manifest,
+                &force_legacy(mk_query("alpha nosuchterm", 10)),
+                None,
+            )
+            .unwrap();
+        assert_eq!(wand.total_hits, 0, "term bloom AND-prunes the segment");
+        assert_eq!(legacy.total_hits, 0);
+
+        // Layer 2: strip the term bloom (pre-bloom segment) → in-segment
+        // present-terms-only intersection semantics.
+        let mut footer = SegmentReader::read_footer(&seg_dir).unwrap();
+        footer.term_bloom = None;
+        std::fs::write(
+            seg_dir.join("footer.json"),
+            serde_json::to_string_pretty(&footer).unwrap(),
+        )
+        .unwrap();
+        let searcher = Searcher::new(dir.clone());
+        let wand = searcher
+            .search(&ns, &manifest, &mk_query("alpha nosuchterm", 10), None)
+            .unwrap();
+        let legacy = searcher
+            .search(
+                &ns,
+                &manifest,
+                &force_legacy(mk_query("alpha nosuchterm", 10)),
+                None,
+            )
+            .unwrap();
+        assert_eq!(wand.total_hits, 200, "every doc contains alpha");
+        assert_eq!(wand.total_hits, legacy.total_hits);
+        assert_eq!(page_ids(&wand), page_ids(&legacy));
+
+        // All query terms absent → zero hits, no candidates, even without
+        // the bloom to prune early.
+        let none = searcher
+            .search(
+                &ns,
+                &manifest,
+                &mk_query("nosuchterm alsomissing", 10),
+                None,
+            )
+            .unwrap();
+        assert_eq!(none.total_hits, 0);
+        assert!(none.results.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_term_wand_disjoint_terms_yield_zero_hits() {
+        // Both terms present in the segment but never in the same doc: the
+        // leapfrog join must exhaust without fabricating an intersection.
+        let dir = std::env::temp_dir().join("kosha-test-wand-disjoint");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for i in 0..300 {
+            let word = if i % 2 == 0 { "even" } else { "odd" };
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![Field::text("content", format!("{word} filler"))],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 300,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let r = searcher
+            .search(&ns, &manifest, &mk_query("even odd", 10), None)
+            .unwrap();
+        assert_eq!(r.total_hits, 0);
+        assert!(r.results.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_term_wand_tombstones_fall_back_to_exact_full_path() {
+        // A segment with live tombstones must bypass the WAND gate — the
+        // pruned join can't subtract tombstoned docs from its exact count.
+        let dir = std::env::temp_dir().join("kosha-test-wand-tombstone");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_wand_corpus(&dir, &ns.0, 60);
+        let searcher = Searcher::new(dir.clone());
+
+        let before = searcher
+            .search(&ns, &manifest, &mk_query("alpha beta", 10), None)
+            .unwrap();
+        // Tombstone the top hit; it must vanish and the count must drop.
+        let top_seq = {
+            let top_id = &before.results[0].doc_id.0;
+            top_id.strip_prefix("doc-").unwrap().parse::<u32>().unwrap()
+        };
+        let mut tombs = std::collections::HashMap::new();
+        tombs.insert(
+            SegmentId("s1".into()),
+            std::collections::HashSet::from([top_seq]),
+        );
+        let after = searcher
+            .search(&ns, &manifest, &mk_query("alpha beta", 10), Some(&tombs))
+            .unwrap();
+        assert_eq!(after.total_hits, before.total_hits - 1);
+        assert!(
+            !page_ids(&after).contains(&before.results[0].doc_id.0),
+            "tombstoned doc must not appear"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -308,6 +308,14 @@ fn measure_format(root: &Path, ns: &NamespaceId, manifest: &Manifest) -> FormatR
             "two_term_and",
             mk_query("contract dispute"),
         ),
+        // Three broad Zipfian terms — the stopword-adjacent natural-language
+        // shape where multi-term scoring cost lives (cf. the MSMarco runs);
+        // tracks the block-max AND join's wins and regressions.
+        (
+            "warm 3-term AND broad",
+            "three_term_and_broad",
+            mk_query("the contract dispute"),
+        ),
         ("warm phrase", "phrase", phrase),
         ("warm wildcard w1*", "wildcard_w1", wildcard),
     ];

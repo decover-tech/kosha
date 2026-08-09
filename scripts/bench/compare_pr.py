@@ -26,10 +26,13 @@ from pathlib import Path
 MARKER = "<!-- kosha-bench-compare -->"
 
 # (json key path under formats.v2, display label). Order = table order.
+# Rows missing from one side render as "–" (e.g. a metric added by the PR
+# under review has no baseline column until it lands on main).
 METRICS = [
     (("cold_broad_ms",), 'cold broad ("the")'),
     (("warm_ms", "broad"), 'warm broad ("the")'),
     (("warm_ms", "two_term_and"), "warm 2-term AND"),
+    (("warm_ms", "three_term_and_broad"), "warm 3-term AND broad"),
     (("warm_ms", "phrase"), "warm phrase"),
     (("warm_ms", "wildcard_w1"), "warm wildcard w1*"),
 ]
