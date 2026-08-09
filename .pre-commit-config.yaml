@@ -41,11 +41,20 @@ repos:
       # before it is sealed. See scripts/commit_bench_section.sh. Mirrored by
       # .github/workflows/pre-commit.yml (which amends the same section onto
       # the PR head commit). Never blocks the commit on a bench failure.
+      #
+      # No `pass_filenames: false` here, unlike the Rust hooks above: for a
+      # `prepare-commit-msg`-stage hook, the "filename" pre-commit appends is
+      # the commit-message file path itself (git's native hook argument),
+      # not a list of changed source files. Setting `pass_filenames: false`
+      # (copy-pasted from cargo-fmt/cargo-clippy above, where it correctly
+      # suppresses per-file args) instead starves `commit_bench_section.sh
+      # hook` of the one argument it requires, so every commit failed with
+      # "hook: missing message file path" — reproduced and confirmed fixed
+      # by this removal.
       - id: kosha-bench-commit-msg
         name: append segment_memory cold/warm latency section to commit message
         entry: scripts/commit_bench_section.sh hook
         language: system
         stages: [prepare-commit-msg]
-        pass_filenames: false
         always_run: true
         minimum_pre_commit_version: "3.2.0"

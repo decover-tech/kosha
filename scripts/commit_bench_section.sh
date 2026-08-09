@@ -164,8 +164,20 @@ attach_to_msg_file() {
 # convention) — fall back to the bare git native positional if unset.
 cmd_hook() {
   local msg="${1:-}"
-  [ -z "$msg" ] && die "hook: missing message file path"
-  [ -f "$msg" ] || die "hook: message file not found: $msg"
+  # A misconfigured pre-commit entry (or any invocation that doesn't supply
+  # the message-file argument) must not block the commit — same "never
+  # blocks on failure" contract as every other soft-fail path below. This
+  # previously `die`d (exit 1), which pre-commit treats as a failed hook and
+  # aborts the commit entirely; a config regression here once blocked every
+  # commit in the repo.
+  if [ -z "$msg" ]; then
+    warn "hook: no message file path given — skipping (commit proceeds)."
+    exit 0
+  fi
+  if [ ! -f "$msg" ]; then
+    warn "hook: message file not found: $msg — skipping (commit proceeds)."
+    exit 0
+  fi
 
   local source="${PRE_COMMIT_COMMIT_MSG_SOURCE:-}"
   case "$source" in
