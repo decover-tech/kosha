@@ -1131,6 +1131,8 @@ impl Searcher {
         // a candidate until it's known to have a shot at the final page.
         let mut seg_hits: HashMap<u32, f64> = HashMap::new();
 
+        let operator = query.operator.unwrap_or(kosha_core::QueryOperator::And);
+
         // ── Wildcard matching ──
         let is_wildcard_mode = query.wildcard.is_some();
         let effective_terms = if let Some(ref wc) = query.wildcard {
@@ -1249,7 +1251,15 @@ impl Searcher {
                 // external stream with no ordering validation, so they take
                 // the order-agnostic general path (a debug_assert alone
                 // would let a release build silently drop hits).
-                && reader.has_ordered_postings();
+                && reader.has_ordered_postings()
+                // OR's WAND join relies on skip-ahead pruning to stay fast,
+                // which is exactly what makes an exact union count
+                // impossible (see the join's doc comment below) — an OR
+                // query in exact-count mode takes the general path's full
+                // union scan instead. AND is unaffected: count_budget ==
+                // None there just disables early exit and walks to
+                // completion on the SAME leapfrog algorithm.
+                && (operator == kosha_core::QueryOperator::And || count_budget.is_some());
             if can_block_max_wand {
                 // The whole WAND attempt is fallible: a corrupt v5 block
                 // detected mid-walk yields `None`, and the query falls
@@ -1377,6 +1387,206 @@ impl Searcher {
                             aggs: HashMap::new(),
                             total_hits,
                             hits_capped: false,
+                        });
+                    }
+
+                    if operator == kosha_core::QueryOperator::Or {
+                        // ── Multi-term block-max OR: WAND pivot join ──
+                        //
+                        // Union membership doesn't need every cursor to
+                        // agree the way AND does — a doc matching just one
+                        // rare term is still a hit — so this can't leapfrog
+                        // to "the next doc every cursor lands on". Instead
+                        // it merges on "the smallest doc any live cursor
+                        // sits on", counting and (UB-permitting) scoring
+                        // each exactly once, same discipline as AND's
+                        // leapfrog: every union member is visited while
+                        // `total_hits` still needs to be trustworthy.
+                        //
+                        // The one thing genuinely unique to OR is what
+                        // happens *after* the count budget is spent
+                        // (`can_skip` below): once `total_hits` has already
+                        // reached the cap, further exactness buys nothing,
+                        // so the join switches to classic WAND pivoting
+                        // (Broder et al.) — cursors sitting before the
+                        // "pivot" doc (the smallest doc whose cumulative
+                        // remaining-ceiling bound, summed cursor by cursor
+                        // in ascending doc order, first reaches the k-th-
+                        // best score) jump straight past whatever they were
+                        // sitting on, because nothing before the pivot
+                        // could ever beat the floor. That skip is where
+                        // `total_hits` stops being trustworthy — hence
+                        // gating it behind the budget already being spent,
+                        // not merely behind top-k being full: pivoting the
+                        // instant top-k fills (irrespective of the cap)
+                        // would silently under-count ordinary queries far
+                        // short of 10_000 hits.
+                        //
+                        // `can_block_max_wand` only allows this branch in
+                        // capped mode (`count_budget.is_some()`) — a
+                        // pivot's skip is never visited, so it can never be
+                        // counted either, and `exact_total_hits: true`
+                        // needs every union member seen. That query takes
+                        // the general path's full union scan instead.
+                        //
+                        // Effective_k == 0 (pure count, e.g. a warmup
+                        // probe) has no ranking to speed up and gets
+                        // nothing from any of this — fall to the general
+                        // path rather than special-casing k == 0 here too.
+                        if effective_k == 0 {
+                            return None;
+                        }
+
+                        let mut cursors: Vec<TermCursor<'_>> =
+                            sources.iter().map(TermCursor::new).collect();
+
+                        // Format guard: pivoting needs every term's
+                        // remaining-ceiling bound. A legacy source with no
+                        // stored block summaries can't supply one —
+                        // abandon the attempt (falls to the general path)
+                        // instead of silently running an unbounded join.
+                        for cursor in cursors.iter_mut() {
+                            cursor.remaining_upper_bound(&scorer)?;
+                        }
+
+                        // Seed every cursor at its first posting.
+                        let mut cur: Vec<Option<u32>> =
+                            cursors.iter_mut().map(|c| c.advance_to(0)).collect();
+
+                        let mut total_hits = 0usize;
+                        let mut hits_capped = false;
+                        let mut topk = BoundedTopK::new(effective_k);
+                        // Set once pivoting proves no remaining combination
+                        // of live terms can ever beat the k-th-best score:
+                        // ranking is fully done, nothing left could ever
+                        // enter the page.
+                        let mut ranking_settled = false;
+
+                        'or_join: loop {
+                            let mut order: Vec<usize> =
+                                (0..cursors.len()).filter(|&i| cur[i].is_some()).collect();
+                            if order.is_empty() {
+                                break 'or_join;
+                            }
+                            order.sort_by_key(|&i| cur[i].unwrap());
+
+                            // Only once the count budget is already spent
+                            // may the walk itself start skipping members —
+                            // see the doc comment above. Before that,
+                            // top-k being full still prunes *scoring*
+                            // below, just never candidate discovery.
+                            let can_skip = count_budget.is_some_and(|cap| total_hits >= cap);
+                            let pivot_pos = if can_skip && !ranking_settled {
+                                let floor = topk.floor();
+                                let mut acc = 0.0;
+                                let mut found = None;
+                                for (pos, &i) in order.iter().enumerate() {
+                                    acc += cursors[i]
+                                        .remaining_upper_bound(&scorer)
+                                        .expect("checked for every cursor before the join");
+                                    if acc >= floor {
+                                        found = Some(pos);
+                                        break;
+                                    }
+                                }
+                                match found {
+                                    Some(pos) => pos,
+                                    None => {
+                                        ranking_settled = true;
+                                        0
+                                    }
+                                }
+                            } else {
+                                0
+                            };
+                            let pivot_doc = cur[order[pivot_pos]].unwrap();
+                            // Sorted ascending, so the smallest live doc is
+                            // always order[0] — strictly less than
+                            // pivot_doc iff something is being skipped.
+                            // Only reachable when can_skip was true above.
+                            if cur[order[0]].unwrap() < pivot_doc {
+                                hits_capped = true;
+                            }
+
+                            // Catch up every cursor sitting *before*
+                            // pivot_doc to pivot_doc itself (not past it):
+                            // a cursor being skipped ahead may independently
+                            // also have a posting exactly at pivot_doc, and
+                            // that only shows up if it's allowed to land
+                            // there before the scoring pass below reads
+                            // `cur[]`. Whatever such a cursor had strictly
+                            // between its old position and pivot_doc is
+                            // still lost (that's the actual skip, already
+                            // flagged as `hits_capped` above) — this just
+                            // makes sure pivot_doc's own score is never
+                            // short a term that's really there.
+                            for i in 0..cursors.len() {
+                                if cur[i].is_some_and(|d| d < pivot_doc) {
+                                    cur[i] = cursors[i].advance_to(pivot_doc);
+                                }
+                            }
+
+                            total_hits += 1;
+                            if let Some(meta) = reader.doc_meta(pivot_doc) {
+                                // Query-term order (0..cursors.len()), not
+                                // doc-sorted `order` — matches the general
+                                // path's `term_maps` summation order bit
+                                // for bit (see the AND join's identical
+                                // note above): identical float rounding,
+                                // identical ties.
+                                let prune = topk.is_full() && {
+                                    let mut ub = 0.0;
+                                    for (i, cursor) in cursors.iter_mut().enumerate() {
+                                        if cur[i] == Some(pivot_doc) {
+                                            ub += cursor.block_upper_bound(&scorer, &reader);
+                                        }
+                                    }
+                                    ub < topk.floor()
+                                };
+                                if !prune {
+                                    let mut score = 0.0;
+                                    for (i, cursor) in cursors.iter().enumerate() {
+                                        if cur[i] == Some(pivot_doc) {
+                                            let sp = cursor.current();
+                                            score += scorer.score_term(
+                                                sp.term_frequency,
+                                                cursor.df,
+                                                meta.field_length,
+                                            );
+                                        }
+                                    }
+                                    topk.insert(score, pivot_doc, meta.doc_id);
+                                }
+                            }
+
+                            // Every cursor that matters is now caught up to
+                            // at most pivot_doc — consume whichever ones
+                            // actually landed exactly on it (just scored).
+                            for i in 0..cursors.len() {
+                                if cur[i] == Some(pivot_doc) {
+                                    cur[i] = if pivot_doc == u32::MAX {
+                                        None
+                                    } else {
+                                        cursors[i].advance_to(pivot_doc + 1)
+                                    };
+                                }
+                            }
+
+                            if ranking_settled {
+                                hits_capped = true;
+                                break 'or_join;
+                            }
+                        }
+
+                        if cursors.iter().any(|c| c.corrupt) {
+                            return None;
+                        }
+
+                        return Some(SegmentOutput {
+                            candidates: topk.into_candidates(&reader),
+                            aggs: HashMap::new(),
+                            total_hits,
+                            hits_capped,
                         });
                     }
 
@@ -1549,10 +1759,13 @@ impl Searcher {
                 doc_frequencies.insert(t, p.len() as u32);
             }
 
-            // ── Postings AND/OR: AND for multi-term queries, OR for wildcard ──
+            // ── Postings AND/OR: AND for multi-term queries, OR for wildcard
+            //    or an explicit `operator: or` ──
             let mut scored: HashMap<u32, f64> = HashMap::new();
-            let use_and =
-                term_postings.len() > 1 && !is_wildcard_mode && phrase_tokenized.is_none();
+            let use_and = term_postings.len() > 1
+                && !is_wildcard_mode
+                && phrase_tokenized.is_none()
+                && operator == kosha_core::QueryOperator::And;
 
             if !use_and {
                 // OR mode (wildcard, phrase, or single term): score any matching doc.
@@ -3024,6 +3237,7 @@ mod tests {
             knn: None,
             exact_total_hits: None,
             total_hits_cap: None,
+            operator: None,
         }
     }
 
@@ -3777,6 +3991,7 @@ mod tests {
             knn: None,
             exact_total_hits: None,
             total_hits_cap: None,
+            operator: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
@@ -4336,6 +4551,241 @@ mod tests {
 
     fn page_ids(r: &SearchResult) -> Vec<String> {
         r.results.iter().map(|d| d.doc_id.0.clone()).collect()
+    }
+
+    fn mk_query_or(text: &str, max: usize) -> SearchQuery {
+        let mut q = mk_query(text, max);
+        q.operator = Some(kosha_core::QueryOperator::Or);
+        q
+    }
+
+    /// Corpus for the OR/WAND join tests: "solar" on every third doc,
+    /// "lunar" on every fourth — genuine partial overlap (every twelfth
+    /// doc has both), so the union differs from either term alone AND
+    /// from their intersection, and dedup at the overlap actually gets
+    /// exercised. `n=600` spans several 128-posting blocks per term, same
+    /// as `mk_wand_corpus`.
+    fn mk_or_corpus(dir: &std::path::Path, ns: &str, n: usize) -> Manifest {
+        let seg_dir = dir.join(ns).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for i in 0..n {
+            let mut content = String::new();
+            if i % 3 == 0 {
+                content.push_str(&"solar ".repeat(i % 6 + 1));
+            }
+            if i % 4 == 0 {
+                content.push_str(&"lunar ".repeat(i % 5 + 1));
+            }
+            if content.is_empty() {
+                content.push_str("filler ");
+            }
+            // Distinct padding length → distinct length norms → no score ties.
+            content.push_str(&"pad ".repeat(i % 11));
+            w.add_document(
+                DocumentId(format!("doc-{i:04}")),
+                vec![Field::text("content", content)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: n as u32,
+            }],
+            segment_footers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn or_query_matches_legacy_path_union_ranking_and_scores() {
+        // Same contract as the AND parity test above, but for `operator:
+        // or`: the WAND pivot join must be observably identical to the
+        // general path's HashMap union branch — same total_hits (both
+        // exact here, well under the default cap), same page order, same
+        // scores.
+        let dir = std::env::temp_dir().join("kosha-test-or-wand-parity");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_or_corpus(&dir, &ns.0, 600);
+        let searcher = Searcher::new(dir.clone());
+
+        let wand = searcher
+            .search(&ns, &manifest, &mk_query_or("solar lunar", 10), None)
+            .unwrap();
+        let legacy = searcher
+            .search(
+                &ns,
+                &manifest,
+                &force_legacy(mk_query_or("solar lunar", 10)),
+                None,
+            )
+            .unwrap();
+        assert!(wand.total_hits > 0, "corpus must have union members");
+        assert_eq!(
+            wand.total_hits, legacy.total_hits,
+            "OR total_hits must match the legacy union scan"
+        );
+        assert_eq!(wand.total_hits_relation, TotalHitsRelation::Eq);
+        assert_eq!(
+            page_ids(&wand),
+            page_ids(&legacy),
+            "OR page ranking must match the legacy path"
+        );
+        for (w_doc, l_doc) in wand.results.iter().zip(legacy.results.iter()) {
+            assert!(
+                (w_doc.score - l_doc.score).abs() < 1e-9,
+                "score mismatch on {}: {} vs {}",
+                w_doc.doc_id.0,
+                w_doc.score,
+                l_doc.score
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn or_query_total_hits_equals_exact_union_cardinality() {
+        // i%3==0: 200 docs (0..600). i%4==0: 150 docs. i%12==0 (both): 50
+        // docs. |union| = 200 + 150 - 50 = 300 — hand-computed so a dedup
+        // bug (double-counting the overlap, or an off-by-one in the pivot
+        // skip) shows up as a wrong number, not just "some number > 0".
+        let dir = std::env::temp_dir().join("kosha-test-or-union-cardinality");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_or_corpus(&dir, &ns.0, 600);
+        let searcher = Searcher::new(dir.clone());
+
+        let r = searcher
+            .search(&ns, &manifest, &mk_query_or("solar lunar", 10), None)
+            .unwrap();
+        assert_eq!(r.total_hits, 300);
+        assert_eq!(r.total_hits_relation, TotalHitsRelation::Eq);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_without_operator_still_defaults_to_and() {
+        // Back-compat pin: the exact same corpus/terms as the OR test
+        // above, but through the default (no `operator` set) query —
+        // must reduce to the intersection (i%12==0 → 50 docs), not the
+        // union, proving `SearchQuery::operator: None` changed nothing
+        // about pre-existing AND behavior.
+        let dir = std::env::temp_dir().join("kosha-test-and-default-still-and");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_or_corpus(&dir, &ns.0, 600);
+        let searcher = Searcher::new(dir.clone());
+
+        let r = searcher
+            .search(&ns, &manifest, &mk_query("solar lunar", 10), None)
+            .unwrap();
+        assert_eq!(r.total_hits, 50);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn or_query_caps_total_hits_and_marks_gte() {
+        // A per-query cap well under the true union size (300): the WAND
+        // OR join must stop early once ranking is settled and the budget
+        // is met, report exactly the cap with relation gte, and still
+        // return a correctly-ranked page (capping the count must never
+        // corrupt the page).
+        let dir = std::env::temp_dir().join("kosha-test-or-cap");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_or_corpus(&dir, &ns.0, 600);
+        let searcher = Searcher::new(dir.clone());
+
+        let mut capped_q = mk_query_or("solar lunar", 5);
+        capped_q.total_hits_cap = Some(10);
+        let capped = searcher.search(&ns, &manifest, &capped_q, None).unwrap();
+        assert_eq!(capped.total_hits, 10);
+        assert_eq!(capped.total_hits_relation, TotalHitsRelation::Gte);
+        assert_eq!(capped.results.len(), 5);
+
+        // The page itself must be untouched by capping — same top-5 as an
+        // uncapped OR query over the identical corpus/terms.
+        let uncapped = searcher
+            .search(&ns, &manifest, &mk_query_or("solar lunar", 5), None)
+            .unwrap();
+        assert_eq!(page_ids(&capped), page_ids(&uncapped));
+        for (c, u) in capped.results.iter().zip(uncapped.results.iter()) {
+            assert!((c.score - u.score).abs() < 1e-9);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn or_query_exact_total_hits_ignores_a_low_cap() {
+        // `exact_total_hits: true` must force the full, exact union count
+        // (300) even with a cap that would otherwise bind — proving the
+        // WAND-skip fast path is bypassed entirely (see
+        // `can_block_max_wand`'s operator/count_budget guard) rather than
+        // just having its counter capped after the fact.
+        let dir = std::env::temp_dir().join("kosha-test-or-exact-ignores-cap");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_or_corpus(&dir, &ns.0, 600);
+        let searcher = Searcher::new(dir.clone());
+
+        let mut q = mk_query_or("solar lunar", 5);
+        q.total_hits_cap = Some(10);
+        q.exact_total_hits = Some(true);
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(r.total_hits, 300);
+        assert_eq!(r.total_hits_relation, TotalHitsRelation::Eq);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn or_query_disjoint_terms_union_is_additive() {
+        // Two terms that never co-occur: total_hits must equal the exact
+        // sum of their document frequencies — no overcounting (each doc
+        // still counted once) and no undercounting (dedup logic mustn't
+        // mistake "different docs, same first cursor position" for a
+        // shared match).
+        let dir = std::env::temp_dir().join("kosha-test-or-disjoint-additive");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let n = 600;
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        let mut alpha_docs = 0usize;
+        let mut beta_docs = 0usize;
+        for i in 0..n {
+            let mut content = String::new();
+            if i % 3 == 0 {
+                content.push_str("alphaterm ");
+                alpha_docs += 1;
+            } else if i % 5 == 0 {
+                content.push_str("betaterm ");
+                beta_docs += 1;
+            } else {
+                content.push_str("filler ");
+            }
+            content.push_str(&"pad ".repeat(i % 11));
+            w.add_document(
+                DocumentId(format!("doc-{i:04}")),
+                vec![Field::text("content", content)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: n as u32,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        let r = searcher
+            .search(&ns, &manifest, &mk_query_or("alphaterm betaterm", 5), None)
+            .unwrap();
+        assert_eq!(r.total_hits, alpha_docs + beta_docs);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4900,6 +5350,7 @@ mod tests {
                     knn: None,
                     exact_total_hits: None,
                     total_hits_cap: None,
+                    operator: None,
                 },
                 None,
             )
@@ -4995,6 +5446,7 @@ mod tests {
                     knn: None,
                     exact_total_hits: None,
                     total_hits_cap: None,
+                    operator: None,
                 },
                 None,
             )
@@ -5065,6 +5517,7 @@ mod tests {
                     knn: None,
                     exact_total_hits: None,
                     total_hits_cap: None,
+                    operator: None,
                 },
                 None,
             )
@@ -5092,6 +5545,7 @@ mod tests {
                     knn: None,
                     exact_total_hits: None,
                     total_hits_cap: None,
+                    operator: None,
                 },
                 None,
             )
@@ -5282,6 +5736,7 @@ mod tests {
             knn: None,
             exact_total_hits: None,
             total_hits_cap: None,
+            operator: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -5361,6 +5816,7 @@ mod tests {
             knn: None,
             exact_total_hits: None,
             total_hits_cap: None,
+            operator: None,
         };
 
         let first = searcher.search(&ns, &manifest, &q, None).unwrap();
@@ -5431,6 +5887,7 @@ mod tests {
             knn: None,
             exact_total_hits: None,
             total_hits_cap: None,
+            operator: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);

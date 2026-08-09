@@ -137,6 +137,7 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         // legacy/pruned/unpruned paths — opt out of the v1 default cap.
         exact_total_hits: Some(true),
         total_hits_cap: None,
+        operator: None,
     }
 }
 

@@ -207,6 +207,7 @@ fn mk_query(text: &str) -> SearchQuery {
         knn: None,
         exact_total_hits: None,
         total_hits_cap: None,
+        operator: None,
     }
 }
 

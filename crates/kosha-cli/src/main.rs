@@ -85,13 +85,18 @@ enum Commands {
         #[arg(long)]
         filter: Option<String>,
         /// Full SearchQuery JSON (@file.json or inline). Overrides query/max/filter.
-        #[arg(long, conflicts_with_all = ["query", "filter", "exact"])]
+        #[arg(long, conflicts_with_all = ["query", "filter", "exact", "or"])]
         body: Option<String>,
         /// Force an exact total_hits count instead of the default capped
         /// (gte) count — see SearchQuery.exact_total_hits. Set
         /// exact_total_hits directly in --body instead when using --body.
         #[arg(long)]
         exact: bool,
+        /// Match a document containing ANY query term instead of requiring
+        /// every term (the default) — see SearchQuery.operator. Set
+        /// operator directly in --body instead when using --body.
+        #[arg(long)]
+        or: bool,
     },
     /// Flush buffered documents to a segment
     Flush {
@@ -212,6 +217,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             filter,
             body,
             exact,
+            or,
         } => {
             if let Some(body_src) = body {
                 let body_val = read_json_arg(&body_src)?;
@@ -234,6 +240,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     knn: None,
                     exact_total_hits: exact.then_some(true),
                     total_hits_cap: None,
+                    operator: or.then_some(kosha_core::QueryOperator::Or),
                 };
                 if let Some(filter_src) = filter {
                     search.filter = Some(serde_json::from_str(&filter_src)?);
@@ -592,6 +599,25 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::Search { exact, .. } => assert!(exact),
+            _ => panic!("expected search"),
+        }
+    }
+
+    #[test]
+    fn parses_search_or_flag() {
+        let cli = Cli::try_parse_from([
+            "kosha",
+            "--host",
+            "http://localhost:8080",
+            "search",
+            "-n",
+            "demo",
+            "breach recall",
+            "--or",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Search { or, .. } => assert!(or),
             _ => panic!("expected search"),
         }
     }

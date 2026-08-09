@@ -101,6 +101,7 @@ fn mk_query(text: &str) -> SearchQuery {
         // it keeps measuring the real number, not the v1 default cap.
         exact_total_hits: Some(true),
         total_hits_cap: None,
+        operator: None,
     }
 }
 
