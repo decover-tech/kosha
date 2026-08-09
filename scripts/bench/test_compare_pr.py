@@ -37,6 +37,7 @@ def report(scale=1.0, segs=8, docs=4000):
                 "warm_ms": {
                     "broad": dist(0.9 * scale),
                     "two_term_and": dist(0.5 * scale),
+                    "three_term_and_broad": dist(2.5 * scale),
                     "phrase": dist(0.4 * scale),
                     "wildcard_w1": dist(15.0 * scale),
                 },
@@ -77,14 +78,15 @@ class TestRender(unittest.TestCase):
             'cold broad ("the")',
             'warm broad ("the")',
             "warm 2-term AND",
+            "warm 3-term AND broad",
             "warm phrase",
             "warm wildcard w1*",
             "resident while open",
         ):
             self.assertIn(label, md)
         # 3 percentile rows per latency metric + memory row
-        self.assertEqual(md.count("| p50 |"), 5)
-        self.assertEqual(md.count("| p99 |"), 5)
+        self.assertEqual(md.count("| p50 |"), 6)
+        self.assertEqual(md.count("| p99 |"), 6)
         self.assertIn("cold n=25, warm n=200", md)
         self.assertNotIn("No baseline", md)
         self.assertNotIn("Corpus mismatch", md)
