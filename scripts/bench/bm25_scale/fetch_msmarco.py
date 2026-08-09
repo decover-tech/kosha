@@ -34,6 +34,10 @@ PASSAGE_FILES = [
     for i in range(60)
 ]
 QUERIES_URL = f"{BASE}/queries_parquet/queries.parquet"
+# Large read blocks: the default HfFileSystem block size makes the fetch
+# range-request-latency-bound (tens of docs/sec); 32MB blocks make it
+# throughput-bound.
+BLOCK_SIZE = 32 * 1024 * 1024
 
 
 def pick_columns(schema_names, id_col, text_col):
@@ -64,8 +68,11 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--docs", type=int, default=10_000_000)
     ap.add_argument("--docs-per-shard", type=int, default=100_000)
-    ap.add_argument("--id-column", default="id")
-    ap.add_argument("--text-column", default="text")
+    # Passages schema: docid/url/title/headings/segment/start_char/end_char/
+    # emb — tpuf-benchmark indexes exactly the `segment` column (its parser
+    # comment: 'parses the "segment" column (index 4)'), so we do too.
+    ap.add_argument("--id-column", default="docid")
+    ap.add_argument("--text-column", default="segment")
     ap.add_argument(
         "--skip-queries", action="store_true", help="corpus shards only"
     )
@@ -81,7 +88,7 @@ def main() -> None:
             print(f"queries.txt already present, keeping ({qpath})")
         else:
             print("fetching queries.parquet ...")
-            with fs.open(QUERIES_URL) as f:
+            with fs.open(QUERIES_URL, block_size=BLOCK_SIZE) as f:
                 pf = pq.ParquetFile(f)
                 names = pf.schema_arrow.names
                 _, qtext = pick_columns(names, args.id_column, args.text_column)
@@ -125,12 +132,12 @@ def main() -> None:
                 break
             name = url.rsplit("/", 1)[-1].split("?")[0]
             print(f"[{docs_written:,}/{args.docs:,}] reading {name} ...")
-            with fs.open(url) as f:
+            with fs.open(url, block_size=BLOCK_SIZE) as f:
                 pf = pq.ParquetFile(f)
                 names = pf.schema_arrow.names
                 ident, text = pick_columns(names, args.id_column, args.text_column)
                 cols = [c for c in (ident, text) if c]
-                for batch in pf.iter_batches(batch_size=8192, columns=cols):
+                for batch in pf.iter_batches(batch_size=32768, columns=cols):
                     d = batch.to_pydict()
                     texts = d[text]
                     ids = d[ident] if ident else [None] * len(texts)
