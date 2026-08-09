@@ -370,3 +370,106 @@ What the remaining phase data points at, in order:
 4. **Residual open cost** — white_river still Σ12 s across 59 opens
    (~204 ms/seg) with filters lazy; the remaining eager work (inverted
    blob read + offsets arena parse) is the tail.
+
+---
+
+# Addendum: 1M-doc Kosha vs OpenSearch comparison (2026-08-08)
+
+Same methodology as the 10M run, at 1M docs (tpuf-style: 8 QPS open-loop,
+topk=10, 120s per phase, 961 requests each, queries sampled from the
+corpus's own Zipfian term distribution). Corpus: `generate_corpus.py
+--docs 1000000 --avg-bytes 900 --seed 42` → 0.86GB text, 10 shards. Load
+generator ran **in-cluster** (a `bench-loader` pod — annotate it
+`karpenter.sh/do-not-disrupt: "true"` or consolidation evicts it mid-run),
+so no port-forward overhead in client walls.
+
+| | |
+|---|---|
+| Kosha namespace | `bm25-bench-1m` — 1,000,000/1,000,000 docs (zero loss; no merge rounds at `KOSHA_FLUSH_THRESHOLD=50000`), 17 segments, 4,437 S3 objects, 2.25GB working set |
+| OpenSearch index | `bm25-bench-1m` — 1,000,000 docs, 5 shards/1 replica, BM25 k1=1.2/b=0.75, forcemerged; domain `decoverai-nonprod-search`, 2× `r8g.large.search` |
+
+## OpenSearch — result
+
+961/961 successes both phases, ~8.0 QPS achieved. Same cold-cache caveat
+as the 10M run (`_cache/clear` only — no page-cache eviction on a managed
+domain; treat "cold" as a lower bound).
+
+| | p50 | p90 | p99 |
+|---|---|---|---|
+| **warm** | **8.6ms** | **11.4ms** | **20.6ms** |
+| "cold" | 8.9ms | 11.7ms | 22.8ms |
+
+## Kosha — the runs, and the three silent-correctness bugs they caught
+
+**First attempt (invalidated):** beautiful latencies, `total_hits=0` on
+every request. Root cause (**PR #83**): `inverted_uses_posting_blobs`
+checked the raw magic of `inverted.idx` without unwrapping the KIZC zstd
+wrapper → query pods never hydrated `postings-*.bin` and the missing-file
+guard was filtered by the same broken gate → silent empties on every
+S3-hydrating read of a compressed split-postings namespace. Ingest pods
+(local blobs) masked it. Old inline-format namespaces unaffected.
+
+**Valid baseline @ #83** (961/961 both phases, 0 errors, real hits):
+
+| | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| cold | 1,328ms | 12,512ms | 14,367ms | 20,051ms |
+| warm | 350ms | 832ms | 1,621ms | 2,303ms |
+
+Cold tail = CPU-HPA scaling 2→5 mid-run (each new pod enters the LB
+cold). Warm = scoring CPU (score_ms 70–830ms) + ~35–130ms unpersisted
+per-doc ranged-GET materialize + 15–130ms per-query hydration-check floor.
+Cold hydration fetched only 0.5–90MB per query (scoring-set-only working
+as designed — never the 2.25GB namespace).
+
+**Same-day optimization arc — #84 → #85 → #86 → #89:**
+
+- **#84** (persist `doc_store.bin` per page-segment) killed the warm
+  materialize term but exposed **non-atomic hydration writes**: cancelled/
+  racing inline 54MB fetches left sticky zero-byte `doc_store.bin` files
+  that read as complete → 20–27% permanent HTTP 500s ("failed to fill
+  whole buffer"). Fixed by **#86** (atomic temp+rename writes; presence
+  checks validate size against the offsets sidecar; existing poison
+  self-heals).
+- **#85** (block-max WAND single-term early termination + namespace-level
+  hydration verdict cache) — the verdict cache skipped the **per-query**
+  posting-blob ensure, so any term whose 1-of-256 blob shard wasn't local
+  yet silently scored zero: **79% of requests returned `total_hits=0`**,
+  non-deterministically per pod. Fixed by **#89** (verdict covers only the
+  static scoring set; blobs ensured every query — sub-ms stats when
+  local).
+
+**Definitive run** (image = main @ #89, fully cold rollout restart; hit
+counts validated — 10% zero-hit ≈ the corpus's legitimate rate; 3
+cold-phase errors (0.3%) were connection drops from a pod still draining
+at bench start; warm 961/961 clean):
+
+| | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| **cold** | 269ms | 2,938ms | 7,907ms | 9,920ms |
+| **warm** | **125ms** | **440ms** | **1,221ms** | 1,694ms |
+
+Server-side warm medians: score 93ms (multi-term full scoring; median
+4.4k hits), hydrate ~10ms (verdict cache + per-query blob stats),
+**materialize 0.2ms** (doc stores local after first touch).
+
+## Standing comparison — 1M docs, 8 QPS, topk=10
+
+| | cold p50 | cold p99 | warm p50 | warm p90 | warm p99 |
+|---|---|---|---|---|---|
+| OpenSearch (cache-clear "cold") | 8.9ms | 22.8ms | 8.6ms | 11.4ms | 20.6ms |
+| Kosha @ #83 (morning) | 1,328ms | 14,367ms | 350ms | 832ms | 1,621ms |
+| **Kosha @ #89 (evening)** | **269ms** | 7,907ms | **125ms** | 440ms | 1,221ms |
+
+One day: cold p50 5×, warm p50 2.8×, correctness verified at every step.
+Remaining gaps, in leverage order:
+
+1. **Multi-term scoring** — the WAND fast path is single-term only; warm
+   p50 is now set by multi-term queries scoring 10³–10⁶ candidates in
+   full. Extending block-max pruning to multi-term (true WAND) is the
+   next ~10× on warm.
+2. **Cold tail is scale-out re-hydration** — HPA-added pods enter the LB
+   cold with no cross-pod cache reuse.
+3. **Harness hardening** — `query_bench.py` should fail any phase whose
+   zero-hit rate exceeds ~20%: two of this arc's three regressions
+   produced *better-looking* latencies while returning nothing.
