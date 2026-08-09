@@ -514,3 +514,53 @@ converging to warm within minutes.
 
 Trajectory: unrunnable → 100× off (round 1 @4QPS) → 34× off at full
 spec, in two days, with every remaining contributor named and owned.
+
+---
+
+# Addendum: 10M MSMarco round 5 — OR-mode + result cache (2026-08-09)
+
+Engine: main @ #110 (adds #104 rarest-first probe, #106 hot-path
+allocs, #108 OR-mode union WAND, #110 whole-response result cache).
+Four 30-minute 8 QPS phases on one build, 57,604 requests total, zero
+errors everywhere.
+
+| phase | p50 | p90 | p99 | zero-hit |
+|---|---|---|---|---|
+| warm, AND, cache-off | 379ms | 1,059ms | 1,857ms | 33% (AND invariant) |
+| warm, OR, cache-off | **174ms** | **309ms** | **481ms** | **0.06%** |
+| warm, OR, cache-on | **6.0ms** | 107ms | 329ms | 0.06% |
+| cold, OR, cache-on | 6.0ms | 104ms | 6,483ms | 0.06% |
+| tpuf published — warm | 13ms | 18ms | 29ms | — |
+| tpuf published — cold | 316ms | 381ms | 559ms | — |
+
+## Findings
+
+1. **OR-mode (#108) is the structural win the roadmap predicted**: −54%
+   p50 and −74% p99 vs AND on the same build, with the p99/p50 ratio
+   tightening from 4.9× to 2.8× (tpuf's shape is 2.2×) — the signature
+   of pruning-friendly union execution. It also ends the 33%-empty-
+   results UX: union matching leaves 0.06% zero-hit.
+2. **The result cache (#110) collapses the protocol's steady state**:
+   warm p50 6.0ms — under tpuf's published 13ms — with 32 cores near
+   idle (load 0.08 vs 25–29 in every uncached phase). The honest
+   framing: the tpuf-benchmark protocol repeats each of 1,677 queries
+   ~8.6× per phase, so cache-on p50 measures the hit path; p90 (107ms)
+   is the miss path, ≈ the cache-off distribution as expected. Engine-
+   vs-engine comparisons should quote the cache-off row unless the
+   competitor's caching posture is known.
+3. **Cold with cache**: p50 6ms immediately (the cache needs no segment
+   warmth), p99 6.5s = the S3 rehydration transient on misses, same
+   cold story as previous rounds underneath a warm hit path.
+
+## Where this leaves the gap
+
+Cache-off OR — the honest engine number — stands at 174/309/481 vs
+13/18/29: ~13× at p50, with the remaining decomposition (probe-measured
+in round 4) split between per-query fixed costs at 167 segments,
+concurrency contention, and union-WAND execution constants. The next
+levers per the roadmap: impact-ordered threshold bootstrapping,
+compaction (blocked on tiered doc-loss), cross-segment floor sharing.
+
+Trajectory across three days: 8 QPS unrunnable → 34× → 13× cache-off,
+and past tpuf's published warm median with the cache the protocol
+rewards.
