@@ -234,7 +234,7 @@ impl SegmentWriter {
             let blob_id = posting_blob_id_for_term(term_str) as u32;
             let blob = &mut posting_blobs[blob_id as usize];
             let p_off = blob.len() as u64;
-            write_postings_varint_delta(blob, postings);
+            write_postings_skip_split(blob, postings, &self.doc_records);
             let p_len = (blob.len() as u64 - p_off) as u32;
             entries.push((term_off, term_str.len() as u32, blob_id, p_off, p_len));
         }
@@ -244,7 +244,7 @@ impl SegmentWriter {
 
         let mut buf = Vec::with_capacity(pool_base as usize + pool.len());
         buf.extend_from_slice(&INVERTED_MAGIC.to_le_bytes());
-        buf.extend_from_slice(&SPLIT_INVERTED_VERSION.to_le_bytes());
+        buf.extend_from_slice(&SKIP_SPLIT_INVERTED_VERSION.to_le_bytes());
         buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(POSTING_BLOB_SHARDS as u32).to_le_bytes());
         for (term_off, term_len, blob_id, p_off, p_len) in entries {
@@ -389,6 +389,15 @@ const FIXED_SPLIT_INVERTED_VERSION: u32 = 3;
 /// Varint/delta split version: same table as v3, with posting blobs encoded
 /// as varints and delta-coded doc ids/positions.
 pub const SPLIT_INVERTED_VERSION: u32 = 4;
+/// Skip-pointer split version: v4's TOC + shard layout, but each term's
+/// blob span is `[n_postings][skip table][scoring bytes][positions bytes]`.
+/// Scoring (BM25/WAND) decodes only `(doc_id, tf)` pairs, block by block;
+/// the per-128-posting skip entries (`last_doc_id`, byte length, `max_tf`,
+/// `min_field_length`) let block-max WAND read upper bounds straight from
+/// the index and skip whole blocks without ever varint-decoding them.
+/// Positions are decoded only by the full [`SegmentReader::postings`] path
+/// (phrase queries, legacy consumers).
+pub const SKIP_SPLIT_INVERTED_VERSION: u32 = 5;
 /// Wrapper magic for a zstd-compressed inverted artifact — applied
 /// independently to the TOC (`inverted.idx`) and to each posting blob
 /// shard, so lazy per-shard fetch/decode is unchanged. The wrapped bytes
@@ -438,7 +447,12 @@ pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
         return false;
     }
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
-    version == FIXED_SPLIT_INVERTED_VERSION || version == SPLIT_INVERTED_VERSION
+    // Every split version lives here, including v5 — omitting a new split
+    // version from this gate is exactly the PR #83 silent-zero-hits bug
+    // (cold reads skip posting-blob hydration and score nothing).
+    version == FIXED_SPLIT_INVERTED_VERSION
+        || version == SPLIT_INVERTED_VERSION
+        || version == SKIP_SPLIT_INVERTED_VERSION
 }
 
 /// First [`INVERTED_HEADER_LEN`] bytes of the *logical* (uncompressed)
@@ -501,7 +515,7 @@ pub struct LazyInvertedIndex {
     data: Vec<u8>,
     term_count: usize,
     /// Decoded-postings LRU — see [`PostingsCache`].
-    cache: PostingsCache,
+    cache: PostingsCache<Arc<Vec<Posting>>>,
 }
 
 pub struct SplitInvertedIndex {
@@ -509,13 +523,21 @@ pub struct SplitInvertedIndex {
     segment_dir: PathBuf,
     term_count: usize,
     encoding: SplitPostingsEncoding,
-    cache: PostingsCache,
+    cache: PostingsCache<Arc<Vec<Posting>>>,
+    /// v5 (skip-split) only: per-term scoring views (skip table + raw
+    /// scoring/positions bytes, block-decoded on demand) — cached
+    /// separately from full decodes because the WAND read path never
+    /// materializes `Vec<Posting>` at all. Same admission/LRU policy.
+    scoring_cache: PostingsCache<Arc<BlockedTermPostings>>,
 }
 
 #[derive(Clone, Copy)]
 enum SplitPostingsEncoding {
     Fixed32,
     VarintDelta,
+    /// v5: `[skip table][scoring (doc,tf)][positions]` per term span — see
+    /// [`BlockedTermPostings`] and [`write_postings_skip_split`].
+    SkipSplit,
 }
 
 /// Checked little-endian u32 read that advances the cursor.
@@ -647,15 +669,14 @@ pub trait PostingsMemoryAccount: Send + Sync {
 /// (insert adds, evict and drop release), so a fleet of open segments'
 /// aggregate decoded postings counts toward the query pod's live-bytes
 /// watermark — bounded by admission, not just the per-segment cap here.
-struct PostingsCache {
+struct PostingsCache<V> {
     max_bytes: usize,
-    state: Mutex<PostingsCacheState>,
+    state: Mutex<PostingsCacheState<V>>,
     account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
 }
 
-#[derive(Default)]
-struct PostingsCacheState {
-    entries: HashMap<usize, (Arc<Vec<Posting>>, usize)>,
+struct PostingsCacheState<V> {
+    entries: HashMap<usize, (V, usize)>,
     recency: VecDeque<usize>,
     total_bytes: usize,
     /// Recently-missed term indices (bounded ring) for second-touch
@@ -668,7 +689,18 @@ struct PostingsCacheState {
 /// blast writing thousands of one-shot entries through it costs nothing.
 const POSTINGS_CACHE_MISS_RING: usize = 256;
 
-impl PostingsCache {
+impl<V> Default for PostingsCacheState<V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            recency: VecDeque::new(),
+            total_bytes: 0,
+            recent_misses: VecDeque::new(),
+        }
+    }
+}
+
+impl<V: Clone> PostingsCache<V> {
     fn new(
         max_bytes: usize,
         account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
@@ -680,12 +712,12 @@ impl PostingsCache {
         }
     }
 
-    fn get(&self, term_index: usize) -> Option<Arc<Vec<Posting>>> {
+    fn get(&self, term_index: usize) -> Option<V> {
         if self.max_bytes == 0 {
             return None;
         }
         let mut st = self.state.lock().unwrap();
-        let hit = st.entries.get(&term_index).map(|(p, _)| Arc::clone(p));
+        let hit = st.entries.get(&term_index).map(|(p, _)| p.clone());
         if hit.is_some() {
             if let Some(pos) = st.recency.iter().position(|k| *k == term_index) {
                 st.recency.remove(pos);
@@ -719,7 +751,7 @@ impl PostingsCache {
         false
     }
 
-    fn insert(&self, term_index: usize, postings: Arc<Vec<Posting>>, bytes: usize) {
+    fn insert(&self, term_index: usize, postings: V, bytes: usize) {
         // An entry bigger than the whole budget would evict everything and
         // then itself churn on every query — don't cache it at all.
         if self.max_bytes == 0 || bytes > self.max_bytes {
@@ -771,7 +803,7 @@ impl PostingsCache {
     }
 }
 
-impl Drop for PostingsCache {
+impl<V> Drop for PostingsCache<V> {
     fn drop(&mut self) {
         // Release whatever this segment's postings cache still holds to the
         // live-bytes account, so `MemoryLedger::live` stays truthful as the
@@ -801,6 +833,16 @@ impl Drop for PostingsCache {
 pub enum PostingsRef<'a> {
     Borrowed(&'a [Posting]),
     Shared(Arc<Vec<Posting>>),
+}
+
+/// Scoring-side postings handle returned by
+/// [`SegmentReader::scoring_postings_for_terms`]: v5 segments hand out the
+/// block-lazy skip-table view; older formats fall back to the classic full
+/// decode (shared with the phrase path and the postings cache), which the
+/// caller walks exactly as before.
+pub enum ScoringPostingsRef<'a> {
+    Blocked(Arc<BlockedTermPostings>),
+    Decoded(PostingsRef<'a>),
 }
 
 impl std::ops::Deref for PostingsRef<'_> {
@@ -980,6 +1022,9 @@ fn decode_postings_bytes(mut buf: &[u8]) -> Option<(Vec<Posting>, usize)> {
 /// offset within the blob, span length, admit-to-cache).
 type PendingBlobReads<'a> = Vec<(usize, &'a str, usize, usize, bool)>;
 
+/// v4 span codec, retained for reading fixtures/tests — the production
+/// writer moved to [`write_postings_skip_split`] (v5).
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_postings_varint_delta(out: &mut Vec<u8>, postings: &[Posting]) {
     put_var_u32(out, postings.len() as u32);
     let mut prev_doc_id = 0u32;
@@ -1026,13 +1071,258 @@ fn decode_postings_varint_delta_bytes(mut buf: &[u8]) -> Option<(Vec<Posting>, u
     Some((postings, approx_bytes))
 }
 
+/// Posting-block granularity of the v5 skip-split encoding. One skip entry
+/// summarizes each block; scoring decode happens a block at a time.
+pub const SCORING_BLOCK_LEN: usize = 128;
+
+/// The scoring-side view of one posting: everything BM25/WAND needs, and
+/// nothing else. `Copy` and 8 bytes flat — a decoded block is a small,
+/// cache-friendly array instead of `Vec<Posting>`'s per-posting heap
+/// positions vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScoringPosting {
+    pub doc_id: u32,
+    pub term_frequency: u32,
+}
+
+/// One skip-table entry: the write-time summary of a 128-posting block.
+/// `max_tf`/`min_field_length` feed the BM25 block upper bound without
+/// touching posting bytes or the doc store; `last_doc_id` drives the
+/// leapfrog gallop; the byte range delimits the block's scoring bytes so a
+/// block decodes standalone (delta base = previous entry's `last_doc_id`).
+#[derive(Clone, Copy, Debug)]
+pub struct ScoringBlockSummary {
+    pub last_doc_id: u32,
+    pub max_tf: u32,
+    pub min_field_length: u32,
+    scoring_start: u32,
+    scoring_end: u32,
+}
+
+/// Serialize one term's postings in the v5 skip-split span layout:
+///
+/// ```text
+/// n_postings: varint
+/// per block (ceil(n/128)): last_doc_id delta from previous block's last
+///                          scoring byte length of the block
+///                          max_tf
+///                          min_field_length          (all varints)
+/// scoring bytes: per posting, doc_id delta from previous posting + tf
+///                (the delta chain runs across blocks; the skip table
+///                provides each block's decode base)
+/// positions bytes: per posting (same ordinal order), n_positions +
+///                  position deltas — read only by the full-postings path
+/// ```
+fn write_postings_skip_split(out: &mut Vec<u8>, postings: &[Posting], doc_records: &[DocRecord]) {
+    put_var_u32(out, postings.len() as u32);
+
+    let mut scoring: Vec<u8> = Vec::new();
+    let mut prev_doc = 0u32;
+    let mut prev_last = 0u32;
+    for block in postings.chunks(SCORING_BLOCK_LEN) {
+        let start = scoring.len();
+        let mut max_tf = 0u32;
+        let mut min_fl = u32::MAX;
+        for posting in block {
+            put_var_u32(&mut scoring, posting.doc_id.wrapping_sub(prev_doc));
+            prev_doc = posting.doc_id;
+            put_var_u32(&mut scoring, posting.term_frequency);
+            max_tf = max_tf.max(posting.term_frequency);
+            if let Some(record) = doc_records.get(posting.doc_id as usize) {
+                min_fl = min_fl.min(record.field_length);
+            }
+        }
+        let last = block.last().expect("chunks yields non-empty blocks").doc_id;
+        put_var_u32(out, last.wrapping_sub(prev_last));
+        prev_last = last;
+        put_var_u32(out, (scoring.len() - start) as u32);
+        put_var_u32(out, max_tf);
+        // An unresolvable field length can only mean a doc_seq outside the
+        // writer's own records (impossible in practice); 0 keeps the upper
+        // bound conservative-valid rather than poisoning it.
+        put_var_u32(out, if min_fl == u32::MAX { 0 } else { min_fl });
+    }
+    out.extend_from_slice(&scoring);
+
+    for posting in postings {
+        put_var_u32(out, posting.positions.len() as u32);
+        let mut prev_pos = 0u32;
+        for &pos in &posting.positions {
+            put_var_u32(out, pos.wrapping_sub(prev_pos));
+            prev_pos = pos;
+        }
+    }
+}
+
+/// One term's parsed v5 span: skip table in memory, scoring/position bytes
+/// shared, blocks decoded strictly on demand — a block the WAND pruning or
+/// the leapfrog gallop steps over is never varint-decoded at all.
+pub struct BlockedTermPostings {
+    doc_count: u32,
+    blocks: Vec<ScoringBlockSummary>,
+    /// The whole term span (skip table + scoring + positions).
+    span: Arc<Vec<u8>>,
+    scoring_base: u32,
+    positions_base: u32,
+}
+
+impl BlockedTermPostings {
+    /// Parse a v5 term span. Validates the skip table against the span
+    /// bounds once, so per-block decode can't walk off the buffer.
+    fn parse(span: Arc<Vec<u8>>) -> Option<Self> {
+        let mut buf: &[u8] = &span;
+        let doc_count = take_var_u32(&mut buf)?;
+        let n_blocks = (doc_count as usize).div_ceil(SCORING_BLOCK_LEN);
+        let mut blocks = Vec::with_capacity(n_blocks);
+        let mut prev_last = 0u32;
+        let mut scoring_off = 0u64;
+        for _ in 0..n_blocks {
+            let last_delta = take_var_u32(&mut buf)?;
+            let len = take_var_u32(&mut buf)?;
+            let max_tf = take_var_u32(&mut buf)?;
+            let min_field_length = take_var_u32(&mut buf)?;
+            let last_doc_id = prev_last.wrapping_add(last_delta);
+            prev_last = last_doc_id;
+            let scoring_start = u32::try_from(scoring_off).ok()?;
+            scoring_off += len as u64;
+            blocks.push(ScoringBlockSummary {
+                last_doc_id,
+                max_tf,
+                min_field_length,
+                scoring_start,
+                scoring_end: u32::try_from(scoring_off).ok()?,
+            });
+        }
+        let scoring_base = span.len() - buf.len();
+        let positions_base = scoring_base as u64 + scoring_off;
+        if positions_base > span.len() as u64 {
+            return None; // scoring section extends past the span
+        }
+        Some(Self {
+            doc_count,
+            blocks,
+            scoring_base: u32::try_from(scoring_base).ok()?,
+            positions_base: u32::try_from(positions_base).ok()?,
+            span,
+        })
+    }
+
+    /// The term's document frequency (number of postings).
+    pub fn doc_count(&self) -> usize {
+        self.doc_count as usize
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn summary(&self, block: usize) -> &ScoringBlockSummary {
+        &self.blocks[block]
+    }
+
+    /// First block at or after `from_block` whose `last_doc_id >= target`
+    /// — the only block that can contain `target`. `None` = exhausted.
+    pub fn find_block(&self, target: u32, from_block: usize) -> Option<usize> {
+        if from_block >= self.blocks.len() {
+            return None;
+        }
+        let rel = self.blocks[from_block..].partition_point(|b| b.last_doc_id < target);
+        let idx = from_block + rel;
+        (idx < self.blocks.len()).then_some(idx)
+    }
+
+    /// Decode block `block`'s `(doc_id, tf)` pairs into `out` (cleared
+    /// first). Returns false on corrupt bytes — callers treat that block
+    /// as contributing nothing, mirroring the lenient `Option` decode of
+    /// the other formats.
+    pub fn read_block(&self, block: usize, out: &mut Vec<ScoringPosting>) -> bool {
+        out.clear();
+        let Some(summary) = self.blocks.get(block) else {
+            return false;
+        };
+        let start = self.scoring_base as usize + summary.scoring_start as usize;
+        let end = self.scoring_base as usize + summary.scoring_end as usize;
+        let Some(mut buf) = self.span.get(start..end) else {
+            return false;
+        };
+        let in_block = block_posting_count(self.doc_count as usize, block);
+        let mut prev_doc = if block == 0 {
+            0
+        } else {
+            self.blocks[block - 1].last_doc_id
+        };
+        for _ in 0..in_block {
+            let Some(doc_delta) = take_var_u32(&mut buf) else {
+                return false;
+            };
+            let Some(term_frequency) = take_var_u32(&mut buf) else {
+                return false;
+            };
+            let doc_id = prev_doc.wrapping_add(doc_delta);
+            prev_doc = doc_id;
+            out.push(ScoringPosting {
+                doc_id,
+                term_frequency,
+            });
+        }
+        true
+    }
+
+    /// Full decode — scoring and positions sections zipped by ordinal into
+    /// the classic `Vec<Posting>`. This is the phrase-query / compat path;
+    /// scoring never calls it.
+    fn decode_full(&self) -> Option<(Vec<Posting>, usize)> {
+        let mut postings: Vec<Posting> = Vec::with_capacity(self.doc_count as usize);
+        let mut block_buf: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
+        let mut positions_buf = self.span.get(self.positions_base as usize..)?;
+        let mut position_count = 0usize;
+        for block in 0..self.blocks.len() {
+            if !self.read_block(block, &mut block_buf) {
+                return None;
+            }
+            for sp in &block_buf {
+                let npos = take_var_u32(&mut positions_buf)? as usize;
+                let mut positions = Vec::with_capacity(npos);
+                let mut prev_pos = 0u32;
+                for _ in 0..npos {
+                    let pos = prev_pos.wrapping_add(take_var_u32(&mut positions_buf)?);
+                    prev_pos = pos;
+                    positions.push(pos);
+                }
+                position_count += npos;
+                postings.push(Posting {
+                    doc_id: sp.doc_id,
+                    term_frequency: sp.term_frequency,
+                    positions,
+                });
+            }
+        }
+        let approx_bytes = postings.len() * std::mem::size_of::<Posting>() + position_count * 4;
+        Some((postings, approx_bytes))
+    }
+
+    /// Resident-byte estimate for the cache: the shared span plus the
+    /// parsed skip table.
+    fn approx_bytes(&self) -> usize {
+        self.span.len() + self.blocks.len() * std::mem::size_of::<ScoringBlockSummary>()
+    }
+}
+
+/// Number of postings in `block` for a term with `doc_count` postings.
+fn block_posting_count(doc_count: usize, block: usize) -> usize {
+    let start = block * SCORING_BLOCK_LEN;
+    doc_count.saturating_sub(start).min(SCORING_BLOCK_LEN)
+}
+
 impl SplitInvertedIndex {
     fn detect(data: &[u8]) -> bool {
         if data.len() < INVERTED_HEADER_LEN || data[0..4] != INVERTED_MAGIC.to_le_bytes() {
             return false;
         }
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        version == FIXED_SPLIT_INVERTED_VERSION || version == SPLIT_INVERTED_VERSION
+        version == FIXED_SPLIT_INVERTED_VERSION
+            || version == SPLIT_INVERTED_VERSION
+            || version == SKIP_SPLIT_INVERTED_VERSION
     }
 
     fn from_bytes(
@@ -1048,6 +1338,7 @@ impl SplitInvertedIndex {
         let encoding = match version {
             FIXED_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::Fixed32,
             SPLIT_INVERTED_VERSION => SplitPostingsEncoding::VarintDelta,
+            SKIP_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::SkipSplit,
             _ => return Err(corrupt(&format!("unsupported version {version}"))),
         };
         let term_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
@@ -1070,7 +1361,8 @@ impl SplitInvertedIndex {
             segment_dir,
             term_count,
             encoding,
-            cache: PostingsCache::new(postings_cache_max_bytes(), account),
+            cache: PostingsCache::new(postings_cache_max_bytes(), account.clone()),
+            scoring_cache: PostingsCache::new(postings_cache_max_bytes(), account),
         };
         for i in 0..term_count {
             let (term_off, term_len, blob_id, _, _) = index.raw_entry(i);
@@ -1176,6 +1468,10 @@ impl SplitInvertedIndex {
                     SplitPostingsEncoding::VarintDelta => {
                         decode_postings_varint_delta_bytes(&blob[p_off..p_end])
                     }
+                    SplitPostingsEncoding::SkipSplit => {
+                        BlockedTermPostings::parse(Arc::new(blob[p_off..p_end].to_vec()))
+                            .and_then(|b| b.decode_full())
+                    }
                 };
                 let Some((postings, approx_bytes)) = decoded else {
                     continue;
@@ -1200,7 +1496,67 @@ impl SplitInvertedIndex {
             SplitPostingsEncoding::VarintDelta => {
                 decode_postings_varint_delta_bytes(&blob[p_off..p_end])
             }
+            SplitPostingsEncoding::SkipSplit => {
+                BlockedTermPostings::parse(Arc::new(blob[p_off..p_end].to_vec()))
+                    .and_then(|b| b.decode_full())
+            }
         }
+    }
+
+    /// Scoring-side batch fetch for the v5 skip-split encoding: per term, a
+    /// shared [`BlockedTermPostings`] (skip table + raw bytes) instead of a
+    /// fully decoded `Vec<Posting>` — positions are never touched, blocks
+    /// decode on demand. Returns `None` when this segment predates v5 so
+    /// the caller can fall back to the full decode path.
+    fn scoring_postings_for_terms<'a>(
+        &'a self,
+        terms: &'a [String],
+    ) -> Option<Vec<(&'a str, Arc<BlockedTermPostings>)>> {
+        if !matches!(self.encoding, SplitPostingsEncoding::SkipSplit) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(terms.len());
+        let mut by_blob: HashMap<usize, PendingBlobReads<'a>> = HashMap::new();
+
+        for term in terms {
+            let Some(i) = self.find(term) else {
+                continue;
+            };
+            if let Some(hit) = self.scoring_cache.get(i) {
+                out.push((term.as_str(), hit));
+                continue;
+            }
+            let admit = self.scoring_cache.admit_on_miss(i);
+            let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
+            by_blob
+                .entry(blob_id)
+                .or_default()
+                .push((i, term.as_str(), p_off, p_len, admit));
+        }
+
+        for (blob_id, spans) in by_blob {
+            let Some(blob) = self.read_posting_blob(blob_id) else {
+                continue;
+            };
+            for (i, term, p_off, p_len, admit) in spans {
+                let Some(p_end) = p_off.checked_add(p_len).filter(|&e| e <= blob.len()) else {
+                    continue;
+                };
+                let Some(parsed) =
+                    BlockedTermPostings::parse(Arc::new(blob[p_off..p_end].to_vec()))
+                else {
+                    continue;
+                };
+                let arc = Arc::new(parsed);
+                if admit {
+                    let bytes = arc.approx_bytes();
+                    self.scoring_cache.insert(i, Arc::clone(&arc), bytes);
+                }
+                out.push((term, arc));
+            }
+        }
+
+        Some(out)
     }
 
     fn read_posting_blob(&self, blob_id: usize) -> Option<Vec<u8>> {
@@ -1508,6 +1864,29 @@ impl SegmentReader {
         terms: &'a [String],
     ) -> Vec<(&'a str, PostingsRef<'a>)> {
         self.inverted.postings_for_terms(terms)
+    }
+
+    /// Postings for the BM25/WAND scoring pass: `(doc_id, tf)` only. On v5
+    /// (skip-split) segments this never decodes positions and hands the
+    /// scorer per-block skip summaries (upper-bound inputs + last doc ids)
+    /// so pruned or galloped-over blocks are never varint-decoded at all;
+    /// on older formats it degrades to the classic full decode.
+    pub fn scoring_postings_for_terms<'a>(
+        &'a self,
+        terms: &'a [String],
+    ) -> Vec<(&'a str, ScoringPostingsRef<'a>)> {
+        if let InvertedAccess::Split(split) = &self.inverted {
+            if let Some(blocked) = split.scoring_postings_for_terms(terms) {
+                return blocked
+                    .into_iter()
+                    .map(|(t, b)| (t, ScoringPostingsRef::Blocked(b)))
+                    .collect();
+            }
+        }
+        self.postings_for_terms(terms)
+            .into_iter()
+            .map(|(t, p)| (t, ScoringPostingsRef::Decoded(p)))
+            .collect()
     }
 
     /// Zero-I/O: `doc_id` + `field_length` for one document, without
@@ -2371,11 +2750,16 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-inverted-v2-roundtrip");
         let expected = write_inverted_fixture(&dir);
 
-        // Sanity: the file on disk really is split v4.
+        // Sanity: the file on disk really is the split layout (v5 today).
         let raw = fs::read(dir.join("inverted.idx")).unwrap();
         assert!(
             SplitInvertedIndex::detect(&raw),
-            "writer should emit the split v4 magic-prefixed layout"
+            "writer should emit the split magic-prefixed layout"
+        );
+        assert_eq!(
+            u32::from_le_bytes(raw[4..8].try_into().unwrap()),
+            SKIP_SPLIT_INVERTED_VERSION,
+            "writer should emit the v5 skip-split version"
         );
 
         let r = SegmentReader::open(dir.clone()).unwrap();
@@ -3306,6 +3690,238 @@ mod tests {
         writer.join().unwrap();
         reader.join().unwrap();
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Write a v4 (varint-delta, no skip table) split index for `index` —
+    /// the format the production writer emitted before v5 — so fallback
+    /// behavior stays covered now that fresh segments are always v5.
+    fn write_varint_split_inverted(dir: &Path, index: &HashMap<String, Vec<Posting>>) {
+        let mut terms: Vec<&String> = index.keys().collect();
+        terms.sort();
+
+        let mut pool: Vec<u8> = Vec::new();
+        let mut posting_blobs: Vec<Vec<u8>> =
+            (0..POSTING_BLOB_SHARDS).map(|_| Vec::new()).collect();
+        let mut entries: Vec<(u64, u32, u32, u64, u32)> = Vec::with_capacity(terms.len());
+        for term_str in &terms {
+            let postings = &index[*term_str];
+            let term_off = pool.len() as u64;
+            pool.extend_from_slice(term_str.as_bytes());
+            let blob_id = posting_blob_id_for_term(term_str) as u32;
+            let blob = &mut posting_blobs[blob_id as usize];
+            let p_off = blob.len() as u64;
+            write_postings_varint_delta(blob, postings);
+            let p_len = (blob.len() as u64 - p_off) as u32;
+            entries.push((term_off, term_str.len() as u32, blob_id, p_off, p_len));
+        }
+
+        let table_len = entries.len() as u64 * SPLIT_INVERTED_TABLE_ENTRY_LEN as u64;
+        let pool_base = INVERTED_HEADER_LEN as u64 + table_len;
+        let mut buf = Vec::with_capacity(pool_base as usize + pool.len());
+        buf.extend_from_slice(&INVERTED_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&SPLIT_INVERTED_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(POSTING_BLOB_SHARDS as u32).to_le_bytes());
+        for (term_off, term_len, blob_id, p_off, p_len) in entries {
+            buf.extend_from_slice(&(pool_base + term_off).to_le_bytes());
+            buf.extend_from_slice(&term_len.to_le_bytes());
+            buf.extend_from_slice(&blob_id.to_le_bytes());
+            buf.extend_from_slice(&p_off.to_le_bytes());
+            buf.extend_from_slice(&p_len.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        buf.extend_from_slice(&pool);
+        fs::write(dir.join("inverted.idx"), maybe_compress_inverted(&buf)).unwrap();
+        for (blob_id, blob) in posting_blobs.into_iter().enumerate() {
+            if !blob.is_empty() {
+                fs::write(
+                    dir.join(posting_blob_file_for_id(blob_id)),
+                    maybe_compress_inverted(&blob),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Multi-block postings fixture: `n` postings with irregular doc_id
+    /// gaps, varied tfs, and a mix of empty and non-empty position lists.
+    fn mk_blocked_postings(n: usize) -> Vec<Posting> {
+        (0..n)
+            .map(|i| Posting {
+                doc_id: (i * 3 + (i % 7)) as u32,
+                term_frequency: (i % 13 + 1) as u32,
+                positions: if i % 4 == 0 {
+                    Vec::new()
+                } else {
+                    (0..(i % 5)).map(|j| (j * 2 + i % 3) as u32).collect()
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn skip_split_span_round_trips_scoring_blocks_and_positions() {
+        // 300 postings → 3 blocks (128/128/44). The span must reproduce,
+        // per block: the exact (doc_id, tf) pairs, write-time skip
+        // summaries matching a brute-force pass, and a full decode
+        // identical to the input (positions included).
+        let postings = mk_blocked_postings(300);
+        let doc_records: Vec<DocRecord> = (0..1000)
+            .map(|i| DocRecord {
+                doc_id: DocumentId(format!("d{i}")),
+                doc_seq: i as u32,
+                field_length: (i % 97 + 5) as u32,
+                fields: Vec::new(),
+            })
+            .collect();
+        let mut span = Vec::new();
+        write_postings_skip_split(&mut span, &postings, &doc_records);
+        let parsed = BlockedTermPostings::parse(Arc::new(span)).expect("span must parse");
+
+        assert_eq!(parsed.doc_count(), 300);
+        assert_eq!(parsed.block_count(), 3);
+
+        let mut buf = Vec::new();
+        for (b, chunk) in postings.chunks(SCORING_BLOCK_LEN).enumerate() {
+            let summary = *parsed.summary(b);
+            assert_eq!(summary.last_doc_id, chunk.last().unwrap().doc_id);
+            assert_eq!(
+                summary.max_tf,
+                chunk.iter().map(|p| p.term_frequency).max().unwrap()
+            );
+            assert_eq!(
+                summary.min_field_length,
+                chunk
+                    .iter()
+                    .map(|p| doc_records[p.doc_id as usize].field_length)
+                    .min()
+                    .unwrap()
+            );
+            assert!(parsed.read_block(b, &mut buf), "block {b} must decode");
+            let expected: Vec<ScoringPosting> = chunk
+                .iter()
+                .map(|p| ScoringPosting {
+                    doc_id: p.doc_id,
+                    term_frequency: p.term_frequency,
+                })
+                .collect();
+            assert_eq!(buf, expected, "block {b} scoring mismatch");
+        }
+
+        let (full, _) = parsed.decode_full().expect("full decode");
+        assert_eq!(full, postings, "positions must survive the round trip");
+
+        // find_block: exact hits, between-blocks targets, and past-the-end.
+        assert_eq!(parsed.find_block(0, 0), Some(0));
+        let b1_first = postings[SCORING_BLOCK_LEN].doc_id;
+        assert_eq!(parsed.find_block(b1_first, 0), Some(1));
+        assert_eq!(parsed.find_block(b1_first, 2), Some(2));
+        let last = postings.last().unwrap().doc_id;
+        assert_eq!(parsed.find_block(last, 0), Some(2));
+        assert_eq!(parsed.find_block(last + 1, 0), None);
+    }
+
+    #[test]
+    fn skip_split_truncated_span_fails_closed() {
+        // Every truncation point must yield a clean parse failure or a
+        // clean block/full decode failure — never a panic, never data from
+        // past the span.
+        let postings = mk_blocked_postings(200);
+        let doc_records: Vec<DocRecord> = (0..700)
+            .map(|i| DocRecord {
+                doc_id: DocumentId(format!("d{i}")),
+                doc_seq: i as u32,
+                field_length: 10,
+                fields: Vec::new(),
+            })
+            .collect();
+        let mut span = Vec::new();
+        write_postings_skip_split(&mut span, &postings, &doc_records);
+
+        for cut in 0..span.len() {
+            let Some(parsed) = BlockedTermPostings::parse(Arc::new(span[..cut].to_vec())) else {
+                continue; // clean parse rejection
+            };
+            // Parse can succeed on a truncated scoring/positions section —
+            // block reads and full decode must then fail closed.
+            let mut buf = Vec::new();
+            for b in 0..parsed.block_count() {
+                let _ = parsed.read_block(b, &mut buf); // must not panic
+            }
+            let _ = parsed.decode_full(); // must not panic
+        }
+    }
+
+    #[test]
+    fn varint_split_v4_still_opens_and_falls_back_to_decoded_scoring() {
+        // Segments written by the previous (v4) writer: full postings
+        // still decode, and the scoring API degrades to the Decoded
+        // variant instead of pretending there's a skip table.
+        let dir = std::env::temp_dir().join("kosha-test-inverted-v4-fallback");
+        let expected = write_inverted_fixture(&dir);
+        write_varint_split_inverted(&dir, &expected);
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        for (term, postings) in &expected {
+            let got = r
+                .postings(term)
+                .unwrap_or_else(|| panic!("missing term {term}"));
+            assert_eq!(&*got, postings.as_slice(), "postings mismatch for {term}");
+        }
+        let terms: Vec<String> = expected.keys().cloned().collect();
+        let scoring = r.scoring_postings_for_terms(&terms);
+        assert_eq!(scoring.len(), terms.len());
+        for (term, s) in scoring {
+            match s {
+                ScoringPostingsRef::Decoded(p) => {
+                    assert_eq!(&*p, expected[term].as_slice());
+                }
+                ScoringPostingsRef::Blocked(_) => {
+                    panic!("v4 segment must not hand out skip-table views")
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skip_split_v5_scoring_is_blocked_and_matches_full_decode() {
+        let dir = std::env::temp_dir().join("kosha-test-inverted-v5-scoring");
+        let expected = write_inverted_fixture(&dir);
+
+        // The freshly-written segment is v5 — and it must pass the posting
+        // -blob hydration gate (the PR #83 silent-zero-hits regression
+        // class: a split version missing from the gate never hydrates its
+        // blobs on cold reads).
+        assert!(
+            inverted_uses_posting_blobs(&dir),
+            "v5 must be recognized by the hydration gate"
+        );
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let terms: Vec<String> = expected.keys().cloned().collect();
+        let mut buf = Vec::new();
+        for (term, s) in r.scoring_postings_for_terms(&terms) {
+            let ScoringPostingsRef::Blocked(blocked) = s else {
+                panic!("v5 segment must hand out skip-table views")
+            };
+            let full = &expected[term];
+            assert_eq!(blocked.doc_count(), full.len());
+            let mut flat: Vec<ScoringPosting> = Vec::new();
+            for b in 0..blocked.block_count() {
+                assert!(blocked.read_block(b, &mut buf));
+                flat.extend_from_slice(&buf);
+            }
+            let expected_flat: Vec<ScoringPosting> = full
+                .iter()
+                .map(|p| ScoringPosting {
+                    doc_id: p.doc_id,
+                    term_frequency: p.term_frequency,
+                })
+                .collect();
+            assert_eq!(flat, expected_flat, "scoring stream mismatch for {term}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

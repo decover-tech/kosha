@@ -10,9 +10,11 @@ use kosha_core::{
     segment_may_contain_terms, segment_may_match, AggBucket, AggBucketResult, AggCompositeBucket,
     AggCompositeResult, AggMetricResult, Aggregation, AggregationResults, Bm25Params, DocumentId,
     FieldType, FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry, NamespaceId,
-    Posting, ScoredDocument, SearchQuery, SearchResult, SortSpec, TermBloomMode,
+    ScoredDocument, SearchQuery, SearchResult, SortSpec, TermBloomMode,
 };
-use kosha_segment::{tokenize, PostingsMemoryAccount, SegmentReader};
+use kosha_segment::{
+    tokenize, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
+};
 
 /// Optional callback the searcher invokes to ensure `doc_store.bin` is
 /// present locally for the segments holding the materialize page — the
@@ -1209,9 +1211,19 @@ impl Searcher {
                 // empty lists) — mirroring the general path, whose AND
                 // intersection runs over whatever `postings_for_terms`
                 // returns, i.e. only the terms present in this segment.
-                let term_postings: Vec<(&str, kosha_segment::PostingsRef<'_>)> =
-                    reader.postings_for_terms(terms_for_bm25);
-                if term_postings.is_empty() {
+                //
+                // v5 (skip-split) segments hand back block-lazy skip-table
+                // views: positions bytes are never decoded on this path,
+                // and a block the pruning or the gallop steps over is never
+                // varint-decoded at all. Older formats degrade to the
+                // classic full decode, walked in the same 128-posting
+                // windows the pre-skip-table code used — identical cost.
+                let sources: Vec<ScoringBlocks<'_>> = reader
+                    .scoring_postings_for_terms(terms_for_bm25)
+                    .into_iter()
+                    .map(|(_, scoring)| ScoringBlocks::new(scoring))
+                    .collect();
+                if sources.is_empty() {
                     // No query term appears in this segment.
                     return Ok(Some(SegmentOutput {
                         candidates: Vec::new(),
@@ -1227,10 +1239,10 @@ impl Searcher {
                 // candidates and an empty page.
                 let effective_k = query.from.saturating_add(query.max_results);
 
-                if let [(_, postings)] = term_postings.as_slice() {
+                if let [source] = sources.as_slice() {
                     // ── Single present term: block-by-block walk ──
-                    let df = postings.len() as u32;
-                    let total_hits = postings.len();
+                    let df = source.doc_count() as u32;
+                    let total_hits = source.doc_count();
                     if effective_k == 0 {
                         // Pure count-only: skip all scoring; total_hits IS df.
                         return Ok(Some(SegmentOutput {
@@ -1241,33 +1253,38 @@ impl Searcher {
                     }
 
                     let mut topk = BoundedTopK::new(effective_k);
-                    for block in postings.chunks(WAND_BLOCK_SIZE) {
-                        // Pull max_tf + min_field_length for the block by a
-                        // single cheap pass over the small in-block postings
-                        // slice — `reader.doc_meta` is an in-memory array
-                        // index (no I/O), `WAND_BLOCK_SIZE` is 128 so the
-                        // pass is ~µs even on the hottest term. The result
-                        // is the block's per-doc score ceiling, used as the
-                        // WAND pivot for skip/score below.
-                        let mut max_tf = 0u32;
-                        let mut min_fl = u32::MAX;
-                        for posting in block {
-                            if posting.term_frequency > max_tf {
-                                max_tf = posting.term_frequency;
-                            }
-                            if let Some(meta) = reader.doc_meta(posting.doc_id) {
-                                if meta.field_length < min_fl {
-                                    min_fl = meta.field_length;
+                    let mut buf: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
+                    for block in 0..source.block_count() {
+                        // The block's per-doc score ceiling. v5 reads it
+                        // straight from the skip entry — no posting decode,
+                        // no doc_meta pass. Legacy formats recompute it by
+                        // the same in-block scan as before (`doc_meta` is an
+                        // in-memory array index; 128 entries is ~µs).
+                        let stored = source.stored_summary(block);
+                        let (max_tf, min_fl) = match stored {
+                            Some(summary) => summary,
+                            None => {
+                                if !source.read_block(block, &mut buf) {
+                                    continue;
                                 }
+                                let mut max_tf = 0u32;
+                                let mut min_fl = u32::MAX;
+                                for sp in &buf {
+                                    max_tf = max_tf.max(sp.term_frequency);
+                                    if let Some(meta) = reader.doc_meta(sp.doc_id) {
+                                        min_fl = min_fl.min(meta.field_length);
+                                    }
+                                }
+                                if min_fl == u32::MAX {
+                                    // block had no resolvable metas — skip it
+                                    // as unscorable, treating it as "can't
+                                    // reach" to avoid an UB of +inf leaking
+                                    // past the threshold.
+                                    continue;
+                                }
+                                (max_tf, min_fl)
                             }
-                        }
-                        if min_fl == u32::MAX {
-                            // block had no resolvable metas — skip it as
-                            // unscorable, treating it as "can't reach" to
-                            // avoid an UB of +inf leaking past the threshold.
-                            continue;
-                        }
-                        // Upper bound for any doc's BM25 score in this block.
+                        };
                         let block_ub = scorer.block_max_score(max_tf, df, min_fl);
 
                         // WAND pivot test: skip the block entirely iff we
@@ -1277,19 +1294,23 @@ impl Searcher {
                         // as higher-scoring docs land in `topk`, so later
                         // buckets face progressively tighter UBs — the long
                         // tail of low-tf high-dl docs falls off fast for
-                        // Zipfian terms.
+                        // Zipfian terms. On v5 a skipped block was never
+                        // decoded in the first place.
                         if topk.is_full() && block_ub <= topk.floor() {
                             continue;
                         }
-                        for posting in block {
-                            let doc_seq = posting.doc_id;
-                            if let Some(meta) = reader.doc_meta(doc_seq) {
-                                let score = scorer.score_term(
-                                    posting.term_frequency,
-                                    df,
-                                    meta.field_length,
-                                );
-                                topk.insert(score, doc_seq, || DocumentId(meta.doc_id.to_owned()));
+                        // v5: only a block that survived the pivot test is
+                        // ever varint-decoded (legacy already decoded above).
+                        if stored.is_some() && !source.read_block(block, &mut buf) {
+                            continue;
+                        }
+                        for sp in &buf {
+                            if let Some(meta) = reader.doc_meta(sp.doc_id) {
+                                let score =
+                                    scorer.score_term(sp.term_frequency, df, meta.field_length);
+                                topk.insert(score, sp.doc_id, || {
+                                    DocumentId(meta.doc_id.to_owned())
+                                });
                             }
                         }
                     }
@@ -1305,10 +1326,8 @@ impl Searcher {
                 // Cursors stay in query-term order so the per-doc score
                 // summation runs in the same order as the general path's
                 // `term_maps` loop — bit-identical floats, identical ties.
-                let mut cursors: Vec<TermCursor<'_>> = term_postings
-                    .iter()
-                    .map(|(_, postings)| TermCursor::new(postings))
-                    .collect();
+                let mut cursors: Vec<TermCursor<'_>> =
+                    sources.iter().map(TermCursor::new).collect();
 
                 let mut total_hits = 0usize;
                 let mut topk = BoundedTopK::new(effective_k);
@@ -1355,9 +1374,9 @@ impl Searcher {
                             if !prune {
                                 let mut score = 0.0;
                                 for cursor in &cursors {
-                                    let posting = cursor.current();
+                                    let sp = cursor.current();
                                     score += scorer.score_term(
-                                        posting.term_frequency,
+                                        sp.term_frequency,
                                         cursor.df,
                                         meta.field_length,
                                     );
@@ -1995,109 +2014,234 @@ impl Searcher {
     }
 }
 
-/// Lightweight hit kept through ranking; full field payloads are cloned only
-/// for the final page (see issue #37).
-/// Postings-block granularity for the block-max WAND paths: per-block
-/// `max_tf` / `min_field_length` summaries feed
-/// [`Bm25Scorer::block_max_score`] upper bounds.
-const WAND_BLOCK_SIZE: usize = 128;
+/// Uniform block-level view over one term's scoring postings for the WAND
+/// paths. v5 (skip-split) segments expose stored skip summaries and decode
+/// 128-posting blocks on demand — pruned or galloped-over blocks are never
+/// varint-decoded; legacy formats expose the same-size windows over the
+/// already-decoded postings, so their cost profile is exactly the
+/// pre-skip-table code's. Valid because postings are stored in ascending
+/// `doc_seq` order (the writer appends them in insertion order).
+enum ScoringBlocks<'a> {
+    Blocked(Arc<kosha_segment::BlockedTermPostings>),
+    Decoded(kosha_segment::PostingsRef<'a>),
+}
 
-/// One term's postings cursor in the multi-term block-max AND join (see the
-/// WAND section of `score_segment`). Valid because postings lists are
-/// stored in ascending `doc_seq` order — the writer appends them in
-/// insertion order — which is what makes the leapfrog intersection and the
-/// gallop in [`Self::advance_to`] correct.
+impl<'a> ScoringBlocks<'a> {
+    fn new(scoring: kosha_segment::ScoringPostingsRef<'a>) -> Self {
+        match scoring {
+            kosha_segment::ScoringPostingsRef::Blocked(b) => Self::Blocked(b),
+            kosha_segment::ScoringPostingsRef::Decoded(p) => {
+                debug_assert!(
+                    p.windows(2).all(|w| w[0].doc_id < w[1].doc_id),
+                    "postings must be sorted by doc_seq"
+                );
+                Self::Decoded(p)
+            }
+        }
+    }
+
+    /// The term's document frequency in this segment.
+    fn doc_count(&self) -> usize {
+        match self {
+            Self::Blocked(b) => b.doc_count(),
+            Self::Decoded(p) => p.len(),
+        }
+    }
+
+    fn block_count(&self) -> usize {
+        match self {
+            Self::Blocked(b) => b.block_count(),
+            Self::Decoded(p) => p.len().div_ceil(SCORING_BLOCK_LEN),
+        }
+    }
+
+    fn last_doc(&self, block: usize) -> u32 {
+        match self {
+            Self::Blocked(b) => b.summary(block).last_doc_id,
+            Self::Decoded(p) => {
+                let end = ((block + 1) * SCORING_BLOCK_LEN).min(p.len());
+                p[end - 1].doc_id
+            }
+        }
+    }
+
+    /// The write-time `(max_tf, min_field_length)` skip summary, when the
+    /// format stores one (v5). `None` → the caller computes the same pair
+    /// from the decoded block, exactly like the pre-skip-table code.
+    fn stored_summary(&self, block: usize) -> Option<(u32, u32)> {
+        match self {
+            Self::Blocked(b) => {
+                let summary = b.summary(block);
+                Some((summary.max_tf, summary.min_field_length))
+            }
+            Self::Decoded(_) => None,
+        }
+    }
+
+    /// First block at or after `from` whose last doc_id is >= `target` —
+    /// the only block that can contain `target`. Binary search either way;
+    /// blocks stepped over are never decoded.
+    fn find_block(&self, target: u32, from: usize) -> Option<usize> {
+        match self {
+            Self::Blocked(b) => b.find_block(target, from),
+            Self::Decoded(p) => {
+                let start = from * SCORING_BLOCK_LEN;
+                if start >= p.len() {
+                    return None;
+                }
+                let idx = start + p[start..].partition_point(|x| x.doc_id < target);
+                (idx < p.len()).then_some(idx / SCORING_BLOCK_LEN)
+            }
+        }
+    }
+
+    /// Decode/copy block `block`'s `(doc_id, tf)` pairs into `out`.
+    fn read_block(&self, block: usize, out: &mut Vec<ScoringPosting>) -> bool {
+        match self {
+            Self::Blocked(b) => b.read_block(block, out),
+            Self::Decoded(p) => {
+                out.clear();
+                let start = block * SCORING_BLOCK_LEN;
+                let Some(window) = p.get(start..(start + SCORING_BLOCK_LEN).min(p.len())) else {
+                    return false;
+                };
+                out.extend(window.iter().map(|posting| ScoringPosting {
+                    doc_id: posting.doc_id,
+                    term_frequency: posting.term_frequency,
+                }));
+                !out.is_empty()
+            }
+        }
+    }
+}
+
+/// One term's cursor in the multi-term block-max AND join (see the WAND
+/// section of `score_segment`): tracks a current block (decoded into a
+/// small reusable buffer) plus an index within it, advancing by skip-table
+/// binary search across blocks and `partition_point` within one — so the
+/// leapfrog never decodes a block it doesn't land in.
 struct TermCursor<'a> {
-    postings: &'a [Posting],
-    /// The term's document frequency in this segment (`postings.len()`).
+    source: &'a ScoringBlocks<'a>,
+    /// The term's document frequency in this segment.
     df: u32,
-    pos: usize,
+    block: usize,
+    /// `buf` holds `block`'s decoded postings.
+    loaded: bool,
+    buf: Vec<ScoringPosting>,
+    idx: usize,
+    exhausted: bool,
     /// Block index `block_ub` was computed for (`usize::MAX` = none yet).
     ub_block: usize,
     block_ub: f64,
 }
 
 impl<'a> TermCursor<'a> {
-    fn new(postings: &'a [Posting]) -> Self {
-        debug_assert!(
-            postings.windows(2).all(|w| w[0].doc_id < w[1].doc_id),
-            "postings must be sorted by doc_seq (the writer emits them in insertion order)"
-        );
+    fn new(source: &'a ScoringBlocks<'a>) -> Self {
         TermCursor {
-            postings,
-            df: postings.len() as u32,
-            pos: 0,
+            df: source.doc_count() as u32,
+            block: 0,
+            loaded: false,
+            buf: Vec::with_capacity(SCORING_BLOCK_LEN),
+            idx: 0,
+            exhausted: source.block_count() == 0,
             ub_block: usize::MAX,
             block_ub: 0.0,
+            source,
         }
     }
 
     /// The posting the cursor sits on. Only valid directly after an
     /// [`Self::advance_to`] that returned `Some`.
-    fn current(&self) -> &Posting {
-        &self.postings[self.pos]
+    fn current(&self) -> ScoringPosting {
+        self.buf[self.idx]
     }
 
     /// Position on the first posting with `doc_id >= target` and return its
-    /// doc_id, or `None` when the list is exhausted. Exponential gallop
-    /// from the current position, then a binary search inside the overshoot
-    /// window — amortized O(log gap) per call, so a whole join costs
-    /// O(shortest · log(longest/shortest)) instead of O(sum of lists).
+    /// doc_id, or `None` when the list is exhausted. Skip-table binary
+    /// search locates the one block that can contain `target` (blocks in
+    /// between are never decoded), then a `partition_point` over the ≤128
+    /// decoded entries lands inside it.
     fn advance_to(&mut self, target: u32) -> Option<u32> {
-        let postings = self.postings;
-        if self.pos >= postings.len() {
-            return None;
+        loop {
+            if self.exhausted {
+                return None;
+            }
+            if self.loaded && self.idx < self.buf.len() && self.buf[self.idx].doc_id >= target {
+                return Some(self.buf[self.idx].doc_id);
+            }
+            // Locate the block that can contain `target`.
+            let located = if !self.loaded {
+                self.source.find_block(target, self.block)
+            } else if self.source.last_doc(self.block) < target {
+                self.source.find_block(target, self.block + 1)
+            } else {
+                Some(self.block)
+            };
+            let Some(block) = located else {
+                self.exhausted = true;
+                return None;
+            };
+            if block != self.block || !self.loaded {
+                self.block = block;
+                if !self.source.read_block(block, &mut self.buf) {
+                    // Corrupt block: stop this term conservatively — the
+                    // same query against the full-decode path would have
+                    // dropped the term entirely at decode.
+                    self.exhausted = true;
+                    return None;
+                }
+                self.loaded = true;
+                self.idx = 0;
+            }
+            self.idx += self.buf[self.idx..].partition_point(|p| p.doc_id < target);
+            if self.idx < self.buf.len() {
+                return Some(self.buf[self.idx].doc_id);
+            }
+            // Only reachable on a short (corrupt) block, since
+            // `last_doc(block) >= target` — try the next block.
+            self.block += 1;
+            self.loaded = false;
+            if self.block >= self.source.block_count() {
+                self.exhausted = true;
+                return None;
+            }
         }
-        if postings[self.pos].doc_id >= target {
-            return Some(postings[self.pos].doc_id);
-        }
-        // Invariant at loop exit: postings[pos + bound/2].doc_id < target,
-        // and either pos + bound is past the end or its doc_id >= target —
-        // so the first qualifying index lies in (pos + bound/2, pos + bound].
-        let mut bound = 1usize;
-        while self.pos + bound < postings.len() && postings[self.pos + bound].doc_id < target {
-            bound <<= 1;
-        }
-        let lo = self.pos + (bound >> 1) + 1;
-        let hi = postings.len().min(self.pos + bound + 1);
-        let idx = lo + postings[lo..hi].partition_point(|p| p.doc_id < target);
-        self.pos = idx;
-        postings.get(idx).map(|p| p.doc_id)
     }
 
-    /// BM25 upper bound of the cursor's current 128-posting block, computed
-    /// lazily on first entry into the block and cached until the cursor
-    /// crosses into the next one — blocks the gallop jumps clean over are
-    /// never summarized at all.
+    /// BM25 upper bound of the cursor's current block. v5 reads the skip
+    /// entry (no decode, no doc_meta); legacy recomputes from the decoded
+    /// buffer exactly like the pre-skip-table cursor. Cached until the
+    /// cursor crosses into the next block.
     fn block_upper_bound(
         &mut self,
         scorer: &Bm25Scorer,
         reader: &kosha_segment::SegmentReader,
     ) -> f64 {
-        let block = self.pos / WAND_BLOCK_SIZE;
-        if block != self.ub_block {
-            let start = block * WAND_BLOCK_SIZE;
-            let end = (start + WAND_BLOCK_SIZE).min(self.postings.len());
-            let mut max_tf = 0u32;
-            let mut min_fl = u32::MAX;
-            for posting in &self.postings[start..end] {
-                if posting.term_frequency > max_tf {
-                    max_tf = posting.term_frequency;
-                }
-                if let Some(meta) = reader.doc_meta(posting.doc_id) {
-                    if meta.field_length < min_fl {
-                        min_fl = meta.field_length;
+        if self.block != self.ub_block {
+            self.ub_block = self.block;
+            let (max_tf, min_fl) = match self.source.stored_summary(self.block) {
+                Some(summary) => summary,
+                None => {
+                    // The cursor sits on an intersection member inside this
+                    // block, so `buf` necessarily holds it.
+                    let mut max_tf = 0u32;
+                    let mut min_fl = u32::MAX;
+                    for sp in &self.buf {
+                        max_tf = max_tf.max(sp.term_frequency);
+                        if let Some(meta) = reader.doc_meta(sp.doc_id) {
+                            min_fl = min_fl.min(meta.field_length);
+                        }
                     }
+                    if min_fl == u32::MAX {
+                        // A block with no resolvable metas can't contribute
+                        // score (the scoring pass skips meta-less docs).
+                        self.block_ub = 0.0;
+                        return 0.0;
+                    }
+                    (max_tf, min_fl)
                 }
-            }
-            self.ub_block = block;
-            // A block with no resolvable metas can't contribute score (the
-            // scoring pass skips meta-less docs), so its ceiling is zero.
-            self.block_ub = if min_fl == u32::MAX {
-                0.0
-            } else {
-                scorer.block_max_score(max_tf, self.df, min_fl)
             };
+            self.block_ub = scorer.block_max_score(max_tf, self.df, min_fl);
         }
         self.block_ub
     }
