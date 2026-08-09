@@ -90,6 +90,17 @@ fn build_corpus(
             for _ in 0..WORDS_PER_DOC {
                 words.push(vocab_word(rng.zipfish(vocab)));
             }
+            // A deliberately rare term, injected into exactly 3 documents
+            // regardless of corpus size — the Zipfian draw above doesn't
+            // reliably produce a truly rare (single/handful-of-hits) term
+            // even at high ranks (its density only falls off as 1/sqrt(k),
+            // not sharply). "needle" gives the essential-term join bench
+            // section a genuine "huge lists, tiny intersection" case: AND
+            // it with "the"/"contract" (near-every-doc terms) and the
+            // 3-doc intersection is exactly the needle's postings.
+            if s == 0 && d < 3.min(docs) {
+                words.push("needle".into());
+            }
             w.add_document(
                 DocumentId(format!("s{s}-d{d}")),
                 vec![Field::text("t", words.join(" "))],
@@ -319,6 +330,97 @@ fn main() {
         println!(
             "    ✗ BUG: total_hits diverges (legacy={} pruned={} unpruned={}) — the AND join is wrong",
             legacy_rows[0].total_hits, joined_rows[0].total_hits, nopr_rows[0].total_hits
+        );
+    }
+
+    // ── Skewed AND: essential-term join vs symmetric leapfrog ──────────
+    //
+    // "the contract needle" — two stopword-scale dense terms ANDed with a
+    // 3-doc rare term (injected by `build_corpus`, independent of corpus
+    // size). This is the pathological case for a round-robin leapfrog:
+    // every cursor participates in raising the candidate, so the huge
+    // terms' cursors get walked through the whole doc range even though
+    // the final intersection is 3 docs. The essential-term join instead
+    // drives candidate discovery off the smallest list ("needle") alone
+    // and only *probes* "the"/"contract" once per driver candidate — see
+    // the doc comment on `score_segment`'s multi-term arm.
+    let skew_text = "the contract needle";
+    let _ = searcher
+        .search_with_stats(&ns, &manifest, &mk_query(skew_text, topk), None)
+        .unwrap();
+    let _ = searcher
+        .search_with_stats(&ns, &manifest, &mk_legacy(skew_text, topk), None)
+        .unwrap();
+    let skew_legacy_rows = run_rows(&mk_legacy(skew_text, topk));
+    let skew_joined_rows = run_rows(&mk_query(skew_text, topk));
+    let med_skew_legacy_score = median_ms(skew_legacy_rows.iter().map(|r| r.score_ms).collect());
+    let med_skew_joined_score = median_ms(skew_joined_rows.iter().map(|r| r.score_ms).collect());
+    let med_skew_legacy = median_ms(skew_legacy_rows.iter().map(|r| r.wall_ms).collect());
+    let med_skew_joined = median_ms(skew_joined_rows.iter().map(|r| r.wall_ms).collect());
+
+    println!();
+    println!("  Skewed AND (\"{skew_text}\", huge lists + 3-doc rare term, topk={topk}):");
+    println!(
+        "    legacy HashMap path    : score {:>8.2} ms | wall {:>8.2} ms  (total_hits={})",
+        med_skew_legacy_score, med_skew_legacy, skew_legacy_rows[0].total_hits
+    );
+    println!(
+        "    essential-term AND join: score {:>8.2} ms | wall {:>8.2} ms  (total_hits={})  scoring speedup vs legacy = {:.2}×",
+        med_skew_joined_score,
+        med_skew_joined,
+        skew_joined_rows[0].total_hits,
+        med_skew_legacy_score / med_skew_joined_score.max(1e-9)
+    );
+    if skew_legacy_rows[0].total_hits == skew_joined_rows[0].total_hits {
+        println!("    ✓ total_hits identical — exact-count invariant holds on the skewed case too");
+    } else {
+        println!(
+            "    ✗ BUG: total_hits diverges (legacy={} join={})",
+            skew_legacy_rows[0].total_hits, skew_joined_rows[0].total_hits
+        );
+    }
+
+    // ── Balanced AND: no single dominant rarest term ────────────────────
+    //
+    // The counterpoint to the skewed case above: five mid-frequency terms
+    // (ranks 50/55/60/65/70 — none of them stopword-scale, none of them
+    // near-unique) narrowing combinatorially to a small intersection. This
+    // is the shape a fixed single-driver design (walk the smallest list,
+    // probe the rest) regresses on — probing already costs the same
+    // O(log blocks) as walking, since every term here uses the same
+    // skip-table `advance_to`, so a fixed driver just gives up the
+    // round-robin's ability to raise the candidate using whichever cursor
+    // currently knows the most. Rarest-first *alignment order* (what's
+    // actually implemented) keeps that adaptivity and still front-loads
+    // the cheap rejections — this section is the regression guard for that
+    // choice, not a speedup demo.
+    let bal_text = "w50 w55 w60 w65 w70";
+    let _ = searcher
+        .search_with_stats(&ns, &manifest, &mk_query(bal_text, topk), None)
+        .unwrap();
+    let _ = searcher
+        .search_with_stats(&ns, &manifest, &mk_legacy(bal_text, topk), None)
+        .unwrap();
+    let bal_legacy_rows = run_rows(&mk_legacy(bal_text, topk));
+    let bal_joined_rows = run_rows(&mk_query(bal_text, topk));
+    let med_bal_legacy_score = median_ms(bal_legacy_rows.iter().map(|r| r.score_ms).collect());
+    let med_bal_joined_score = median_ms(bal_joined_rows.iter().map(|r| r.score_ms).collect());
+    println!();
+    println!("  Balanced AND (\"{bal_text}\", 5 mid-frequency terms, topk={topk}):");
+    println!(
+        "    legacy HashMap path    : score {:>8.2} ms  (total_hits={})",
+        med_bal_legacy_score, bal_legacy_rows[0].total_hits
+    );
+    println!(
+        "    essential-term AND join: score {:>8.2} ms  (total_hits={})  scoring speedup vs legacy = {:.2}×",
+        med_bal_joined_score,
+        bal_joined_rows[0].total_hits,
+        med_bal_legacy_score / med_bal_joined_score.max(1e-9)
+    );
+    if bal_legacy_rows[0].total_hits != bal_joined_rows[0].total_hits {
+        println!(
+            "    ✗ BUG: total_hits diverges (legacy={} join={})",
+            bal_legacy_rows[0].total_hits, bal_joined_rows[0].total_hits
         );
     }
 
