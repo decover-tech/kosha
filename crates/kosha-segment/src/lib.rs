@@ -576,6 +576,15 @@ pub struct SplitInvertedIndex {
     /// separately from full decodes because the WAND read path never
     /// materializes `Vec<Posting>` at all. Same admission/LRU policy.
     scoring_cache: PostingsCache<Arc<BlockedTermPostings>>,
+    /// Set when a term the TOC *contains* could not be served because its
+    /// posting-blob shard failed to read or decode (evicted from the disk
+    /// cache, truncated, corrupt). Distinguishes "term absent" (a normal
+    /// non-match) from "term unreadable" — without the distinction, a blob
+    /// evicted after a presence check silently scores as zero hits (the
+    /// PR #83 failure class). Readers drain it via
+    /// [`SegmentReader::take_blob_read_failure`] and must surface an error
+    /// instead of returning results that silently omit the term.
+    blob_read_failure: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -1432,6 +1441,7 @@ impl SplitInvertedIndex {
             encoding,
             cache: PostingsCache::new(postings_cache_max_bytes(), account.clone()),
             scoring_cache: PostingsCache::new(postings_cache_max_bytes(), account),
+            blob_read_failure: std::sync::atomic::AtomicBool::new(false),
         };
         for i in 0..term_count {
             let (term_off, term_len, blob_id, _, _) = index.raw_entry(i);
@@ -1535,10 +1545,14 @@ impl SplitInvertedIndex {
 
         for (blob_id, spans) in by_blob {
             let Some(blob) = self.read_posting_blob(blob_id) else {
+                // Every term queued on this shard was TOC-present; the
+                // shard itself is unreadable (evicted/corrupt).
+                self.note_blob_read_failure();
                 continue;
             };
             for (i, slot, term, p_off, p_len, admit) in spans {
                 let Some(p_end) = p_off.checked_add(p_len).filter(|&e| e <= blob.len()) else {
+                    self.note_blob_read_failure();
                     continue;
                 };
                 let decoded = match self.encoding {
@@ -1552,6 +1566,7 @@ impl SplitInvertedIndex {
                     }
                 };
                 let Some((postings, approx_bytes)) = decoded else {
+                    self.note_blob_read_failure();
                     continue;
                 };
                 let arc = Arc::new(postings);
@@ -1566,6 +1581,18 @@ impl SplitInvertedIndex {
     }
 
     fn decode_postings(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
+        let decoded = self.decode_postings_inner(i);
+        if decoded.is_none() {
+            // The TOC contains this term (callers only reach here after
+            // `find` succeeded) but its blob shard couldn't serve it —
+            // evicted, truncated, or corrupt. Flag it so the query layer
+            // can error instead of silently treating the term as absent.
+            self.note_blob_read_failure();
+        }
+        decoded
+    }
+
+    fn decode_postings_inner(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
         let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
         let blob = self.read_posting_blob(blob_id)?;
         let p_end = p_off.checked_add(p_len).filter(|&e| e <= blob.len())?;
@@ -1579,6 +1606,19 @@ impl SplitInvertedIndex {
                     .and_then(|b| b.decode_full())
             }
         }
+    }
+
+    fn note_blob_read_failure(&self) {
+        self.blob_read_failure
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drain the "a TOC-present term's blob shard failed to read" flag —
+    /// see the field doc. Cleared on read so one surfaced error doesn't
+    /// echo forever.
+    fn take_blob_read_failure(&self) -> bool {
+        self.blob_read_failure
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Scoring-side batch fetch for the v5 skip-split encoding: per term, a
@@ -1622,15 +1662,20 @@ impl SplitInvertedIndex {
 
         for (blob_id, spans) in by_blob {
             let Some(blob) = self.read_posting_blob(blob_id) else {
+                // Every term queued on this shard was TOC-present; the
+                // shard itself is unreadable (evicted/corrupt).
+                self.note_blob_read_failure();
                 continue;
             };
             for (i, slot, term, p_off, p_len, admit) in spans {
                 let Some(p_end) = p_off.checked_add(p_len).filter(|&e| e <= blob.len()) else {
+                    self.note_blob_read_failure();
                     continue;
                 };
                 let Some(parsed) =
                     BlockedTermPostings::parse(Arc::new(blob[p_off..p_end].to_vec()))
                 else {
+                    self.note_blob_read_failure();
                     continue;
                 };
                 let arc = Arc::new(parsed);
@@ -1968,6 +2013,19 @@ impl SegmentReader {
     /// scorer per-block skip summaries (upper-bound inputs + last doc ids)
     /// so pruned or galloped-over blocks are never varint-decoded at all;
     /// on older formats it degrades to the classic full decode.
+    /// Drain the split index's "a TOC-present term's posting blob failed to
+    /// read" flag. Queries must check this after fetching postings and
+    /// surface an error: silently omitting an unreadable term returns
+    /// wrong results that look like normal non-matches (the PR #83
+    /// failure class — this is what makes presence caching safe against
+    /// disk-cache eviction races). Inline formats never flag.
+    pub fn take_blob_read_failure(&self) -> bool {
+        match &self.inverted {
+            InvertedAccess::Split(split) => split.take_blob_read_failure(),
+            _ => false,
+        }
+    }
+
     pub fn scoring_postings_for_terms<'a>(
         &'a self,
         terms: &'a [String],
