@@ -1254,6 +1254,13 @@ impl Searcher {
                         .into_iter()
                         .map(|(_, scoring)| ScoringBlocks::new(scoring))
                         .collect();
+                    if reader.take_blob_read_failure() {
+                        // A TOC-present term's blob shard was unreadable —
+                        // fall through to the general path, whose refetch
+                        // either succeeds or surfaces a hard error. Serving
+                        // the WAND result would silently omit the term.
+                        return None;
+                    }
                     if sources.is_empty() {
                         // No query term appears in this segment.
                         return Some(SegmentOutput {
@@ -1464,6 +1471,18 @@ impl Searcher {
             // and held for the whole scoring pass either way.
             let term_postings: Vec<(&str, kosha_segment::PostingsRef<'_>)> =
                 reader.postings_for_terms(terms_for_bm25);
+            if reader.take_blob_read_failure() {
+                // A term the TOC contains could not be served (blob shard
+                // evicted/corrupt). Erroring here — instead of scoring
+                // without the term — is what keeps eviction races from
+                // producing silently-wrong results, and what lets the
+                // server invalidate its hydration/presence caches and
+                // refetch on retry.
+                return Err(KoshaError::CorruptSegment(format!(
+                    "segment {}: posting blob unreadable for a present term                      (evicted or corrupt) — retry after rehydration",
+                    entry.segment_id.0
+                )));
+            }
 
             let mut doc_frequencies: HashMap<&str, u32> = HashMap::new();
             for (t, p) in &term_postings {
@@ -1538,6 +1557,16 @@ impl Searcher {
                 // borrow position slices out of them).
                 let phrase_postings_data: Vec<Option<kosha_segment::PostingsRef<'_>>> =
                     phrase_terms.iter().map(|pt| reader.postings(pt)).collect();
+                if reader.take_blob_read_failure() {
+                    // Same contract as the scoring fetch above: an
+                    // unreadable blob for a TOC-present phrase term must
+                    // error, not silently fail the phrase.
+                    return Err(KoshaError::CorruptSegment(format!(
+                        "segment {}: posting blob unreadable for a phrase \
+                         term (evicted or corrupt) — retry after rehydration",
+                        entry.segment_id.0
+                    )));
+                }
                 let phrase_postings: Vec<HashMap<u32, &[u32]>> = phrase_postings_data
                     .iter()
                     .map(|data| {
@@ -4091,11 +4120,16 @@ mod tests {
 
     #[test]
     fn corrupt_postings_fail_closed_not_truncated_or_inflated() {
-        // On-disk corruption of one term's postings must degrade exactly
-        // like v4 always did: the term drops out (queries behave as if it
-        // were absent), never a truncated AND intersection, never a
-        // total_hits claiming docs the page can't contain, and never a
-        // process abort from an unbounded allocation. The corpus is small
+        // On-disk corruption of a TOC-present term's blob must fail the
+        // query LOUDLY: a hard error, never a truncated AND intersection,
+        // never a total_hits claiming docs the page can't contain, never a
+        // process abort from an unbounded allocation — and (now that the
+        // blob-presence cache makes eviction races possible) never the old
+        // silent term-drop either, which returned different results with
+        // no signal anything was wrong. The server invalidates its
+        // hydration/presence caches on this error and refetches on retry,
+        // which repairs eviction; true corruption keeps erroring loudly —
+        // the correct outcome for data needing repair. The corpus is small
         // enough that blobs stay under the KIZC compression threshold, so
         // the test can corrupt raw span bytes in place.
         let dir = std::env::temp_dir().join("kosha-test-corrupt-fail-closed");
@@ -4153,26 +4187,80 @@ mod tests {
             .unwrap();
         assert_eq!(alpha_only.total_hits, 150, "alpha's shard is untouched");
 
-        let both = searcher
-            .search(&ns, &manifest, &mk_query("alpha beta", 10), None)
+        let both = searcher.search(&ns, &manifest, &mk_query("alpha beta", 10), None);
+        assert!(
+            both.is_err(),
+            "an unreadable blob for a TOC-present term must error, not \
+             silently drop the term or truncate the intersection: {both:?}"
+        );
+
+        let beta = searcher.search(&ns, &manifest, &mk_query("beta", 10), None);
+        assert!(
+            beta.is_err(),
+            "an undecodable single term must error, not report zero hits \
+             or the span-header df: {beta:?}"
+        );
+
+        // A term genuinely absent from the corpus is a normal non-match:
+        // the footer's term bloom AND-prunes the segment to a clean zero —
+        // crucially with no error, proving the failure flag distinguishes
+        // "absent" from "unreadable".
+        let absent = searcher
+            .search(&ns, &manifest, &mk_query("alpha nosuchterm", 10), None)
             .unwrap();
         assert_eq!(
-            both.total_hits, alpha_only.total_hits,
-            "corrupt term must drop out of the AND (v4 semantics), not \
-             truncate the intersection"
+            absent.total_hits, 0,
+            "bloom-pruned absent term is a clean zero"
         );
-        assert_eq!(page_ids(&both), page_ids(&alpha_only));
 
-        let beta = searcher
-            .search(&ns, &manifest, &mk_query("beta", 10), None)
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evicted_posting_blob_errors_instead_of_silent_absence() {
+        // The blob-presence-cache eviction race, end to end: a blob file
+        // DELETED after the segment was opened (what a disk-cache LRU
+        // eviction looks like) must surface as a hard error the server can
+        // react to (invalidate presence caches, rehydrate, retry) — never
+        // as a silent zero-term result.
+        let dir = std::env::temp_dir().join("kosha-test-evicted-blob");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        for i in 0..150 {
+            w.add_document(
+                DocumentId(format!("doc-{i:04}")),
+                vec![Field::text(
+                    "t",
+                    format!("alpha beta{}", " pad".repeat(i % 4)),
+                )],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 150,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        // Open + warm the segment so the reader is cached, THEN evict
+        // beta's shard file from under it.
+        let ok = searcher
+            .search(&ns, &manifest, &mk_query("alpha", 10), None)
             .unwrap();
-        assert_eq!(
-            beta.total_hits, 0,
-            "undecodable single term must fail closed to zero hits, not \
-             report the span-header df with an empty page"
-        );
-        assert!(beta.results.is_empty());
+        assert_eq!(ok.total_hits, 150);
+        std::fs::remove_file(seg_dir.join(kosha_segment::posting_blob_file_for_term("beta")))
+            .unwrap();
 
+        let r = searcher.search(&ns, &manifest, &mk_query("alpha beta", 10), None);
+        assert!(
+            r.is_err(),
+            "evicted blob for a TOC-present term must error: {r:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
