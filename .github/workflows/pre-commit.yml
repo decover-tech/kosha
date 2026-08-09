@@ -54,6 +54,15 @@ jobs:
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
+          # The workflow definition comes from the merge ref (main), but we
+          # check out the PR HEAD BRANCH (we must — we amend + push it), so a
+          # branch cut before the hook landed on main has no script in its
+          # checkout. Skip cleanly; the branch picks the hook up on rebase.
+          if [ ! -f scripts/commit_bench_section.sh ]; then
+            echo "scripts/commit_bench_section.sh not on this branch (predates the hook) — skipping."
+            exit 0
+          fi
+
           sha_before="$(git rev-parse HEAD)"
 
           # amend: 0 = amended, 5 = no-op (markers already on HEAD), other = fail.
