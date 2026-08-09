@@ -475,9 +475,9 @@ minutes of each phase — 14,401/14,401 requests, zero errors, both phases:
 | tpuf published — cold | 316ms | 381ms | 559ms | — |
 | **Kosha cold (wipe + 30m window)** | **431ms** | 1,218ms | 4,641ms | 8.8s |
 
-Round-over-round at the sustainable-rate comparison point: warm p50
-304ms @4QPS (round 1, pre-WAND) vs 449ms @8QPS (round 2 — at 2× the
-load, near saturation). Correctness invariant held: zero-hit rate 33.2%
+Round-over-round at the same rate (4 QPS, warm, 10-minute run):
+**304ms → 224ms p50** (1.36× service-time improvement); the 8 QPS p50 of
+449ms is that service time plus near-saturation queueing (load ~31/32). Correctness invariant held: zero-hit rate 33.2%
 in both phases, identical to round 1's AND-semantics rate — the
 optimizations changed latency, not results. Warm phase hydrated **0
 bytes**; cold hydrated 4.1GB of 23GB lazily, first-minute p50 3.1s
