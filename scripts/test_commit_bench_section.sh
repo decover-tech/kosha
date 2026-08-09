@@ -244,9 +244,22 @@ test_hook_no_latency_rows_exits_zero() {
   assert_eq "$before" "$(cksum "$msg")" 'hook: no-latency-rows msg unchanged'
 }
 
-test_hook_missing_arg_exits_one() {
+test_hook_missing_arg_exits_zero() {
+  # A misconfigured pre-commit entry (or any caller that omits the
+  # message-file arg) must never block the commit — same soft-fail
+  # contract as the no-cargo/no-corpus/no-rows cases below. This used to
+  # `die` (exit 1); a `pass_filenames: false` regression on the
+  # prepare-commit-msg hook entry once made every commit in the repo fail
+  # this way.
   setup
-  assert_exit 1 'hook: missing msg arg exits 1' env PATH="$NO_CARGO_PATH" "$SCRIPT" hook
+  assert_exit 0 'hook: missing msg arg exits 0 (does not block commit)' \
+    env PATH="$NO_CARGO_PATH" "$SCRIPT" hook
+}
+
+test_hook_missing_file_exits_zero() {
+  setup
+  assert_exit 0 'hook: nonexistent msg file exits 0 (does not block commit)' \
+    env PATH="$NO_CARGO_PATH" "$SCRIPT" hook "$WORK/does-not-exist"
 }
 
 test_dispatch_bad_subcommand_exits_one() {
@@ -299,6 +312,32 @@ test_yaml_pre_commit_config_valid() {
   fi
 }
 
+test_yaml_kosha_bench_hook_gets_msg_file_arg() {
+  # For a `prepare-commit-msg`-stage hook, the "filename" pre-commit
+  # forwards *is* the commit-message file path (git's native hook
+  # argument) — not a list of changed source files. `pass_filenames:
+  # false` on this hook entry starves `commit_bench_section.sh hook` of
+  # the one argument it requires, and every commit failed as a result
+  # until this was caught. Assert it stays absent.
+  # 'ABSENT' sentinel distinguishes "key not set" (correct — defaults to
+  # pre-commit's own default, which forwards the msg-file arg) from an
+  # explicit `pass_filenames: false` (the regression).
+  local value
+  value="$(python3 -c "
+import yaml
+cfg = yaml.safe_load(open('$REPO_ROOT/.pre-commit-config.yaml'))
+for repo in cfg.get('repos', []):
+    for hook in repo.get('hooks', []):
+        if hook.get('id') == 'kosha-bench-commit-msg':
+            print(hook.get('pass_filenames', 'ABSENT'))
+" 2>/dev/null)"
+  if [ "$value" = "False" ]; then
+    bad 'yaml: kosha-bench-commit-msg hook does not set pass_filenames: false'
+  else
+    ok 'yaml: kosha-bench-commit-msg hook does not set pass_filenames: false'
+  fi
+}
+
 test_yaml_workflow_valid() {
   if python3 -c "import yaml; yaml.safe_load(open('$REPO_ROOT/.github/workflows/pre-commit.yml'))" 2>/dev/null; then
     ok 'yaml: pre-commit.yml parses'
@@ -323,7 +362,8 @@ main() {
   test_hook_no_cargo_exits_zero
   test_hook_no_corpus_exits_zero
   test_hook_no_latency_rows_exits_zero
-  test_hook_missing_arg_exits_one
+  test_hook_missing_arg_exits_zero
+  test_hook_missing_file_exits_zero
   test_dispatch_bad_subcommand_exits_one
   test_amend_adds_markers
   test_amend_preserves_subject_body
@@ -331,6 +371,7 @@ main() {
   test_amend_no_cargo_exits_one
   test_amend_no_corpus_exits_one
   test_yaml_pre_commit_config_valid
+  test_yaml_kosha_bench_hook_gets_msg_file_arg
   test_yaml_workflow_valid
   printf '\n=== Results: %d passed, %d failed ===\n' "$PASS" "$FAIL"
   [ "$FAIL" -eq 0 ] || exit 1
