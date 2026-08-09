@@ -37,6 +37,9 @@ pub struct Cache {
     /// Eviction bound in bytes. `None` means unbounded (legacy behavior).
     max_bytes: Option<u64>,
     total_bytes: AtomicU64,
+    /// Bumped once per file/dir actually removed by `evict` — see
+    /// `eviction_generation()`.
+    eviction_generation: AtomicU64,
     /// Cache keys ordered oldest-touched (front) to most-recently-touched
     /// (back). Touched on both read and write.
     recency: Mutex<VecDeque<String>>,
@@ -68,6 +71,7 @@ impl Cache {
             cache_dir,
             max_bytes,
             total_bytes: AtomicU64::new(total_bytes),
+            eviction_generation: AtomicU64::new(0),
             recency: Mutex::new(recency),
             pinned: Mutex::new(HashMap::new()),
         };
@@ -283,16 +287,34 @@ impl Cache {
             let len = path.metadata().map(|m| m.len()).unwrap_or(0);
             std::fs::remove_file(&path)?;
             self.total_bytes.fetch_sub(len, Ordering::Relaxed);
+            self.eviction_generation.fetch_add(1, Ordering::Relaxed);
         } else if path.is_dir() {
             let len = dir_size(&path);
             std::fs::remove_dir_all(&path)?;
             self.total_bytes.fetch_sub(len, Ordering::Relaxed);
+            self.eviction_generation.fetch_add(1, Ordering::Relaxed);
         }
         let mut recency = self.recency.lock().unwrap();
         if let Some(pos) = recency.iter().position(|k| k == key) {
             recency.remove(pos);
         }
         Ok(())
+    }
+
+    /// Monotonic counter bumped once per file/dir this cache has actually
+    /// removed (LRU `enforce_limit` or an explicit `evict` call) — never on
+    /// a no-op `evict` of an already-absent key. Callers that cache their
+    /// own "is this file present on disk" verdicts across requests (e.g.
+    /// the server's posting-blob presence cache) can snapshot this value
+    /// alongside a verdict and treat any change as "something was removed
+    /// since — don't trust stale presence verdicts, re-check." Global
+    /// rather than per-key by design: the cost of a spurious wide
+    /// invalidation (one extra real stat, on the next warm query) is far
+    /// cheaper than the plumbing needed for a precise per-key signal, and
+    /// eviction is rare relative to query volume, so the blast radius of
+    /// "invalidate everything on any eviction" is small in practice.
+    pub fn eviction_generation(&self) -> u64 {
+        self.eviction_generation.load(Ordering::Relaxed)
     }
 
     /// Clear the entire cache.
@@ -443,6 +465,32 @@ mod tests {
         assert!(cache.total_size() <= 100);
         assert!(cache.get("first").is_none());
         assert!(cache.get("second").is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `eviction_generation` must bump for an automatic LRU eviction
+    /// (`enforce_limit`'s internal `evict` call), not just an explicit
+    /// `Cache::evict` from outside — callers that snapshot this counter to
+    /// invalidate their own presence caches (see kosha-server's
+    /// `posting_blob_presence`) need to catch space-pressure evictions,
+    /// which are exactly the LRU path, not the explicit one.
+    #[test]
+    fn eviction_generation_bumps_on_automatic_lru_eviction() {
+        let dir = std::env::temp_dir().join("kosha-test-cache-eviction-gen-lru");
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_max_bytes(dir.clone(), Some(100));
+
+        cache.put_bytes("first", &[0u8; 60]).unwrap();
+        assert_eq!(cache.eviction_generation(), 0);
+
+        // Pushes total to 120 > 100, forcing "first" out via enforce_limit.
+        cache.put_bytes("second", &[0u8; 60]).unwrap();
+        assert_eq!(
+            cache.eviction_generation(),
+            1,
+            "the LRU eviction inside enforce_limit must bump the generation"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

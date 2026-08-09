@@ -247,6 +247,56 @@ struct AppState {
     /// holds at most low-thousands entries; per-query cost is a single
     /// `HashMap` lookup, vs. 17 syscalls on the legacy path.
     completed_hydrations: Mutex<HashMap<(String, u64), bool>>,
+    /// Posting-blob presence cache (Tier 1 O3), the sibling optimization to
+    /// `completed_hydrations` above: that verdict can never cover posting
+    /// blobs (PR #89 — they're fetched per query term, not per segment), so
+    /// `ensure_query_posting_blobs` pays a full `fs::metadata` stat sweep
+    /// over every `(segment, term-shard)` pair on *every* request, even a
+    /// fully-warm one on the cached-verdict fast path. At 167 segments ×
+    /// ~5 term-shards per query that's 800+ stats — done twice, once to
+    /// decide what to fetch and again to compute `missing` — measured as a
+    /// flat ~86–92 ms tax on every warm query at that scale (it was ~10 ms
+    /// at 1M docs / 17 segments; the cost scales linearly with segment
+    /// count).
+    ///
+    /// Keyed by namespace, one entry holding the manifest version it was
+    /// populated against plus the `{segment_relative_path -> {file_name}}`
+    /// pairs physically confirmed present for that version so far. A
+    /// lookup against a different (newer) manifest version than the stored
+    /// one is treated as a miss — same free invalidation-on-publish as
+    /// `completed_hydrations` — and *replaces* the stale entry outright
+    /// rather than leaving it to accumulate: unlike that cache's 16-byte
+    /// `(u64, u64)` tuples, this one holds real path/file strings, so
+    /// stale-version entries are worth actively pruning instead of just
+    /// tolerating unbounded growth.
+    ///
+    /// Purely additive within a version — an entry only ever gains
+    /// confirmed-present pairs from real `fs::metadata` stats, never a
+    /// pair it hasn't itself verified — so a cache hit is exactly as
+    /// trustworthy as the stat it stands in for **as of the moment it was
+    /// taken**. Unlike a scoring-set file (footer/`inverted.idx`/offsets),
+    /// whose absence surfaces as a hard `SegmentReader::open` IO error that
+    /// self-heals via the existing error-path verdict invalidation, a
+    /// missing posting blob does **not** error — `scoring_postings_for_terms`
+    /// just returns no postings for that shard, i.e. quietly fewer/zero
+    /// hits (this asymmetry is exactly what PR #89 had to fix once already:
+    /// the reader accepting a segment while its blobs silently weren't
+    /// fetched). A positive verdict here that outlives a real eviction —
+    /// `self.cache` LRU-evicts under `KOSHA_CACHE_MAX_BYTES` pressure — must
+    /// therefore never be trusted past that eviction. Every stored entry is
+    /// stamped with `self.cache.eviction_generation()` as of the moment it
+    /// was verified, and a read compares that stamp against the *current*
+    /// generation: any eviction anywhere (not just of this exact file —
+    /// tracking that precisely isn't worth the plumbing given how rare
+    /// eviction is relative to query volume) invalidates the snapshot,
+    /// falling back to a real stat. See `Cache::eviction_generation`'s doc
+    /// comment for the full rationale.
+    ///
+    /// The inner map is `Arc`-wrapped so a read only bumps a refcount
+    /// (no per-request clone of a potentially-large map) and a write uses
+    /// `Arc::make_mut` (copy-on-write only when a concurrent reader is
+    /// still holding the old snapshot).
+    posting_blob_presence: Mutex<PostingBlobPresenceCache>,
     /// Readiness-gated warmup (Tier 1 O2): when `KOSHA_WARMUP_NAMESPACES`
     /// is set, a background thread prefetches the scoring-set files
     /// (`footer.json` + `inverted.idx` + `doc_store.offsets` [+ `filters.bin`/
@@ -922,6 +972,7 @@ impl AppState {
             self_ref: Weak::new(),
             backfill_jobs: Mutex::new(std::collections::HashSet::new()),
             completed_hydrations: Mutex::new(HashMap::new()),
+            posting_blob_presence: Mutex::new(HashMap::new()),
             // Warmup starts ready; `spawn_warmup` flips `false` only when
             // there's configured work to do (and back to `true` on
             // completion / fail-open). See the field's doc comment.
@@ -1664,7 +1715,8 @@ impl AppState {
             needs_filters,
             &paths_with_manifest_footer,
         );
-        let postings_outcome = self.ensure_posting_blobs_local(&to_hydrate, &posting_files);
+        let postings_outcome =
+            self.ensure_posting_blobs_local(ns, manifest.version, &to_hydrate, &posting_files);
         outcome.files_fetched += postings_outcome.files_fetched;
         outcome.bytes_fetched += postings_outcome.bytes_fetched;
         outcome.missing.extend(postings_outcome.missing);
@@ -1849,7 +1901,8 @@ impl AppState {
     /// namespace-level verdict can never cover posting blobs, because they
     /// are fetched per query term (each term hashes to one of the
     /// [`kosha_segment::POSTING_BLOB_SHARDS`] shard files). Sub-ms when the
-    /// shards are already local.
+    /// shards are already local and the presence cache has already seen
+    /// them this manifest version — see `posting_blob_presence`.
     #[cfg(feature = "s3")]
     fn ensure_query_posting_blobs(
         &self,
@@ -1866,12 +1919,14 @@ impl AppState {
             .iter()
             .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
             .collect();
-        self.ensure_posting_blobs_local(&seg_paths, &posting_files)
+        self.ensure_posting_blobs_local(ns, manifest.version, &seg_paths, &posting_files)
     }
 
     #[cfg(feature = "s3")]
     fn ensure_posting_blobs_local(
         &self,
+        ns: &NamespaceId,
+        manifest_version: u64,
         seg_paths: &[PathBuf],
         posting_files: &[String],
     ) -> HydrationOutcome {
@@ -1883,21 +1938,29 @@ impl AppState {
         }
 
         let _permit = self.hydration_semaphore.acquire();
-        let mut logical_paths: Vec<(String, u64)> = Vec::new();
-        for seg_path in seg_paths {
-            if !kosha_segment::inverted_uses_posting_blobs(seg_path) {
-                continue;
-            }
-            let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
-                continue;
-            };
-            let s3_prefix = rel_path.to_string_lossy();
-            for file_name in posting_files {
-                if !file_present_nonempty(&seg_path.join(file_name)) {
-                    logical_paths.push((format!("{s3_prefix}/{file_name}"), 0));
-                }
-            }
-        }
+
+        // Presence-cache read (Tier 1 O3): an `Arc` snapshot (refcount
+        // bump, no clone) of whichever (segment, shard) pairs are already
+        // confirmed present for this exact `(namespace, manifest_version,
+        // eviction_generation)`. A stale/absent entry — different manifest
+        // version, or an eviction happened anywhere since it was written —
+        // yields an empty map, i.e. this degrades to the pre-cache full
+        // stat sweep, never a false "present." See the field's doc comment
+        // for why the eviction-generation check exists.
+        let eviction_gen = self.cache.eviction_generation();
+        let cached = {
+            let cache = self.posting_blob_presence.lock().unwrap();
+            posting_blob_cache_lookup(&cache, &ns.0, manifest_version, eviction_gen)
+        };
+
+        let (logical_paths, mut newly_confirmed) = plan_posting_blob_fetch(
+            seg_paths,
+            posting_files,
+            &self.data_dir,
+            &cached,
+            kosha_segment::inverted_uses_posting_blobs,
+            file_present_nonempty,
+        );
 
         let mut outcome = HydrationOutcome::default();
         if !logical_paths.is_empty() {
@@ -1908,30 +1971,46 @@ impl AppState {
                 self.scoring_hydrate_concurrency
             );
             self.hydrate_files(s3, &logical_paths, self.scoring_hydrate_concurrency);
-            for (path, _) in &logical_paths {
-                if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
+        }
+
+        // Post-fetch verification only needs to re-stat what we actually
+        // attempted to fetch — everything else was already resolved above
+        // (via a cache hit or the pre-fetch stat in `plan_posting_blob_fetch`),
+        // so re-checking the entire (segment × shard) cross-product a
+        // second time, as the pre-cache code did, is redundant.
+        for (rel, _) in &logical_paths {
+            let path = self.data_dir.join(rel);
+            match std::fs::metadata(&path) {
+                Ok(m) if m.is_file() && m.len() > 0 => {
                     outcome.files_fetched += 1;
                     outcome.bytes_fetched += m.len();
+                    if let Some((seg_rel, file_name)) = rel.rsplit_once('/') {
+                        newly_confirmed.push((seg_rel.to_string(), file_name.to_string()));
+                    }
                 }
+                _ => outcome.missing.push(rel.clone()),
             }
         }
 
-        outcome.missing = seg_paths
-            .iter()
-            .filter(|seg_path| kosha_segment::inverted_uses_posting_blobs(seg_path))
-            .flat_map(|seg_path| {
-                posting_files.iter().filter_map(move |file_name| {
-                    let path = seg_path.join(file_name);
-                    if file_present_nonempty(&path) {
-                        None
-                    } else {
-                        path.strip_prefix(&self.data_dir)
-                            .ok()
-                            .map(|p| p.to_string_lossy().into_owned())
-                    }
-                })
-            })
-            .collect();
+        // Fold every pair this call physically confirmed present — via
+        // cache-miss stat or post-fetch verification — back into the
+        // cache, one lock acquisition regardless of how many pairs were
+        // checked. Re-reads the eviction generation: if an eviction
+        // happened mid-call, entries are stamped with the *later* value,
+        // which is still correct — every stamped pair was itself verified
+        // by a real stat taken during this call, at or after that point.
+        if !newly_confirmed.is_empty() {
+            let write_gen = self.cache.eviction_generation();
+            let mut cache = self.posting_blob_presence.lock().unwrap();
+            posting_blob_cache_insert(
+                &mut cache,
+                &ns.0,
+                manifest_version,
+                write_gen,
+                newly_confirmed,
+            );
+        }
+
         outcome
     }
 
@@ -1971,6 +2050,122 @@ fn file_present_nonempty(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.is_file() && m.len() > 0)
         .unwrap_or(false)
+}
+
+/// Decide which `(segment, posting-shard)` pairs in `seg_paths ×
+/// posting_files` still need fetching, given `cached` — a snapshot of
+/// pairs the caller has already confirmed present for the current
+/// `(namespace, manifest_version, eviction_generation)` (see
+/// `AppState::posting_blob_presence`). Free function, independent of
+/// `AppState`/`S3Storage` (mirrors `partition_for_hydration`), so it can be
+/// unit-tested with fake `is_split`/`is_present` predicates instead of real
+/// segment files on disk.
+///
+/// `(logical_paths_to_fetch, newly_confirmed_present)` — see
+/// `plan_posting_blob_fetch`'s doc comment for what each side means.
+#[cfg(feature = "s3")]
+type PostingBlobFetchPlan = (Vec<(String, u64)>, Vec<(String, String)>);
+
+/// Returns `(logical_paths_to_fetch, newly_confirmed_present)`:
+/// `logical_paths_to_fetch` are `(s3_relative_path, 0)` pairs (size unknown
+/// up front, same convention `ensure_posting_blobs_local`'s callers already
+/// use) still absent locally; `newly_confirmed_present` are pairs this call
+/// verified present via a real stat (cache miss but found on disk) — the
+/// caller folds these back into the presence cache.
+#[cfg(feature = "s3")]
+fn plan_posting_blob_fetch(
+    seg_paths: &[PathBuf],
+    posting_files: &[String],
+    data_dir: &Path,
+    cached: &HashMap<String, std::collections::HashSet<String>>,
+    is_split: impl Fn(&Path) -> bool,
+    is_present: impl Fn(&Path) -> bool,
+) -> PostingBlobFetchPlan {
+    let mut logical_paths: Vec<(String, u64)> = Vec::new();
+    let mut newly_confirmed: Vec<(String, String)> = Vec::new();
+
+    for seg_path in seg_paths {
+        if !is_split(seg_path) {
+            continue;
+        }
+        let Ok(rel_path) = seg_path.strip_prefix(data_dir) else {
+            continue;
+        };
+        let s3_prefix = rel_path.to_string_lossy().into_owned();
+        let cached_shards = cached.get(&s3_prefix);
+        for file_name in posting_files {
+            if cached_shards.is_some_and(|set| set.contains(file_name.as_str())) {
+                continue; // already confirmed present this (version, eviction_generation)
+            }
+            if is_present(&seg_path.join(file_name)) {
+                newly_confirmed.push((s3_prefix.clone(), file_name.clone()));
+            } else {
+                logical_paths.push((format!("{s3_prefix}/{file_name}"), 0));
+            }
+        }
+    }
+
+    (logical_paths, newly_confirmed)
+}
+
+/// `posting_blob_presence` type alias — spelled out at each use site
+/// otherwise, this keeps the lookup/insert signatures readable. Not
+/// `cfg`-gated: the `AppState` field itself isn't (matches
+/// `completed_hydrations`, so non-`s3` builds still have a well-typed,
+/// always-empty field rather than needing their own cfg'd variant).
+type PostingBlobPresenceCache = HashMap<
+    String,
+    (
+        u64,
+        u64,
+        Arc<HashMap<String, std::collections::HashSet<String>>>,
+    ),
+>;
+
+/// Read side of the posting-blob presence cache: an `Arc` snapshot (cheap
+/// refcount bump) of the confirmed-present shard map for `ns`, or an empty
+/// map if there's no entry, it's for a different manifest version, or an
+/// eviction has happened anywhere since it was written. Free function
+/// (mirrors `partition_for_hydration`/`plan_posting_blob_fetch`) so the
+/// exact staleness rules are unit-testable without `AppState`.
+#[cfg(feature = "s3")]
+fn posting_blob_cache_lookup(
+    cache: &PostingBlobPresenceCache,
+    ns: &str,
+    manifest_version: u64,
+    eviction_gen: u64,
+) -> Arc<HashMap<String, std::collections::HashSet<String>>> {
+    match cache.get(ns) {
+        Some((v, g, segs)) if *v == manifest_version && *g == eviction_gen => Arc::clone(segs),
+        _ => Arc::new(HashMap::new()),
+    }
+}
+
+/// Write side: fold `newly_confirmed` pairs into `cache` for `ns`. If the
+/// existing entry (if any) belongs to a different manifest version or
+/// eviction generation than `manifest_version`/`write_gen`, it's replaced
+/// outright rather than merged into — a stale entry's pairs are not known
+/// to still be valid, so keeping them around would either waste memory
+/// (dead manifest version) or reintroduce the exact stale-positive hazard
+/// the eviction-generation check exists to close.
+#[cfg(feature = "s3")]
+fn posting_blob_cache_insert(
+    cache: &mut PostingBlobPresenceCache,
+    ns: &str,
+    manifest_version: u64,
+    write_gen: u64,
+    newly_confirmed: Vec<(String, String)>,
+) {
+    let entry = cache
+        .entry(ns.to_string())
+        .or_insert_with(|| (manifest_version, write_gen, Arc::new(HashMap::new())));
+    if entry.0 != manifest_version || entry.1 != write_gen {
+        *entry = (manifest_version, write_gen, Arc::new(HashMap::new()));
+    }
+    let map = Arc::make_mut(&mut entry.2);
+    for (seg_rel, file_name) in newly_confirmed {
+        map.entry(seg_rel).or_default().insert(file_name);
+    }
 }
 
 fn redact_database_url(url: &str) -> String {
@@ -2917,13 +3112,21 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             // longer there. Invalidate the verdict so the retry's
             // `hydrate_segments_for_search` actually re-checks physical
             // existence and re-fetches what's missing instead of trusting
-            // the cache and failing again.
+            // the cache and failing again. Also drop the posting-blob
+            // presence entry for this namespace: the eviction-generation
+            // guard already covers a `self.cache` LRU eviction, but this is
+            // a cheap belt-and-suspenders reset on any observed failure,
+            // and matters for the non-eviction case where the searcher
+            // itself failed for another reason.
             #[cfg(feature = "s3")]
-            state
-                .completed_hydrations
-                .lock()
-                .unwrap()
-                .remove(&(ns.0.clone(), manifest.version));
+            {
+                state
+                    .completed_hydrations
+                    .lock()
+                    .unwrap()
+                    .remove(&(ns.0.clone(), manifest.version));
+                state.posting_blob_presence.lock().unwrap().remove(&ns.0);
+            }
             search_error_response(&e)
         }
     }
@@ -3960,6 +4163,215 @@ mod tests {
                 "{f} must always be fetched regardless of needs_vectors"
             );
         }
+    }
+
+    /// Core regression for the presence-cache optimization: a
+    /// `(segment, shard)` pair already recorded in `cached` must not be
+    /// re-stated — the whole point is to turn an `fs::metadata` syscall
+    /// into a `HashSet` lookup on a warm namespace.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn plan_posting_blob_fetch_skips_stat_for_cached_pairs() {
+        use std::cell::Cell;
+
+        let seg = PathBuf::from("/data/ns/seg-1");
+        let posting_files = vec!["postings-00.bin".to_string(), "postings-01.bin".to_string()];
+
+        let mut cached = HashMap::new();
+        cached.insert(
+            "ns/seg-1".to_string(),
+            std::collections::HashSet::from(["postings-00.bin".to_string()]),
+        );
+
+        let stat_calls = Cell::new(0);
+        let (logical_paths, newly_confirmed) = plan_posting_blob_fetch(
+            std::slice::from_ref(&seg),
+            &posting_files,
+            Path::new("/data"),
+            &cached,
+            |_| true, // every segment is split-format
+            |path| {
+                stat_calls.set(stat_calls.get() + 1);
+                path.ends_with("postings-01.bin") // only the uncached shard "exists"
+            },
+        );
+
+        assert_eq!(
+            stat_calls.get(),
+            1,
+            "the cached (seg-1, postings-00.bin) pair must never reach the is_present stat"
+        );
+        assert!(
+            logical_paths.is_empty(),
+            "postings-01.bin was found present by the stat, so nothing needs fetching"
+        );
+        assert_eq!(
+            newly_confirmed,
+            vec![("ns/seg-1".to_string(), "postings-01.bin".to_string())],
+            "only the freshly-stated, freshly-present pair should be reported back for caching"
+        );
+    }
+
+    /// A shard neither cached nor present on disk must be queued for
+    /// fetch, not silently dropped.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn plan_posting_blob_fetch_queues_absent_uncached_shards() {
+        let seg = PathBuf::from("/data/ns/seg-1");
+        let posting_files = vec!["postings-00.bin".to_string()];
+        let cached = HashMap::new();
+
+        let (logical_paths, newly_confirmed) = plan_posting_blob_fetch(
+            std::slice::from_ref(&seg),
+            &posting_files,
+            Path::new("/data"),
+            &cached,
+            |_| true,
+            |_| false, // nothing is present locally
+        );
+
+        assert_eq!(
+            logical_paths,
+            vec![("ns/seg-1/postings-00.bin".to_string(), 0)],
+            "an absent, uncached shard must be queued for fetch"
+        );
+        assert!(newly_confirmed.is_empty());
+    }
+
+    /// A non-split-format segment must be skipped entirely — no stat calls,
+    /// no fetch, no cache entries — matching the pre-cache
+    /// `inverted_uses_posting_blobs` gate this wraps.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn plan_posting_blob_fetch_skips_non_split_segments() {
+        use std::cell::Cell;
+
+        let seg = PathBuf::from("/data/ns/seg-legacy");
+        let posting_files = vec!["postings-00.bin".to_string()];
+        let cached = HashMap::new();
+        let stat_calls = Cell::new(0);
+
+        let (logical_paths, newly_confirmed) = plan_posting_blob_fetch(
+            std::slice::from_ref(&seg),
+            &posting_files,
+            Path::new("/data"),
+            &cached,
+            |_| false, // not split-format
+            |_| {
+                stat_calls.set(stat_calls.get() + 1);
+                true
+            },
+        );
+
+        assert_eq!(
+            stat_calls.get(),
+            0,
+            "a non-split segment must never be stat'd"
+        );
+        assert!(logical_paths.is_empty());
+        assert!(newly_confirmed.is_empty());
+    }
+
+    /// The invalidation contract the task asked for: a lookup against a
+    /// newer manifest version than what's stored must miss (same
+    /// free-invalidation-on-publish `completed_hydrations` gets), and an
+    /// insert against that newer version must replace the stale entry
+    /// rather than merge into it.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn posting_blob_cache_misses_and_resets_on_manifest_version_bump() {
+        let mut cache: PostingBlobPresenceCache = HashMap::new();
+        posting_blob_cache_insert(
+            &mut cache,
+            "ns1",
+            /* manifest_version */ 1,
+            /* eviction_gen */ 0,
+            vec![("ns1/seg-1".to_string(), "postings-00.bin".to_string())],
+        );
+
+        // Same version, same eviction generation: hit.
+        let hit = posting_blob_cache_lookup(&cache, "ns1", 1, 0);
+        assert!(hit.get("ns1/seg-1").unwrap().contains("postings-00.bin"));
+
+        // A new manifest published (version bumped 1 -> 2): must miss.
+        let miss = posting_blob_cache_lookup(&cache, "ns1", 2, 0);
+        assert!(
+            miss.is_empty(),
+            "a newer manifest version than the cached entry must be treated as a full miss"
+        );
+
+        // Inserting under the new version must replace, not merge with,
+        // the stale v1 entry.
+        posting_blob_cache_insert(
+            &mut cache,
+            "ns1",
+            2,
+            0,
+            vec![("ns1/seg-2".to_string(), "postings-00.bin".to_string())],
+        );
+        let after_bump = posting_blob_cache_lookup(&cache, "ns1", 2, 0);
+        assert!(
+            after_bump.get("ns1/seg-1").is_none(),
+            "the v1 entry must not survive into the v2 generation"
+        );
+        assert!(after_bump.get("ns1/seg-2").is_some());
+    }
+
+    /// The safety net this PR adds beyond the manifest-version key: a
+    /// disk-cache eviction (which — unlike a missing scoring-set file —
+    /// does *not* surface as a search error for posting blobs, see the
+    /// `posting_blob_presence` field's doc comment) must invalidate a
+    /// same-manifest-version cache entry, not just a version bump.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn posting_blob_cache_misses_on_eviction_generation_change_even_if_version_unchanged() {
+        let mut cache: PostingBlobPresenceCache = HashMap::new();
+        posting_blob_cache_insert(
+            &mut cache,
+            "ns1",
+            1,
+            /* eviction_gen */ 5,
+            vec![("ns1/seg-1".to_string(), "postings-00.bin".to_string())],
+        );
+
+        assert!(!posting_blob_cache_lookup(&cache, "ns1", 1, 5).is_empty());
+        assert!(
+            posting_blob_cache_lookup(&cache, "ns1", 1, 6).is_empty(),
+            "same manifest version but a later eviction generation must still miss — \
+             an eviction may have removed the exact blob this entry vouched for"
+        );
+    }
+
+    /// `Cache::evict` must bump `eviction_generation` only when it actually
+    /// removes something — a no-op evict of an already-absent key must not
+    /// spuriously invalidate every presence-cache entry on the server.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn cache_eviction_generation_bumps_only_on_real_removal() {
+        let dir = std::env::temp_dir().join("kosha-test-eviction-generation");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let cache = Cache::new(dir.clone());
+        assert_eq!(cache.eviction_generation(), 0);
+
+        // Evicting a key that was never written is a no-op.
+        let _ = cache.evict("never-written.bin");
+        assert_eq!(
+            cache.eviction_generation(),
+            0,
+            "a no-op evict of an absent key must not bump the generation"
+        );
+
+        cache.put_bytes("real-file.bin", b"hello").unwrap();
+        cache.evict("real-file.bin").unwrap();
+        assert_eq!(
+            cache.eviction_generation(),
+            1,
+            "evicting a file that was actually present must bump the generation"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "s3")]
