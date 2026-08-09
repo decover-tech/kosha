@@ -589,7 +589,7 @@ fn simple_wildcard_match(text: &str, pattern: &str, case_insensitive: bool) -> b
 // ─── Match phrase scorer ────────────────────────────────────────────────────
 
 pub fn match_phrase_score(
-    postings_list: &[Vec<u32>], // positions for each query term, per doc
+    postings_list: &[&[u32]], // positions for each query term, per doc
     slop: u32,
 ) -> f64 {
     if postings_list.is_empty() {
@@ -599,7 +599,7 @@ pub fn match_phrase_score(
         return 1.0;
     }
 
-    let first_positions = &postings_list[0];
+    let first_positions = postings_list[0];
     for &start_pos in first_positions {
         let mut matched = true;
         for (i, positions) in postings_list[1..].iter().enumerate() {
@@ -1602,10 +1602,15 @@ impl Searcher {
 
                 let doc_ids: Vec<u32> = scored.keys().copied().collect();
                 for doc_id in doc_ids {
-                    let mut term_positions: Vec<Vec<u32>> = Vec::new();
+                    // Borrowed positions straight out of `phrase_postings`
+                    // (which already holds `&[u32]` slices into the
+                    // decoded postings) — `match_phrase_score` only reads,
+                    // so there's no need to clone each term's position
+                    // list into a fresh `Vec` per candidate doc.
+                    let mut term_positions: Vec<&[u32]> = Vec::new();
                     for term_map in &phrase_postings {
-                        if let Some(positions) = term_map.get(&doc_id) {
-                            term_positions.push(positions.to_vec());
+                        if let Some(&positions) = term_map.get(&doc_id) {
+                            term_positions.push(positions);
                         }
                     }
                     if term_positions.len() < phrase_terms.len() {
@@ -1759,9 +1764,11 @@ impl Searcher {
         let sort_value_maps = if sort_value_fields.is_empty() {
             HashMap::new()
         } else {
+            let wanted: HashSet<u32> = ranked.iter().map(|(_, doc_seq)| *doc_seq).collect();
             build_sort_value_maps(
                 filter_store.expect("custom sort requires filter_store"),
                 sort_value_fields,
+                &wanted,
             )
         };
         let mut candidates = Vec::with_capacity(ranked.len());
@@ -2718,23 +2725,37 @@ fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
 /// field would otherwise be the one place deferred materialization forced a
 /// disk read per candidate instead of just per returned page. Built once
 /// per segment per query, not once per hit.
+///
+/// `wanted` restricts the clone to this segment's actual candidate set:
+/// `store`'s per-field entries cover *every document in the segment* that
+/// has the field set, matched or not, so without this filter a query
+/// matching a handful of docs in a large segment would still clone every
+/// other document's value for that field. `extract_sort_values` only ever
+/// looks up `wanted` doc_seqs, so anything outside it is wasted work.
 fn build_sort_value_maps(
     store: &FilterStore,
     fields: &[String],
+    wanted: &HashSet<u32>,
 ) -> HashMap<String, HashMap<u32, String>> {
     fields
         .iter()
         .map(|field| {
             let map = if let Some(entries) = store.string_fields.get(field) {
-                entries.iter().map(|(seq, v)| (*seq, v.clone())).collect()
+                entries
+                    .iter()
+                    .filter(|(seq, _)| wanted.contains(seq))
+                    .map(|(seq, v)| (*seq, v.clone()))
+                    .collect()
             } else if let Some(entries) = store.integer_fields.get(field) {
                 entries
                     .iter()
+                    .filter(|(seq, _)| wanted.contains(seq))
                     .map(|(seq, v)| (*seq, v.to_string()))
                     .collect()
             } else if let Some(entries) = store.float_fields.get(field) {
                 entries
                     .iter()
+                    .filter(|(seq, _)| wanted.contains(seq))
                     .map(|(seq, v)| (*seq, v.to_string()))
                     .collect()
             } else {
@@ -2782,18 +2803,21 @@ fn candidate_sort_value<'a>(
 // ─── Aggregation functions ──────────────────────────────────────────────────
 
 pub fn compute_single_aggregation(store: &FilterStore, field: &str) -> AggregationResults {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+    // Borrowed key while counting — one `String` alloc per *distinct*
+    // value at bucket-emission time, not one per document, matching
+    // `compute_cardinality`/`compute_composite` right below.
+    let mut counts: HashMap<&str, usize> = HashMap::new();
 
     if let Some(entries) = store.string_fields.get(field) {
         for (_, val) in entries {
-            *counts.entry(val.clone()).or_default() += 1;
+            *counts.entry(val.as_str()).or_default() += 1;
         }
     }
 
     let mut buckets: Vec<AggBucket> = counts
         .into_iter()
         .map(|(k, c)| AggBucket {
-            key: k,
+            key: k.to_string(),
             doc_count: c,
         })
         .collect();
@@ -3424,25 +3448,90 @@ mod tests {
     #[test]
     fn match_phrase_no_slop() {
         // Positions: doc has "quick" at 0, "brown" at 1, "fox" at 2.
-        let postings = vec![vec![0u32], vec![1u32], vec![2u32]];
-        let score = match_phrase_score(&postings, 0);
+        let postings: Vec<Vec<u32>> = vec![vec![0u32], vec![1u32], vec![2u32]];
+        let refs: Vec<&[u32]> = postings.iter().map(Vec::as_slice).collect();
+        let score = match_phrase_score(&refs, 0);
         assert!((score - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn match_phrase_with_slop() {
         // Positions: "quick" at 0, "fox" at 2 (skipping "brown").
-        let postings = vec![vec![0u32], vec![2u32]];
-        let score = match_phrase_score(&postings, 1);
+        let postings: Vec<Vec<u32>> = vec![vec![0u32], vec![2u32]];
+        let refs: Vec<&[u32]> = postings.iter().map(Vec::as_slice).collect();
+        let score = match_phrase_score(&refs, 1);
         assert!((score - 1.0).abs() < 1e-6, "slop=1 should match gap of 2");
     }
 
     #[test]
     fn match_phrase_no_match() {
         // Positions: "quick" at 0, "fox" at 5 (too far).
-        let postings = vec![vec![0u32], vec![5u32]];
-        let score = match_phrase_score(&postings, 2);
+        let postings: Vec<Vec<u32>> = vec![vec![0u32], vec![5u32]];
+        let refs: Vec<&[u32]> = postings.iter().map(Vec::as_slice).collect();
+        let score = match_phrase_score(&refs, 2);
         assert_eq!(score, 0.0, "slop=2 should not match gap of 5");
+    }
+
+    #[test]
+    fn match_phrase_query_end_to_end_filters_and_scores() {
+        // Only `match_phrase_score` itself was unit-tested before; nothing
+        // exercised `score_segment`'s phrase-matching loop end to end (the
+        // call site that used to `positions.to_vec()` per candidate doc
+        // and now pushes the `&[u32]` borrow straight from
+        // `phrase_postings` instead). Three docs cover both removal
+        // branches plus the surviving match:
+        //   - "adjacent": "quick" then "brown" back to back -> matches.
+        //   - "scattered": both terms present, but far apart -> phrase_score
+        //     == 0.0, removed.
+        //   - "missing": only "quick" appears -> term_positions.len() <
+        //     phrase_terms.len(), removed.
+        let dir = std::env::temp_dir().join("kosha-test-match-phrase-e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        w.add_document(
+            DocumentId("adjacent".into()),
+            vec![Field::text("t", "the quick brown fox jumps")],
+        );
+        w.add_document(
+            DocumentId("scattered".into()),
+            vec![Field::text(
+                "t",
+                "quick red green blue yellow purple brown fox",
+            )],
+        );
+        w.add_document(
+            DocumentId("missing".into()),
+            vec![Field::text("t", "quick fox jumps over")],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 3,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let mut query = mk_query("", 10);
+        query.match_phrase = Some(kosha_core::MatchPhraseQuery {
+            field: "t".into(),
+            phrase: "quick brown".into(),
+            slop: 0,
+        });
+        let r = searcher.search(&ns, &manifest, &query, None).unwrap();
+        assert_eq!(
+            r.total_hits, 1,
+            "only the adjacent-terms doc should survive phrase filtering"
+        );
+        assert_eq!(r.results.len(), 1);
+        assert_eq!(r.results[0].doc_id.0, "adjacent");
+        assert!(r.results[0].score > 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4709,6 +4798,104 @@ mod tests {
         assert_eq!(r.results.len(), 2);
         assert_eq!(r.results[0].doc_id.0, "b"); // a-user
         assert_eq!(r.results[1].doc_id.0, "c"); // m-user
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn field_sort_ignores_non_matching_docs_sharing_the_sort_field() {
+        // `build_sort_value_maps` filters `filter_store`'s per-field
+        // entries down to the query's actual candidate set before cloning
+        // (see its doc comment) — `filter_store` itself holds every
+        // document in the segment with the field set, matched or not.
+        // "unrelated" has the custodian field set but doesn't match the
+        // query text, so it must never influence — or accidentally
+        // replace — the sort values the two real matches get. If the
+        // `wanted` filter excluded a real match by mistake, that match's
+        // sort value would silently default to "" and both matches would
+        // tie, falling through to `compare_candidate_sort_keys`'s doc_id
+        // tiebreak — so the doc_ids are deliberately the *reverse* of the
+        // intended custodian order ("rrr-..." sorts after "aaa-..." but
+        // carries the *earlier* custodian value), which would produce a
+        // visibly different (wrong) order under that fallback than under
+        // a correct sort-by-custodian. Confirmed this test actually
+        // catches the bug: temporarily inverted the `wanted` filter in
+        // `build_sort_value_maps` and watched it fail, then reverted.
+        let dir = std::env::temp_dir().join("kosha-test-sort-wanted-filter");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        w.add_document(
+            DocumentId("zzz-later-doc-id".into()),
+            vec![
+                Field::text("content", "shared token"),
+                Field::keyword("custodian", "a-user"),
+            ],
+        );
+        w.add_document(
+            DocumentId("aaa-earlier-doc-id".into()),
+            vec![
+                Field::text("content", "shared token"),
+                Field::keyword("custodian", "z-user"),
+            ],
+        );
+        w.add_document(
+            DocumentId("unrelated".into()),
+            vec![
+                Field::text("content", "no overlap here"),
+                Field::keyword("custodian", "m-user"),
+            ],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 3,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let mut custodian_sort = HashMap::new();
+        custodian_sort.insert(
+            "custodian".into(),
+            SortOrder {
+                order: "asc".into(),
+            },
+        );
+        let r = searcher
+            .search(
+                &ns,
+                &manifest,
+                &SearchQuery {
+                    query_text: "shared".into(),
+                    max_results: 10,
+                    from: 0,
+                    bm25_params: Bm25Params::default(),
+                    filter: None,
+                    sort: vec![SortSpec {
+                        fields: custodian_sort,
+                    }],
+                    search_after: None,
+                    highlight: None,
+                    aggs: HashMap::new(),
+                    wildcard: None,
+                    match_phrase: None,
+                    knn: None,
+                    exact_total_hits: None,
+                    total_hits_cap: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            r.total_hits, 2,
+            "\"unrelated\" doesn't match the query text"
+        );
+        assert_eq!(r.results.len(), 2);
+        assert_eq!(r.results[0].doc_id.0, "zzz-later-doc-id"); // a-user
+        assert_eq!(r.results[1].doc_id.0, "aaa-earlier-doc-id"); // z-user
         let _ = std::fs::remove_dir_all(&dir);
     }
 
