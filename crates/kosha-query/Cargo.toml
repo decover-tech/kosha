@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "topk_blockmax"
 harness = false
+
+[[bench]]
+name = "filtered_broad_query"
+harness = false

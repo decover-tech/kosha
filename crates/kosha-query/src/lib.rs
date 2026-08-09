@@ -1120,7 +1120,11 @@ impl Searcher {
         let has_only_filter = !has_query && query.filter.is_some();
 
         // Per-segment hits keyed by doc_seq for O(1) kNN hybrid merge.
-        let mut seg_hits: HashMap<u32, (f64, DocumentId)> = HashMap::new();
+        // Score only — `DocumentId` (an owned `String` allocation) is
+        // deferred until after the top-k cut below, the same discipline
+        // `BoundedTopK` already uses on the WAND paths: don't materialize
+        // a candidate until it's known to have a shot at the final page.
+        let mut seg_hits: HashMap<u32, f64> = HashMap::new();
 
         // ── Wildcard matching ──
         let is_wildcard_mode = query.wildcard.is_some();
@@ -1582,8 +1586,8 @@ impl Searcher {
                         continue;
                     }
                 }
-                if let Some(meta) = reader.doc_meta(doc_seq) {
-                    seg_hits.insert(doc_seq, (score, DocumentId(meta.doc_id.to_owned())));
+                if reader.doc_meta(doc_seq).is_some() {
+                    seg_hits.insert(doc_seq, score);
                 }
             }
         } else if has_only_filter {
@@ -1599,7 +1603,7 @@ impl Searcher {
                 }
                 if let Some(meta) = reader.doc_meta(doc_seq) {
                     let score = scorer.score_term(1, total_docs, meta.field_length);
-                    seg_hits.insert(doc_seq, (score, DocumentId(meta.doc_id.to_owned())));
+                    seg_hits.insert(doc_seq, score);
                 }
             }
         }
@@ -1622,7 +1626,7 @@ impl Searcher {
                 if !seg_hits.is_empty() {
                     for (doc_seq, knn_score) in knn_results {
                         if let Some(existing) = seg_hits.get_mut(&doc_seq) {
-                            existing.0 = existing.0 * 0.5 + knn_score * 0.5 * 100.0;
+                            *existing = *existing * 0.5 + knn_score * 0.5 * 100.0;
                         }
                     }
                 } else {
@@ -1631,14 +1635,64 @@ impl Searcher {
                         if is_tombstoned(doc_seq) {
                             continue;
                         }
-                        if let Some(meta) = reader.doc_meta(doc_seq) {
-                            seg_hits.insert(
-                                doc_seq,
-                                ((score + 1.0) * 10.0, DocumentId(meta.doc_id.to_owned())),
-                            );
+                        if reader.doc_meta(doc_seq).is_some() {
+                            seg_hits.insert(doc_seq, (score + 1.0) * 10.0);
                         }
                     }
                 }
+            }
+        }
+
+        // Overall count of non-tombstoned, filter-passing, query-matching
+        // docs in this segment — decoupled from the (possibly truncated)
+        // candidate list built below, mirroring the WAND paths'
+        // total_hits/candidates split (see `SegmentOutput`).
+        let total_hits = seg_hits.len();
+
+        // Cut to this segment's top `effective_k` by score *before* paying
+        // the `DocumentId` allocation — same discipline `BoundedTopK`
+        // already applies on the WAND paths, extended to every query shape
+        // that doesn't qualify for WAND (filtered, aggregated, wildcard,
+        // phrase, hybrid-kNN). `select_nth_unstable_by` is O(n), no
+        // allocation beyond the `(f64, u32)` collect below.
+        //
+        // Only safe when the final page order is driven by `score` alone:
+        // `query.sort` non-empty means the page order comes from
+        // `compare_candidate_sort_keys` (a custom field or an explicit
+        // `_id` order — note this is stricter than `sort_value_fields`,
+        // which excludes "_id" too: a `sort: [{"_id": ...}]` query has
+        // `sort_value_fields.is_empty() == true` but doesn't rank by score
+        // at all). A `search_after` cursor needs this segment's *full*
+        // candidate set to locate the cursor position downstream. Cutting
+        // by score first in either case could drop the doc that actually
+        // belongs on the page.
+        let effective_k = query.from.saturating_add(query.max_results);
+        let can_truncate =
+            query.sort.is_empty() && query.search_after.as_ref().is_none_or(|a| a.is_empty());
+
+        let mut ranked: Vec<(f64, u32)> = seg_hits.into_iter().map(|(d, s)| (s, d)).collect();
+        if can_truncate {
+            if effective_k == 0 {
+                ranked.clear();
+            } else if ranked.len() > effective_k {
+                // Tie-break by doc_id string ascending, matching both
+                // `BoundedTopK::rank` and `sort_cmp`'s default-ranking
+                // branch exactly — otherwise a cut among score-tied docs
+                // (common: BM25 scores repeat whenever tf/field_length
+                // repeat) could keep a different doc than the final page
+                // order would have chosen. `doc_meta` is a cheap arena
+                // borrow, not an allocation, so this doesn't reintroduce
+                // the cost this change removes.
+                ranked.select_nth_unstable_by(effective_k - 1, |a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            let a_id = reader.doc_meta(a.1).map(|m| m.doc_id).unwrap_or_default();
+                            let b_id = reader.doc_meta(b.1).map(|m| m.doc_id).unwrap_or_default();
+                            a_id.cmp(b_id)
+                        })
+                });
+                ranked.truncate(effective_k);
             }
         }
 
@@ -1650,8 +1704,11 @@ impl Searcher {
                 sort_value_fields,
             )
         };
-        let mut candidates = Vec::with_capacity(seg_hits.len());
-        for (doc_seq, (score, doc_id)) in seg_hits {
+        let mut candidates = Vec::with_capacity(ranked.len());
+        for (score, doc_seq) in ranked {
+            let Some(meta) = reader.doc_meta(doc_seq) else {
+                continue;
+            };
             let sort_values = if sort_value_fields.is_empty() {
                 Vec::new()
             } else {
@@ -1660,7 +1717,7 @@ impl Searcher {
             candidates.push(HitCandidate {
                 reader: Arc::clone(&reader),
                 doc_seq,
-                doc_id,
+                doc_id: DocumentId(meta.doc_id.to_owned()),
                 score,
                 sort_values,
             });
@@ -1685,11 +1742,6 @@ impl Searcher {
                 }
             }
         }
-
-        // Overall count of non-tombstoned, filter-passing, query-matching docs
-        // in this segment — `candidates.len()` captures exactly this set
-        // for the general scoring path. Computed before the move below.
-        let total_hits = candidates.len();
 
         Ok(Some(SegmentOutput {
             candidates,
@@ -2438,14 +2490,15 @@ struct HitCandidate {
 ///
 /// `total_hits` is this segment's total number of matching docs that would
 /// have been scored under the *full* (non-pruned) scoring pass — decoupled
-/// from `candidates.len()` so the block-max WAND early-termination paths can
-/// return only the top-`from + max_results` candidates while still reporting
-/// the true total hit count down-channel: the term's doc frequency on the
-/// single-term path, the exact count of intersection members visited by the
-/// leapfrog join on the multi-term AND path. The general
-/// (non-early-termination) path sets it to `candidates.len()`, preserving
-/// its previous behavior exactly — early-termination is the only place the
-/// two diverge.
+/// from `candidates.len()` so both the block-max WAND early-termination
+/// paths and the general path's own top-k cut (see `score_segment`'s
+/// `can_truncate`) can return only the top `from + max_results` candidates
+/// while still reporting the true total hit count down-channel: the term's
+/// doc frequency on the single-term WAND path, the exact count of
+/// intersection members visited by the leapfrog join on the multi-term AND
+/// path, and `seg_hits.len()` (pre-truncation) on the general path. Only
+/// custom-sort and `search_after` queries — which can't safely truncate by
+/// score alone — still have `total_hits == candidates.len()`.
 struct SegmentOutput {
     candidates: Vec<HitCandidate>,
     aggs: HashMap<String, AggregationResults>,
@@ -4367,6 +4420,131 @@ mod tests {
         assert_eq!(page2.results.len(), 2);
         assert_eq!(page2.results[0].doc_id.0, "doc-2");
         assert_eq!(page2.results[1].doc_id.0, "doc-3");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filtered_query_top_k_matches_full_sort_slice() {
+        // A `query.filter` disqualifies the block-max WAND gate entirely
+        // (`can_block_max_wand` requires `query.filter.is_none()`), so this
+        // exercises `score_segment`'s general-path top-k cut: `seg_hits` is
+        // truncated to `effective_k` by score *before* any `DocumentId` is
+        // materialized. A small page (max_results=5, forces truncation
+        // since 60 docs match) must return exactly the top 5 of what an
+        // unbounded page (max_results=60, no truncation — `ranked.len()`
+        // never exceeds `effective_k`) returns, in the same order, with
+        // the same `total_hits` — proving the cut doesn't reorder or drop
+        // the wrong candidates.
+        let dir = std::env::temp_dir().join("kosha-test-filtered-topk-slice");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        let n = 60usize;
+        for i in 0..n {
+            // Term frequency varies per doc (distinct BM25 scores); every
+            // doc still passes the filter, so all 60 are candidates.
+            let content = format!("{} filler", "target ".repeat(i + 1));
+            w.add_document(
+                DocumentId(format!("doc-{i:03}")),
+                vec![
+                    Field::text("content", content),
+                    Field::keyword("cat", "match"),
+                ],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: n as u32,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let filter = Some(kosha_core::FilterClause::Term {
+            term: std::collections::HashMap::from([("cat".into(), "match".into())]),
+        });
+
+        let mut full_query = mk_query("target", n);
+        full_query.filter = filter.clone();
+        let full = searcher.search(&ns, &manifest, &full_query, None).unwrap();
+        assert_eq!(full.total_hits, n, "filter must keep every doc");
+        assert_eq!(full.results.len(), n);
+
+        let mut page_query = mk_query("target", 5);
+        page_query.filter = filter;
+        let page = searcher.search(&ns, &manifest, &page_query, None).unwrap();
+        assert_eq!(
+            page.total_hits, n,
+            "total_hits must reflect all matches, not just the truncated page"
+        );
+        assert_eq!(page.results.len(), 5);
+        assert_eq!(
+            page_ids(&page),
+            page_ids(&full)[..5].to_vec(),
+            "truncated page must match the top 5 of the untruncated full sort"
+        );
+        for (p, f) in page.results.iter().zip(full.results[..5].iter()) {
+            assert_eq!(p.score, f.score, "score must match the untruncated pass");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filtered_query_top_k_ties_break_by_doc_id() {
+        // Every doc here has IDENTICAL content (same tf, same field length
+        // -> identical BM25 score), so the general path's top-k cut is
+        // exercised entirely on its tie-break, not on score ordering. The
+        // canonical order (`BoundedTopK::rank`, `sort_cmp`'s default-score
+        // branch) is (score desc, doc_id asc) — with every score tied,
+        // that reduces to plain doc_id ascending. A cut that ignores the
+        // tie-break (e.g. an unordered `select_nth_unstable_by` on score
+        // alone) can arbitrarily keep the wrong subset of tied docs.
+        let dir = std::env::temp_dir().join("kosha-test-filtered-topk-ties");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        let n = 30usize;
+        for i in 0..n {
+            w.add_document(
+                DocumentId(format!("doc-{i:03}")),
+                vec![
+                    Field::text("content", "target token same for every doc"),
+                    Field::keyword("cat", "match"),
+                ],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: n as u32,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let filter = Some(kosha_core::FilterClause::Term {
+            term: std::collections::HashMap::from([("cat".into(), "match".into())]),
+        });
+
+        let mut page_query = mk_query("target", 5);
+        page_query.filter = filter;
+        let page = searcher.search(&ns, &manifest, &page_query, None).unwrap();
+        assert_eq!(page.total_hits, n);
+        assert_eq!(
+            page_ids(&page),
+            vec!["doc-000", "doc-001", "doc-002", "doc-003", "doc-004"],
+            "with every score tied, the top-k cut must keep the doc_id-ascending \
+             prefix, matching sort_cmp's default tie-break exactly"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
