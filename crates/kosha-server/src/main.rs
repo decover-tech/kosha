@@ -1069,6 +1069,8 @@ impl AppState {
                 wildcard: None,
                 match_phrase: None,
                 knn: None,
+                exact_total_hits: None,
+                total_hits_cap: None,
             };
             let t_ns = std::time::Instant::now();
             let outcome = self.hydrate_segments_for_search(&ns, &manifest, &query);
@@ -3180,6 +3182,8 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         wildcard: None,
         match_phrase: None,
         knn: None,
+        exact_total_hits: None,
+        total_hits_cap: None,
     };
 
     let (manifest, tombstones) = {

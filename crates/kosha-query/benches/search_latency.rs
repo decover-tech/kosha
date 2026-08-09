@@ -96,6 +96,11 @@ fn mk_query(text: &str) -> SearchQuery {
         wildcard: None,
         match_phrase: None,
         knn: None,
+        // This bench validates total_hits correctness itself (HIT_COUNT,
+        // TERM_BLOOM_DOCS_PER_SEG assertions) — opt into exact counting so
+        // it keeps measuring the real number, not the v1 default cap.
+        exact_total_hits: Some(true),
+        total_hits_cap: None,
     }
 }
 

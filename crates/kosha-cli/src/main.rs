@@ -226,6 +226,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     wildcard: None,
                     match_phrase: None,
                     knn: None,
+                    exact_total_hits: None,
+                    total_hits_cap: None,
                 };
                 if let Some(filter_src) = filter {
                     search.filter = Some(serde_json::from_str(&filter_src)?);

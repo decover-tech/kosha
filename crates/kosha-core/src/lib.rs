@@ -912,6 +912,21 @@ pub struct SearchQuery {
     pub match_phrase: Option<MatchPhraseQuery>,
     #[serde(default)]
     pub knn: Option<KnnQuery>,
+    /// `None` (default) defers to the engine-wide `KOSHA_EXACT_TOTAL_HITS`
+    /// setting (itself `false` unless set) — `total_hits` is capped at
+    /// `total_hits_cap` and reported with `relation: "gte"` once exceeded,
+    /// OpenSearch `track_total_hits`-style. `Some(true)` forces an exact
+    /// count for this query regardless of the engine default: every AND-join
+    /// intersection member is visited (no early exit), which is the cost a
+    /// broad multi-term query pays to get an exact number nobody reads past
+    /// page 1 of. See [`TotalHitsRelation`].
+    #[serde(default)]
+    pub exact_total_hits: Option<bool>,
+    /// Per-query override for the capped-count threshold (only consulted
+    /// when `total_hits` isn't being counted exactly). `None` defers to the
+    /// engine-wide `KOSHA_TOTAL_HITS_CAP` setting (default `10_000`).
+    #[serde(default)]
+    pub total_hits_cap: Option<usize>,
 }
 fn default_max_results() -> usize {
     10
@@ -926,10 +941,25 @@ pub struct ScoredDocument {
     pub highlights: Option<Vec<String>>,
 }
 
+/// Whether `SearchResult.total_hits` is the exact match count or a capped
+/// lower bound (OpenSearch/Elasticsearch `hits.total.relation` naming).
+/// See `SearchQuery.exact_total_hits`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TotalHitsRelation {
+    Eq,
+    Gte,
+}
+fn default_total_hits_relation() -> TotalHitsRelation {
+    TotalHitsRelation::Eq
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub results: Vec<ScoredDocument>,
     pub total_hits: usize,
+    #[serde(default = "default_total_hits_relation")]
+    pub total_hits_relation: TotalHitsRelation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregations: Option<AggregationResults>,
 }

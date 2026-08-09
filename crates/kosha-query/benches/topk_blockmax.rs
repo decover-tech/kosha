@@ -122,6 +122,10 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         wildcard: None,
         match_phrase: None,
         knn: None,
+        // This bench's entire point is the exact-count invariant across
+        // legacy/pruned/unpruned paths — opt out of the v1 default cap.
+        exact_total_hits: Some(true),
+        total_hits_cap: None,
     }
 }
 

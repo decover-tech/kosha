@@ -88,6 +88,8 @@ fn main() {
         wildcard: None,
         match_phrase: None,
         knn: None,
+        exact_total_hits: None,
+        total_hits_cap: None,
     };
 
     // Warm the segment cache.
