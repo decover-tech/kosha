@@ -17,8 +17,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use kosha_core::{
-    Bm25Params, DocumentId, Field, FilterClause, Manifest, ManifestEntry, NamespaceId,
-    SearchQuery, SegmentId,
+    Bm25Params, DocumentId, Field, FilterClause, Manifest, ManifestEntry, NamespaceId, SearchQuery,
+    SegmentId,
 };
 use kosha_query::Searcher;
 use kosha_segment::SegmentWriter;
