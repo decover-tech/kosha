@@ -370,3 +370,82 @@ What the remaining phase data points at, in order:
 4. **Residual open cost** — white_river still Σ12 s across 59 opens
    (~204 ms/seg) with filters lazy; the remaining eager work (inverted
    blob read + offsets arena parse) is the tail.
+
+---
+
+# Addendum: 10M MSMarco apples-to-apples vs turbopuffer (2026-08-09)
+
+True like-for-like against tpuf-benchmark's published "Full-Text Perf"
+chart: **their exact corpus and queries** (CohereLabs msmarco-v2.1 — the
+`segment` text column, real MSMarco queries cycled in dataset order, via
+`fetch_msmarco.py`), 10M docs / 9.91GB text, topk=10, on **their hardware
+class** (m7i.8xlarge, 32 vCPU / 128GB ≈ their c2-standard-30; newer CPU
+generation, noted), single-node Kosha (main @ #89) + same-region S3
+segment bucket, mirroring their VM↔GCS architecture. 167 segments, 23GB
+segment working set, exactly 10,000,000 docs loaded (4,187 docs/sec
+ingest, CPU-idle — flush/upload-serialized).
+
+## Headline 1: tpuf's 8 QPS workload does not fit — CPU-saturated at ~6.4 QPS
+
+At their published load spec (8 QPS open-loop) the box pins all 32 cores
+(95%+ user CPU) completing ~6.4 QPS; the open-loop queue grows without
+bound (queue_ms reached 230+ seconds). Multi-term full scoring costs
+~0.4–4s of CPU per real MSMarco query (5–15 terms, common terms with df
+in the millions). Evidence: `kosha_8qps_saturation.log`.
+
+## Headline 2: service latency at a sustainable 4 QPS
+
+30 min per phase, 7,201/7,201 requests each, zero errors:
+
+| | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| tpuf-benchmark published — warm | 13ms | 18ms | 29ms | — |
+| **Kosha warm** | **304ms** | 1,695ms | 3,343ms | 6.5s |
+| tpuf-benchmark published — cold | 316ms | 381ms | 559ms | — |
+| **Kosha cold (30m window incl. transient)** | **287ms** | 1,600ms | 4,951ms | 8.4s |
+
+Cold detail: cache wiped + process restarted, then 30m at 4 QPS. First
+minute: p50 3.5s / p99 7.8s; converged to warm-equivalent (p50 280ms) by
+~4 minutes. **Total hydration over the whole cold phase: 3.8GB of the
+23GB namespace across 131 of 7,201 queries** — per-query lazy hydration
+holds at 10M scale, and Kosha's cold *median* sits at tpuf's published
+cold median (287ms vs 316ms) because most queries touch already-hydrated
+shards. (Their cold is steady-state `disable_cache: true` — a stricter
+definition; Kosha has no per-query cache bypass, so the transient window
+is the nearest honest equivalent. Both definitions stated, pick your
+reading.)
+
+## Semantics caveat — Kosha's multi-term BM25 is AND
+
+32–33% of requests returned zero hits (vs ~10% legitimate on the
+synthetic corpus): Kosha requires **all** terms to match (documented in
+kosha-query: "multi-term BM25 is AND"), so long natural-language queries
+often match nothing, while tpuf/Lucene-style engines rank the union.
+Two consequences:
+1. The engines answer different questions on the same query stream —
+   disclosed here, doesn't invalidate latency comparison but affects
+   relevance comparability.
+2. **Kosha currently pays OR-cost for AND-results**: it fully traverses
+   and scores every term's postings, then intersects. A conjunctive
+   query can instead be driven by the rarest term's postings (skip-list
+   intersection), touching ~df(rarest) postings instead of Σdf — that
+   plus positions-free scoring decode is likely a 10–50× scoring win on
+   this workload *without* changing semantics.
+
+## What closes the gap, in leverage order
+
+1. **Intersection-driven / block-max multi-term scoring** (#85 extends
+   from single-term): drive by rarest term, skip blocks below threshold.
+   This is the entire warm gap — tpuf runs the same queries at 13ms via
+   exactly this class of pruning; Lucene has shipped BMW since 8.0.
+2. **tf-only postings decode on the scoring path** — positions decode is
+   pure overhead for non-phrase queries.
+3. **Ingest throughput** (secondary): 4.2k docs/sec with 32 idle cores —
+   flush/upload serialization, relevant for time-to-benchmark, not
+   queries.
+
+Setup/teardown: `terraform/dev-machines/aws/bench-kosha` in the infra
+repo (m7i.8xlarge ~$2/hr — destroy after each round). Corpus fetch:
+`fetch_msmarco.py --out-dir /data/corpus --docs 10000000` (~40 min).
+Raw artifacts: results JSONs + per-phase server logs archived with the
+benchmark session.
