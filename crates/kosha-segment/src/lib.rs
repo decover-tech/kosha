@@ -1020,7 +1020,11 @@ fn decode_postings_bytes(mut buf: &[u8]) -> Option<(Vec<Posting>, usize)> {
 
 /// Cache-miss postings reads pending against one blob: (entry index, term,
 /// offset within the blob, span length, admit-to-cache).
-type PendingBlobReads<'a> = Vec<(usize, &'a str, usize, usize, bool)>;
+/// `(term_table_index, output_slot, term, postings_off, postings_len, admit)`
+/// for terms whose postings must be decoded from a blob shard —
+/// `output_slot` carries the term's position in the caller's requested
+/// order so the batched decode can emit deterministically.
+type PendingBlobReads<'a> = Vec<(usize, usize, &'a str, usize, usize, bool)>;
 
 /// v4 span codec, retained for reading fixtures/tests — the production
 /// writer moved to [`write_postings_skip_split`] (v5).
@@ -1436,15 +1440,24 @@ impl SplitInvertedIndex {
     }
 
     fn postings_for_terms<'a>(&'a self, terms: &'a [String]) -> Vec<(&'a str, Arc<Vec<Posting>>)> {
-        let mut out = Vec::with_capacity(terms.len());
+        // The output is emitted strictly in the requested `terms` order.
+        // That order is load-bearing: both the general scoring path and the
+        // WAND join sum per-term float scores in whatever order this
+        // returns, and callers document identical page order across paths —
+        // when cache hits came first and blob-miss groups followed in
+        // HashMap iteration order, two runs of the same query could sum in
+        // different orders and swap docs tied at a page boundary.
+        type Slot<'a> = Option<(&'a str, Arc<Vec<Posting>>)>;
+        let mut slots: Vec<Slot<'a>> = Vec::new();
+        slots.resize_with(terms.len(), || None);
         let mut by_blob: HashMap<usize, PendingBlobReads<'a>> = HashMap::new();
 
-        for term in terms {
+        for (slot, term) in terms.iter().enumerate() {
             let Some(i) = self.find(term) else {
                 continue;
             };
             if let Some(hit) = self.cache.get(i) {
-                out.push((term.as_str(), hit));
+                slots[slot] = Some((term.as_str(), hit));
                 continue;
             }
             let admit = self.cache.admit_on_miss(i);
@@ -1452,14 +1465,14 @@ impl SplitInvertedIndex {
             by_blob
                 .entry(blob_id)
                 .or_default()
-                .push((i, term.as_str(), p_off, p_len, admit));
+                .push((i, slot, term.as_str(), p_off, p_len, admit));
         }
 
         for (blob_id, spans) in by_blob {
             let Some(blob) = self.read_posting_blob(blob_id) else {
                 continue;
             };
-            for (i, term, p_off, p_len, admit) in spans {
+            for (i, slot, term, p_off, p_len, admit) in spans {
                 let Some(p_end) = p_off.checked_add(p_len).filter(|&e| e <= blob.len()) else {
                     continue;
                 };
@@ -1480,11 +1493,11 @@ impl SplitInvertedIndex {
                 if admit {
                     self.cache.insert(i, Arc::clone(&arc), approx_bytes);
                 }
-                out.push((term, arc));
+                slots[slot] = Some((term, arc));
             }
         }
 
-        out
+        slots.into_iter().flatten().collect()
     }
 
     fn decode_postings(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
@@ -1515,15 +1528,23 @@ impl SplitInvertedIndex {
         if !matches!(self.encoding, SplitPostingsEncoding::SkipSplit) {
             return None;
         }
-        let mut out = Vec::with_capacity(terms.len());
+        // Slot-assembled in requested-term order — same load-bearing
+        // reason as `postings_for_terms`: the WAND leapfrog join sums
+        // per-term float scores in whatever order this returns, and a
+        // cache-hits-first / HashMap-iteration-order result would let two
+        // runs of the same query sum in different orders and swap docs
+        // tied at a page boundary.
+        type Slot<'a> = Option<(&'a str, Arc<BlockedTermPostings>)>;
+        let mut slots: Vec<Slot<'a>> = Vec::new();
+        slots.resize_with(terms.len(), || None);
         let mut by_blob: HashMap<usize, PendingBlobReads<'a>> = HashMap::new();
 
-        for term in terms {
+        for (slot, term) in terms.iter().enumerate() {
             let Some(i) = self.find(term) else {
                 continue;
             };
             if let Some(hit) = self.scoring_cache.get(i) {
-                out.push((term.as_str(), hit));
+                slots[slot] = Some((term.as_str(), hit));
                 continue;
             }
             let admit = self.scoring_cache.admit_on_miss(i);
@@ -1531,14 +1552,14 @@ impl SplitInvertedIndex {
             by_blob
                 .entry(blob_id)
                 .or_default()
-                .push((i, term.as_str(), p_off, p_len, admit));
+                .push((i, slot, term.as_str(), p_off, p_len, admit));
         }
 
         for (blob_id, spans) in by_blob {
             let Some(blob) = self.read_posting_blob(blob_id) else {
                 continue;
             };
-            for (i, term, p_off, p_len, admit) in spans {
+            for (i, slot, term, p_off, p_len, admit) in spans {
                 let Some(p_end) = p_off.checked_add(p_len).filter(|&e| e <= blob.len()) else {
                     continue;
                 };
@@ -1552,11 +1573,11 @@ impl SplitInvertedIndex {
                     let bytes = arc.approx_bytes();
                     self.scoring_cache.insert(i, Arc::clone(&arc), bytes);
                 }
-                out.push((term, arc));
+                slots[slot] = Some((term, arc));
             }
         }
 
-        Some(out)
+        Some(slots.into_iter().flatten().collect())
     }
 
     fn read_posting_blob(&self, blob_id: usize) -> Option<Vec<u8>> {
@@ -1838,6 +1859,17 @@ impl SegmentReader {
     }
     pub fn doc_count(&self) -> u32 {
         self.footer.doc_count
+    }
+    /// Whether this segment's per-term postings lists are guaranteed to be
+    /// sorted by ascending `doc_id` (doc_seq). True for every format the
+    /// current `SegmentWriter` emits (inline-lazy v2 and split v3/v4 —
+    /// postings are written in insertion order, and varint-delta encoding
+    /// *requires* ascending ids). False for legacy v1 `Eager` segments,
+    /// whose postings are parsed from an external stream with no ordering
+    /// validation — order-sensitive algorithms (the WAND leapfrog join)
+    /// must fall back to order-agnostic paths for those.
+    pub fn has_ordered_postings(&self) -> bool {
+        !matches!(self.inverted, InvertedAccess::Eager(_))
     }
     pub fn avg_field_length(&self) -> f64 {
         self.footer.avg_field_length
@@ -2919,6 +2951,37 @@ mod tests {
     }
 
     #[test]
+    fn postings_for_terms_preserves_requested_order() {
+        // The output order is load-bearing: scoring paths sum per-term
+        // float scores in this order and promise deterministic pages.
+        // Request terms in a chosen order twice — once fully cache-cold
+        // (batched blob decode used to emit in HashMap iteration order)
+        // and once fully cache-warm (hits used to jump the queue) — and
+        // both must come back exactly as requested.
+        let dir = std::env::temp_dir().join("kosha-test-postings-order");
+        let expected = write_inverted_fixture(&dir);
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(
+            r.has_ordered_postings(),
+            "current writer output must advertise ordered postings"
+        );
+
+        let mut terms: Vec<String> = expected.keys().cloned().collect();
+        terms.sort();
+        terms.reverse(); // deliberately not the TOC's sorted order
+        for pass in ["cold", "warm"] {
+            let got: Vec<&str> = r
+                .postings_for_terms(&terms)
+                .iter()
+                .map(|(t, _)| *t)
+                .collect();
+            let want: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            assert_eq!(got, want, "{pass} pass must preserve requested order");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn postings_for_terms_matches_individual_lookup() {
         let dir = std::env::temp_dir().join("kosha-test-postings-batch");
         let expected = write_inverted_fixture(&dir);
@@ -2961,6 +3024,11 @@ mod tests {
         assert!(
             matches!(r.inverted, InvertedAccess::Eager(_)),
             "v1 file must open on the eager fallback path"
+        );
+        assert!(
+            !r.has_ordered_postings(),
+            "eager v1 postings carry no ordering guarantee — order-sensitive \
+             query paths (WAND leapfrog) must not run on them"
         );
         for (term, postings) in &expected {
             let got = r
