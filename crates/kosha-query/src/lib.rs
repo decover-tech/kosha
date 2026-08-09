@@ -3238,6 +3238,7 @@ mod tests {
             exact_total_hits: None,
             total_hits_cap: None,
             operator: None,
+            no_cache: None,
         }
     }
 
@@ -3992,6 +3993,7 @@ mod tests {
             exact_total_hits: None,
             total_hits_cap: None,
             operator: None,
+            no_cache: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
@@ -5351,6 +5353,7 @@ mod tests {
                     exact_total_hits: None,
                     total_hits_cap: None,
                     operator: None,
+                    no_cache: None,
                 },
                 None,
             )
@@ -5447,6 +5450,7 @@ mod tests {
                     exact_total_hits: None,
                     total_hits_cap: None,
                     operator: None,
+                    no_cache: None,
                 },
                 None,
             )
@@ -5518,6 +5522,7 @@ mod tests {
                     exact_total_hits: None,
                     total_hits_cap: None,
                     operator: None,
+                    no_cache: None,
                 },
                 None,
             )
@@ -5546,6 +5551,7 @@ mod tests {
                     exact_total_hits: None,
                     total_hits_cap: None,
                     operator: None,
+                    no_cache: None,
                 },
                 None,
             )
@@ -5737,6 +5743,7 @@ mod tests {
             exact_total_hits: None,
             total_hits_cap: None,
             operator: None,
+            no_cache: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -5817,6 +5824,7 @@ mod tests {
             exact_total_hits: None,
             total_hits_cap: None,
             operator: None,
+            no_cache: None,
         };
 
         let first = searcher.search(&ns, &manifest, &q, None).unwrap();
@@ -5888,6 +5896,7 @@ mod tests {
             exact_total_hits: None,
             total_hits_cap: None,
             operator: None,
+            no_cache: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);

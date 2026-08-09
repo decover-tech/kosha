@@ -241,6 +241,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     exact_total_hits: exact.then_some(true),
                     total_hits_cap: None,
                     operator: or.then_some(kosha_core::QueryOperator::Or),
+                    no_cache: None,
                 };
                 if let Some(filter_src) = filter {
                     search.filter = Some(serde_json::from_str(&filter_src)?);

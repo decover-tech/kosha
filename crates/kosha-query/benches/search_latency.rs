@@ -102,6 +102,7 @@ fn mk_query(text: &str) -> SearchQuery {
         exact_total_hits: Some(true),
         total_hits_cap: None,
         operator: None,
+        no_cache: None,
     }
 }
 
