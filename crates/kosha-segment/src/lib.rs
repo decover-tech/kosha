@@ -227,6 +227,7 @@ impl SegmentWriter {
             (0..POSTING_BLOB_SHARDS).map(|_| Vec::new()).collect();
         // (term_off_in_pool, term_len, blob_id, postings_off_in_blob, postings_len)
         let mut entries: Vec<(u64, u32, u32, u64, u32)> = Vec::with_capacity(terms.len());
+        let write_version = postings_write_version();
         for term_str in &terms {
             let postings = &self.inverted_index[*term_str];
             let term_off = pool.len() as u64;
@@ -234,7 +235,13 @@ impl SegmentWriter {
             let blob_id = posting_blob_id_for_term(term_str) as u32;
             let blob = &mut posting_blobs[blob_id as usize];
             let p_off = blob.len() as u64;
-            write_postings_skip_split(blob, postings, &self.doc_records);
+            if write_version == SPLIT_INVERTED_VERSION {
+                // Rollout/rollback compatibility mode — see
+                // `postings_write_version`.
+                write_postings_varint_delta(blob, postings);
+            } else {
+                write_postings_skip_split(blob, postings, &self.doc_records);
+            }
             let p_len = (blob.len() as u64 - p_off) as u32;
             entries.push((term_off, term_str.len() as u32, blob_id, p_off, p_len));
         }
@@ -244,7 +251,7 @@ impl SegmentWriter {
 
         let mut buf = Vec::with_capacity(pool_base as usize + pool.len());
         buf.extend_from_slice(&INVERTED_MAGIC.to_le_bytes());
-        buf.extend_from_slice(&SKIP_SPLIT_INVERTED_VERSION.to_le_bytes());
+        buf.extend_from_slice(&write_version.to_le_bytes());
         buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(POSTING_BLOB_SHARDS as u32).to_le_bytes());
         for (term_off, term_len, blob_id, p_off, p_len) in entries {
@@ -398,6 +405,47 @@ pub const SPLIT_INVERTED_VERSION: u32 = 4;
 /// Positions are decoded only by the full [`SegmentReader::postings`] path
 /// (phrase queries, legacy consumers).
 pub const SKIP_SPLIT_INVERTED_VERSION: u32 = 5;
+
+/// THE canonical "is this a split-format inverted TOC?" predicate. Every
+/// site that dispatches on split-ness (the server's posting-blob hydration
+/// gate, `SplitInvertedIndex::detect`, format probes) must call this
+/// instead of enumerating versions locally: a version list that drifts
+/// between the hydration gate and the reader is exactly the PR #83
+/// silent-zero-hits bug — the reader accepts the segment while hydration
+/// never fetches its blobs. Adding v6 must be a one-line change here.
+pub fn is_split_inverted_version(version: u32) -> bool {
+    version == FIXED_SPLIT_INVERTED_VERSION
+        || version == SPLIT_INVERTED_VERSION
+        || version == SKIP_SPLIT_INVERTED_VERSION
+}
+
+/// The inverted-postings version the writer emits —
+/// `KOSHA_POSTINGS_WRITE_VERSION`, accepted values `4` (varint-delta
+/// split) and `5` (skip-split); default `5`. This is the mixed-fleet
+/// rollout/rollback gate: a reader only understands versions up to its own
+/// build, so during a rolling deploy (writer upgraded before all query
+/// replicas) or ahead of a possible rollback, set `4` until the whole
+/// fleet reads v5 — segments written as v5 are permanently unreadable by
+/// pre-v5 binaries. Read once (segments are finalized frequently).
+fn postings_write_version() -> u32 {
+    static VERSION: OnceLock<u32> = OnceLock::new();
+    *VERSION.get_or_init(|| {
+        match std::env::var("KOSHA_POSTINGS_WRITE_VERSION")
+            .ok()
+            .as_deref()
+        {
+            Some("4") => SPLIT_INVERTED_VERSION,
+            Some("5") | None => SKIP_SPLIT_INVERTED_VERSION,
+            Some(other) => {
+                eprintln!(
+                    "WARN: KOSHA_POSTINGS_WRITE_VERSION={other} not supported \
+                     (accepted: 4, 5) — writing v{SKIP_SPLIT_INVERTED_VERSION}"
+                );
+                SKIP_SPLIT_INVERTED_VERSION
+            }
+        }
+    })
+}
 /// Wrapper magic for a zstd-compressed inverted artifact — applied
 /// independently to the TOC (`inverted.idx`) and to each posting blob
 /// shard, so lazy per-shard fetch/decode is unchanged. The wrapped bytes
@@ -447,12 +495,11 @@ pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
         return false;
     }
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
-    // Every split version lives here, including v5 — omitting a new split
-    // version from this gate is exactly the PR #83 silent-zero-hits bug
-    // (cold reads skip posting-blob hydration and score nothing).
-    version == FIXED_SPLIT_INVERTED_VERSION
-        || version == SPLIT_INVERTED_VERSION
-        || version == SKIP_SPLIT_INVERTED_VERSION
+    // Delegates to the one canonical predicate — a version list that
+    // drifts between this hydration gate and the reader is exactly the
+    // PR #83 silent-zero-hits bug (cold reads skip posting-blob hydration
+    // and score nothing).
+    is_split_inverted_version(version)
 }
 
 /// First [`INVERTED_HEADER_LEN`] bytes of the *logical* (uncompressed)
@@ -1269,6 +1316,15 @@ impl BlockedTermPostings {
                 term_frequency,
             });
         }
+        // The delta chain must land exactly on the skip entry's
+        // last_doc_id. Without this check a flipped bit in any doc-delta
+        // varint still "decodes" — every doc_id after it is shifted, BM25
+        // resolves doc_meta for the wrong documents, and the page returns
+        // wrong results with confident scores and no error anywhere.
+        if prev_doc != summary.last_doc_id {
+            out.clear();
+            return false;
+        }
         true
     }
 
@@ -1286,6 +1342,15 @@ impl BlockedTermPostings {
             }
             for sp in &block_buf {
                 let npos = take_var_u32(&mut positions_buf)? as usize;
+                // Untrusted count: every position takes at least one byte,
+                // so a valid `npos` can never exceed the remaining buffer.
+                // Without this bound a single corrupt varint (up to
+                // u32::MAX) turns into a multi-gigabyte `with_capacity`
+                // request that aborts the process instead of failing the
+                // decode closed.
+                if npos > positions_buf.len() {
+                    return None;
+                }
                 let mut positions = Vec::with_capacity(npos);
                 let mut prev_pos = 0u32;
                 for _ in 0..npos {
@@ -1324,9 +1389,9 @@ impl SplitInvertedIndex {
             return false;
         }
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        version == FIXED_SPLIT_INVERTED_VERSION
-            || version == SPLIT_INVERTED_VERSION
-            || version == SKIP_SPLIT_INVERTED_VERSION
+        // Same canonical predicate as the hydration gate — see
+        // `is_split_inverted_version` for why these must never diverge.
+        is_split_inverted_version(version)
     }
 
     fn from_bytes(
@@ -2977,6 +3042,138 @@ mod tests {
                 .collect();
             let want: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
             assert_eq!(got, want, "{pass} pass must preserve requested order");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_block_rejects_corrupted_doc_delta() {
+        // One flipped bit in a scoring doc-delta varint used to "decode"
+        // fine — every doc_id after it silently shifted, and BM25 scored
+        // the wrong documents with no error anywhere. The block's decoded
+        // end must land exactly on the skip entry's last_doc_id.
+        let postings: Vec<Posting> = (0..300)
+            .map(|i| Posting {
+                doc_id: i * 3, // gaps so deltas are multi-valued
+                term_frequency: (i % 7) + 1,
+                positions: vec![i],
+            })
+            .collect();
+        let doc_records: Vec<DocRecord> = (0..=897)
+            .map(|i| DocRecord {
+                doc_id: DocumentId(format!("d{i}")),
+                doc_seq: i,
+                field_length: 10,
+                fields: Vec::new(),
+            })
+            .collect();
+        let mut span = Vec::new();
+        write_postings_skip_split(&mut span, &postings, &doc_records);
+
+        let clean = BlockedTermPostings::parse(Arc::new(span.clone())).unwrap();
+        let mut buf = Vec::new();
+        assert!(clean.read_block(0, &mut buf), "clean block must decode");
+        assert!(clean.decode_full().is_some(), "clean span must full-decode");
+
+        // Corrupt one byte in the middle of block 0's scoring bytes. The
+        // skip table still parses; only the decoded doc chain breaks.
+        let scoring_mid = span.len() / 2;
+        let mut corrupted = span.clone();
+        corrupted[scoring_mid] ^= 0x01;
+        if let Some(parsed) = BlockedTermPostings::parse(Arc::new(corrupted)) {
+            let mut any_block_failed = false;
+            let mut buf = Vec::new();
+            for b in 0..parsed.block_count() {
+                if !parsed.read_block(b, &mut buf) {
+                    any_block_failed = true;
+                }
+            }
+            assert!(
+                any_block_failed || parsed.decode_full().is_none(),
+                "a corrupted span must fail some decode closed, never \
+                 return shifted doc_ids as success"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_full_rejects_oversized_position_count() {
+        // A corrupt positions-count varint used to drive
+        // Vec::with_capacity(up to u32::MAX) — a multi-gigabyte allocation
+        // request that aborts the process. Every position needs at least
+        // one byte, so a valid count can never exceed the remaining
+        // buffer; the decode must fail closed instead.
+        let postings: Vec<Posting> = (0..4)
+            .map(|i| Posting {
+                doc_id: i,
+                term_frequency: 1,
+                positions: vec![1, 2],
+            })
+            .collect();
+        let doc_records: Vec<DocRecord> = (0..4)
+            .map(|i| DocRecord {
+                doc_id: DocumentId(format!("d{i}")),
+                doc_seq: i,
+                field_length: 10,
+                fields: Vec::new(),
+            })
+            .collect();
+        let mut span = Vec::new();
+        write_postings_skip_split(&mut span, &postings, &doc_records);
+
+        let clean = BlockedTermPostings::parse(Arc::new(span.clone())).unwrap();
+        let (decoded, _) = clean.decode_full().unwrap();
+        assert_eq!(decoded.len(), 4);
+
+        // The positions section trails the span; overwrite its first
+        // varint (the first posting's n_positions) with a 5-byte varint
+        // encoding ~u32::MAX.
+        let scoring_bytes: usize = (0..clean.block_count())
+            .map(|b| {
+                let s = clean.summary(b);
+                (s.scoring_end - s.scoring_start) as usize
+            })
+            .sum();
+        let positions_start = clean.scoring_base as usize + scoring_bytes;
+        let mut corrupted = span.clone();
+        corrupted.truncate(positions_start);
+        corrupted.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        let parsed = BlockedTermPostings::parse(Arc::new(corrupted))
+            .expect("skip table untouched — parse must still succeed");
+        assert!(
+            parsed.decode_full().is_none(),
+            "oversized position count must fail closed, not allocate"
+        );
+    }
+
+    #[test]
+    fn scoring_postings_for_terms_preserves_requested_order() {
+        // Same load-bearing property as `postings_for_terms_preserves_
+        // requested_order`, but for the v5 block-lazy scoring path
+        // (`SegmentReader::scoring_postings_for_terms` /
+        // `SplitInvertedIndex::scoring_postings_for_terms`): the WAND
+        // leapfrog join sums per-term float scores in whatever order this
+        // returns, so cache-hits-first / HashMap-iteration-order output
+        // would let two runs of the same query swap docs tied at a page
+        // boundary. Request terms out of TOC order, cold then warm.
+        let dir = std::env::temp_dir().join("kosha-test-scoring-postings-order");
+        let expected = write_inverted_fixture(&dir);
+        let r = SegmentReader::open(dir.clone()).unwrap();
+
+        let mut terms: Vec<String> = expected.keys().cloned().collect();
+        terms.sort();
+        terms.reverse(); // deliberately not the TOC's sorted order
+        for pass in ["cold", "warm"] {
+            let got: Vec<&str> = r
+                .scoring_postings_for_terms(&terms)
+                .iter()
+                .map(|(t, _)| *t)
+                .collect();
+            let want: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+            assert_eq!(
+                got, want,
+                "{pass} pass must preserve requested order on the scoring path"
+            );
         }
         let _ = fs::remove_dir_all(&dir);
     }

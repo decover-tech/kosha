@@ -1214,202 +1214,232 @@ impl Searcher {
                 // would let a release build silently drop hits).
                 && reader.has_ordered_postings();
             if can_block_max_wand {
-                // Terms absent from this segment are omitted (not treated as
-                // empty lists) — mirroring the general path, whose AND
-                // intersection runs over whatever `postings_for_terms`
-                // returns, i.e. only the terms present in this segment.
-                //
-                // v5 (skip-split) segments hand back block-lazy skip-table
-                // views: positions bytes are never decoded on this path,
-                // and a block the pruning or the gallop steps over is never
-                // varint-decoded at all. Older formats degrade to the
-                // classic full decode, walked in the same 128-posting
-                // windows the pre-skip-table code used — identical cost.
-                let sources: Vec<ScoringBlocks<'_>> = reader
-                    .scoring_postings_for_terms(terms_for_bm25)
-                    .into_iter()
-                    .map(|(_, scoring)| ScoringBlocks::new(scoring))
-                    .collect();
-                if sources.is_empty() {
-                    // No query term appears in this segment.
-                    return Ok(Some(SegmentOutput {
-                        candidates: Vec::new(),
-                        aggs: HashMap::new(),
-                        total_hits: 0,
-                    }));
-                }
-
-                // `from` deep pagination still needs `from + max_results`
-                // candidates per segment to slot the page correctly after
-                // the cross-segment sort — the bounded-topk test's
-                // `from=20, max_results=5` would otherwise have only 5
-                // candidates and an empty page.
-                let effective_k = query.from.saturating_add(query.max_results);
-
-                if let [source] = sources.as_slice() {
-                    // ── Single present term: block-by-block walk ──
-                    let df = source.doc_count() as u32;
-                    let total_hits = source.doc_count();
-                    if effective_k == 0 {
-                        // Pure count-only: skip all scoring; total_hits IS df.
-                        return Ok(Some(SegmentOutput {
+                // The whole WAND attempt is fallible: a corrupt v5 block
+                // detected mid-walk yields `None`, and the query falls
+                // through to the general path below, whose full decode
+                // drops undecodable terms — the same fail-closed semantics
+                // v4 corruption always had. Returning partial output here
+                // instead would truncate AND intersections or report an
+                // exact-looking total_hits with missing candidates.
+                let wand_attempt = || -> Option<SegmentOutput> {
+                    // Terms absent from this segment are omitted (not treated as
+                    // empty lists) — mirroring the general path, whose AND
+                    // intersection runs over whatever `postings_for_terms`
+                    // returns, i.e. only the terms present in this segment.
+                    //
+                    // v5 (skip-split) segments hand back block-lazy skip-table
+                    // views: positions bytes are never decoded on this path,
+                    // and a block the pruning or the gallop steps over is never
+                    // varint-decoded at all. Older formats degrade to the
+                    // classic full decode, walked in the same 128-posting
+                    // windows the pre-skip-table code used — identical cost.
+                    let sources: Vec<ScoringBlocks<'_>> = reader
+                        .scoring_postings_for_terms(terms_for_bm25)
+                        .into_iter()
+                        .map(|(_, scoring)| ScoringBlocks::new(scoring))
+                        .collect();
+                    if sources.is_empty() {
+                        // No query term appears in this segment.
+                        return Some(SegmentOutput {
                             candidates: Vec::new(),
                             aggs: HashMap::new(),
-                            total_hits,
-                        }));
+                            total_hits: 0,
+                        });
                     }
 
-                    let mut topk = BoundedTopK::new(effective_k);
-                    let mut buf: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
-                    for block in 0..source.block_count() {
-                        // The block's per-doc score ceiling. v5 reads it
-                        // straight from the skip entry — no posting decode,
-                        // no doc_meta pass. Legacy formats recompute it by
-                        // decoding the block and scanning doc_meta (shared
-                        // fallback logic with `TermCursor::block_upper_bound`
-                        // via `block_bounds`).
-                        let stored = source.stored_summary(block);
-                        let (max_tf, min_fl) = match stored {
-                            Some(summary) => summary,
-                            None => {
-                                if !source.read_block(block, &mut buf) {
-                                    continue;
+                    // `from` deep pagination still needs `from + max_results`
+                    // candidates per segment to slot the page correctly after
+                    // the cross-segment sort — the bounded-topk test's
+                    // `from=20, max_results=5` would otherwise have only 5
+                    // candidates and an empty page.
+                    let effective_k = query.from.saturating_add(query.max_results);
+
+                    if let [source] = sources.as_slice() {
+                        // ── Single present term: block-by-block walk ──
+                        let df = source.doc_count() as u32;
+                        let total_hits = source.doc_count();
+                        if effective_k == 0 {
+                            // Pure count-only: skip all scoring; total_hits IS df.
+                            return Some(SegmentOutput {
+                                candidates: Vec::new(),
+                                aggs: HashMap::new(),
+                                total_hits,
+                            });
+                        }
+
+                        let mut topk = BoundedTopK::new(effective_k);
+                        let mut buf: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
+                        for block in 0..source.block_count() {
+                            // The block's per-doc score ceiling. v5 reads it
+                            // straight from the skip entry — no posting decode,
+                            // no doc_meta pass. Legacy formats recompute it by
+                            // decoding the block and scanning doc_meta (shared
+                            // fallback logic with `TermCursor::block_upper_bound`
+                            // via `block_bounds`).
+                            let stored = source.stored_summary(block);
+                            let (max_tf, min_fl) = match stored {
+                                Some(summary) => summary,
+                                None => {
+                                    if !source.read_block(block, &mut buf) {
+                                        // Corrupt block: abandon the WAND
+                                        // attempt — skipping it would leave
+                                        // total_hits (= span-header df) claiming
+                                        // docs the page can never contain.
+                                        return None;
+                                    }
+                                    let Some(bounds) = block_bounds(&buf, &reader) else {
+                                        // block had no resolvable metas — skip it
+                                        // as unscorable, treating it as "can't
+                                        // reach" to avoid an UB of +inf leaking
+                                        // past the threshold.
+                                        continue;
+                                    };
+                                    bounds
                                 }
-                                let Some(bounds) = block_bounds(&buf, &reader) else {
-                                    // block had no resolvable metas — skip it
-                                    // as unscorable, treating it as "can't
-                                    // reach" to avoid an UB of +inf leaking
-                                    // past the threshold.
-                                    continue;
-                                };
-                                bounds
-                            }
-                        };
-                        // Upper bound for any doc's BM25 score in this block.
-                        let block_ub = scorer.block_max_score(max_tf, df, min_fl);
+                            };
+                            // Upper bound for any doc's BM25 score in this block.
+                            let block_ub = scorer.block_max_score(max_tf, df, min_fl);
 
-                        // WAND pivot test: skip the block entirely iff we
-                        // already hold `effective_k` candidates AND the best
-                        // candidate score in the block can't beat the
-                        // current k-th-best. Strictly below only: a block
-                        // whose ceiling ties the floor can still win the
-                        // page under the (score desc, doc_id asc) total
-                        // order the merge uses, so it must be scored. The
-                        // threshold rises monotonically as higher-scoring
-                        // docs land in `topk`, so later buckets face
-                        // progressively tighter UBs — the long tail of
-                        // low-tf high-dl docs falls off fast for Zipfian
-                        // terms. On v5 a skipped block was never decoded in
-                        // the first place.
-                        if topk.is_full() && block_ub < topk.floor() {
-                            continue;
-                        }
-                        // v5: only a block that survived the pivot test is
-                        // ever varint-decoded (legacy already decoded above
-                        // to compute bounds).
-                        if stored.is_some() && !source.read_block(block, &mut buf) {
-                            continue;
-                        }
-                        for sp in &buf {
-                            if let Some(meta) = reader.doc_meta(sp.doc_id) {
-                                let score =
-                                    scorer.score_term(sp.term_frequency, df, meta.field_length);
-                                topk.insert(score, sp.doc_id, meta.doc_id);
+                            // WAND pivot test: skip the block entirely iff we
+                            // already hold `effective_k` candidates AND the best
+                            // candidate score in the block can't beat the
+                            // current k-th-best. Strictly below only: a block
+                            // whose ceiling ties the floor can still win the
+                            // page under the (score desc, doc_id asc) total
+                            // order the merge uses, so it must be scored. The
+                            // threshold rises monotonically as higher-scoring
+                            // docs land in `topk`, so later buckets face
+                            // progressively tighter UBs — the long tail of
+                            // low-tf high-dl docs falls off fast for Zipfian
+                            // terms. On v5 a skipped block was never decoded in
+                            // the first place.
+                            if topk.is_full() && block_ub < topk.floor() {
+                                continue;
+                            }
+                            // v5: only a block that survived the pivot test is
+                            // ever varint-decoded (legacy already decoded above
+                            // to compute bounds).
+                            if stored.is_some() && !source.read_block(block, &mut buf) {
+                                // Corrupt block — fail the attempt closed, same
+                                // as above.
+                                return None;
+                            }
+                            for sp in &buf {
+                                if let Some(meta) = reader.doc_meta(sp.doc_id) {
+                                    let score =
+                                        scorer.score_term(sp.term_frequency, df, meta.field_length);
+                                    topk.insert(score, sp.doc_id, meta.doc_id);
+                                }
                             }
                         }
+
+                        return Some(SegmentOutput {
+                            candidates: topk.into_candidates(&reader),
+                            aggs: HashMap::new(),
+                            total_hits,
+                        });
                     }
 
-                    return Ok(Some(SegmentOutput {
+                    // ── Multi-term block-max AND: leapfrog join ──
+                    // `scoring_postings_for_terms` (and its `postings_for_terms`
+                    // fallback) guarantee requested-term order — they emit into
+                    // per-term slots, never HashMap iteration order — so the
+                    // per-doc score summation below runs in the same
+                    // deterministic order as the general path's `term_maps`
+                    // loop: identical float rounding, identical ties.
+                    let mut cursors: Vec<TermCursor<'_>> =
+                        sources.iter().map(TermCursor::new).collect();
+
+                    let mut total_hits = 0usize;
+                    let mut topk = BoundedTopK::new(effective_k);
+                    let mut target: u32 = 0;
+                    'join: loop {
+                        // Align every cursor on the smallest doc_seq >= `target`
+                        // present in ALL lists: repeatedly raise the candidate
+                        // to the highest cursor landing until one full pass
+                        // moves nothing (= every cursor agrees).
+                        let mut candidate = target;
+                        loop {
+                            let mut moved = false;
+                            for cursor in cursors.iter_mut() {
+                                match cursor.advance_to(candidate) {
+                                    // Some list exhausted → intersection done.
+                                    None => break 'join,
+                                    Some(doc) if doc > candidate => {
+                                        candidate = doc;
+                                        moved = true;
+                                    }
+                                    Some(_) => {}
+                                }
+                            }
+                            if !moved {
+                                break;
+                            }
+                        }
+
+                        // Every cursor sits on `candidate`: an intersection
+                        // member. Count it unconditionally — total_hits must
+                        // stay exact, and it must count postings-intersection
+                        // membership exactly like the single-present-term arm's
+                        // `postings.len()` does (meta resolvability affects
+                        // whether a doc can be *scored*, never whether it is
+                        // *counted*) — then score it only if its summed
+                        // per-term block ceiling says it could still make the
+                        // page.
+                        total_hits += 1;
+                        if effective_k > 0 {
+                            if let Some(meta) = reader.doc_meta(candidate) {
+                                let prune = topk.is_full() && {
+                                    let mut ub = 0.0;
+                                    for cursor in cursors.iter_mut() {
+                                        ub += cursor.block_upper_bound(&scorer, &reader);
+                                    }
+                                    // Strict: a doc whose ceiling ties the
+                                    // floor can still win by doc_id tiebreak.
+                                    ub < topk.floor()
+                                };
+                                if !prune {
+                                    let mut score = 0.0;
+                                    for cursor in &cursors {
+                                        let sp = cursor.current();
+                                        score += scorer.score_term(
+                                            sp.term_frequency,
+                                            cursor.df,
+                                            meta.field_length,
+                                        );
+                                    }
+                                    topk.insert(score, candidate, meta.doc_id);
+                                }
+                            }
+                        }
+
+                        if candidate == u32::MAX {
+                            break;
+                        }
+                        target = candidate + 1;
+                    }
+
+                    // A cursor that stopped on a corrupt block (rather than
+                    // genuine exhaustion) truncated the join at that doc range
+                    // — intersection members past it were neither counted nor
+                    // scored. Fail the attempt closed instead of returning the
+                    // truncated result as if it were exact.
+                    if cursors.iter().any(|c| c.corrupt) {
+                        return None;
+                    }
+
+                    Some(SegmentOutput {
                         candidates: topk.into_candidates(&reader),
                         aggs: HashMap::new(),
                         total_hits,
-                    }));
+                    })
+                };
+                if let Some(output) = wand_attempt() {
+                    return Ok(Some(output));
                 }
-
-                // ── Multi-term block-max AND: leapfrog join ──
-                // `scoring_postings_for_terms` (and its `postings_for_terms`
-                // fallback) guarantee requested-term order — they emit into
-                // per-term slots, never HashMap iteration order — so the
-                // per-doc score summation below runs in the same
-                // deterministic order as the general path's `term_maps`
-                // loop: identical float rounding, identical ties.
-                let mut cursors: Vec<TermCursor<'_>> =
-                    sources.iter().map(TermCursor::new).collect();
-
-                let mut total_hits = 0usize;
-                let mut topk = BoundedTopK::new(effective_k);
-                let mut target: u32 = 0;
-                'join: loop {
-                    // Align every cursor on the smallest doc_seq >= `target`
-                    // present in ALL lists: repeatedly raise the candidate
-                    // to the highest cursor landing until one full pass
-                    // moves nothing (= every cursor agrees).
-                    let mut candidate = target;
-                    loop {
-                        let mut moved = false;
-                        for cursor in cursors.iter_mut() {
-                            match cursor.advance_to(candidate) {
-                                // Some list exhausted → intersection done.
-                                None => break 'join,
-                                Some(doc) if doc > candidate => {
-                                    candidate = doc;
-                                    moved = true;
-                                }
-                                Some(_) => {}
-                            }
-                        }
-                        if !moved {
-                            break;
-                        }
-                    }
-
-                    // Every cursor sits on `candidate`: an intersection
-                    // member. Count it unconditionally — total_hits must
-                    // stay exact, and it must count postings-intersection
-                    // membership exactly like the single-present-term arm's
-                    // `postings.len()` does (meta resolvability affects
-                    // whether a doc can be *scored*, never whether it is
-                    // *counted*) — then score it only if its summed
-                    // per-term block ceiling says it could still make the
-                    // page.
-                    total_hits += 1;
-                    if effective_k > 0 {
-                        if let Some(meta) = reader.doc_meta(candidate) {
-                            let prune = topk.is_full() && {
-                                let mut ub = 0.0;
-                                for cursor in cursors.iter_mut() {
-                                    ub += cursor.block_upper_bound(&scorer, &reader);
-                                }
-                                // Strict: a doc whose ceiling ties the
-                                // floor can still win by doc_id tiebreak.
-                                ub < topk.floor()
-                            };
-                            if !prune {
-                                let mut score = 0.0;
-                                for cursor in &cursors {
-                                    let sp = cursor.current();
-                                    score += scorer.score_term(
-                                        sp.term_frequency,
-                                        cursor.df,
-                                        meta.field_length,
-                                    );
-                                }
-                                topk.insert(score, candidate, meta.doc_id);
-                            }
-                        }
-                    }
-
-                    if candidate == u32::MAX {
-                        break;
-                    }
-                    target = candidate + 1;
-                }
-
-                return Ok(Some(SegmentOutput {
-                    candidates: topk.into_candidates(&reader),
-                    aggs: HashMap::new(),
-                    total_hits,
-                }));
+                // Corruption detected: fall through to the general path,
+                // whose full decode drops undecodable terms (fail-closed,
+                // v4-equivalent) instead of truncating or inflating.
             }
 
             // `PostingsRef`: legacy segments lend a borrow into their parsed
@@ -2177,6 +2207,12 @@ struct TermCursor<'a> {
     buf: Vec<ScoringPosting>,
     idx: usize,
     exhausted: bool,
+    /// Set when the cursor stopped because a block failed to decode rather
+    /// than by genuine exhaustion. The join must check this after the loop:
+    /// a corrupt-stopped cursor truncated the intersection, and the caller
+    /// must fail the WAND attempt closed instead of reporting the partial
+    /// result as exact.
+    corrupt: bool,
     /// Block index `block_ub` was computed for (`usize::MAX` = none yet).
     ub_block: usize,
     block_ub: f64,
@@ -2191,6 +2227,7 @@ impl<'a> TermCursor<'a> {
             buf: Vec::with_capacity(SCORING_BLOCK_LEN),
             idx: 0,
             exhausted: source.block_count() == 0,
+            corrupt: false,
             ub_block: usize::MAX,
             block_ub: 0.0,
             source,
@@ -2209,50 +2246,51 @@ impl<'a> TermCursor<'a> {
     /// between are never decoded), then a `partition_point` over the ≤128
     /// decoded entries lands inside it.
     fn advance_to(&mut self, target: u32) -> Option<u32> {
-        loop {
-            if self.exhausted {
-                return None;
-            }
-            if self.loaded && self.idx < self.buf.len() && self.buf[self.idx].doc_id >= target {
-                return Some(self.buf[self.idx].doc_id);
-            }
-            // Locate the block that can contain `target`.
-            let located = if !self.loaded {
-                self.source.find_block(target, self.block)
-            } else if self.source.last_doc(self.block) < target {
-                self.source.find_block(target, self.block + 1)
-            } else {
-                Some(self.block)
-            };
-            let Some(block) = located else {
-                self.exhausted = true;
-                return None;
-            };
-            if block != self.block || !self.loaded {
-                self.block = block;
-                if !self.source.read_block(block, &mut self.buf) {
-                    // Corrupt block: stop this term conservatively — the
-                    // same query against the full-decode path would have
-                    // dropped the term entirely at decode.
-                    self.exhausted = true;
-                    return None;
-                }
-                self.loaded = true;
-                self.idx = 0;
-            }
-            self.idx += self.buf[self.idx..].partition_point(|p| p.doc_id < target);
-            if self.idx < self.buf.len() {
-                return Some(self.buf[self.idx].doc_id);
-            }
-            // Only reachable on a short (corrupt) block, since
-            // `last_doc(block) >= target` — try the next block.
-            self.block += 1;
-            self.loaded = false;
-            if self.block >= self.source.block_count() {
-                self.exhausted = true;
-                return None;
-            }
+        if self.exhausted {
+            return None;
         }
+        if self.loaded && self.idx < self.buf.len() && self.buf[self.idx].doc_id >= target {
+            return Some(self.buf[self.idx].doc_id);
+        }
+        // Locate the block that can contain `target`.
+        let located = if !self.loaded {
+            self.source.find_block(target, self.block)
+        } else if self.source.last_doc(self.block) < target {
+            self.source.find_block(target, self.block + 1)
+        } else {
+            Some(self.block)
+        };
+        let Some(block) = located else {
+            self.exhausted = true;
+            return None;
+        };
+        if block != self.block || !self.loaded {
+            self.block = block;
+            if !self.source.read_block(block, &mut self.buf) {
+                // Corrupt block: stop the walk AND flag it — the join
+                // distinguishes corruption from exhaustion and fails the
+                // whole WAND attempt closed, falling back to the general
+                // path (whose full decode drops the term, the
+                // v4-equivalent semantics). Stopping silently here would
+                // truncate the intersection at this doc range.
+                self.exhausted = true;
+                self.corrupt = true;
+                return None;
+            }
+            self.loaded = true;
+            self.idx = 0;
+        }
+        self.idx += self.buf[self.idx..].partition_point(|p| p.doc_id < target);
+        if self.idx < self.buf.len() {
+            return Some(self.buf[self.idx].doc_id);
+        }
+        // Unreachable with a validated decode (`read_block` checks the
+        // block's final doc_id against the skip entry, and
+        // `last_doc(block) >= target` guaranteed a landing) — treat it as
+        // corruption, not exhaustion, so the join fails closed.
+        self.exhausted = true;
+        self.corrupt = true;
+        None
     }
 
     /// BM25 upper bound of the cursor's current block. v5 reads the skip
@@ -3836,6 +3874,93 @@ mod tests {
             page_ids(&full)[20..25].to_vec(),
             "deep page must match the equivalent slice of a legacy full sort"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_postings_fail_closed_not_truncated_or_inflated() {
+        // On-disk corruption of one term's postings must degrade exactly
+        // like v4 always did: the term drops out (queries behave as if it
+        // were absent), never a truncated AND intersection, never a
+        // total_hits claiming docs the page can't contain, and never a
+        // process abort from an unbounded allocation. The corpus is small
+        // enough that blobs stay under the KIZC compression threshold, so
+        // the test can corrupt raw span bytes in place.
+        let dir = std::env::temp_dir().join("kosha-test-corrupt-fail-closed");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        for i in 0..150 {
+            let mut text = format!("alpha{}", " filler".repeat(i % 5));
+            if i % 2 == 0 {
+                text.push_str(" beta");
+            }
+            w.add_document(
+                DocumentId(format!("doc-{i:04}")),
+                vec![Field::text("t", text)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 150,
+            }],
+            segment_footers: Default::default(),
+        };
+
+        // Baseline (uncorrupted): "alpha beta" intersects, "beta" matches.
+        {
+            let searcher = Searcher::new(dir.clone());
+            let both = searcher
+                .search(&ns, &manifest, &mk_query("alpha beta", 10), None)
+                .unwrap();
+            assert_eq!(both.total_hits, 75);
+            let beta = searcher
+                .search(&ns, &manifest, &mk_query("beta", 10), None)
+                .unwrap();
+            assert_eq!(beta.total_hits, 75);
+        }
+
+        // Corrupt beta's posting-blob shard on disk (garbage over the
+        // middle third — hits the span regardless of internal layout).
+        let blob_path = seg_dir.join(kosha_segment::posting_blob_file_for_term("beta"));
+        let mut blob = std::fs::read(&blob_path).unwrap();
+        let (start, end) = (blob.len() / 3, blob.len() * 2 / 3);
+        for b in &mut blob[start..end] {
+            *b = 0xFF;
+        }
+        std::fs::write(&blob_path, &blob).unwrap();
+
+        // Fresh searcher — no cached postings from the baseline pass.
+        let searcher = Searcher::new(dir.clone());
+        let alpha_only = searcher
+            .search(&ns, &manifest, &mk_query("alpha", 10), None)
+            .unwrap();
+        assert_eq!(alpha_only.total_hits, 150, "alpha's shard is untouched");
+
+        let both = searcher
+            .search(&ns, &manifest, &mk_query("alpha beta", 10), None)
+            .unwrap();
+        assert_eq!(
+            both.total_hits, alpha_only.total_hits,
+            "corrupt term must drop out of the AND (v4 semantics), not \
+             truncate the intersection"
+        );
+        assert_eq!(page_ids(&both), page_ids(&alpha_only));
+
+        let beta = searcher
+            .search(&ns, &manifest, &mk_query("beta", 10), None)
+            .unwrap();
+        assert_eq!(
+            beta.total_hits, 0,
+            "undecodable single term must fail closed to zero hits, not \
+             report the span-header df with an empty page"
+        );
+        assert!(beta.results.is_empty());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
