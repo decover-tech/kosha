@@ -10,7 +10,7 @@ use kosha_core::{
     segment_may_contain_terms, segment_may_match, AggBucket, AggBucketResult, AggCompositeBucket,
     AggCompositeResult, AggMetricResult, Aggregation, AggregationResults, Bm25Params, DocumentId,
     FieldType, FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry, NamespaceId,
-    ScoredDocument, SearchQuery, SearchResult, SortSpec, TermBloomMode,
+    ScoredDocument, SearchQuery, SearchResult, SortSpec, TermBloomMode, TotalHitsRelation,
 };
 use kosha_segment::{
     tokenize, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
@@ -1197,6 +1197,18 @@ impl Searcher {
             //   * tombstones: even a sparse tombstone set changes `total_hits`
             //     by some-doc subtraction — fording a fall-back to the full
             //     path where total_hits = candidates.len() remains exact.
+            //
+            // Every path above stays exact per segment, on purpose — no
+            // pruning here ever bends a count (the KIZC lesson: a pruning
+            // path that bends counts looks better while broken). The
+            // OpenSearch-style capped/`gte` reporting callers actually see
+            // is applied once, centrally, in `search_inner` after these
+            // exact per-segment totals are already summed — see
+            // `resolve_total_hits`. This v1 caps only the *reported*
+            // number; the join above still walks to completion regardless
+            // of the cap, since safely stopping the walk itself needs a
+            // per-term suffix-max upper bound the postings v5 skip table
+            // doesn't carry yet (tracked as follow-up work).
             let segment_has_tombstones = tombstones.is_some_and(|t| {
                 t.get(&entry.segment_id)
                     .is_some_and(|seqs| !seqs.is_empty())
@@ -1820,6 +1832,7 @@ impl Searcher {
                 SearchResult {
                     results: Vec::new(),
                     total_hits: 0,
+                    total_hits_relation: TotalHitsRelation::Eq,
                     aggregations: None,
                 },
                 phase_stats,
@@ -1952,6 +1965,25 @@ impl Searcher {
                 all_aggs.insert(agg_name, result);
             }
         }
+
+        // ── total_hits capping (OpenSearch-style, opt out per query) ──
+        // Every segment above counted its intersection exactly (see the
+        // `can_block_max_wand` doc comment) — this is the one place that
+        // number is turned into what callers actually see. Default: capped
+        // at `total_hits_cap` with `relation: gte` beyond it, because exact
+        // AND total_hits forces the join to visit every intersection member
+        // even long after the top-k page is settled — for a broad query
+        // intersecting millions of docs that's the difference between
+        // walking ~10⁶ candidates and reporting "at least 10,000" for free.
+        // `exact_total_hits: true` (per query, or `KOSHA_EXACT_TOTAL_HITS`
+        // engine-wide) restores the old unconditional-exact behavior.
+        let exact = query
+            .exact_total_hits
+            .unwrap_or_else(exact_total_hits_engine_default);
+        let cap = query
+            .total_hits_cap
+            .unwrap_or_else(total_hits_cap_engine_default);
+        let (total_hits, total_hits_relation) = resolve_total_hits(total_hits, exact, cap);
 
         // ── Sort (score-only / sort-key candidates — no full field payloads) ──
         let sort_cmp = |a: &HitCandidate, b: &HitCandidate| -> std::cmp::Ordering {
@@ -2100,6 +2132,7 @@ impl Searcher {
             SearchResult {
                 results: page,
                 total_hits,
+                total_hits_relation,
                 aggregations: merged_aggs,
             },
             phase_stats,
@@ -2242,6 +2275,47 @@ fn block_bounds(
 #[doc(hidden)]
 pub fn force_legacy_search_after() -> Option<Vec<String>> {
     Some(vec![String::new()])
+}
+
+/// Engine-wide default for `SearchQuery.exact_total_hits` when a request
+/// doesn't set it (`KOSHA_EXACT_TOTAL_HITS`, default `false` — capped
+/// counts). Read once: searches happen far more often than this changes,
+/// same rationale as `kosha_segment`'s `postings_cache_max_bytes`.
+fn exact_total_hits_engine_default() -> bool {
+    static DEFAULT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEFAULT.get_or_init(|| {
+        std::env::var("KOSHA_EXACT_TOTAL_HITS")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Engine-wide default cap for the OpenSearch-style capped `total_hits`
+/// count (`KOSHA_TOTAL_HITS_CAP`, default `10_000` — matches OpenSearch /
+/// Elasticsearch's `track_total_hits` default cap). Per-query
+/// `SearchQuery.total_hits_cap` overrides this.
+fn total_hits_cap_engine_default() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("KOSHA_TOTAL_HITS_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000)
+    })
+}
+
+/// Turns an exact cross-segment `total_hits` sum into what a caller sees:
+/// capped at `cap` with `relation: gte` beyond it, unless `exact` asks for
+/// the uncapped number. Pulled out as a pure function (no env/query
+/// plumbing) so the capping arithmetic itself is unit-testable without a
+/// large corpus or global env-var state — see the tests below.
+fn resolve_total_hits(total_hits: usize, exact: bool, cap: usize) -> (usize, TotalHitsRelation) {
+    if !exact && total_hits > cap {
+        (cap, TotalHitsRelation::Gte)
+    } else {
+        (total_hits, TotalHitsRelation::Eq)
+    }
 }
 
 /// One term's cursor in the multi-term block-max AND join (see the WAND
@@ -2776,7 +2850,90 @@ mod tests {
             wildcard: None,
             match_phrase: None,
             knn: None,
+            exact_total_hits: None,
+            total_hits_cap: None,
         }
+    }
+
+    #[test]
+    fn resolve_total_hits_caps_and_labels_relation() {
+        // Under the cap: exact regardless of the `exact` flag.
+        assert_eq!(resolve_total_hits(5, false, 10), (5, TotalHitsRelation::Eq));
+        assert_eq!(resolve_total_hits(5, true, 10), (5, TotalHitsRelation::Eq));
+        // At the cap exactly: still exact (only *exceeding* the cap flips
+        // it — an intersection of precisely `cap` docs has nothing hidden).
+        assert_eq!(
+            resolve_total_hits(10, false, 10),
+            (10, TotalHitsRelation::Eq)
+        );
+        // Over the cap: capped + gte, unless exact mode overrides it.
+        assert_eq!(
+            resolve_total_hits(50, false, 10),
+            (10, TotalHitsRelation::Gte)
+        );
+        assert_eq!(
+            resolve_total_hits(50, true, 10),
+            (50, TotalHitsRelation::Eq)
+        );
+    }
+
+    #[test]
+    fn total_hits_cap_overrides_via_query_field() {
+        // End-to-end wiring check for `total_hits_cap` / `exact_total_hits`
+        // on `SearchQuery`, without needing a >10k-document corpus to
+        // exercise the (much larger) engine-wide default cap.
+        let dir = std::env::temp_dir().join("kosha-test-total-hits-cap-override");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        let n = 10usize;
+        for i in 0..n {
+            w.add_document(
+                DocumentId(format!("doc-{i:02}")),
+                vec![Field::text("content", "widget")],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: n as u32,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        // Default query (both fields None): under the engine-wide default
+        // cap (10_000), so exact and reported as such.
+        let default_r = searcher
+            .search(&ns, &manifest, &mk_query("widget", 5), None)
+            .unwrap();
+        assert_eq!(default_r.total_hits, n);
+        assert_eq!(default_r.total_hits_relation, TotalHitsRelation::Eq);
+
+        // Per-query cap below the true count: capped + gte, page unaffected.
+        let mut capped_q = mk_query("widget", 5);
+        capped_q.total_hits_cap = Some(3);
+        let capped_r = searcher.search(&ns, &manifest, &capped_q, None).unwrap();
+        assert_eq!(capped_r.total_hits, 3);
+        assert_eq!(capped_r.total_hits_relation, TotalHitsRelation::Gte);
+        assert_eq!(
+            capped_r.results.len(),
+            5,
+            "the returned page is untouched by capping"
+        );
+
+        // exact_total_hits: true overrides even a low per-query cap.
+        let mut exact_q = mk_query("widget", 5);
+        exact_q.total_hits_cap = Some(3);
+        exact_q.exact_total_hits = Some(true);
+        let exact_r = searcher.search(&ns, &manifest, &exact_q, None).unwrap();
+        assert_eq!(exact_r.total_hits, n);
+        assert_eq!(exact_r.total_hits_relation, TotalHitsRelation::Eq);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Write a one-document segment containing `text` and return its dir.
@@ -3281,6 +3438,8 @@ mod tests {
             }),
             match_phrase: None,
             knn: None,
+            exact_total_hits: None,
+            total_hits_cap: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
@@ -4323,6 +4482,8 @@ mod tests {
                     wildcard: None,
                     match_phrase: None,
                     knn: None,
+                    exact_total_hits: None,
+                    total_hits_cap: None,
                 },
                 None,
             )
@@ -4388,6 +4549,8 @@ mod tests {
                     wildcard: None,
                     match_phrase: None,
                     knn: None,
+                    exact_total_hits: None,
+                    total_hits_cap: None,
                 },
                 None,
             )
@@ -4413,6 +4576,8 @@ mod tests {
                     wildcard: None,
                     match_phrase: None,
                     knn: None,
+                    exact_total_hits: None,
+                    total_hits_cap: None,
                 },
                 None,
             )
@@ -4601,6 +4766,8 @@ mod tests {
             wildcard: None,
             match_phrase: None,
             knn: None,
+            exact_total_hits: None,
+            total_hits_cap: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -4678,6 +4845,8 @@ mod tests {
             wildcard: None,
             match_phrase: None,
             knn: None,
+            exact_total_hits: None,
+            total_hits_cap: None,
         };
 
         let first = searcher.search(&ns, &manifest, &q, None).unwrap();
@@ -4746,6 +4915,8 @@ mod tests {
             wildcard: None,
             match_phrase: None,
             knn: None,
+            exact_total_hits: None,
+            total_hits_cap: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
