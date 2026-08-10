@@ -364,7 +364,8 @@ What the remaining phase data points at, in order:
    namespace-level `segments.meta` object (blooms + doc counts + format
    versions, one GET) is the next hydrate lever.
 2. **Compaction** — 1103 segments for 1M docs multiplies every remaining
-   per-segment cost (blocked on the tiered doc-loss bug).
+   per-segment cost. The tiered doc-loss bug that blocked this is fixed
+   (PR #62); not yet run at this scale.
 3. **Postings compression** — remaining scoring-set bytes (1170 MB on
    `paragraph_index_hnsw`) are mostly postings.
 4. **Residual open cost** — white_river still Σ12 s across 59 opens
@@ -509,8 +510,10 @@ converging to warm within minutes.
 3. **Queue/admit only appear at p90+** — saturation artifacts that
    shrink as service time drops.
 4. **167 segments multiply fixed per-query costs** — compaction to ~16
-   large segments (blocked on the tiered doc-loss bug) trims cursor
-   setup, TOC lookups, and fan-out overhead.
+   large segments trims cursor setup, TOC lookups, and fan-out overhead.
+   Both blockers are fixed (doc-loss on a read failure mid-merge, PR #62;
+   a separate race where a delete landing mid-merge was silently
+   discarded, PR #113); not yet run at this scale.
 
 Trajectory: unrunnable → 100× off (round 1 @4QPS) → 34× off at full
 spec, in two days, with every remaining contributor named and owned.
