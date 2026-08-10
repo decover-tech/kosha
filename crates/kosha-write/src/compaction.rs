@@ -15,6 +15,17 @@ pub struct CompactionPolicy {
     pub min_mergeable_segments: usize,
     /// `needs_compaction` flips true when mergeable segment count reaches this.
     pub trigger_mergeable_segments: usize,
+    /// Byte ceiling on a merge's *combined input size* — no pass may produce
+    /// a segment larger than this (`0` disables the cap). Guards memory:
+    /// the parsed-segment cache and live-bytes budget evict whole segments,
+    /// so an unbounded merge (167 → 1 on the 10M MSMarco bench) produces
+    /// one giant, effectively unevictable entry and the box lives in
+    /// reclaim stalls. Same idea as Lucene's 5GB `max_merged_segment`;
+    /// oversized segments are simply never merge inputs again. `Full` mode
+    /// under a cap merges one greedy smallest-first group per pass, so
+    /// repeated passes converge to ~`ceil(total_bytes / cap)` segments —
+    /// callers loop until `segments_after` stops dropping.
+    pub max_merged_segment_bytes: u64,
 }
 
 impl Default for CompactionPolicy {
@@ -24,6 +35,7 @@ impl Default for CompactionPolicy {
             max_segments_per_merge: 32,
             min_mergeable_segments: 2,
             trigger_mergeable_segments: 8,
+            max_merged_segment_bytes: 5 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -100,13 +112,20 @@ pub fn needs_compaction(manifest: &Manifest, policy: &CompactionPolicy) -> bool 
 ///
 /// `is_local` filters out segments that are not present on disk (same safe
 /// partial-merge behavior as the legacy all-to-one compact path).
-pub fn select_merge_inputs<F>(
+///
+/// `segment_bytes` reports a candidate's on-disk size for the
+/// `max_merged_segment_bytes` cap. `None` (size unknowable) is treated as
+/// "too big to group" — the segment is conservatively left unmerged rather
+/// than risking an over-cap output.
+pub fn select_merge_inputs<F, G>(
     manifest: &Manifest,
     opts: &CompactOptions,
     mut is_local: F,
+    mut segment_bytes: G,
 ) -> Option<MergePlan>
 where
     F: FnMut(&SegmentId) -> bool,
+    G: FnMut(&SegmentId) -> Option<u64>,
 {
     let mut candidates: Vec<ManifestEntry> = manifest
         .segments
@@ -119,8 +138,38 @@ where
         return None;
     }
 
+    let cap = opts.policy.max_merged_segment_bytes;
     match opts.mode {
-        CompactMode::Full => Some(MergePlan { inputs: candidates }),
+        CompactMode::Full => {
+            if cap == 0 {
+                return Some(MergePlan { inputs: candidates });
+            }
+            // Greedy smallest-first group under the cap: one group per
+            // pass; repeated passes converge to ~ceil(total/cap) segments.
+            // Sort is (size, id) so planning is deterministic; unknown
+            // sizes sort last and can never join a capped group.
+            let mut sized: Vec<(u64, ManifestEntry)> = candidates
+                .into_iter()
+                .map(|e| (segment_bytes(&e.segment_id).unwrap_or(u64::MAX), e))
+                .collect();
+            sized.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1.segment_id.0.cmp(&b.1.segment_id.0))
+            });
+            let mut total = 0u64;
+            let mut inputs = Vec::new();
+            for (bytes, entry) in sized {
+                if total.saturating_add(bytes) > cap {
+                    break;
+                }
+                total += bytes;
+                inputs.push(entry);
+            }
+            if inputs.len() < 2 {
+                return None;
+            }
+            Some(MergePlan { inputs })
+        }
         CompactMode::Tiered => {
             candidates.retain(|e| e.doc_count < opts.policy.max_mergeable_docs);
             if candidates.len() < opts.policy.min_mergeable_segments {
@@ -128,6 +177,20 @@ where
             }
             candidates.sort_by_key(|e| e.doc_count);
             candidates.truncate(opts.policy.max_segments_per_merge);
+            if cap > 0 {
+                // Same greedy prefix, in the existing doc-count order.
+                let mut total = 0u64;
+                let mut kept = Vec::new();
+                for entry in candidates {
+                    let bytes = segment_bytes(&entry.segment_id).unwrap_or(u64::MAX);
+                    if total.saturating_add(bytes) > cap {
+                        break;
+                    }
+                    total += bytes;
+                    kept.push(entry);
+                }
+                candidates = kept;
+            }
             if candidates.len() < opts.policy.min_mergeable_segments {
                 return None;
             }
@@ -171,9 +234,10 @@ mod tests {
                 max_segments_per_merge: 2,
                 min_mergeable_segments: 2,
                 trigger_mergeable_segments: 8,
+                ..CompactionPolicy::default()
             },
         };
-        let plan = select_merge_inputs(&m, &opts, |_| true).expect("plan");
+        let plan = select_merge_inputs(&m, &opts, |_| true, |_| Some(1)).expect("plan");
         assert_eq!(plan.inputs.len(), 2);
         assert_eq!(plan.inputs[0].segment_id.0, "tiny-a");
         assert_eq!(plan.inputs[1].segment_id.0, "tiny-b");
@@ -184,7 +248,7 @@ mod tests {
     fn tiered_noop_when_below_min_mergeable() {
         let m = manifest(vec![entry("a", 10), entry("huge", 80_000)]);
         let opts = CompactOptions::tiered(CompactionPolicy::default());
-        assert!(select_merge_inputs(&m, &opts, |_| true).is_none());
+        assert!(select_merge_inputs(&m, &opts, |_| true, |_| Some(1)).is_none());
     }
 
     #[test]
@@ -195,9 +259,93 @@ mod tests {
             entry("missing", 5),
         ]);
         let opts = CompactOptions::full();
-        let plan = select_merge_inputs(&m, &opts, |id| id.0 != "missing").expect("plan");
+        let plan =
+            select_merge_inputs(&m, &opts, |id| id.0 != "missing", |_| Some(1)).expect("plan");
         assert_eq!(plan.inputs.len(), 2);
         assert!(plan.inputs.iter().any(|e| e.segment_id.0 == "b"));
+    }
+
+    #[test]
+    fn full_capped_groups_smallest_first_and_converges() {
+        let m = manifest(vec![
+            entry("big", 100),
+            entry("small-a", 10),
+            entry("small-b", 20),
+            entry("mid", 50),
+        ]);
+        let sizes = |id: &SegmentId| -> Option<u64> {
+            Some(match id.0.as_str() {
+                "small-a" => 10,
+                "small-b" => 20,
+                "mid" => 50,
+                "big" => 4_000,
+                _ => unreachable!(),
+            })
+        };
+        let mut opts = CompactOptions::full();
+        opts.policy.max_merged_segment_bytes = 100;
+        // Greedy smallest-first: small-a(10) + small-b(20) + mid(50) = 80
+        // fits; big(4000) would blow the cap and is left alone.
+        let plan = select_merge_inputs(&m, &opts, |_| true, sizes).expect("plan");
+        let ids: Vec<&str> = plan
+            .inputs
+            .iter()
+            .map(|e| e.segment_id.0.as_str())
+            .collect();
+        assert_eq!(ids, vec!["small-a", "small-b", "mid"]);
+
+        // Converged state: every remaining pair exceeds the cap → no plan,
+        // which is how repeated capped-full passes terminate.
+        let m2 = manifest(vec![entry("x", 1), entry("y", 1)]);
+        let plan2 = select_merge_inputs(&m2, &opts, |_| true, |_| Some(90));
+        assert!(
+            plan2.is_none(),
+            "two 90-byte segments can't fit a 100-byte cap"
+        );
+    }
+
+    #[test]
+    fn full_cap_zero_disables_the_cap() {
+        let m = manifest(vec![entry("a", 1), entry("b", 1), entry("c", 1)]);
+        let mut opts = CompactOptions::full();
+        opts.policy.max_merged_segment_bytes = 0;
+        let plan = select_merge_inputs(&m, &opts, |_| true, |_| Some(u64::MAX)).expect("plan");
+        assert_eq!(plan.inputs.len(), 3, "cap 0 must merge everything");
+    }
+
+    #[test]
+    fn unknown_size_never_joins_a_capped_group() {
+        let m = manifest(vec![entry("a", 1), entry("b", 1), entry("c", 1)]);
+        let mut opts = CompactOptions::full();
+        opts.policy.max_merged_segment_bytes = 100;
+        // "c" has no readable size: it must be excluded, the sized pair merges.
+        let plan = select_merge_inputs(
+            &m,
+            &opts,
+            |_| true,
+            |id| if id.0 == "c" { None } else { Some(10) },
+        )
+        .expect("plan");
+        let ids: Vec<&str> = plan
+            .inputs
+            .iter()
+            .map(|e| e.segment_id.0.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn tiered_honors_byte_cap() {
+        let m = manifest(vec![entry("t1", 10), entry("t2", 20), entry("t3", 30)]);
+        let policy = CompactionPolicy {
+            max_merged_segment_bytes: 25,
+            ..CompactionPolicy::default()
+        };
+        let opts = CompactOptions::tiered(policy);
+        // doc-count order t1,t2,t3 at 10 bytes each: t1+t2=20 fits, t3 would
+        // make 30 > 25 → prefix stops at two inputs.
+        let plan = select_merge_inputs(&m, &opts, |_| true, |_| Some(10)).expect("plan");
+        assert_eq!(plan.inputs.len(), 2);
     }
 
     #[test]

@@ -688,9 +688,12 @@ impl Indexer {
             }
             let segments_before = state.manifest.segments.len();
             let ns_dir = self.data_dir.join(&namespace.0);
-            let plan = match select_merge_inputs(&state.manifest, &opts, |seg_id| {
-                ns_dir.join(&seg_id.0).exists()
-            }) {
+            let plan = match select_merge_inputs(
+                &state.manifest,
+                &opts,
+                |seg_id| ns_dir.join(&seg_id.0).exists(),
+                |seg_id| segment_dir_bytes(&ns_dir.join(&seg_id.0)),
+            ) {
                 Some(p) => p,
                 None => {
                     return Ok(CompactResult {
@@ -986,6 +989,22 @@ fn segment_flush_counter(segment_id: &SegmentId) -> Option<u64> {
     } else {
         None
     }
+}
+
+/// Sum of file sizes directly inside a segment dir, for the
+/// `max_merged_segment_bytes` merge cap. `None` when the dir is unreadable
+/// — the planner then conservatively leaves that segment unmerged.
+fn segment_dir_bytes(dir: &std::path::Path) -> Option<u64> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        if let Ok(md) = entry.metadata() {
+            if md.is_file() {
+                total = total.saturating_add(md.len());
+            }
+        }
+    }
+    Some(total)
 }
 
 /// Standalone filter applier for delete operations (no Searcher dependency).
@@ -1812,6 +1831,7 @@ mod tests {
             max_segments_per_merge: 32,
             min_mergeable_segments: 2,
             trigger_mergeable_segments: 2,
+            ..CompactionPolicy::default()
         };
         let idx = Indexer::new(dir.clone())
             .with_flush_threshold(2)
