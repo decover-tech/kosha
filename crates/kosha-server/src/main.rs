@@ -317,6 +317,13 @@ struct AppState {
     /// prefetch, empty when warmup is disabled. Kept on `AppState` so the
     /// `/readyz` handler can report what's pending.
     warmup_namespaces: Vec<String>,
+    /// `KOSHA_WARMUP_POSTING_BLOBS` (default true): whether warmup also
+    /// bulk-prefetches the posting-blob shards for every segment, not just
+    /// the static scoring set. This is the cold-start-convoy fix: without
+    /// it, warmup leaves all `postings-XX.bin` traffic to first-touch
+    /// queries, which saturate the hydrator and queue behind each other
+    /// for the first minutes after a cold start.
+    warmup_posting_blobs: bool,
     /// `KOSHA_INGEST_HOST` — set only on query-role pods (deployment-query.yaml).
     /// When present, write-path requests this pod receives are forwarded here
     /// instead of executed locally — see `is_write_path`/`forward_to_ingest`.
@@ -898,11 +905,20 @@ impl AppState {
                     .collect()
             })
             .unwrap_or_default();
+        // KOSHA_WARMUP_POSTING_BLOBS=0 restricts warmup to the static
+        // scoring set (pre-#TBD behavior). Default on: the whole point of
+        // warming a namespace is that the first real queries don't convoy
+        // behind first-touch posting-blob hydration — measured on the 10M
+        // MSMarco cold run as a ~3-minute window where p99 is queue-bound
+        // at 7–12s while steady-state is 529ms (RESULTS.md round 6).
+        let warmup_posting_blobs =
+            env_flag_default_on(std::env::var("KOSHA_WARMUP_POSTING_BLOBS").ok().as_deref());
         if !warmup_namespaces.is_empty() {
             println!(
-                "warmup: configured for {} namespace(s): {}",
+                "warmup: configured for {} namespace(s): {} (posting blobs: {})",
                 warmup_namespaces.len(),
-                warmup_namespaces.join(", ")
+                warmup_namespaces.join(", "),
+                if warmup_posting_blobs { "on" } else { "off" },
             );
         }
 
@@ -981,6 +997,7 @@ impl AppState {
             // completion / fail-open). See the field's doc comment.
             warmup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             warmup_namespaces,
+            warmup_posting_blobs,
             ingest_host,
             write_http_client,
         }
@@ -1082,6 +1099,14 @@ impl AppState {
             let _ = tombstones;
             let dur = t_ns.elapsed();
             if outcome.missing.is_empty() {
+                // Mirror the search path's verdict caching (handle_search_post):
+                // the static scoring set is now local for this manifest
+                // version, so the first real queries skip the per-segment
+                // stat sweep instead of each re-deriving this verdict.
+                self.completed_hydrations
+                    .lock()
+                    .unwrap()
+                    .insert((ns.0.clone(), manifest.version), true);
                 println!(
                     "warmup: [{}/{}] '{ns_name}' ready: fetched {} file(s), {:.1} MB in {:.1}s",
                     idx + 1,
@@ -1100,6 +1125,64 @@ impl AppState {
                     outcome.missing.len(),
                     dur.as_secs_f64(),
                 );
+            }
+
+            // Phase 2 — bulk posting-blob prefetch (the cold-start-convoy
+            // fix). The scoring-set pass above leaves every `postings-XX.bin`
+            // shard to first-touch queries; at 8 QPS those all fan out to S3
+            // at once, saturate the hydrator, and queue behind each other
+            // (measured: ~3 minutes of 7–12s p99 after a cold start, vs
+            // 529ms steady-state). Prefetching the shards here moves that
+            // transient off the query path entirely.
+            //
+            // Batched in small segment groups on purpose:
+            // `ensure_posting_blobs_local` holds a `hydration_semaphore`
+            // permit (default 4) for the duration of each call, so one
+            // whole-namespace call would starve live queries arriving
+            // mid-warmup — recreating the convoy in a different queue. Short
+            // batches interleave with query traffic, and each batch's
+            // verified shards land in the presence cache as it completes.
+            // Requires `inverted.idx` local to detect split segments, which
+            // phase 1 just ensured.
+            if self.warmup_posting_blobs {
+                let t_blobs = std::time::Instant::now();
+                let all_blobs = kosha_segment::all_posting_blob_files();
+                let seg_paths: Vec<PathBuf> = manifest
+                    .segments
+                    .iter()
+                    .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+                    .collect();
+                let mut blob_files = 0usize;
+                let mut blob_bytes = 0u64;
+                let mut blob_missing = 0usize;
+                for chunk in seg_paths.chunks(8) {
+                    let o =
+                        self.ensure_posting_blobs_local(&ns, manifest.version, chunk, &all_blobs);
+                    blob_files += o.files_fetched;
+                    blob_bytes += o.bytes_fetched;
+                    blob_missing += o.missing.len();
+                }
+                if blob_missing == 0 {
+                    println!(
+                        "warmup: [{}/{}] '{ns_name}' posting blobs ready: fetched {} blob(s), \
+                         {:.1} MB in {:.1}s",
+                        idx + 1,
+                        total,
+                        blob_files,
+                        blob_bytes as f64 / (1024.0 * 1024.0),
+                        t_blobs.elapsed().as_secs_f64(),
+                    );
+                } else {
+                    eprintln!(
+                        "warn: warmup: [{}/{}] '{ns_name}' posting blobs partial — {} blob(s) \
+                         still missing after fetch ({:.1}s); first-touch queries will hydrate \
+                         the rest",
+                        idx + 1,
+                        total,
+                        blob_missing,
+                        t_blobs.elapsed().as_secs_f64(),
+                    );
+                }
             }
         }
         self.warmup_complete
@@ -2044,6 +2127,14 @@ impl AppState {
             Err(e) => eprintln!("WARN: failed to read {s3_path} for upload: {e}"),
         }
     }
+}
+
+/// Parse a default-on boolean env toggle: unset or any other value → true;
+/// `0`, `false`, or `off` (whitespace-trimmed) → false. Used for
+/// `KOSHA_WARMUP_POSTING_BLOBS`.
+fn env_flag_default_on(raw: Option<&str>) -> bool {
+    raw.map(|v| !matches!(v.trim(), "0" | "false" | "off"))
+        .unwrap_or(true)
 }
 
 /// Redact the password portion of a Postgres URL for logs.
@@ -4212,6 +4303,21 @@ mod tests {
     use super::*;
     use kosha_core::{Document, DocumentId, Field};
     use std::fs;
+
+    #[test]
+    fn env_flag_default_on_semantics() {
+        // Unset → on (the KOSHA_WARMUP_POSTING_BLOBS default).
+        assert!(env_flag_default_on(None));
+        // Only the explicit disable spellings turn it off.
+        for off in ["0", "false", "off", " 0 ", "  false"] {
+            assert!(!env_flag_default_on(Some(off)), "{off:?} should disable");
+        }
+        // Anything else — including enable-ish and garbage values — stays on,
+        // so a typo can never silently disable warmup blob prefetch.
+        for on in ["1", "true", "on", "", "yes", "FALSE"] {
+            assert!(env_flag_default_on(Some(on)), "{on:?} should stay on");
+        }
+    }
 
     #[cfg(feature = "s3")]
     #[test]
