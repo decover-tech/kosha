@@ -102,6 +102,17 @@ def main() -> None:
         required=True,
         help="label only — this script doesn't manage cache state itself",
     )
+    ap.add_argument(
+        "--operator",
+        choices=["and", "or"],
+        default=None,
+        help="query operator sent with each request (engine default when omitted)",
+    )
+    ap.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="send no_cache=true on every request (bypass the result cache)",
+    )
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
     global OPERATOR, NO_CACHE
