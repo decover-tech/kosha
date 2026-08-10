@@ -93,7 +93,21 @@ def main() -> None:
     ap.add_argument(
         "--compact-after",
         action="store_true",
-        help="call POST /v1/admin/compact-namespace once after the final flush",
+        help="run /v1/admin/compact-namespace after the final flush (see --compact-mode)",
+    )
+    ap.add_argument(
+        "--compact-mode",
+        choices=["tiered", "full"],
+        default="tiered",
+        help="compaction mode: tiered merges small segments per pass; "
+        "full is an all-to-one merge (single pass)",
+    )
+    ap.add_argument(
+        "--compact-passes",
+        type=int,
+        default=1,
+        help="max tiered passes; loops until the segment count stops "
+        "dropping or this many passes ran (ignored for --compact-mode full)",
     )
     args = ap.parse_args()
 
@@ -137,16 +151,48 @@ def main() -> None:
     ).raise_for_status()
 
     if args.compact_after:
-        print("compacting namespace (synchronous, may take a while)...")
-        tc0 = time.time()
-        resp = session.post(
-            f"{args.host}/v1/admin/compact-namespace",
-            json={"namespace": args.namespace, "mode": "tiered"},
-            headers=headers,
-            timeout=3600,
+        docs_before = namespace_stats(session, args.host, headers, args.namespace)[
+            "documents"
+        ]
+        passes = 1 if args.compact_mode == "full" else max(1, args.compact_passes)
+        for pass_no in range(1, passes + 1):
+            print(
+                f"compaction pass {pass_no}/{passes} "
+                f"(mode={args.compact_mode}, synchronous, may take a while)..."
+            )
+            tc0 = time.time()
+            resp = session.post(
+                f"{args.host}/v1/admin/compact-namespace",
+                json={"namespace": args.namespace, "mode": args.compact_mode},
+                headers=headers,
+                timeout=7200,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            print(f"compaction: {body} ({time.time() - tc0:.1f}s)")
+            if body.get("not_hydrated"):
+                raise SystemExit(
+                    f"compaction pass was partial: {len(body['not_hydrated'])} "
+                    "segment(s) could not be hydrated — refusing to continue "
+                    "(bench numbers over a partially-compacted namespace are "
+                    "not comparable)"
+                )
+            if body.get("segments_after", 0) >= body.get("segments_before", 0):
+                print("compaction converged (segment count stopped dropping)")
+                break
+        # Doc-loss guard (the tiered doc-loss class fixed in #113): compaction
+        # rewrites every document, so any delta here is silent corruption the
+        # latency numbers would happily hide.
+        stats = namespace_stats(session, args.host, headers, args.namespace)
+        if stats["documents"] != docs_before:
+            raise SystemExit(
+                f"DOC-COUNT MISMATCH after compaction: {docs_before:,} before, "
+                f"{stats['documents']:,} after — do not trust this namespace"
+            )
+        print(
+            f"post-compaction: {stats['segments']} segment(s), "
+            f"{stats['documents']:,} docs verified unchanged"
         )
-        resp.raise_for_status()
-        print(f"compaction: {resp.json()} ({time.time() - tc0:.1f}s)")
 
     elapsed = time.time() - t0
     print(
@@ -159,6 +205,16 @@ def main() -> None:
             f"p50={statistics.median(batch_latencies):.3f}s "
             f"max={max(batch_latencies):.3f}s"
         )
+
+
+def namespace_stats(session, host: str, headers: dict, namespace: str) -> dict:
+    """Fetch this namespace's entry from GET /stats (documents, segments)."""
+    resp = session.get(f"{host}/stats", headers=headers, timeout=60)
+    resp.raise_for_status()
+    for entry in resp.json().get("namespaces", []):
+        if entry.get("namespace") == namespace:
+            return entry
+    raise SystemExit(f"namespace {namespace!r} missing from /stats response")
 
 
 def _progress(docs_sent: int, t0: float) -> None:
