@@ -142,7 +142,7 @@ impl SpFreshIndex {
         );
         self.garbage_collect_all();
         self.append_live(doc_seq, version, vector)?;
-        self.rebuild_until_balanced();
+        self.stabilize_assignments();
         Ok(())
     }
 
@@ -153,6 +153,7 @@ impl SpFreshIndex {
         state.deleted = true;
         state.version = state.version.wrapping_add(1) & 0x7f;
         self.merge_underfull();
+        self.stabilize_assignments();
         true
     }
 
@@ -369,6 +370,21 @@ impl SpFreshIndex {
         }
     }
 
+    fn stabilize_assignments(&mut self) {
+        let max_passes = self
+            .version_map
+            .len()
+            .saturating_mul(self.postings.len().max(1))
+            .max(1);
+        for _ in 0..max_passes {
+            self.rebuild_until_balanced();
+            if !self.repair_nearest_partition_assignments() {
+                break;
+            }
+        }
+        self.rebuild_until_balanced();
+    }
+
     fn split_posting(&mut self, idx: usize) {
         if idx >= self.postings.len() {
             return;
@@ -559,6 +575,32 @@ impl SpFreshIndex {
             })
             .collect();
         self.apply_reassignments(moves);
+    }
+
+    fn repair_nearest_partition_assignments(&mut self) -> bool {
+        let mut moves = Vec::new();
+        for posting in &self.postings {
+            let current_id = posting.id;
+            for entry in &posting.entries {
+                if !self.is_entry_live(entry) {
+                    continue;
+                }
+                if let Some(nearest_idx) = self.nearest_posting(&entry.vector) {
+                    let nearest_id = self.postings[nearest_idx].id;
+                    if nearest_id != current_id {
+                        moves.push((
+                            entry.doc_seq,
+                            entry.version,
+                            entry.vector.clone(),
+                            nearest_id,
+                        ));
+                    }
+                }
+            }
+        }
+        let moved = !moves.is_empty();
+        self.apply_reassignments(moves);
+        moved
     }
 
     fn garbage_collect_all(&mut self) {
@@ -809,6 +851,7 @@ fn skip(cursor: &mut &[u8], len: usize) -> Result<(), KoshaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn opts() -> SpFreshOptions {
         SpFreshOptions {
@@ -816,6 +859,131 @@ mod tests {
             min_posting_len: 1,
             split_neighbor_count: 4,
         }
+    }
+
+    fn stress_opts() -> SpFreshOptions {
+        SpFreshOptions {
+            max_posting_len: 6,
+            min_posting_len: 2,
+            split_neighbor_count: 6,
+        }
+    }
+
+    fn generated_vector(seed: u32, dimensions: usize) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+        (0..dimensions)
+            .map(|dim| {
+                state = state
+                    .wrapping_mul(1_664_525)
+                    .wrapping_add(1_013_904_223 + dim as u32);
+                ((state % 2_000) as f32 - 1_000.0) / 1_000.0
+            })
+            .collect()
+    }
+
+    fn exact_knn(model: &HashMap<u32, Vec<f32>>, query: &[f32], k: usize) -> Vec<(u32, f64)> {
+        let mut scores: Vec<(u32, f64)> = model
+            .iter()
+            .map(|(doc_seq, vector)| (*doc_seq, cosine_similarity(query, vector) as f64))
+            .collect();
+        scores.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        scores.truncate(k);
+        scores
+    }
+
+    fn assert_live_vectors_match_model(index: &SpFreshIndex, model: &HashMap<u32, Vec<f32>>) {
+        let live = index.live_vectors();
+        assert_eq!(live.len(), model.len(), "live vector count mismatch");
+        for (doc_seq, vector) in live {
+            assert_eq!(
+                Some(&vector),
+                model.get(&doc_seq),
+                "live vector mismatch for doc_seq={doc_seq}"
+            );
+        }
+    }
+
+    fn assert_single_current_copy_per_live_doc(index: &SpFreshIndex) {
+        let mut live_counts: HashMap<u32, usize> = HashMap::new();
+        for posting in &index.postings {
+            for entry in &posting.entries {
+                if index.is_entry_live(entry) {
+                    *live_counts.entry(entry.doc_seq).or_default() += 1;
+                }
+            }
+        }
+        for (doc_seq, state) in &index.version_map {
+            let expected = usize::from(!state.deleted);
+            assert_eq!(
+                live_counts.get(doc_seq).copied().unwrap_or(0),
+                expected,
+                "unexpected live physical-copy count for doc_seq={doc_seq}"
+            );
+        }
+    }
+
+    fn assert_nearest_partition_assignment(index: &SpFreshIndex) {
+        for posting in &index.postings {
+            for entry in &posting.entries {
+                if !index.is_entry_live(entry) {
+                    continue;
+                }
+                let assigned = cosine_distance(&entry.vector, &posting.centroid);
+                let best = index
+                    .postings
+                    .iter()
+                    .map(|candidate| cosine_distance(&entry.vector, &candidate.centroid))
+                    .fold(f32::INFINITY, f32::min);
+                assert!(
+                    assigned <= best + 1e-5,
+                    "doc_seq={} assigned to posting {} at distance {assigned}, but best distance is {best}",
+                    entry.doc_seq,
+                    posting.id
+                );
+            }
+        }
+    }
+
+    fn assert_exhaustive_search_matches_exact(
+        index: &SpFreshIndex,
+        model: &HashMap<u32, Vec<f32>>,
+    ) {
+        if model.is_empty() {
+            return;
+        }
+        let query_count = 24;
+        for query_id in 0..query_count {
+            let query = generated_vector(10_000 + query_id, index.dimensions());
+            let k = model.len().min(5);
+            let got = index.search(&query, k, index.postings().len());
+            let expected = exact_knn(model, &query, k);
+            assert_eq!(
+                got.iter().map(|(doc_seq, _)| *doc_seq).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|(doc_seq, _)| *doc_seq)
+                    .collect::<Vec<_>>(),
+                "exact-search doc order mismatch for query_id={query_id}"
+            );
+            for ((got_doc, got_score), (expected_doc, expected_score)) in got.iter().zip(expected) {
+                assert_eq!(*got_doc, expected_doc);
+                assert!(
+                    (got_score - expected_score).abs() < 1e-6,
+                    "score mismatch for doc_seq={got_doc}: got {got_score}, expected {expected_score}"
+                );
+            }
+        }
+    }
+
+    fn assert_index_invariants(index: &SpFreshIndex, model: &HashMap<u32, Vec<f32>>) {
+        assert_live_vectors_match_model(index, model);
+        assert_single_current_copy_per_live_doc(index);
+        assert_nearest_partition_assignment(index);
+        assert_exhaustive_search_matches_exact(index, model);
     }
 
     #[test]
@@ -858,5 +1026,84 @@ mod tests {
         let decoded = SpFreshIndex::from_bytes(&bytes).unwrap().unwrap();
         assert_eq!(decoded.options(), normalize_options(opts()));
         assert_eq!(decoded.live_vectors(), vec![(7, vec![1.0, 0.0, 0.0])]);
+    }
+
+    #[test]
+    fn deterministic_update_sequence_preserves_lire_invariants() {
+        let mut index = SpFreshIndex::new(4, stress_opts());
+        let mut model = HashMap::new();
+
+        for step in 0..160 {
+            let doc_seq = (step * 37 + 11) % 41;
+            if step % 7 == 0 {
+                index.delete(doc_seq);
+                model.remove(&doc_seq);
+            } else {
+                let vector = generated_vector(step + 1_000, 4);
+                index.insert(doc_seq, vector.clone()).unwrap();
+                model.insert(doc_seq, vector);
+            }
+            assert_index_invariants(&index, &model);
+        }
+    }
+
+    #[test]
+    fn repeated_updates_past_version_wrap_keep_one_live_copy() {
+        let mut index = SpFreshIndex::new(3, stress_opts());
+        let mut model = HashMap::new();
+        for step in 0..180 {
+            let vector = generated_vector(step + 20_000, 3);
+            index.insert(9, vector.clone()).unwrap();
+            model.insert(9, vector);
+            assert_index_invariants(&index, &model);
+        }
+    }
+
+    #[test]
+    fn split_reassigns_neighbor_vectors_to_nearest_new_posting() {
+        let mut index = SpFreshIndex::new(
+            2,
+            SpFreshOptions {
+                max_posting_len: 3,
+                min_posting_len: 1,
+                split_neighbor_count: 4,
+            },
+        );
+        let mut model = HashMap::new();
+        for (doc_seq, vector) in [
+            (0, vec![1.0, 0.02]),
+            (1, vec![1.0, -0.02]),
+            (2, vec![0.92, 0.2]),
+            (3, vec![0.92, -0.2]),
+            (4, vec![0.65, 0.76]),
+            (5, vec![0.62, 0.79]),
+            (6, vec![0.64, -0.77]),
+            (7, vec![0.61, -0.80]),
+        ] {
+            index.insert(doc_seq, vector.clone()).unwrap();
+            model.insert(doc_seq, vector);
+        }
+
+        assert!(
+            index.stats().postings > 1,
+            "fixture should trigger at least one split"
+        );
+        assert_index_invariants(&index, &model);
+    }
+
+    #[test]
+    fn merge_reassigns_survivors_and_preserves_exact_search() {
+        let mut index = SpFreshIndex::new(3, stress_opts());
+        let mut model = HashMap::new();
+        for doc_seq in 0..30 {
+            let vector = generated_vector(doc_seq + 30_000, 3);
+            index.insert(doc_seq, vector.clone()).unwrap();
+            model.insert(doc_seq, vector);
+        }
+        for doc_seq in (0..30).step_by(3) {
+            index.delete(doc_seq);
+            model.remove(&doc_seq);
+        }
+        assert_index_invariants(&index, &model);
     }
 }
