@@ -17,6 +17,7 @@ Usage (needs: pip install pyarrow huggingface_hub):
 
 import argparse
 import json
+import subprocess
 import time
 from pathlib import Path
 
@@ -63,6 +64,17 @@ def pick_columns(schema_names, id_col, text_col):
     return ident, text
 
 
+def s3_sync(src: str, dst: str) -> None:
+    """Mirror sealed artifacts between the out-dir and the S3 cache via the
+    aws CLI (present on the bench AMI; instance-role auth — no extra deps).
+    In-progress .tmp shards never enter the cache."""
+    print(f"s3 sync: {src} -> {dst}")
+    subprocess.run(
+        ["aws", "s3", "sync", src, dst, "--exclude", "*.tmp", "--no-progress"],
+        check=True,
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", type=Path, required=True)
@@ -76,8 +88,33 @@ def main() -> None:
     ap.add_argument(
         "--skip-queries", action="store_true", help="corpus shards only"
     )
+    ap.add_argument(
+        "--s3-cache",
+        default=None,
+        help="s3://bucket/prefix holding previously-fetched shards; synced "
+        "down before any HuggingFace traffic and re-uploaded after a fresh "
+        "fetch, so the HF download happens once ever. Use one prefix per "
+        "corpus size (e.g. .../msmarco-10m) — the cache is keyed by nothing "
+        "else",
+    )
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.s3_cache:
+        s3_sync(args.s3_cache, str(args.out_dir))
+        mpath = args.out_dir / "manifest.json"
+        if mpath.exists():
+            cached = json.loads(mpath.read_text())
+            queries_ok = args.skip_queries or (
+                (args.out_dir / "queries.txt").exists()
+            )
+            if cached.get("docs", 0) >= args.docs and queries_ok:
+                print(
+                    f"corpus cache hit: {cached['docs']:,} docs from "
+                    f"{args.s3_cache}; skipping HuggingFace entirely"
+                )
+                return
+            print("partial corpus in S3 cache; resuming from HuggingFace")
 
     fs = HfFileSystem()
 
@@ -195,6 +232,10 @@ def main() -> None:
         f"{shard_idx} shards"
     )
     print(f"manifest: {args.out_dir / 'manifest.json'}")
+
+    if args.s3_cache:
+        s3_sync(str(args.out_dir), args.s3_cache)
+        print(f"corpus uploaded to cache: {args.s3_cache}")
 
 
 if __name__ == "__main__":
