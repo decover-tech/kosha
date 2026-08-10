@@ -564,3 +564,47 @@ compaction (blocked on tiered doc-loss), cross-segment floor sharing.
 Trajectory across three days: 8 QPS unrunnable → 34× → 13× cache-off,
 and past tpuf's published warm median with the cache the protocol
 rewards.
+
+---
+
+# Addendum — 10M MSMarco round 6: cold, cache-off (2026-08-09)
+
+The one cell rounds 1–5 never measured: a cold namespace with the result
+cache bypassed (`no_cache: true`), i.e. honest engine speed on first
+contact with the data. Fresh m7i.8xlarge, same corpus/queries/protocol,
+engine main @ `4f505dc` (round-5 build + #101 presence-cache hardening);
+bench script from #111. Local segment store wiped (`rm -rf` + container
+restart), then one 30-minute 8 QPS OR-mode phase: 14,401/14,401
+requests, zero errors, zero-hit 0.062% (union corridor — valid run).
+
+| 8 QPS, topk=10, 30min | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| **Kosha cold, OR, cache-off** | **184ms** | **366ms** | 7,858ms | 14.2s |
+| tpuf published — cold | 316ms | 381ms | 559ms | — |
+
+Cold p50 beats tpuf's published cold median by 1.7×; p90 is at parity.
+The p99 gap is entirely a **startup convoy**, not steady-state behavior:
+
+| window (server-side totals) | p50 | p90 | p99 |
+|---|---|---|---|
+| first 3 minutes (~1,440 reqs) | 196ms | 7,847ms | 12,353ms |
+| **steady state (minutes 3–30)** | **170ms** | **333ms** | **529ms** |
+
+Every one of the 150 slowest requests landed in the first tenth of the
+run. Their median breakdown: **7.4s queue + 2.0s hydrate, score only
+~130ms** — at t=0 every query needs S3 blob hydration across 167
+segments, the hydrator saturates, and arrivals behind the burst wait in
+line. Once first-touch hydration clears (~3 minutes), cold-steady-state
+p99 of 529ms sits at tpuf's published 559ms.
+
+Implications:
+1. **Steady-state cold is already at parity with tpuf** across the
+   distribution; the whole headline p99 is a transient measured once per
+   cold start.
+2. **The convoy is addressable**: pre-hydration warmup on namespace
+   attach (bulk-fetch posting blobs ahead of query traffic) would
+   collapse the transient; compaction 167→16 segments cuts the
+   first-touch fan-out ~10× independently.
+3. The presentation pair for engine comparisons: warm cache-on
+   (6.0/107/329) + cold cache-off (184/366/7,858), with the windowed
+   decomposition above as the honest footnote on the cold tail.
