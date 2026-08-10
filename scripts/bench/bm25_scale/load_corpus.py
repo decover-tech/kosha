@@ -22,6 +22,8 @@ Usage:
 """
 
 import argparse
+import array
+import itertools
 import json
 import statistics
 import subprocess
@@ -36,17 +38,83 @@ def auth_headers(api_key: str | None) -> dict:
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
-def to_kosha_documents(lines: list[str]) -> list[dict]:
+EMB_DIM = 1024
+EMB_REC_BYTES = EMB_DIM * 4
+
+
+def to_kosha_documents(lines: list[str], embs: list | None = None) -> list[dict]:
     docs = []
-    for line in lines:
+    for i, line in enumerate(lines):
         rec = json.loads(line)
-        docs.append(
-            {
-                "id": rec["id"],
-                "fields": [{"name": "text", "field_type": "Text", "value": rec["text"]}],
-            }
-        )
+        fields = [{"name": "text", "field_type": "Text", "value": rec["text"]}]
+        if embs is not None:
+            emb_id, vec = embs[i]
+            if emb_id != rec["id"]:
+                raise SystemExit(
+                    f"embedding/text shard misalignment: text doc {rec['id']!r} "
+                    f"paired with embedding for {emb_id!r} — refusing to load"
+                )
+            # Field::vector wire format: the value is a JSON array string.
+            fields.append(
+                {
+                    "name": "text_emb",
+                    "field_type": "Vector",
+                    "value": json.dumps(vec),
+                }
+            )
+        docs.append({"id": rec["id"], "fields": fields})
     return docs
+
+
+def iter_emb_records(emb_dir: str):
+    """Yield (docid, [f32; 1024]) across emb-*.f32/.ids shard pairs, local
+    dir or s3://bucket/prefix, in shard order."""
+    if emb_dir.startswith("s3://"):
+        base = emb_dir.rstrip("/")
+        listing = subprocess.run(
+            ["aws", "s3", "ls", base + "/"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        names = sorted(
+            f[-1] for line in listing.splitlines()
+            if (f := line.split()) and f[-1].startswith("emb-") and f[-1].endswith(".f32")
+        )
+        if not names:
+            raise SystemExit(f"no emb-*.f32 objects under {base}/")
+        for name in names:
+            ids_name = name[: -len(".f32")] + ".ids"
+            ids = subprocess.run(
+                ["aws", "s3", "cp", f"{base}/{ids_name}", "-"],
+                check=True, capture_output=True, text=True,
+            ).stdout.splitlines()
+            proc = subprocess.Popen(
+                ["aws", "s3", "cp", f"{base}/{name}", "-"],
+                stdout=subprocess.PIPE,
+            )
+            assert proc.stdout is not None
+            for docid in ids:
+                buf = proc.stdout.read(EMB_REC_BYTES)
+                if len(buf) != EMB_REC_BYTES:
+                    raise SystemExit(f"truncated embedding shard {name}")
+                vec = array.array("f")
+                vec.frombytes(buf)
+                yield docid, list(vec)
+            if proc.wait() != 0:
+                raise SystemExit(f"aws s3 cp failed for {base}/{name}")
+    else:
+        shard_paths = sorted(Path(emb_dir).glob("emb-*.f32"))
+        if not shard_paths:
+            raise SystemExit(f"no emb-*.f32 files found under {emb_dir}")
+        for shard_path in shard_paths:
+            ids = shard_path.with_suffix(".ids").read_text().splitlines()
+            with shard_path.open("rb") as f:
+                for docid in ids:
+                    buf = f.read(EMB_REC_BYTES)
+                    if len(buf) != EMB_REC_BYTES:
+                        raise SystemExit(f"truncated embedding shard {shard_path}")
+                    vec = array.array("f")
+                    vec.frombytes(buf)
+                    yield docid, list(vec)
 
 
 def post_batch(session, host, namespace, headers, docs, timeout) -> float:
@@ -127,6 +195,15 @@ def main() -> None:
     # would collapse the double slash in the URI).
     ap.add_argument("--corpus-dir", required=True)
     ap.add_argument("--api-key", default=None)
+    ap.add_argument(
+        "--embeddings-dir",
+        default=None,
+        help="emb-*.f32/.ids shards from fetch_msmarco_embeddings.py (local "
+        "dir or s3://bucket/prefix); each doc gains a 1024-dim Vector field "
+        "'text_emb'. Alignment with the text shards is verified per doc. "
+        "Use a much smaller --batch-size (e.g. 1000): vectors are ~12KB of "
+        "JSON per doc",
+    )
     ap.add_argument("--batch-size", type=int, default=20_000)
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--timeout", type=float, default=120.0)
@@ -163,10 +240,18 @@ def main() -> None:
     docs_sent = 0
     batch_latencies: list[float] = []
 
+    emb_iter = iter_emb_records(args.embeddings_dir) if args.embeddings_dir else None
+
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futures = {}
         for lines in iter_batches(args.corpus_dir, args.batch_size):
-            docs = to_kosha_documents(lines)
+            embs = list(itertools.islice(emb_iter, len(lines))) if emb_iter else None
+            if embs is not None and len(embs) != len(lines):
+                raise SystemExit(
+                    f"embeddings exhausted: {len(embs)} records for a "
+                    f"{len(lines)}-doc batch"
+                )
+            docs = to_kosha_documents(lines, embs)
             fut = pool.submit(
                 post_batch, session, args.host, args.namespace, headers, docs, args.timeout
             )

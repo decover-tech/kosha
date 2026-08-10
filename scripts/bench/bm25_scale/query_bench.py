@@ -56,23 +56,41 @@ def percentile(data: list[float], p: float) -> float:
 
 OPERATOR = None
 NO_CACHE = False
+# kNN mode (Vector Perf): when KNN_VECS is set, requests carry a knn clause
+# with the query's embedding instead of BM25 query text.
+KNN_VECS = None
+KNN_FIELD = "text_emb"
+KNN_NUM_CANDIDATES = 100
 
 
-def payload_for(namespace: str, query_text: str, topk: int) -> dict:
-    payload = {"namespace": namespace, "query_text": query_text, "max_results": topk}
-    if OPERATOR:
-        payload["operator"] = OPERATOR
+def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> dict:
+    if KNN_VECS is not None:
+        payload = {
+            "namespace": namespace,
+            "query_text": "",
+            "max_results": topk,
+            "knn": {
+                "field": KNN_FIELD,
+                "vector": KNN_VECS[qidx % len(KNN_VECS)],
+                "k": topk,
+                "num_candidates": KNN_NUM_CANDIDATES,
+            },
+        }
+    else:
+        payload = {"namespace": namespace, "query_text": query_text, "max_results": topk}
+        if OPERATOR:
+            payload["operator"] = OPERATOR
     if NO_CACHE:
         payload["no_cache"] = True
     return payload
 
 
-def run_query(session, host, namespace, headers, query_text, topk, timeout, results, lock, errors):
+def run_query(session, host, namespace, headers, query_text, topk, timeout, results, lock, errors, qidx=0):
     t0 = time.time()
     try:
         resp = session.post(
             f"{host}/search",
-            json=payload_for(namespace, query_text, topk),
+            json=payload_for(namespace, query_text, topk, qidx),
             headers=headers,
             timeout=timeout,
         )
@@ -113,15 +131,52 @@ def main() -> None:
         action="store_true",
         help="send no_cache=true on every request (bypass the result cache)",
     )
+    ap.add_argument(
+        "--knn-embeddings",
+        type=Path,
+        default=None,
+        help="queries_emb.f32 from fetch_msmarco_embeddings.py (1024-dim "
+        "float32 records aligned with --queries-file). When set, requests "
+        "run vector search (knn clause) instead of BM25",
+    )
+    ap.add_argument("--knn-field", default="text_emb")
+    ap.add_argument(
+        "--knn-num-candidates",
+        type=int,
+        default=100,
+        help="ANN candidate pool per query (tpuf-comparable default)",
+    )
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
-    global OPERATOR, NO_CACHE
+    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES
     OPERATOR = args.operator
     NO_CACHE = args.no_cache
 
     queries = [l.strip() for l in args.queries_file.read_text().splitlines() if l.strip()]
     if not queries:
         raise SystemExit(f"no queries in {args.queries_file}")
+
+    if args.knn_embeddings:
+        import array as _array
+
+        DIM = 1024
+        raw = args.knn_embeddings.read_bytes()
+        if len(raw) % (DIM * 4) != 0:
+            raise SystemExit(f"{args.knn_embeddings} is not a whole number of {DIM}-float records")
+        vecs = []
+        for off in range(0, len(raw), DIM * 4):
+            a = _array.array("f")
+            a.frombytes(raw[off : off + DIM * 4])
+            vecs.append(list(a))
+        if len(vecs) != len(queries):
+            raise SystemExit(
+                f"{len(vecs)} query embeddings vs {len(queries)} queries — "
+                "misaligned inputs, refusing to run"
+            )
+        KNN_VECS = vecs
+        KNN_FIELD = args.knn_field
+        KNN_NUM_CANDIDATES = args.knn_num_candidates
+        print(f"kNN mode: {len(vecs)} query vectors, field={KNN_FIELD!r}, num_candidates={KNN_NUM_CANDIDATES}")
 
     headers = auth_headers(args.api_key)
     session = requests.Session()
@@ -143,7 +198,8 @@ def main() -> None:
         now = time.time()
         if now < next_send:
             time.sleep(next_send - now)
-        query_text = queries[i % len(queries)]
+        qidx = i % len(queries)
+        query_text = queries[qidx]
         i += 1
         th = threading.Thread(
             target=run_query,
@@ -158,6 +214,7 @@ def main() -> None:
                 results,
                 lock,
                 errors,
+                qidx,
             ),
             daemon=True,
         )
