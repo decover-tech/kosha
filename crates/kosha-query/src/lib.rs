@@ -1713,10 +1713,12 @@ impl Searcher {
             }
         }
 
-        // ── kNN search (HNSW when available, flat fallback) ──
+        // ── kNN search (SPFresh when available, HNSW/flat legacy fallback) ──
         if let Some(ref knn) = query.knn {
             if !reader.vector_store.vectors.is_empty() {
-                let knn_results: Vec<(u32, f64)> = if let Some(ref hnsw) = reader.hnsw_map {
+                let knn_results: Vec<(u32, f64)> = if let Some(ref spfresh) = reader.spfresh_index {
+                    spfresh.search(&knn.vector, knn.k, knn.num_candidates)
+                } else if let Some(ref hnsw) = reader.hnsw_map {
                     let query_point = kosha_segment::CosinePoint(knn.vector.clone());
                     let mut search = instant_distance::Search::default();
                     hnsw.search(&query_point, &mut search)

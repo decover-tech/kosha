@@ -4,6 +4,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub mod spfresh;
+pub use spfresh::{SpFreshIndex, SpFreshOptions, SpFreshPosting, SpFreshStats};
+
 use instant_distance::{Builder, HnswMap, Point, Search};
 use kosha_core::{
     build_filter_blooms, build_term_bloom, AggBucket, AggBucketResult, AggMetricResult,
@@ -339,17 +342,10 @@ impl SegmentWriter {
         if self.vectors.is_empty() {
             return Ok(());
         }
-        // Write vector.idx (raw vectors for flat kNN)
-        let mut buf = Vec::new();
-        let dim = self.vectors[0].1.len() as u32;
-        buf.extend_from_slice(&dim.to_le_bytes());
-        buf.extend_from_slice(&(self.vectors.len() as u32).to_le_bytes());
-        for &(doc_seq, ref v) in &self.vectors {
-            buf.extend_from_slice(&doc_seq.to_le_bytes());
-            for &val in v {
-                buf.extend_from_slice(&val.to_le_bytes());
-            }
-        }
+        // Write vector.idx as a SPFresh snapshot. Readers still accept the
+        // previous raw-vector format for already-persisted segments.
+        let index = SpFreshIndex::try_build(&self.vectors, SpFreshOptions::default())?;
+        let buf = index.to_bytes();
         self.backend.write("vector.idx", &buf)?;
 
         Ok(())
@@ -1833,25 +1829,26 @@ pub struct SegmentReader {
     filters: LazyFilters,
     pub vector_store: VectorStore,
     pub hnsw_map: Option<HnswMap<CosinePoint, u32>>,
+    pub spfresh_index: Option<SpFreshIndex>,
 }
 
 impl SegmentReader {
-    /// Opens a segment, always loading vectors and building the HNSW graph.
-    /// Kept for callers that genuinely need the vector store regardless of
-    /// query shape (merge/compaction, tests). Query-time lexical search
-    /// should use `open_with_options` instead — see its doc comment.
+    /// Opens a segment, always loading its vector index when present. Kept for
+    /// callers that genuinely need the vector store regardless of query shape
+    /// (merge/compaction, tests). Query-time lexical search should use
+    /// `open_with_options` instead — see its doc comment.
     pub fn open(segment_dir: PathBuf) -> Result<Self, KoshaError> {
         Self::open_with_options(segment_dir, true)
     }
 
-    /// Opens a segment, loading the vector store and building its HNSW graph
-    /// only when `load_vectors` is true.
+    /// Opens a segment, loading the vector store and vector index only when
+    /// `load_vectors` is true.
     ///
-    /// `vector.idx` reads and `build_hnsw` are the dominant cost of opening a
-    /// segment (especially under emulation, e.g. amd64-under-Rosetta), yet a
-    /// pure lexical/BM25 query (no `query.knn`) never touches either. Skipping
-    /// both for that case is what keeps keyword search latency independent of
-    /// embedding volume.
+    /// `vector.idx` reads and vector-index construction are the dominant cost
+    /// of opening a segment (especially under emulation, e.g.
+    /// amd64-under-Rosetta), yet a pure lexical/BM25 query (no `query.knn`)
+    /// never touches either. Skipping both for that case is what keeps keyword
+    /// search latency independent of embedding volume.
     pub fn open_with_options(segment_dir: PathBuf, load_vectors: bool) -> Result<Self, KoshaError> {
         Self::open_with_footer_options(segment_dir, load_vectors, None, None)
     }
@@ -1872,12 +1869,16 @@ impl SegmentReader {
         footer: Option<Footer>,
         postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
     ) -> Result<Self, KoshaError> {
-        let (vs, hm) = if load_vectors {
-            let vs = Self::read_vectors(&segment_dir)?;
-            let hm = build_hnsw(&vs.vectors).map(|(m, _)| m);
-            (vs, hm)
+        let (vs, hm, spfresh_index) = if load_vectors {
+            let (vs, spfresh_index) = Self::read_vectors(&segment_dir)?;
+            let hm = if spfresh_index.is_some() {
+                None
+            } else {
+                build_hnsw(&vs.vectors).map(|(m, _)| m)
+            };
+            (vs, hm, spfresh_index)
         } else {
-            (VectorStore::default(), None)
+            (VectorStore::default(), None, None)
         };
         let footer = match footer {
             Some(footer) => footer,
@@ -1901,6 +1902,7 @@ impl SegmentReader {
             },
             vector_store: vs,
             hnsw_map: hm,
+            spfresh_index,
         })
     }
 
@@ -2309,15 +2311,26 @@ impl SegmentReader {
         index
     }
 
-    fn read_vectors(segment_dir: &Path) -> Result<VectorStore, KoshaError> {
+    fn read_vectors(segment_dir: &Path) -> Result<(VectorStore, Option<SpFreshIndex>), KoshaError> {
         let path = segment_dir.join("vector.idx");
         if !path.exists() {
-            return Ok(VectorStore::default());
+            return Ok((VectorStore::default(), None));
         }
         let data = fs::read(&path)?;
+        if let Some(index) = SpFreshIndex::from_bytes(&data)? {
+            let vectors = index.live_vectors();
+            let dimensions = index.dimensions();
+            return Ok((
+                VectorStore {
+                    vectors,
+                    dimensions,
+                },
+                Some(index),
+            ));
+        }
         let mut cursor = &data[..];
         if cursor.len() < 8 {
-            return Ok(VectorStore::default());
+            return Ok((VectorStore::default(), None));
         }
         let dim = read_u32_le(&mut cursor) as usize;
         let count = read_u32_le(&mut cursor) as usize;
@@ -2330,10 +2343,13 @@ impl SegmentReader {
             }
             vectors.push((doc_seq, v));
         }
-        Ok(VectorStore {
-            vectors,
-            dimensions: dim,
-        })
+        Ok((
+            VectorStore {
+                vectors,
+                dimensions: dim,
+            },
+            None,
+        ))
     }
 
     /// Raw bytes of `filters.bin` — empty when the file is absent (a
@@ -3679,17 +3695,55 @@ mod tests {
         let lexical = SegmentReader::open_with_options(dir.clone(), false).unwrap();
         assert!(lexical.vector_store.vectors.is_empty());
         assert!(lexical.hnsw_map.is_none());
+        assert!(lexical.spfresh_index.is_none());
         // Lexical data is unaffected — still fully readable.
         assert!(lexical.postings("quick").is_some());
 
-        // KNN path (and open(), its default): vectors + HNSW present.
+        // KNN path (and open(), its default): vectors + SPFresh present.
         let knn = SegmentReader::open_with_options(dir.clone(), true).unwrap();
         assert_eq!(knn.vector_store.vectors.len(), 1);
-        assert!(knn.hnsw_map.is_some());
+        assert!(knn.hnsw_map.is_none());
+        assert!(knn.spfresh_index.is_some());
 
         let default_open = SegmentReader::open(dir.clone()).unwrap();
         assert_eq!(default_open.vector_store.vectors.len(), 1);
-        assert!(default_open.hnsw_map.is_some());
+        assert!(default_open.hnsw_map.is_none());
+        assert!(default_open.spfresh_index.is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_raw_vector_idx_still_loads_with_hnsw() {
+        let dir = std::env::temp_dir().join("kosha-test-seg-legacy-vectors");
+        let _ = fs::remove_dir_all(&dir);
+        let seg_id = SegmentId("test".into());
+        let mut w = SegmentWriter::new(seg_id, dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::vector("contentEmbedding", vec![1.0, 0.0])],
+        );
+        w.add_document(
+            DocumentId("d2".into()),
+            vec![Field::vector("contentEmbedding", vec![0.0, 1.0])],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&1.0f32.to_le_bytes());
+        raw.extend_from_slice(&0.0f32.to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&0.0f32.to_le_bytes());
+        raw.extend_from_slice(&1.0f32.to_le_bytes());
+        fs::write(dir.join("vector.idx"), raw).unwrap();
+
+        let reader = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+        assert!(reader.spfresh_index.is_none());
+        assert_eq!(reader.vector_store.vectors.len(), 2);
+        assert!(reader.hnsw_map.is_some());
 
         let _ = fs::remove_dir_all(&dir);
     }
