@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub mod spfresh;
-pub use spfresh::{SpFreshIndex, SpFreshOptions, SpFreshPosting, SpFreshStats};
+pub use spfresh::{
+    CentroidNavigator, LocalRebuildJob, PostingBlockMapping, PostingCasError, ProductQuantizer,
+    SpFreshAsyncIndex, SpFreshBlockController, SpFreshIndex, SpFreshOptions, SpFreshPosting,
+    SpFreshStats,
+};
 
 use instant_distance::{Builder, HnswMap, Point, Search};
 use kosha_core::{
