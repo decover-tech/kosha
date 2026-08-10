@@ -2024,6 +2024,7 @@ version = "0.1.0"
 dependencies = [
  "instant-distance",
  "kosha-core",
+ "kosha-vector-spfresh",
  "serde",
  "serde_json",
  "zstd",

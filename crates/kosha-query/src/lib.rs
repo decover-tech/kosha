@@ -1955,36 +1955,58 @@ impl Searcher {
             }
         }
 
-        // ── kNN search (HNSW when available, flat fallback) ──
+        // ── kNN search (SPFresh lazy posting index when the segment has
+        // one, else HNSW, else flat fallback — unchanged for anything that
+        // isn't a v2 segment) ──
         if let Some(ref knn) = query.knn {
-            if !reader.vector_store.vectors.is_empty() {
-                let knn_results: Vec<(u32, f64)> = if let Some(ref hnsw) = reader.hnsw_map {
-                    let query_point = kosha_segment::CosinePoint(knn.vector.clone());
-                    let mut search = instant_distance::Search::default();
-                    hnsw.search(&query_point, &mut search)
-                        .take(knn.k)
-                        .map(|item| (*item.value, (1.0 - item.distance as f64).max(0.0)))
-                        .collect()
-                } else {
-                    flat_knn(&knn.vector, &reader.vector_store.vectors, knn.k)
-                };
-                // Merge with this segment's BM25 hits or use kNN directly.
-                // Per-segment HashMap keeps hybrid merge O(k), not O(hits·k).
-                if !seg_hits.is_empty() {
-                    for (doc_seq, knn_score) in knn_results {
-                        if let Some(existing) = seg_hits.get_mut(&doc_seq) {
-                            *existing = *existing * 0.5 + knn_score * 0.5 * 100.0;
-                        }
+            // `knn.num_candidates` used to be a dead field (defined on
+            // `KnnQuery`, never read downstream) — it's now the lazy path's
+            // `nprobe`: how many posting centroids to probe per query.
+            let knn_results: Vec<(u32, f64)> = match reader.knn_search(
+                &knn.vector,
+                knn.k,
+                knn.num_candidates,
+            ) {
+                Some(Ok(results)) => results,
+                Some(Err(e)) => {
+                    eprintln!(
+                        "WARN: knn_search failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
+                        reader.segment_dir().display()
+                    );
+                    Vec::new()
+                }
+                None if !reader.vector_store.vectors.is_empty() => {
+                    if let Some(ref hnsw) = reader.hnsw_map {
+                        let query_point = kosha_segment::CosinePoint(knn.vector.clone());
+                        let mut search = instant_distance::Search::default();
+                        hnsw.search(&query_point, &mut search)
+                            .take(knn.k)
+                            .map(|item| (*item.value, (1.0 - item.distance as f64).max(0.0)))
+                            .collect()
+                    } else {
+                        flat_knn(&knn.vector, &reader.vector_store.vectors, knn.k)
                     }
-                } else {
-                    // Pure kNN search for this segment.
-                    for (doc_seq, score) in knn_results {
-                        if is_tombstoned(doc_seq) {
-                            continue;
-                        }
-                        if reader.doc_meta(doc_seq).is_some() {
-                            seg_hits.insert(doc_seq, (score + 1.0) * 10.0);
-                        }
+                }
+                None => Vec::new(),
+            };
+            // Merge with this segment's BM25 hits or use kNN directly.
+            // Per-segment HashMap keeps hybrid merge O(k), not O(hits·k).
+            // (A no-op on an empty `knn_results`, same as before this
+            // block existed — no separate emptiness gate needed.)
+            if !seg_hits.is_empty() {
+                for (doc_seq, knn_score) in knn_results {
+                    if let Some(existing) = seg_hits.get_mut(&doc_seq) {
+                        *existing = *existing * 0.5 + knn_score * 0.5 * 100.0;
+                    }
+                }
+            } else {
+                // Pure kNN search for this segment.
+                for (doc_seq, score) in knn_results {
+                    if is_tombstoned(doc_seq) {
+                        continue;
+                    }
+                    if reader.doc_meta(doc_seq).is_some() {
+                        seg_hits.insert(doc_seq, (score + 1.0) * 10.0);
                     }
                 }
             }
@@ -4252,6 +4274,86 @@ mod tests {
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
         assert_eq!(r.results[0].doc_id.0, "d1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v2_knn_search_recall_matches_brute_force() {
+        // Round-trip, end to end: write a segment with several vectors
+        // under the v2 (posting-based) writer default, reopen it, run a
+        // real `query.knn` search through `Searcher::search`, and confirm
+        // the results actually match brute-force nearest neighbors over the
+        // same vectors — not just "returns something without erroring".
+        let dir = std::env::temp_dir().join("kosha-test-knn-v2-recall");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+
+        let mut vectors: Vec<(String, Vec<f32>)> = Vec::new();
+        for i in 0..40u32 {
+            let angle = (i as f32) * std::f32::consts::PI / 20.0;
+            let v = vec![angle.cos(), angle.sin(), 0.0, 0.0];
+            let doc_id = format!("d{i}");
+            w.add_document(
+                DocumentId(doc_id.clone()),
+                vec![Field::vector("contentEmbedding", v.clone())],
+            );
+            vectors.push((doc_id, v));
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 40,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        let query_vector = vec![1.0, 0.0, 0.0, 0.0]; // exact match for d0 (angle 0)
+        let mut q = mk_query("", 5);
+        q.knn = Some(kosha_core::KnnQuery {
+            field: "contentEmbedding".into(),
+            vector: query_vector.clone(),
+            k: 5,
+            num_candidates: 40, // probe ~everything, this test is about recall not nprobe tuning
+            filter: None,
+        });
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(r.results.len(), 5);
+
+        // Brute-force ground truth over the exact same vectors, cosine similarity.
+        let mut brute: Vec<(String, f32)> = vectors
+            .iter()
+            .map(|(id, v)| {
+                let dot: f32 = v.iter().zip(&query_vector).map(|(a, b)| a * b).sum();
+                let norm_v: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let norm_q: f32 = query_vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                (id.clone(), dot / (norm_v * norm_q))
+            })
+            .collect();
+        brute.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let expected_top5: Vec<String> = brute.iter().take(5).map(|(id, _)| id.clone()).collect();
+
+        let got_ids: Vec<String> = r.results.iter().map(|hit| hit.doc_id.0.clone()).collect();
+        let overlap = got_ids
+            .iter()
+            .filter(|id| expected_top5.contains(id))
+            .count();
+        assert!(
+            overlap >= 4,
+            "expected at least 4/5 recall against brute force, got {overlap}/5 \
+             (got={got_ids:?}, expected={expected_top5:?})"
+        );
+        // The exact match at the query vector must always be found.
+        assert!(
+            got_ids.contains(&"d0".to_string()),
+            "exact match must always be in the results: {got_ids:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

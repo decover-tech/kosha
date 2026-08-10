@@ -523,7 +523,20 @@ fn chunk_by_byte_budget(files: &[(String, u64)], budget: u64) -> Vec<Vec<(String
 /// test instead of needing a real `S3Storage` to exercise.
 #[cfg(feature = "s3")]
 fn hydration_wants_file(name: &str, needs_vectors: bool) -> bool {
-    needs_vectors || name != "vector.idx"
+    // `vector.offsets` is the v2 posting-index sidecar (see kosha-segment's
+    // "Vector index format" section) — it must be gated identically to
+    // `vector.idx`, not just added to the "always fetch" bucket. The
+    // original `needs_vectors || name != "vector.idx"` form only excluded
+    // the one hardcoded name; naively extending it to `name !=
+    // "vector.offsets"` too would have flipped this to `needs_vectors ||
+    // true` for the sidecar (always fetch it, regardless of
+    // `needs_vectors`) — the opposite bug from the one this function
+    // exists to prevent.
+    if name == "vector.idx" || name == "vector.offsets" {
+        needs_vectors
+    } else {
+        true
+    }
 }
 
 /// Segments in `manifest` not yet recorded as synced in `synced`, in
@@ -1859,6 +1872,15 @@ impl AppState {
         if !doc_access_ok {
             return false;
         }
+        // Deliberately does NOT also require vector.offsets: it's an
+        // optional sidecar (legacy v1 segments never have one; the reader
+        // falls back to an eager parse of vector.idx alone when it's
+        // absent — same tolerance doc_access_ok above gives
+        // doc_store.offsets vs. doc_store.bin). `ensure_scoring_files_local`
+        // still proactively *attempts* to fetch it when present on S3 (see
+        // its comment) — this predicate just doesn't block "can we score"
+        // on that attempt having succeeded, since scoring is correct
+        // either way.
         if needs_vectors && !file_present_nonempty(&seg_path.join("vector.idx")) {
             return false;
         }
@@ -1953,8 +1975,29 @@ impl AppState {
                     logical_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
                 }
 
-                if needs_vectors && !file_present_nonempty(&seg_path.join("vector.idx")) {
-                    logical_paths.push((format!("{s3_prefix}/vector.idx"), 0));
+                if needs_vectors {
+                    if !file_present_nonempty(&seg_path.join("vector.idx")) {
+                        logical_paths.push((format!("{s3_prefix}/vector.idx"), 0));
+                    }
+                    // vector.offsets is the v2 posting-index sidecar — like
+                    // doc_store.offsets, only some segments have one
+                    // (legacy v1 segments never do; the reader falls back
+                    // to an eager parse of vector.idx alone when it's
+                    // absent). Unlike doc_store's sidecar, there's no
+                    // Footer.format_version signal to predict its existence
+                    // (vector.idx is deliberately self-describing,
+                    // independent of Footer — same as inverted.idx), so
+                    // this always attempts the fetch when vectors are
+                    // needed; a segment that doesn't have one just shows up
+                    // as a per-file miss in `s3.read_many`'s accounting,
+                    // not a hydration failure. Without this, the lazy path
+                    // never activates for S3-backed segments — the sidecar
+                    // never lands locally before `SegmentReader::open`, so
+                    // every S3-backed KNN query silently takes the (still
+                    // correct, just slower) eager fallback.
+                    if !file_present_nonempty(&seg_path.join("vector.offsets")) {
+                        logical_paths.push((format!("{s3_prefix}/vector.offsets"), 0));
+                    }
                 }
             }
 
@@ -4417,6 +4460,19 @@ mod tests {
             hydration_wants_file("vector.idx", true),
             "a knn query must still fetch vector.idx"
         );
+        // vector.offsets (the v2 posting-index sidecar) must be gated
+        // identically to vector.idx, not lumped into the "always fetch"
+        // bucket — a naive `name != "vector.idx"` extension would silently
+        // regress this to "always fetch the sidecar," reintroducing the
+        // exact bandwidth waste `needs_vectors` gating exists to prevent.
+        assert!(
+            !hydration_wants_file("vector.offsets", false),
+            "a query that doesn't need vectors must not fetch vector.offsets either"
+        );
+        assert!(
+            hydration_wants_file("vector.offsets", true),
+            "a knn query must still fetch vector.offsets"
+        );
         for f in [
             "footer.json",
             "doc_store.bin",
@@ -4734,6 +4790,17 @@ mod tests {
         assert!(
             AppState::segment_is_scoring_complete(&dir, true, true, false),
             "vector.idx present must make it kNN scoring-complete"
+        );
+        assert!(
+            !dir.join("vector.offsets").exists(),
+            "sanity: this assertion must be exercising the no-sidecar case"
+        );
+        assert!(
+            AppState::segment_is_scoring_complete(&dir, true, true, false),
+            "vector.offsets (the v2 posting-index sidecar) must be optional for scoring \
+             completeness — legacy v1 segments never have one, and the reader falls back to \
+             an eager parse of vector.idx alone when it's absent, same as doc_store's own \
+             sidecar-optional tolerance above"
         );
         let _ = fs::remove_dir_all(&dir);
 
