@@ -32,7 +32,7 @@ use std::time::Instant;
 use kosha_core::{
     Bm25Params, DocumentId, Field, Manifest, ManifestEntry, NamespaceId, SearchQuery, SegmentId,
 };
-use kosha_query::Searcher;
+use kosha_query::{set_wand_probe_order, Searcher, WandProbeOrder};
 use kosha_segment::SegmentWriter;
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -424,6 +424,70 @@ fn main() {
             "    ✗ BUG: total_hits diverges (legacy={} join={})",
             bal_legacy_rows[0].total_hits, bal_joined_rows[0].total_hits
         );
+    }
+
+    // ── Alignment-order A/B: rarest-first vs query-term-order ───────────
+    //
+    // The earlier sections above compare both WAND-arm variants against the
+    // legacy HashMap path, never against each other — that A/B is exactly
+    // what PR #104 (the rarest-first change) needed and shipped without.
+    // This section runs each query shape twice on the SAME corpus / SAME
+    // `mk_query` (the WAND path, not legacy), flipping only the
+    // per-pass alignment probe order between runs:
+    //   * RarestFirst — the PR #104 default (probes smallest-df cursor first).
+    //   * QueryOrder  — the pre-#104 behavior (probes in query-term order).
+    //
+    // Result must be byte-identical (the intersection is commutative w.r.t.
+    // probe order — only convergence speed varies); `total_hits` and the
+    // page are asserted to match across both runs. The `score_ms` medians
+    // ARE the measurement #104 was missing.
+    let ab_queries: &[&str] = &[mt_text, skew_text, bal_text];
+    for &qtext in ab_queries {
+        set_wand_probe_order(WandProbeOrder::RarestFirst);
+        let rf_rows = run_rows(&mk_query(qtext, topk));
+
+        set_wand_probe_order(WandProbeOrder::QueryOrder);
+        let qo_rows = run_rows(&mk_query(qtext, topk));
+
+        // Restore the production default so anything downstream (including
+        // a future caller across the bench binary) sees the #104 behavior.
+        set_wand_probe_order(WandProbeOrder::RarestFirst);
+
+        let med_rf = median_ms(rf_rows.iter().map(|r| r.score_ms).collect());
+        let med_qo = median_ms(qo_rows.iter().map(|r| r.score_ms).collect());
+        println!();
+        println!("  Alignment-order A/B (\"{qtext}\", topk={topk}, same WAND path):");
+        println!(
+            "    rarest-first  (PR #104): score {:>8.2} ms  (total_hits={})",
+            med_rf, rf_rows[0].total_hits
+        );
+        println!(
+            "    query-order   (pre-#104): score {:>8.2} ms  (total_hits={})",
+            med_qo, qo_rows[0].total_hits
+        );
+        let delta = med_qo - med_rf;
+        let sign = if delta >= 0.0 { "+" } else { "-" };
+        println!(
+            "    Δ score_ms (query-order minus rarest-first): {sign}{:.2} ms  — {}",
+            delta.abs(),
+            if delta.abs() < 1e-3 {
+                "no measurable difference"
+            } else if delta > 0.0 {
+                "rarest-first faster (confirms PR #104's hypothesis)"
+            } else {
+                "query-order faster (PR #104 regresses this shape)"
+            }
+        );
+        if rf_rows[0].total_hits != qo_rows[0].total_hits {
+            println!(
+                "    ✗ BUG: total_hits diverges between probe orders \
+                 (rf={} qo={}) — the intersection is commutative w.r.t. probe \
+                 order; this is a real bug",
+                rf_rows[0].total_hits, qo_rows[0].total_hits
+            );
+        } else {
+            println!("    ✓ total_hits identical across probe orders");
+        }
     }
 
     let _ = std::fs::remove_dir_all(&work);

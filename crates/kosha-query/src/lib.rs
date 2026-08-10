@@ -1617,8 +1617,17 @@ impl Searcher {
                     // the rarest term first means a false candidate is
                     // rejected — and the round below re-driven — before the
                     // huge lists are ever touched.
+                    //
+                    // `QueryOrder` (the pre-#104 behavior) is selectable via
+                    // `set_wand_probe_order` so a bench can A/B the two on
+                    // the same corpus/shape — see `WandProbeOrder` for why
+                    // that switch exists. Result is identical either way
+                    // (intersection is commutative w.r.t. probe order); only
+                    // convergence speed differs.
                     let mut align_order: Vec<usize> = (0..cursors.len()).collect();
-                    align_order.sort_by_key(|&i| cursors[i].df);
+                    if wand_probe_order() == WandProbeOrder::RarestFirst {
+                        align_order.sort_by_key(|&i| cursors[i].df);
+                    }
 
                     let mut total_hits = 0usize;
                     let mut topk = BoundedTopK::new(effective_k);
@@ -2243,7 +2252,8 @@ impl Searcher {
             .unwrap_or_else(exact_total_hits_engine_default);
         let cap = query
             .total_hits_cap
-            .unwrap_or_else(total_hits_cap_engine_default);
+            .unwrap_or_else(total_hits_cap_engine_default)
+            .max(1);
         let count_budget = (!exact).then_some(cap);
 
         let open_stats = OpenStatsCollector::default();
@@ -2615,6 +2625,56 @@ pub fn force_legacy_search_after() -> Option<Vec<String>> {
     Some(vec![String::new()])
 }
 
+/// Multi-term AND join's per-pass alignment probe order. Default is
+/// `RarestFirst` (the choice PR #104 shipped: probe the cursor with the
+/// smallest df first each pass). `QueryOrder` reverts to the pre-#104
+/// behavior (probe in query-term order) and exists solely so a bench can
+/// A/B the two on the same corpus/shape — the comparison #104's own bench
+/// omitted, since it only compared both modes against the legacy HashMap
+/// path, never against each other. Production code should leave the
+/// default.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WandProbeOrder {
+    /// Probe rarest-list-first each pass. Default.
+    RarestFirst,
+    /// Probe in query-term order. The pre-#104 behavior; for benching only.
+    QueryOrder,
+}
+
+const WAND_PROBE_ORDER_RAREST_FIRST: u8 = 0;
+const WAND_PROBE_ORDER_QUERY_ORDER: u8 = 1;
+
+// Initial value matches `WandProbeOrder::RarestFirst` (PR #104's default).
+// `AtomicU8` rather than `OnceLock<bool>` so a bench can flip the mode at
+// runtime between A and B runs inside one process (see topk_blockmax),
+// which a `OnceLock`-seeded env var can't.
+static WAND_PROBE_ORDER: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(WAND_PROBE_ORDER_RAREST_FIRST);
+
+/// Override the multi-term AND join's alignment probe order. `#[doc(hidden)]`
+/// because this is a bench hook, not a supported production knob: nothing in
+/// the query-result contract changes with either mode (the intersection is
+/// commutative w.r.t. probe order — only convergence speed varies), so the
+/// only callers should be benches measuring that speed delta.
+#[doc(hidden)]
+pub fn set_wand_probe_order(o: WandProbeOrder) {
+    WAND_PROBE_ORDER.store(
+        match o {
+            WandProbeOrder::RarestFirst => WAND_PROBE_ORDER_RAREST_FIRST,
+            WandProbeOrder::QueryOrder => WAND_PROBE_ORDER_QUERY_ORDER,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn wand_probe_order() -> WandProbeOrder {
+    match WAND_PROBE_ORDER.load(Ordering::Relaxed) {
+        WAND_PROBE_ORDER_QUERY_ORDER => WandProbeOrder::QueryOrder,
+        _ => WandProbeOrder::RarestFirst,
+    }
+}
+
 /// Engine-wide default for `SearchQuery.exact_total_hits` when a request
 /// doesn't set it (`KOSHA_EXACT_TOTAL_HITS`, default `false` — capped
 /// counts). Read once: searches happen far more often than this changes,
@@ -2632,7 +2692,10 @@ fn exact_total_hits_engine_default() -> bool {
 /// Engine-wide default cap for the OpenSearch-style capped `total_hits`
 /// count (`KOSHA_TOTAL_HITS_CAP`, default `10_000` — matches OpenSearch /
 /// Elasticsearch's `track_total_hits` default cap). Per-query
-/// `SearchQuery.total_hits_cap` overrides this.
+/// `SearchQuery.total_hits_cap` overrides this. A parsed value of `0`
+/// (which would make every capped query report `(0, gte)` for any non-empty
+/// intersection) is clamped to `1` — the smallest cap that still means
+/// "stop once you've counted one"; `0` is almost certainly a misconfig.
 fn total_hits_cap_engine_default() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
@@ -2640,6 +2703,7 @@ fn total_hits_cap_engine_default() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10_000)
+            .max(1)
     })
 }
 
@@ -2657,6 +2721,13 @@ fn resolve_total_hits(
     // `any_capped`: some segment stopped counting early, so `total_hits`
     // is a lower bound even when it doesn't exceed `cap` — e.g. one
     // segment that stopped exactly at the budget. Never set in exact mode.
+    // Clamp `cap` defensively to ≥ 1: the env-var default already clamps,
+    // but a per-query `SearchQuery.total_hits_cap: Some(0)` would otherwise
+    // turn every capped query into `(0, gte)` — without this guard the
+    // "stop once you've counted `cap`" early-exit in `score_segment` would
+    // also fire on `total_hits >= 0` (always true) as soon as the page
+    // fills, so the central funnel has to defend the same invariant too.
+    let cap = cap.max(1);
     if !exact && (total_hits > cap || any_capped) {
         (total_hits.min(cap), TotalHitsRelation::Gte)
     } else {
@@ -3391,6 +3462,28 @@ mod tests {
             resolve_total_hits(50, true, 10, false),
             (50, TotalHitsRelation::Eq)
         );
+        // `cap == 0` (a misconfig — `KOSHA_TOTAL_HITS_CAP=0` or a per-query
+        // `total_hits_cap: Some(0)`) is clamped to `1` so a capped query
+        // over a non-empty intersection reports `(1, gte)` instead of the
+        // footgun `(0, gte)` that reads as "we don't know there's more
+        // than zero matches," which is false any time total_hits > 0.
+        assert_eq!(
+            resolve_total_hits(7, false, 0, false),
+            (1, TotalHitsRelation::Gte),
+            "cap=0 must clamp to 1, not collapse the count to 0"
+        );
+        assert_eq!(
+            resolve_total_hits(0, false, 0, false),
+            (0, TotalHitsRelation::Eq),
+            "an empty intersection stays (0, eq) regardless of the cap clamp"
+        );
+        // `any_capped` with cap=0 (e.g. a segment early-exited under a
+        // misconfigured 0 cap): still clamps the report to ≥ 1 once there
+        // is anything to count, instead of claiming "≥ 0" vacuously.
+        assert_eq!(
+            resolve_total_hits(5, false, 0, true),
+            (1, TotalHitsRelation::Gte)
+        );
     }
 
     #[test]
@@ -3448,6 +3541,96 @@ mod tests {
         let exact_r = searcher.search(&ns, &manifest, &exact_q, None).unwrap();
         assert_eq!(exact_r.total_hits, n);
         assert_eq!(exact_r.total_hits_relation, TotalHitsRelation::Eq);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capped_total_hits_reports_gte_from_central_clamp_with_no_segment_early_exit() {
+        // Coverage gap surfaced in review of #103: the suite exercised
+        // `any_capped`-driven `gte` (the per-segment early-exit path) but
+        // never the central-clamp-only path — multiple segments where EACH
+        // is below `cap` so none flags `hits_capped`, but the SUMMED total
+        // exceeds `cap`, so only `resolve_total_hits`'s `total_hits > cap`
+        // branch flips the relation. This test proves:
+        //   * the cross-segment sum is compared against `cap`, not each
+        //     segment individually (a per-segment-clamp regression would
+        //     report `Eq` here — no single segment ever exceeded the cap);
+        //   * the page stays identical to the exact run (clamp affects
+        //     only the reported count, never ranking);
+        //   * `gte` is reported even though `any_capped == false`;
+        //   * exact mode overrides the central clamp and reports the true
+        //     summed count, proving the cap path is gated on `!exact`.
+        let dir = std::env::temp_dir().join("kosha-test-cap-central-clamp-multi-seg");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+
+        // Three segments, 8 matches each for "alpha beta" → summed 24.
+        // Cap = 10: each segment's per-segment total (8) is BELOW the cap,
+        // so `score_segment`'s `count_budget.is_some_and(|c| total_hits >= c)`
+        // never fires inside any single segment — `hits_capped` stays
+        // `false` on every `SegmentOutput`. The central clamp is the only
+        // thing that can possibly report `gte` here.
+        let seg_dirs: Vec<PathBuf> = ["s1", "s2", "s3"]
+            .into_iter()
+            .map(|s| {
+                let seg_dir = dir.join(&ns.0).join(s);
+                let mut w = SegmentWriter::new(SegmentId(s.into()), seg_dir.clone());
+                for i in 0..8 {
+                    w.add_document(
+                        DocumentId(format!("{s}-d{i:02}")),
+                        vec![Field::text("t", "alpha beta")],
+                    );
+                }
+                w.finalize(Bm25Params::default()).unwrap();
+                seg_dir
+            })
+            .collect();
+        let manifest = Manifest {
+            version: 1,
+            segments: seg_dirs
+                .iter()
+                .enumerate()
+                .map(|(i, _)| ManifestEntry {
+                    segment_id: SegmentId(format!("s{}", i + 1)),
+                    doc_count: 8,
+                })
+                .collect(),
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        // Ground truth: exact count is the full intersection ≡ 8 × 3 = 24.
+        let mut exact_q = mk_query("alpha beta", 5);
+        exact_q.exact_total_hits = Some(true);
+        let exact = searcher.search(&ns, &manifest, &exact_q, None).unwrap();
+        assert_eq!(exact.total_hits, 24);
+        assert_eq!(exact.total_hits_relation, TotalHitsRelation::Eq);
+
+        // Capped under the sum: each segment's 8 is below `cap = 10`, so
+        // no segment early-exits — `gte` must come from the central clamp
+        // (`total_hits > cap`), not from `any_capped`.
+        let mut capped_q = mk_query("alpha beta", 5);
+        capped_q.exact_total_hits = Some(false);
+        capped_q.total_hits_cap = Some(10);
+        let capped = searcher.search(&ns, &manifest, &capped_q, None).unwrap();
+        assert_eq!(
+            capped.total_hits, 10,
+            "the summed total (24) clamps to the cap (10), not to any \
+             per-segment ceiling — a per-segment-clamp regression reports \
+             `Eq` here since no single segment ever reached 10"
+        );
+        assert_eq!(
+            capped.total_hits_relation,
+            TotalHitsRelation::Gte,
+            "the central-clamp path must report `gte` even when no segment \
+             flagged `hits_capped` — only the summed count exceeded the cap"
+        );
+        assert_eq!(
+            page_ids(&capped),
+            page_ids(&exact),
+            "capping the reported count must never change the page"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

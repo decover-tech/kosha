@@ -312,7 +312,7 @@ test_yaml_pre_commit_config_valid() {
   fi
 }
 
-test_yaml_kosha_bench_hook_gets_msg_file_arg() {
+test_yaml_kosha_bench_hook_does_not_set_pass_filenames_false() {
   # For a `prepare-commit-msg`-stage hook, the "filename" pre-commit
   # forwards *is* the commit-message file path (git's native hook
   # argument) — not a list of changed source files. `pass_filenames:
@@ -371,7 +371,7 @@ main() {
   test_amend_no_cargo_exits_one
   test_amend_no_corpus_exits_one
   test_yaml_pre_commit_config_valid
-  test_yaml_kosha_bench_hook_gets_msg_file_arg
+  test_yaml_kosha_bench_hook_does_not_set_pass_filenames_false
   test_yaml_workflow_valid
   printf '\n=== Results: %d passed, %d failed ===\n' "$PASS" "$FAIL"
   [ "$FAIL" -eq 0 ] || exit 1
