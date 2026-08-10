@@ -85,13 +85,18 @@ enum Commands {
         #[arg(long)]
         filter: Option<String>,
         /// Full SearchQuery JSON (@file.json or inline). Overrides query/max/filter.
-        #[arg(long, conflicts_with_all = ["query", "filter", "exact"])]
+        #[arg(long, conflicts_with_all = ["query", "filter", "exact", "or"])]
         body: Option<String>,
         /// Force an exact total_hits count instead of the default capped
         /// (gte) count — see SearchQuery.exact_total_hits. Set
         /// exact_total_hits directly in --body instead when using --body.
         #[arg(long)]
         exact: bool,
+        /// Match a document containing ANY query term instead of requiring
+        /// every term (the default) — see SearchQuery.operator. Set
+        /// operator directly in --body instead when using --body.
+        #[arg(long)]
+        or: bool,
     },
     /// Flush buffered documents to a segment
     Flush {
@@ -212,6 +217,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             filter,
             body,
             exact,
+            or,
         } => {
             if let Some(body_src) = body {
                 let body_val = read_json_arg(&body_src)?;
@@ -219,7 +225,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_value(&value, cli.json, human_search_value)?;
             } else {
                 let query_text = query.ok_or("provide a query string or --body")?;
-                let mut search = build_search_query(query_text, max_results, exact);
+                let mut search = build_search_query(query_text, max_results, exact, or);
                 if let Some(filter_src) = filter {
                     search.filter = Some(serde_json::from_str(&filter_src)?);
                 }
@@ -536,11 +542,20 @@ fn human_search_value(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
 /// Build a `SearchQuery` from the non-`--body` `Search` command fields. The
 /// `exact` flag wires through to `SearchQuery.exact_total_hits` (`Some(true)`
 /// when set, `None` otherwise — deferring to the engine-wide default
-/// `KOSHA_EXACT_TOTAL_HITS`). Pulled out as a pure function (no I/O) so the
-/// `--exact` -> `SearchQuery.exact_total_hits = Some(true)` wiring — the
-/// contract `parses_search_exact_flag` only half-checked, since it stops at
-/// the clap parse — is unit-testable end to end.
-fn build_search_query(query_text: String, max_results: usize, exact: bool) -> SearchQuery {
+/// `KOSHA_EXACT_TOTAL_HITS`); `or` wires to `SearchQuery.operator` the same
+/// way (`Some(QueryOperator::Or)` vs. `None` — never an eager `Some(And)`, so
+/// the engine's own default operator still applies when unset). Pulled out
+/// as a pure function (no I/O) so the `--exact`/`--or` -> `SearchQuery`
+/// wiring — the contract `parses_search_exact_flag`/`parses_search_or_flag`
+/// only half-check, since they stop at the clap parse — is unit-testable
+/// end to end. `no_cache` has no CLI flag yet (set `no_cache` directly in
+/// `--body` instead), so it's always `None` here.
+fn build_search_query(
+    query_text: String,
+    max_results: usize,
+    exact: bool,
+    or: bool,
+) -> SearchQuery {
     SearchQuery {
         query_text,
         max_results,
@@ -556,6 +571,8 @@ fn build_search_query(query_text: String, max_results: usize, exact: bool) -> Se
         knn: None,
         exact_total_hits: exact.then_some(true),
         total_hits_cap: None,
+        operator: or.then_some(kosha_core::QueryOperator::Or),
+        no_cache: None,
     }
 }
 
@@ -617,7 +634,7 @@ mod tests {
         // an exact count"). This test closes that loop end to end without
         // standing up a real HTTP server — exactly what the #105 review
         // flagged as missing.
-        let with_exact = build_search_query("breach".to_string(), 5, true);
+        let with_exact = build_search_query("breach".to_string(), 5, true, false);
         assert_eq!(
             with_exact.exact_total_hits,
             Some(true),
@@ -627,17 +644,63 @@ mod tests {
         assert_eq!(with_exact.query_text, "breach");
         assert_eq!(with_exact.max_results, 5);
         assert_eq!(with_exact.from, 0, "the CLI never sets `from`");
+        assert_eq!(
+            with_exact.operator, None,
+            "--exact alone must not set --or's field"
+        );
 
         // Without `--exact`: defer to the engine-wide default. The
         // important assertion is `None` (NOT `Some(false)`), so the engine
         // default — which the server reads the same way — still applies.
-        let without_exact = build_search_query("breach".to_string(), 5, false);
+        let without_exact = build_search_query("breach".to_string(), 5, false, false);
         assert_eq!(
             without_exact.exact_total_hits, None,
             "absence of --exact must defer to the engine default via None, \
              not eagerly set Some(false)"
         );
         assert_eq!(without_exact.total_hits_cap, None);
+        assert_eq!(without_exact.operator, None);
+    }
+
+    #[test]
+    fn build_search_query_wires_or_flag_to_search_query_operator() {
+        // Sibling of `build_search_query_wires_exact_flag_to_search_query`
+        // for the `--or` flag: `parses_search_or_flag` proves clap surfaces
+        // `or: bool`, this closes the rest of the loop through
+        // `build_search_query` -> `SearchQuery.operator`.
+        let with_or = build_search_query("breach recall".to_string(), 5, false, true);
+        assert_eq!(
+            with_or.operator,
+            Some(kosha_core::QueryOperator::Or),
+            "--or must wire to SearchQuery.operator = Some(QueryOperator::Or)"
+        );
+
+        // Without `--or`: defer to the engine-wide default operator (AND) —
+        // `None`, not an eagerly-set `Some(QueryOperator::And)`.
+        let without_or = build_search_query("breach recall".to_string(), 5, false, false);
+        assert_eq!(
+            without_or.operator, None,
+            "absence of --or must defer to the engine default via None"
+        );
+    }
+
+    #[test]
+    fn parses_search_or_flag() {
+        let cli = Cli::try_parse_from([
+            "kosha",
+            "--host",
+            "http://localhost:8080",
+            "search",
+            "-n",
+            "demo",
+            "breach recall",
+            "--or",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Search { or, .. } => assert!(or),
+            _ => panic!("expected search"),
+        }
     }
 
     #[test]

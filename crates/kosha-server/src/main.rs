@@ -247,6 +247,8 @@ struct AppState {
     /// holds at most low-thousands entries; per-query cost is a single
     /// `HashMap` lookup, vs. 17 syscalls on the legacy path.
     completed_hydrations: Mutex<HashMap<(String, u64), bool>>,
+    /// Whole-response cache for POST /search — see [`ResultCache`].
+    result_cache: Mutex<ResultCache>,
     /// Posting-blob presence cache (Tier 1 O3), the sibling optimization to
     /// `completed_hydrations` above: that verdict can never cover posting
     /// blobs (PR #89 — they're fetched per query term, not per segment), so
@@ -985,6 +987,7 @@ impl AppState {
             self_ref: Weak::new(),
             backfill_jobs: Mutex::new(std::collections::HashSet::new()),
             completed_hydrations: Mutex::new(HashMap::new()),
+            result_cache: Mutex::new(ResultCache::new(result_cache_budget())),
             posting_blob_presence: Mutex::new(HashMap::new()),
             // Warmup starts ready; `spawn_warmup` flips `false` only when
             // there's configured work to do (and back to `true` on
@@ -1084,6 +1087,8 @@ impl AppState {
                 knn: None,
                 exact_total_hits: None,
                 total_hits_cap: None,
+                operator: None,
+                no_cache: None,
             };
             let t_ns = std::time::Instant::now();
             let outcome = self.hydrate_segments_for_search(&ns, &manifest, &query);
@@ -3016,6 +3021,37 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         (m, t)
     };
 
+    // ── Whole-response result cache ─────────────────────────────────────
+    // Real query traffic is Zipfian in queries too; identical requests
+    // against an unchanged namespace re-pay the full scoring pass today.
+    // Keyed by (namespace, manifest_version, canonical query): a publish
+    // bumps the version and orphans stale entries, the same free
+    // invalidation the hydration-verdict and blob-presence caches use.
+    // Deliberately NOT cached: requests that opt out (`no_cache`), kNN
+    // queries (embedding keys are huge), and namespaces with live
+    // tombstones — tombstones flow to the searcher outside the manifest,
+    // so a version-keyed entry could serve deleted docs (verify-then-relax
+    // is a follow-up, skip-when-present is the safe v1).
+    let has_tombstones = tombstones
+        .as_ref()
+        .is_some_and(|t| t.values().any(|s| !s.is_empty()));
+    let cache_key = if result_cache_budget() > 0
+        && !query.no_cache.unwrap_or(false)
+        && query.knn.is_none()
+        && !has_tombstones
+    {
+        serde_json::to_string(&query)
+            .ok()
+            .map(|canonical| (ns.0.clone(), manifest.version, canonical))
+    } else {
+        None
+    };
+    if let Some(ref key) = cache_key {
+        if let Some(resp) = state.result_cache.lock().unwrap().lookup(key) {
+            return resp;
+        }
+    }
+
     // Footer-first hydrate: bloom-prune before downloading full segments.
     let t_hydrate = Instant::now();
     #[cfg(feature = "s3")]
@@ -3118,7 +3154,13 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                 &phases,
                 result.total_hits,
             );
-            json_ok(&result)
+            let resp = json_ok(&result);
+            // Only successful responses enter the cache, after the search
+            // proved every needed file readable.
+            if let Some(key) = cache_key {
+                state.result_cache.lock().unwrap().insert(key, &resp);
+            }
+            resp
         }
         Err(e) => {
             // A search failure (segment file IO error after eviction, or
@@ -3145,6 +3187,104 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             search_error_response(&e)
         }
     }
+}
+
+/// Whole-response cache for `POST /search` — see the cache block in
+/// [`handle_search_post`] for keying and exclusion rules. Bounded by
+/// `KOSHA_RESULT_CACHE_MAX_BYTES` (default 64MiB, `0` disables); LRU by
+/// last-use tick with linear-scan eviction (entry counts are small at
+/// realistic budgets). Response strings are cached verbatim, so a hit is
+/// one map lookup plus a clone.
+struct ResultCache {
+    entries: HashMap<(String, u64, String), ResultCacheEntry>,
+    bytes: usize,
+    budget: usize,
+    tick: u64,
+    hits: u64,
+    misses: u64,
+}
+
+struct ResultCacheEntry {
+    resp: String,
+    bytes: usize,
+    last_used: u64,
+}
+
+impl ResultCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+            budget,
+            tick: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn lookup(&mut self, key: &(String, u64, String)) -> Option<String> {
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some(e) = self.entries.get_mut(key) {
+            e.last_used = tick;
+            self.hits += 1;
+            Some(e.resp.clone())
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    fn insert(&mut self, key: (String, u64, String), resp: &str) {
+        if self.budget == 0 {
+            return;
+        }
+        let entry_bytes = resp.len() + key.0.len() + key.2.len() + 64;
+        // A single oversized response (huge page sizes) must not evict the
+        // whole cache to store one entry nobody may repeat.
+        if entry_bytes > self.budget / 4 {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes -= old.bytes;
+        }
+        self.tick += 1;
+        self.bytes += entry_bytes;
+        self.entries.insert(
+            key,
+            ResultCacheEntry {
+                resp: resp.to_owned(),
+                bytes: entry_bytes,
+                last_used: self.tick,
+            },
+        );
+        while self.bytes > self.budget {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(e) = self.entries.remove(&oldest) {
+                self.bytes -= e.bytes;
+            }
+        }
+    }
+}
+
+/// `KOSHA_RESULT_CACHE_MAX_BYTES` — byte budget for [`ResultCache`]
+/// (default 64MiB, `0` disables). Read once, same rationale as the other
+/// cache knobs.
+fn result_cache_budget() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("KOSHA_RESULT_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 * 1024 * 1024)
+    })
 }
 
 // ─── GET /search (query params, simple queries) ─────────────────────────────
@@ -3197,6 +3337,8 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         knn: None,
         exact_total_hits: None,
         total_hits_cap: None,
+        operator: None,
+        no_cache: None,
     };
 
     let (manifest, tombstones) = {
@@ -5477,6 +5619,54 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         AppState::new(dir)
+    }
+
+    fn rc_key(ns: &str, v: u64, q: &str) -> (String, u64, String) {
+        (ns.to_string(), v, q.to_string())
+    }
+
+    #[test]
+    fn result_cache_hits_evicts_and_isolates_versions() {
+        let mut c = ResultCache::new(10_000);
+        let k1 = rc_key("ns", 1, "q1");
+        assert!(c.lookup(&k1).is_none(), "cold lookup misses");
+        c.insert(k1.clone(), "resp1");
+        assert_eq!(c.lookup(&k1).as_deref(), Some("resp1"), "hit after insert");
+        assert_eq!((c.hits, c.misses), (1, 1));
+
+        // A manifest publish bumps the version: same query, new key, miss.
+        let k1v2 = rc_key("ns", 2, "q1");
+        assert!(c.lookup(&k1v2).is_none(), "version bump orphans entries");
+
+        // Byte-budget LRU: filling past the budget evicts oldest-used.
+        let mut c = ResultCache::new(1_000);
+        for i in 0..20 {
+            c.insert(rc_key("ns", 1, &format!("q{i}")), &"x".repeat(100));
+        }
+        assert!(c.bytes <= 1_000, "stays within budget ({} bytes)", c.bytes);
+        assert!(
+            c.lookup(&rc_key("ns", 1, "q0")).is_none(),
+            "oldest entry evicted"
+        );
+        assert!(
+            c.lookup(&rc_key("ns", 1, "q19")).is_some(),
+            "newest entry retained"
+        );
+    }
+
+    #[test]
+    fn result_cache_rejects_oversized_and_zero_budget() {
+        let mut c = ResultCache::new(1_000);
+        let big = "x".repeat(400); // > budget/4 with key overhead
+        c.insert(rc_key("ns", 1, "big"), &big);
+        assert!(
+            c.lookup(&rc_key("ns", 1, "big")).is_none(),
+            "one oversized response must not monopolize the cache"
+        );
+
+        let mut c = ResultCache::new(0);
+        c.insert(rc_key("ns", 1, "q"), "resp");
+        assert!(c.lookup(&rc_key("ns", 1, "q")).is_none(), "0 disables");
     }
 
     #[test]

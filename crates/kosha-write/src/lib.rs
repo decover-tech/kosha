@@ -656,6 +656,23 @@ impl Indexer {
         namespace: &NamespaceId,
         opts: CompactOptions,
     ) -> Result<CompactResult, KoshaError> {
+        self.compact_namespace_with_options_impl(namespace, opts, || {})
+    }
+
+    /// Same as `compact_namespace_with_options`, but calls `after_plan` once
+    /// the tombstone snapshot below has been taken and `state` released,
+    /// immediately before merge I/O starts — the exact window in which a
+    /// concurrent `delete_by_query` can land on an input segment. Always
+    /// `|| {}` in production; the test-only seam a race regression needs to
+    /// land a delete deterministically instead of racing real threads
+    /// against merge I/O timing. See
+    /// `compact_carries_forward_a_delete_that_lands_mid_merge`.
+    fn compact_namespace_with_options_impl(
+        &self,
+        namespace: &NamespaceId,
+        opts: CompactOptions,
+        after_plan: impl FnOnce(),
+    ) -> Result<CompactResult, KoshaError> {
         let handle = self.ns_handle(namespace);
         let _compact_guard = handle.compact.lock().unwrap();
 
@@ -705,6 +722,8 @@ impl Indexer {
             (plan, tombstones, bm25_params, segments_before)
         };
 
+        after_plan();
+
         // ── Merge I/O with state lock released (DESIGN.md §7.1) ──────────
         let ns_dir = self.data_dir.join(&namespace.0);
         let seg_id = SegmentId(format!(
@@ -716,6 +735,14 @@ impl Indexer {
         let mut writer = kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir);
         let mut any_docs = false;
         let old_segment_ids = plan.input_ids();
+        // (old segment_id, old doc_seq) → the doc's doc_seq in the merged
+        // output, for every doc actually copied. `SegmentWriter::add_document`
+        // assigns doc_seq as `self.doc_records.len()` at call time (strictly
+        // in call order), so `next_new_seq` tracks it exactly. Only needed to
+        // carry a tombstone forward (see the publish block below) — a doc
+        // excluded here by the snapshot below never needs an entry.
+        let mut seq_remap: HashMap<(SegmentId, u32), u32> = HashMap::new();
+        let mut next_new_seq: u32 = 0;
 
         for entry in &plan.inputs {
             let reader = kosha_segment::SegmentReader::open(ns_dir.join(&entry.segment_id.0))?;
@@ -732,6 +759,8 @@ impl Indexer {
                 if ts.is_some_and(|set| set.contains(&doc_rec.doc_seq)) {
                     continue;
                 }
+                seq_remap.insert((entry.segment_id.clone(), doc_rec.doc_seq), next_new_seq);
+                next_new_seq += 1;
                 writer.add_document(doc_rec.doc_id, doc_rec.fields);
                 any_docs = true;
             }
@@ -767,11 +796,37 @@ impl Indexer {
                 });
             }
 
+            // Carry forward any tombstone added to an input segment *after*
+            // the plan snapshot above but before this publish — a
+            // `delete_by_query` landing mid-merge. Without this, the tombstone
+            // below is unconditionally dropped with the rest of the input
+            // segment's state, and the doc it targeted (already copied into
+            // the merge output under the stale snapshot) comes back to life
+            // in the merged segment. `seq_remap` has no entry for a doc_seq
+            // that was already tombstoned at snapshot time — it was excluded
+            // from the merge output entirely, so there's nothing to carry.
+            let mut carried_tombstones: HashSet<u32> = HashSet::new();
+            for old_id in &old_segment_ids {
+                let snapshot = tombstones.get(old_id);
+                let Some(live) = state.tombstones.get(old_id) else {
+                    continue;
+                };
+                for &old_seq in live {
+                    if snapshot.is_some_and(|s| s.contains(&old_seq)) {
+                        continue;
+                    }
+                    if let Some(&new_seq) = seq_remap.get(&(old_id.clone(), old_seq)) {
+                        carried_tombstones.insert(new_seq);
+                    }
+                }
+            }
+
             state
                 .manifest
                 .segments
                 .retain(|e| !old_segment_ids.contains(&e.segment_id));
             state.manifest.version += 1;
+            let merged_segment_id = seg_id.clone();
             state.manifest.segments.push(ManifestEntry {
                 segment_id: seg_id,
                 doc_count: footer.doc_count,
@@ -781,6 +836,13 @@ impl Indexer {
             for seg_id in &old_segment_ids {
                 state.tombstones.remove(seg_id);
                 state.manifest.segment_footers.remove(seg_id);
+            }
+            if !carried_tombstones.is_empty() {
+                state
+                    .tombstones
+                    .entry(merged_segment_id)
+                    .or_default()
+                    .extend(carried_tombstones);
             }
             state.id_index = None;
         }
@@ -1562,6 +1624,110 @@ mod tests {
 
         // Nothing published: the namespace's segment list is untouched.
         assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for a race distinct from the read-failure one above: a
+    /// `delete_by_query` landing *after* compaction snapshots tombstones but
+    /// *before* it publishes (the window where `state` is unlocked for merge
+    /// I/O — see `compact_namespace_with_options_impl`'s doc comment). The
+    /// merge loop only ever consults the stale snapshot, so it copies the
+    /// doc the concurrent delete just tombstoned; unless that tombstone is
+    /// carried forward onto the merged segment at publish, the delete is
+    /// silently discarded and the doc comes back to life the moment the
+    /// merged segment replaces its inputs. `after_plan` (the test-only hook)
+    /// lands the delete deterministically instead of racing real threads
+    /// against merge I/O timing that's too fast in a test fixture to hit
+    /// reliably.
+    #[test]
+    fn compact_carries_forward_a_delete_that_lands_mid_merge() {
+        let dir = std::env::temp_dir().join("kosha-test-compact-tombstone-race");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ns = NamespaceId("test".into());
+        let idx = Indexer::new(dir.clone()).with_flush_threshold(2);
+
+        idx.index_documents(
+            ns.clone(),
+            vec![
+                Document {
+                    id: DocumentId("d1".into()),
+                    fields: vec![
+                        Field::text("title", "hello world"),
+                        Field::keyword("status", "active"),
+                    ],
+                },
+                Document {
+                    id: DocumentId("d2".into()),
+                    fields: vec![
+                        Field::text("title", "goodbye world"),
+                        Field::keyword("status", "active"),
+                    ],
+                },
+            ],
+        )
+        .unwrap();
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("d3".into()),
+                fields: vec![
+                    Field::text("title", "hello again"),
+                    Field::keyword("status", "active"),
+                ],
+            }],
+        )
+        .unwrap();
+        // A lone 3rd doc doesn't reach `with_flush_threshold(2)` on its own —
+        // flush it explicitly so it lands in its own (2nd) segment instead
+        // of staying buffered.
+        idx.flush_namespace(&ns).unwrap();
+        assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 2);
+
+        let manifest_before = idx.manifest(&ns).unwrap();
+        let filter: FilterClause =
+            serde_json::from_str(r#"{"term": {"status": "active"}}"#).unwrap();
+
+        // The hook fires once merge planning has snapshotted tombstones and
+        // released `state`, exactly reproducing a delete that lands in that
+        // window in production — deleting *all three* docs so the merge
+        // output (had the race not been fixed) would end up with none of
+        // its docs live.
+        let ns_hook = ns.clone();
+        let deleted = std::cell::Cell::new(0usize);
+        let result = idx
+            .compact_namespace_with_options_impl(&ns, CompactOptions::full(), || {
+                let count = idx
+                    .delete_by_query(&ns_hook, &manifest_before, &filter)
+                    .unwrap();
+                deleted.set(count);
+            })
+            .unwrap();
+        assert_eq!(deleted.get(), 3, "the mid-merge delete itself must land");
+        assert!(result.merged);
+
+        // The merge output still physically contains all 3 docs (copied
+        // under the stale pre-delete snapshot) — that's expected and fine,
+        // the same way an already-known-tombstoned doc stays on disk in any
+        // segment. What must NOT happen is the delete being lost: every doc
+        // must still read back as deleted through the tombstone-aware path.
+        let seg_id = idx.manifest(&ns).unwrap().segments[0].segment_id.clone();
+        let reader = kosha_segment::SegmentReader::open(dir.join("test").join(&seg_id.0)).unwrap();
+        assert_eq!(
+            reader.doc_count(),
+            3,
+            "merge output should still contain all 3 docs pre-tombstone"
+        );
+
+        let tombstones = idx.get_tombstones(&ns).unwrap();
+        let live_tombstones: HashSet<u32> = tombstones.get(&seg_id).cloned().unwrap_or_default();
+        assert_eq!(
+            live_tombstones.len(),
+            3,
+            "a delete landing mid-merge must be carried forward onto the merged segment, \
+             not silently discarded: {live_tombstones:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

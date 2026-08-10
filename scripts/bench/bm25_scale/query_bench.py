@@ -54,12 +54,25 @@ def percentile(data: list[float], p: float) -> float:
     return s[f] + (s[c] - s[f]) * (k - f)
 
 
+OPERATOR = None
+NO_CACHE = False
+
+
+def payload_for(namespace: str, query_text: str, topk: int) -> dict:
+    payload = {"namespace": namespace, "query_text": query_text, "max_results": topk}
+    if OPERATOR:
+        payload["operator"] = OPERATOR
+    if NO_CACHE:
+        payload["no_cache"] = True
+    return payload
+
+
 def run_query(session, host, namespace, headers, query_text, topk, timeout, results, lock, errors):
     t0 = time.time()
     try:
         resp = session.post(
             f"{host}/search",
-            json={"namespace": namespace, "query_text": query_text, "max_results": topk},
+            json=payload_for(namespace, query_text, topk),
             headers=headers,
             timeout=timeout,
         )
@@ -89,8 +102,22 @@ def main() -> None:
         required=True,
         help="label only — this script doesn't manage cache state itself",
     )
+    ap.add_argument(
+        "--operator",
+        choices=["and", "or"],
+        default=None,
+        help="query operator sent with each request (engine default when omitted)",
+    )
+    ap.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="send no_cache=true on every request (bypass the result cache)",
+    )
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
+    global OPERATOR, NO_CACHE
+    OPERATOR = args.operator
+    NO_CACHE = args.no_cache
 
     queries = [l.strip() for l in args.queries_file.read_text().splitlines() if l.strip()]
     if not queries:

@@ -927,6 +927,35 @@ pub struct SearchQuery {
     /// engine-wide `KOSHA_TOTAL_HITS_CAP` setting (default `10_000`).
     #[serde(default)]
     pub total_hits_cap: Option<usize>,
+    /// `None` (default) is strict AND: a document must contain every
+    /// `query_text` term to match at all — unchanged from before this
+    /// field existed. `Some(Or)` matches a document containing ANY query
+    /// term (union), scored by summing whichever terms it actually
+    /// matched — OpenSearch's `operator: or` on a `match` query.
+    ///
+    /// OR's fast path skips over non-contributing postings the same way
+    /// AND's capped-mode early exit does, which is exactly why an exact
+    /// union count is incompatible with it: a skipped stretch is never
+    /// visited, so it can never be counted either. `exact_total_hits:
+    /// true` with `operator: or` therefore falls back to a full,
+    /// unskipped union scan instead of the fast join — still correct,
+    /// just without OR's speed advantage. See [`QueryOperator`].
+    #[serde(default)]
+    pub operator: Option<QueryOperator>,
+    /// Bypass the server's whole-response result cache for this request:
+    /// the search executes in full and its response is not stored. For
+    /// measurement and read-after-write tests. `None`/`false` = normal
+    /// caching (when the engine has it enabled).
+    #[serde(default)]
+    pub no_cache: Option<bool>,
+}
+
+/// See `SearchQuery.operator`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryOperator {
+    And,
+    Or,
 }
 fn default_max_results() -> usize {
     10
