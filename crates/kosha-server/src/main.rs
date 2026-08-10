@@ -1209,6 +1209,40 @@ impl AppState {
                         t_blobs.elapsed().as_secs_f64(),
                     );
                 }
+
+                // Phase 3 — doc stores. Page materialization (Option A, see
+                // `ensure_doc_store` in `handle_search_post`) asks for the
+                // WHOLE `doc_store.bin` of every page-hit segment, so on a
+                // cold pod the first queries pay full-file S3 fetches — for
+                // large compacted segments that is a multi-GB in-memory GET
+                // on the query path (the round-7 incident: a 10.6GB merged
+                // doc store failed repeatedly under memory pressure and
+                // 100% of queries 503'd). Prefetching here moves that cost
+                // into the readiness gate, batched like the blobs so the
+                // hydration semaphore is never held for the whole namespace.
+                // Chunks of 2, not 8: the S3 fetch buffers each file's whole
+                // body in memory, and post-compaction doc stores are the
+                // largest files in a segment — two multi-GB bodies in flight
+                // is plenty.
+                let t_ds = std::time::Instant::now();
+                let mut ds_files = 0usize;
+                let mut ds_bytes = 0u64;
+                for chunk in seg_paths.chunks(2) {
+                    let (files, bytes) = self.ensure_files_local(chunk, "doc_store.bin");
+                    ds_files += files;
+                    ds_bytes += bytes;
+                }
+                if ds_files > 0 {
+                    println!(
+                        "warmup: [{}/{}] '{ns_name}' doc stores ready: fetched {} file(s), \
+                         {:.1} MB in {:.1}s",
+                        idx + 1,
+                        total,
+                        ds_files,
+                        ds_bytes as f64 / (1024.0 * 1024.0),
+                        t_ds.elapsed().as_secs_f64(),
+                    );
+                }
             }
         }
         self.warmup_complete
