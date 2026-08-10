@@ -3903,7 +3903,14 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
 /// a process-wide indexer lock; only the target namespace's compact lock is
 /// held for the duration.
 ///
-/// Request body: {"namespace": "paragraph_index_hnsw", "mode": "tiered"|"full"}
+/// Request body: {"namespace": "paragraph_index_hnsw", "mode": "tiered"|"full",
+///                "max_segment_bytes": 5368709120}   // optional; 0 = uncapped
+///
+/// Merged output size is capped (default 5GiB, Lucene-style): `full` under a
+/// cap merges one greedy smallest-first group per pass — loop the endpoint
+/// until `segments_after` stops dropping to converge on
+/// ~ceil(total_bytes/cap) segments. `max_segment_bytes: 0` restores the
+/// legacy all-to-one merge.
 ///
 /// Every existing segment should hydrate locally first (compaction reads each
 /// one via `SegmentReader::open`) — for a namespace with hundreds of segments
@@ -3983,10 +3990,22 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
         (manifest.segments.len(), not_hydrated)
     };
 
-    let opts = kosha_write::CompactOptions {
-        mode,
-        policy: state.indexer.compaction_policy().clone(),
-    };
+    let mut policy = state.indexer.compaction_policy().clone();
+    // Merge-size cap precedence: policy default (5GiB) < env < request body.
+    // `0` disables the cap (legacy all-to-one full merge — the 167→1 merge
+    // that put the 10M bench box into reclaim stalls; opt back in explicitly
+    // if that's really wanted).
+    if let Some(n) = std::env::var("KOSHA_COMPACT_MAX_SEGMENT_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        policy.max_merged_segment_bytes = n;
+    }
+    if let Some(n) = req.get("max_segment_bytes").and_then(|v| v.as_u64()) {
+        policy.max_merged_segment_bytes = n;
+    }
+    let max_segment_bytes = policy.max_merged_segment_bytes;
+    let opts = kosha_write::CompactOptions { mode, policy };
     let result = match state.indexer.compact_namespace_with_options(&ns, opts) {
         Ok(r) => r,
         Err(e) => return json_error(500, &format!("compaction error: {e}")),
@@ -4015,6 +4034,7 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
         "segments_before": segments_before,
         "segments_after": segments_after,
         "segments_merged": result.segments_merged,
+        "max_segment_bytes": max_segment_bytes,
         "not_hydrated": not_hydrated,
     }))
 }

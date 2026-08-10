@@ -146,8 +146,10 @@ def main() -> None:
         "--compact-passes",
         type=int,
         default=1,
-        help="max tiered passes; loops until the segment count stops "
-        "dropping or this many passes ran (ignored for --compact-mode full)",
+        help="max compaction passes; loops until the segment count stops "
+        "dropping or this many passes ran. Applies to both modes: full is "
+        "size-capped server-side (5GiB default), so it too converges over "
+        "passes rather than producing one unevictable monolith",
     )
     args = ap.parse_args()
 
@@ -194,7 +196,7 @@ def main() -> None:
         docs_before = namespace_stats(session, args.host, headers, args.namespace)[
             "documents"
         ]
-        passes = 1 if args.compact_mode == "full" else max(1, args.compact_passes)
+        passes = max(1, args.compact_passes)
         for pass_no in range(1, passes + 1):
             print(
                 f"compaction pass {pass_no}/{passes} "
