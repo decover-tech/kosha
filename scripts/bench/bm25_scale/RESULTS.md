@@ -619,7 +619,8 @@ Cache-off OR — the honest engine number — stands at 174/309/481 vs
 in round 4) split between per-query fixed costs at 167 segments,
 concurrency contention, and union-WAND execution constants. The next
 levers per the roadmap: impact-ordered threshold bootstrapping,
-compaction (blocked on tiered doc-loss), cross-segment floor sharing.
+compaction (the tiered doc-loss bug that blocked this is fixed — PR
+#62 — not yet run at this scale), cross-segment floor sharing.
 
 Trajectory across three days: 8 QPS unrunnable → 34× → 13× cache-off,
 and past tpuf's published warm median with the cache the protocol
