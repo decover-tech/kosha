@@ -3195,25 +3195,25 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // Keyed by (namespace, manifest_version, canonical query): a publish
     // bumps the version and orphans stale entries, the same free
     // invalidation the hydration-verdict and blob-presence caches use.
-    // Deliberately NOT cached: requests that opt out (`no_cache`), kNN
-    // queries (embedding keys are huge), and namespaces with live
-    // tombstones — tombstones flow to the searcher outside the manifest,
-    // so a version-keyed entry could serve deleted docs (verify-then-relax
-    // is a follow-up, skip-when-present is the safe v1).
+    // kNN queries are cacheable too — ANN probing is deterministic for a
+    // fixed manifest — but their embedding is digested rather than
+    // inlined (see `canonical_query_for_cache`): a 1024-dim vector is
+    // ~14KB of JSON, which would bloat every key and turn each lookup
+    // into a long string compare. Deliberately NOT cached: requests that
+    // opt out (`no_cache`) and namespaces with live tombstones —
+    // tombstones flow to the searcher outside the manifest, so a
+    // version-keyed entry could serve deleted docs (verify-then-relax is
+    // a follow-up, skip-when-present is the safe v1).
     let has_tombstones = tombstones
         .as_ref()
         .is_some_and(|t| t.values().any(|s| !s.is_empty()));
-    let cache_key = if result_cache_budget() > 0
-        && !query.no_cache.unwrap_or(false)
-        && query.knn.is_none()
-        && !has_tombstones
-    {
-        serde_json::to_string(&query)
-            .ok()
-            .map(|canonical| (ns.0.clone(), manifest.version, canonical))
-    } else {
-        None
-    };
+    let cache_key =
+        if result_cache_budget() > 0 && !query.no_cache.unwrap_or(false) && !has_tombstones {
+            canonical_query_for_cache(&query)
+                .map(|canonical| (ns.0.clone(), manifest.version, canonical))
+        } else {
+            None
+        };
     if let Some(ref key) = cache_key {
         if let Some(resp) = state.result_cache.lock().unwrap().lookup(key) {
             return resp;
@@ -3359,6 +3359,46 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
 
 /// Whole-response cache for `POST /search` — see the cache block in
 /// [`handle_search_post`] for keying and exclusion rules. Bounded by
+/// Canonical query string for [`ResultCache`] keys. Non-kNN queries are
+/// their serde JSON verbatim (unchanged from the original cache). A kNN
+/// query has its embedding replaced by a compact digest — dimension plus a
+/// 128-bit content hash (two independently-seeded `DefaultHasher` passes
+/// over the raw f32 bits) — because inlining a 1024-dim vector puts ~14KB
+/// of JSON in every key: memory bloat and a long string compare per
+/// lookup. 128 bits keeps accidental collisions out of practical reach;
+/// a collision would silently serve another vector's results, so 64 bits
+/// (birthday-bounded) was not acceptable for a correctness-bearing key.
+fn canonical_query_for_cache(query: &SearchQuery) -> Option<String> {
+    let Some(ref knn) = query.knn else {
+        return serde_json::to_string(query).ok();
+    };
+    use std::hash::{Hash, Hasher};
+    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    // Independent second stream via a fixed seed prefix; hashing bit
+    // patterns (not floats) keeps NaN/-0.0 handling exact and total.
+    for &v in &knn.vector {
+        v.to_bits().hash(&mut h1);
+    }
+    (0xa5a5_5a5a_u64, knn.vector.len() as u64).hash(&mut h2);
+    for &v in &knn.vector {
+        v.to_bits().hash(&mut h2);
+    }
+    let digest = format!(
+        "dim{}:{:016x}{:016x}",
+        knn.vector.len(),
+        h1.finish(),
+        h2.finish()
+    );
+    let mut stripped = query.clone();
+    if let Some(ref mut k) = stripped.knn {
+        k.vector = Vec::new();
+    }
+    serde_json::to_string(&stripped)
+        .ok()
+        .map(|canonical| format!("{canonical}|knn_vec:{digest}"))
+}
+
 /// `KOSHA_RESULT_CACHE_MAX_BYTES` (default 64MiB, `0` disables); LRU by
 /// last-use tick with linear-scan eviction (entry counts are small at
 /// realistic budgets). Response strings are cached verbatim, so a hit is
@@ -5850,6 +5890,66 @@ mod tests {
 
     fn rc_key(ns: &str, v: u64, q: &str) -> (String, u64, String) {
         (ns.to_string(), v, q.to_string())
+    }
+
+    #[test]
+    fn knn_cache_keys_digest_vectors_and_distinguish_them() {
+        let base = kosha_core::SearchQuery {
+            query_text: String::new(),
+            max_results: 10,
+            bm25_params: kosha_core::Bm25Params::default(),
+            from: 0,
+            filter: None,
+            sort: Vec::new(),
+            search_after: None,
+            highlight: None,
+            aggs: std::collections::HashMap::new(),
+            wildcard: None,
+            match_phrase: None,
+            knn: None,
+            exact_total_hits: None,
+            total_hits_cap: None,
+            operator: None,
+            no_cache: None,
+        };
+        let with_vec = |v: Vec<f32>, k: usize| {
+            let mut q = base.clone();
+            q.knn = Some(kosha_core::KnnQuery {
+                field: "text_emb".into(),
+                vector: v,
+                k,
+                num_candidates: 100,
+                filter: None,
+            });
+            q
+        };
+
+        // Non-kNN: canonical == plain serde JSON (unchanged behavior).
+        assert_eq!(
+            canonical_query_for_cache(&base),
+            serde_json::to_string(&base).ok()
+        );
+
+        let a = canonical_query_for_cache(&with_vec(vec![0.1_f32; 1024], 10)).unwrap();
+        let a2 = canonical_query_for_cache(&with_vec(vec![0.1_f32; 1024], 10)).unwrap();
+        assert_eq!(a, a2, "same vector must produce the same key");
+
+        // One-bit difference in one component must change the key.
+        let mut v = vec![0.1_f32; 1024];
+        v[517] = f32::from_bits(v[517].to_bits() ^ 1);
+        let b = canonical_query_for_cache(&with_vec(v, 10)).unwrap();
+        assert_ne!(a, b, "different vectors must produce different keys");
+
+        // Non-vector knn params still flow through the canonical JSON.
+        let c = canonical_query_for_cache(&with_vec(vec![0.1_f32; 1024], 20)).unwrap();
+        assert_ne!(a, c, "k must remain part of the key");
+
+        // The whole point: no raw embedding in the key.
+        assert!(
+            a.len() < 1024,
+            "key must stay compact (digested), got {} bytes",
+            a.len()
+        );
     }
 
     #[test]
