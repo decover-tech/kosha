@@ -364,7 +364,8 @@ What the remaining phase data points at, in order:
    namespace-level `segments.meta` object (blooms + doc counts + format
    versions, one GET) is the next hydrate lever.
 2. **Compaction** — 1103 segments for 1M docs multiplies every remaining
-   per-segment cost (blocked on the tiered doc-loss bug).
+   per-segment cost. The tiered doc-loss bug that blocked this is fixed
+   (PR #62); not yet run at this scale.
 3. **Postings compression** — remaining scoring-set bytes (1170 MB on
    `paragraph_index_hnsw`) are mostly postings.
 4. **Residual open cost** — white_river still Σ12 s across 59 opens
@@ -509,8 +510,162 @@ converging to warm within minutes.
 3. **Queue/admit only appear at p90+** — saturation artifacts that
    shrink as service time drops.
 4. **167 segments multiply fixed per-query costs** — compaction to ~16
-   large segments (blocked on the tiered doc-loss bug) trims cursor
-   setup, TOC lookups, and fan-out overhead.
+   large segments trims cursor setup, TOC lookups, and fan-out overhead.
+   Both blockers are fixed (doc-loss on a read failure mid-merge, PR #62;
+   a separate race where a delete landing mid-merge was silently
+   discarded, PR #113); not yet run at this scale.
 
 Trajectory: unrunnable → 100× off (round 1 @4QPS) → 34× off at full
 spec, in two days, with every remaining contributor named and owned.
+
+---
+
+# Addendum: 10M MSMarco round 4 — presence cache + capped counts A/B (2026-08-09)
+
+Engine: main @ #103 (adds #99 posting-blob presence cache, #100 capped
+total_hits, #103 join early-termination). Same corpus/protocol/VM as
+rounds 2. Three 30-minute 8 QPS phases, 14,401/14,401 each, zero errors,
+**zero-hit rate 33.2% in all three phases** (invariant intact).
+
+| 8 QPS, topk=10 | p50 | p90 | p99 |
+|---|---|---|---|
+| warm, capped counts (new default) | 361ms | 1,017ms | 1,814ms |
+| warm, exact counts (`KOSHA_EXACT_TOTAL_HITS=1`) | 333ms | 987ms | 1,726ms |
+| cold, capped (wipe + 30m window) | 355ms | 1,067ms | 5,100ms |
+| round 2 reference (warm) | 449ms | 1,374ms | 2,295ms |
+
+## Findings
+
+1. **R2→R4 warm p50 −21–26% — attributable to the presence cache
+   (#99)**, which cut the per-query blob-check tax 86→~39ms and, by
+   moving the box off the saturation cliff, erased the p90 queueing term
+   entirely (248ms→0).
+2. **Approximate counting bought ~nothing**: the capped-vs-exact phase
+   gap (361 vs 333) is run-order page-cache bias, not signal. A paired
+   probe (same warm process, interleaved per-request `exact_total_hits`
+   flips, 8 pairs × 24 queries incl. forced-ET via `total_hits_cap=100`)
+   measured **mean delta −0.1ms / +0.3ms** — ET is statistically
+   invisible. Root cause: counting was never the cost. The per-segment
+   10k budget is effectively never reached (needs a ~1.67M-doc total
+   intersection), and even when forced, the post-page-stable walk tail
+   is negligible — **intersection discovery over stopword-scale lists is
+   the cost**, and no counting rule touches it. #103's semantics (caps,
+   `gte`) remain the API win; its exit machinery is confirmed harmless.
+3. **~Half of phase latency is concurrency contention, not service
+   time**: the probe's individually-timed queries cost 68–175ms on the
+   same warm server whose 8 QPS phase p50 is 361ms. Single-query warm
+   service is already ~100–150ms; the rest is CPU overlap between
+   concurrent rayon-parallel searches.
+
+## Revised leverage order (full roadmap doc in the session artifact)
+
+1. **Query-result cache** — the benchmark protocol repeats each of
+   1,677 queries ~8.6× per phase; any engine with a result LRU serves
+   warm mostly from cache (a plausible component of turbopuffer's 13ms).
+   Legitimate production feature; must be benchmarked cache-on AND
+   cache-off separately.
+2. **Impact-ordered threshold bootstrapping** — BoundedTopK fills in
+   doc_seq order, so the pruning floor stays weak for thousands of
+   postings; visiting the driving term's blocks in descending stored-UB
+   order makes the floor lethal after ~k docs. The biggest k=10-specific
+   delta vs Lucene-class engines.
+3. **Global score floor across segments + per-segment max-score skip**
+   — per-segment top-k floors are independent today; sharing one floor
+   lets hot segments disqualify entire other segments unopened.
+4. **Rarest-first join ordering; OR-mode ranking; compaction** — as per
+   the roadmap; OR-mode remains the structural answer to discovery cost.
+
+---
+
+# Addendum: 10M MSMarco round 5 — OR-mode + result cache (2026-08-09)
+
+Engine: main @ #110 (adds #104 rarest-first probe, #106 hot-path
+allocs, #108 OR-mode union WAND, #110 whole-response result cache).
+Four 30-minute 8 QPS phases on one build, 57,604 requests total, zero
+errors everywhere.
+
+| phase | p50 | p90 | p99 | zero-hit |
+|---|---|---|---|---|
+| warm, AND, cache-off | 379ms | 1,059ms | 1,857ms | 33% (AND invariant) |
+| warm, OR, cache-off | **174ms** | **309ms** | **481ms** | **0.06%** |
+| warm, OR, cache-on | **6.0ms** | 107ms | 329ms | 0.06% |
+| cold, OR, cache-on | 6.0ms | 104ms | 6,483ms | 0.06% |
+| tpuf published — warm | 13ms | 18ms | 29ms | — |
+| tpuf published — cold | 316ms | 381ms | 559ms | — |
+
+## Findings
+
+1. **OR-mode (#108) is the structural win the roadmap predicted**: −54%
+   p50 and −74% p99 vs AND on the same build, with the p99/p50 ratio
+   tightening from 4.9× to 2.8× (tpuf's shape is 2.2×) — the signature
+   of pruning-friendly union execution. It also ends the 33%-empty-
+   results UX: union matching leaves 0.06% zero-hit.
+2. **The result cache (#110) collapses the protocol's steady state**:
+   warm p50 6.0ms — under tpuf's published 13ms — with 32 cores near
+   idle (load 0.08 vs 25–29 in every uncached phase). The honest
+   framing: the tpuf-benchmark protocol repeats each of 1,677 queries
+   ~8.6× per phase, so cache-on p50 measures the hit path; p90 (107ms)
+   is the miss path, ≈ the cache-off distribution as expected. Engine-
+   vs-engine comparisons should quote the cache-off row unless the
+   competitor's caching posture is known.
+3. **Cold with cache**: p50 6ms immediately (the cache needs no segment
+   warmth), p99 6.5s = the S3 rehydration transient on misses, same
+   cold story as previous rounds underneath a warm hit path.
+
+## Where this leaves the gap
+
+Cache-off OR — the honest engine number — stands at 174/309/481 vs
+13/18/29: ~13× at p50, with the remaining decomposition (probe-measured
+in round 4) split between per-query fixed costs at 167 segments,
+concurrency contention, and union-WAND execution constants. The next
+levers per the roadmap: impact-ordered threshold bootstrapping,
+compaction (the tiered doc-loss bug that blocked this is fixed — PR
+#62 — not yet run at this scale), cross-segment floor sharing.
+
+Trajectory across three days: 8 QPS unrunnable → 34× → 13× cache-off,
+and past tpuf's published warm median with the cache the protocol
+rewards.
+
+---
+
+# Addendum — 10M MSMarco round 6: cold, cache-off (2026-08-09)
+
+The one cell rounds 1–5 never measured: a cold namespace with the result
+cache bypassed (`no_cache: true`), i.e. honest engine speed on first
+contact with the data. Fresh m7i.8xlarge, same corpus/queries/protocol,
+engine main @ `4f505dc` (round-5 build + #101 presence-cache hardening);
+bench script from #111. Local segment store wiped (`rm -rf` + container
+restart), then one 30-minute 8 QPS OR-mode phase: 14,401/14,401
+requests, zero errors, zero-hit 0.062% (union corridor — valid run).
+
+| 8 QPS, topk=10, 30min | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| **Kosha cold, OR, cache-off** | **184ms** | **366ms** | 7,858ms | 14.2s |
+| tpuf published — cold | 316ms | 381ms | 559ms | — |
+
+Cold p50 beats tpuf's published cold median by 1.7×; p90 is at parity.
+The p99 gap is entirely a **startup convoy**, not steady-state behavior:
+
+| window (server-side totals) | p50 | p90 | p99 |
+|---|---|---|---|
+| first 3 minutes (~1,440 reqs) | 196ms | 7,847ms | 12,353ms |
+| **steady state (minutes 3–30)** | **170ms** | **333ms** | **529ms** |
+
+Every one of the 150 slowest requests landed in the first tenth of the
+run. Their median breakdown: **7.4s queue + 2.0s hydrate, score only
+~130ms** — at t=0 every query needs S3 blob hydration across 167
+segments, the hydrator saturates, and arrivals behind the burst wait in
+line. Once first-touch hydration clears (~3 minutes), cold-steady-state
+p99 of 529ms sits at tpuf's published 559ms.
+
+Implications:
+1. **Steady-state cold is already at parity with tpuf** across the
+   distribution; the whole headline p99 is a transient measured once per
+   cold start.
+2. **The convoy is addressable**: pre-hydration warmup on namespace
+   attach (bulk-fetch posting blobs ahead of query traffic) would
+   collapse the transient; compaction 167→16 segments cuts the
+   first-touch fan-out ~10× independently.
+3. The presentation pair for engine comparisons: warm cache-on
+   (6.0/107/329) + cold cache-off (184/366/7,858), with the windowed
+   decomposition above as the honest footnote on the cold tail.
