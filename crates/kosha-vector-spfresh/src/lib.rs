@@ -25,6 +25,7 @@ mod search;
 
 use std::collections::HashMap;
 
+pub use centroid_probe::nearest_centroids;
 pub use error::VectorIndexError;
 pub use point::{cosine_distance, cosine_similarity};
 pub use rng::DeterministicRng;
@@ -144,6 +145,20 @@ pub struct RebalanceStats {
     pub entries_gced: usize,
 }
 
+/// A read-only snapshot of one posting's live content — centroid plus
+/// `(id, vector)` pairs — for external callers that want to persist the
+/// index (e.g. `kosha-segment`'s on-disk writer, via [`ClusterIndex::snapshot`]).
+///
+/// Tombstoned entries are never included: a persisted snapshot has no
+/// notion of "this used to exist but was deleted" — callers that need
+/// deletes handle them at their own layer (kosha's segments already do,
+/// via document-level tombstones filtered at query time).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostingSnapshot {
+    pub centroid: Vec<f32>,
+    pub entries: Vec<(u32, Vec<f32>)>,
+}
+
 /// A SPANN-style cluster/posting ANN index, kept balanced by LIRE.
 ///
 /// Rebalancing (`Split`/`Merge`/`Reassign`) runs **synchronously inline** at
@@ -228,6 +243,22 @@ impl ClusterIndex {
         }
 
         stats
+    }
+
+    /// A read-only snapshot of every active posting's live content, for
+    /// external serialization. See [`PostingSnapshot`].
+    pub fn snapshot(&self) -> Vec<PostingSnapshot> {
+        self.active_posting_ids()
+            .map(|pid| {
+                let p = self.postings[pid]
+                    .as_ref()
+                    .expect("active_posting_ids only yields Some slots");
+                PostingSnapshot {
+                    centroid: p.centroid.clone(),
+                    entries: p.live_entries().map(|e| (e.id, e.vector.clone())).collect(),
+                }
+            })
+            .collect()
     }
 
     pub fn stats(&self) -> IndexStats {
@@ -360,6 +391,50 @@ mod tests {
         assert!(idx.delete(1000));
         assert!(!idx.contains(1000));
         assert!(!idx.delete(1000)); // already gone
+    }
+
+    #[test]
+    fn snapshot_covers_every_live_vector_exactly_once_and_matches_stats() {
+        let dim = 4;
+        let mut vectors = Vec::new();
+        for i in 0..60u32 {
+            let angle = (i as f32) * std::f32::consts::PI / 30.0;
+            vectors.push((i, vec_at(dim, angle, 0.0)));
+        }
+        let mut cfg = ClusterIndexConfig::new(dim);
+        cfg.target_posting_size = 8;
+        cfg.max_posting_size = 16;
+        cfg.min_posting_size = 2;
+        let mut idx = ClusterIndex::build(&vectors, cfg).unwrap();
+        idx.delete(0);
+        idx.delete(1);
+
+        let snap = idx.snapshot();
+        assert_eq!(snap.len(), idx.active_posting_count());
+
+        let mut seen: Vec<u32> = snap
+            .iter()
+            .flat_map(|p| p.entries.iter().map(|(id, _)| *id))
+            .collect();
+        seen.sort_unstable();
+        let mut expected = idx.ids();
+        expected.sort_unstable();
+        assert_eq!(
+            seen, expected,
+            "snapshot must cover exactly the live id set, no more, no less"
+        );
+
+        // No tombstones should ever surface in a snapshot.
+        assert!(!seen.contains(&0));
+        assert!(!seen.contains(&1));
+
+        // Each posting's centroid dimension must match the index's.
+        for p in &snap {
+            assert_eq!(p.centroid.len(), dim);
+            for (_, v) in &p.entries {
+                assert_eq!(v.len(), dim);
+            }
+        }
     }
 
     #[test]

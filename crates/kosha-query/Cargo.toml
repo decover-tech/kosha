@@ -47,3 +47,7 @@ harness = false
 [[bench]]
 name = "filtered_broad_query"
 harness = false
+
+[[bench]]
+name = "vector_segment_open"
+harness = false
