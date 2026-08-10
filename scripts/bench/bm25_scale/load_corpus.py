@@ -24,6 +24,7 @@ Usage:
 import argparse
 import json
 import statistics
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -65,18 +66,55 @@ def post_batch(session, host, namespace, headers, docs, timeout) -> float:
     return time.time() - t0
 
 
-def iter_batches(corpus_dir: Path, batch_size: int):
-    shard_paths = sorted(corpus_dir.glob("shard-*.ndjson"))
-    if not shard_paths:
-        raise SystemExit(f"no shard-*.ndjson files found under {corpus_dir}")
+def iter_shard_lines(corpus_dir: str):
+    """Yield NDJSON lines across all shards, local dir or s3://bucket/prefix.
+
+    S3 shards are streamed through `aws s3 cp <key> -` (instance-role auth,
+    no local staging) one shard at a time, so a 10M-doc corpus needs no
+    corpus-sized disk on the bench VM at all.
+    """
+    if corpus_dir.startswith("s3://"):
+        base = corpus_dir.rstrip("/")
+        listing = subprocess.run(
+            ["aws", "s3", "ls", base + "/"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        shards = []
+        for line in listing.splitlines():
+            fields = line.split()
+            if fields and fields[-1].startswith("shard-") and fields[-1].endswith(".ndjson"):
+                shards.append(fields[-1])
+        shards.sort()
+        if not shards:
+            raise SystemExit(f"no shard-*.ndjson objects under {base}/")
+        for name in shards:
+            proc = subprocess.Popen(
+                ["aws", "s3", "cp", f"{base}/{name}", "-"],
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            assert proc.stdout is not None
+            yield from proc.stdout
+            if proc.wait() != 0:
+                raise SystemExit(f"aws s3 cp failed for {base}/{name}")
+    else:
+        shard_paths = sorted(Path(corpus_dir).glob("shard-*.ndjson"))
+        if not shard_paths:
+            raise SystemExit(f"no shard-*.ndjson files found under {corpus_dir}")
+        for shard_path in shard_paths:
+            with shard_path.open() as f:
+                yield from f
+
+
+def iter_batches(corpus_dir: str, batch_size: int):
     buf: list[str] = []
-    for shard_path in shard_paths:
-        with shard_path.open() as f:
-            for line in f:
-                buf.append(line)
-                if len(buf) >= batch_size:
-                    yield buf
-                    buf = []
+    for line in iter_shard_lines(corpus_dir):
+        buf.append(line)
+        if len(buf) >= batch_size:
+            yield buf
+            buf = []
     if buf:
         yield buf
 
@@ -85,7 +123,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", required=True)
     ap.add_argument("--namespace", required=True)
-    ap.add_argument("--corpus-dir", required=True, type=Path)
+    # A local shard directory or s3://bucket/prefix (kept as str: Path()
+    # would collapse the double slash in the URI).
+    ap.add_argument("--corpus-dir", required=True)
     ap.add_argument("--api-key", default=None)
     ap.add_argument("--batch-size", type=int, default=20_000)
     ap.add_argument("--concurrency", type=int, default=4)
