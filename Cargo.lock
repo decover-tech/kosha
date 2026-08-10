@@ -2054,6 +2054,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kosha-vector-spfresh"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "instant-distance",
+ "kosha-query",
+ "kosha-segment",
+]
+
+[[package]]
 name = "kosha-write"
 version = "0.1.0"
 dependencies = [
