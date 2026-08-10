@@ -442,8 +442,11 @@ impl SegmentWriter {
 // no `vector.idx` at all -> no vectors (unchanged from today); sidecar
 // present and valid -> lazy (centroids resident, entries seek+read per
 // posting on demand); magic present but sidecar missing/corrupt -> eager
-// full parse of the v2 blob into a flat `VectorStore`, same shape as legacy
-// -> `build_hnsw` exactly as today; no magic -> legacy v1 path, unchanged.
+// full parse of the v2 blob into a flat `VectorStore`, served by exact
+// `flat_knn`; no magic -> legacy v1 parse, also served by `flat_knn`.
+// No branch builds an ANN structure — that happens at write time only
+// (issue #126: open-path `build_hnsw` was a rayon all-core, minutes-long
+// build at bench scale, and admission control turned it into 100% 429s).
 
 /// Magic prefix of a v2 `vector.idx` ("KVE2", little-endian u32).
 pub const VECTOR_MAGIC: u32 = u32::from_le_bytes(*b"KVE2");
@@ -2299,6 +2302,12 @@ pub struct SegmentReader {
     inverted: InvertedAccess,
     filters: LazyFilters,
     pub vector_store: VectorStore,
+    /// Always `None` since issue #126: ANN structures are built at write
+    /// time only, and open never constructs HNSW (a rayon all-core,
+    /// minutes-at-scale build) — flat/legacy segments are served by exact
+    /// `flat_knn` over `vector_store` instead. The field survives so a
+    /// pre-built graph could be *loaded* here if a future format persists
+    /// one; nothing populates it today.
     pub hnsw_map: Option<HnswMap<CosinePoint, u32>>,
     /// `Some` only for a v2 segment whose `vector.offsets` sidecar parsed
     /// cleanly. When set, `vector_store`/`hnsw_map` above are left at their
@@ -2392,10 +2401,15 @@ impl SegmentReader {
 
         let Some((dim, _total_count)) = parse_vector_idx_header(&data) else {
             // No magic (or an unrecognized version) — legacy v1 flat
-            // format, unchanged behavior.
+            // format. Serve it with exact flat_knn (no hnsw_map): ANN
+            // structures are built at WRITE time only. Constructing HNSW
+            // here put a rayon all-core, minutes-long build on the open
+            // path (issue #126: >10min for one query at 1M docs, and
+            // admission control turned the stall into 100% 429s), while
+            // exact scan of a flush-sized segment is milliseconds — and
+            // strictly better recall.
             let vs = Self::read_vectors(segment_dir)?;
-            let hm = build_hnsw(&vs.vectors).map(|(m, _)| m);
-            return Ok((vs, hm, None));
+            return Ok((vs, None, None));
         };
 
         // Valid v2 header. Prefer the lazy path; fall back to a full eager
@@ -2431,8 +2445,9 @@ impl SegmentReader {
 
         match parse_vector_idx_eager(&data) {
             Some(vs) => {
-                let hm = build_hnsw(&vs.vectors).map(|(m, _)| m);
-                Ok((vs, hm, None))
+                // Same rule as the legacy branch above: no query/open-path
+                // ANN builds — exact flat_knn serves this segment.
+                Ok((vs, None, None))
             }
             None => {
                 // Valid header but the body itself is truncated/corrupt —
@@ -4417,8 +4432,9 @@ mod tests {
             "eager fallback must recover every vector"
         );
         assert!(
-            r.hnsw_map.is_some(),
-            "eager fallback still builds the HNSW graph, same as legacy"
+            r.hnsw_map.is_none(),
+            "no ANN structure is ever built outside the write path — the \
+             eager fallback is served by exact flat_knn (issue #126)"
         );
 
         let _ = fs::remove_dir_all(&dir);
