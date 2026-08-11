@@ -487,6 +487,57 @@ impl S3Storage {
         })
     }
 
+    /// Immediate child "directories" under a logical path — the S3
+    /// common-prefix listing (delimiter `/`), fully paginated. For a
+    /// namespace path this returns its segment ids. `list_with_sizes`
+    /// cannot serve this purpose: it returns only immediate child *files*
+    /// (nested keys are filtered out) and reads a single unpaginated page —
+    /// the import-namespace endpoint's original listing bug.
+    pub fn list_child_dirs(&self, path: &str) -> Result<Vec<String>, KoshaError> {
+        let mut prefix = self.s3_key(path);
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let prefix_for_strip = prefix.clone();
+
+        self.rt.block_on(async move {
+            let mut out = Vec::new();
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut req = client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&prefix)
+                    .delimiter("/");
+                if let Some(token) = continuation.take() {
+                    req = req.continuation_token(token);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                for cp in resp.common_prefixes() {
+                    if let Some(p) = cp.prefix() {
+                        let child = p
+                            .strip_prefix(&prefix_for_strip)
+                            .unwrap_or(p)
+                            .trim_end_matches('/');
+                        if !child.is_empty() {
+                            out.push(child.to_string());
+                        }
+                    }
+                }
+                match resp.next_continuation_token() {
+                    Some(t) => continuation = Some(t.to_string()),
+                    None => break,
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// Whether S3 actually has *any* object under `logical_dir` — a
     /// ground-truth durability check, unlike `StorageBackend::exists`
     /// (which only checks local disk) or `list_with_sizes`/`list` (which
