@@ -469,27 +469,74 @@ impl SegmentCache {
     }
 }
 
-/// Sum the on-disk size of a segment's component files, as a proxy for the
-/// in-memory footprint of its parsed representation. Missing files (e.g.
-/// `vector.idx` when `load_vectors` is false) simply contribute nothing.
-fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u64 {
-    let mut files = vec![
-        "doc_store.bin",
-        "inverted.idx",
-        "filters.bin",
-        "footer.json",
-    ];
+/// Approximate the *resident* footprint of a parsed segment — the currency
+/// both [`SegmentCache`]'s byte budget and [`MemoryLedger`]'s admission
+/// estimate are denominated in.
+///
+/// This must mirror `SegmentReader::open_with_footer_options`'s laziness,
+/// because the largest files on disk are deliberately **not** held in
+/// memory:
+///
+/// * `doc_store.bin` becomes `DocStoreAccess::Lazy` — a path plus a small
+///   offsets index — whenever the `doc_store.offsets` sidecar is present.
+///   Only a legacy segment without that sidecar parses the whole store
+///   eagerly.
+/// * `vector.idx` becomes `LazyVectorIndex` — centroids plus `(offset,
+///   len)` ranges — whenever `vector.offsets` is present. Only the
+///   legacy/eager fallback parses the whole blob into a `VectorStore`.
+///
+/// Charging their full on-disk size instead was measured at **120–230×**
+/// the true footprint on MSMarco-shaped segments, and that single wrong
+/// number broke vector search twice over (issue #136): a 200-segment kNN
+/// query estimated ~248 GiB against a 64 GiB watermark, so every query
+/// first evicted the entire cache to try to make room (guaranteeing 200
+/// cold opens, forever) and then could only be admitted alone via the
+/// anti-starvation path — serializing all kNN traffic on a 32-core box.
+///
+/// Under-counting is the dangerous direction (this ledger exists because of
+/// a staging OOM), so anything that *can* become resident is still charged
+/// up front. That's why `filters.bin` is counted in full despite being
+/// `LazyFilters`: it sits behind a `OnceLock` that the first filtered query
+/// populates and every later query keeps alive. Transient per-read buffers
+/// (lazy doc-store reads) hold nothing after the read, and decoded postings
+/// report their own growth dynamically via [`PostingsMemoryAccount`] — so
+/// neither belongs here.
+/// Exposed (rather than private) so the `vector_segment_accounting` bench
+/// can measure *this* function against real allocator numbers instead of a
+/// hand-copied twin — a copy that silently drifts from the real accounting
+/// is precisely how #136 stayed invisible.
+pub fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u64 {
+    let size = |f: &str| {
+        std::fs::metadata(seg_dir.join(f))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+
+    // Always resident: the parsed footer and the inverted index's TOC.
+    let mut total = size("footer.json").saturating_add(size("inverted.idx"));
+
+    // Resident: the offsets index (lazy) or the whole store (legacy eager).
+    let doc_offsets = size("doc_store.offsets");
+    total = total.saturating_add(if doc_offsets > 0 {
+        doc_offsets
+    } else {
+        size("doc_store.bin")
+    });
+
+    // Becomes resident on the first filtered query and stays — see above.
+    total = total.saturating_add(size("filters.bin"));
+
     if load_vectors {
-        files.push("vector.idx");
+        // Resident: centroids + ranges (v2 lazy) or the whole parsed
+        // VectorStore (legacy / missing-sidecar fallback).
+        let vec_offsets = size("vector.offsets");
+        total = total.saturating_add(if vec_offsets > 0 {
+            vec_offsets
+        } else {
+            size("vector.idx")
+        });
     }
-    files
-        .iter()
-        .map(|f| {
-            std::fs::metadata(seg_dir.join(f))
-                .map(|m| m.len())
-                .unwrap_or(0)
-        })
-        .sum()
+    total
 }
 
 // ─── BM25 scorer ────────────────────────────────────────────────────────────
@@ -3760,6 +3807,252 @@ mod tests {
         assert!(
             !searcher.segment_cache.contains(&key1),
             "segment must become evictable once no request pins it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_byte_charge_reflects_resident_size_not_on_disk_size() {
+        // Issue #136's root cause: `approx_segment_bytes` charged the full
+        // on-disk size of files the reader deliberately does NOT hold in
+        // memory (`doc_store.bin` behind `DocStoreAccess::Lazy`, `vector.idx`
+        // behind `LazyVectorIndex`). Measured 120-230x over-charge on
+        // MSMarco-shaped segments, which broke both the cache budget and the
+        // admission estimate.
+        //
+        // Structural assertion, no allocator instrumentation needed: two
+        // segments identical but for document *body size* must be charged
+        // near-identically, because bodies live in `doc_store.bin` and are
+        // never resident. If someone reverts to summing raw file sizes, the
+        // charge tracks the bodies and this fails.
+        let dir = std::env::temp_dir().join("kosha-test-byte-charge-resident");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mk = |seg: &str, body_words: usize| -> PathBuf {
+            let seg_dir = dir.join("test").join(seg);
+            let mut w = SegmentWriter::new(SegmentId(seg.into()), seg_dir.clone());
+            for d in 0..50 {
+                // Same vocabulary in both segments (so the inverted index and
+                // filters match); only the repetition count differs, which
+                // lands almost entirely in doc_store.bin.
+                let body = format!("alpha beta {}", "padding ".repeat(body_words));
+                w.add_document(
+                    DocumentId(format!("{seg}-d{d}")),
+                    vec![
+                        Field::text("t", body),
+                        Field::vector("emb", vec![1.0, 0.0, 0.0]),
+                    ],
+                );
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            seg_dir
+        };
+
+        let small_dir = mk("small", 4);
+        let big_dir = mk("big", 400); // ~100x the body bytes
+
+        let on_disk = |d: &std::path::Path, f: &str| {
+            std::fs::metadata(d.join(f)).map(|m| m.len()).unwrap_or(0)
+        };
+        // Precondition: the bodies really did make doc_store.bin much bigger,
+        // otherwise this test proves nothing.
+        let small_store = on_disk(&small_dir, "doc_store.bin");
+        let big_store = on_disk(&big_dir, "doc_store.bin");
+        assert!(
+            big_store > small_store * 10,
+            "test setup: expected a much larger doc_store ({small_store} vs {big_store})"
+        );
+        // Precondition: both sidecars exist, so the reader is on its lazy
+        // paths (a segment without them legitimately charges the full files).
+        assert!(on_disk(&big_dir, "doc_store.offsets") > 0);
+        assert!(on_disk(&big_dir, "vector.offsets") > 0);
+
+        // Exact identity: the charge is precisely the components that stay
+        // resident — sidecars, TOC, footer, and the (eagerly budgeted) raw
+        // filters buffer. Never the lazily-read blobs.
+        let expected = |d: &std::path::Path, load_vectors: bool| -> u64 {
+            let mut t = on_disk(d, "footer.json")
+                + on_disk(d, "inverted.idx")
+                + on_disk(d, "doc_store.offsets")
+                + on_disk(d, "filters.bin");
+            if load_vectors {
+                t += on_disk(d, "vector.offsets");
+            }
+            t
+        };
+        for (label, d) in [("small", &small_dir), ("big", &big_dir)] {
+            for load_vectors in [false, true] {
+                assert_eq!(
+                    approx_segment_bytes(d, load_vectors),
+                    expected(d, load_vectors),
+                    "{label} segment (load_vectors={load_vectors}): charge must be \
+                     exactly the resident components"
+                );
+            }
+        }
+
+        // The two blobs the reader never holds must be excluded outright —
+        // the charge is below `doc_store.bin` alone, even counting vectors.
+        assert!(
+            approx_segment_bytes(&big_dir, true) < big_store,
+            "charge ({}) must exclude the lazy doc_store.bin ({big_store})",
+            approx_segment_bytes(&big_dir, true)
+        );
+        let vector_idx = on_disk(&big_dir, "vector.idx");
+        let knn_delta =
+            approx_segment_bytes(&big_dir, true) - approx_segment_bytes(&big_dir, false);
+        assert!(
+            vector_idx > 0 && knn_delta < vector_idx,
+            "kNN charge delta ({knn_delta}) must exclude the lazy vector.idx ({vector_idx})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn many_segment_knn_query_stays_cached_within_a_realistic_watermark() {
+        // The end-to-end shape of issue #136, and the reason the 10M vector
+        // run collapsed at 8 QPS. With the old (inflated) accounting, a kNN
+        // query over N segments estimated far more than the live watermark,
+        // so `admit` called `evict_idle` for the shortfall — flushing the
+        // whole cache on EVERY query, guaranteeing N cold opens forever —
+        // and could then only be admitted via the `active == 0`
+        // anti-starvation path, serializing all vector traffic.
+        //
+        // The watermark here is deliberately far below the segments' total
+        // on-disk size but comfortably above their true resident size: the
+        // exact regime the production run was in (48 GiB cache / 64 GiB
+        // watermark against 266 GB of on-disk segments that are only a few
+        // GB resident).
+        let dir = std::env::temp_dir().join("kosha-test-knn-watermark");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        const N: usize = 12;
+
+        let mut segments = Vec::with_capacity(N);
+        let mut on_disk_total = 0u64;
+        for i in 0..N {
+            let seg = format!("s{i:02}");
+            let seg_dir = dir.join(&ns.0).join(&seg);
+            let mut w = SegmentWriter::new(SegmentId(seg.clone()), seg_dir.clone());
+            for d in 0..40 {
+                // Fat bodies: on-disk size is dominated by doc_store.bin,
+                // which is never resident.
+                w.add_document(
+                    DocumentId(format!("{seg}-d{d}")),
+                    vec![
+                        Field::text("t", format!("alpha {}", "padding ".repeat(500))),
+                        Field::vector("emb", vec![1.0, 0.0, 0.0]),
+                    ],
+                );
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            for f in ["doc_store.bin", "vector.idx", "filters.bin", "inverted.idx"] {
+                on_disk_total += std::fs::metadata(seg_dir.join(f))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+            }
+            segments.push(ManifestEntry {
+                segment_id: SegmentId(seg),
+                doc_count: 40,
+            });
+        }
+        let manifest = Manifest {
+            version: 1,
+            segments,
+            segment_footers: Default::default(),
+        };
+
+        // Reproduce the production regime exactly, independent of how this
+        // synthetic corpus happens to split between files: pick a watermark
+        // that comfortably holds the true resident footprint but is far
+        // below what the OLD accounting charged (which summed the whole
+        // doc_store.bin + vector.idx). Under the old numbers this query
+        // could never fit, so `admit` evicted the whole cache and then
+        // serialized on the anti-starvation path.
+        // Both totals are summed straight from the files, NOT via
+        // `approx_segment_bytes` — otherwise reverting the fix would move
+        // the watermark with it and the test could only fail in setup
+        // instead of demonstrating the broken behaviour.
+        let seg_dirs: Vec<PathBuf> = manifest
+            .segments
+            .iter()
+            .map(|e| dir.join(&ns.0).join(&e.segment_id.0))
+            .collect();
+        let sum_files = |files: &[&str]| -> u64 {
+            seg_dirs
+                .iter()
+                .map(|d| {
+                    files
+                        .iter()
+                        .map(|f| std::fs::metadata(d.join(f)).map(|m| m.len()).unwrap_or(0))
+                        .sum::<u64>()
+                })
+                .sum()
+        };
+        // What the segments actually keep resident (lazy sidecars).
+        let resident_total = sum_files(&[
+            "footer.json",
+            "inverted.idx",
+            "doc_store.offsets",
+            "filters.bin",
+            "vector.offsets",
+        ]);
+        // What the pre-fix accounting charged (whole lazy blobs).
+        let old_charge_total = sum_files(&[
+            "footer.json",
+            "inverted.idx",
+            "doc_store.bin",
+            "filters.bin",
+            "vector.idx",
+        ]);
+        // Midpoint of the two accountings: strictly above what the segments
+        // really cost (so the fixed code fits the whole working set) and
+        // strictly below what the old code charged (so the old code could
+        // not). Derived rather than hardcoded, so it stays valid as the
+        // synthetic corpus's file-size split drifts.
+        let watermark = (resident_total + old_charge_total) / 2;
+        assert!(
+            resident_total < watermark && watermark < old_charge_total,
+            "setup: watermark ({watermark}) must sit between the true resident \
+             cost ({resident_total}) and the old accounting's charge \
+             ({old_charge_total}) — otherwise the broken regime isn't \
+             reproduced (on-disk total {on_disk_total})"
+        );
+
+        let searcher = Searcher::with_memory_limits(
+            dir.clone(),
+            DEFAULT_SEGMENT_CACHE_CAPACITY,
+            watermark,
+            watermark,
+            Duration::from_secs(5),
+        );
+
+        let mut knn_q = mk_query("", 10);
+        knn_q.knn = Some(kosha_core::KnnQuery {
+            field: "emb".into(),
+            vector: vec![1.0, 0.0, 0.0],
+            k: 10,
+            num_candidates: 40,
+            filter: None,
+        });
+
+        let (_, stats) = searcher
+            .search_with_stats(&ns, &manifest, &knn_q, None)
+            .unwrap();
+        assert_eq!((stats.open_cold, stats.open_cached), (N, 0));
+
+        // The whole point: a repeat kNN query must be served entirely from
+        // the cache. Before the fix this was (N, 0) again — every query
+        // evicted the cache it had just filled.
+        let (_, stats) = searcher
+            .search_with_stats(&ns, &manifest, &knn_q, None)
+            .unwrap();
+        assert_eq!(
+            (stats.open_cold, stats.open_cached),
+            (0, N),
+            "repeat kNN query must hit cache, not re-open every segment — issue #136"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

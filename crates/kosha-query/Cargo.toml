@@ -51,3 +51,7 @@ harness = false
 [[bench]]
 name = "vector_segment_open"
 harness = false
+
+[[bench]]
+name = "vector_segment_accounting"
+harness = false
