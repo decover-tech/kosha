@@ -17,7 +17,7 @@ SEG_BUCKET="${KOSHA_S3_BUCKET:-decoverai-bench-kosha-segments}"
 SNAP="s3://decoverai-bench-corpus-cache/snapshots/$NAME"
 
 echo "snapshotting namespace '$NS' -> $SNAP"
-aws s3 sync "s3://$SEG_BUCKET/segments/$NS" "$SNAP/segments/$NS" --no-progress
+aws s3 sync "s3://$SEG_BUCKET/segments/$NS" "$SNAP/segments/$NS" --no-progress --copy-props none
 
 # Full control-plane dump. NOTE: this includes every namespace's rows —
 # restore on a fresh stack whose bench bucket only holds this snapshot's

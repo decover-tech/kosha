@@ -19,7 +19,7 @@ SNAP="s3://decoverai-bench-corpus-cache/snapshots/$NAME"
 aws s3 ls "$SNAP/pg-kosha.sql.gz" >/dev/null || { echo "no snapshot at $SNAP"; exit 1; }
 
 echo "restoring '$NS' from $SNAP"
-aws s3 sync "$SNAP/segments/$NS" "s3://$SEG_BUCKET/segments/$NS" --no-progress
+aws s3 sync "$SNAP/segments/$NS" "s3://$SEG_BUCKET/segments/$NS" --no-progress --copy-props none
 
 sudo docker start pg >/dev/null 2>&1 || true
 until sudo docker exec pg pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done
