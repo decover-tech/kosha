@@ -4236,26 +4236,19 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
         let Some(ref s3) = state.s3_storage else {
             return json_error(400, "S3 not configured on this pod");
         };
-        let listing = match s3.list_with_sizes(&ns.0) {
+        // Segment ids are the namespace prefix's child "directories"
+        // (paginated common-prefix listing — `list_with_sizes` filters out
+        // nested keys and reads one page, so it can't enumerate segments).
+        let mut seg_ids = match s3.list_child_dirs(&ns.0) {
             Ok(l) => l,
             Err(e) => return json_error(500, &format!("S3 list failed: {e}")),
         };
-        // Logical paths are "<ns>/<segment_id>/<file>"; a segment exists
-        // for import purposes iff its footer.json does.
-        let mut seg_ids: Vec<String> = listing
-            .iter()
-            .filter_map(|(path, _)| {
-                let rest = path.strip_prefix(&format!("{}/", ns.0))?;
-                let (seg, file) = rest.split_once('/')?;
-                (file == "footer.json").then(|| seg.to_string())
-            })
-            .collect();
         seg_ids.sort();
         seg_ids.dedup();
         if seg_ids.is_empty() {
             return json_error(
                 404,
-                &format!("no segment footers found under '{}/' in S3", ns.0),
+                &format!("no segment directories found under '{}/' in S3", ns.0),
             );
         }
 
