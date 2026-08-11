@@ -669,3 +669,47 @@ Implications:
 3. The presentation pair for engine comparisons: warm cache-on
    (6.0/107/329) + cold cache-off (184/366/7,858), with the windowed
    decomposition above as the honest footnote on the cold tail.
+
+---
+
+# Addendum — 10M Vector Perf baseline (round 9, 2026-08-11)
+
+First kNN measurement at the tpuf workload scale: 10M docs + Cohere
+1024-dim embeddings (real query embeddings), 200 SPFresh-v2 segments,
+8 QPS, k=10, num_candidates=100. Build: main + #128 + #129.
+
+**Verdict: the 8 QPS protocol is not yet sustainable for vector search.**
+
+| measurement | result |
+|---|---|
+| isolated kNN service time (no load) | **3.55s/query** steady; first query 80s (one-time opens) |
+| cold, cache-off @ 8 QPS | 64/14,401 ok — queue collapse (0.04 QPS achieved) |
+| warm, cache-on @ 8 QPS | 0/14,401 — drowned by the cold phase's backlog |
+
+The phase numbers are overload measurements (3.55s × 8 QPS open-loop =
+unbounded queue), the same shape as BM25's round 1 — which ended seven
+rounds later at 71ms cold p50.
+
+**Root cause of the 3.55s is already found** (issue #136): every query
+logs `opens_cold=200 opens_cached=0 open_total_ms≈98,000` — the
+parsed-segment cache never caches vector-variant opens, so each query
+re-parses all 200 segments (~98 CPU-seconds, parallelized to 3.5s
+wall). The SPFresh probe itself is a small fraction. The cache-policy
+fix is the next lever (plausibly 10–30×); segment-count reduction
+(blocked on SPFresh build scaling: a 500k-doc flush build ran >900s
+in-request) is the one after.
+
+Also measured this round, on the ingest side:
+
+- Server-side vector load: **485 docs/sec sustained** (~5.7h for 10M) —
+  the per-namespace lock + in-request flush builds, precisely
+  characterized.
+- **Offline parallel segment builder (#135): the 10M text corpus built
+  as 200 segments in 50.2s — 199k docs/sec, 410× the server path** —
+  then attached via `import-namespace` (#133/#137) and verified
+  serving. Bulk ingest is now build-offline + attach.
+- Warmup (#129) moved the full 257GB vector working set before
+  `/readyz`; 10s when files are local. Namespace snapshots (#132) mean
+  neither corpus ever loads again: re-benching after engine fixes is
+  restore + warmup + phases (~90 min), or one `benchmark` Action
+  dispatch (#134).
