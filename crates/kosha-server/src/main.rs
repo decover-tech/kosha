@@ -2790,6 +2790,10 @@ fn route(
         return handle_compact_namespace(body, tenant, state);
     }
 
+    if request_line.starts_with("POST /v1/admin/import-namespace") {
+        return handle_import_namespace(body, tenant, state);
+    }
+
     // ── Internal, pod-to-pod only ────────────────────────────────────────
     // Never called by clients — only by a peer replica that lost the
     // `hydration_leases` claim race for this file (see `fetch_from_peer`).
@@ -4153,6 +4157,157 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
         "max_segment_bytes": max_segment_bytes,
         "not_hydrated": not_hydrated,
     }))
+}
+
+/// Build an import manifest from recovered segment footers: entries sorted
+/// by segment id (deterministic regardless of S3 listing order), doc counts
+/// from the footers themselves, version 1 (imports start a fresh version
+/// history — the old one is what was lost).
+fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manifest {
+    let mut footers = footers;
+    footers.sort_by(|a, b| a.segment_id.0.cmp(&b.segment_id.0));
+    let mut segments = Vec::with_capacity(footers.len());
+    let mut segment_footers = std::collections::HashMap::with_capacity(footers.len());
+    for footer in footers {
+        segments.push(kosha_core::ManifestEntry {
+            segment_id: footer.segment_id.clone(),
+            doc_count: footer.doc_count,
+        });
+        segment_footers.insert(footer.segment_id.clone(), footer);
+    }
+    kosha_core::Manifest {
+        version: 1,
+        segments,
+        segment_footers,
+    }
+}
+
+/// POST /v1/admin/import-namespace — rebuild a namespace's control-plane
+/// manifest from its segment objects in S3.
+///
+/// Disaster recovery and snapshot restore: object storage survives while
+/// the control plane is lost (dropped postgres, restored-from-snapshot
+/// bench stack, region migration). Every fact the manifest needs already
+/// lives in the segments' `footer.json` files — this lists the namespace's
+/// S3 prefix, fetches every footer, rebuilds the manifest, and persists it
+/// through the normal control-store path.
+///
+/// Request body: {"namespace": "...", "overwrite": false}
+/// Refuses (409) if the namespace already has segments unless
+/// `"overwrite": true` — a live namespace's history must never be
+/// clobbered by an accidental import.
+#[allow(unused_variables)]
+fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> String {
+    #[cfg(not(feature = "s3"))]
+    {
+        json_error(400, "import-namespace requires the s3 feature")
+    }
+    #[cfg(feature = "s3")]
+    {
+        let req: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+        };
+        let Some(ns_raw) = req.get("namespace").and_then(|v| v.as_str()) else {
+            return json_error(400, "missing 'namespace'");
+        };
+        let overwrite = req
+            .get("overwrite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let ns = NamespaceId(ns_raw.to_string());
+
+        if !overwrite {
+            if let Some(m) = state.indexer.manifest_cloned(&ns) {
+                if !m.segments.is_empty() {
+                    return json_error(
+                        409,
+                        &format!(
+                            "namespace '{}' already has {} segment(s); pass \"overwrite\": true \
+                             to replace its manifest",
+                            ns.0,
+                            m.segments.len()
+                        ),
+                    );
+                }
+            }
+        }
+
+        let Some(ref s3) = state.s3_storage else {
+            return json_error(400, "S3 not configured on this pod");
+        };
+        let listing = match s3.list_with_sizes(&ns.0) {
+            Ok(l) => l,
+            Err(e) => return json_error(500, &format!("S3 list failed: {e}")),
+        };
+        // Logical paths are "<ns>/<segment_id>/<file>"; a segment exists
+        // for import purposes iff its footer.json does.
+        let mut seg_ids: Vec<String> = listing
+            .iter()
+            .filter_map(|(path, _)| {
+                let rest = path.strip_prefix(&format!("{}/", ns.0))?;
+                let (seg, file) = rest.split_once('/')?;
+                (file == "footer.json").then(|| seg.to_string())
+            })
+            .collect();
+        seg_ids.sort();
+        seg_ids.dedup();
+        if seg_ids.is_empty() {
+            return json_error(
+                404,
+                &format!("no segment footers found under '{}/' in S3", ns.0),
+            );
+        }
+
+        let footer_paths: Vec<String> = seg_ids
+            .iter()
+            .map(|seg| format!("{}/{}/footer.json", ns.0, seg))
+            .collect();
+        s3.read_many(&footer_paths, 16);
+
+        let mut footers = Vec::with_capacity(seg_ids.len());
+        let mut unreadable = Vec::new();
+        for (seg, rel) in seg_ids.iter().zip(&footer_paths) {
+            let local = state.data_dir.join(rel);
+            match std::fs::read(&local)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<kosha_core::Footer>(&bytes).ok())
+            {
+                Some(f) => footers.push(f),
+                None => unreadable.push(seg.clone()),
+            }
+        }
+        // All-or-nothing: a partial import silently shrinks the namespace,
+        // which is exactly the silent-data-loss class this endpoint exists
+        // to recover from.
+        if !unreadable.is_empty() {
+            return json_error(
+                500,
+                &format!(
+                    "{} of {} segment footer(s) unreadable ({}); refusing partial import",
+                    unreadable.len(),
+                    seg_ids.len(),
+                    unreadable.join(", ")
+                ),
+            );
+        }
+
+        let manifest = manifest_from_footers(footers);
+        let segments = manifest.segments.len();
+        let documents: u64 = manifest.segments.iter().map(|e| e.doc_count as u64).sum();
+        state.indexer.restore_manifest(ns.clone(), manifest);
+        {
+            let mut ctrl = state.controller.lock().unwrap();
+            ctrl.ensure_namespace(ns.clone());
+        }
+        state.persist_manifest(&ns);
+
+        json_ok(&serde_json::json!({
+            "namespace": ns.0,
+            "segments": segments,
+            "documents": documents,
+        }))
+    }
 }
 
 /// POST /v1/admin/api-keys — create a new API key for a tenant.
@@ -5991,6 +6146,39 @@ mod tests {
             a.len() < 1024,
             "key must stay compact (digested), got {} bytes",
             a.len()
+        );
+    }
+
+    #[test]
+    fn import_manifest_is_deterministic_and_complete() {
+        let footer = |id: &str, docs: u32| kosha_core::Footer {
+            segment_id: kosha_core::SegmentId(id.into()),
+            doc_count: docs,
+            total_field_length: docs as u64 * 7,
+            avg_field_length: 7.0,
+            bm25_params: kosha_core::Bm25Params::default(),
+            created_at: "2026-08-11T00:00:00Z".into(),
+            filter_blooms: None,
+            term_bloom: None,
+            format_version: kosha_core::SEGMENT_FORMAT_VERSION,
+        };
+        // Deliberately unsorted input: S3 listing order must not leak into
+        // the rebuilt manifest.
+        let m = manifest_from_footers(vec![
+            footer("ns-000002", 30),
+            footer("ns-000000", 10),
+            footer("ns-000001", 20),
+        ]);
+        assert_eq!(m.version, 1, "imports start a fresh version history");
+        let ids: Vec<&str> = m.segments.iter().map(|e| e.segment_id.0.as_str()).collect();
+        assert_eq!(ids, vec!["ns-000000", "ns-000001", "ns-000002"]);
+        let docs: u64 = m.segments.iter().map(|e| e.doc_count as u64).sum();
+        assert_eq!(docs, 60);
+        assert_eq!(
+            m.segment_footers.len(),
+            3,
+            "every footer must ride along (manifest-carried footers skip \
+             the footer-first hydration phase on cold search)"
         );
     }
 
