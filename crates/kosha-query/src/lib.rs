@@ -1146,6 +1146,10 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
         manifest_footer: Option<&kosha_core::Footer>,
+        // Shared pure-kNN top-k floor (f32 bits of `sim + 1.0`) — present
+        // only when the query shape qualifies; see its construction in
+        // `search_inner` for the gate and encoding.
+        knn_floor: Option<&std::sync::atomic::AtomicU32>,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
@@ -2062,13 +2066,23 @@ impl Searcher {
             } else {
                 knn.k
             };
+            // Read the shared floor (if this query qualifies): postings —
+            // or the entire segment — that can't beat the global k-th best
+            // are skipped inside `knn_search_with_floor` without hydrating
+            // a vector. Relaxed ordering is fine: the floor only ever
+            // rises, and a stale read merely prunes less.
+            let floor_sim = knn_floor.and_then(|f| {
+                let bits = f.load(Ordering::Relaxed);
+                (bits != 0).then(|| f32::from_bits(bits) as f64 - 1.0)
+            });
             // `knn.num_candidates` used to be a dead field (defined on
             // `KnnQuery`, never read downstream) — it's now the lazy path's
             // `nprobe`: how many posting centroids to probe per query.
-            let mut knn_results: Vec<(u32, f64)> = match reader.knn_search(
+            let mut knn_results: Vec<(u32, f64)> = match reader.knn_search_with_floor(
                 &knn.vector,
                 fetch_k,
                 knn.num_candidates,
+                floor_sim,
             ) {
                 Some(Ok(results)) => results,
                 Some(Err(e)) => {
@@ -2126,6 +2140,7 @@ impl Searcher {
                 // *live* candidates. The list is score-descending, so stop
                 // once k survivors are in.
                 let mut kept = 0usize;
+                let mut survivor_sims: Vec<f64> = Vec::new();
                 for (doc_seq, score) in knn_results {
                     if kept >= knn.k {
                         break;
@@ -2135,7 +2150,21 @@ impl Searcher {
                     }
                     if reader.doc_meta(doc_seq).is_some() {
                         seg_hits.insert(doc_seq, (score + 1.0) * 10.0);
+                        survivor_sims.push(score);
                         kept += 1;
+                    }
+                }
+                // Raise the shared floor: this segment alone produced
+                // `effective_k` genuine (live, filter-passing) results, so
+                // the final page's k-th best can't score below its own
+                // k-th best — a sound global lower bound other segments
+                // use to skip postings. Only rises (fetch_max), so racing
+                // segments can't loosen it.
+                if let Some(f) = knn_floor {
+                    let effective_k = query.from.saturating_add(query.max_results);
+                    if effective_k > 0 && survivor_sims.len() >= effective_k {
+                        let kth = survivor_sims[effective_k - 1];
+                        f.fetch_max(((kth + 1.0) as f32).to_bits(), Ordering::Relaxed);
                     }
                 }
             }
@@ -2407,6 +2436,25 @@ impl Searcher {
             .max(1);
         let count_budget = (!exact).then_some(cap);
 
+        // Global kNN top-k floor, shared across the segment fan-out below.
+        // Only a *pure* score-ordered kNN query qualifies: any lexical leg
+        // or top-level filter turns per-segment scores into blends or
+        // intersections a similarity floor can't soundly bound, and a
+        // custom sort / search_after page isn't score-ordered at all. The
+        // atomic holds the f32 bits of `(sim + 1.0)` (non-negative, so the
+        // bit pattern orders like the float; 0 encodes the -1.0 identity).
+        // Segments raise it via their own k-th-best survivors and read it
+        // to skip postings — and whole segments — whose radius bound can't
+        // beat it (see `SegmentReader::knn_search_with_floor`).
+        let knn_floor: Option<std::sync::atomic::AtomicU32> = (query.knn.is_some()
+            && query_terms.is_empty()
+            && query.wildcard.is_none()
+            && query.match_phrase.is_none()
+            && query.filter.is_none()
+            && query.sort.is_empty()
+            && query.search_after.as_ref().is_none_or(|a| a.is_empty()))
+        .then(|| std::sync::atomic::AtomicU32::new(0));
+
         let open_stats = OpenStatsCollector::default();
         let t_score = Instant::now();
         let segment_outputs: Vec<SegmentOutput> = manifest
@@ -2424,6 +2472,7 @@ impl Searcher {
                     &sort_value_fields,
                     tombstones,
                     manifest_footer,
+                    knn_floor.as_ref(),
                     &permit,
                     &open_stats,
                 )
@@ -4943,6 +4992,99 @@ mod tests {
         assert!(
             got.contains(&"d2") && got.contains(&"d38"),
             "next-nearest live docs missing: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruned_pure_knn_matches_brute_force_across_segments() {
+        // The radius-bound pruning (global top-k floor + per-posting
+        // `q·c + r` bounds) must be invisible in results: with `nprobe`
+        // covering every posting, a pure kNN page equals exact brute-force
+        // top-k over all segments' vectors. Clustered corpus so the floor
+        // and bounds actually engage (uniform noise would prune nothing).
+        let dir = std::env::temp_dir().join("kosha-test-knn-pruned-exact");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let center = |c: u32| -> Vec<f32> {
+            (0..8)
+                .map(|j| {
+                    if j == (c as usize % 8) {
+                        1.0
+                    } else {
+                        0.1 * c as f32
+                    }
+                })
+                .collect()
+        };
+        let mut all: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut entries = Vec::new();
+        let mut lcg: u64 = 7;
+        let mut next = move || {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((lcg >> 40) as f32 / (1u64 << 23) as f32) - 0.5
+        };
+        for s in 0..4 {
+            let seg_id = SegmentId(format!("s{s}"));
+            let mut w = SegmentWriter::new(seg_id.clone(), dir.join(&ns.0).join(&seg_id.0));
+            for d in 0..60u32 {
+                let c = center(d % 6);
+                let v: Vec<f32> = c.iter().map(|x| x + next() * 0.2).collect();
+                let doc_id = format!("s{s}-d{d}");
+                w.add_document(
+                    DocumentId(doc_id.clone()),
+                    vec![Field::vector("embedding", v.clone())],
+                );
+                all.push((doc_id, v));
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: seg_id,
+                doc_count: 60,
+            });
+        }
+        let manifest = Manifest {
+            version: 1,
+            segments: entries,
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let query_vector: Vec<f32> = center(2).iter().map(|x| x + 0.05).collect();
+        let mut q = mk_query("", 10);
+        q.knn = Some(kosha_core::KnnQuery {
+            field: "embedding".into(),
+            vector: query_vector.clone(),
+            k: 10,
+            num_candidates: 1000, // cover every posting: pruning is the only cut
+            filter: None,
+        });
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        let got: Vec<String> = r.results.iter().map(|h| h.doc_id.0.clone()).collect();
+
+        let mut brute: Vec<(String, f64)> = all
+            .iter()
+            .map(|(id, v)| {
+                let dot: f64 = v
+                    .iter()
+                    .zip(&query_vector)
+                    .map(|(a, b)| (a * b) as f64)
+                    .sum();
+                let nv: f64 = v.iter().map(|x| (x * x) as f64).sum::<f64>().sqrt();
+                let nq: f64 = query_vector
+                    .iter()
+                    .map(|x| (x * x) as f64)
+                    .sum::<f64>()
+                    .sqrt();
+                (id.clone(), dot / (nv * nq))
+            })
+            .collect();
+        brute.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let expected: Vec<String> = brute.iter().take(10).map(|(id, _)| id.clone()).collect();
+        assert_eq!(
+            got, expected,
+            "pruned pure-kNN page must equal exact brute-force top-k"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

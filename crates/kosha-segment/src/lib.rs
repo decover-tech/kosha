@@ -161,11 +161,14 @@ impl SegmentWriter {
         self.write_doc_store()?;
         self.write_inverted_index()?;
         self.write_filters()?;
-        match vector_write_version() {
-            1 => self.write_vectors()?,
+        let vector_radii = match vector_write_version() {
+            1 => {
+                self.write_vectors()?;
+                None
+            }
             _ => self.write_vectors_v2()?,
-        }
-        let footer = self.write_footer(bm25_params)?;
+        };
+        let footer = self.write_footer(bm25_params, vector_radii)?;
         Ok(footer)
     }
 
@@ -370,9 +373,9 @@ impl SegmentWriter {
     /// `kosha_vector_spfresh::ClusterIndex` from this segment's buffered
     /// vectors and serializes its postings — see the "Vector index format"
     /// section below for the byte layout.
-    fn write_vectors_v2(&self) -> Result<(), KoshaError> {
+    fn write_vectors_v2(&self) -> Result<Option<Vec<f32>>, KoshaError> {
         if self.vectors.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let dim = self.vectors[0].1.len();
         // Unit-norm (write version 3, on-disk header version 2): normalize
@@ -407,10 +410,33 @@ impl SegmentWriter {
             KoshaError::CorruptSegment(format!("failed to build vector index: {e}"))
         })?;
         let mut postings = index.snapshot();
+        // Unit-norm path: also compute each posting's max residual radius
+        // against the (normalized) centroid actually stored — the footer
+        // carries these so the read path can bound `q·v ≤ q·c + r` and
+        // skip postings/segments that can't beat the global top-k floor.
+        let mut radii: Option<Vec<f32>> = None;
         let format_version = if unit_norm {
             for p in &mut postings {
                 kosha_vector_spfresh::normalize_in_place(&mut p.centroid);
             }
+            radii = Some(
+                postings
+                    .iter()
+                    .map(|p| {
+                        p.entries
+                            .iter()
+                            .map(|(_, v)| {
+                                let mut d2 = 0.0f32;
+                                for (x, c) in v.iter().zip(&p.centroid) {
+                                    let t = x - c;
+                                    d2 += t * t;
+                                }
+                                d2.sqrt()
+                            })
+                            .fold(0.0f32, f32::max)
+                    })
+                    .collect(),
+            );
             UNIT_NORM_VECTOR_INDEX_VERSION
         } else {
             VECTOR_INDEX_VERSION
@@ -419,10 +445,14 @@ impl SegmentWriter {
             encode_vector_index_v2(dim as u32, &postings, format_version);
         self.backend.write("vector.idx", &idx_bytes)?;
         self.backend.write("vector.offsets", &offsets_bytes)?;
-        Ok(())
+        Ok(radii)
     }
 
-    fn write_footer(&self, bm25_params: Bm25Params) -> Result<Footer, KoshaError> {
+    fn write_footer(
+        &self,
+        bm25_params: Bm25Params,
+        vector_posting_radii: Option<Vec<f32>>,
+    ) -> Result<Footer, KoshaError> {
         let doc_count = self.doc_records.len() as u32;
         let avg = if doc_count > 0 {
             self.total_field_length as f64 / doc_count as f64
@@ -441,6 +471,7 @@ impl SegmentWriter {
                 self.inverted_index.keys().map(|s| s.as_str()),
             )),
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
+            vector_posting_radii,
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -845,8 +876,8 @@ mod vector_index_v2_tests {
         writer.write_doc_store().unwrap();
         writer.write_inverted_index().unwrap();
         writer.write_filters().unwrap();
-        writer.write_vectors_v2().unwrap();
-        writer.write_footer(Bm25Params::default()).unwrap();
+        let radii = writer.write_vectors_v2().unwrap();
+        writer.write_footer(Bm25Params::default(), radii).unwrap();
 
         // On disk: header says unit-norm, and every stored vector and
         // centroid actually is unit-L2.
@@ -882,6 +913,59 @@ mod vector_index_v2_tests {
                 "doc {doc_seq}: dot-path {sim} vs cosine {expected}"
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn footer_radii_written_and_floor_skips_unreachable_postings() {
+        let dir = std::env::temp_dir().join(format!("kosha-v2-radii-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut writer = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        for i in 0..30u32 {
+            let angle = (i as f32) * std::f32::consts::PI / 15.0;
+            writer.add_document(
+                DocumentId(format!("d{i}")),
+                vec![Field::vector(
+                    "embedding",
+                    vec![angle.cos(), angle.sin(), 0.0],
+                )],
+            );
+        }
+        writer.backend.create_dir_all("").unwrap();
+        writer.write_doc_store().unwrap();
+        writer.write_inverted_index().unwrap();
+        writer.write_filters().unwrap();
+        let radii = writer.write_vectors_v2().unwrap();
+        writer.write_footer(Bm25Params::default(), radii).unwrap();
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        // The footer carries one radius per sidecar posting.
+        let offsets_data = fs::read(dir.join("vector.offsets")).unwrap();
+        let idx_data = fs::read(dir.join("vector.idx")).unwrap();
+        let (dim, _, version) = parse_vector_idx_header(&idx_data).expect("valid header");
+        let posting_count = parse_vector_offsets(&offsets_data, dim, version)
+            .expect("valid sidecar")
+            .len();
+        let footer_radii = r
+            .footer()
+            .vector_posting_radii
+            .as_ref()
+            .expect("unit-norm writer must record posting radii");
+        assert_eq!(footer_radii.len(), posting_count);
+
+        // A floor no posting bound can beat (sims cap at 1.0) must skip
+        // every posting — no hydration, no results, no error. Without a
+        // floor the same search returns normally.
+        let q = [1.0, 0.0, 0.0];
+        let pruned = r
+            .knn_search_with_floor(&q, 3, 64, Some(1.5))
+            .expect("lazy index")
+            .unwrap();
+        assert!(pruned.is_empty(), "floor above max bound must skip all");
+        let unpruned = r.knn_search(&q, 3, 64).expect("lazy index").unwrap();
+        assert_eq!(unpruned.len(), 3);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2435,6 +2519,25 @@ type LoadedVectorState = (
 /// cache and in-flight queries (a cache hit is a pointer clone).
 type SharedVectorPosting = Arc<Vec<(u32, Vec<f32>)>>;
 
+/// Total-ordered similarity for the pruning heap. Sims are produced by
+/// `dot(..).clamp(-1.0, 1.0)` so they are never NaN, making `partial_cmp`
+/// total in practice; ties fall back to `Equal`.
+#[derive(PartialEq)]
+struct OrderedSim(f64);
+impl Eq for OrderedSim {}
+impl PartialOrd for OrderedSim {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrderedSim {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
 struct LazyVectorIndex {
     vector_idx_path: PathBuf,
     dim: usize,
@@ -2449,6 +2552,14 @@ struct LazyVectorIndex {
     /// [`UNIT_NORM_VECTOR_INDEX_VERSION`]) — scoring uses the dot-only fast
     /// path: normalize the query once, then `1 - dot` *is* cosine distance.
     unit_norm: bool,
+    /// Per-posting max residual radius from the footer, parallel to
+    /// `centroids`/`ranges`. `Some` only for unit-norm segments whose
+    /// footer carried a radii list of matching length: then no member of
+    /// posting `p` can score above `q·c_p + radii[p]`, and postings whose
+    /// bound can't beat the current top-k floor are skipped without
+    /// hydration. `None` (legacy footer, length mismatch) → no pruning,
+    /// exact pre-radii behavior.
+    radii: Option<Vec<f32>>,
     /// Decoded postings LRU keyed by range index — the vector twin of the
     /// text path's per-segment [`PostingsCache`]. Without it every kNN
     /// query re-reads and re-decodes its `nprobe` candidate postings from
@@ -2518,14 +2629,20 @@ impl SegmentReader {
         footer: Option<Footer>,
         postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
     ) -> Result<Self, KoshaError> {
-        let (vs, hm, vector_index) = if load_vectors {
-            Self::load_vector_index(&segment_dir, postings_account.clone())?
-        } else {
-            (VectorStore::default(), None, None)
-        };
+        // Footer first: the lazy vector index wants the footer's
+        // `vector_posting_radii` (pruning bounds) at construction.
         let footer = match footer {
             Some(footer) => footer,
             None => Self::read_footer(&segment_dir)?,
+        };
+        let (vs, hm, vector_index) = if load_vectors {
+            Self::load_vector_index(
+                &segment_dir,
+                postings_account.clone(),
+                footer.vector_posting_radii.as_deref(),
+            )?
+        } else {
+            (VectorStore::default(), None, None)
         };
         let doc_store = match try_read_doc_index(&segment_dir, footer.doc_count) {
             Some(index) => DocStoreAccess::Lazy {
@@ -2557,6 +2674,7 @@ impl SegmentReader {
     fn load_vector_index(
         segment_dir: &Path,
         postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+        footer_radii: Option<&[f32]>,
     ) -> Result<LoadedVectorState, KoshaError> {
         let idx_path = segment_dir.join("vector.idx");
         let Ok(data) = fs::read(&idx_path) else {
@@ -2592,6 +2710,14 @@ impl SegmentReader {
                     centroids.push(p.centroid);
                     ranges.push((p.offset, p.length));
                 }
+                let unit_norm = version == UNIT_NORM_VECTOR_INDEX_VERSION;
+                // Radii are trusted only when they can possibly be the
+                // sidecar's twin: unit-norm segment, one radius per
+                // posting. Anything else (legacy footer, stale pairing)
+                // → no pruning rather than wrong pruning.
+                let radii = footer_radii
+                    .filter(|r| unit_norm && r.len() == centroids.len())
+                    .map(|r| r.to_vec());
                 return Ok((
                     VectorStore::default(),
                     None,
@@ -2600,7 +2726,8 @@ impl SegmentReader {
                         dim: dim as usize,
                         centroids,
                         ranges,
-                        unit_norm: version == UNIT_NORM_VECTOR_INDEX_VERSION,
+                        radii,
+                        unit_norm,
                         cache: PostingsCache::new(
                             vector_postings_cache_max_bytes(),
                             postings_account,
@@ -2684,8 +2811,28 @@ impl SegmentReader {
         k: usize,
         nprobe: usize,
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
+        self.knn_search_with_floor(query, k, nprobe, None)
+    }
+
+    /// [`SegmentReader::knn_search`] with an optional global top-k floor:
+    /// a similarity the final page's k-th best is already known to meet
+    /// (maintained across segments by the caller). Postings whose bound
+    /// `q·c_p + radius_p` can't beat the floor — or the local k-th best,
+    /// whichever is higher — are skipped without hydrating a vector, and a
+    /// whole segment whose *best* posting bound trails the floor does no
+    /// hydration at all. Pruning is sound (Cauchy–Schwarz: no member can
+    /// out-score its posting's bound), so results are identical to the
+    /// unpruned walk over the same `nprobe` candidates; it engages only
+    /// when the segment carries footer radii (see `LazyVectorIndex::radii`).
+    pub fn knn_search_with_floor(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        floor: Option<f64>,
+    ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
         let vi = self.vector_index.as_ref()?;
-        Some(self.knn_search_lazy(vi, query, k, nprobe))
+        Some(self.knn_search_lazy(vi, query, k, nprobe, floor))
     }
 
     fn knn_search_lazy(
@@ -2694,6 +2841,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         nprobe: usize,
+        floor: Option<f64>,
     ) -> Result<Vec<(u32, f64)>, KoshaError> {
         // Unit-norm segments: normalize the query once, then every stored
         // comparison is a bare dot product — same cosine scores (clamped
@@ -2707,6 +2855,9 @@ impl SegmentReader {
         } else {
             query
         };
+        if let Some(radii) = &vi.radii {
+            return self.knn_search_pruned(vi, radii, query, k, nprobe, floor);
+        }
         let candidates = if vi.unit_norm {
             kosha_vector_spfresh::nearest_centroids_dot(&vi.centroids, query, nprobe)
         } else {
@@ -2725,6 +2876,68 @@ impl SegmentReader {
         }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
+        Ok(scored)
+    }
+
+    /// Bound-pruned scoring walk (unit-norm + radii segments; `query` is
+    /// already unit). Postings are visited in descending `q·c_p` order —
+    /// the same top-`nprobe` candidate set the unpruned path scores, so
+    /// skipping via the bound changes cost, never results.
+    fn knn_search_pruned(
+        &self,
+        vi: &LazyVectorIndex,
+        radii: &[f32],
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        floor: Option<f64>,
+    ) -> Result<Vec<(u32, f64)>, KoshaError> {
+        // Rank once, keeping the q·c values — the bounds reuse them.
+        let mut ranked: Vec<(usize, f32)> = vi
+            .centroids
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, kosha_vector_spfresh::dot(query, c)))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(nprobe);
+
+        // Min-heap of the k best sims seen so far: peek() is the local
+        // floor once full.
+        let mut top: std::collections::BinaryHeap<std::cmp::Reverse<(OrderedSim, u32)>> =
+            std::collections::BinaryHeap::with_capacity(k + 1);
+        let mut tau = floor.unwrap_or(f64::NEG_INFINITY);
+        for &(range_idx, qc) in &ranked {
+            // `q·c + r` bounds any member's dot; cosine itself never
+            // exceeds 1.0, so the effective bound is the smaller of the
+            // two (a wide posting sitting on top of the query would
+            // otherwise carry a vacuous bound > 1).
+            let bound = ((qc + radii[range_idx]) as f64).min(1.0);
+            if bound <= tau {
+                // No member of this posting can beat what the page already
+                // has — skip without touching vector.idx.
+                continue;
+            }
+            for (id, v) in self.hydrate_posting(vi, range_idx)?.iter() {
+                let sim = kosha_vector_spfresh::dot(query, v).clamp(-1.0, 1.0) as f64;
+                if top.len() < k {
+                    top.push(std::cmp::Reverse((OrderedSim(sim), *id)));
+                } else {
+                    let worst = top.peek().map(|r| r.0 .0 .0).unwrap_or(f64::INFINITY);
+                    if sim > worst {
+                        top.pop();
+                        top.push(std::cmp::Reverse((OrderedSim(sim), *id)));
+                    }
+                }
+            }
+            if top.len() == k {
+                if let Some(r) = top.peek() {
+                    tau = tau.max(r.0 .0 .0);
+                }
+            }
+        }
+        let mut scored: Vec<(u32, f64)> = top.into_iter().map(|r| (r.0 .1, r.0 .0 .0)).collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(scored)
     }
 
@@ -4564,8 +4777,8 @@ mod tests {
         w.write_doc_store().unwrap();
         w.write_inverted_index().unwrap();
         w.write_filters().unwrap();
-        w.write_vectors_v2().unwrap();
-        w.write_footer(Bm25Params::default()).unwrap();
+        let radii = w.write_vectors_v2().unwrap();
+        w.write_footer(Bm25Params::default(), radii).unwrap();
         seg_id
     }
 

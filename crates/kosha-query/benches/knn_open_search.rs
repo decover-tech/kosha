@@ -95,7 +95,34 @@ fn vocab_word(rank: usize) -> String {
 /// one embedding per doc.
 const WORDS_PER_DOC: usize = 24;
 
-fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, dim: usize) -> Manifest {
+/// Deterministic cluster centers shared by every segment — real embedding
+/// corpora are strongly clustered (topics), and cluster structure is what
+/// makes centroid bounds tight. `clusters == 0` degenerates to the old
+/// uniform-random corpus (worst case for any pruning).
+fn cluster_center(cluster: usize, dim: usize) -> Vec<f32> {
+    let mut rng = Lcg(0xC1_0000 + cluster as u64);
+    (0..dim).map(|_| rng.coord()).collect()
+}
+
+fn clustered_vector(rng: &mut Lcg, clusters: usize, dim: usize) -> Vec<f32> {
+    if clusters == 0 {
+        return (0..dim).map(|_| rng.coord()).collect();
+    }
+    let c = (rng.next() % clusters as u64) as usize;
+    cluster_center(c, dim)
+        .into_iter()
+        .map(|x| x + rng.coord() * 0.2)
+        .collect()
+}
+
+fn build_corpus(
+    root: &Path,
+    ns: &NamespaceId,
+    segs: usize,
+    docs: usize,
+    dim: usize,
+    clusters: usize,
+) -> Manifest {
     let _ = std::fs::remove_dir_all(root);
     let mut entries = Vec::with_capacity(segs);
     for s in 0..segs {
@@ -108,7 +135,7 @@ fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, dim: us
             for _ in 0..WORDS_PER_DOC {
                 words.push(vocab_word(rng.zipfish(2000)));
             }
-            let vector: Vec<f32> = (0..dim).map(|_| rng.coord()).collect();
+            let vector = clustered_vector(&mut rng, clusters, dim);
             w.add_document(
                 DocumentId(format!("s{s}-d{d}")),
                 vec![
@@ -153,13 +180,23 @@ fn mk_query(text: &str, knn: Option<KnnQuery>) -> SearchQuery {
     }
 }
 
-fn mk_knn(dim: usize, k: usize) -> KnnQuery {
+fn mk_knn(dim: usize, k: usize, clusters: usize) -> KnnQuery {
     // Deterministic query vector from its own seed — not a corpus vector,
-    // so the search can't degenerate into an exact-match shortcut.
+    // so the search can't degenerate into an exact-match shortcut. In
+    // clustered mode it sits near (not on) a cluster center, like a real
+    // query embedding landing in a topic's neighborhood.
     let mut rng = Lcg(0xC0FFEE);
+    let vector = if clusters == 0 {
+        (0..dim).map(|_| rng.coord()).collect()
+    } else {
+        cluster_center(1 % clusters, dim)
+            .into_iter()
+            .map(|x| x + rng.coord() * 0.1)
+            .collect()
+    };
     KnnQuery {
         field: "embedding".into(),
-        vector: (0..dim).map(|_| rng.coord()).collect(),
+        vector,
         k,
         num_candidates: 10 * k,
         filter: None,
@@ -218,13 +255,14 @@ fn main() {
     let docs = env_usize("KOSHA_BENCH_DOCS", 2000);
     let dim = env_usize("KOSHA_BENCH_DIM", 128);
     let k = env_usize("KOSHA_BENCH_K", 10);
+    let clusters = env_usize("KOSHA_BENCH_CLUSTERS", 64);
 
     let root = std::env::temp_dir().join("kosha-bench-knn-open-search");
     let ns = NamespaceId("bench".into());
 
     eprintln!("building corpus: {segs} segs × {docs} docs, dim {dim} …");
     let t_build = Instant::now();
-    let manifest = build_corpus(&root, &ns, segs, docs, dim);
+    let manifest = build_corpus(&root, &ns, segs, docs, dim, clusters);
     let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
 
     // Cold open (vectors + HNSW build-or-load) + exact resident bytes while
@@ -265,7 +303,7 @@ fn main() {
     let mut cold_samples = Vec::new();
     for _ in 0..cold_iters {
         let searcher = Searcher::new(root.to_path_buf());
-        let q = mk_query("", Some(mk_knn(dim, k)));
+        let q = mk_query("", Some(mk_knn(dim, k, clusters)));
         let t = Instant::now();
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         cold_samples.push(t.elapsed().as_secs_f64() * 1e3);
@@ -280,11 +318,15 @@ fn main() {
     let searcher = Searcher::new(root.to_path_buf());
     let warm_iters = env_usize("KOSHA_BENCH_WARM_ITERS", 20);
     let shapes: Vec<(&'static str, &'static str, SearchQuery)> = vec![
-        ("warm kNN", "knn", mk_query("", Some(mk_knn(dim, k)))),
+        (
+            "warm kNN",
+            "knn",
+            mk_query("", Some(mk_knn(dim, k, clusters))),
+        ),
         (
             "warm hybrid (\"the\" + kNN)",
             "hybrid_broad",
-            mk_query("the", Some(mk_knn(dim, k))),
+            mk_query("the", Some(mk_knn(dim, k, clusters))),
         ),
     ];
     let mut warm = Vec::new();
@@ -305,7 +347,7 @@ fn main() {
 
     println!();
     println!(
-        "corpus: {segs} segments × {docs} docs ({} total), dim {dim}, k {k}",
+        "corpus: {segs} segments × {docs} docs ({} total), dim {dim}, k {k}, clusters {clusters}",
         segs * docs
     );
     println!(
@@ -334,7 +376,7 @@ fn main() {
             .collect();
         let report = serde_json::json!({
             "schema": 1,
-            "corpus": { "segs": segs, "docs": docs, "dim": dim, "k": k },
+            "corpus": { "segs": segs, "docs": docs, "dim": dim, "k": k, "clusters": clusters },
             "write_ms": build_ms,
             "vector_idx_bytes": idx_bytes,
             "open_ms": open.json(),

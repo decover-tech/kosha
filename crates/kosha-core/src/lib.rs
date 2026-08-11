@@ -533,6 +533,18 @@ pub struct Footer {
     /// older segments regardless of this number.
     #[serde(default)]
     pub format_version: u32,
+    /// Per-posting max residual radius (`max ‖v − c_p‖` over each vector
+    /// posting's members, in unit-norm space), parallel to the
+    /// `vector.offsets` sidecar's posting order. Enables sound kNN
+    /// pruning: for a unit query `q`, no member of posting `p` can score
+    /// above `q·c_p + radius_p` (Cauchy–Schwarz), so postings — and whole
+    /// segments — whose bound can't beat the current global top-k floor
+    /// are skipped without hydrating a single vector. Same discipline as
+    /// `filter_blooms`/`term_bloom` above: `None` means written before
+    /// radii existed (or a non-unit-norm vector index) — callers must not
+    /// prune.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_posting_radii: Option<Vec<f32>>,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
