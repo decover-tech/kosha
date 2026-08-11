@@ -1,0 +1,189 @@
+# Manually-triggered end-to-end benchmark: provision the bench VM stack,
+# restore snapshotted corpora (or load from the S3 corpus cache), run the
+# BM25 and/or kNN phase suites, publish a results table to the job
+# summary, upload the raw JSONs, and tear the stack down.
+#
+# Modes and the 6h job ceiling:
+#   restore (default): snapshot -> phases, ~90-120 min per suite. Fits.
+#   load:              full load -> snapshot -> phases. BM25 fits (~2.5h);
+#                      vector does NOT (the 10M vector load alone runs ~6h
+#                      at the measured ~485 docs/sec) — run that once from
+#                      a workstation (scripts/bench/bm25_scale/vm/), then
+#                      use restore mode here forever after.
+#
+# Required repo secrets:
+#   BENCH_AWS_ACCESS_KEY_ID / BENCH_AWS_SECRET_ACCESS_KEY
+#     IAM user (or assumed-role creds) with the bench account's terraform
+#     + S3 permissions. Swap for OIDC role assumption when set up.
+#   INFRA_REPO_TOKEN
+#     read token for the infra repo (terraform lives there).
+#
+# Teardown policy mirrors the bench standing rule: destroy on success;
+# on failure the stack is KEPT for debugging (a summary line says so) —
+# destroy it manually or re-dispatch with suite=none after investigating.
+name: benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: which benchmark suite(s) to run
+        type: choice
+        options: [both, bm25, vector, none]
+        default: both
+      mode:
+        description: restore snapshots (fast) or full load (slow; vector overruns the 6h job limit)
+        type: choice
+        options: [restore, load]
+        default: restore
+      qps:
+        description: target queries/sec per phase
+        default: "8"
+      duration:
+        description: seconds per phase (tpuf protocol = 1800)
+        default: "1800"
+
+concurrency:
+  group: bench-vm            # one bench stack; never two runs at once
+  cancel-in-progress: false
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.BENCH_AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.BENCH_AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: us-east-1
+  BM25_NS: msmarco-10m
+  VEC_NS: msmarco-10m-vec
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: decover-tech/infra
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: infra
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Provision bench VM
+        id: tf
+        working-directory: infra/terraform/dev-machines/aws/bench-kosha
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false
+          echo "ip=$(terraform output -raw machine_ip)" >> "$GITHUB_OUTPUT"
+          # terraform writes the keypair beside the config
+          cp bench-kosha.pem "$RUNNER_TEMP/bench.pem" && chmod 600 "$RUNNER_TEMP/bench.pem"
+
+      - name: Wait for SSH + provision VM basics
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 ec2-user@$IP"
+          for i in $(seq 60); do $SSH 'command -v docker >/dev/null && echo ready' && break || sleep 10; done
+          rsync -az -e "ssh -i $RUNNER_TEMP/bench.pem -o StrictHostKeyChecking=accept-new" \
+            --exclude target --exclude .git ./ "ec2-user@$IP:kosha/"
+          $SSH 'sudo dnf install -q -y python3.11 python3.11-pip >/dev/null 2>&1 || true
+                python3.11 -m venv ~/venv311 2>/dev/null || true
+                ~/venv311/bin/pip install -q requests
+                chmod +x ~/kosha/scripts/bench/bm25_scale/vm/*.sh'
+
+      - name: Build server image + start containers
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem ec2-user@$IP"
+          $SSH 'set -e
+            cd ~/kosha && sudo docker build -q -t kosha-server:bench .
+            sudo mkdir -p /data/kosha /data/pg && sudo chown -R 10001:10001 /data/kosha
+            sudo docker rm -f pg kosha 2>/dev/null || true
+            sudo docker run -d --name pg --network host -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=kosha \
+              -v /data/pg:/var/lib/postgresql/data postgres:16
+            until sudo docker exec pg pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done
+            sudo docker create --name kosha --network host \
+              -e DATABASE_URL=postgresql://postgres:bench@127.0.0.1:5432/kosha \
+              -e KOSHA_API_KEY=sk-bench \
+              -e KOSHA_S3_BUCKET=decoverai-bench-kosha-segments -e KOSHA_S3_PREFIX=segments/ \
+              -e AWS_DEFAULT_REGION=us-east-1 -e KOSHA_FLUSH_THRESHOLD=50000 \
+              -e KOSHA_HTTP_IO_TIMEOUT_SECS=1800 \
+              -e KOSHA_CACHE_DIR=/var/cache/kosha -e KOSHA_DATA_DIR=/var/cache/kosha/data \
+              -e KOSHA_CACHE_MAX_BYTES=644245094400 -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \
+              -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
+              -e KOSHA_WARMUP_NAMESPACES="msmarco-10m,msmarco-10m-vec" \
+              -v /data/kosha:/var/cache/kosha kosha-server:bench
+            sudo docker start kosha
+            until curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null; do sleep 3; done
+            aws s3 cp --quiet s3://decoverai-bench-corpus-cache/msmarco-10m/queries.txt /data/queries.txt
+            aws s3 cp --quiet s3://decoverai-bench-corpus-cache/msmarco-10m-emb/queries_emb.f32 /data/queries_emb.f32 || true'
+
+      - name: BM25 suite
+        if: contains(fromJSON('["both","bm25"]'), inputs.suite)
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          if [ '${{ inputs.mode }}' = 'restore' ]; then
+            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $BM25_NS"
+          else
+            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+              ~/venv311/bin/python3 ../load_corpus.py --host http://127.0.0.1:8080 \
+                --namespace $BM25_NS --corpus-dir s3://decoverai-bench-corpus-cache/msmarco-10m \
+                --api-key sk-bench --batch-size 20000 --concurrency 8 \
+                --compact-after --compact-mode full --compact-passes 12 && \
+              ./snapshot_namespace.sh $BM25_NS"
+          fi
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+            ./run_phases.sh bm25 $BM25_NS /data/results-ci/bm25 '${{ inputs.qps }}' '${{ inputs.duration }}'"
+
+      - name: Vector suite
+        if: contains(fromJSON('["both","vector"]'), inputs.suite)
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          if [ '${{ inputs.mode }}' = 'restore' ]; then
+            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $VEC_NS"
+          else
+            echo "::error::vector full-load (~6h) exceeds the job ceiling — run it from a workstation once, then use restore mode"
+            exit 1
+          fi
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+            ./run_phases.sh vector $VEC_NS /data/results-ci/vector '${{ inputs.qps }}' '${{ inputs.duration }}'"
+
+      - name: Collect results + summary
+        if: always() && inputs.suite != 'none'
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          mkdir -p results
+          scp -i "$RUNNER_TEMP/bench.pem" -r "ec2-user@$IP:/data/results-ci/*" results/ 2>/dev/null || true
+          {
+            echo "## Benchmark results (${{ inputs.suite }}, ${{ inputs.mode }}, ${{ inputs.qps }} QPS, ${{ inputs.duration }}s phases)"
+            echo ""
+            echo "| phase | p50 ms | p90 ms | p99 ms | requests | errors |"
+            echo "|---|---|---|---|---|---|"
+            find results -name '*.json' | sort | while read -r f; do
+              python3 - "$f" << 'EOF'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          n = sys.argv[1].split("/")[-1].removesuffix(".json")
+          fmt = lambda v: "NaN" if v != v else f"{v:.1f}"
+          print(f"| {n} | {fmt(d['p50_ms'])} | {fmt(d['p90_ms'])} | {fmt(d['p99_ms'])} | {d['requests']} | {d['errors']} |")
+          EOF
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.suite != 'none'
+        with:
+          name: bench-results
+          path: results/
+          if-no-files-found: ignore
+
+      - name: Teardown (success only — failures keep the VM for debugging)
+        if: success()
+        working-directory: infra/terraform/dev-machines/aws/bench-kosha
+        run: terraform destroy -auto-approve -input=false
+
+      - name: Teardown skipped notice
+        if: failure()
+        run: echo "::warning::bench VM stack KEPT for debugging (standing rule). Destroy manually when done."
