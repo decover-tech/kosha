@@ -8,7 +8,7 @@
 #   ./run_phases.sh bm25   <namespace> <out-dir> [qps] [duration]
 #   ./run_phases.sh vector <namespace> <out-dir> [qps] [duration]
 #
-# bm25:   cold OR cache-off phase, then warm OR cache-off + warm cache-on.
+# bm25:   cold OR cache-off phase, then warm OR cache-on.
 # vector: cold kNN cache-off phase, then warm kNN cache-on.
 # "cold" here means: this script wipes the local store and restarts the
 # kosha container first, gating on /readyz (warmup does the prefetch —
@@ -51,7 +51,6 @@ phase() { # phase <label> <extra-args...>
 
 if [ "$SUITE" = "bm25" ]; then
   phase text_cold_or_nocache --phase cold --operator or --no-cache
-  phase text_warm_or_nocache --phase warm --operator or --no-cache
   phase text_warm_or_cache   --phase warm --operator or
 else
   phase knn_cold_nocache --phase cold --knn-embeddings /data/queries_emb.f32 --no-cache
