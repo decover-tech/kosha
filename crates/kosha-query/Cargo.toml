@@ -55,3 +55,7 @@ harness = false
 [[bench]]
 name = "vector_segment_accounting"
 harness = false
+
+[[bench]]
+name = "knn_open_search"
+harness = false
