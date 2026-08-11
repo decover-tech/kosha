@@ -50,9 +50,9 @@ phase() { # phase <label> <extra-args...>
 }
 
 if [ "$SUITE" = "bm25" ]; then
-  phase cold_or_nocache  --phase cold --operator or --no-cache
-  phase warm_or_nocache  --phase warm --operator or --no-cache
-  phase warm_or_cache    --phase warm --operator or
+  phase text_cold_or_nocache --phase cold --operator or --no-cache
+  phase text_warm_or_nocache --phase warm --operator or --no-cache
+  phase text_warm_or_cache   --phase warm --operator or
 else
   phase knn_cold_nocache --phase cold --knn-embeddings /data/queries_emb.f32 --no-cache
   phase knn_warm_cache   --phase warm --knn-embeddings /data/queries_emb.f32
