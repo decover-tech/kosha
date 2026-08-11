@@ -1963,6 +1963,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kosha-build-segments"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kosha-core",
+ "kosha-segment",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kosha-cache"
 version = "0.1.0"
 dependencies = [
