@@ -1085,6 +1085,24 @@ fn postings_cache_max_bytes() -> usize {
     })
 }
 
+/// Per-segment byte budget for the decoded *vector* postings LRU
+/// (`KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES`, default 32 MiB, `0` disables).
+/// Larger default than the text budget above because a kNN query's working
+/// set is `nprobe` whole postings of `dim`-wide f32 vectors — at realistic
+/// embedding dimensionality a single posting runs hundreds of KiB, so a
+/// text-sized budget would thrash. Aggregate residency across segments is
+/// still bounded by the ledger watermark (entries report to the same
+/// [`PostingsMemoryAccount`]), not by this per-segment cap alone.
+fn vector_postings_cache_max_bytes() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32 * 1024 * 1024)
+    })
+}
+
 /// Optional live-memory account the segment's per-segment postings LRU
 /// reports its resident bytes to (Tier 1 O6). The decoded form of postings
 /// lives outside the on-disk format (the per-query `PostingsCache`), so
@@ -2283,6 +2301,10 @@ type LoadedVectorState = (
 /// `SegmentReader::hydrate_posting`. Mutually exclusive with
 /// `vector_store`/`hnsw_map` being populated — see `load_vector_index`'s
 /// doc comment for the four-way dispatch.
+/// A vector posting's decoded live entries, shared between the per-segment
+/// cache and in-flight queries (a cache hit is a pointer clone).
+type SharedVectorPosting = Arc<Vec<(u32, Vec<f32>)>>;
+
 struct LazyVectorIndex {
     vector_idx_path: PathBuf,
     dim: usize,
@@ -2293,6 +2315,14 @@ struct LazyVectorIndex {
     centroids: Vec<Vec<f32>>,
     /// `(offset, length)` into `vector.idx`, parallel to `centroids`.
     ranges: Vec<(u64, u32)>,
+    /// Decoded postings LRU keyed by range index — the vector twin of the
+    /// text path's per-segment [`PostingsCache`]. Without it every kNN
+    /// query re-reads and re-decodes its `nprobe` candidate postings from
+    /// `vector.idx`, even when the segment itself is warm in the
+    /// `SegmentCache` — hydration I/O + decode was the dominant warm-path
+    /// cost. Entries are `Arc`s (hit = pointer clone) and resident bytes
+    /// report to the same live-bytes account as text postings.
+    cache: PostingsCache<SharedVectorPosting>,
 }
 
 pub struct SegmentReader {
@@ -2355,7 +2385,7 @@ impl SegmentReader {
         postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
     ) -> Result<Self, KoshaError> {
         let (vs, hm, vector_index) = if load_vectors {
-            Self::load_vector_index(&segment_dir)?
+            Self::load_vector_index(&segment_dir, postings_account.clone())?
         } else {
             (VectorStore::default(), None, None)
         };
@@ -2390,7 +2420,10 @@ impl SegmentReader {
     /// `VECTOR_MAGIC`. Returns `(vector_store, hnsw_map, vector_index)`
     /// where exactly one of `vector_index` or `(vector_store, hnsw_map)` is
     /// populated (the latter possibly both empty/`None`, for "no vectors").
-    fn load_vector_index(segment_dir: &Path) -> Result<LoadedVectorState, KoshaError> {
+    fn load_vector_index(
+        segment_dir: &Path,
+        postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+    ) -> Result<LoadedVectorState, KoshaError> {
         let idx_path = segment_dir.join("vector.idx");
         let Ok(data) = fs::read(&idx_path) else {
             // No vector.idx at all — a namespace/segment with no vector
@@ -2433,6 +2466,10 @@ impl SegmentReader {
                         dim: dim as usize,
                         centroids,
                         ranges,
+                        cache: PostingsCache::new(
+                            vector_postings_cache_max_bytes(),
+                            postings_account,
+                        ),
                     }),
                 ));
             }
@@ -2479,13 +2516,26 @@ impl SegmentReader {
         &self,
         vi: &LazyVectorIndex,
         range_idx: usize,
-    ) -> Result<Vec<(u32, Vec<f32>)>, KoshaError> {
+    ) -> Result<SharedVectorPosting, KoshaError> {
+        if let Some(hit) = vi.cache.get(range_idx) {
+            return Ok(hit);
+        }
         let (offset, length) = vi.ranges[range_idx];
         let mut file = fs::File::open(&vi.vector_idx_path)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; length as usize];
         file.read_exact(&mut buf)?;
-        Ok(decode_posting_entries(&buf, vi.dim as u32))
+        let decoded = Arc::new(decode_posting_entries(&buf, vi.dim as u32));
+        // Second-touch admission, same as text postings: one-shot probes
+        // (a cold namespace scanned once) pass through without evicting a
+        // hot working set; recurring probes get cached on their second
+        // hydration.
+        if vi.cache.admit_on_miss(range_idx) {
+            let bytes = decoded.len()
+                * (std::mem::size_of::<(u32, Vec<f32>)>() + vi.dim * std::mem::size_of::<f32>());
+            vi.cache.insert(range_idx, Arc::clone(&decoded), bytes);
+        }
+        Ok(decoded)
     }
 
     /// kNN search over the lazy v2 posting index: probe `nprobe` nearest
@@ -2513,10 +2563,10 @@ impl SegmentReader {
         let candidates = kosha_vector_spfresh::nearest_centroids(&vi.centroids, query, nprobe);
         let mut scored: Vec<(u32, f64)> = Vec::new();
         for range_idx in candidates {
-            for (id, v) in self.hydrate_posting(vi, range_idx)? {
+            for (id, v) in self.hydrate_posting(vi, range_idx)?.iter() {
                 scored.push((
-                    id,
-                    kosha_vector_spfresh::cosine_similarity(query, &v) as f64,
+                    *id,
+                    kosha_vector_spfresh::cosine_similarity(query, v) as f64,
                 ));
             }
         }
@@ -4364,6 +4414,41 @@ mod tests {
         w.write_vectors_v2().unwrap();
         w.write_footer(Bm25Params::default()).unwrap();
         seg_id
+    }
+
+    #[test]
+    fn warm_knn_serves_postings_from_cache_without_touching_vector_idx() {
+        let dir = std::env::temp_dir().join("kosha-test-vector-v2-posting-cache");
+        write_v2_fixture(
+            &dir,
+            &[
+                ("d0", vec![1.0, 0.0, 0.0, 0.0]),
+                ("d1", vec![0.0, 1.0, 0.0, 0.0]),
+                ("d2", vec![0.0, 0.0, 1.0, 0.0]),
+                ("d3", vec![0.9, 0.1, 0.0, 0.0]),
+            ],
+        );
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let q = [1.0, 0.0, 0.0, 0.0];
+        // Two identical searches: the first records every probed posting in
+        // the second-touch admission ring, the second hydrates them again
+        // and caches the decodes.
+        let first = r.knn_search(&q, 2, 16).expect("lazy index").unwrap();
+        let second = r.knn_search(&q, 2, 16).expect("lazy index").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.first().map(|(id, _)| *id), Some(0));
+
+        // Delete the backing file: a warm search must be served entirely
+        // from the decoded-postings cache and never reopen `vector.idx`.
+        fs::remove_file(dir.join("vector.idx")).unwrap();
+        let third = r
+            .knn_search(&q, 2, 16)
+            .expect("lazy index")
+            .expect("warm search must not read vector.idx");
+        assert_eq!(first, third);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
