@@ -1243,6 +1243,48 @@ impl AppState {
                         t_ds.elapsed().as_secs_f64(),
                     );
                 }
+
+                // Phase 4 — vector indexes, only for namespaces that have
+                // them. A cold kNN query otherwise hydrates `vector.idx`
+                // (hundreds of MB to GBs per segment at embedding scale)
+                // on the query path — the doc-store lesson (#123/#126) in
+                // vector form. Probe one segment's tiny `vector.offsets`
+                // sidecar first: segments are format-homogeneous within a
+                // namespace in practice, and a text-only namespace skips
+                // the whole phase without issuing per-segment fetches for
+                // files that don't exist.
+                let probe = &seg_paths[..1.min(seg_paths.len())];
+                let _ = self.ensure_files_local(probe, "vector.offsets");
+                let namespace_has_vectors = probe
+                    .first()
+                    .map(|p| p.join("vector.offsets").is_file())
+                    .unwrap_or(false);
+                if namespace_has_vectors {
+                    let t_vec = std::time::Instant::now();
+                    let mut vec_files = 0usize;
+                    let mut vec_bytes = 0u64;
+                    for chunk in seg_paths.chunks(8) {
+                        let (files, bytes) = self.ensure_files_local(chunk, "vector.offsets");
+                        vec_files += files;
+                        vec_bytes += bytes;
+                    }
+                    // Same chunks-of-2 as doc stores: vector.idx bodies are
+                    // buffered whole in memory during fetch.
+                    for chunk in seg_paths.chunks(2) {
+                        let (files, bytes) = self.ensure_files_local(chunk, "vector.idx");
+                        vec_files += files;
+                        vec_bytes += bytes;
+                    }
+                    println!(
+                        "warmup: [{}/{}] '{ns_name}' vector indexes ready: fetched {} file(s), \
+                         {:.1} MB in {:.1}s",
+                        idx + 1,
+                        total,
+                        vec_files,
+                        vec_bytes as f64 / (1024.0 * 1024.0),
+                        t_vec.elapsed().as_secs_f64(),
+                    );
+                }
             }
         }
         self.warmup_complete
