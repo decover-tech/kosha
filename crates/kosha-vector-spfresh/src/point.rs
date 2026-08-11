@@ -1,19 +1,56 @@
-//! Cosine distance — deliberately matches `kosha_segment::CosinePoint::distance`
-//! bit-for-bit so this crate's behavior is directly comparable to kosha's
-//! current HNSW path (see the benches).
+//! Cosine distance and the dot-product primitives behind it. Accumulation
+//! is chunked into independent lanes (see [`dot`]) rather than one serial
+//! `.sum()` chain, so results differ from the historical
+//! `kosha_segment::CosinePoint::distance` in the last float bits — nothing
+//! persisted or compared across versions depends on bit-exact scores, and
+//! the HNSW path this was once kept bit-compatible with is gone (#126).
+
+/// Dot product with 8 independent accumulator lanes. A plain
+/// `.zip().map().sum()` compiles to a serial dependency chain (rustc won't
+/// reassociate f32 addition), leaving SIMD units idle in the hottest loop
+/// of both kNN scoring and k-means; independent lanes let LLVM vectorize.
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dot: dimension mismatch");
+    let mut acc = [0.0f32; 8];
+    let ca = a.chunks_exact(8);
+    let cb = b.chunks_exact(8);
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    for (xa, xb) in ca.zip(cb) {
+        for l in 0..8 {
+            acc[l] += xa[l] * xb[l];
+        }
+    }
+    let mut s = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    for (x, y) in ra.iter().zip(rb.iter()) {
+        s += x * y;
+    }
+    s
+}
+
+/// Scale `v` to unit L2 norm in place. A zero vector is left untouched —
+/// downstream dot scoring then yields similarity `0`, matching
+/// `cosine_distance`'s "zero-norm is maximally distant" convention.
+pub fn normalize_in_place(v: &mut [f32]) {
+    let n = dot(v, v).sqrt();
+    if n > 0.0 {
+        let inv = 1.0 / n;
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
+}
 
 /// `1.0 - clamp(dot(a,b) / (||a|| * ||b||), -1, 1)`; a zero-norm vector is
-/// defined to be maximally distant (`1.0`) from everything, matching
-/// kosha-segment's `CosinePoint::distance`.
+/// defined to be maximally distant (`1.0`) from everything.
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "cosine_distance: dimension mismatch");
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let d = dot(a, b);
+    let na = dot(a, a).sqrt();
+    let nb = dot(b, b).sqrt();
     if na == 0.0 || nb == 0.0 {
         return 1.0;
     }
-    1.0 - (dot / (na * nb)).clamp(-1.0, 1.0)
+    1.0 - (d / (na * nb)).clamp(-1.0, 1.0)
 }
 
 /// `1.0 - cosine_distance(a, b)`.

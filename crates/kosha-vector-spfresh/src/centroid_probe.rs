@@ -19,12 +19,20 @@ fn rank_by_distance<'a>(
     query: &[f32],
     limit: usize,
 ) -> Vec<usize> {
+    rank_by(candidates, limit, |c| cosine_distance(query, c))
+}
+
+/// Ranking core parameterized on the distance function (ascending — smaller
+/// is nearer), so the unit-norm dot path shares the same select/sort logic.
+fn rank_by<'a>(
+    candidates: impl Iterator<Item = (usize, &'a [f32])>,
+    limit: usize,
+    distance: impl Fn(&[f32]) -> f32,
+) -> Vec<usize> {
     if limit == 0 {
         return Vec::new();
     }
-    let mut scored: Vec<(usize, f32)> = candidates
-        .map(|(id, c)| (id, cosine_distance(query, c)))
-        .collect();
+    let mut scored: Vec<(usize, f32)> = candidates.map(|(id, c)| (id, distance(c))).collect();
     let n = limit.min(scored.len());
     if n == 0 {
         return Vec::new();
@@ -61,6 +69,19 @@ pub fn nearest_centroids(centroids: &[Vec<f32>], query: &[f32], nprobe: usize) -
         centroids.iter().enumerate().map(|(i, c)| (i, c.as_slice())),
         query,
         nprobe,
+    )
+}
+
+/// [`nearest_centroids`] for the unit-norm fast path: when `query` and every
+/// centroid are unit-L2, `1 - dot` *is* the cosine distance, so ranking by
+/// negated dot gives the identical order without recomputing norms per
+/// comparison. Callers are responsible for the unit-norm precondition (in
+/// kosha-segment it's carried by the vector-index format version).
+pub fn nearest_centroids_dot(centroids: &[Vec<f32>], query: &[f32], nprobe: usize) -> Vec<usize> {
+    rank_by(
+        centroids.iter().enumerate().map(|(i, c)| (i, c.as_slice())),
+        nprobe,
+        |c| -crate::point::dot(query, c),
     )
 }
 
