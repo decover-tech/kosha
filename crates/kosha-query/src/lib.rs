@@ -940,6 +940,26 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     (dot / (norm_a * norm_b)) as f64
 }
 
+/// Over-fetch multiplier for per-segment kNN whenever candidates can be
+/// rejected *after* the top-`k` cut (tombstones, `knn.filter`, or a
+/// top-level `query.filter`): the segment fetches `k × factor` candidates
+/// and truncates back to `k` survivors post-rejection. Without it, a
+/// selective filter or a batch of deletes landing near the query silently
+/// voids most (or all) of the page. Nearly free on the lazy v2 path, which
+/// scores every hydrated candidate regardless and uses `k` only to
+/// truncate. `KOSHA_KNN_OVERFETCH_FACTOR`, default 10, min 1 (disables
+/// over-fetching). Read once.
+fn knn_overfetch_factor() -> usize {
+    static FACTOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FACTOR.get_or_init(|| {
+        std::env::var("KOSHA_KNN_OVERFETCH_FACTOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10)
+            .max(1)
+    })
+}
+
 /// Flat kNN search: compute cosine similarity against all stored vectors,
 /// return top-K (doc_seq, score) pairs.
 pub fn flat_knn(query_vector: &[f32], vectors: &[(u32, Vec<f32>)], k: usize) -> Vec<(u32, f64)> {
@@ -1173,8 +1193,10 @@ impl Searcher {
             Some(open_stats),
         )?;
         let total_docs = reader.doc_count();
-        let needs_filter_store =
-            query.filter.is_some() || !sort_value_fields.is_empty() || !query.aggs.is_empty();
+        let needs_filter_store = query.filter.is_some()
+            || query.knn.as_ref().is_some_and(|k| k.filter.is_some())
+            || !sort_value_fields.is_empty()
+            || !query.aggs.is_empty();
         let filter_store = if needs_filter_store {
             Some(reader.filter_store())
         } else {
@@ -2025,12 +2047,27 @@ impl Searcher {
         // one, else HNSW, else flat fallback — unchanged for anything that
         // isn't a v2 segment) ──
         if let Some(ref knn) = query.knn {
+            // Tombstones, the kNN-scoped filter, and the top-level filter
+            // all reject candidates *after* the per-segment kNN has cut to
+            // `k` — so a selective filter (or deletes landing near the
+            // query vector) could void most or all of the k and silently
+            // return a short page. Over-fetch whenever post-kNN rejection
+            // is possible, then truncate back to `k` survivors below.
+            let can_reject = knn.filter.is_some()
+                || query.filter.is_some()
+                || tombstones
+                    .is_some_and(|t| t.get(&entry.segment_id).is_some_and(|s| !s.is_empty()));
+            let fetch_k = if can_reject {
+                knn.k.saturating_mul(knn_overfetch_factor())
+            } else {
+                knn.k
+            };
             // `knn.num_candidates` used to be a dead field (defined on
             // `KnnQuery`, never read downstream) — it's now the lazy path's
             // `nprobe`: how many posting centroids to probe per query.
-            let knn_results: Vec<(u32, f64)> = match reader.knn_search(
+            let mut knn_results: Vec<(u32, f64)> = match reader.knn_search(
                 &knn.vector,
-                knn.k,
+                fetch_k,
                 knn.num_candidates,
             ) {
                 Some(Ok(results)) => results,
@@ -2046,33 +2083,59 @@ impl Searcher {
                         let query_point = kosha_segment::CosinePoint(knn.vector.clone());
                         let mut search = instant_distance::Search::default();
                         hnsw.search(&query_point, &mut search)
-                            .take(knn.k)
+                            .take(fetch_k)
                             .map(|item| (*item.value, (1.0 - item.distance as f64).max(0.0)))
                             .collect()
                     } else {
-                        flat_knn(&knn.vector, &reader.vector_store.vectors, knn.k)
+                        flat_knn(&knn.vector, &reader.vector_store.vectors, fetch_k)
                     }
                 }
                 None => Vec::new(),
             };
+            // `knn.filter` — accepted on the wire since the field was
+            // introduced but silently ignored until now. It scopes the kNN
+            // candidates themselves (which docs may be vector matches);
+            // the top-level `query.filter` continues to govern the merged
+            // result set as before.
+            if let Some(ref clause) = knn.filter {
+                let candidates: HashSet<u32> = knn_results.iter().map(|(d, _)| *d).collect();
+                let passed = FilterApplier::apply(
+                    clause,
+                    filter_store.expect("knn.filter requires filter_store"),
+                    &candidates,
+                )?;
+                knn_results.retain(|(d, _)| passed.contains(d));
+            }
             // Merge with this segment's BM25 hits or use kNN directly.
             // Per-segment HashMap keeps hybrid merge O(k), not O(hits·k).
             // (A no-op on an empty `knn_results`, same as before this
             // block existed — no separate emptiness gate needed.)
             if !seg_hits.is_empty() {
+                // Hybrid blend: only docs already in `seg_hits` (i.e. that
+                // passed the lexical/filter legs) receive their vector
+                // contribution — the over-fetched tail just means more of
+                // the surviving docs get their true vector score instead
+                // of missing the old top-`k` cut.
                 for (doc_seq, knn_score) in knn_results {
                     if let Some(existing) = seg_hits.get_mut(&doc_seq) {
                         *existing = *existing * 0.5 + knn_score * 0.5 * 100.0;
                     }
                 }
             } else {
-                // Pure kNN search for this segment.
+                // Pure kNN search for this segment: keep the top `knn.k`
+                // *live* candidates. The list is score-descending, so stop
+                // once k survivors are in.
+                let mut kept = 0usize;
                 for (doc_seq, score) in knn_results {
+                    if kept >= knn.k {
+                        break;
+                    }
                     if is_tombstoned(doc_seq) {
                         continue;
                     }
                     if reader.doc_meta(doc_seq).is_some() {
                         seg_hits.insert(doc_seq, (score + 1.0) * 10.0);
+                        kept += 1;
                     }
                 }
             }
@@ -4767,6 +4830,120 @@ mod tests {
             "exact match must always be in the results: {got_ids:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 40 unit vectors around a circle, doc `i` at angle `i·9°`, each
+    /// tagged with a `parity` keyword — the shared fixture for the kNN
+    /// over-fetch tests below. Returns the corpus dir + manifest.
+    fn knn_circle_corpus_with_parity(dir_name: &str) -> (std::path::PathBuf, Manifest) {
+        let dir = std::env::temp_dir().join(dir_name);
+        let _ = std::fs::remove_dir_all(&dir);
+        let seg_dir = dir.join("test").join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for i in 0..40u32 {
+            let angle = (i as f32) * std::f32::consts::PI / 20.0;
+            let parity = if i % 2 == 0 { "even" } else { "odd" };
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![
+                    Field::vector("contentEmbedding", vec![angle.cos(), angle.sin(), 0.0, 0.0]),
+                    Field::keyword("parity", parity),
+                ],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 40,
+            }],
+            segment_footers: Default::default(),
+        };
+        (dir, manifest)
+    }
+
+    fn mk_knn_circle_query(k: usize, filter: Option<kosha_core::FilterClause>) -> SearchQuery {
+        let mut q = mk_query("", k);
+        q.knn = Some(kosha_core::KnnQuery {
+            field: "contentEmbedding".into(),
+            vector: vec![1.0, 0.0, 0.0, 0.0], // exact match for d0
+            k,
+            num_candidates: 40,
+            filter,
+        });
+        q
+    }
+
+    #[test]
+    fn knn_scoped_filter_restricts_candidates_not_silently_ignored() {
+        // `KnnQuery.filter` was accepted on the wire and silently ignored —
+        // a filtered vector search returned unfiltered neighbors. The
+        // query vector sits exactly on d0 ("even"); filtering to "odd"
+        // must return only odd docs, led by the nearest odd neighbors
+        // (d1 and d39, ±9° away).
+        let (dir, manifest) = knn_circle_corpus_with_parity("kosha-test-knn-scoped-filter");
+        let ns = NamespaceId("test".into());
+        let searcher = Searcher::new(dir.clone());
+        let q = mk_knn_circle_query(
+            5,
+            Some(kosha_core::FilterClause::Term {
+                term: std::collections::HashMap::from([("parity".into(), "odd".into())]),
+            }),
+        );
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        let got: Vec<&str> = r.results.iter().map(|h| h.doc_id.0.as_str()).collect();
+        assert_eq!(
+            r.results.len(),
+            5,
+            "filtered kNN page came up short: {got:?}"
+        );
+        for id in &got {
+            let i: u32 = id[1..].parse().unwrap();
+            assert!(
+                i % 2 == 1,
+                "knn.filter=odd returned an even doc {id}: {got:?}"
+            );
+        }
+        assert!(
+            got.contains(&"d1") && got.contains(&"d39"),
+            "nearest odd neighbors missing: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_overfetch_survives_tombstoned_nearest_neighbors() {
+        // Tombstones are applied after the per-segment kNN cut to `k` —
+        // without over-fetch, deleting the k nearest docs returns an empty
+        // page even though 37 live vectors remain. Tombstone the three
+        // nearest to the query (d0, d1, d39) and ask for k=3: the page
+        // must still hold three live docs, led by the next ring (d2, d38).
+        let (dir, manifest) = knn_circle_corpus_with_parity("kosha-test-knn-tombstone-overfetch");
+        let ns = NamespaceId("test".into());
+        let searcher = Searcher::new(dir.clone());
+        let tombstones = std::collections::HashMap::from([(
+            SegmentId("s1".into()),
+            std::collections::HashSet::from([0u32, 1, 39]),
+        )]);
+        let q = mk_knn_circle_query(3, None);
+        let r = searcher
+            .search(&ns, &manifest, &q, Some(&tombstones))
+            .unwrap();
+        let got: Vec<&str> = r.results.iter().map(|h| h.doc_id.0.as_str()).collect();
+        assert_eq!(
+            r.results.len(),
+            3,
+            "kNN page shorted by tombstoned neighbors: {got:?}"
+        );
+        for id in ["d0", "d1", "d39"] {
+            assert!(!got.contains(&id), "tombstoned doc {id} returned: {got:?}");
+        }
+        assert!(
+            got.contains(&"d2") && got.contains(&"d38"),
+            "next-nearest live docs missing: {got:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
