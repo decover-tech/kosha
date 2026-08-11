@@ -25,9 +25,9 @@ mod search;
 
 use std::collections::HashMap;
 
-pub use centroid_probe::nearest_centroids;
+pub use centroid_probe::{nearest_centroids, nearest_centroids_dot};
 pub use error::VectorIndexError;
-pub use point::{cosine_distance, cosine_similarity};
+pub use point::{cosine_distance, cosine_similarity, dot, normalize_in_place};
 pub use rng::DeterministicRng;
 
 use posting::{Posting, PostingId};
