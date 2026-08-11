@@ -25,8 +25,10 @@ import argparse
 import array
 import itertools
 import json
+import os
 import statistics
 import subprocess
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -81,26 +83,33 @@ def iter_emb_records(emb_dir: str):
         )
         if not names:
             raise SystemExit(f"no emb-*.f32 objects under {base}/")
+        tmp_dir = bench_tmp_dir()
         for name in names:
             ids_name = name[: -len(".f32")] + ".ids"
-            ids = subprocess.run(
-                ["aws", "s3", "cp", f"{base}/{ids_name}", "-"],
-                check=True, capture_output=True, text=True,
-            ).stdout.splitlines()
-            proc = subprocess.Popen(
-                ["aws", "s3", "cp", f"{base}/{name}", "-"],
-                stdout=subprocess.PIPE,
-            )
-            assert proc.stdout is not None
-            for docid in ids:
-                buf = proc.stdout.read(EMB_REC_BYTES)
-                if len(buf) != EMB_REC_BYTES:
-                    raise SystemExit(f"truncated embedding shard {name}")
-                vec = array.array("f")
-                vec.frombytes(buf)
-                yield docid, list(vec)
-            if proc.wait() != 0:
-                raise SystemExit(f"aws s3 cp failed for {base}/{name}")
+            ids_tmp = tmp_dir / f"stage-{os.getpid()}-{ids_name}"
+            f32_tmp = tmp_dir / f"stage-{os.getpid()}-{name}"
+            s3_fetch_with_retries(f"{base}/{ids_name}", ids_tmp)
+            s3_fetch_with_retries(f"{base}/{name}", f32_tmp)
+            try:
+                ids = ids_tmp.read_text().splitlines()
+                expected = len(ids) * EMB_REC_BYTES
+                actual = f32_tmp.stat().st_size
+                if actual != expected:
+                    raise SystemExit(
+                        f"embedding shard {name}: {actual} bytes on disk, "
+                        f"{expected} expected for {len(ids)} ids"
+                    )
+                with f32_tmp.open("rb") as f:
+                    for docid in ids:
+                        buf = f.read(EMB_REC_BYTES)
+                        if len(buf) != EMB_REC_BYTES:
+                            raise SystemExit(f"truncated embedding shard {name}")
+                        vec = array.array("f")
+                        vec.frombytes(buf)
+                        yield docid, list(vec)
+            finally:
+                ids_tmp.unlink(missing_ok=True)
+                f32_tmp.unlink(missing_ok=True)
     else:
         shard_paths = sorted(Path(emb_dir).glob("emb-*.f32"))
         if not shard_paths:
@@ -134,6 +143,37 @@ def post_batch(session, host, namespace, headers, docs, timeout) -> float:
     return time.time() - t0
 
 
+def s3_fetch_with_retries(url: str, dest: Path) -> None:
+    """Download one S3 object to a local file, retrying transient failures.
+
+    Streaming objects through a live `aws s3 cp <key> -` pipe proved
+    fragile: while the loader blocks on a flush-triggering /index request
+    (minutes at large flush thresholds), the pipe backs up and the idle S3
+    connection gets killed — surfacing as a truncated shard mid-load
+    (round 9). A to-file download gets the CLI's own retry/resume
+    machinery, and per-shard staging is only one shard of disk at a time.
+    """
+    for attempt in range(4):
+        r = subprocess.run(
+            ["aws", "s3", "cp", "--quiet", url, str(dest)],
+            capture_output=True,
+        )
+        if r.returncode == 0:
+            return
+        time.sleep(2 ** attempt)
+    raise SystemExit(f"aws s3 cp failed after 4 attempts: {url}")
+
+
+def bench_tmp_dir() -> Path:
+    """Shard staging dir — /data/tmp when the bench VM's big volume exists,
+    else the system tempdir."""
+    data_tmp = Path("/data/tmp")
+    if data_tmp.parent.is_dir():
+        data_tmp.mkdir(exist_ok=True)
+        return data_tmp
+    return Path(tempfile.gettempdir())
+
+
 def iter_shard_lines(corpus_dir: str):
     """Yield NDJSON lines across all shards, local dir or s3://bucket/prefix.
 
@@ -157,16 +197,15 @@ def iter_shard_lines(corpus_dir: str):
         shards.sort()
         if not shards:
             raise SystemExit(f"no shard-*.ndjson objects under {base}/")
+        tmp_dir = bench_tmp_dir()
         for name in shards:
-            proc = subprocess.Popen(
-                ["aws", "s3", "cp", f"{base}/{name}", "-"],
-                stdout=subprocess.PIPE,
-                text=True,
-            )
-            assert proc.stdout is not None
-            yield from proc.stdout
-            if proc.wait() != 0:
-                raise SystemExit(f"aws s3 cp failed for {base}/{name}")
+            tmp = tmp_dir / f"stage-{os.getpid()}-{name}"
+            s3_fetch_with_retries(f"{base}/{name}", tmp)
+            try:
+                with tmp.open() as f:
+                    yield from f
+            finally:
+                tmp.unlink(missing_ok=True)
     else:
         shard_paths = sorted(Path(corpus_dir).glob("shard-*.ndjson"))
         if not shard_paths:
