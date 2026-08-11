@@ -48,6 +48,7 @@ sudo docker run -d --name kosha --network host \
   -e KOSHA_CACHE_DIR=/var/cache/kosha -e KOSHA_DATA_DIR=/var/cache/kosha/data \
   -e KOSHA_CACHE_MAX_BYTES=644245094400 -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \
   -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
+  -e KOSHA_SEGMENT_CACHE_CAPACITY=16384 \
   -v /data/kosha:/var/cache/kosha kosha-server:bench8 >/dev/null
 until curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null; do sleep 2; done
 echo "kosha up"

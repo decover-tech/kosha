@@ -33,6 +33,7 @@ start_kosha() {
     -e KOSHA_CACHE_DIR=/var/cache/kosha -e KOSHA_DATA_DIR=/var/cache/kosha/data \
     -e KOSHA_CACHE_MAX_BYTES=644245094400 -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \
     -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
+    -e KOSHA_SEGMENT_CACHE_CAPACITY=16384 \
     -e KOSHA_WARMUP_NAMESPACES="msmarco-10m-vec,default/msmarco-10m-vec" \
     -v /data/kosha:/var/cache/kosha kosha-server:bench10 >/dev/null
   until curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null; do sleep 3; done

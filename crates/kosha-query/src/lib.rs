@@ -45,7 +45,26 @@ pub type DocStoreHydrator<'a> = Option<&'a dyn Fn(&[PathBuf])>;
 /// [`SegmentCache`]). Segments are immutable once written (DESIGN.md §6.2),
 /// so caching a parsed segment indefinitely is safe — the only reason to
 /// bound this is memory, not staleness.
-pub const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = 64;
+///
+/// [`SegmentCache`] enforces this count cap AND the byte budget below
+/// together (`len <= capacity && total <= max_bytes`) — whichever binds
+/// first governs eviction. The byte budget is sized to actually reflect
+/// available memory and is the intended primary bound; this count cap
+/// exists only as a defensive ceiling against many-tiny-segments
+/// pathologies (thousands of near-empty segments whose fixed per-entry
+/// overhead — open file handles, mmap regions, bookkeeping — could matter
+/// even while comfortably under the byte budget).
+///
+/// It must stay well above `2 × (typical segment count)`: each segment is
+/// cached under up to two distinct keys — lexical (`load_vectors=false`)
+/// and vector (`load_vectors=true`) — since `Searcher::open_segment` keys
+/// on both the segment id and that flag. A cap sized for one variant only starves
+/// the other under mixed BM25+kNN traffic: whichever variant is queried
+/// less often gets LRU-evicted by the more frequent one before it can
+/// ever be reused, even though the byte budget has ample room (issue
+/// #136 — a 200-segment vector namespace saw `opens_cold=200` on *every*
+/// query, cache hits never happening, because this cap was 64).
+pub const DEFAULT_SEGMENT_CACHE_CAPACITY: usize = 4096;
 
 /// Default byte budget for [`SegmentCache`] (see its doc comment for why
 /// this exists at all). Deliberately conservative and independent of
@@ -3669,6 +3688,23 @@ mod tests {
         seg_dir
     }
 
+    /// Like [`mk_segment`], but the document also carries a vector field —
+    /// so the segment can serve both the lexical and kNN cache-key variant
+    /// (see `Searcher::open_segment`'s `load_vectors` flag).
+    fn mk_segment_with_vector(root: &std::path::Path, ns: &str, seg: &str, text: &str) -> PathBuf {
+        let seg_dir = root.join(ns).join(seg);
+        let mut w = SegmentWriter::new(SegmentId(seg.into()), seg_dir.clone());
+        w.add_document(
+            DocumentId(format!("{seg}-d1")),
+            vec![
+                Field::text("t", text),
+                Field::vector("emb", vec![1.0, 0.0, 0.0]),
+            ],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+        seg_dir
+    }
+
     fn ledger_snapshot(searcher: &Searcher) -> (u64, u64, usize) {
         let st = searcher.ledger.state.lock().unwrap();
         (st.live, st.reserved, st.active)
@@ -3865,6 +3901,90 @@ mod tests {
             .unwrap();
         assert_eq!((stats.open_cold, stats.open_cached), (0, 2));
         assert_eq!(stats.open_total_ms, 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixed_bm25_and_knn_traffic_both_stay_cached_under_default_limits() {
+        // Issue #136: a 200-segment namespace under real (mixed BM25 + kNN)
+        // traffic reported opens_cold=200 on *every* kNN query — the cache
+        // never held on to the vector-variant opens. Root cause was not a
+        // key mismatch (lexical and kNN opens are correctly keyed on
+        // `load_vectors`); it was DEFAULT_SEGMENT_CACHE_CAPACITY (a count
+        // ceiling, independent of the byte budget) being sized for one
+        // variant of one segment each, not two variants of many. Under
+        // mixed traffic, whichever variant is queried less often gets
+        // LRU-evicted by the other before it can ever be reused, however
+        // much byte budget remains unused.
+        //
+        // 80 segments exceeds the old default cap (64) while two variants
+        // (160 keys) exceeds it twice over — this reproduces the bug
+        // against the *actual* production defaults (`Searcher::new`, not a
+        // hand-tuned small capacity), and must stay reproduced-and-fixed
+        // rather than passing by construction.
+        let dir = std::env::temp_dir().join("kosha-test-mixed-bm25-knn-cache");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        const N: usize = 80;
+        let mut segments = Vec::with_capacity(N);
+        for i in 0..N {
+            let seg = format!("s{i:03}");
+            mk_segment_with_vector(&dir, "test", &seg, "alpha beta");
+            segments.push(ManifestEntry {
+                segment_id: SegmentId(seg),
+                doc_count: 1,
+            });
+        }
+        let manifest = Manifest {
+            version: 1,
+            segments,
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        let mut knn_q = mk_query("", 10);
+        knn_q.knn = Some(kosha_core::KnnQuery {
+            field: "emb".into(),
+            vector: vec![1.0, 0.0, 0.0],
+            k: 10,
+            num_candidates: N,
+            filter: None,
+        });
+        let bm25_q = mk_query("alpha", 10);
+
+        // Cold pass, both variants: every segment opens fresh under each key.
+        let (_, stats) = searcher
+            .search_with_stats(&ns, &manifest, &bm25_q, None)
+            .unwrap();
+        assert_eq!((stats.open_cold, stats.open_cached), (N, 0));
+        let (_, stats) = searcher
+            .search_with_stats(&ns, &manifest, &knn_q, None)
+            .unwrap();
+        assert_eq!((stats.open_cold, stats.open_cached), (N, 0));
+
+        // Repeat BOTH variants again. With capacity correctly sized above
+        // 2N, neither variant evicted the other — both must now be fully
+        // cache-hit. (Before the fix, the kNN pass above evicted every
+        // BM25 entry inserted first, so the repeat BM25 search here would
+        // itself go cold again, and the repeat kNN search below — the
+        // literal issue #136 symptom — would too.)
+        let (_, stats) = searcher
+            .search_with_stats(&ns, &manifest, &bm25_q, None)
+            .unwrap();
+        assert_eq!(
+            (stats.open_cold, stats.open_cached),
+            (0, N),
+            "BM25 opens should be fully cached after a kNN pass touched the same segments"
+        );
+        let (_, stats) = searcher
+            .search_with_stats(&ns, &manifest, &knn_q, None)
+            .unwrap();
+        assert_eq!(
+            (stats.open_cold, stats.open_cached),
+            (0, N),
+            "kNN opens should be fully cached on repeat — issue #136"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
