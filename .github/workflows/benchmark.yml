@@ -101,7 +101,13 @@ jobs:
             sudo docker rm -f pg kosha 2>/dev/null || true
             sudo docker run -d --name pg --network host -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=kosha \
               -v /data/pg:/var/lib/postgresql/data postgres:16
-            until sudo docker exec pg pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done
+            # Bounded waits throughout: an unbounded `until` loop turns a
+            # crashed/never-healthy container into a silent hang that eats
+            # the whole 350-minute job budget with no signal (what happened
+            # in run 31641650173 — stuck 87+ min with no way to tell
+            # "still working" from "never coming up" short of cancelling).
+            for i in $(seq 60); do sudo docker exec pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 2
+              [ "$i" -eq 60 ] && { echo "::error::postgres never became ready after 120s"; sudo docker logs pg; exit 1; }; done
             sudo docker create --name kosha --network host \
               -e DATABASE_URL=postgresql://postgres:bench@127.0.0.1:5432/kosha \
               -e KOSHA_API_KEY=sk-bench \
@@ -114,7 +120,8 @@ jobs:
               -e KOSHA_WARMUP_NAMESPACES="msmarco-10m,msmarco-10m-vec" \
               -v /data/kosha:/var/cache/kosha kosha-server:bench
             sudo docker start kosha
-            until curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null; do sleep 3; done
+            for i in $(seq 60); do curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null && break; sleep 3
+              [ "$i" -eq 60 ] && { echo "::error::kosha /stats never responded after 180s"; sudo docker logs kosha; exit 1; }; done
             aws s3 cp --quiet s3://decoverai-bench-corpus-cache/msmarco-10m/queries.txt /data/queries.txt
             aws s3 cp --quiet s3://decoverai-bench-corpus-cache/msmarco-10m-emb/queries_emb.f32 /data/queries_emb.f32 || true'
 
