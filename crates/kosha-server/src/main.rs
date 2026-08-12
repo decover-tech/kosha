@@ -6154,6 +6154,7 @@ mod tests {
             filter_blooms: None,
             term_bloom: None,
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
+            vector_posting_radii: None,
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.
