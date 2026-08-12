@@ -375,18 +375,48 @@ impl SegmentWriter {
             return Ok(());
         }
         let dim = self.vectors[0].1.len();
+        // Unit-norm (write version 3, on-disk header version 2): normalize
+        // once here so the read path can score with a bare dot product.
+        // Clustering runs on the normalized copies too (spherical k-means —
+        // the geometry cosine actually ranks by), and snapshot centroids are
+        // re-normalized afterwards because a mean of unit vectors is not
+        // itself unit-length.
+        let unit_norm = vector_write_version() >= 3;
+        let normalized: Vec<(u32, Vec<f32>)>;
+        let vectors: &[(u32, Vec<f32>)] = if unit_norm {
+            normalized = self
+                .vectors
+                .iter()
+                .map(|(id, v)| {
+                    let mut v = v.clone();
+                    kosha_vector_spfresh::normalize_in_place(&mut v);
+                    (*id, v)
+                })
+                .collect();
+            &normalized
+        } else {
+            &self.vectors
+        };
         let config = kosha_vector_spfresh::ClusterIndexConfig::new(dim);
-        let index =
-            kosha_vector_spfresh::ClusterIndex::build(&self.vectors, config).map_err(|e| {
-                // A real ClusterIndex::build failure here (practically always
-                // DimensionMismatch — inconsistent vector dimensionality across
-                // documents in the same segment) means the legacy writer above
-                // would have silently written ragged, unparseable bytes instead.
-                // Fail loud rather than emit a corrupt vector.idx.
-                KoshaError::CorruptSegment(format!("failed to build vector index: {e}"))
-            })?;
-        let postings = index.snapshot();
-        let (idx_bytes, offsets_bytes) = encode_vector_index_v2(dim as u32, &postings);
+        let index = kosha_vector_spfresh::ClusterIndex::build(vectors, config).map_err(|e| {
+            // A real ClusterIndex::build failure here (practically always
+            // DimensionMismatch — inconsistent vector dimensionality across
+            // documents in the same segment) means the legacy writer above
+            // would have silently written ragged, unparseable bytes instead.
+            // Fail loud rather than emit a corrupt vector.idx.
+            KoshaError::CorruptSegment(format!("failed to build vector index: {e}"))
+        })?;
+        let mut postings = index.snapshot();
+        let format_version = if unit_norm {
+            for p in &mut postings {
+                kosha_vector_spfresh::normalize_in_place(&mut p.centroid);
+            }
+            UNIT_NORM_VECTOR_INDEX_VERSION
+        } else {
+            VECTOR_INDEX_VERSION
+        };
+        let (idx_bytes, offsets_bytes) =
+            encode_vector_index_v2(dim as u32, &postings, format_version);
         self.backend.write("vector.idx", &idx_bytes)?;
         self.backend.write("vector.offsets", &offsets_bytes)?;
         Ok(())
@@ -452,14 +482,18 @@ impl SegmentWriter {
 pub const VECTOR_MAGIC: u32 = u32::from_le_bytes(*b"KVE2");
 /// Magic prefix of the `vector.offsets` sidecar ("KVOF", little-endian u32).
 pub const VECTOR_OFFSETS_MAGIC: u32 = u32::from_le_bytes(*b"KVOF");
-/// The only vector-index version so far. A single canonical dispatch point
-/// (mirroring `is_split_inverted_version`'s discipline) even with nothing to
-/// dispatch between yet, so a future version bump doesn't have to invent the
-/// pattern from scratch.
+/// Version 1: vectors and centroids stored exactly as ingested (raw
+/// magnitudes) — scoring must normalize per comparison.
 pub const VECTOR_INDEX_VERSION: u32 = 1;
+/// Version 2: every stored vector and centroid is unit-L2-normalized at
+/// write time (zero vectors stay zero). Cosine then collapses to a plain
+/// dot product, so the read path skips the two norms + sqrts per
+/// comparison that dominate scoring at high `dim`. Scores are unchanged in
+/// meaning: dot of unit vectors *is* the cosine of the originals.
+pub const UNIT_NORM_VECTOR_INDEX_VERSION: u32 = 2;
 
 pub fn is_known_vector_index_version(version: u32) -> bool {
-    version == VECTOR_INDEX_VERSION
+    version == VECTOR_INDEX_VERSION || version == UNIT_NORM_VECTOR_INDEX_VERSION
 }
 
 /// `magic(4) + version(4) + dim(4) + total_count(4)`.
@@ -482,18 +516,19 @@ struct VectorPostingIndex {
 fn encode_vector_index_v2(
     dim: u32,
     postings: &[kosha_vector_spfresh::PostingSnapshot],
+    version: u32,
 ) -> (Vec<u8>, Vec<u8>) {
     let total_count: u32 = postings.iter().map(|p| p.entries.len() as u32).sum();
 
     let mut idx_buf = Vec::new();
     idx_buf.extend_from_slice(&VECTOR_MAGIC.to_le_bytes());
-    idx_buf.extend_from_slice(&VECTOR_INDEX_VERSION.to_le_bytes());
+    idx_buf.extend_from_slice(&version.to_le_bytes());
     idx_buf.extend_from_slice(&dim.to_le_bytes());
     idx_buf.extend_from_slice(&total_count.to_le_bytes());
 
     let mut offsets_buf = Vec::new();
     offsets_buf.extend_from_slice(&VECTOR_OFFSETS_MAGIC.to_le_bytes());
-    offsets_buf.extend_from_slice(&VECTOR_INDEX_VERSION.to_le_bytes());
+    offsets_buf.extend_from_slice(&version.to_le_bytes());
     offsets_buf.extend_from_slice(&dim.to_le_bytes());
     offsets_buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
 
@@ -517,11 +552,11 @@ fn encode_vector_index_v2(
     (idx_buf, offsets_buf)
 }
 
-/// Parses a v2 `vector.idx`'s header only — `(dim, total_count)`. `None` for
-/// anything that isn't a valid, recognized-version v2 header (legacy file,
-/// truncated, corrupt, unknown version) — callers fall back accordingly,
-/// never panic on untrusted disk content.
-fn parse_vector_idx_header(data: &[u8]) -> Option<(u32, u32)> {
+/// Parses a v2 `vector.idx`'s header only — `(dim, total_count, version)`.
+/// `None` for anything that isn't a valid, recognized-version v2 header
+/// (legacy file, truncated, corrupt, unknown version) — callers fall back
+/// accordingly, never panic on untrusted disk content.
+fn parse_vector_idx_header(data: &[u8]) -> Option<(u32, u32, u32)> {
     if data.len() < VECTOR_IDX_HEADER_LEN || data[0..4] != VECTOR_MAGIC.to_le_bytes() {
         return None;
     }
@@ -532,7 +567,7 @@ fn parse_vector_idx_header(data: &[u8]) -> Option<(u32, u32)> {
     }
     let dim = read_u32_le(&mut cursor);
     let total_count = read_u32_le(&mut cursor);
-    Some((dim, total_count))
+    Some((dim, total_count, version))
 }
 
 /// Eager fallback: parses the *entire* v2 blob into a flat vector list,
@@ -545,7 +580,7 @@ fn parse_vector_idx_header(data: &[u8]) -> Option<(u32, u32)> {
 /// returns `None`, same "never trust blindly" discipline as
 /// `try_read_doc_index`'s doc-count cross-check.
 fn parse_vector_idx_eager(data: &[u8]) -> Option<VectorStore> {
-    let (dim, total_count) = parse_vector_idx_header(data)?;
+    let (dim, total_count, _version) = parse_vector_idx_header(data)?;
     let record_size = 4 + 4 * dim as usize;
     let expected_len = VECTOR_IDX_HEADER_LEN + total_count as usize * record_size;
     if data.len() != expected_len {
@@ -567,19 +602,26 @@ fn parse_vector_idx_eager(data: &[u8]) -> Option<VectorStore> {
     })
 }
 
-/// Parses `vector.offsets` into the lazy posting index. `expected_dim`
-/// cross-checks against `vector.idx`'s own header dim (already parsed by
-/// the caller) — any mismatch is treated as corruption, matching the same
-/// "never trust one file over the other" discipline `try_read_doc_index`
-/// applies to its doc-count check. Also validates total file length against
-/// the header-implied size before trusting any per-record read.
-fn parse_vector_offsets(data: &[u8], expected_dim: u32) -> Option<Vec<VectorPostingIndex>> {
+/// Parses `vector.offsets` into the lazy posting index. `expected_dim` and
+/// `expected_version` cross-check against `vector.idx`'s own header (already
+/// parsed by the caller) — any mismatch is treated as corruption, matching
+/// the same "never trust one file over the other" discipline
+/// `try_read_doc_index` applies to its doc-count check. The version check
+/// matters since unit-norm (v2): a stale sidecar paired with a rewritten
+/// blob could otherwise flip the scoring path. Also validates total file
+/// length against the header-implied size before trusting any per-record
+/// read.
+fn parse_vector_offsets(
+    data: &[u8],
+    expected_dim: u32,
+    expected_version: u32,
+) -> Option<Vec<VectorPostingIndex>> {
     if data.len() < VECTOR_OFFSETS_HEADER_LEN || data[0..4] != VECTOR_OFFSETS_MAGIC.to_le_bytes() {
         return None;
     }
     let mut cursor = &data[4..];
     let version = read_u32_le(&mut cursor);
-    if !is_known_vector_index_version(version) {
+    if !is_known_vector_index_version(version) || version != expected_version {
         return None;
     }
     let dim = read_u32_le(&mut cursor);
@@ -647,13 +689,16 @@ mod vector_index_v2_tests {
     #[test]
     fn round_trips_header_and_posting_boundaries() {
         let postings = sample_postings();
-        let (idx_bytes, offsets_bytes) = encode_vector_index_v2(2, &postings);
+        let (idx_bytes, offsets_bytes) = encode_vector_index_v2(2, &postings, VECTOR_INDEX_VERSION);
 
-        let (dim, total_count) = parse_vector_idx_header(&idx_bytes).expect("valid v2 header");
+        let (dim, total_count, version) =
+            parse_vector_idx_header(&idx_bytes).expect("valid v2 header");
+        assert_eq!(version, VECTOR_INDEX_VERSION);
         assert_eq!(dim, 2);
         assert_eq!(total_count, 3);
 
-        let parsed_offsets = parse_vector_offsets(&offsets_bytes, dim).expect("valid sidecar");
+        let parsed_offsets =
+            parse_vector_offsets(&offsets_bytes, dim, VECTOR_INDEX_VERSION).expect("valid sidecar");
         assert_eq!(parsed_offsets.len(), 2);
         assert_eq!(parsed_offsets[0].centroid, vec![1.0, 0.0]);
         assert_eq!(parsed_offsets[1].centroid, vec![0.0, 1.0]);
@@ -669,7 +714,8 @@ mod vector_index_v2_tests {
     #[test]
     fn eager_fallback_recovers_flat_vector_list_without_sidecar() {
         let postings = sample_postings();
-        let (idx_bytes, _offsets_bytes) = encode_vector_index_v2(2, &postings);
+        let (idx_bytes, _offsets_bytes) =
+            encode_vector_index_v2(2, &postings, VECTOR_INDEX_VERSION);
         let store = parse_vector_idx_eager(&idx_bytes).expect("valid v2 blob");
         assert_eq!(store.dimensions, 2);
         let mut ids: Vec<u32> = store.vectors.iter().map(|(id, _)| *id).collect();
@@ -691,7 +737,8 @@ mod vector_index_v2_tests {
     #[test]
     fn truncated_vector_idx_is_rejected_not_panicked_on() {
         let postings = sample_postings();
-        let (mut idx_bytes, _offsets_bytes) = encode_vector_index_v2(2, &postings);
+        let (mut idx_bytes, _offsets_bytes) =
+            encode_vector_index_v2(2, &postings, VECTOR_INDEX_VERSION);
         idx_bytes.truncate(idx_bytes.len() - 3);
         assert!(parse_vector_idx_eager(&idx_bytes).is_none());
     }
@@ -699,17 +746,30 @@ mod vector_index_v2_tests {
     #[test]
     fn truncated_offsets_sidecar_is_rejected_not_panicked_on() {
         let postings = sample_postings();
-        let (_idx_bytes, mut offsets_bytes) = encode_vector_index_v2(2, &postings);
+        let (_idx_bytes, mut offsets_bytes) =
+            encode_vector_index_v2(2, &postings, VECTOR_INDEX_VERSION);
         offsets_bytes.truncate(offsets_bytes.len() - 3);
-        assert!(parse_vector_offsets(&offsets_bytes, 2).is_none());
+        assert!(parse_vector_offsets(&offsets_bytes, 2, VECTOR_INDEX_VERSION).is_none());
     }
 
     #[test]
     fn dim_mismatch_between_files_is_rejected() {
         let postings = sample_postings();
-        let (_idx_bytes, offsets_bytes) = encode_vector_index_v2(2, &postings);
+        let (_idx_bytes, offsets_bytes) =
+            encode_vector_index_v2(2, &postings, VECTOR_INDEX_VERSION);
         // vector.idx claims dim=3, but the sidecar was built for dim=2.
-        assert!(parse_vector_offsets(&offsets_bytes, 3).is_none());
+        assert!(parse_vector_offsets(&offsets_bytes, 3, VECTOR_INDEX_VERSION).is_none());
+    }
+
+    #[test]
+    fn version_mismatch_between_files_is_rejected() {
+        let postings = sample_postings();
+        // Sidecar written raw (v1) but vector.idx claims unit-norm (v2):
+        // trusting the pair would score raw-magnitude vectors with the
+        // dot-only path — reject, falling back to the eager parse.
+        let (_idx_bytes, offsets_bytes) =
+            encode_vector_index_v2(2, &postings, VECTOR_INDEX_VERSION);
+        assert!(parse_vector_offsets(&offsets_bytes, 2, UNIT_NORM_VECTOR_INDEX_VERSION).is_none());
     }
 
     #[test]
@@ -737,12 +797,14 @@ mod vector_index_v2_tests {
         writer.write_vectors_v2().unwrap();
 
         let data = fs::read(dir.join("vector.idx")).unwrap();
-        let (dim, total_count) = parse_vector_idx_header(&data).expect("valid v2 header");
+        let (dim, total_count, version) = parse_vector_idx_header(&data).expect("valid v2 header");
         assert_eq!(dim, 2);
         assert_eq!(total_count, 2);
+        // The real writer defaults to the unit-norm version (write gate 3).
+        assert_eq!(version, UNIT_NORM_VECTOR_INDEX_VERSION);
 
         let offsets_data = fs::read(dir.join("vector.offsets")).unwrap();
-        let postings = parse_vector_offsets(&offsets_data, dim).expect("valid sidecar");
+        let postings = parse_vector_offsets(&offsets_data, dim, version).expect("valid sidecar");
         let mut ids: Vec<u32> = postings
             .iter()
             .flat_map(|p| {
@@ -755,6 +817,71 @@ mod vector_index_v2_tests {
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![0, 1]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unit_norm_writes_store_unit_vectors_and_score_like_cosine() {
+        let dir = std::env::temp_dir().join(format!("kosha-v2-unitnorm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Deliberately non-unit magnitudes: cosine must ignore them, and the
+        // stored representation must not preserve them.
+        let originals: Vec<(&str, Vec<f32>)> = vec![
+            ("d0", vec![3.0, 0.0, 0.0]),
+            ("d1", vec![0.0, 0.5, 0.0]),
+            ("d2", vec![4.0, 4.0, 0.0]),
+            ("d3", vec![0.0, 0.0, 10.0]),
+        ];
+        let mut writer = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        for (id, v) in &originals {
+            writer.add_document(
+                DocumentId(id.to_string()),
+                vec![Field::vector("embedding", v.clone())],
+            );
+        }
+        writer.backend.create_dir_all("").unwrap();
+        writer.write_doc_store().unwrap();
+        writer.write_inverted_index().unwrap();
+        writer.write_filters().unwrap();
+        writer.write_vectors_v2().unwrap();
+        writer.write_footer(Bm25Params::default()).unwrap();
+
+        // On disk: header says unit-norm, and every stored vector and
+        // centroid actually is unit-L2.
+        let data = fs::read(dir.join("vector.idx")).unwrap();
+        let (dim, _, version) = parse_vector_idx_header(&data).expect("valid header");
+        assert_eq!(version, UNIT_NORM_VECTOR_INDEX_VERSION);
+        let store = parse_vector_idx_eager(&data).expect("valid blob");
+        for (_, v) in &store.vectors {
+            let norm = kosha_vector_spfresh::dot(v, v).sqrt();
+            assert!((norm - 1.0).abs() < 1e-5, "stored vector not unit: {norm}");
+        }
+        let offsets_data = fs::read(dir.join("vector.offsets")).unwrap();
+        for p in parse_vector_offsets(&offsets_data, dim, version).expect("valid sidecar") {
+            let norm = kosha_vector_spfresh::dot(&p.centroid, &p.centroid).sqrt();
+            assert!((norm - 1.0).abs() < 1e-5, "centroid not unit: {norm}");
+        }
+
+        // Dot-only scoring must reproduce the cosine similarities of the
+        // *original* raw-magnitude vectors (up to float rounding).
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        assert!(reader.has_lazy_vector_index());
+        let query = [2.0, 1.0, 0.0];
+        let results = reader
+            .knn_search(&query, originals.len(), 16)
+            .expect("lazy index")
+            .unwrap();
+        assert_eq!(results.len(), originals.len());
+        for (doc_seq, sim) in results {
+            let expected =
+                kosha_vector_spfresh::cosine_similarity(&query, &originals[doc_seq as usize].1);
+            assert!(
+                (sim - expected as f64).abs() < 1e-5,
+                "doc {doc_seq}: dot-path {sim} vs cosine {expected}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -828,19 +955,22 @@ fn postings_write_version() -> u32 {
 
 /// The vector-index version `finalize` writes — `KOSHA_VECTOR_WRITE_VERSION`,
 /// accepted values `1` (legacy flat, no magic — full parse + `build_hnsw` on
-/// every open) and `2` (posting-based, this PR's format); default `2`. Same
-/// mixed-fleet rollout/rollback purpose as `postings_write_version`: during
-/// a rolling deploy (writer upgraded before every query replica understands
-/// v2) or ahead of a possible rollback, set `1` until the whole fleet reads
-/// v2. Read once (segments are finalized frequently).
+/// every open), `2` (posting-based, raw magnitudes) and `3` (posting-based,
+/// unit-norm vectors + centroids → dot-only scoring; the on-disk header says
+/// [`UNIT_NORM_VECTOR_INDEX_VERSION`]); default `3`. Same mixed-fleet
+/// rollout/rollback purpose as `postings_write_version`: during a rolling
+/// deploy (writer upgraded before every query replica understands the
+/// unit-norm version) or ahead of a possible rollback, set `2` until the
+/// whole fleet reads it. Read once (segments are finalized frequently).
 fn vector_write_version() -> u32 {
     static VERSION: OnceLock<u32> = OnceLock::new();
     *VERSION.get_or_init(|| match std::env::var("KOSHA_VECTOR_WRITE_VERSION").ok().as_deref() {
         Some("1") => 1,
-        Some("2") | None => 2,
+        Some("2") => 2,
+        Some("3") | None => 3,
         Some(other) => {
-            eprintln!("WARN: KOSHA_VECTOR_WRITE_VERSION={other} not supported (accepted: 1, 2) — writing v2");
-            2
+            eprintln!("WARN: KOSHA_VECTOR_WRITE_VERSION={other} not supported (accepted: 1, 2, 3) — writing v3");
+            3
         }
     })
 }
@@ -2315,6 +2445,10 @@ struct LazyVectorIndex {
     centroids: Vec<Vec<f32>>,
     /// `(offset, length)` into `vector.idx`, parallel to `centroids`.
     ranges: Vec<(u64, u32)>,
+    /// Stored vectors and centroids are unit-L2 (on-disk header version is
+    /// [`UNIT_NORM_VECTOR_INDEX_VERSION`]) — scoring uses the dot-only fast
+    /// path: normalize the query once, then `1 - dot` *is* cosine distance.
+    unit_norm: bool,
     /// Decoded postings LRU keyed by range index — the vector twin of the
     /// text path's per-segment [`PostingsCache`]. Without it every kNN
     /// query re-reads and re-decodes its `nprobe` candidate postings from
@@ -2432,7 +2566,7 @@ impl SegmentReader {
             return Ok((VectorStore::default(), None, None));
         };
 
-        let Some((dim, _total_count)) = parse_vector_idx_header(&data) else {
+        let Some((dim, _total_count, version)) = parse_vector_idx_header(&data) else {
             // No magic (or an unrecognized version) — legacy v1 flat
             // format. Serve it with exact flat_knn (no hnsw_map): ANN
             // structures are built at WRITE time only. Constructing HNSW
@@ -2451,7 +2585,7 @@ impl SegmentReader {
         // just without the lazy-hydration benefit, rather than losing
         // vector search for the segment entirely.
         if let Ok(offsets_data) = fs::read(segment_dir.join("vector.offsets")) {
-            if let Some(parsed) = parse_vector_offsets(&offsets_data, dim) {
+            if let Some(parsed) = parse_vector_offsets(&offsets_data, dim, version) {
                 let mut centroids = Vec::with_capacity(parsed.len());
                 let mut ranges = Vec::with_capacity(parsed.len());
                 for p in parsed {
@@ -2466,6 +2600,7 @@ impl SegmentReader {
                         dim: dim as usize,
                         centroids,
                         ranges,
+                        unit_norm: version == UNIT_NORM_VECTOR_INDEX_VERSION,
                         cache: PostingsCache::new(
                             vector_postings_cache_max_bytes(),
                             postings_account,
@@ -2560,14 +2695,32 @@ impl SegmentReader {
         k: usize,
         nprobe: usize,
     ) -> Result<Vec<(u32, f64)>, KoshaError> {
-        let candidates = kosha_vector_spfresh::nearest_centroids(&vi.centroids, query, nprobe);
+        // Unit-norm segments: normalize the query once, then every stored
+        // comparison is a bare dot product — same cosine scores (clamped
+        // identically), none of the per-comparison norms + sqrts.
+        let normalized_query: Vec<f32>;
+        let query: &[f32] = if vi.unit_norm {
+            let mut q = query.to_vec();
+            kosha_vector_spfresh::normalize_in_place(&mut q);
+            normalized_query = q;
+            &normalized_query
+        } else {
+            query
+        };
+        let candidates = if vi.unit_norm {
+            kosha_vector_spfresh::nearest_centroids_dot(&vi.centroids, query, nprobe)
+        } else {
+            kosha_vector_spfresh::nearest_centroids(&vi.centroids, query, nprobe)
+        };
         let mut scored: Vec<(u32, f64)> = Vec::new();
         for range_idx in candidates {
             for (id, v) in self.hydrate_posting(vi, range_idx)?.iter() {
-                scored.push((
-                    *id,
-                    kosha_vector_spfresh::cosine_similarity(query, v) as f64,
-                ));
+                let sim = if vi.unit_norm {
+                    kosha_vector_spfresh::dot(query, v).clamp(-1.0, 1.0)
+                } else {
+                    kosha_vector_spfresh::cosine_similarity(query, v)
+                };
+                scored.push((*id, sim as f64));
             }
         }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
