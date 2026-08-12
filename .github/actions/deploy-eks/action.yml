@@ -83,7 +83,15 @@ runs:
     - name: Set up Kustomize
       shell: bash
       run: |
-        curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s -- 5.4.3
+        # The official install script resolves the release via the
+        # unauthenticated api.github.com releases endpoint (60 req/hr,
+        # shared across the whole Actions runner IP pool) — easy to hit
+        # mid-day and it fails with "gzip: stdin: not in gzip format"
+        # (curl gets the rate-limit JSON body, not a tarball). Download
+        # the pinned release asset directly instead: github.com/…/releases/
+        # download/ serves straight from the CDN, no api.github.com call.
+        curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" \
+          | tar xz
         sudo mv kustomize /usr/local/bin/
 
     - name: Resolve per-environment settings
