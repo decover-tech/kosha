@@ -64,6 +64,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: decover-tech/infra
+          # bench-kosha terraform lives on this branch, not main
+          ref: bench/kosha-c2-vm
           token: ${{ secrets.INFRA_REPO_TOKEN }}
           path: infra
 
