@@ -372,28 +372,111 @@ struct SegmentFetch {
 /// `tokio::sync::Semaphore` would mean adding the `sync` feature to a crate
 /// that otherwise only uses tokio internally, behind a blocking boundary,
 /// to run S3 SDK futures.)
+#[derive(Default)]
+struct SemState {
+    permits: usize,
+    /// Requests currently blocked in `acquire*`. Bounding this is what
+    /// turns overload into shedding instead of unbounded queueing.
+    waiters: usize,
+}
+
 struct Semaphore {
-    permits: Mutex<usize>,
+    state: Mutex<SemState>,
     cv: Condvar,
+    /// Max requests allowed to wait for a permit. `0` = unbounded (the
+    /// pre-#146 behavior).
+    max_waiters: usize,
+    /// How long a request may wait before being shed. `None` = forever.
+    wait_timeout: Option<Duration>,
 }
 
 impl Semaphore {
     fn new(permits: usize) -> Self {
+        Self::with_queue_limits(permits, 0, None)
+    }
+
+    fn with_queue_limits(
+        permits: usize,
+        max_waiters: usize,
+        wait_timeout: Option<Duration>,
+    ) -> Self {
         Self {
-            permits: Mutex::new(permits),
+            state: Mutex::new(SemState {
+                permits,
+                waiters: 0,
+            }),
             cv: Condvar::new(),
+            max_waiters,
+            wait_timeout,
         }
     }
 
     /// Block until a permit is available, then hold it until the returned
-    /// guard is dropped.
+    /// guard is dropped. Unbounded — kept for callers where waiting is
+    /// always preferable to failing.
     fn acquire(&self) -> SemaphorePermit<'_> {
-        let mut permits = self.permits.lock().unwrap();
-        while *permits == 0 {
-            permits = self.cv.wait(permits).unwrap();
+        let mut st = self.state.lock().unwrap();
+        while st.permits == 0 {
+            st = self.cv.wait(st).unwrap();
         }
-        *permits -= 1;
+        st.permits -= 1;
         SemaphorePermit { sem: self }
+    }
+
+    /// Acquire a permit, or shed (`None`) if the queue is already too deep
+    /// or the wait exceeds `wait_timeout`.
+    ///
+    /// This is the I/O-side analogue of [`kosha_query::MemoryLedger`]'s
+    /// admission gate. The ledger bounds *bytes*; nothing bounded the
+    /// accumulation of work when the machine simply could not keep up.
+    /// Measured on the 10M vector namespace: with 8 permits and a service
+    /// time inflated by storage saturation, arrivals queued until
+    /// `queue_ms=118,942` against `score_ms=2,256` — every request waiting
+    /// two minutes for a result its client had long since abandoned, while
+    /// the box thrashed its disk and even sshd was starved of I/O.
+    ///
+    /// Failing fast is strictly better for everyone: the client gets a 429
+    /// it can retry with backoff (kosha_client already does), and the
+    /// server stops accepting work it has no capacity to finish. A queue
+    /// deeper than the service rate can drain is not throughput, it is
+    /// latency nobody asked for.
+    fn acquire_or_shed(&self) -> Option<SemaphorePermit<'_>> {
+        let mut st = self.state.lock().unwrap();
+        if st.permits > 0 {
+            st.permits -= 1;
+            return Some(SemaphorePermit { sem: self });
+        }
+        // Fast-fail on a queue that is already saturated — waiting only to
+        // time out later would burn the client's deadline for nothing.
+        if self.max_waiters > 0 && st.waiters >= self.max_waiters {
+            return None;
+        }
+        let deadline = self.wait_timeout.map(|t| Instant::now() + t);
+        st.waiters += 1;
+        let outcome = loop {
+            if st.permits > 0 {
+                st.permits -= 1;
+                break true;
+            }
+            match deadline {
+                None => st = self.cv.wait(st).unwrap(),
+                Some(d) => {
+                    let now = Instant::now();
+                    if now >= d {
+                        break false;
+                    }
+                    let (guard, _) = self.cv.wait_timeout(st, d - now).unwrap();
+                    st = guard;
+                }
+            }
+        };
+        st.waiters -= 1;
+        outcome.then(|| SemaphorePermit { sem: self })
+    }
+
+    #[cfg(test)]
+    fn waiters(&self) -> usize {
+        self.state.lock().unwrap().waiters
     }
 }
 
@@ -403,8 +486,8 @@ struct SemaphorePermit<'a> {
 
 impl Drop for SemaphorePermit<'_> {
     fn drop(&mut self) {
-        let mut permits = self.sem.permits.lock().unwrap();
-        *permits += 1;
+        let mut st = self.sem.state.lock().unwrap();
+        st.permits += 1;
         self.sem.cv.notify_one();
     }
 }
@@ -998,13 +1081,29 @@ impl AppState {
                     .filter(|n| *n > 0)
                     .unwrap_or(4),
             ),
-            search_semaphore: Semaphore::new(
-                std::env::var("KOSHA_MAX_CONCURRENT_SEARCHES")
+            search_semaphore: {
+                let permits = std::env::var("KOSHA_MAX_CONCURRENT_SEARCHES")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .filter(|n| *n > 0)
-                    .unwrap_or(8),
-            ),
+                    .unwrap_or(8);
+                // Queue bound + wait cap: overload must shed, not pile up.
+                // Default queue depth is 4x the permits — enough to ride out
+                // a burst, far short of the two-minute queues that formed on
+                // the 10M vector namespace when the disk saturated.
+                let max_waiters = std::env::var("KOSHA_SEARCH_QUEUE_DEPTH")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(permits * 4);
+                let wait_ms: u64 = std::env::var("KOSHA_SEARCH_QUEUE_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(10_000);
+                Semaphore::with_queue_limits(
+                    permits,
+                    max_waiters,
+                    (wait_ms > 0).then(|| Duration::from_millis(wait_ms)),
+                )
+            },
             #[cfg(all(feature = "s3", feature = "postgres"))]
             hydration_leases,
             #[cfg(all(feature = "s3", feature = "postgres"))]
@@ -3327,7 +3426,13 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // Acquired after hydration (which has its own ceiling) so a search
     // waiting on S3 doesn't also hold a scoring slot.
     let t_queue = Instant::now();
-    let _slot = state.search_semaphore.acquire();
+    let Some(_slot) = state.search_semaphore.acquire_or_shed() else {
+        // Shed rather than queue: see `Semaphore::acquire_or_shed`.
+        return json_error(
+            429,
+            "search overloaded: scoring queue is saturated — retry with backoff",
+        );
+    };
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
 
     // On-demand `doc_store.bin` for page materialization (Option A): scoring
@@ -3646,7 +3751,13 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     // Acquired after hydration (which has its own ceiling) so a search
     // waiting on S3 doesn't also hold a scoring slot.
     let t_queue = Instant::now();
-    let _slot = state.search_semaphore.acquire();
+    let Some(_slot) = state.search_semaphore.acquire_or_shed() else {
+        // Shed rather than queue: see `Semaphore::acquire_or_shed`.
+        return json_error(
+            429,
+            "search overloaded: scoring queue is saturated — retry with backoff",
+        );
+    };
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
 
     // On-demand `doc_store.bin` page materialization — see
@@ -4645,6 +4756,79 @@ mod tests {
     use super::*;
     use kosha_core::{Document, DocumentId, Field};
     use std::fs;
+
+    #[test]
+    fn saturated_search_queue_sheds_instead_of_queueing_forever() {
+        // The 10M vector namespace's failure mode: 8 permits, service time
+        // inflated by storage saturation, and `acquire()` waiting forever —
+        // so arrivals accumulated until queue_ms=118,942 against
+        // score_ms=2,256. Every one of those requests was waiting two
+        // minutes for a result its client had already given up on, while
+        // the box thrashed. Overload must shed, not queue.
+        let sem = Arc::new(Semaphore::with_queue_limits(
+            1,
+            2,
+            Some(Duration::from_millis(50)),
+        ));
+
+        // The only permit is taken; two waiters may queue behind it.
+        let held = sem.acquire_or_shed().expect("first acquire must succeed");
+
+        let mut waiting = Vec::new();
+        for _ in 0..2 {
+            let s = Arc::clone(&sem);
+            waiting.push(std::thread::spawn(move || s.acquire_or_shed().is_some()));
+        }
+        // Let both reach the wait loop so the queue is genuinely full.
+        let t0 = Instant::now();
+        while sem.waiters() < 2 && t0.elapsed() < Duration::from_secs(2) {
+            std::thread::yield_now();
+        }
+        assert_eq!(sem.waiters(), 2, "both waiters should be queued");
+
+        // Queue is at its bound → the next arrival is shed IMMEDIATELY,
+        // not made to burn its deadline first.
+        let t = Instant::now();
+        assert!(
+            sem.acquire_or_shed().is_none(),
+            "arrival beyond the queue bound must be shed"
+        );
+        assert!(
+            t.elapsed() < Duration::from_millis(40),
+            "shedding must be immediate, not a timeout wait ({:?})",
+            t.elapsed()
+        );
+
+        // The queued waiters time out rather than blocking forever.
+        for h in waiting {
+            assert!(!h.join().unwrap(), "queued waiter should time out and shed");
+        }
+
+        // Once the permit comes back, service resumes normally.
+        drop(held);
+        assert!(
+            sem.acquire_or_shed().is_some(),
+            "a freed permit must be acquirable again"
+        );
+    }
+
+    #[test]
+    fn unbounded_semaphore_still_waits_for_a_permit() {
+        // `Semaphore::new` keeps the old unbounded behavior for callers
+        // where waiting beats failing (hydration), so this change is scoped
+        // to the search path.
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem.acquire();
+        let s = Arc::clone(&sem);
+        let t = std::thread::spawn(move || {
+            let _p = s.acquire();
+            true
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!t.is_finished(), "must still be waiting, not shed");
+        drop(held);
+        assert!(t.join().unwrap());
+    }
 
     #[test]
     fn env_flag_default_on_semantics() {
