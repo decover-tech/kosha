@@ -4525,7 +4525,8 @@ fn log_search_timing(
     println!(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} score_ms={:.1} \
-         materialize_ms={:.1} opens_cold={} opens_cached={} open_total_ms={:.1} hits={}",
+         materialize_ms={:.1} opens_cold={} opens_cached={} open_total_ms={:.1} \
+         knn_postings={} hits={}",
         ns.0,
         total_ms,
         hydrate_ms,
@@ -4538,6 +4539,7 @@ fn log_search_timing(
         phases.open_cold,
         phases.open_cached,
         phases.open_total_ms,
+        phases.knn_postings_probed,
         total_hits,
     );
 }

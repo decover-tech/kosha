@@ -2325,6 +2325,11 @@ struct LazyVectorIndex {
     cache: PostingsCache<SharedVectorPosting>,
 }
 
+/// `(top-k hits, postings hydrated)` for a budgeted kNN probe — see
+/// [`SegmentReader::knn_search_within`]. `None` when the segment has no
+/// lazy v2 vector index.
+pub type BudgetedKnnResult = Option<Result<(Vec<(u32, f64)>, usize), KoshaError>>;
+
 pub struct SegmentReader {
     segment_dir: PathBuf,
     footer: Footer,
@@ -2551,6 +2556,89 @@ impl SegmentReader {
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
         let vi = self.vector_index.as_ref()?;
         Some(self.knn_search_lazy(vi, query, k, nprobe))
+    }
+
+    /// Distance from `query` to every one of this segment's posting
+    /// centroids — **pure CPU, zero I/O**: centroids are already resident in
+    /// [`LazyVectorIndex`], loaded from the `vector.offsets` sidecar at open.
+    ///
+    /// This is the cheap half of a global probe budget. `num_candidates` is
+    /// a *whole-query* budget, but a segment can only ever rank its own
+    /// centroids, so the query layer collects these distances across all
+    /// segments, picks a global cutoff, and only then pays for hydration —
+    /// see [`Self::knn_search_within`]. Without that split, `num_candidates`
+    /// is applied per segment and total probe depth scales with segment
+    /// count (200 segments x 100 = 20,000 posting reads for one top-10).
+    ///
+    /// `None` when this segment has no lazy v2 vector index (legacy flat
+    /// segments), which the caller treats as "cannot participate in global
+    /// budgeting" and falls back to its own path.
+    pub fn knn_centroid_distances(&self, query: &[f32]) -> Option<Vec<f32>> {
+        let vi = self.vector_index.as_ref()?;
+        Some(
+            vi.centroids
+                .iter()
+                .map(|c| kosha_vector_spfresh::cosine_distance(query, c))
+                .collect(),
+        )
+    }
+
+    /// Score only the postings whose centroid distance is `<= max_distance`,
+    /// capped at `max_probes` regardless (a tie at the cutoff, or a
+    /// degenerate all-zero-distance segment, must not reopen the fan-out
+    /// this exists to bound). Returns the segment's top `k`.
+    ///
+    /// The companion to [`Self::knn_centroid_distances`]: the query layer
+    /// derives `max_distance` from the global budget, so the union of work
+    /// across segments is ~`num_candidates` postings for the whole query
+    /// instead of `num_candidates` per segment.
+    /// Returns `(top_k, postings_hydrated)` — the probe count is reported
+    /// so the query layer can surface it in `SearchPhaseStats`; it is the
+    /// number that makes runaway probe depth visible.
+    pub fn knn_search_within(
+        &self,
+        query: &[f32],
+        k: usize,
+        max_distance: f32,
+        max_probes: usize,
+    ) -> BudgetedKnnResult {
+        let vi = self.vector_index.as_ref()?;
+        Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes))
+    }
+
+    fn knn_search_within_lazy(
+        &self,
+        vi: &LazyVectorIndex,
+        query: &[f32],
+        k: usize,
+        max_distance: f32,
+        max_probes: usize,
+    ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
+        // Rank this segment's qualifying centroids nearest-first, so the
+        // `max_probes` cap keeps the *best* candidates when it bites.
+        let mut qualifying: Vec<(usize, f32)> = vi
+            .centroids
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, kosha_vector_spfresh::cosine_distance(query, c)))
+            .filter(|(_, d)| *d <= max_distance)
+            .collect();
+        qualifying.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        qualifying.truncate(max_probes);
+
+        let probes = qualifying.len();
+        let mut scored: Vec<(u32, f64)> = Vec::new();
+        for (range_idx, _) in qualifying {
+            for (id, v) in self.hydrate_posting(vi, range_idx)?.iter() {
+                scored.push((
+                    *id,
+                    kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                ));
+            }
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        Ok((scored, probes))
     }
 
     fn knn_search_lazy(

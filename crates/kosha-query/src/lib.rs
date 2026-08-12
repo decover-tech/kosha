@@ -960,6 +960,29 @@ fn knn_overfetch_factor() -> usize {
     })
 }
 
+/// Whether `knn.num_candidates` is treated as a whole-query probe budget
+/// (default) rather than a per-segment one.
+///
+/// Per-segment is how it behaved before this flag existed, and it makes a
+/// kNN query's cost scale with segment count: 200 segments x 100 candidates
+/// = 20,000 posting hydrations for a single top-10, ~12.8% of a 10M corpus
+/// scored per query. Measured on the 10M MSMarco vector namespace, that
+/// demanded ~160k disk reads/sec at 8 QPS against a volume delivering
+/// 8,000 — the queries never had a chance.
+///
+/// `KOSHA_KNN_GLOBAL_BUDGET=0` restores per-segment probing (an escape
+/// hatch if a namespace's recall regresses; prefer raising
+/// `num_candidates`, which under global budgeting means what it says).
+fn knn_global_budget_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("KOSHA_KNN_GLOBAL_BUDGET").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
 /// Flat kNN search: compute cosine similarity against all stored vectors,
 /// return top-K (doc_seq, score) pairs.
 pub fn flat_knn(query_vector: &[f32], vectors: &[(u32, Vec<f32>)], k: usize) -> Vec<(u32, f64)> {
@@ -994,6 +1017,13 @@ pub struct SearchPhaseStats {
     pub open_cached: usize,
     /// Summed wall time of the cold opens above, across rayon workers.
     pub open_total_ms: f64,
+    /// Vector postings hydrated across all segments for a kNN query — the
+    /// real cost driver of vector search, and the number whose absence let
+    /// per-segment probing go unnoticed: at 200 segments x
+    /// `num_candidates`=100 this was 20,000 disk reads for one top-10.
+    /// Under the global probe budget it should land near
+    /// `num_candidates` for the whole query. Zero for non-kNN queries.
+    pub knn_postings_probed: usize,
 }
 
 /// Shared-atomic collector threaded through the parallel scoring pass to
@@ -1004,6 +1034,9 @@ struct OpenStatsCollector {
     cold: AtomicUsize,
     cached: AtomicUsize,
     open_nanos: AtomicU64,
+    /// Vector postings hydrated across segments (kNN only) — see
+    /// [`SearchPhaseStats::knn_postings_probed`].
+    knn_postings: AtomicUsize,
 }
 
 pub struct Searcher {
@@ -1128,6 +1161,78 @@ impl Searcher {
     /// caller reduces their outputs (candidates flattened, aggregations
     /// merged) — see [`Searcher::search`], which runs this via
     /// `par_iter().map(...)` across the manifest instead of one at a time.
+    /// The distance cutoff that admits about `num_candidates` posting
+    /// probes across the WHOLE query, or `None` to fall back to per-segment
+    /// `nprobe`.
+    ///
+    /// Cheap by construction: it only reads posting centroids, which are
+    /// already resident in every open segment's `LazyVectorIndex` (loaded
+    /// from the small `vector.offsets` sidecar), so this pass does no
+    /// posting I/O at all — the expensive part of a kNN query is
+    /// `hydrate_posting`, and that is precisely what the cutoff then
+    /// prevents.
+    ///
+    /// Returns `None` when no segment can report centroids (legacy flat
+    /// vector segments), so those namespaces keep their existing behavior
+    /// rather than silently searching nothing.
+    fn global_probe_cutoff(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        knn: &kosha_core::KnnQuery,
+        permit: &AdmissionPermit,
+        open_stats: &OpenStatsCollector,
+    ) -> Option<f32> {
+        let budget = knn.num_candidates.max(1);
+        // Distances from every segment, gathered in parallel. A segment
+        // that fails to open or has no lazy index contributes nothing —
+        // it will simply take the per-segment fallback path when scored.
+        let mut all: Vec<f32> = manifest
+            .segments
+            .par_iter()
+            .filter_map(|entry| {
+                let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                if !seg_dir.exists() {
+                    return None;
+                }
+                let reader = self
+                    .open_segment(
+                        &namespace.0,
+                        &entry.segment_id.0,
+                        seg_dir,
+                        true,
+                        manifest.segment_footer(&entry.segment_id).cloned(),
+                        Some(permit),
+                        Some(open_stats),
+                    )
+                    .ok()?;
+                let mut d = reader.knn_centroid_distances(&knn.vector)?;
+                // Only the `budget` nearest of any single segment can ever
+                // matter to a global top-`budget`; trimming here keeps the
+                // merge below proportional to segments x budget, not to
+                // total posting count.
+                d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                d.truncate(budget);
+                Some(d)
+            })
+            .flatten()
+            .collect();
+
+        if all.is_empty() {
+            return None; // no v2 vector segments — keep legacy behavior
+        }
+        if all.len() <= budget {
+            // The whole namespace has fewer postings than the budget:
+            // nothing to prune, admit everything.
+            return Some(f32::INFINITY);
+        }
+        let idx = budget - 1;
+        all.select_nth_unstable_by(idx, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Some(all[idx])
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn score_segment(
         &self,
@@ -1148,6 +1253,12 @@ impl Searcher {
         manifest_footer: Option<&kosha_core::Footer>,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
+        // `Some(cutoff)` = a global probe budget was computed for this kNN
+        // query (see `global_probe_cutoff`): probe only centroids within
+        // `cutoff` instead of this segment's own `num_candidates` nearest.
+        // `None` = no budget available (legacy flat segments, or budgeting
+        // disabled) — fall back to per-segment `nprobe`.
+        knn_cutoff: Option<f32>,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
         let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
         if !seg_dir.exists() {
@@ -2062,14 +2173,36 @@ impl Searcher {
             } else {
                 knn.k
             };
-            // `knn.num_candidates` used to be a dead field (defined on
-            // `KnnQuery`, never read downstream) — it's now the lazy path's
-            // `nprobe`: how many posting centroids to probe per query.
-            let mut knn_results: Vec<(u32, f64)> = match reader.knn_search(
-                &knn.vector,
-                fetch_k,
-                knn.num_candidates,
-            ) {
+            // `knn.num_candidates` is a WHOLE-QUERY probe budget, not a
+            // per-segment one. When the query layer managed to compute a
+            // global cutoff, probe only centroids inside it; the union
+            // across segments is then ~`num_candidates` postings for the
+            // query. Falling back to per-segment `nprobe` (no cutoff) is
+            // correct but pays `num_candidates` in EVERY segment, so total
+            // probe depth scales with segment count.
+            let probe = match knn_cutoff {
+                Some(cutoff) => reader
+                    .knn_search_within(&knn.vector, fetch_k, cutoff, knn.num_candidates)
+                    .map(|r| {
+                        r.map(|(results, probes)| {
+                            open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
+                            results
+                        })
+                    }),
+                None => reader
+                    .knn_search(&knn.vector, fetch_k, knn.num_candidates)
+                    .map(|r| {
+                        r.inspect(|_| {
+                            // Per-segment fallback probes up to `num_candidates`
+                            // in THIS segment; record the ceiling so the metric
+                            // still reflects the fan-out being paid.
+                            open_stats
+                                .knn_postings
+                                .fetch_add(knn.num_candidates, Ordering::Relaxed);
+                        })
+                    }),
+            };
+            let mut knn_results: Vec<(u32, f64)> = match probe {
                 Some(Ok(results)) => results,
                 Some(Err(e)) => {
                     eprintln!(
@@ -2408,6 +2541,23 @@ impl Searcher {
         let count_budget = (!exact).then_some(cap);
 
         let open_stats = OpenStatsCollector::default();
+
+        // ── global kNN probe budget ────────────────────────────────────
+        // `num_candidates` is a whole-query budget. Applied per segment
+        // (the pre-#143 behavior) it makes probe depth scale with segment
+        // count: at 200 segments x 100 candidates that is 20,000 posting
+        // reads to answer one top-10, ~12.8% of a 10M corpus, and it gets
+        // worse as the namespace grows. Here we spend a cheap, zero-I/O
+        // pass over already-resident centroids to find the distance cutoff
+        // that admits ~`num_candidates` postings ACROSS the whole query,
+        // then let each segment probe only inside it.
+        let knn_cutoff = match query.knn {
+            Some(ref knn) if knn_global_budget_enabled() => {
+                self.global_probe_cutoff(namespace, manifest, knn, &permit, &open_stats)
+            }
+            _ => None,
+        };
+
         let t_score = Instant::now();
         let segment_outputs: Vec<SegmentOutput> = manifest
             .segments
@@ -2426,6 +2576,7 @@ impl Searcher {
                     manifest_footer,
                     &permit,
                     &open_stats,
+                    knn_cutoff,
                 )
             })
             .collect::<Result<Vec<Option<SegmentOutput>>, KoshaError>>()?
@@ -2436,6 +2587,7 @@ impl Searcher {
         phase_stats.open_cold = open_stats.cold.load(Ordering::Relaxed);
         phase_stats.open_cached = open_stats.cached.load(Ordering::Relaxed);
         phase_stats.open_total_ms = open_stats.open_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
         let t_materialize = Instant::now();
 
         let mut candidates: Vec<HitCandidate> = Vec::new();
@@ -3875,6 +4027,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Build `segs` segments each holding `per_seg` unit-ish vectors spread
+    /// over a 2-D arc embedded in 4-D, so nearest neighbours are well
+    /// defined and brute force is trivial to compute.
+    fn mk_vector_corpus(
+        dir: &std::path::Path,
+        ns: &str,
+        segs: usize,
+        per_seg: usize,
+    ) -> (Manifest, Vec<(String, Vec<f32>)>) {
+        let mut entries = Vec::new();
+        let mut all = Vec::new();
+        let total = (segs * per_seg) as f32;
+        for s in 0..segs {
+            let seg = format!("s{s:03}");
+            let seg_dir = dir.join(ns).join(&seg);
+            let mut w = SegmentWriter::new(SegmentId(seg.clone()), seg_dir);
+            for i in 0..per_seg {
+                let n = (s * per_seg + i) as f32;
+                let angle = n * std::f32::consts::PI / total; // spread over [0, pi)
+                let v = vec![angle.cos(), angle.sin(), 0.0, 0.0];
+                let doc_id = format!("{seg}-d{i}");
+                w.add_document(
+                    DocumentId(doc_id.clone()),
+                    vec![Field::vector("emb", v.clone())],
+                );
+                all.push((doc_id, v));
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: SegmentId(seg),
+                doc_count: per_seg as u32,
+            });
+        }
+        (
+            Manifest {
+                version: 1,
+                segments: entries,
+                segment_footers: Default::default(),
+            },
+            all,
+        )
+    }
+
+    #[test]
+    fn knn_num_candidates_is_a_whole_query_budget_not_per_segment() {
+        // The 10M vector round's real bottleneck: `num_candidates` was
+        // passed straight through as per-segment `nprobe`, so probe depth
+        // scaled with segment count — 200 segments x 100 candidates =
+        // 20,000 posting hydrations to answer one top-10 (~12.8% of the
+        // corpus), demanding ~160k disk reads/sec at 8 QPS against a volume
+        // that delivers 8,000.
+        //
+        // Under global budgeting the total probes across ALL segments must
+        // stay near `num_candidates`, independent of how many segments the
+        // namespace happens to have.
+        let dir = std::env::temp_dir().join("kosha-test-knn-global-budget");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        const SEGS: usize = 16;
+        let (manifest, _) = mk_vector_corpus(&dir, "test", SEGS, 64);
+
+        let searcher = Searcher::new(dir.clone());
+        let mut q = mk_query("", 10);
+        q.knn = Some(kosha_core::KnnQuery {
+            field: "emb".into(),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            k: 10,
+            num_candidates: 8,
+            filter: None,
+        });
+
+        let (r, stats) = searcher
+            .search_with_stats(&ns, &manifest, &q, None)
+            .unwrap();
+        assert!(!r.results.is_empty(), "kNN must still return hits");
+
+        // The budget is a whole-query one. Allow generous slack for ties at
+        // the cutoff, but it must NOT scale with segment count: per-segment
+        // probing would be up to num_candidates * SEGS = 128.
+        assert!(
+            stats.knn_postings_probed <= 8 * 4,
+            "probes ({}) must stay near num_candidates=8, not scale to {} segments",
+            stats.knn_postings_probed,
+            SEGS
+        );
+        assert!(
+            stats.knn_postings_probed > 0,
+            "a kNN query must probe something"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_global_budget_preserves_top_hit_against_brute_force() {
+        // Cutting probe depth must not cost correctness on the hit that
+        // matters: the exact nearest neighbour has to survive budgeting.
+        // (A cheap search that returns the wrong answer benches beautifully
+        // and is worthless — cf. the KIZC silent-zero-hits regression.)
+        let dir = std::env::temp_dir().join("kosha-test-knn-budget-recall");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let (manifest, all) = mk_vector_corpus(&dir, "test", 8, 64);
+
+        let searcher = Searcher::new(dir.clone());
+        let query_vector = vec![1.0, 0.0, 0.0, 0.0];
+        let mut q = mk_query("", 5);
+        q.knn = Some(kosha_core::KnnQuery {
+            field: "emb".into(),
+            vector: query_vector.clone(),
+            k: 5,
+            num_candidates: 32,
+            filter: None,
+        });
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(r.results.len(), 5);
+
+        // Brute-force ground truth over the identical vectors.
+        let mut brute: Vec<(String, f32)> = all
+            .iter()
+            .map(|(id, v)| {
+                let dot: f32 = v.iter().zip(&query_vector).map(|(a, b)| a * b).sum();
+                let nv: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nq: f32 = query_vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                (id.clone(), dot / (nv * nq))
+            })
+            .collect();
+        brute.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let got: Vec<String> = r.results.iter().map(|h| h.doc_id.0.clone()).collect();
+        assert_eq!(
+            got[0], brute[0].0,
+            "global budgeting must still return the true nearest neighbour"
+        );
+        let top10: Vec<&String> = brute.iter().take(10).map(|(id, _)| id).collect();
+        let overlap = got.iter().filter(|id| top10.contains(id)).count();
+        assert!(
+            overlap >= 4,
+            "expected >=4 of 5 results inside brute-force top-10, got {overlap} ({got:?})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn segment_byte_charge_reflects_resident_size_not_on_disk_size() {
         // Issue #136's root cause: `approx_segment_bytes` charged the full
@@ -4101,10 +4397,17 @@ mod tests {
             filter: None,
         });
 
+        // A kNN query now walks the segments TWICE: once in the zero-I/O
+        // centroid pass that computes the global probe budget, then once to
+        // score. The second walk is served from the segment cache, so the
+        // counts are (N cold, N cached) — the pre-pass pays the parses and
+        // scoring hits the cache. Both are reported rather than suppressed:
+        // hiding the pre-pass would make a genuinely cold query look fully
+        // warm, which is the class of misleading metric that let #136 hide.
         let (_, stats) = searcher
             .search_with_stats(&ns, &manifest, &knn_q, None)
             .unwrap();
-        assert_eq!((stats.open_cold, stats.open_cached), (N, 0));
+        assert_eq!((stats.open_cold, stats.open_cached), (N, N));
 
         // The whole point: a repeat kNN query must be served entirely from
         // the cache. Before the fix this was (N, 0) again — every query
@@ -4114,8 +4417,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             (stats.open_cold, stats.open_cached),
-            (0, N),
-            "repeat kNN query must hit cache, not re-open every segment — issue #136"
+            (0, 2 * N),
+            "repeat kNN query must hit cache on both passes, not re-open every segment — issue #136"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4314,10 +4617,12 @@ mod tests {
             .search_with_stats(&ns, &manifest, &bm25_q, None)
             .unwrap();
         assert_eq!((stats.open_cold, stats.open_cached), (N, 0));
+        // kNN walks segments twice (zero-I/O centroid pass for the global
+        // probe budget, then scoring), the second walk cache-served.
         let (_, stats) = searcher
             .search_with_stats(&ns, &manifest, &knn_q, None)
             .unwrap();
-        assert_eq!((stats.open_cold, stats.open_cached), (N, 0));
+        assert_eq!((stats.open_cold, stats.open_cached), (N, N));
 
         // Repeat BOTH variants again. With capacity correctly sized above
         // 2N, neither variant evicted the other — both must now be fully
@@ -4338,8 +4643,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             (stats.open_cold, stats.open_cached),
-            (0, N),
-            "kNN opens should be fully cached on repeat — issue #136"
+            (0, 2 * N),
+            "kNN opens should be fully cached on both passes — issue #136"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
