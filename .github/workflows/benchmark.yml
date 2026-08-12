@@ -99,7 +99,7 @@ jobs:
           SSH="ssh -i $RUNNER_TEMP/bench.pem ec2-user@$IP"
           $SSH 'set -e
             cd ~/kosha && sudo docker build -q -t kosha-server:bench .
-            sudo mkdir -p /data/kosha /data/pg && sudo chown -R 10001:10001 /data/kosha
+            sudo mkdir -p /data/kosha /data/pg && sudo chown ec2-user:ec2-user /data && sudo chown -R 10001:10001 /data/kosha
             sudo docker rm -f pg kosha 2>/dev/null || true
             sudo docker run -d --name pg --network host -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=kosha \
               -v /data/pg:/var/lib/postgresql/data postgres:16
@@ -117,8 +117,8 @@ jobs:
               -v /data/kosha:/var/cache/kosha kosha-server:bench
             sudo docker start kosha
             until curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null; do sleep 3; done
-            aws s3 cp --quiet s3://decoverai-bench-corpus-cache/msmarco-10m/queries.txt /data/queries.txt
-            aws s3 cp --quiet s3://decoverai-bench-corpus-cache/msmarco-10m-emb/queries_emb.f32 /data/queries_emb.f32 || true'
+            aws s3 cp --only-show-errors s3://decoverai-bench-corpus-cache/msmarco-10m/queries.txt /data/queries.txt
+            aws s3 cp --only-show-errors s3://decoverai-bench-corpus-cache/msmarco-10m-emb/queries_emb.f32 /data/queries_emb.f32 || true'
 
       - name: BM25 suite
         if: contains(fromJSON('["both","bm25"]'), inputs.suite)
