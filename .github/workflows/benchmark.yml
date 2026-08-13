@@ -82,6 +82,21 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v3
 
+      - name: Bootstrap embeddings cache volume (idempotent)
+        if: inputs.run_recall_check == true
+        working-directory: infra/terraform/dev-machines/aws/bench-embeddings-cache
+        # bench-kosha's terraform_remote_state lookup needs this stack's
+        # state to already exist — it's a separate, persistent stack
+        # precisely so bench-kosha's per-round destroy never touches it,
+        # which also means nothing else ever applies it. First-ever run
+        # here creates the real volume (~seconds — an EBS volume isn't
+        # populated until formatted/synced, that happens on the VM side in
+        # mount_embeddings_cache.sh); every run after that is a genuine
+        # no-op apply against unchanged config, safe to repeat every time.
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false
+
       - name: Provision bench VM
         id: tf
         working-directory: infra/terraform/dev-machines/aws/bench-kosha
