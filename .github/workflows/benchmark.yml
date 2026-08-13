@@ -97,7 +97,7 @@ jobs:
           SSH="ssh -i $RUNNER_TEMP/bench.pem ec2-user@$IP"
           $SSH 'set -e
             cd ~/kosha && sudo docker build -q -t kosha-server:bench .
-            sudo mkdir -p /data/kosha /data/pg && sudo chown -R 10001:10001 /data/kosha
+            sudo mkdir -p /data/kosha /data/pg && sudo chown ec2-user:ec2-user /data && sudo chown -R 10001:10001 /data/kosha
             sudo docker rm -f pg kosha 2>/dev/null || true
             sudo docker run -d --name pg --network host -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=kosha \
               -v /data/pg:/var/lib/postgresql/data postgres:16
