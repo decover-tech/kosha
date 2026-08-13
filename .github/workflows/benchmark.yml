@@ -40,8 +40,8 @@ on:
         description: target queries/sec per phase
         default: "8"
       duration:
-        description: seconds per phase (tpuf protocol = 1800)
-        default: "1800"
+        description: seconds per phase (300 = quick ~5min check; pass 1800 for the full tpuf-protocol duration on a publication-grade run)
+        default: "300"
 
 concurrency:
   group: bench-vm            # one bench stack; never two runs at once
