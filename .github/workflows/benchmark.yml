@@ -42,6 +42,19 @@ on:
       duration:
         description: seconds per phase (300 = quick ~5min check; pass 1800 for the full tpuf-protocol duration on a publication-grade run)
         default: "300"
+      run_recall_check:
+        description: >-
+          also compute real recall@k against exact brute-force ground truth
+          over the full vector corpus (recall_check.py) — off by default:
+          adds a persistent-volume attach/mount plus the brute-force scan
+          itself (a few minutes once the embeddings cache is warm; ~4 min
+          longer on the very first run ever, which populates it). Only
+          meaningful when the vector suite is running.
+        type: boolean
+        default: false
+      recall_sample:
+        description: number of queries to check recall for (statistical sample, not the full query set)
+        default: "100"
 
 concurrency:
   group: bench-vm            # one bench stack; never two runs at once
@@ -74,8 +87,9 @@ jobs:
         working-directory: infra/terraform/dev-machines/aws/bench-kosha
         run: |
           terraform init -input=false
-          terraform apply -auto-approve -input=false
+          terraform apply -auto-approve -input=false -var="mount_embeddings_cache=${{ inputs.run_recall_check }}"
           echo "ip=$(terraform output -raw machine_ip)" >> "$GITHUB_OUTPUT"
+          echo "embeddings_volume_id=$(terraform output -raw embeddings_cache_volume_id)" >> "$GITHUB_OUTPUT"
           # terraform writes the keypair beside the config
           cp bench-kosha.pem "$RUNNER_TEMP/bench.pem" && chmod 600 "$RUNNER_TEMP/bench.pem"
 
@@ -157,6 +171,23 @@ jobs:
           $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
             ./run_phases.sh vector $VEC_NS /data/results-ci/vector '${{ inputs.qps }}' '${{ inputs.duration }}'"
 
+      - name: Recall check (real recall@k vs. brute-force ground truth)
+        if: contains(fromJSON('["both","vector"]'), inputs.suite) && inputs.run_recall_check == true
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          # mount_embeddings_cache.sh prints only the mount path to stdout
+          # (everything else goes to stderr) — safe to capture directly.
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+            EMB_DIR=\$(./mount_embeddings_cache.sh '${{ steps.tf.outputs.embeddings_volume_id }}') && \
+            cd ~/kosha/scripts/bench/bm25_scale && \
+            ~/venv311/bin/python3 recall_check.py \
+              --host http://127.0.0.1:8080 --namespace $VEC_NS --api-key sk-bench \
+              --embeddings-dir \"\$EMB_DIR\" \
+              --queries-file /data/queries.txt --queries-emb /data/queries_emb.f32 \
+              --sample '${{ inputs.recall_sample }}' --k 10 --num-candidates 100 \
+              --out /data/results-ci/vector/recall.json"
+
       - name: Collect results + summary
         if: always() && inputs.suite != 'none'
         run: |
@@ -168,7 +199,7 @@ jobs:
             echo ""
             echo "| phase | p50 ms | p90 ms | p99 ms | requests | errors |"
             echo "|---|---|---|---|---|---|"
-            find results -name '*.json' | sort | while read -r f; do
+            find results -name '*.json' ! -name 'recall.json' | sort | while read -r f; do
               python3 - "$f" << 'EOF'
           import json, sys
           d = json.load(open(sys.argv[1]))
@@ -177,6 +208,24 @@ jobs:
           print(f"| {n} | {fmt(d['p50_ms'])} | {fmt(d['p90_ms'])} | {fmt(d['p99_ms'])} | {d['requests']} | {d['errors']} |")
           EOF
             done
+            # recall.json has a different schema entirely (mean_recall_at_k,
+            # not p50_ms) — its own section rather than forcing it into the
+            # latency table above.
+            if [ -f results/vector/recall.json ]; then
+              echo ""
+              echo "## Vector recall@k (vs. exact brute-force ground truth)"
+              echo ""
+              python3 - results/vector/recall.json << 'EOF'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          print(f"- sample: {d['sample_size']} queries, k={d['k']}, num_candidates={d['num_candidates']}")
+          print(f"- mean recall@k: **{d['mean_recall_at_k']:.2f}** (min {d['min_recall_at_k']:.2f}, median {d['median_recall_at_k']:.2f})")
+          print(f"- top-1 match rate: {d['top1_match_rate']:.2f}")
+          print(f"- queries with a degraded kNN segment: {d['queries_with_degraded_segments']}/{d['sample_size']}")
+          if d['mean_recall_at_k'] < 0.9:
+              print("\n⚠️ below the 0.9 recall bar the ANN index's own unit tests require in isolation.")
+          EOF
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
@@ -189,7 +238,13 @@ jobs:
       - name: Teardown (success only — failures keep the VM for debugging)
         if: success()
         working-directory: infra/terraform/dev-machines/aws/bench-kosha
-        run: terraform destroy -auto-approve -input=false
+        # Same -var as apply: destroy needs the identical value to resolve
+        # count-indexed resource addresses (aws_volume_attachment[0], the
+        # remote-state data source) the same way apply did — the embeddings
+        # cache volume itself is untouched either way (own stack, own
+        # state), this only controls whether *this* stack's attachment to
+        # it gets detached.
+        run: terraform destroy -auto-approve -input=false -var="mount_embeddings_cache=${{ inputs.run_recall_check }}"
 
       - name: Teardown skipped notice
         if: failure()
