@@ -85,7 +85,10 @@ def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> di
     return payload
 
 
-def run_query(session, host, namespace, headers, query_text, topk, timeout, results, lock, errors, qidx=0):
+def run_query(
+    session, host, namespace, headers, query_text, topk, timeout,
+    results, lock, errors, hit_counts, degraded_counts, qidx=0,
+):
     t0 = time.time()
     try:
         resp = session.post(
@@ -95,10 +98,22 @@ def run_query(session, host, namespace, headers, query_text, topk, timeout, resu
             timeout=timeout,
         )
         resp.raise_for_status()
-        resp.json()  # force full body read so latency includes deserialization
+        # A 200 with an empty/short results array, or a kNN response with
+        # segments that silently dropped their vector candidates, looks
+        # identical to a healthy one if you only check status + latency —
+        # that's the gap this is closing. See the correctness-signal
+        # discussion this script was extended for.
+        body = resp.json()
         latency = time.time() - t0
+        hits = len(body.get("results", []))
+        # None for a non-kNN query (the field isn't sent at all); 0 means
+        # "kNN query, every segment searched cleanly" — see
+        # `SearchResult::knn_degraded_segments` on the server.
+        degraded = body.get("knn_degraded_segments")
         with lock:
             results.append(latency)
+            hit_counts.append(hits)
+            degraded_counts.append(degraded if degraded is not None else 0)
     except Exception as e:  # noqa: BLE001 - benchmark tool, record and move on
         with lock:
             errors.append(str(e))
@@ -182,6 +197,8 @@ def main() -> None:
     session = requests.Session()
     results: list[float] = []
     errors: list[str] = []
+    hit_counts: list[int] = []
+    degraded_counts: list[int] = []
     lock = threading.Lock()
     threads: list[threading.Thread] = []
 
@@ -214,6 +231,8 @@ def main() -> None:
                 results,
                 lock,
                 errors,
+                hit_counts,
+                degraded_counts,
                 qidx,
             ),
             daemon=True,
@@ -228,6 +247,17 @@ def main() -> None:
 
     elapsed = time.time() - start
     achieved_qps = len(results) / elapsed if elapsed > 0 else 0
+
+    # Correctness signal, not just latency: a 200 with an empty/short page,
+    # or a kNN response missing whatever a failed segment would have
+    # contributed, previously looked identical to a healthy response here.
+    # `hit_counts`/`degraded_counts` are index-aligned with `results` (both
+    # only ever appended together, under the same lock, in `run_query`).
+    n = len(hit_counts)
+    zero_hit = sum(1 for h in hit_counts if h == 0)
+    short_page = sum(1 for h in hit_counts if 0 < h < args.topk)
+    knn_degraded_requests = sum(1 for d in degraded_counts if d > 0)
+    knn_degraded_segments_total = sum(degraded_counts)
 
     summary = {
         "phase": args.phase,
@@ -244,6 +274,20 @@ def main() -> None:
         "p99_ms": percentile(results, 99) * 1000,
         "mean_ms": (statistics.fmean(results) * 1000) if results else float("nan"),
         "max_ms": (max(results) * 1000) if results else float("nan"),
+        # Zero rate on a healthy run is normal for BM25 (a narrow query can
+        # genuinely match nothing); on kNN it should be ~0 — any nonzero
+        # rate there means "successful" responses are hiding empty pages.
+        "zero_hit_requests": zero_hit,
+        "zero_hit_rate": (zero_hit / n) if n else float("nan"),
+        "short_page_requests": short_page,
+        "short_page_rate": (short_page / n) if n else float("nan"),
+        # Always 0 for BM25 (the field is never sent on a non-kNN response —
+        # see SearchResult::knn_degraded_segments). Nonzero on kNN means at
+        # least one segment's vector index search failed and silently
+        # contributed zero candidates for that request.
+        "knn_degraded_requests": knn_degraded_requests,
+        "knn_degraded_rate": (knn_degraded_requests / n) if n else float("nan"),
+        "knn_degraded_segments_total": knn_degraded_segments_total,
     }
 
     print(json.dumps(summary, indent=2))
@@ -251,6 +295,14 @@ def main() -> None:
         print(f"\n{len(errors)} errors, first 5:")
         for e in errors[:5]:
             print(f"  {e}")
+    if zero_hit:
+        print(f"\n{zero_hit}/{n} requests returned zero hits ({summary['zero_hit_rate']:.1%})")
+    if knn_degraded_requests:
+        print(
+            f"\n{knn_degraded_requests}/{n} requests had a degraded kNN segment "
+            f"({knn_degraded_segments_total} segment-failures total) — results may be "
+            "missing true nearest neighbors from the affected segment(s)"
+        )
 
     if args.out:
         args.out.write_text(json.dumps(summary, indent=2))

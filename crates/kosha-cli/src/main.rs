@@ -593,6 +593,7 @@ mod tests {
             total_hits,
             total_hits_relation: relation,
             aggregations: None,
+            knn_degraded_segments: None,
         };
         assert_eq!(
             format_total_hits_line(&mk(3, kosha_core::TotalHitsRelation::Eq)),
