@@ -1498,6 +1498,7 @@ impl Searcher {
                             aggs: HashMap::new(),
                             total_hits: 0,
                             hits_capped: false,
+                            knn_segment_degraded: false,
                         });
                     }
 
@@ -1519,6 +1520,7 @@ impl Searcher {
                                 aggs: HashMap::new(),
                                 total_hits,
                                 hits_capped: false,
+                                knn_segment_degraded: false,
                             });
                         }
 
@@ -1593,6 +1595,7 @@ impl Searcher {
                             aggs: HashMap::new(),
                             total_hits,
                             hits_capped: false,
+                            knn_segment_degraded: false,
                         });
                     }
 
@@ -1793,6 +1796,7 @@ impl Searcher {
                             aggs: HashMap::new(),
                             total_hits,
                             hits_capped,
+                            knn_segment_degraded: false,
                         });
                     }
 
@@ -1952,6 +1956,7 @@ impl Searcher {
                         aggs: HashMap::new(),
                         total_hits,
                         hits_capped,
+                        knn_segment_degraded: false,
                     })
                 };
                 if let Some(output) = wand_attempt() {
@@ -2157,6 +2162,7 @@ impl Searcher {
         // ── kNN search (SPFresh lazy posting index when the segment has
         // one, else HNSW, else flat fallback — unchanged for anything that
         // isn't a v2 segment) ──
+        let mut knn_segment_degraded = false;
         if let Some(ref knn) = query.knn {
             // Tombstones, the kNN-scoped filter, and the top-level filter
             // all reject candidates *after* the per-segment kNN has cut to
@@ -2209,6 +2215,12 @@ impl Searcher {
                         "WARN: knn_search failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
                         reader.segment_dir().display()
                     );
+                    // Client-visible counterpart to the log line above — see
+                    // `SearchResult::knn_degraded_segments`. This segment's
+                    // true nearest neighbors are silently missing from the
+                    // page below; a caller checking only HTTP status has no
+                    // other way to know.
+                    knn_segment_degraded = true;
                     Vec::new()
                 }
                 None if !reader.vector_store.vectors.is_empty() => {
@@ -2381,6 +2393,7 @@ impl Searcher {
             aggs,
             total_hits,
             hits_capped: false,
+            knn_segment_degraded,
         }))
     }
 
@@ -2456,6 +2469,9 @@ impl Searcher {
                     total_hits: 0,
                     total_hits_relation: TotalHitsRelation::Eq,
                     aggregations: None,
+                    // No segments existed to search, degraded or otherwise —
+                    // distinct from "searched N segments, 0 degraded".
+                    knn_degraded_segments: None,
                 },
                 phase_stats,
             ));
@@ -2604,10 +2620,14 @@ impl Searcher {
         // doesn't take the early-termination fast path.
         let mut total_hits: usize = 0;
         let mut any_capped = false;
+        let mut knn_degraded_segments: u32 = 0;
         for output in segment_outputs {
             candidates.extend(output.candidates);
             total_hits += output.total_hits;
             any_capped |= output.hits_capped;
+            if output.knn_segment_degraded {
+                knn_degraded_segments += 1;
+            }
             // Last-segment-wins per agg name, same reduction the old
             // sequential loop did via repeated `all_aggs.insert(...)`.
             // `segment_outputs` is in manifest order, so this is
@@ -2785,6 +2805,7 @@ impl Searcher {
                 total_hits,
                 total_hits_relation,
                 aggregations: merged_aggs,
+                knn_degraded_segments: query.knn.as_ref().map(|_| knn_degraded_segments),
             },
             phase_stats,
         ))
@@ -3348,6 +3369,11 @@ struct SegmentOutput {
     /// (>= the budget), and the response relation must be `gte` even if
     /// the summed total happens to equal the cap exactly.
     hits_capped: bool,
+    /// True when this segment's kNN search failed and contributed zero
+    /// vector candidates (see `SearchResult::knn_degraded_segments`).
+    /// Always `false` on every fast path below except the general path,
+    /// which is the only one that runs kNN at all.
+    knn_segment_degraded: bool,
 }
 
 fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {

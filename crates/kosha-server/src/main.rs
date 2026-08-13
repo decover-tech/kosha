@@ -3472,6 +3472,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                 queue_ms,
                 &phases,
                 result.total_hits,
+                result.knn_degraded_segments,
             );
             let resp = json_ok(&result);
             // Only successful responses enter the cache, after the search
@@ -3793,6 +3794,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
                 queue_ms,
                 &phases,
                 result.total_hits,
+                result.knn_degraded_segments,
             );
             json_ok(&result)
         }
@@ -4627,6 +4629,10 @@ fn log_search_timing(
     queue_ms: f64,
     phases: &kosha_query::SearchPhaseStats,
     total_hits: usize,
+    // See `kosha_core::SearchResult::knn_degraded_segments` — `None` (a
+    // non-kNN query) logs the same as `Some(0)` here; this line is a human/
+    // grep-facing skim, not the API contract that needs the distinction.
+    knn_degraded_segments: Option<u32>,
 ) {
     let total_ms = hydrate_ms
         + queue_ms
@@ -4637,7 +4643,7 @@ fn log_search_timing(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} score_ms={:.1} \
          materialize_ms={:.1} opens_cold={} opens_cached={} open_total_ms={:.1} \
-         knn_postings={} hits={}",
+         knn_postings={} knn_degraded={} hits={}",
         ns.0,
         total_ms,
         hydrate_ms,
@@ -4651,6 +4657,7 @@ fn log_search_timing(
         phases.open_cached,
         phases.open_total_ms,
         phases.knn_postings_probed,
+        knn_degraded_segments.unwrap_or(0),
         total_hits,
     );
 }

@@ -991,6 +991,18 @@ pub struct SearchResult {
     pub total_hits_relation: TotalHitsRelation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregations: Option<AggregationResults>,
+    /// `None` for a non-kNN query (the concept doesn't apply). For a kNN
+    /// query, the number of segments whose vector index search failed and
+    /// silently contributed zero candidates for this request — `Some(0)`
+    /// means every segment searched cleanly. A page that "succeeded" (200,
+    /// non-empty `results`) can still be missing whatever the failed
+    /// segment(s) would have contributed; this is the only client-visible
+    /// signal of that. Was previously an `eprintln!` on the server only
+    /// (kosha-query's `score_segment`) — invisible to callers, so a
+    /// benchmark harness checking only HTTP status/latency could not have
+    /// told a degraded response from a healthy one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn_degraded_segments: Option<u32>,
 }
 
 // ─── Indexing types ────────────────────────────────────────────────────────
