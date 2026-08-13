@@ -8,18 +8,30 @@
 #   ./run_phases.sh bm25   <namespace> <out-dir> [qps] [duration]
 #   ./run_phases.sh vector <namespace> <out-dir> [qps] [duration]
 #
-# bm25:   cold OR cache-off phase, then warm OR cache-off + warm cache-on.
-# vector: cold kNN cache-off phase, then warm kNN cache-on.
+# Two phases each, cold cache-off then warm cache-on — the pair that
+# actually distinguishes "first touch" from "steady state", which is what
+# most runs are checking. (bm25 used to also run a warm-cache-off phase in
+# between; dropped — vector never had it, and it wasn't pulling its weight
+# for the usual "did this change help" check.)
 # "cold" here means: this script wipes the local store and restarts the
 # kosha container first, gating on /readyz (warmup does the prefetch —
 # configure KOSHA_WARMUP_NAMESPACES on the container for the namespace).
+#
+# [duration] defaults to 300s (quick, ~5 min/phase) — fine for warm-phase
+# numbers and for cold p50/p90 sanity checks, i.e. most runs ("did this
+# change help"). NOT enough to trust a *cold* p99: round 6 (RESULTS.md)
+# measured the startup convoy — every query needing S3 hydration across
+# every segment at t=0 — taking ~3 min to clear on its own, so a 5-min cold
+# phase leaves only ~2 min (≈960 reqs @ 8 QPS) of genuinely post-convoy
+# data, thin for a tail percentile. Pass 1800 explicitly (the full
+# tpuf-protocol duration) whenever a cold p99 is going into a report.
 set -euo pipefail
 
 SUITE="${1:?usage: run_phases.sh bm25|vector <namespace> <out-dir> [qps] [duration]}"
 NS="${2:?namespace required}"
 OUT="${3:?out-dir required}"
 QPS="${4:-8}"
-DURATION="${5:-1800}"
+DURATION="${5:-300}"
 API_KEY="${KOSHA_API_KEY:-sk-bench}"
 BENCH=~/kosha/scripts/bench/bm25_scale/query_bench.py
 PY=~/venv311/bin/python3
@@ -51,7 +63,6 @@ phase() { # phase <label> <extra-args...>
 
 if [ "$SUITE" = "bm25" ]; then
   phase cold_or_nocache  --phase cold --operator or --no-cache
-  phase warm_or_nocache  --phase warm --operator or --no-cache
   phase warm_or_cache    --phase warm --operator or
 else
   phase knn_cold_nocache --phase cold --knn-embeddings /data/queries_emb.f32 --no-cache
