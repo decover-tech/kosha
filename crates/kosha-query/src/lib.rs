@@ -2235,7 +2235,23 @@ impl Searcher {
                         flat_knn(&knn.vector, &reader.vector_store.vectors, fetch_k)
                     }
                 }
-                None => Vec::new(),
+                None => {
+                    // `vector_index` and `vector_store` are both empty
+                    // here (that's why we're in this arm at all), but that
+                    // shape is shared by two different segment states: a
+                    // segment with no vector field at all (legitimate, no
+                    // flag), and one whose vector.idx has a valid header
+                    // but a corrupt/truncated body (its true neighbors are
+                    // silently missing — must be counted).
+                    if reader.vector_index_degraded() {
+                        eprintln!(
+                            "WARN: segment {} has a corrupt vector.idx body — treating as no vector hits for this segment",
+                            reader.segment_dir().display()
+                        );
+                        knn_segment_degraded = true;
+                    }
+                    Vec::new()
+                }
             };
             // `knn.filter` — accepted on the wire since the field was
             // introduced but silently ignored until now. It scopes the kNN
@@ -5159,6 +5175,149 @@ mod tests {
         assert!(
             got_ids.contains(&"d0".to_string()),
             "exact match must always be in the results: {got_ids:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_degraded_segments_counts_a_segment_with_a_corrupt_vector_idx_body() {
+        // `knn_search`/`knn_search_within` returning `Err` isn't the only
+        // way a segment's vectors can go silently missing: a segment whose
+        // `vector.idx` has a valid v2 header but a corrupt/truncated body
+        // parses to nothing at open time and lands in the exact same
+        // `None => Vec::new()` branch as a segment with no vector field at
+        // all. Without checking `reader.vector_index_degraded()` there, this
+        // segment would return a clean zero-hit result with no signal that
+        // its true nearest neighbors are missing — the blind spot in the
+        // original `knn_degraded_segments` (PR #152).
+        let dir = std::env::temp_dir().join("kosha-test-knn-degraded-corrupt-body");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::vector("contentEmbedding", vec![1.0, 0.0, 0.0])],
+        );
+        w.add_document(
+            DocumentId("d2".into()),
+            vec![Field::vector("contentEmbedding", vec![0.0, 1.0, 0.0])],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        // Force the corrupt-body path: drop the sidecar (forces the eager
+        // fallback), then truncate vector.idx's body so the eager parse
+        // fails too, while its header stays valid — same recipe as
+        // `kosha-segment`'s `corrupt_vector_idx_body_is_marked_degraded_not_silently_emptied`.
+        std::fs::remove_file(seg_dir.join("vector.offsets")).unwrap();
+        let idx_path = seg_dir.join("vector.idx");
+        let mut bytes = std::fs::read(&idx_path).unwrap();
+        bytes.truncate(bytes.len() - 3);
+        std::fs::write(&idx_path, &bytes).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 2,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let mut q = mk_query("", 5);
+        q.knn = Some(kosha_core::KnnQuery {
+            field: "contentEmbedding".into(),
+            vector: vec![1.0, 0.0, 0.0],
+            k: 5,
+            num_candidates: 10,
+            filter: None,
+        });
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(
+            r.results.len(),
+            0,
+            "the corrupt segment's vectors are genuinely unrecoverable"
+        );
+        assert_eq!(
+            r.knn_degraded_segments,
+            Some(1),
+            "a segment with a corrupt vector.idx body must be counted as \
+             degraded, not silently reported as a clean zero-hit result"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_degraded_segments_counts_a_segment_whose_hydration_errors() {
+        // The other half of the degraded-segment signal: `knn_search`
+        // itself returning `Err` (as opposed to the corrupt-body-at-open
+        // case above, where the index never loads in the first place). The
+        // lazy v2 path resolves centroids from `vector.offsets` at open and
+        // only opens `vector.idx` for real when a probed posting needs
+        // hydrating — so a *warm* reader (already cached from a prior
+        // search on the same `Searcher`) whose backing file then vanishes
+        // fails at hydration time, not at open time. `hydrate_posting`'s
+        // one-shot admission also means the first touch of a posting is
+        // never itself cached, so a second identical query is guaranteed to
+        // re-hit disk rather than serve from the decoded-postings cache.
+        let dir = std::env::temp_dir().join("kosha-test-knn-degraded-hydration-error");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::vector("contentEmbedding", vec![1.0, 0.0, 0.0])],
+        );
+        w.add_document(
+            DocumentId("d2".into()),
+            vec![Field::vector("contentEmbedding", vec![0.0, 1.0, 0.0])],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 2,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let mut q = mk_query("", 5);
+        q.knn = Some(kosha_core::KnnQuery {
+            field: "contentEmbedding".into(),
+            vector: vec![1.0, 0.0, 0.0],
+            k: 5,
+            num_candidates: 10,
+            filter: None,
+        });
+
+        // First call: vector.idx is present, opens and hydrates normally,
+        // warming this segment into the searcher's own SegmentCache (keyed
+        // by namespace/segment/load_vectors — reused as-is by the next
+        // call, not reopened from disk).
+        let warm = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(warm.knn_degraded_segments, Some(0));
+
+        // Now the file disappears. The already-open reader still has it
+        // resident in `vector_idx_path`, so the segment stays "present" as
+        // far as the cache/open path is concerned — only the next
+        // hydration attempt discovers it's gone.
+        std::fs::remove_file(seg_dir.join("vector.idx")).unwrap();
+
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(
+            r.results.len(),
+            0,
+            "hydration failed, so this segment has no vector hits to return"
+        );
+        assert_eq!(
+            r.knn_degraded_segments,
+            Some(1),
+            "a segment whose knn_search errors must be counted as degraded"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

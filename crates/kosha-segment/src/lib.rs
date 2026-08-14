@@ -2417,12 +2417,16 @@ impl LazyFilters {
 }
 
 /// Return type of `load_vector_index`: `(vector_store, hnsw_map,
-/// vector_index)`, exactly one of `vector_index` or `(vector_store,
-/// hnsw_map)` populated.
+/// vector_index, degraded)`, exactly one of `vector_index` or
+/// `(vector_store, hnsw_map)` populated. `degraded` is `true` only for the
+/// one case where a segment's vectors are unreadable rather than genuinely
+/// absent (a valid v2 header with a corrupt/truncated body) — everything
+/// else, including "no vector.idx file at all", leaves it `false`.
 type LoadedVectorState = (
     VectorStore,
     Option<HnswMap<CosinePoint, u32>>,
     Option<LazyVectorIndex>,
+    bool,
 );
 
 /// Resident state for a v2 (posting-based) segment's vectors: centroids are
@@ -2484,6 +2488,16 @@ pub struct SegmentReader {
     /// and fall back to `hnsw_map`/`vector_store` otherwise, exactly as
     /// before this field existed.
     vector_index: Option<LazyVectorIndex>,
+    /// `true` when this segment has a valid v2 `vector.idx` header but a
+    /// corrupt/truncated body. In this state `vector_index` is `None` and
+    /// `vector_store` is empty — identical, at the type level, to a segment
+    /// with no vector field at all. The query layer (`kosha-query`) checks
+    /// this flag to tell the two apart: a genuinely vector-less segment
+    /// contributes zero kNN hits legitimately, while a degraded one is
+    /// silently missing real results and must be counted in
+    /// `SearchResult::knn_degraded_segments` instead. See
+    /// `load_vector_index`'s corrupt-body branch.
+    vector_index_degraded: bool,
 }
 
 impl SegmentReader {
@@ -2523,10 +2537,10 @@ impl SegmentReader {
         footer: Option<Footer>,
         postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
     ) -> Result<Self, KoshaError> {
-        let (vs, hm, vector_index) = if load_vectors {
+        let (vs, hm, vector_index, vector_index_degraded) = if load_vectors {
             Self::load_vector_index(&segment_dir, postings_account.clone())?
         } else {
-            (VectorStore::default(), None, None)
+            (VectorStore::default(), None, None, false)
         };
         let footer = match footer {
             Some(footer) => footer,
@@ -2551,6 +2565,7 @@ impl SegmentReader {
             vector_store: vs,
             hnsw_map: hm,
             vector_index,
+            vector_index_degraded,
         })
     }
 
@@ -2568,7 +2583,7 @@ impl SegmentReader {
             // No vector.idx at all — a namespace/segment with no vector
             // fields. Not an error; matches `read_vectors`'s existing
             // missing-file handling.
-            return Ok((VectorStore::default(), None, None));
+            return Ok((VectorStore::default(), None, None, false));
         };
 
         let Some((dim, _total_count, version)) = parse_vector_idx_header(&data) else {
@@ -2581,7 +2596,7 @@ impl SegmentReader {
             // exact scan of a flush-sized segment is milliseconds — and
             // strictly better recall.
             let vs = Self::read_vectors(segment_dir)?;
-            return Ok((vs, None, None));
+            return Ok((vs, None, None, false));
         };
 
         // Valid v2 header. Prefer the lazy path; fall back to a full eager
@@ -2611,6 +2626,7 @@ impl SegmentReader {
                             postings_account,
                         ),
                     }),
+                    false,
                 ));
             }
             eprintln!(
@@ -2624,17 +2640,20 @@ impl SegmentReader {
             Some(vs) => {
                 // Same rule as the legacy branch above: no query/open-path
                 // ANN builds — exact flat_knn serves this segment.
-                Ok((vs, None, None))
+                Ok((vs, None, None, false))
             }
             None => {
                 // Valid header but the body itself is truncated/corrupt —
-                // genuinely unrecoverable for this segment's vectors.
+                // genuinely unrecoverable for this segment's vectors. Marked
+                // `degraded` (not just empty) so the query layer counts this
+                // segment in `SearchResult::knn_degraded_segments` rather
+                // than treating it as a legitimate vector-less segment.
                 eprintln!(
                     "WARN: vector.idx has a valid v2 header but corrupt body for {} \
                      — this segment will return no vector search results until rewritten",
                     segment_dir.display()
                 );
-                Ok((VectorStore::default(), None, None))
+                Ok((VectorStore::default(), None, None, true))
             }
         }
     }
@@ -2645,6 +2664,16 @@ impl SegmentReader {
     /// existing `hnsw_map`/`flat_knn` path.
     pub fn has_lazy_vector_index(&self) -> bool {
         self.vector_index.is_some()
+    }
+
+    /// `true` when this segment's vectors exist but are currently
+    /// unreadable (corrupt/truncated `vector.idx` body behind a valid v2
+    /// header) — as opposed to the segment genuinely having no vector
+    /// field, which also reports empty `vector_index`/`vector_store` but
+    /// leaves this `false`. See the field's doc comment for why callers
+    /// must check this before treating an empty kNN result as legitimate.
+    pub fn vector_index_degraded(&self) -> bool {
+        self.vector_index_degraded
     }
 
     /// Reads and decodes one posting's live entries from `vector.idx` —
@@ -4788,6 +4817,59 @@ mod tests {
         assert!(
             r.knn_search(&[0.0], 5, 16).is_none(),
             "no lazy index means knn_search returns None, not an error"
+        );
+        assert!(
+            !r.vector_index_degraded(),
+            "a segment with no vector field at all is not degraded — it \
+             legitimately has nothing to search"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_vector_idx_body_is_marked_degraded_not_silently_emptied() {
+        // `vector_index` and `vector_store` end up empty here exactly as in
+        // `segment_with_no_vector_fields_has_no_vector_index_at_all` above —
+        // same shape, different reality: this segment's vectors exist but
+        // are unreadable. `vector_index_degraded()` is the only thing that
+        // tells the two apart, and it's what the query layer checks before
+        // deciding whether to count the segment in `knn_degraded_segments`.
+        let dir = std::env::temp_dir().join("kosha-test-vector-v2-corrupt-body");
+        write_v2_fixture(
+            &dir,
+            &[
+                ("d0", vec![1.0, 0.0, 0.0, 0.0]),
+                ("d1", vec![0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+
+        // Force the eager-parse fallback (drop the sidecar), then truncate
+        // vector.idx's body so even the eager parse fails too — a valid v2
+        // header with an unrecoverable body, the one branch of
+        // `load_vector_index` that can't serve the segment any other way.
+        fs::remove_file(dir.join("vector.offsets")).unwrap();
+        let idx_path = dir.join("vector.idx");
+        let mut bytes = fs::read(&idx_path).unwrap();
+        bytes.truncate(bytes.len() - 3);
+        fs::write(&idx_path, &bytes).unwrap();
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(
+            r.vector_index_degraded(),
+            "corrupt body behind a valid v2 header must be marked degraded, \
+             not indistinguishable from a legitimately vector-less segment"
+        );
+        assert!(!r.has_lazy_vector_index());
+        assert!(
+            r.vector_store.vectors.is_empty(),
+            "a corrupt body has no recoverable vectors — degraded, not \
+             silently repopulated from somewhere else"
+        );
+        assert!(
+            r.knn_search(&[1.0, 0.0, 0.0, 0.0], 2, 16).is_none(),
+            "knn_search still reports None (same as vector-less) — callers \
+             must check vector_index_degraded() to tell the two apart"
         );
 
         let _ = fs::remove_dir_all(&dir);
