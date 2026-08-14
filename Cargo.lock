@@ -2033,6 +2033,7 @@ dependencies = [
 name = "kosha-segment"
 version = "0.1.0"
 dependencies = [
+ "cap",
  "instant-distance",
  "kosha-core",
  "kosha-vector-spfresh",
