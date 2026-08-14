@@ -983,6 +983,65 @@ fn knn_global_budget_enabled() -> bool {
     })
 }
 
+/// Fraction of a namespace's total centroid count that [`effective_knn_budget`]
+/// floors the probe budget to. `num_candidates` selects *centroids/clusters*
+/// to probe, not documents — a fixed default that doesn't scale with corpus
+/// fragmentation silently under-serves recall as segment count grows: the
+/// "tpuf-comparable" default of 100 measured mean recall@10 of 0.563 on a
+/// 10M-doc, ~200-segment namespace (RESULTS.md), and
+/// `thin_global_budget_can_bury_the_true_neighbour_in_a_diluted_centroid`
+/// proves the mechanism deterministically — a cluster's centroid can look
+/// mediocre even when it buries the single best-matching document, and that
+/// whole cluster is skipped once its centroid loses a too-thin cutoff.
+///
+/// Override via `KOSHA_KNN_BUDGET_FRACTION` while tuning against a real
+/// corpus — this default (5%) is a starting point grounded in typical IVF
+/// nprobe/nlist ratios for high recall, not yet empirically validated at
+/// the 10M-doc scale that motivated it.
+fn knn_budget_fraction() -> f64 {
+    static FRACTION: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *FRACTION.get_or_init(|| {
+        std::env::var("KOSHA_KNN_BUDGET_FRACTION")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|f| *f > 0.0 && f.is_finite())
+            .unwrap_or(0.05)
+    })
+}
+
+/// Upper bound on the scaled floor — without a cap, a namespace with enough
+/// centroids could silently turn every kNN query into a near-exhaustive
+/// scan (the exact posting-hydration fan-out `knn_global_budget_enabled`'s
+/// own doc comment describes as "the queries never had a chance"). This
+/// bounds the floor's *worst case* cost; an explicit client `num_candidates`
+/// above the cap is still honored as-is (never reduced) — see
+/// `effective_knn_budget`. Override via `KOSHA_KNN_BUDGET_MAX_CAP`.
+fn knn_budget_max_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("KOSHA_KNN_BUDGET_MAX_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(20_000)
+    })
+}
+
+/// Scales a client-requested kNN probe budget up to a sane floor for the
+/// corpus actually being searched, instead of trusting a fixed constant
+/// that quietly under-serves recall as a namespace grows. This is a FLOOR
+/// only: an explicit client request above it is never reduced, so a caller
+/// that already knows to ask for more keeps getting exactly that. No
+/// separate lower bound beyond `requested` itself — a small namespace
+/// naturally produces a small `ceil(fraction * total_centroids)`, and
+/// there's nothing wrong with that; a client's own smaller explicit
+/// request deserves the same respect a larger one gets, not an unrelated
+/// constant silently overriding it.
+fn effective_knn_budget(requested: usize, total_centroids: usize) -> usize {
+    let floor = ((total_centroids as f64 * knn_budget_fraction()).ceil() as usize)
+        .min(knn_budget_max_cap());
+    requested.max(floor)
+}
+
 /// Flat kNN search: compute cosine similarity against all stored vectors,
 /// return top-K (doc_seq, score) pairs.
 pub fn flat_knn(query_vector: &[f32], vectors: &[(u32, Vec<f32>)], k: usize) -> Vec<(u32, f64)> {
@@ -1162,8 +1221,13 @@ impl Searcher {
     /// merged) — see [`Searcher::search`], which runs this via
     /// `par_iter().map(...)` across the manifest instead of one at a time.
     /// The distance cutoff that admits about `num_candidates` posting
-    /// probes across the WHOLE query, or `None` to fall back to per-segment
-    /// `nprobe`.
+    /// probes across the WHOLE query (or the corpus-scaled floor from
+    /// [`effective_knn_budget`], whichever is larger), paired with that
+    /// same effective budget so the caller can apply it as the per-segment
+    /// `max_probes` safety cap too — using the raw client `num_candidates`
+    /// there instead would silently re-shrink a floor-widened cutoff back
+    /// down in any segment where more than the client's own request
+    /// qualifies. `None` to fall back to per-segment `nprobe`.
     ///
     /// Cheap by construction: it only reads posting centroids, which are
     /// already resident in every open segment's `LazyVectorIndex` (loaded
@@ -1182,12 +1246,18 @@ impl Searcher {
         knn: &kosha_core::KnnQuery,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
-    ) -> Option<f32> {
-        let budget = knn.num_candidates.max(1);
-        // Distances from every segment, gathered in parallel. A segment
-        // that fails to open or has no lazy index contributes nothing —
-        // it will simply take the per-segment fallback path when scored.
-        let mut all: Vec<f32> = manifest
+    ) -> Option<(f32, usize)> {
+        let requested = knn.num_candidates.max(1);
+        // Distances from every segment's centroids, gathered in parallel —
+        // zero posting I/O, centroids are already resident from open. Kept
+        // untruncated per-segment (unlike the pre-corpus-scaling version):
+        // the effective budget below needs the corpus's real total
+        // centroid count, not just enough of it to satisfy the client's
+        // own request, and this pass was already O(that segment's centroid
+        // count) just to compute the distances in the first place — a
+        // segment that fails to open or has no lazy index contributes
+        // nothing, and simply takes the per-segment fallback path later.
+        let all: Vec<f32> = manifest
             .segments
             .par_iter()
             .filter_map(|entry| {
@@ -1206,14 +1276,7 @@ impl Searcher {
                         Some(open_stats),
                     )
                     .ok()?;
-                let mut d = reader.knn_centroid_distances(&knn.vector)?;
-                // Only the `budget` nearest of any single segment can ever
-                // matter to a global top-`budget`; trimming here keeps the
-                // merge below proportional to segments x budget, not to
-                // total posting count.
-                d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                d.truncate(budget);
-                Some(d)
+                reader.knn_centroid_distances(&knn.vector)
             })
             .flatten()
             .collect();
@@ -1221,16 +1284,19 @@ impl Searcher {
         if all.is_empty() {
             return None; // no v2 vector segments — keep legacy behavior
         }
+        let total_centroids = all.len();
+        let budget = effective_knn_budget(requested, total_centroids);
+        let mut all = all;
         if all.len() <= budget {
-            // The whole namespace has fewer postings than the budget:
+            // The whole namespace has fewer centroids than the budget:
             // nothing to prune, admit everything.
-            return Some(f32::INFINITY);
+            return Some((f32::INFINITY, budget));
         }
         let idx = budget - 1;
         all.select_nth_unstable_by(idx, |a, b| {
             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
         });
-        Some(all[idx])
+        Some((all[idx], budget))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1253,12 +1319,15 @@ impl Searcher {
         manifest_footer: Option<&kosha_core::Footer>,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
-        // `Some(cutoff)` = a global probe budget was computed for this kNN
-        // query (see `global_probe_cutoff`): probe only centroids within
-        // `cutoff` instead of this segment's own `num_candidates` nearest.
-        // `None` = no budget available (legacy flat segments, or budgeting
-        // disabled) — fall back to per-segment `nprobe`.
-        knn_cutoff: Option<f32>,
+        // `Some((cutoff, effective_budget))` = a global probe budget was
+        // computed for this kNN query (see `global_probe_cutoff`): probe
+        // only centroids within `cutoff`, capped at `effective_budget` per
+        // segment — NOT this segment's raw `knn.num_candidates`, which
+        // `effective_budget` may already have widened past (see
+        // `effective_knn_budget`). `None` = no budget available (legacy
+        // flat segments, or budgeting disabled) — fall back to per-segment
+        // `nprobe`.
+        knn_cutoff: Option<(f32, usize)>,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
         let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
         if !seg_dir.exists() {
@@ -2187,8 +2256,8 @@ impl Searcher {
             // correct but pays `num_candidates` in EVERY segment, so total
             // probe depth scales with segment count.
             let probe = match knn_cutoff {
-                Some(cutoff) => reader
-                    .knn_search_within(&knn.vector, fetch_k, cutoff, knn.num_candidates)
+                Some((cutoff, effective_budget)) => reader
+                    .knn_search_within(&knn.vector, fetch_k, cutoff, effective_budget)
                     .map(|r| {
                         r.map(|(results, probes)| {
                             open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
