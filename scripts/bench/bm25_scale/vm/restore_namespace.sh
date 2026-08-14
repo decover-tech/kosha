@@ -35,4 +35,14 @@ sudo rm -rf /var/cache/kosha-placeholder 2>/dev/null || true
 sudo rm -rf /data/kosha/data/* 2>/dev/null || true
 sudo docker start kosha >/dev/null
 until curl -sf -H "Authorization: Bearer ${KOSHA_API_KEY:-sk-bench}" http://127.0.0.1:8080/stats >/dev/null; do sleep 3; done
+
+# Segment count matters for anything that reasons about a per-query probe
+# budget spread across segments (e.g. knn.num_candidates is a whole-query
+# budget, not per-segment) — surface it here rather than leave it buried,
+# it's cheap and this is the one point every run already waits on /stats.
+STATS_SEGMENTS="$(curl -sf -H "Authorization: Bearer ${KOSHA_API_KEY:-sk-bench}" http://127.0.0.1:8080/stats \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); ns=[n for n in d.get('namespaces',[]) if n.get('namespace')=='$NS']; print(f\"{ns[0]['segments']} segments, {ns[0]['documents']} docs\" if ns else 'namespace not found in /stats')" \
+  2>/dev/null || echo "stats parse failed")"
+echo "RESTORE-STATS $NS: $STATS_SEGMENTS"
+
 echo "RESTORE-COMPLETE $NAME — server up; wait on /readyz for warmup before benching"

@@ -55,6 +55,14 @@ on:
       recall_sample:
         description: number of queries to check recall for (statistical sample, not the full query set)
         default: "100"
+      recall_num_candidates:
+        description: >-
+          whole-query kNN probe budget for the recall check (knn.num_candidates
+          is shared across every segment in the namespace, not per-segment —
+          the "tpuf-comparable" 100 default that query_bench.py's phases also
+          use gets thin fast as segment count grows; bump this to test
+          whether recall recovers with a larger budget)
+        default: "100"
 
 concurrency:
   group: bench-vm            # one bench stack; never two runs at once
@@ -200,7 +208,7 @@ jobs:
               --host http://127.0.0.1:8080 --namespace $VEC_NS --api-key sk-bench \
               --embeddings-dir \"\$EMB_DIR\" \
               --queries-file /data/queries.txt --queries-emb /data/queries_emb.f32 \
-              --sample '${{ inputs.recall_sample }}' --k 10 --num-candidates 100 \
+              --sample '${{ inputs.recall_sample }}' --k 10 --num-candidates '${{ inputs.recall_num_candidates }}' \
               --out /data/results-ci/vector/recall.json"
 
       - name: Collect results + summary
