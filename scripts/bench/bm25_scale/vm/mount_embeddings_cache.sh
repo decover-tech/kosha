@@ -48,7 +48,16 @@ if ! sudo file -s "$DEV" | grep -q ext4; then
   sudo mkfs -t ext4 -q "$DEV"
 fi
 
-sudo mount "$DEV" "$MOUNT"
+if mountpoint -q "$MOUNT"; then
+  # A failed run's bench VM is kept around for debugging (standing rule) —
+  # the very same instance can get reused by the next dispatch before
+  # anyone tears it down, and this volume + mount survive with it. Mount
+  # itself isn't idempotent (exit 32 on an already-mounted target), so
+  # check first rather than let that abort the whole step.
+  log "embeddings cache already mounted at $MOUNT (VM reused from a prior run) — skipping mount"
+else
+  sudo mount "$DEV" "$MOUNT"
+fi
 sudo chown -R "$(id -u):$(id -g)" "$MOUNT"
 
 if [ -f "$MOUNT/emb_manifest.json" ]; then
