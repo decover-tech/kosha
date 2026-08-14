@@ -117,7 +117,7 @@ jobs:
             --exclude target --exclude .git ./ "ec2-user@$IP:kosha/"
           $SSH 'sudo dnf install -q -y python3.11 python3.11-pip >/dev/null 2>&1 || true
                 python3.11 -m venv ~/venv311 2>/dev/null || true
-                ~/venv311/bin/pip install -q requests
+                ~/venv311/bin/pip install -q requests numpy
                 chmod +x ~/kosha/scripts/bench/bm25_scale/vm/*.sh'
 
       - name: Build server image + start containers
