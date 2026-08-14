@@ -157,6 +157,19 @@ pub struct RebalanceStats {
 pub struct PostingSnapshot {
     pub centroid: Vec<f32>,
     pub entries: Vec<(u32, Vec<f32>)>,
+    /// Max cosine distance from `centroid` to any entry in this posting —
+    /// a triangle-inequality bound: `distance(query, member) >=
+    /// distance(query, centroid) - radius` for every member, so
+    /// `(distance(query, centroid) - radius).max(0.0)` is a safe LOWER
+    /// bound on how close this posting's closest member could possibly be
+    /// to any query. Ranking postings by that bound instead of raw
+    /// centroid distance is what lets a "diffuse" posting (small centroid
+    /// pull, but a genuinely close member buried inside it) still qualify
+    /// for probing — see kosha-query's
+    /// `thin_global_budget_can_bury_the_true_neighbour_in_a_diluted_centroid`
+    /// for the failure mode this exists to fix at the source, rather than
+    /// compensating for it with a wider raw probe budget.
+    pub radius: f32,
 }
 
 /// A SPANN-style cluster/posting ANN index, kept balanced by LIRE.
@@ -253,9 +266,18 @@ impl ClusterIndex {
                 let p = self.postings[pid]
                     .as_ref()
                     .expect("active_posting_ids only yields Some slots");
+                let entries: Vec<(u32, Vec<f32>)> =
+                    p.live_entries().map(|e| (e.id, e.vector.clone())).collect();
+                // Free byproduct of the pass that already visits every
+                // live entry to clone it — no second scan.
+                let radius = entries
+                    .iter()
+                    .map(|(_, v)| cosine_distance(&p.centroid, v))
+                    .fold(0.0f32, f32::max);
                 PostingSnapshot {
                     centroid: p.centroid.clone(),
-                    entries: p.live_entries().map(|e| (e.id, e.vector.clone())).collect(),
+                    entries,
+                    radius,
                 }
             })
             .collect()
@@ -434,6 +456,44 @@ mod tests {
             for (_, v) in &p.entries {
                 assert_eq!(v.len(), dim);
             }
+        }
+    }
+
+    #[test]
+    fn snapshot_radius_is_the_true_max_distance_to_any_live_member() {
+        // Direct, independent check: recompute each posting's radius by
+        // brute force from its own entries and confirm it matches exactly
+        // — not just "some non-negative number got set".
+        let dim = 4;
+        let mut vectors = Vec::new();
+        for i in 0..60u32 {
+            let angle = (i as f32) * std::f32::consts::PI / 30.0;
+            vectors.push((i, vec_at(dim, angle, 0.0)));
+        }
+        let mut cfg = ClusterIndexConfig::new(dim);
+        cfg.target_posting_size = 8;
+        cfg.max_posting_size = 16;
+        cfg.min_posting_size = 2;
+        let idx = ClusterIndex::build(&vectors, cfg).unwrap();
+        let snap = idx.snapshot();
+
+        assert!(!snap.is_empty());
+        for p in &snap {
+            let brute_force_radius = p
+                .entries
+                .iter()
+                .map(|(_, v)| cosine_distance(&p.centroid, v))
+                .fold(0.0f32, f32::max);
+            assert!(
+                (p.radius - brute_force_radius).abs() < 1e-6,
+                "radius {} must equal the brute-force max distance {brute_force_radius}",
+                p.radius
+            );
+            // A posting always contains at least its own centroid's
+            // "closest" member — radius can never be negative (cosine
+            // distance is >= 0 by construction) and a single-entry
+            // posting's radius is that entry's exact distance to centroid.
+            assert!(p.radius >= 0.0);
         }
     }
 

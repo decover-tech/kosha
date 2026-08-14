@@ -5197,9 +5197,21 @@ mod tests {
         // mediocre because its OTHER members happen to sit far from the
         // query can lose the global cutoff entirely, even while burying an
         // individual document that would have been the single best answer
-        // in the whole corpus — classic IVF quantization error, and it
-        // gets more likely to bite as segment/cluster count grows relative
-        // to num_candidates, which is exactly the untested regime.
+        // in the whole corpus — classic IVF quantization error.
+        //
+        // This exact corpus originally proved the target excluded at ANY
+        // budget up to 50 (dead last, rank 51/51, under raw centroid
+        // distance) — the finding that motivated radius-aware ranking
+        // (`RADIUS_AWARE_VECTOR_INDEX_VERSION`, now the default write
+        // format: see `radius_aware_ranking_finds_the_diluted_neighbour_without_widening_the_budget`,
+        // the sibling test proving that fix resolves this SAME corpus at
+        // num_candidates=15). Radius-awareness is now on by default here
+        // too, which is real progress — the target's effective rank moves
+        // from dead last (51/51) to 10th of 51 — but a lower bound is
+        // still a bound, not a promise of finding everything on zero
+        // budget: this test now shows an even thinner budget (5, clear of
+        // the target's rank-10 lower bound with margin) still excludes it.
+        // The mechanism helps; it doesn't make budget irrelevant.
         //
         // Constructed deterministically, not relying on realistic-looking
         // random data: one "target" segment holds the true nearest
@@ -5209,7 +5221,8 @@ mod tests {
         // query. 50 one-doc "decoy" segments sit at 20°-80°, all with
         // cos_sim strictly greater than the target centroid's ~0.017 (by
         // construction, verified below), so a "closest centroid first"
-        // global ranking always ranks every decoy ahead of the target.
+        // global ranking always ranks every decoy ahead of the target on
+        // raw distance.
         let dir = std::env::temp_dir().join("kosha-test-knn-thin-budget-dilution");
         let _ = std::fs::remove_dir_all(&dir);
         let ns = NamespaceId("test".into());
@@ -5300,14 +5313,14 @@ mod tests {
             q
         };
 
-        // Thin budget (well under decoy count): the target segment's
-        // centroid loses the global cutoff to every decoy, so the buried
-        // true nearest neighbour is never even hydrated — zero recall on
-        // this query, not a near-miss. This is the failure mode the real
-        // benchmark hit (some queries measured recall_at_k == 0.0).
-        let thin = searcher
-            .search(&ns, &manifest, &mk_knn_q(10), None)
-            .unwrap();
+        // Thin budget (well under the target's radius-aware rank of 10):
+        // the target segment's lower bound still loses the global cutoff,
+        // so the buried true nearest neighbour is never even hydrated —
+        // zero recall on this query, not a near-miss. This is the failure
+        // mode the real benchmark hit (some queries measured
+        // recall_at_k == 0.0) — radius-awareness narrows when it happens,
+        // it doesn't eliminate the need for an adequate budget.
+        let thin = searcher.search(&ns, &manifest, &mk_knn_q(5), None).unwrap();
         assert!(
             !thin.results.is_empty(),
             "the budget excludes the target segment, not every segment — a \
@@ -5316,9 +5329,10 @@ mod tests {
         assert_ne!(
             thin.results.first().map(|h| h.doc_id.0.clone()),
             Some("true-nn".to_string()),
-            "at num_candidates=10 (< {DECOYS} decoys, all closer than the diluted \
-             target centroid), the true nearest neighbour must be excluded — got \
-             {:?}",
+            "at num_candidates=5 (well clear of the target's radius-aware \
+             rank of 10 among {}), the true nearest neighbour must still be \
+             excluded — got {:?}",
+            DECOYS + 1,
             thin.results
         );
 
@@ -5335,6 +5349,96 @@ mod tests {
             "at num_candidates >= segment count every centroid qualifies — the \
              true nearest neighbour must be found: {:?}",
             generous.results
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn radius_aware_ranking_finds_the_diluted_neighbour_without_widening_the_budget() {
+        // The structural fix for the exact scenario proved above: instead
+        // of needing a budget wide enough to include every segment (the
+        // "generous" case), a radius-aware lower bound lets the diluted
+        // target segment qualify at a budget that's still genuinely thin
+        // (15, vs. 51 total segments — nowhere close to "admit everything").
+        //
+        // Same corpus as `thin_global_budget_can_bury_the_true_neighbour_in_a_diluted_centroid`
+        // (true neighbour at 8°, opposite-facing diluter at 170°, 50
+        // one-doc decoys at 20°-80°), but this time every segment writes at
+        // the real default `vector_write_version()` (radius-aware) instead
+        // of relying on num_candidates alone. The target centroid's raw
+        // distance to the query is ~0.98 (worse than every decoy — old
+        // ranking excludes it at any budget up to 50, as the sibling test
+        // proves) but its *radius* (the diluter pulls the centroid ~89°
+        // off zero-ish while the true neighbour sits only 8° off) is large
+        // enough that the lower bound `(distance - radius).max(0.0)` drops
+        // to ~0.14 — inside the 15 nearest lower bounds of the 51 total.
+        let dir = std::env::temp_dir().join("kosha-test-knn-radius-aware-dilution");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+
+        let unit = |deg: f32| {
+            let r = deg.to_radians();
+            vec![r.cos(), r.sin()]
+        };
+
+        let mut entries = Vec::new();
+
+        let target_dir = dir.join(&ns.0).join("target");
+        let mut tw = SegmentWriter::new(SegmentId("target".into()), target_dir);
+        tw.add_document(
+            DocumentId("true-nn".into()),
+            vec![Field::vector("emb", unit(8.0))],
+        );
+        tw.add_document(
+            DocumentId("diluter".into()),
+            vec![Field::vector("emb", unit(170.0))],
+        );
+        tw.finalize(Bm25Params::default()).unwrap();
+        entries.push(ManifestEntry {
+            segment_id: SegmentId("target".into()),
+            doc_count: 2,
+        });
+
+        const DECOYS: usize = 50;
+        for i in 0..DECOYS {
+            let deg = 20.0 + (i as f32) * (60.0 / (DECOYS as f32 - 1.0)); // 20°..80°
+            let seg = format!("decoy{i:03}");
+            let seg_dir = dir.join(&ns.0).join(&seg);
+            let mut w = SegmentWriter::new(SegmentId(seg.clone()), seg_dir);
+            w.add_document(
+                DocumentId(format!("{seg}-d0")),
+                vec![Field::vector("emb", unit(deg))],
+            );
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: SegmentId(seg),
+                doc_count: 1,
+            });
+        }
+
+        let manifest = Manifest {
+            version: 1,
+            segments: entries,
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let mut q = mk_query("", 1);
+        q.knn = Some(kosha_core::KnnQuery {
+            field: "emb".into(),
+            vector: vec![1.0, 0.0],
+            k: 1,
+            num_candidates: 15, // thin: well under the 51-segment corpus
+            filter: None,
+        });
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        assert_eq!(
+            r.results.first().map(|h| h.doc_id.0.clone()),
+            Some("true-nn".to_string()),
+            "radius-aware ranking must find the diluted true neighbour at a \
+             thin budget (15), not just at a budget wide enough to admit \
+             every segment — got {:?}",
+            r.results
         );
 
         let _ = std::fs::remove_dir_all(&dir);
