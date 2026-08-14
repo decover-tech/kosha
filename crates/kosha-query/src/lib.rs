@@ -5181,6 +5181,166 @@ mod tests {
     }
 
     #[test]
+    fn thin_global_budget_can_bury_the_true_neighbour_in_a_diluted_centroid() {
+        // The real 10M-doc/~200-segment run measured mean recall@10 of
+        // 0.563 (some queries at 0.0) at num_candidates=100 — the
+        // "tpuf-comparable" default every existing recall test runs well
+        // above (knn_global_budget_preserves_top_hit_against_brute_force
+        // uses 8 segments at num_candidates=32, a 4x-over-segment-count
+        // ratio; the real run's ratio was ~0.5x). `global_probe_cutoff`
+        // provably preserves the true global top-`num_candidates`
+        // *centroids* (per-segment truncation can't drop a true top-K
+        // member — proved by construction, not just tested here) — so the
+        // failure isn't there. It's the next step down: probing only
+        // selects which *clusters* get hydrated, and a cluster's centroid
+        // is an average of its members. A cluster whose centroid is
+        // mediocre because its OTHER members happen to sit far from the
+        // query can lose the global cutoff entirely, even while burying an
+        // individual document that would have been the single best answer
+        // in the whole corpus — classic IVF quantization error, and it
+        // gets more likely to bite as segment/cluster count grows relative
+        // to num_candidates, which is exactly the untested regime.
+        //
+        // Constructed deterministically, not relying on realistic-looking
+        // random data: one "target" segment holds the true nearest
+        // neighbour (8° from the query, cos_sim ~0.99) paired with a
+        // deliberately opposite "diluter" doc (170°) — their average
+        // centroid lands at ~89°, cos_sim ~0.017, nearly orthogonal to the
+        // query. 50 one-doc "decoy" segments sit at 20°-80°, all with
+        // cos_sim strictly greater than the target centroid's ~0.017 (by
+        // construction, verified below), so a "closest centroid first"
+        // global ranking always ranks every decoy ahead of the target.
+        let dir = std::env::temp_dir().join("kosha-test-knn-thin-budget-dilution");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+
+        let unit = |deg: f32| {
+            let r = deg.to_radians();
+            vec![r.cos(), r.sin()]
+        };
+
+        let mut entries = Vec::new();
+
+        // Target segment: the true nearest neighbour, diluted by an
+        // opposite-facing doc in the same (tiny, sub-min_posting_size)
+        // segment so SPFresh forms exactly one centroid = their average.
+        let target_dir = dir.join(&ns.0).join("target");
+        let mut tw = SegmentWriter::new(SegmentId("target".into()), target_dir);
+        tw.add_document(
+            DocumentId("true-nn".into()),
+            vec![Field::vector("emb", unit(8.0))],
+        );
+        tw.add_document(
+            DocumentId("diluter".into()),
+            vec![Field::vector("emb", unit(170.0))],
+        );
+        tw.finalize(Bm25Params::default()).unwrap();
+        entries.push(ManifestEntry {
+            segment_id: SegmentId("target".into()),
+            doc_count: 2,
+        });
+
+        // Verify the dilution math holds before trusting the rest of the
+        // test on it: the target centroid's cosine similarity to the query
+        // must be lower than every decoy's.
+        let q = unit(0.0);
+        let cos_sim = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        };
+        let mut centroid = vec![0.0f32; 2];
+        for v in [unit(8.0), unit(170.0)] {
+            for (c, x) in centroid.iter_mut().zip(&v) {
+                *c += x;
+            }
+        }
+        let target_centroid_sim = cos_sim(&q, &centroid);
+
+        const DECOYS: usize = 50;
+        for i in 0..DECOYS {
+            let deg = 20.0 + (i as f32) * (60.0 / (DECOYS as f32 - 1.0)); // 20°..80°
+            let decoy_sim = cos_sim(&q, &unit(deg));
+            assert!(
+                decoy_sim > target_centroid_sim,
+                "decoy {i} at {deg}° (cos_sim={decoy_sim}) must beat the target \
+                 centroid (cos_sim={target_centroid_sim}) for this test to be valid"
+            );
+            let seg = format!("decoy{i:03}");
+            let seg_dir = dir.join(&ns.0).join(&seg);
+            let mut w = SegmentWriter::new(SegmentId(seg.clone()), seg_dir);
+            w.add_document(
+                DocumentId(format!("{seg}-d0")),
+                vec![Field::vector("emb", unit(deg))],
+            );
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: SegmentId(seg),
+                doc_count: 1,
+            });
+        }
+
+        let total_segments = entries.len(); // 51
+        let manifest = Manifest {
+            version: 1,
+            segments: entries,
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let mk_knn_q = |num_candidates: usize| {
+            let mut q = mk_query("", 1);
+            q.knn = Some(kosha_core::KnnQuery {
+                field: "emb".into(),
+                vector: unit(0.0),
+                k: 1,
+                num_candidates,
+                filter: None,
+            });
+            q
+        };
+
+        // Thin budget (well under decoy count): the target segment's
+        // centroid loses the global cutoff to every decoy, so the buried
+        // true nearest neighbour is never even hydrated — zero recall on
+        // this query, not a near-miss. This is the failure mode the real
+        // benchmark hit (some queries measured recall_at_k == 0.0).
+        let thin = searcher
+            .search(&ns, &manifest, &mk_knn_q(10), None)
+            .unwrap();
+        assert!(
+            !thin.results.is_empty(),
+            "the budget excludes the target segment, not every segment — a \
+             decoy must still answer"
+        );
+        assert_ne!(
+            thin.results.first().map(|h| h.doc_id.0.clone()),
+            Some("true-nn".to_string()),
+            "at num_candidates=10 (< {DECOYS} decoys, all closer than the diluted \
+             target centroid), the true nearest neighbour must be excluded — got \
+             {:?}",
+            thin.results
+        );
+
+        // Generous budget (>= total segment count): global_probe_cutoff's
+        // own short-circuit admits every segment, the target's centroid
+        // now qualifies, and the buried true neighbour — by far the
+        // single closest individual document in the corpus — is found.
+        let generous = searcher
+            .search(&ns, &manifest, &mk_knn_q(total_segments), None)
+            .unwrap();
+        assert_eq!(
+            generous.results.first().map(|h| h.doc_id.0.clone()),
+            Some("true-nn".to_string()),
+            "at num_candidates >= segment count every centroid qualifies — the \
+             true nearest neighbour must be found: {:?}",
+            generous.results
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn knn_degraded_segments_counts_a_segment_with_a_corrupt_vector_idx_body() {
         // `knn_search`/`knn_search_within` returning `Err` isn't the only
         // way a segment's vectors can go silently missing: a segment whose
