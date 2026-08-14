@@ -382,6 +382,7 @@ impl SegmentWriter {
         // re-normalized afterwards because a mean of unit vectors is not
         // itself unit-length.
         let unit_norm = vector_write_version() >= 3;
+        let radius_aware = vector_write_version() >= 4;
         let normalized: Vec<(u32, Vec<f32>)>;
         let vectors: &[(u32, Vec<f32>)] = if unit_norm {
             normalized = self
@@ -410,8 +411,27 @@ impl SegmentWriter {
         let format_version = if unit_norm {
             for p in &mut postings {
                 kosha_vector_spfresh::normalize_in_place(&mut p.centroid);
+                // Renormalizing shifts both direction and magnitude (a mean
+                // of unit vectors isn't itself unit-length), which
+                // invalidates the radius `ClusterIndex::snapshot` computed
+                // against the pre-renormalization centroid. Recompute
+                // against the final, on-disk centroid — cheap (one more
+                // pass over this posting's already-small entry list, not
+                // the whole segment) and only when it'll actually be
+                // persisted.
+                if radius_aware {
+                    p.radius = p
+                        .entries
+                        .iter()
+                        .map(|(_, v)| kosha_vector_spfresh::cosine_distance(&p.centroid, v))
+                        .fold(0.0f32, f32::max);
+                }
             }
-            UNIT_NORM_VECTOR_INDEX_VERSION
+            if radius_aware {
+                RADIUS_AWARE_VECTOR_INDEX_VERSION
+            } else {
+                UNIT_NORM_VECTOR_INDEX_VERSION
+            }
         } else {
             VECTOR_INDEX_VERSION
         };
@@ -465,7 +485,10 @@ impl SegmentWriter {
 //                    posting *boundaries* live only in the sidecar.
 //   vector.offsets: [magic][version][dim][posting_count] then, per posting:
 //                    [centroid:f32×dim][offset:u64][length:u32] into
-//                    vector.idx. Small — always resident once read (mirrors
+//                    vector.idx, plus — version >= RADIUS_AWARE_VECTOR_INDEX_VERSION
+//                    only — [radius:f32] (max cosine distance from centroid
+//                    to any live member; see that constant's doc comment).
+//                    Small — always resident once read (mirrors
 //                    `doc_store.offsets`/`DocStoreAccess::Lazy`).
 //
 // Four-way read dispatch (see `SegmentReader::open_with_footer_options`):
@@ -491,9 +514,35 @@ pub const VECTOR_INDEX_VERSION: u32 = 1;
 /// comparison that dominate scoring at high `dim`. Scores are unchanged in
 /// meaning: dot of unit vectors *is* the cosine of the originals.
 pub const UNIT_NORM_VECTOR_INDEX_VERSION: u32 = 2;
+/// Version 3: unit-norm (implies everything version 2 does — see
+/// `is_unit_norm_vector_index_version`) plus a `radius` field per posting in
+/// `vector.offsets`: the max cosine distance from that posting's centroid to
+/// any of its live members. Ranking/admitting postings by the
+/// triangle-inequality lower bound `(distance(query, centroid) -
+/// radius).max(0.0)` instead of raw centroid distance is what lets a
+/// "diffuse" posting (mediocre centroid, but a genuinely close member
+/// buried inside it) still get probed — see kosha-query's
+/// `thin_global_budget_can_bury_the_true_neighbour_in_a_diluted_centroid`
+/// for the failure mode this exists to fix at the source rather than
+/// compensate for with a wider raw probe budget. Older sidecars (version 1
+/// or 2) have no radius field on disk; readers treat that as radius = 0.0,
+/// which degrades exactly to today's raw-centroid-distance ranking — no
+/// regression, just no improvement, until a segment is rewritten.
+pub const RADIUS_AWARE_VECTOR_INDEX_VERSION: u32 = 3;
 
 pub fn is_known_vector_index_version(version: u32) -> bool {
-    version == VECTOR_INDEX_VERSION || version == UNIT_NORM_VECTOR_INDEX_VERSION
+    version == VECTOR_INDEX_VERSION
+        || version == UNIT_NORM_VECTOR_INDEX_VERSION
+        || version == RADIUS_AWARE_VECTOR_INDEX_VERSION
+}
+
+/// `>=` rather than `==`: every version from [`UNIT_NORM_VECTOR_INDEX_VERSION`]
+/// onward stores unit-L2-normalized vectors/centroids — treating this as a
+/// threshold (matching `vector_write_version()`'s own `>= 3` gate) means a
+/// future version bump that adds more fields doesn't silently break the
+/// dot-only scoring fast path the way an exact `==` check would.
+pub fn is_unit_norm_vector_index_version(version: u32) -> bool {
+    version >= UNIT_NORM_VECTOR_INDEX_VERSION
 }
 
 /// `magic(4) + version(4) + dim(4) + total_count(4)`.
@@ -502,11 +551,15 @@ const VECTOR_IDX_HEADER_LEN: usize = 16;
 const VECTOR_OFFSETS_HEADER_LEN: usize = 16;
 
 /// One posting's parsed sidecar entry: its centroid plus the byte range in
-/// `vector.idx` holding its live entries.
+/// `vector.idx` holding its live entries. `radius` is `0.0` when parsed from
+/// a pre-radius-aware sidecar (version 1 or 2) — that degrades ranking
+/// exactly to raw centroid distance, the pre-existing behavior, not a wrong
+/// answer.
 struct VectorPostingIndex {
     centroid: Vec<f32>,
     offset: u64,
     length: u32,
+    radius: f32,
 }
 
 /// Serializes posting snapshots (as produced by `ClusterIndex::snapshot`) to
@@ -532,6 +585,7 @@ fn encode_vector_index_v2(
     offsets_buf.extend_from_slice(&dim.to_le_bytes());
     offsets_buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
 
+    let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
     for p in postings {
         let offset = idx_buf.len() as u64;
         for (id, v) in &p.entries {
@@ -547,6 +601,9 @@ fn encode_vector_index_v2(
         }
         offsets_buf.extend_from_slice(&offset.to_le_bytes());
         offsets_buf.extend_from_slice(&length.to_le_bytes());
+        if radius_aware {
+            offsets_buf.extend_from_slice(&p.radius.to_le_bytes());
+        }
     }
 
     (idx_buf, offsets_buf)
@@ -629,7 +686,8 @@ fn parse_vector_offsets(
         return None;
     }
     let posting_count = read_u32_le(&mut cursor);
-    let record_size = 4 * dim as usize + 8 + 4;
+    let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
+    let record_size = 4 * dim as usize + 8 + 4 + if radius_aware { 4 } else { 0 };
     let expected_len = VECTOR_OFFSETS_HEADER_LEN + posting_count as usize * record_size;
     if data.len() != expected_len {
         return None;
@@ -642,10 +700,16 @@ fn parse_vector_offsets(
         }
         let offset = read_u64_le(&mut cursor);
         let length = read_u32_le(&mut cursor);
+        let radius = if radius_aware {
+            read_f32_le(&mut cursor)
+        } else {
+            0.0
+        };
         out.push(VectorPostingIndex {
             centroid,
             offset,
             length,
+            radius,
         });
     }
     Some(out)
@@ -678,10 +742,30 @@ mod vector_index_v2_tests {
             kosha_vector_spfresh::PostingSnapshot {
                 centroid: vec![1.0, 0.0],
                 entries: vec![(0, vec![1.0, 0.0]), (1, vec![0.9, 0.1])],
+                radius: 0.0,
             },
             kosha_vector_spfresh::PostingSnapshot {
                 centroid: vec![0.0, 1.0],
                 entries: vec![(2, vec![0.0, 1.0])],
+                radius: 0.0,
+            },
+        ]
+    }
+
+    /// Distinct, non-zero, non-uniform radii so a round trip is a real
+    /// check — `sample_postings()` above stays radius-0.0 for the format
+    /// tests that predate radius-awareness and aren't about it.
+    fn sample_postings_with_radius() -> Vec<kosha_vector_spfresh::PostingSnapshot> {
+        vec![
+            kosha_vector_spfresh::PostingSnapshot {
+                centroid: vec![1.0, 0.0],
+                entries: vec![(0, vec![1.0, 0.0]), (1, vec![0.9, 0.1])],
+                radius: 0.123,
+            },
+            kosha_vector_spfresh::PostingSnapshot {
+                centroid: vec![0.0, 1.0],
+                entries: vec![(2, vec![0.0, 1.0])],
+                radius: 0.456,
             },
         ]
     }
@@ -709,6 +793,37 @@ mod vector_index_v2_tests {
             let decoded = decode_posting_entries(slice, dim);
             assert_eq!(decoded, postings[i].entries);
         }
+    }
+
+    #[test]
+    fn radius_round_trips_only_at_radius_aware_version() {
+        let postings = sample_postings_with_radius();
+
+        // At the radius-aware version, radius is written and read back
+        // exactly.
+        let (_idx_bytes, offsets_bytes) =
+            encode_vector_index_v2(2, &postings, RADIUS_AWARE_VECTOR_INDEX_VERSION);
+        let parsed = parse_vector_offsets(&offsets_bytes, 2, RADIUS_AWARE_VECTOR_INDEX_VERSION)
+            .expect("valid sidecar");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].radius, 0.123);
+        assert_eq!(parsed[1].radius, 0.456);
+
+        // At an older version, radius is never written to disk at all (not
+        // just ignored) — a pre-radius-aware sidecar is genuinely smaller,
+        // and a reader sees 0.0, the value that degrades exactly to
+        // pre-existing raw-centroid-distance behavior.
+        let (_idx_bytes_v2, offsets_bytes_v2) =
+            encode_vector_index_v2(2, &postings, UNIT_NORM_VECTOR_INDEX_VERSION);
+        assert!(
+            offsets_bytes_v2.len() < offsets_bytes.len(),
+            "a v2 sidecar must be smaller than a v3 one for the same postings \
+             — the radius field must not be written"
+        );
+        let parsed_v2 = parse_vector_offsets(&offsets_bytes_v2, 2, UNIT_NORM_VECTOR_INDEX_VERSION)
+            .expect("valid sidecar");
+        assert_eq!(parsed_v2[0].radius, 0.0);
+        assert_eq!(parsed_v2[1].radius, 0.0);
     }
 
     #[test]
@@ -800,11 +915,18 @@ mod vector_index_v2_tests {
         let (dim, total_count, version) = parse_vector_idx_header(&data).expect("valid v2 header");
         assert_eq!(dim, 2);
         assert_eq!(total_count, 2);
-        // The real writer defaults to the unit-norm version (write gate 3).
-        assert_eq!(version, UNIT_NORM_VECTOR_INDEX_VERSION);
+        // The real writer defaults to the radius-aware version (write gate 4).
+        assert_eq!(version, RADIUS_AWARE_VECTOR_INDEX_VERSION);
 
         let offsets_data = fs::read(dir.join("vector.offsets")).unwrap();
         let postings = parse_vector_offsets(&offsets_data, dim, version).expect("valid sidecar");
+        // Two docs, opposite corners — one posting (well under
+        // min_posting_size), radius must be the real distance from the
+        // (unit-norm) centroid to whichever of the two is farther, not 0.0.
+        assert!(
+            postings.iter().any(|p| p.radius > 0.0),
+            "default writer must persist a real (non-placeholder) radius"
+        );
         let mut ids: Vec<u32> = postings
             .iter()
             .flat_map(|p| {
@@ -852,7 +974,7 @@ mod vector_index_v2_tests {
         // centroid actually is unit-L2.
         let data = fs::read(dir.join("vector.idx")).unwrap();
         let (dim, _, version) = parse_vector_idx_header(&data).expect("valid header");
-        assert_eq!(version, UNIT_NORM_VECTOR_INDEX_VERSION);
+        assert_eq!(version, RADIUS_AWARE_VECTOR_INDEX_VERSION);
         let store = parse_vector_idx_eager(&data).expect("valid blob");
         for (_, v) in &store.vectors {
             let norm = kosha_vector_spfresh::dot(v, v).sqrt();
@@ -955,22 +1077,26 @@ fn postings_write_version() -> u32 {
 
 /// The vector-index version `finalize` writes — `KOSHA_VECTOR_WRITE_VERSION`,
 /// accepted values `1` (legacy flat, no magic — full parse + `build_hnsw` on
-/// every open), `2` (posting-based, raw magnitudes) and `3` (posting-based,
-/// unit-norm vectors + centroids → dot-only scoring; the on-disk header says
-/// [`UNIT_NORM_VECTOR_INDEX_VERSION`]); default `3`. Same mixed-fleet
-/// rollout/rollback purpose as `postings_write_version`: during a rolling
-/// deploy (writer upgraded before every query replica understands the
-/// unit-norm version) or ahead of a possible rollback, set `2` until the
-/// whole fleet reads it. Read once (segments are finalized frequently).
+/// every open), `2` (posting-based, raw magnitudes), `3` (posting-based,
+/// unit-norm vectors + centroids → dot-only scoring; on-disk header
+/// [`UNIT_NORM_VECTOR_INDEX_VERSION`]), and `4` (posting-based, unit-norm,
+/// plus a per-posting radius for triangle-inequality-bounded probe ranking;
+/// on-disk header [`RADIUS_AWARE_VECTOR_INDEX_VERSION`]); default `4`. Same
+/// mixed-fleet rollout/rollback purpose as `postings_write_version`: during
+/// a rolling deploy (writer upgraded before every query replica understands
+/// the newest version) or ahead of a possible rollback, pin an older tier
+/// until the whole fleet reads it. Read once (segments are finalized
+/// frequently).
 fn vector_write_version() -> u32 {
     static VERSION: OnceLock<u32> = OnceLock::new();
     *VERSION.get_or_init(|| match std::env::var("KOSHA_VECTOR_WRITE_VERSION").ok().as_deref() {
         Some("1") => 1,
         Some("2") => 2,
-        Some("3") | None => 3,
+        Some("3") => 3,
+        Some("4") | None => 4,
         Some(other) => {
-            eprintln!("WARN: KOSHA_VECTOR_WRITE_VERSION={other} not supported (accepted: 1, 2, 3) — writing v3");
-            3
+            eprintln!("WARN: KOSHA_VECTOR_WRITE_VERSION={other} not supported (accepted: 1, 2, 3, 4) — writing v4");
+            4
         }
     })
 }
@@ -2449,6 +2575,12 @@ struct LazyVectorIndex {
     centroids: Vec<Vec<f32>>,
     /// `(offset, length)` into `vector.idx`, parallel to `centroids`.
     ranges: Vec<(u64, u32)>,
+    /// Parallel to `centroids` — max cosine distance from each posting's
+    /// centroid to any of its live members. `0.0` for every posting when
+    /// read from a pre-radius-aware sidecar (version 1 or 2), which
+    /// degrades ranking exactly to raw centroid distance — see
+    /// `RADIUS_AWARE_VECTOR_INDEX_VERSION`.
+    radii: Vec<f32>,
     /// Stored vectors and centroids are unit-L2 (on-disk header version is
     /// [`UNIT_NORM_VECTOR_INDEX_VERSION`]) — scoring uses the dot-only fast
     /// path: normalize the query once, then `1 - dot` *is* cosine distance.
@@ -2608,9 +2740,11 @@ impl SegmentReader {
             if let Some(parsed) = parse_vector_offsets(&offsets_data, dim, version) {
                 let mut centroids = Vec::with_capacity(parsed.len());
                 let mut ranges = Vec::with_capacity(parsed.len());
+                let mut radii = Vec::with_capacity(parsed.len());
                 for p in parsed {
                     centroids.push(p.centroid);
                     ranges.push((p.offset, p.length));
+                    radii.push(p.radius);
                 }
                 return Ok((
                     VectorStore::default(),
@@ -2620,7 +2754,8 @@ impl SegmentReader {
                         dim: dim as usize,
                         centroids,
                         ranges,
-                        unit_norm: version == UNIT_NORM_VECTOR_INDEX_VERSION,
+                        radii,
+                        unit_norm: is_unit_norm_vector_index_version(version),
                         cache: PostingsCache::new(
                             vector_postings_cache_max_bytes(),
                             postings_account,
@@ -2722,17 +2857,38 @@ impl SegmentReader {
         Some(self.knn_search_lazy(vi, query, k, nprobe))
     }
 
-    /// Distance from `query` to every one of this segment's posting
-    /// centroids — **pure CPU, zero I/O**: centroids are already resident in
-    /// [`LazyVectorIndex`], loaded from the `vector.offsets` sidecar at open.
+    /// Triangle-inequality lower bound on `query`'s distance to *any*
+    /// possible member of `centroids[i]`'s posting: `(distance(query,
+    /// centroid) - radius).max(0.0)`, where `radius` is the max distance
+    /// from that centroid to any of its own live members. For every actual
+    /// member `m`, `distance(query, m) >= distance(query, centroid) -
+    /// distance(centroid, m) >= distance(query, centroid) - radius` — so
+    /// this bound can never overestimate how close the posting's best
+    /// member could be, only underestimate (safe to rank/admit by; never
+    /// wrongly excludes a posting that might contain a close match).
+    /// `radius == 0.0` (pre-radius-aware segments) collapses this to plain
+    /// centroid distance — today's exact behavior, unaffected.
+    fn centroid_lower_bound(query: &[f32], centroid: &[f32], radius: f32) -> f32 {
+        (kosha_vector_spfresh::cosine_distance(query, centroid) - radius).max(0.0)
+    }
+
+    /// Lower-bound distance from `query` to every one of this segment's
+    /// postings (see [`Self::centroid_lower_bound`]) — **pure CPU, zero
+    /// I/O**: centroids and radii are already resident in
+    /// [`LazyVectorIndex`], loaded from the `vector.offsets` sidecar at
+    /// open.
     ///
     /// This is the cheap half of a global probe budget. `num_candidates` is
     /// a *whole-query* budget, but a segment can only ever rank its own
-    /// centroids, so the query layer collects these distances across all
+    /// postings, so the query layer collects these bounds across all
     /// segments, picks a global cutoff, and only then pays for hydration —
     /// see [`Self::knn_search_within`]. Without that split, `num_candidates`
     /// is applied per segment and total probe depth scales with segment
     /// count (200 segments x 100 = 20,000 posting reads for one top-10).
+    /// Ranking by the lower bound rather than raw centroid distance is what
+    /// lets a "diffuse" posting (mediocre centroid pull, but a genuinely
+    /// close member buried inside it) still qualify — see
+    /// `RADIUS_AWARE_VECTOR_INDEX_VERSION`.
     ///
     /// `None` when this segment has no lazy v2 vector index (legacy flat
     /// segments), which the caller treats as "cannot participate in global
@@ -2742,7 +2898,8 @@ impl SegmentReader {
         Some(
             vi.centroids
                 .iter()
-                .map(|c| kosha_vector_spfresh::cosine_distance(query, c))
+                .zip(&vi.radii)
+                .map(|(c, &r)| Self::centroid_lower_bound(query, c, r))
                 .collect(),
         )
     }
@@ -2778,13 +2935,19 @@ impl SegmentReader {
         max_distance: f32,
         max_probes: usize,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
-        // Rank this segment's qualifying centroids nearest-first, so the
-        // `max_probes` cap keeps the *best* candidates when it bites.
+        // Rank this segment's qualifying postings nearest-first (by lower
+        // bound, not raw centroid distance — see `centroid_lower_bound`),
+        // so the `max_probes` cap keeps the *best* candidates when it
+        // bites. `max_distance` is itself a lower-bound cutoff (computed
+        // from the same bound across all segments — see
+        // `Searcher::global_probe_cutoff`), so both sides of this
+        // comparison are in the same units.
         let mut qualifying: Vec<(usize, f32)> = vi
             .centroids
             .iter()
+            .zip(&vi.radii)
             .enumerate()
-            .map(|(i, c)| (i, kosha_vector_spfresh::cosine_distance(query, c)))
+            .map(|(i, (c, &r))| (i, Self::centroid_lower_bound(query, c, r)))
             .filter(|(_, d)| *d <= max_distance)
             .collect();
         qualifying.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -2805,6 +2968,13 @@ impl SegmentReader {
         Ok((scored, probes))
     }
 
+    // Deliberately NOT radius-aware: this is the per-segment `nprobe`
+    // fallback used only when `KOSHA_KNN_GLOBAL_BUDGET=0` disables global
+    // budgeting entirely (an escape hatch, not the default query path).
+    // `kosha_vector_spfresh::nearest_centroids`/`nearest_centroids_dot`
+    // rank by raw distance and don't take a radius parameter — extending
+    // them is separate, lower-priority scope than the global-budget path
+    // this fix targets.
     fn knn_search_lazy(
         &self,
         vi: &LazyVectorIndex,
