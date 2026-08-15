@@ -337,6 +337,20 @@ struct AppState {
     /// queries, which saturate the hydrator and queue behind each other
     /// for the first minutes after a cold start.
     warmup_posting_blobs: bool,
+    /// `KOSHA_WARMUP_HYDRATE_SEGMENT_CACHE` (default true): whether warmup
+    /// also opens every vector-bearing segment into `Searcher`'s live
+    /// `segment_cache` (via `Searcher::warm_segments`), not just prefetching
+    /// `vector.idx`/`vector.offsets` bytes to local disk. Without this, the
+    /// bytes are fast to open but nothing has opened them yet — the first
+    /// wave of real kNN queries still pays for every first-touch
+    /// `open_segment` itself, which at corpus scale (every segment, on
+    /// every query — see `global_probe_cutoff`) reproduces the same
+    /// cold-start convoy this field's sibling exists to prevent. Its own
+    /// flag rather than folding into `warmup_posting_blobs`: this phase
+    /// mutates the *live* `segment_cache`/`MemoryLedger` that concurrent
+    /// real queries also touch, a materially different risk tier than
+    /// phases 1-4's pure disk-byte prefetch.
+    warmup_hydrate_segment_cache: bool,
     /// `KOSHA_INGEST_HOST` — set only on query-role pods (deployment-query.yaml).
     /// When present, write-path requests this pod receives are forwarded here
     /// instead of executed locally — see `is_write_path`/`forward_to_ingest`.
@@ -1022,12 +1036,22 @@ impl AppState {
         // at 7–12s while steady-state is 529ms (RESULTS.md round 6).
         let warmup_posting_blobs =
             env_flag_default_on(std::env::var("KOSHA_WARMUP_POSTING_BLOBS").ok().as_deref());
+        let warmup_hydrate_segment_cache = env_flag_default_on(
+            std::env::var("KOSHA_WARMUP_HYDRATE_SEGMENT_CACHE")
+                .ok()
+                .as_deref(),
+        );
         if !warmup_namespaces.is_empty() {
             println!(
-                "warmup: configured for {} namespace(s): {} (posting blobs: {})",
+                "warmup: configured for {} namespace(s): {} (posting blobs: {}, segment cache: {})",
                 warmup_namespaces.len(),
                 warmup_namespaces.join(", "),
                 if warmup_posting_blobs { "on" } else { "off" },
+                if warmup_hydrate_segment_cache {
+                    "on"
+                } else {
+                    "off"
+                },
             );
         }
 
@@ -1123,6 +1147,7 @@ impl AppState {
             warmup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             warmup_namespaces,
             warmup_posting_blobs,
+            warmup_hydrate_segment_cache,
             ingest_host,
             write_http_client,
         }
@@ -1383,6 +1408,36 @@ impl AppState {
                         vec_bytes as f64 / (1024.0 * 1024.0),
                         t_vec.elapsed().as_secs_f64(),
                     );
+
+                    // Phase 5 — actually open every segment into the live
+                    // `Searcher::segment_cache`, not just prefetch its bytes.
+                    // Phase 4 above makes `open_segment` *fast* on first
+                    // touch; without this, it's still first-touch — the
+                    // first wave of real kNN queries pays for opening every
+                    // segment itself (global_probe_cutoff touches all of
+                    // them on every query), reproducing the same convoy
+                    // phase 4 exists to prevent, just one query later.
+                    if self.warmup_hydrate_segment_cache {
+                        let t_cache = std::time::Instant::now();
+                        match self.searcher.warm_segments(&ns, &manifest, true) {
+                            Ok(o) => println!(
+                                "warmup: [{}/{}] '{ns_name}' segment cache warmed: {} opened, \
+                                 {} already cached, ~{:.1} MB charged in {:.1}s",
+                                idx + 1,
+                                total,
+                                o.opened,
+                                o.already_cached,
+                                o.bytes as f64 / (1024.0 * 1024.0),
+                                t_cache.elapsed().as_secs_f64(),
+                            ),
+                            Err(e) => eprintln!(
+                                "warn: warmup: [{}/{}] '{ns_name}' segment cache warm failed: \
+                                 {e} — first real kNN queries will cold-open (fail-open)",
+                                idx + 1,
+                                total,
+                            ),
+                        }
+                    }
                 }
             }
         }
