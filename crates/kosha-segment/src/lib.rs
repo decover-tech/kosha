@@ -2711,31 +2711,53 @@ impl SegmentReader {
         postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
     ) -> Result<LoadedVectorState, KoshaError> {
         let idx_path = segment_dir.join("vector.idx");
-        let Ok(data) = fs::read(&idx_path) else {
-            // No vector.idx at all — a namespace/segment with no vector
-            // fields. Not an error; matches `read_vectors`'s existing
-            // missing-file handling.
+
+        // Read only the header first — `vector.idx` is hundreds of MB to
+        // GBs per segment at embedding scale, and the common case below
+        // (valid v2 header + a good `vector.offsets` sidecar) never needs a
+        // byte past this. `.take(HEADER_LEN).read_to_end(..)` rather than
+        // `read_exact`: a genuinely short file must yield fewer than
+        // HEADER_LEN bytes without erroring, so `parse_vector_idx_header`'s
+        // own `data.len() < VECTOR_IDX_HEADER_LEN` check still routes it to
+        // the legacy fallback exactly as it did when this read the whole
+        // file. A missing file (open error) is not an error either — matches
+        // `read_vectors`'s existing missing-file handling.
+        let mut header_buf = Vec::with_capacity(VECTOR_IDX_HEADER_LEN);
+        let Ok(mut file) = fs::File::open(&idx_path) else {
             return Ok((VectorStore::default(), None, None, false));
         };
+        if file
+            .by_ref()
+            .take(VECTOR_IDX_HEADER_LEN as u64)
+            .read_to_end(&mut header_buf)
+            .is_err()
+        {
+            return Ok((VectorStore::default(), None, None, false));
+        }
 
-        let Some((dim, _total_count, version)) = parse_vector_idx_header(&data) else {
-            // No magic (or an unrecognized version) — legacy v1 flat
-            // format. Serve it with exact flat_knn (no hnsw_map): ANN
-            // structures are built at WRITE time only. Constructing HNSW
-            // here put a rayon all-core, minutes-long build on the open
-            // path (issue #126: >10min for one query at 1M docs, and
-            // admission control turned the stall into 100% 429s), while
-            // exact scan of a flush-sized segment is milliseconds — and
-            // strictly better recall.
+        let Some((dim, _total_count, version)) = parse_vector_idx_header(&header_buf) else {
+            // Short (<HEADER_LEN) file, or no magic/an unrecognized version
+            // — legacy v1 flat format. Serve it with exact flat_knn (no
+            // hnsw_map): ANN structures are built at WRITE time only.
+            // Constructing HNSW here put a rayon all-core, minutes-long
+            // build on the open path (issue #126: >10min for one query at
+            // 1M docs, and admission control turned the stall into 100%
+            // 429s), while exact scan of a flush-sized segment is
+            // milliseconds — and strictly better recall. `read_vectors`
+            // re-reads the file itself; it never consumed the header-only
+            // buffer above.
             let vs = Self::read_vectors(segment_dir)?;
             return Ok((vs, None, None, false));
         };
 
-        // Valid v2 header. Prefer the lazy path; fall back to a full eager
-        // parse of the (already self-describing) blob if the sidecar is
-        // missing or fails its own sanity checks — search still works,
-        // just without the lazy-hydration benefit, rather than losing
-        // vector search for the segment entirely.
+        // Valid v2 header. Prefer the lazy path — built entirely from the
+        // small `vector.offsets` sidecar, `vector.idx`'s body is never read
+        // on this branch, which is the fix: the old code read the whole
+        // file up front even though this, the common case, never uses it.
+        // Fall back to a full eager parse of the (already self-describing)
+        // blob if the sidecar is missing or fails its own sanity checks —
+        // search still works, just without the lazy-hydration benefit,
+        // rather than losing vector search for the segment entirely.
         if let Ok(offsets_data) = fs::read(segment_dir.join("vector.offsets")) {
             if let Some(parsed) = parse_vector_offsets(&offsets_data, dim, version) {
                 let mut centroids = Vec::with_capacity(parsed.len());
@@ -2771,6 +2793,14 @@ impl SegmentReader {
             );
         }
 
+        // Sidecar missing or invalid — this is the one path that genuinely
+        // needs the whole body, so read it now (not upfront, unlike the old
+        // code). A read error here (e.g. a TOCTOU race — the file vanished
+        // between the header read above and now) degrades the same way a
+        // missing file always has, rather than becoming a hard error.
+        let Ok(data) = fs::read(&idx_path) else {
+            return Ok((VectorStore::default(), None, None, false));
+        };
         match parse_vector_idx_eager(&data) {
             Some(vs) => {
                 // Same rule as the legacy branch above: no query/open-path
@@ -3814,6 +3844,17 @@ fn days_to_date(mut days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    // `cap`'s `total_allocated()` (bytes ever requested, including
+    // already-freed — requires its `stats` feature) rather than
+    // `allocated()` (net/current-live, what `kosha-query`'s benches use for
+    // a different purpose): a large transient buffer that's read and
+    // dropped *within* `load_vector_index` before it returns would net to
+    // ~0 on a live-bytes counter, making that idiom blind to exactly the
+    // bug this test exists to catch.
+    #[global_allocator]
+    static ALLOC: cap::Cap<std::alloc::System> = cap::Cap::new(std::alloc::System, usize::MAX);
 
     /// Serialize an inverted index in the legacy v1 stream layout — the
     /// exact bytes `write_inverted_index` produced before v2 — so the
@@ -4931,6 +4972,143 @@ mod tests {
         assert!(
             top_ids.contains(&3),
             "near neighbor must be in the top-2: {top_ids:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_vector_index_lazy_path_never_reads_the_full_vector_idx_body() {
+        // The bug this proves fixed: `load_vector_index` used to
+        // `fs::read` the *entire* `vector.idx` file just to check its
+        // 16-byte header, even on this — the common — path, where the
+        // real `LazyVectorIndex` is built from the small `vector.offsets`
+        // sidecar and the rest of `vector.idx`'s body is never consulted.
+        let dir = std::env::temp_dir().join("kosha-test-vecidx-header-only-read");
+        write_v2_fixture(&dir, &[("d0", vec![1.0, 0.0]), ("d1", vec![0.0, 1.0])]);
+
+        // Balloon vector.idx well past anything a header-only read would
+        // ever touch, while leaving vector.offsets (what the lazy path
+        // actually relies on) untouched and small. Real segments are
+        // documented elsewhere in this file as "hundreds of MB to GBs" —
+        // 64 MiB is representative and safely allocatable in a test.
+        let idx_path = dir.join("vector.idx");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&idx_path)
+            .unwrap();
+        f.write_all(&vec![0u8; 64 * 1024 * 1024]).unwrap();
+        drop(f);
+
+        let before = ALLOC.total_allocated();
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let allocated = ALLOC.total_allocated().saturating_sub(before);
+
+        assert!(
+            r.has_lazy_vector_index(),
+            "a valid v2 header + good sidecar must still take the lazy path \
+             after padding — the padding is appended past the parsed body, \
+             not corrupting it"
+        );
+        assert!(
+            allocated < 1024 * 1024,
+            "opening a segment with a 64MiB-padded vector.idx allocated \
+             {allocated} bytes — the lazy path must only read the small \
+             vector.offsets sidecar, not the full vector.idx body"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_vector_index_short_file_falls_back_to_legacy_path_not_an_error() {
+        // Fewer than VECTOR_IDX_HEADER_LEN (16) bytes: the header-only read
+        // must yield a short buffer without erroring, and
+        // `parse_vector_idx_header` must see exactly what it saw when this
+        // read the whole file — `data.len() < VECTOR_IDX_HEADER_LEN` — and
+        // fall through to the legacy path, not treat this as a hard error.
+        let dir = std::env::temp_dir().join("kosha-test-vecidx-short-file");
+        // Build a full, valid segment scaffold (footer/inverted/doc_store/
+        // offsets) via the shared fixture, then overwrite just vector.idx —
+        // `open_with_options` needs the rest of the segment to exist.
+        write_v2_fixture(&dir, &[("d0", vec![1.0, 0.0])]);
+        // 4 bytes: `read_vectors` reads this as dim=<garbage>, count
+        // unreadable (needs 8), so it must degrade to `VectorStore::default()`
+        // rather than panicking or erroring — matches its own short-file
+        // handling (`cursor.len() < 8`).
+        fs::write(dir.join("vector.idx"), [1u8, 0, 0, 0]).unwrap();
+
+        let r = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+        assert!(
+            !r.has_lazy_vector_index(),
+            "a file shorter than the header must never take the lazy path"
+        );
+        assert!(r.vector_store.vectors.is_empty());
+        assert!(!r.vector_index_degraded());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_vector_index_legacy_v1_format_still_parses_via_read_vectors() {
+        // No magic prefix at all — the pre-v2 flat format `dim(4) +
+        // count(4) + records`. The header-only read must not mistake this
+        // for a valid-but-truncated v2 header (it has no magic to match in
+        // the first place) and must route to `Self::read_vectors`, which
+        // re-reads the file independently — unaffected by how much of it
+        // the header check above already consumed.
+        let dir = std::env::temp_dir().join("kosha-test-vecidx-legacy-v1");
+        // Same reasoning as the short-file test above: need a full, valid
+        // segment scaffold before overwriting vector.idx.
+        write_v2_fixture(&dir, &[("d0", vec![1.0, 0.0])]);
+        let dim: u32 = 2;
+        let count: u32 = 1;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&dim.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // doc_seq
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&0.0f32.to_le_bytes());
+        fs::write(dir.join("vector.idx"), &buf).unwrap();
+
+        let r = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+        assert!(
+            !r.has_lazy_vector_index(),
+            "legacy v1 has no lazy index — served by exact flat_knn"
+        );
+        assert_eq!(
+            r.vector_store.vectors.len(),
+            1,
+            "must recover the one legacy vector"
+        );
+        assert_eq!(r.vector_store.dimensions, 2);
+        assert!(!r.vector_index_degraded());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_vector_index_corrupt_body_with_no_sidecar_marks_degraded() {
+        // Valid v2 header, no sidecar at all, and a body too short for the
+        // header's own `total_count` — genuinely unrecoverable. This is the
+        // one case that legitimately needs the second, fallback full-file
+        // `fs::read` this fix adds; must still mark `degraded`, not silently
+        // report "no vectors" the way a segment that never had any would.
+        let dir = std::env::temp_dir().join("kosha-test-vecidx-corrupt-body");
+        write_v2_fixture(&dir, &[("d0", vec![1.0, 0.0]), ("d1", vec![0.0, 1.0])]);
+        fs::remove_file(dir.join("vector.offsets")).unwrap();
+        // Truncate the real (valid-header) blob down to just past the
+        // header — declares more records than the body actually has.
+        let real = fs::read(dir.join("vector.idx")).unwrap();
+        fs::write(dir.join("vector.idx"), &real[..VECTOR_IDX_HEADER_LEN + 4]).unwrap();
+
+        let r = SegmentReader::open_with_options(dir.clone(), true).unwrap();
+        assert!(!r.has_lazy_vector_index());
+        assert!(r.vector_store.vectors.is_empty());
+        assert!(
+            r.vector_index_degraded(),
+            "a valid header with an unparseable body must be marked degraded, \
+             not treated as a legitimate vector-less segment"
         );
 
         let _ = fs::remove_dir_all(&dir);

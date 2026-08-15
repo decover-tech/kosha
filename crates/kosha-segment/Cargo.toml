@@ -15,3 +15,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 instant-distance = "0.6"
 zstd = "0.13"
+
+[dev-dependencies]
+# `stats` feature for `total_allocated()` (bytes ever requested, including
+# already-freed) — a plain net/current-live counter would be blind to a
+# large transient buffer that's read and dropped before the function
+# returns, which is exactly the shape of the bug this crate's test proves
+# fixed. `cap` implements `GlobalAlloc` inside its own crate, sidestepping
+# this workspace's `unsafe_code` lint (confirmed: kosha-query's existing
+# benches use this same crate for the same reason).
+cap = { version = "0.1.2", features = ["stats"] }
