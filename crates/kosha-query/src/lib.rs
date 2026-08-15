@@ -1104,6 +1104,16 @@ pub struct Searcher {
     ledger: Arc<MemoryLedger>,
 }
 
+/// Result of a [`Searcher::warm_segments`] pass — how many segments were
+/// newly opened/cached vs. already resident, and the estimated bytes
+/// charged against the admission ledger, for the caller to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarmSegmentsOutcome {
+    pub opened: usize,
+    pub already_cached: usize,
+    pub bytes: u64,
+}
+
 impl Searcher {
     pub fn new(data_dir: PathBuf) -> Self {
         Self::with_segment_cache_limits(
@@ -1207,6 +1217,123 @@ impl Searcher {
         self.segment_cache
             .insert(key, Arc::clone(&tracked), approx_bytes);
         Ok(tracked)
+    }
+
+    /// Opens and caches every manifest segment present locally, for
+    /// `(namespace, segment_id, load_vectors)` — the missing half of
+    /// warmup's own segment-cache prefetch: fetching `vector.idx`/
+    /// `vector.offsets` bytes to local disk makes them *fast to open*, but
+    /// never actually opens them, so [`Searcher`]'s `segment_cache` is
+    /// still empty when `/readyz` flips true and the first wave of real
+    /// query traffic pays for every [`Searcher::open_segment`] itself —
+    /// which, at corpus scale, is exactly what
+    /// [`Searcher::global_probe_cutoff`] does on every kNN query (it opens
+    /// every segment to read centroids), turning first-touch cost into a
+    /// whole-namespace cold-start convoy.
+    ///
+    /// Goes through the same [`MemoryLedger::admit`] admission path real
+    /// search uses (see `search_inner`) rather than opening segments
+    /// unbounded: this gives warming the same backpressure real traffic
+    /// gets — bounded wait, then evict-idle, then anti-starvation admit
+    /// since nothing else is active yet — instead of a single unbounded
+    /// burst independent of the live-bytes watermark.
+    ///
+    /// Every opened segment is held pinned (in the local `pinned` vec, not
+    /// dropped per-iteration) for the whole call, so
+    /// `SegmentCache::evict_idle_until`'s `Arc::strong_count == 1` check
+    /// can't evict a segment this same call just opened — only once this
+    /// call returns (and `pinned`/`permit` drop) does normal LRU eviction
+    /// apply to the newly-warmed set, same as any other idle cache entry.
+    /// Per-segment open failures are logged and skipped, not fatal — a
+    /// missing/corrupt segment shouldn't block warming the rest, matching
+    /// how `global_probe_cutoff`'s `par_iter().filter_map(...)` already
+    /// treats a failed open as "contributes nothing" rather than an error.
+    pub fn warm_segments(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        load_vectors: bool,
+    ) -> Result<WarmSegmentsOutcome, KoshaError> {
+        let present: Vec<&kosha_core::ManifestEntry> = manifest
+            .segments
+            .iter()
+            .filter(|entry| {
+                self.data_dir
+                    .join(&namespace.0)
+                    .join(&entry.segment_id.0)
+                    .exists()
+            })
+            .collect();
+
+        let mut already_cached = 0usize;
+        let estimate: u64 = present
+            .iter()
+            .map(|entry| {
+                let key = (
+                    namespace.0.clone(),
+                    entry.segment_id.0.clone(),
+                    load_vectors,
+                );
+                if self.segment_cache.contains(&key) {
+                    already_cached += 1;
+                    0
+                } else {
+                    let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                    approx_segment_bytes(&seg_dir, load_vectors)
+                }
+            })
+            .sum();
+
+        let permit = self
+            .ledger
+            .admit(estimate, |needed| self.segment_cache.evict_idle(needed))?;
+
+        let mut pinned = Vec::with_capacity(present.len());
+        let mut opened = 0usize;
+        for entry in &present {
+            let key = (
+                namespace.0.clone(),
+                entry.segment_id.0.clone(),
+                load_vectors,
+            );
+            // `open_segment` itself returns `Ok` on a cache hit too — only
+            // count entries that genuinely weren't cached yet as `opened`,
+            // so a second `warm_segments` pass over an already-warm
+            // namespace correctly reports 0 newly opened, not a re-count of
+            // every hit. Still call `open_segment` (and pin the result)
+            // unconditionally below: an already-cached segment gets pinned
+            // for this call's duration too, protecting it from concurrent
+            // eviction by whatever else this same pass opens.
+            let was_cached = self.segment_cache.contains(&key);
+            let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+            match self.open_segment(
+                &namespace.0,
+                &entry.segment_id.0,
+                seg_dir,
+                load_vectors,
+                manifest.segment_footer(&entry.segment_id).cloned(),
+                Some(&permit),
+                None,
+            ) {
+                Ok(tracked) => {
+                    if !was_cached {
+                        opened += 1;
+                    }
+                    pinned.push(tracked);
+                }
+                Err(e) => {
+                    eprintln!("warmup: failed to warm segment {}: {e}", entry.segment_id.0);
+                }
+            }
+        }
+        // `pinned` and `permit` drop here — unpins every segment this call
+        // opened and returns any unconsumed reservation, same as the end of
+        // a real search.
+        Ok(WarmSegmentsOutcome {
+            opened,
+            already_cached,
+            bytes: estimate,
+        })
     }
 
     /// Score one manifest segment against `query`: open it (bloom-pruning
@@ -5069,6 +5196,66 @@ mod tests {
              must fail — a successful search here would mean the cache grew \
              past its byte budget"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_segments_populates_the_cache_so_a_real_search_never_opens_cold() {
+        // Proves what `warm_segments` exists for: the first real query
+        // against a namespace should find every segment already in
+        // `segment_cache` (`open_cached`), not pay a cold `open_segment`
+        // itself (`open_cold`) — `SearchPhaseStats` reports exactly this
+        // split. (An earlier version of this test tried to prove the same
+        // thing by deleting the segment's files and asserting a subsequent
+        // search still succeeded — that doesn't work for vector data: even
+        // a cached `LazyVectorIndex` only holds centroids/ranges from the
+        // small `vector.offsets` sidecar; the actual posting bytes are
+        // hydrated lazily per query from `vector.idx` regardless of whether
+        // the segment was warmed, so deleting `vector.idx` breaks the query
+        // either way and isn't a valid signal here.)
+        let dir = std::env::temp_dir().join("kosha-test-warm-segments");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let (manifest, _) = mk_vector_corpus(&dir, "test", 1, 1);
+
+        let searcher = Searcher::new(dir.clone());
+
+        let outcome = searcher.warm_segments(&ns, &manifest, true).unwrap();
+        assert_eq!(outcome.opened, 1, "the one present segment must be opened");
+        assert_eq!(outcome.already_cached, 0);
+
+        let mut q = mk_query("", 1);
+        q.knn = Some(kosha_core::KnnQuery {
+            field: "emb".into(),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            k: 1,
+            num_candidates: 10,
+            filter: None,
+        });
+        let (result, stats) = searcher
+            .search_with_stats(&ns, &manifest, &q, None)
+            .unwrap();
+        assert_eq!(result.results.len(), 1, "kNN must still return the one hit");
+        assert_eq!(
+            stats.open_cold, 0,
+            "the segment was already warmed — a real query must not need a \
+             cold open"
+        );
+        assert_eq!(
+            stats.open_cached, 2,
+            "a kNN query opens each segment twice — once in \
+             global_probe_cutoff for centroid distances, once in the actual \
+             per-segment scoring pass — and both must be served from the \
+             cache warm_segments filled, not a fresh open"
+        );
+
+        let second = searcher.warm_segments(&ns, &manifest, true).unwrap();
+        assert_eq!(
+            second.already_cached, 1,
+            "a second warm pass should find the segment already cached"
+        );
+        assert_eq!(second.opened, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
