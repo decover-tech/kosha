@@ -517,6 +517,21 @@ struct HydrationOutcome {
     missing: Vec<String>,
     files_fetched: usize,
     bytes_fetched: u64,
+    /// `true` when this pass's `to_hydrate` set was narrowed by a
+    /// per-query bloom/term-prune check (see `hydrate_segments_for_search`)
+    /// rather than covering every segment in the manifest. A "success"
+    /// verdict from a bloom-pruned pass only proves *this query's* narrow
+    /// segment subset is hydrated — it says nothing about the segments a
+    /// *different* filter value would need. `completed_hydrations` is
+    /// keyed on `(namespace, manifest_version)` only, shared across every
+    /// query shape, so callers deciding whether to cache a "namespace
+    /// fully hydrated" verdict must check this and skip caching when it's
+    /// `true` — see the incident this caused: one query's lucky
+    /// bloom-pruned subset got cached as "done" for the whole namespace,
+    /// and every later, differently-filtered query silently scored
+    /// against only that same stale subset forever (not self-healing —
+    /// only a pod restart, which drops the cache, recovered it).
+    bloom_pruned: bool,
 }
 
 /// Segments this caller must fetch itself, paired with the completion
@@ -1248,7 +1263,11 @@ impl AppState {
             let outcome = self.hydrate_segments_for_search(&ns, &manifest, &query);
             let _ = tombstones;
             let dur = t_ns.elapsed();
-            if outcome.missing.is_empty() {
+            // query.filter is always None above, so bloom_pruned is always
+            // false here — this condition is defensive consistency with
+            // the search-path callers (see HydrationOutcome::bloom_pruned),
+            // not a behavior change for warmup itself.
+            if outcome.missing.is_empty() && !outcome.bloom_pruned {
                 // Mirror the search path's verdict caching (handle_search_post):
                 // the static scoring set is now local for this manifest
                 // version, so the first real queries skip the per-segment
@@ -2076,6 +2095,13 @@ impl AppState {
         outcome.missing.extend(postings_outcome.missing);
         outcome.files_fetched += footer_files;
         outcome.bytes_fetched += footer_bytes;
+        // `to_hydrate` only covers every manifest segment when the bloom
+        // check above was skipped entirely (an unfiltered query) — a
+        // filtered/term-pruned query's `to_hydrate` is a proper subset,
+        // chosen by *this* query's own filter value. A caller must not
+        // treat this outcome as proof the whole namespace is hydrated; see
+        // `HydrationOutcome::bloom_pruned`.
+        outcome.bloom_pruned = needs_bloom_check;
         outcome
     }
 
@@ -3467,7 +3493,20 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             // local for this manifest version, so future warm queries
             // skip the per-segment static checks (posting blobs are
             // still ensured per query above).
-            if outcome.missing.is_empty() {
+            //
+            // Only when `!bloom_pruned`: a filtered/term-pruned query's
+            // `to_hydrate` set only covers the segments *its own* filter
+            // value's bloom check admitted, not every segment in the
+            // manifest — caching that narrow success as "namespace fully
+            // hydrated" (this verdict is shared across every query shape
+            // via the namespace+version key) would let a later,
+            // differently-filtered query skip hydrating segments it
+            // actually needs, silently undercounting. Confirmed live: a
+            // query pod got stuck this way after its first-ever query on a
+            // namespace happened to be a filtered one, understating a
+            // filtered count by up to 80% for every later query on that
+            // pod until it was restarted (which drops this cache).
+            if outcome.missing.is_empty() && !outcome.bloom_pruned {
                 state
                     .completed_hydrations
                     .lock()
@@ -3793,7 +3832,9 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
             state.ensure_query_posting_blobs(&ns, &manifest, &query)
         } else {
             let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
-            if outcome.missing.is_empty() {
+            // Only cache when unfiltered — see `HydrationOutcome::bloom_pruned`
+            // and `handle_search_post` for the full rationale.
+            if outcome.missing.is_empty() && !outcome.bloom_pruned {
                 state
                     .completed_hydrations
                     .lock()
@@ -5590,6 +5631,71 @@ mod tests {
             "in-flight entry must be removed after completion so a future cache miss can retry"
         );
         assert!(hydrated.load(Ordering::SeqCst));
+    }
+
+    // ── bloom_pruned: a filtered query's hydration success must not be
+    //    cached as "whole namespace hydrated" ──────────────────────────
+    //
+    // Regression for the live-production bug: `completed_hydrations` is
+    // keyed on `(namespace, manifest_version)` only, shared across every
+    // query shape. A filtered query's `to_hydrate` set inside
+    // `hydrate_segments_for_search` is narrowed by *that query's own*
+    // bloom check — caching its success as "namespace fully hydrated"
+    // let a later, differently-filtered query silently skip hydrating the
+    // segments it actually needed, understating counts by up to 80% until
+    // the pod was restarted (which drops the in-memory cache — the only
+    // reason it ever "recovered").
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn hydrate_segments_for_search_flags_bloom_pruned_only_when_filtered() {
+        let state = test_state();
+        let ns = NamespaceId("bloom-pruned-test".into());
+        let manifest = kosha_core::Manifest {
+            version: 1,
+            segments: vec![kosha_core::ManifestEntry {
+                segment_id: kosha_core::SegmentId("seg-1".into()),
+                doc_count: 10,
+            }],
+            segment_footers: HashMap::new(),
+        };
+        let base_query = kosha_core::SearchQuery {
+            query_text: String::new(),
+            max_results: 10,
+            bm25_params: kosha_core::Bm25Params::default(),
+            from: 0,
+            filter: None,
+            sort: Vec::new(),
+            search_after: None,
+            highlight: None,
+            aggs: std::collections::HashMap::new(),
+            wildcard: None,
+            match_phrase: None,
+            knn: None,
+            exact_total_hits: None,
+            total_hits_cap: None,
+            operator: None,
+            no_cache: None,
+        };
+
+        let unfiltered = state.hydrate_segments_for_search(&ns, &manifest, &base_query);
+        assert!(
+            !unfiltered.bloom_pruned,
+            "an unfiltered query's to_hydrate set covers every segment — safe to cache as \
+             'namespace hydrated'"
+        );
+
+        let mut filtered_query = base_query.clone();
+        filtered_query.filter = Some(kosha_core::FilterClause::Term {
+            term: HashMap::from([("matter_id".to_string(), "some-matter".to_string())]),
+        });
+        let filtered = state.hydrate_segments_for_search(&ns, &manifest, &filtered_query);
+        assert!(
+            filtered.bloom_pruned,
+            "a filtered query's to_hydrate set only covers the segments its own filter value's \
+             bloom check admitted — must NOT be eligible to cache as 'namespace hydrated', or a \
+             later, differently-filtered query would silently skip segments it actually needs"
+        );
     }
 
     #[cfg(feature = "s3")]
