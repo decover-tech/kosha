@@ -193,7 +193,7 @@ impl Indexer {
             let reader = kosha_segment::SegmentReader::open(seg_dir)?;
             let store = reader.filter_store();
             let all: HashSet<u32> = (0..reader.doc_count()).collect();
-            let matching = crate::apply_filter_delete(filter, store, &all)?;
+            let matching = crate::apply_filter_delete(filter, &store, &all)?;
             if !matching.is_empty() {
                 total += matching.len();
                 state

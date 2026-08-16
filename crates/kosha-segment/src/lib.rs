@@ -2507,9 +2507,17 @@ pub struct DocMetaRef<'a> {
 /// size of filters.bin), so the memory ledger's accounting is unchanged;
 /// the parsed form is an additional cost paid only by segments whose
 /// filters are actually exercised.
+///
+/// `state` is only ever written *after* a read has confirmed the file is
+/// actually present — see `get()`. A `OnceLock` cannot express that: its
+/// init closure runs at most once, so a `get()` that raced a not-yet-local
+/// `filters.bin` would freeze an empty parse in permanently, even after a
+/// later hydration landed the real file (see `get()`'s doc comment for the
+/// incident this caused in production: a cached reader silently matched
+/// zero documents forever, on a file later confirmed byte-correct on disk).
 struct LazyFilters {
     segment_dir: PathBuf,
-    parsed: OnceLock<FilterStore>,
+    state: Mutex<Option<Arc<FilterStore>>>,
 }
 
 impl LazyFilters {
@@ -2522,23 +2530,38 @@ impl LazyFilters {
     /// silently matching nothing. Reading at use time sees the
     /// now-hydrated file. (It also means broad queries keep zero filter
     /// bytes resident.)
-    fn get(&self) -> &FilterStore {
-        self.parsed.get_or_init(|| {
-            let raw = SegmentReader::read_filters_raw(&self.segment_dir);
-            if raw.is_empty() {
-                // The writer always emits filters.bin (even with zero
-                // fields, the header is present) — an empty read here
-                // means the file isn't local, i.e. a hydration/eviction
-                // gap, not a segment without filters. Parse yields an
-                // empty store either way; make the abnormal case loud
-                // instead of silently matching nothing.
-                eprintln!(
-                    "WARN: filters.bin missing/empty at first use for {} —                      filtered queries against this segment will match nothing                      until it is re-opened with the file present",
-                    self.segment_dir.display()
-                );
-            }
-            SegmentReader::parse_filters(&raw)
-        })
+    ///
+    /// Only a read that finds the file *present* is cached. A read that
+    /// finds it missing/empty returns a fresh (empty) store for that one
+    /// call but leaves the cache unset, so the *next* call re-reads from
+    /// disk — self-healing once hydration actually lands, instead of
+    /// permanently committing to whatever the first, possibly-premature,
+    /// read happened to see. The writer always emits filters.bin (even
+    /// with zero fields, the header is present), so an empty raw read is
+    /// unambiguously "file isn't local yet," never "this segment has no
+    /// filterable fields" — a genuinely field-less segment's file is
+    /// non-empty (just a zero-entry header) and caches normally on first
+    /// read, so this retry loop only ever runs during the brief hydration
+    /// race, not on every query against a filter-less segment.
+    fn get(&self) -> Arc<FilterStore> {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(store) = guard.as_ref() {
+            return Arc::clone(store);
+        }
+        let raw = SegmentReader::read_filters_raw(&self.segment_dir);
+        if raw.is_empty() {
+            eprintln!(
+                "WARN: filters.bin missing/empty at first use for {} — filtered queries against this segment will match nothing until it hydrates; retrying on next use",
+                self.segment_dir.display()
+            );
+            // Deliberately not cached — leave `guard` as `None` so the
+            // next call re-reads instead of trusting this premature empty
+            // parse forever.
+            return Arc::new(SegmentReader::parse_filters(&raw));
+        }
+        let store = Arc::new(SegmentReader::parse_filters(&raw));
+        *guard = Some(Arc::clone(&store));
+        store
     }
 }
 
@@ -2692,7 +2715,7 @@ impl SegmentReader {
             inverted: Self::read_inverted(&segment_dir, postings_account)?,
             filters: LazyFilters {
                 segment_dir: segment_dir.clone(),
-                parsed: OnceLock::new(),
+                state: Mutex::new(None),
             },
             vector_store: vs,
             hnsw_map: hm,
@@ -3048,7 +3071,7 @@ impl SegmentReader {
     /// The segment's filter columns, parsed on first use (see
     /// [`LazyFilters`]). Queries without filters/aggregations/field sorts
     /// never call this, and never pay the parse.
-    pub fn filter_store(&self) -> &FilterStore {
+    pub fn filter_store(&self) -> Arc<FilterStore> {
         self.filters.get()
     }
 
@@ -4541,13 +4564,13 @@ mod tests {
 
         let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
         assert!(
-            r.filters.parsed.get().is_none(),
+            r.filters.state.lock().unwrap().is_none(),
             "open must not have parsed filters.bin"
         );
         let store = r.filter_store();
         assert!(store.string_fields.contains_key("tag"));
         assert!(
-            r.filters.parsed.get().is_some(),
+            r.filters.state.lock().unwrap().is_some(),
             "first filter_store() call materializes the parse"
         );
 
@@ -4578,7 +4601,7 @@ mod tests {
         let stash = dir.join("filters.bin.stash");
         fs::rename(dir.join("filters.bin"), &stash).unwrap();
         let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
-        assert!(r.filters.parsed.get().is_none());
+        assert!(r.filters.state.lock().unwrap().is_none());
 
         // "Hydrate" the file, then use the SAME (cached) reader.
         fs::rename(&stash, dir.join("filters.bin")).unwrap();
@@ -4586,6 +4609,60 @@ mod tests {
         assert!(
             store.string_fields.contains_key("tag"),
             "cached reader must see filters.bin hydrated after it was opened"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_reader_recovers_after_first_use_races_hydration() {
+        // Regression for the live-production bug this composition-only test
+        // above didn't cover: `cached_reader_sees_filters_hydrated_after_open`
+        // only exercises "opened before hydration, first *use* after
+        // hydration" — but in production the race was "*first use* itself
+        // lands before hydration" (a broad/filter-only query touches
+        // `filter_store()` while `filters.bin` is still mid-fetch). A
+        // `OnceLock`-backed cache would permanently freeze that premature
+        // empty parse; every later query against the same cached reader —
+        // even long after the file was correctly hydrated — would keep
+        // silently matching zero documents. Confirmed live on staging:
+        // `filters.bin` byte-verified correct on disk, yet the cached
+        // reader's query still returned zero hits.
+        let dir = std::env::temp_dir().join("kosha-test-filters-first-use-races-hydration");
+        let _ = fs::remove_dir_all(&dir);
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![
+                Field::text("t", "hello world"),
+                Field::keyword("tag", "alpha"),
+            ],
+        );
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let stash = dir.join("filters.bin.stash");
+        fs::rename(dir.join("filters.bin"), &stash).unwrap();
+        let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+
+        // First use races hydration: filters.bin isn't local yet.
+        let store = r.filter_store();
+        assert!(
+            !store.string_fields.contains_key("tag"),
+            "first use before hydration sees an empty store, as expected"
+        );
+        assert!(
+            r.filters.state.lock().unwrap().is_none(),
+            "an empty read caused by a missing file must not be cached — \
+             only a confirmed-present read commits to the cache"
+        );
+
+        // Hydration lands; the SAME cached reader is used again.
+        fs::rename(&stash, dir.join("filters.bin")).unwrap();
+        let store = r.filter_store();
+        assert!(
+            store.string_fields.contains_key("tag"),
+            "second use after hydration must recover — a premature empty \
+             first read must not be permanent"
         );
 
         let _ = fs::remove_dir_all(&dir);
