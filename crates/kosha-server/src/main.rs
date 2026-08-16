@@ -1372,33 +1372,41 @@ impl AppState {
                 // them. A cold kNN query otherwise hydrates `vector.idx`
                 // (hundreds of MB to GBs per segment at embedding scale)
                 // on the query path — the doc-store lesson (#123/#126) in
-                // vector form. Probe one segment's tiny `vector.offsets`
-                // sidecar first: segments are format-homogeneous within a
-                // namespace in practice, and a text-only namespace skips
-                // the whole phase without issuing per-segment fetches for
-                // files that don't exist.
-                let probe = &seg_paths[..1.min(seg_paths.len())];
-                let _ = self.ensure_files_local(probe, "vector.offsets");
-                let namespace_has_vectors = probe
-                    .first()
-                    .map(|p| p.join("vector.offsets").is_file())
-                    .unwrap_or(false);
-                if namespace_has_vectors {
-                    let t_vec = std::time::Instant::now();
-                    let mut vec_files = 0usize;
-                    let mut vec_bytes = 0u64;
-                    for chunk in seg_paths.chunks(8) {
-                        let (files, bytes) = self.ensure_files_local(chunk, "vector.offsets");
-                        vec_files += files;
-                        vec_bytes += bytes;
-                    }
-                    // Same chunks-of-2 as doc stores: vector.idx bodies are
-                    // buffered whole in memory during fetch.
-                    for chunk in seg_paths.chunks(2) {
-                        let (files, bytes) = self.ensure_files_local(chunk, "vector.idx");
-                        vec_files += files;
-                        vec_bytes += bytes;
-                    }
+                // vector form.
+                //
+                // 2026-08-15: previously probed only the *first* segment's
+                // tiny `vector.offsets` sidecar and skipped this whole phase
+                // for the namespace if that one segment lacked it, on the
+                // assumption that "segments are format-homogeneous within a
+                // namespace in practice." A bulk migration can violate that:
+                // a single flush batch with zero embedded source documents
+                // produces one vector-less segment sitting alongside
+                // hundreds of segments that do have vectors — the single-
+                // segment probe then silently skipped vector warmup for the
+                // *entire* namespace, leaving `vector.idx`/`vector.offsets`
+                // never hydrated and every kNN query returning empty with no
+                // error (`load_vector_index`'s local-file-missing path is
+                // deliberately silent). `ensure_files_local` already
+                // tolerates per-segment missing files (see its doc comment),
+                // so there's no need for the namespace-wide gate at all —
+                // always attempt the fetch and let each segment's own
+                // presence/absence of `vector.offsets` decide for itself.
+                let t_vec = std::time::Instant::now();
+                let mut vec_files = 0usize;
+                let mut vec_bytes = 0u64;
+                for chunk in seg_paths.chunks(8) {
+                    let (files, bytes) = self.ensure_files_local(chunk, "vector.offsets");
+                    vec_files += files;
+                    vec_bytes += bytes;
+                }
+                // Same chunks-of-2 as doc stores: vector.idx bodies are
+                // buffered whole in memory during fetch.
+                for chunk in seg_paths.chunks(2) {
+                    let (files, bytes) = self.ensure_files_local(chunk, "vector.idx");
+                    vec_files += files;
+                    vec_bytes += bytes;
+                }
+                if vec_files > 0 {
                     println!(
                         "warmup: [{}/{}] '{ns_name}' vector indexes ready: fetched {} file(s), \
                          {:.1} MB in {:.1}s",
@@ -1408,35 +1416,35 @@ impl AppState {
                         vec_bytes as f64 / (1024.0 * 1024.0),
                         t_vec.elapsed().as_secs_f64(),
                     );
+                }
 
-                    // Phase 5 — actually open every segment into the live
-                    // `Searcher::segment_cache`, not just prefetch its bytes.
-                    // Phase 4 above makes `open_segment` *fast* on first
-                    // touch; without this, it's still first-touch — the
-                    // first wave of real kNN queries pays for opening every
-                    // segment itself (global_probe_cutoff touches all of
-                    // them on every query), reproducing the same convoy
-                    // phase 4 exists to prevent, just one query later.
-                    if self.warmup_hydrate_segment_cache {
-                        let t_cache = std::time::Instant::now();
-                        match self.searcher.warm_segments(&ns, &manifest, true) {
-                            Ok(o) => println!(
-                                "warmup: [{}/{}] '{ns_name}' segment cache warmed: {} opened, \
-                                 {} already cached, ~{:.1} MB charged in {:.1}s",
-                                idx + 1,
-                                total,
-                                o.opened,
-                                o.already_cached,
-                                o.bytes as f64 / (1024.0 * 1024.0),
-                                t_cache.elapsed().as_secs_f64(),
-                            ),
-                            Err(e) => eprintln!(
-                                "warn: warmup: [{}/{}] '{ns_name}' segment cache warm failed: \
-                                 {e} — first real kNN queries will cold-open (fail-open)",
-                                idx + 1,
-                                total,
-                            ),
-                        }
+                // Phase 5 — actually open every segment into the live
+                // `Searcher::segment_cache`, not just prefetch its bytes.
+                // Phase 4 above makes `open_segment` *fast* on first
+                // touch; without this, it's still first-touch — the
+                // first wave of real kNN queries pays for opening every
+                // segment itself (global_probe_cutoff touches all of
+                // them on every query), reproducing the same convoy
+                // phase 4 exists to prevent, just one query later.
+                if self.warmup_hydrate_segment_cache {
+                    let t_cache = std::time::Instant::now();
+                    match self.searcher.warm_segments(&ns, &manifest, true) {
+                        Ok(o) => println!(
+                            "warmup: [{}/{}] '{ns_name}' segment cache warmed: {} opened, \
+                             {} already cached, ~{:.1} MB charged in {:.1}s",
+                            idx + 1,
+                            total,
+                            o.opened,
+                            o.already_cached,
+                            o.bytes as f64 / (1024.0 * 1024.0),
+                            t_cache.elapsed().as_secs_f64(),
+                        ),
+                        Err(e) => eprintln!(
+                            "warn: warmup: [{}/{}] '{ns_name}' segment cache warm failed: \
+                             {e} — first real kNN queries will cold-open (fail-open)",
+                            idx + 1,
+                            total,
+                        ),
                     }
                 }
             }
