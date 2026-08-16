@@ -2317,7 +2317,9 @@ impl Searcher {
                 let filter_candidates: HashSet<u32> = scored.keys().copied().collect();
                 Some(FilterApplier::apply(
                     clause,
-                    filter_store.expect("query.filter requires filter_store"),
+                    filter_store
+                        .as_ref()
+                        .expect("query.filter requires filter_store"),
                     &filter_candidates,
                 )?)
             } else {
@@ -2341,7 +2343,9 @@ impl Searcher {
             let all_candidates: HashSet<u32> = (0..total_docs).collect();
             let passed = FilterApplier::apply(
                 query.filter.as_ref().unwrap(),
-                filter_store.expect("filter-only query requires filter_store"),
+                filter_store
+                    .as_ref()
+                    .expect("filter-only query requires filter_store"),
                 &all_candidates,
             )?;
             for doc_seq in passed {
@@ -2458,7 +2462,9 @@ impl Searcher {
                 let candidates: HashSet<u32> = knn_results.iter().map(|(d, _)| *d).collect();
                 let passed = FilterApplier::apply(
                     clause,
-                    filter_store.expect("knn.filter requires filter_store"),
+                    filter_store
+                        .as_ref()
+                        .expect("knn.filter requires filter_store"),
                     &candidates,
                 )?;
                 knn_results.retain(|(d, _)| passed.contains(d));
@@ -2556,7 +2562,9 @@ impl Searcher {
         } else {
             let wanted: HashSet<u32> = ranked.iter().map(|(_, doc_seq)| *doc_seq).collect();
             build_sort_value_maps(
-                filter_store.expect("custom sort requires filter_store"),
+                filter_store
+                    .as_ref()
+                    .expect("custom sort requires filter_store"),
                 sort_value_fields,
                 &wanted,
             )
@@ -2583,7 +2591,9 @@ impl Searcher {
         // ── Aggregations (this segment's own contribution only) ──
         let mut aggs = HashMap::new();
         for (agg_name, agg) in &query.aggs {
-            let store = filter_store.expect("aggregations require filter_store");
+            let store = filter_store
+                .as_ref()
+                .expect("aggregations require filter_store");
             match agg {
                 Aggregation::Terms { terms } => {
                     let result = compute_single_aggregation(store, &terms.field);
