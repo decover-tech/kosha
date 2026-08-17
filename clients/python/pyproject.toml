@@ -1,6 +1,6 @@
 [project]
 name = "kosha-client"
-version = "0.2.10"
+version = "0.2.11"
 description = "OpenSearch-compatible Python client for the Kosha search engine"
 requires-python = ">=3.10"
 license = "Apache-2.0"
