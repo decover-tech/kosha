@@ -231,10 +231,15 @@ struct AppState {
     /// The verdict is keyed by manifest version (`manifest.version: u64`)
     /// so it's *automatically* invalidated the moment a new segment
     /// publishes — no manual invalidation on compaction or flush, no TTL
-    /// guessing. After hydration confirms every scoring-set file is local
-    /// (on a cold namespace) the verdict is set to `true` for that
-    /// `(namespace, version)` pair, and subsequent warm requests short-
-    /// circuit `hydrate_segments_for_search` entirely. Failure safety:
+    /// guessing. After hydration confirms a file class is local for every
+    /// segment (on a cold namespace) the corresponding
+    /// [`HydrationVerdict`] flag is set for that `(namespace, version)`
+    /// pair, and subsequent warm requests whose own needs are covered by
+    /// what's been verified so far short-circuit `hydrate_segments_for_search`
+    /// entirely — see `HydrationVerdict` for why this is per-file-class,
+    /// not a flat bool (a query that doesn't need `filters.bin`/`vector.idx`
+    /// never verifies it, so a later query that *does* need one must not
+    /// trust a verdict that never checked it). Failure safety:
     /// if a disk-cache eviction removes a segment's scoring file after
     /// the verdict is cached, the search itself returns an IO error
     /// (`open_segment` fails to open `inverted.idx`), the caller's
@@ -242,11 +247,11 @@ struct AppState {
     /// invalidated on the error path here so the next request re-checks
     /// and re-hydrates the missing file. The collection grows
     /// unboundedly in principle (one entry per manifest bump per
-    /// namespace) but each is a `(u64, u64)` tuple — 16 bytes — and
-    /// manifest versions roll slowly enough that even a long-lived pod
-    /// holds at most low-thousands entries; per-query cost is a single
-    /// `HashMap` lookup, vs. 17 syscalls on the legacy path.
-    completed_hydrations: Mutex<HashMap<(String, u64), bool>>,
+    /// namespace) but each value is two bools, and manifest versions roll
+    /// slowly enough that even a long-lived pod holds at most
+    /// low-thousands entries; per-query cost is a single `HashMap` lookup,
+    /// vs. 17 syscalls on the legacy path.
+    completed_hydrations: Mutex<HashMap<(String, u64), HydrationVerdict>>,
     /// Whole-response cache for POST /search — see [`ResultCache`].
     result_cache: Mutex<ResultCache>,
     /// Posting-blob presence cache (Tier 1 O3), the sibling optimization to
@@ -532,6 +537,62 @@ struct HydrationOutcome {
     /// against only that same stale subset forever (not self-healing —
     /// only a pod restart, which drops the cache, recovered it).
     bloom_pruned: bool,
+}
+
+/// Cached verdict for `completed_hydrations`: NOT a single "namespace is
+/// fully hydrated" bool, but which *file classes* have actually been
+/// confirmed local for every segment in this `(namespace, manifest_version)`
+/// — because whether a hydration pass even looks at `filters.bin` or
+/// `vector.idx` depends entirely on the query that drove it
+/// (`query_needs_filter_store` / `query.knn.is_some()`). A pass for a plain
+/// unfiltered, unsorted, non-kNN query — including warmup's own probe query,
+/// see `run_warmup` — legitimately reports `outcome.missing.is_empty()` with
+/// *neither* file ever having been checked. Recording that success as a
+/// flat `true` let a *later* query that actually needs `filters.bin` (a
+/// `query.filter`, a non-`_score`/`_id` sort, or `aggs`) or `vector.idx` (a
+/// `knn` query) take the cached-verdict fast path (`ensure_query_posting_blobs`
+/// only — no scoring-set check at all) and silently run against a segment
+/// whose `filters.bin`/`vector.idx` was never fetched, scoring against
+/// nothing. Confirmed live: a `documentId`-filtered, sorted, paginated
+/// chunk-visibility check landed 100% zero-hit on every retry for several
+/// minutes on a pod whose own warmup pass (or an earlier plain-text query)
+/// had already cached a bare "hydrated" verdict for that manifest version —
+/// not self-healing short of a new segment publish (bumps the version key)
+/// or a pod restart (drops the map), the same non-recovery signature as
+/// #166/#167.
+///
+/// Each flag is set only by a pass that itself needed (and therefore
+/// verified, via `hydrate_segments_for_search`'s unconditional per-segment
+/// check) that file class *and* was not bloom-pruned (`!bloom_pruned` — see
+/// [`HydrationOutcome::bloom_pruned`]; a bloom-pruned pass only verifies a
+/// query-specific segment subset, never the whole namespace, for either
+/// file class). Flags accumulate (`|=`) across passes rather than being
+/// overwritten, so e.g. a sorted query verifying `filters.bin` and a later
+/// kNN query verifying `vector.idx` combine into one verdict that covers
+/// both for everything after. A query needing neither file class is
+/// trivially covered regardless of the flags (`covers(false, false)` is
+/// always `true`) — the common warm-baseline-search case keeps today's
+/// single-`HashMap`-lookup fast path.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct HydrationVerdict {
+    filters_verified: bool,
+    vectors_verified: bool,
+}
+
+impl HydrationVerdict {
+    /// Whether this verdict can be trusted to skip a full
+    /// `hydrate_segments_for_search` pass for a query with these needs.
+    fn covers(&self, needs_filters: bool, needs_vectors: bool) -> bool {
+        (!needs_filters || self.filters_verified) && (!needs_vectors || self.vectors_verified)
+    }
+
+    /// Record what a successful, non-bloom-pruned pass for a query with
+    /// these needs actually verified, merging with (not replacing) whatever
+    /// was already known for this manifest version.
+    fn merge(&mut self, needs_filters: bool, needs_vectors: bool) {
+        self.filters_verified |= needs_filters;
+        self.vectors_verified |= needs_vectors;
+    }
 }
 
 /// Segments this caller must fetch itself, paired with the completion
@@ -1259,6 +1320,8 @@ impl AppState {
                 operator: None,
                 no_cache: None,
             };
+            let needs_filters = query_needs_filter_store(&query);
+            let needs_vectors = query.knn.is_some();
             let t_ns = std::time::Instant::now();
             let outcome = self.hydrate_segments_for_search(&ns, &manifest, &query);
             let _ = tombstones;
@@ -1269,13 +1332,21 @@ impl AppState {
             // not a behavior change for warmup itself.
             if outcome.missing.is_empty() && !outcome.bloom_pruned {
                 // Mirror the search path's verdict caching (handle_search_post):
-                // the static scoring set is now local for this manifest
-                // version, so the first real queries skip the per-segment
-                // stat sweep instead of each re-deriving this verdict.
+                // record only what this pass actually verified — see
+                // `HydrationVerdict`. Warmup's probe query is unfiltered,
+                // unsorted, and non-kNN, so `needs_filters`/`needs_vectors`
+                // are both false here: this merge is a no-op today (neither
+                // flag is set), which is exactly the point — warmup's own
+                // success must NOT be mistaken for "filters.bin/vector.idx
+                // are local," or a later filtered/sorted/kNN query on this
+                // same pod would wrongly take the cached-verdict fast path
+                // and silently skip hydrating the file it actually needs.
                 self.completed_hydrations
                     .lock()
                     .unwrap()
-                    .insert((ns.0.clone(), manifest.version), true);
+                    .entry((ns.0.clone(), manifest.version))
+                    .or_default()
+                    .merge(needs_filters, needs_vectors);
                 println!(
                     "warmup: [{}/{}] '{ns_name}' ready: fetched {} file(s), {:.1} MB in {:.1}s",
                     idx + 1,
@@ -3469,14 +3540,21 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         // the 15–130 ms per-query hydration-check floor to a single
         // HashMap lookup.
         let verdict_key = (ns.0.clone(), manifest.version);
-        let cached_complete = state
+        // What THIS query actually needs verified — see `HydrationVerdict`.
+        // A cached verdict from an earlier pass that never checked
+        // `filters.bin`/`vector.idx` (e.g. an unfiltered plain-text query,
+        // or warmup's own probe) must not be trusted by a query that does
+        // need one of them; `covers` enforces that per-file-class check
+        // instead of trusting a flat "namespace hydrated" bool.
+        let needs_filters = query_needs_filter_store(&query);
+        let needs_vectors = query.knn.is_some();
+        let cached_covers = state
             .completed_hydrations
             .lock()
             .unwrap()
             .get(&verdict_key)
-            .copied()
-            .unwrap_or(false);
-        let outcome = if cached_complete {
+            .is_some_and(|v| v.covers(needs_filters, needs_vectors));
+        let outcome = if cached_covers {
             // The cached verdict can only ever cover the *static* scoring
             // set (footers/TOCs/offsets/filters). Posting blobs are fetched
             // per query — each term hashes to one of the 256 shard files —
@@ -3489,10 +3567,10 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             state.ensure_query_posting_blobs(&ns, &manifest, &query)
         } else {
             let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
-            // Cache the verdict on success: the static scoring set is
-            // local for this manifest version, so future warm queries
-            // skip the per-segment static checks (posting blobs are
-            // still ensured per query above).
+            // Cache what this pass verified: the static scoring set is
+            // local for this manifest version, so future warm queries with
+            // matching-or-lesser needs skip the per-segment static checks
+            // (posting blobs are still ensured per query above).
             //
             // Only when `!bloom_pruned`: a filtered/term-pruned query's
             // `to_hydrate` set only covers the segments *its own* filter
@@ -3506,12 +3584,19 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             // namespace happened to be a filtered one, understating a
             // filtered count by up to 80% for every later query on that
             // pod until it was restarted (which drops this cache).
+            //
+            // Merged (`|=` via `HydrationVerdict::merge`), not overwritten:
+            // a query needing only `filters.bin` must not erase a
+            // `vectors_verified` flag an earlier kNN pass already earned,
+            // and vice versa.
             if outcome.missing.is_empty() && !outcome.bloom_pruned {
                 state
                     .completed_hydrations
                     .lock()
                     .unwrap()
-                    .insert(verdict_key, true);
+                    .entry(verdict_key)
+                    .or_default()
+                    .merge(needs_filters, needs_vectors);
             }
             outcome
         };
@@ -3817,29 +3902,34 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     #[cfg(feature = "s3")]
     let hydration = {
         // Same cached-verdict short-circuit as `handle_search_post` —
-        // see that function for the rationale (Tier 1 O2).
+        // see that function for the rationale (Tier 1 O2) and
+        // `HydrationVerdict` for why this is per-file-class, not a flat
+        // bool.
         let verdict_key = (ns.0.clone(), manifest.version);
-        let cached_complete = state
+        let needs_filters = query_needs_filter_store(&query);
+        let needs_vectors = query.knn.is_some();
+        let cached_covers = state
             .completed_hydrations
             .lock()
             .unwrap()
             .get(&verdict_key)
-            .copied()
-            .unwrap_or(false);
-        let outcome = if cached_complete {
+            .is_some_and(|v| v.covers(needs_filters, needs_vectors));
+        let outcome = if cached_covers {
             // Posting blobs are per-query and outside the cached verdict —
             // see `handle_search_post` for the full rationale.
             state.ensure_query_posting_blobs(&ns, &manifest, &query)
         } else {
             let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
-            // Only cache when unfiltered — see `HydrationOutcome::bloom_pruned`
+            // Only merge when unfiltered — see `HydrationOutcome::bloom_pruned`
             // and `handle_search_post` for the full rationale.
             if outcome.missing.is_empty() && !outcome.bloom_pruned {
                 state
                     .completed_hydrations
                     .lock()
                     .unwrap()
-                    .insert(verdict_key, true);
+                    .entry(verdict_key)
+                    .or_default()
+                    .merge(needs_filters, needs_vectors);
             }
             outcome
         };
@@ -5695,6 +5785,208 @@ mod tests {
             "a filtered query's to_hydrate set only covers the segments its own filter value's \
              bloom check admitted — must NOT be eligible to cache as 'namespace hydrated', or a \
              later, differently-filtered query would silently skip segments it actually needs"
+        );
+    }
+
+    // ── HydrationVerdict: a pass that never needed filters.bin/vector.idx
+    //    must not let a later query that DOES need one take the cached-
+    //    verdict fast path ─────────────────────────────────────────────
+    //
+    // Same bug family as #166 (LazyFilters) and #167 (bloom_pruned), one
+    // layer up: `completed_hydrations` used to be a flat `bool`, so ANY
+    // successful, non-bloom-pruned pass — including warmup's own probe
+    // query (unfiltered, unsorted, non-kNN — see `run_warmup`) or an
+    // ordinary plain-text search — got cached as "namespace hydrated" for
+    // that manifest version. But `hydrate_segments_for_search` only ever
+    // checks `filters.bin`/`vector.idx` when the *driving* query needs
+    // them (`query_needs_filter_store` / `query.knn.is_some()`); a plain
+    // query's success proves nothing about whether either file was ever
+    // fetched. A later query on the SAME pod for the SAME manifest
+    // version that DOES need `filters.bin` — e.g. a `documentId`-filtered,
+    // sorted, `search_after`-paginated chunk-visibility check, structurally
+    // identical to what `post_index_processing` in the `backend` repo runs
+    // right after indexing — would see `cached_complete == true` and take
+    // the `ensure_query_posting_blobs`-only fast path, which never looks
+    // at `filters.bin` at all. If that file hadn't been fetched yet, the
+    // query would silently score against an empty/absent filter store —
+    // every retry, indefinitely, since nothing about a plain query
+    // succeeding again would ever trigger a real check. Not self-healing
+    // short of a new segment publish (bumps the version key) or a pod
+    // restart (drops the map) — the same non-recovery signature as
+    // #166/#167.
+    //
+    // Fix: `completed_hydrations` now stores a [`HydrationVerdict`] with
+    // independent `filters_verified`/`vectors_verified` flags, each set
+    // only by a pass that itself needed (and therefore actually checked)
+    // that file class.
+
+    #[test]
+    fn hydration_verdict_covers_only_what_was_actually_verified() {
+        let mut v = HydrationVerdict::default();
+        assert!(
+            v.covers(false, false),
+            "a query needing neither file class is trivially covered by any verdict"
+        );
+        assert!(
+            !v.covers(true, false),
+            "an unverified verdict must not cover a query that needs filters.bin"
+        );
+        assert!(
+            !v.covers(false, true),
+            "an unverified verdict must not cover a query that needs vector.idx"
+        );
+
+        // A pass that itself needed only filters.bin verifies only that.
+        v.merge(true, false);
+        assert!(v.covers(false, false));
+        assert!(v.covers(true, false));
+        assert!(
+            !v.covers(false, true),
+            "verifying filters.bin must not also mark vector.idx as verified"
+        );
+        assert!(!v.covers(true, true));
+
+        // A later pass needing vector.idx merges in, not overwrites.
+        v.merge(false, true);
+        assert!(
+            v.covers(true, true),
+            "flags accumulate across passes — filters_verified from an earlier pass must \
+             survive a later pass that only verified vectors"
+        );
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn unfiltered_pass_success_does_not_let_a_filtered_sorted_paginated_query_skip_its_own_check() {
+        let state = test_state();
+        let ns = NamespaceId("chunk-lookup-hydration-test".into());
+        let manifest = kosha_core::Manifest {
+            version: 1,
+            segments: vec![kosha_core::ManifestEntry {
+                segment_id: kosha_core::SegmentId("seg-1".into()),
+                doc_count: 10,
+            }],
+            segment_footers: HashMap::new(),
+        };
+        let base_query = kosha_core::SearchQuery {
+            query_text: String::new(),
+            max_results: 10,
+            bm25_params: kosha_core::Bm25Params::default(),
+            from: 0,
+            filter: None,
+            sort: Vec::new(),
+            search_after: None,
+            highlight: None,
+            aggs: std::collections::HashMap::new(),
+            wildcard: None,
+            match_phrase: None,
+            knn: None,
+            exact_total_hits: None,
+            total_hits_cap: None,
+            operator: None,
+            no_cache: None,
+        };
+        let verdict_key = (ns.0.clone(), manifest.version);
+
+        // Step 1: a plain unfiltered/unsorted/non-kNN pass — exactly
+        // warmup's own probe query shape — succeeds and (per the existing
+        // `!bloom_pruned` gate) is eligible to merge into the cache.
+        let warmup_like = base_query.clone();
+        let needs_filters_1 = query_needs_filter_store(&warmup_like);
+        let needs_vectors_1 = warmup_like.knn.is_some();
+        assert!(
+            !needs_filters_1 && !needs_vectors_1,
+            "warmup's probe query must not need filters.bin/vector.idx — this is exactly \
+             what makes its success unable to prove either file is local"
+        );
+        let outcome = state.hydrate_segments_for_search(&ns, &manifest, &warmup_like);
+        assert!(outcome.missing.is_empty() && !outcome.bloom_pruned);
+        state
+            .completed_hydrations
+            .lock()
+            .unwrap()
+            .entry(verdict_key.clone())
+            .or_default()
+            .merge(needs_filters_1, needs_vectors_1);
+
+        // Step 2: a documentId-filtered, sorted, search_after-paginated
+        // chunk-visibility query — the shape `post_index_processing`
+        // sends — arrives next on the SAME pod, SAME manifest version.
+        let mut chunk_lookup = base_query.clone();
+        chunk_lookup.filter = Some(kosha_core::FilterClause::Term {
+            term: HashMap::from([("documentId".to_string(), "doc-42".to_string())]),
+        });
+        chunk_lookup.sort = vec![kosha_core::SortSpec {
+            fields: HashMap::from([(
+                "chunkIndex".to_string(),
+                kosha_core::SortOrder {
+                    order: "asc".to_string(),
+                },
+            )]),
+        }];
+        chunk_lookup.search_after = Some(vec!["0".to_string()]);
+        let needs_filters_2 = query_needs_filter_store(&chunk_lookup);
+        let needs_vectors_2 = chunk_lookup.knn.is_some();
+        assert!(
+            needs_filters_2,
+            "a documentId term filter needs filters.bin"
+        );
+
+        let cached = state
+            .completed_hydrations
+            .lock()
+            .unwrap()
+            .get(&verdict_key)
+            .copied();
+        let cached_covers = cached.is_some_and(|v| v.covers(needs_filters_2, needs_vectors_2));
+        assert!(
+            !cached_covers,
+            "an unfiltered pass that never checked filters.bin must not let a later, \
+             filtered+sorted+paginated query believe filters.bin is local — it must fall \
+             through to a real hydrate_segments_for_search pass, exactly as if nothing had \
+             been cached yet"
+        );
+
+        // Step 3 (the fix's other half): once a pass that itself needs
+        // filters.bin — and is not bloom-pruned, e.g. an unfiltered query
+        // sorted by a real field — succeeds, filters_verified becomes
+        // true and DOES cover a later query that only needs filters.bin.
+        let mut sorted_unfiltered = base_query.clone();
+        sorted_unfiltered.sort = vec![kosha_core::SortSpec {
+            fields: HashMap::from([(
+                "chunkIndex".to_string(),
+                kosha_core::SortOrder {
+                    order: "asc".to_string(),
+                },
+            )]),
+        }];
+        let needs_filters_3 = query_needs_filter_store(&sorted_unfiltered);
+        let needs_vectors_3 = sorted_unfiltered.knn.is_some();
+        assert!(needs_filters_3, "sorting by a real field needs filters.bin");
+        let outcome3 = state.hydrate_segments_for_search(&ns, &manifest, &sorted_unfiltered);
+        assert!(
+            outcome3.missing.is_empty() && !outcome3.bloom_pruned,
+            "unfiltered (no query.filter/term-prune) means to_hydrate covers every segment — \
+             safe to merge"
+        );
+        state
+            .completed_hydrations
+            .lock()
+            .unwrap()
+            .entry(verdict_key.clone())
+            .or_default()
+            .merge(needs_filters_3, needs_vectors_3);
+
+        let cached_after = state
+            .completed_hydrations
+            .lock()
+            .unwrap()
+            .get(&verdict_key)
+            .copied();
+        assert!(
+            cached_after.is_some_and(|v| v.covers(true, false)),
+            "a pass that itself verified filters.bin must let a later query needing only \
+             filters.bin take the fast path"
         );
     }
 
