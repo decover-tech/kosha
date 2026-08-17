@@ -191,6 +191,53 @@ def test_extract_filter_accepts_top_level_terms_query():
     assert KoshaClient._extract_filter(body) == body["query"]
 
 
+def test_extract_query_text_ignores_bare_top_level_term_value():
+    """A bare `{"query": {"term": {...}}}` must not leak its value into
+    BM25 query text.
+
+    `term` is an exact-match filter, not free text — `_extract_filter`
+    already carries it through to Kosha's native `filter` field unchanged.
+    Previously the term's own value (e.g. a matter/document id) was
+    returned as query text whenever it happened to be a string, turning an
+    intended filter-only lookup into a bogus BM25 search for that literal
+    id — a search that finds nothing (the id almost never appears in any
+    document's indexed free text) and silently collapses correct results
+    to zero, even though `_extract_filter` translated the filter correctly.
+    """
+    body = {"query": {"term": {"matter_id": "6642a1b2-c3d4-e5f6-a7b8-c9d0e1f2a3b4"}}}
+
+    assert KoshaClient._extract_query_text(body) == ""
+    # The filter side must still carry the clause through unchanged.
+    assert KoshaClient._extract_filter(body) == body["query"]
+
+
+def test_search_bare_term_query_sends_empty_query_text_and_native_filter(monkeypatch):
+    """End-to-end: `.search(body={"query": {"term": {...}}})` must hit
+    Kosha's filter-only path (empty `query_text`, native `filter`), not a
+    bogus BM25 search on the term's value. Regression test for the exact
+    failure mode: a bare top-level `term` query silently returning zero
+    hits because its value leaked into `query_text`.
+    """
+    captured = {}
+
+    def fake_request(self, method, path, body=None):  # noqa: ANN001
+        captured["method"] = method
+        captured["path"] = path
+        captured["body"] = body
+        return {"results": [{"doc_id": "a", "score": 1.0, "fields": []}], "total_hits": 1}
+
+    monkeypatch.setattr(KoshaClient, "_request", fake_request)
+    client = KoshaClient(hosts=["http://localhost:9"], api_key="k")
+    result = client.search(
+        index="paragraph_index_hnsw",
+        body={"query": {"term": {"matter_id": "m1"}}},
+    )
+
+    assert captured["body"]["query_text"] == ""
+    assert captured["body"]["filter"] == {"term": {"matter_id": "m1"}}
+    assert result["hits"]["total"]["value"] == 1
+
+
 def test_update_by_query_supports_parameter_maps(monkeypatch):
     client = KoshaClient(hosts=["http://localhost:9"], api_key="k")
     pages = [

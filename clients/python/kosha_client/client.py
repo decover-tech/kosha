@@ -345,11 +345,21 @@ class KoshaClient:
 
         # term: {"term": {"field": "value"}} — exact match, not full-text.
         # We return empty because Kosha does BM25, not term queries (Phase 1).
-        term = query.get("term")
-        if term is not None:
-            for field, val in term.items():
-                if isinstance(val, str):
-                    return val
+        #
+        # A bare top-level `{"query": {"term": {...}}}` reaches this branch
+        # directly (unlike a `term` nested in `bool.must`/`should`, which
+        # `_is_filter_only_clause` already screens out above before this
+        # function is even called on it). Previously this loop returned the
+        # term's own VALUE as query text whenever it happened to be a
+        # string — e.g. a bare `{"term": {"matter_id": "<uuid>"}}` filter
+        # query turned into a BM25 search for the literal matter_id text,
+        # which almost never appears in any document's indexed free text,
+        # silently collapsing an otherwise-correct filter-only query to
+        # zero hits. `_extract_filter` already carries this clause through
+        # to Kosha's native `filter` field unchanged — query text must stay
+        # empty here so the request takes Kosha's filter-only path instead
+        # of an unintended (and bogus) BM25 leg.
+        if query.get("term") is not None:
             return ""
 
         # match_all

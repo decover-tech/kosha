@@ -7670,6 +7670,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression coverage for the investigation behind the
+    /// `kosha_client` bare-`term`-query fix (see `client.py`'s
+    /// `_extract_from_query_dsl`): a `term` clause nested inside a
+    /// `bool.must` filter must evaluate identically to the same `term`
+    /// applied bare (no `bool` wrapper) — `FilterApplier::apply` dispatches
+    /// both through the exact same `apply_term`, so this pins that parity
+    /// down at the engine level. It held before and after the client fix;
+    /// the actual bug — a bare top-level `term` query's value leaking into
+    /// BM25 `query_text` and silently zeroing results — lived entirely in
+    /// `kosha_client`, not here. See `clients/python/tests/test_client_fields.py`
+    /// for the regression test covering that failure mode directly.
+    #[test]
+    fn bool_must_term_filter_matches_bare_term_filter() {
+        let dir = std::env::temp_dir().join("kosha-test-bool-must-term-parity");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        w.add_document(DocumentId("a".into()), vec![Field::text("matterId", "m1")]);
+        w.add_document(DocumentId("b".into()), vec![Field::text("matterId", "m2")]);
+        w.finalize(Bm25Params::default()).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 2,
+            }],
+            segment_footers: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+
+        let mut bare_q = mk_query("", 10);
+        bare_q.filter = Some(kosha_core::FilterClause::Term {
+            term: std::collections::HashMap::from([("matterId".into(), "m1".into())]),
+        });
+        let bare_r = searcher.search(&ns, &manifest, &bare_q, None).unwrap();
+
+        let mut bool_q = mk_query("", 10);
+        bool_q.filter = Some(kosha_core::FilterClause::Bool {
+            bool: kosha_core::BoolFilter {
+                must: vec![kosha_core::FilterClause::Term {
+                    term: std::collections::HashMap::from([("matterId".into(), "m1".into())]),
+                }],
+                must_not: vec![],
+                should: vec![],
+                minimum_should_match: 1,
+            },
+        });
+        let bool_r = searcher.search(&ns, &manifest, &bool_q, None).unwrap();
+
+        assert_eq!(
+            bare_r.total_hits, 1,
+            "bare term filter must match only doc a"
+        );
+        assert_eq!(
+            bare_r.total_hits, bool_r.total_hits,
+            "bool.must-wrapped term filter must match the bare term filter"
+        );
+        assert_eq!(bare_r.results[0].doc_id.0, "a");
+        assert_eq!(bool_r.results[0].doc_id.0, "a");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn filter_keeps_hits_across_segments() {
         let dir = std::env::temp_dir().join("kosha-test-filter-multiseg");
