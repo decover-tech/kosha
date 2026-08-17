@@ -5,13 +5,25 @@
 
 The manifest is applied by hand and is intentionally not part of the
 kustomize overlay, so normal deployments cannot restart a one-shot backfill.
+
+The cluster-specific endpoints are read from the environment so no account
+id, registry, or search-domain hostname is committed. The defaults render
+placeholders — set these before applying the manifest for real:
+
+    KOSHA_MIGRATION_ES_HOST     OpenSearch endpoint to read from
+    KOSHA_MIGRATION_IMAGE       fully-qualified kosha-server image
+    AWS_REGION                  region for both (default us-east-1)
 """
 
 from __future__ import annotations
 
-ES_HOST = "https://vpc-decoverai-nonprod-search-rdaf2ygjik3teui5prmuotjlx4.us-east-1.es.amazonaws.com"
-REGION = "us-east-1"
-KOSHA_IMAGE = "010928200670.dkr.ecr.us-east-1.amazonaws.com/decover/kosha:main"
+import os
+
+ES_HOST = os.environ.get("KOSHA_MIGRATION_ES_HOST", "https://<opensearch-endpoint>")
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+KOSHA_IMAGE = os.environ.get(
+    "KOSHA_MIGRATION_IMAGE", "<registry>/decover/kosha:main"
+)
 
 # Exact alias names Sage reads. Never resolve these through `_cat/indices`,
 # which returns concrete *_v2 backing names and would mis-name namespaces.
@@ -121,4 +133,6 @@ def render() -> str:
 
 
 if __name__ == "__main__":
-    print(render())
+    # end="" — render() already ends in a newline, and a second one would
+    # fail the end-of-file-fixer pre-commit hook on the generated manifest.
+    print(render(), end="")
