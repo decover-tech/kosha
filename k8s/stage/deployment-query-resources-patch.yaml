@@ -35,15 +35,26 @@
 # the ingest Deployment's hostPath NVMe volume, which the kubelet does NOT
 # count against ephemeral-storage). Left unset, that cache is unbounded, so
 # it — not KOSHA_SEGMENT_CACHE_MAX_BYTES above, which only bounds the
-# in-memory parsed-segment cache — is what actually consumes the pod's 20Gi
-# ephemeral-storage limit. A benchmark against a ~22GB single namespace
-# (10M docs) filled it, and pods got Kubernetes-Evicted ("ephemeral local
-# storage usage exceeds the total limit of containers 20Gi") rather than
-# gracefully LRU-evicting, repeatedly, which also starved capacity for
-# unrelated namespaces sharing the same pods. 12GiB leaves 8Gi (40%)
-# headroom on the 20Gi limit for everything else on the container
-# filesystem (logs, /tmp, transient hydration staging before files land in
-# the cache dir).
+# in-memory parsed-segment cache — is what actually consumes the pod's
+# ephemeral-storage limit.
+#
+# 2026-08-17: doubled straight through (memory, ephemeral-storage, and both
+# cache-budget env vars together) after this exact "ephemeral local storage
+# usage exceeds the total limit of containers 20Gi" eviction reproduced live
+# — a cold pod hydrating paragraph_index_hnsw's full 88 segments (22,758
+# files) filled the on-disk cache past the then-current 20Gi ephemeral-
+# storage limit and got Kubernetes-Evicted, same failure mode as the
+# original 10M-doc benchmark this comment already documented. Root cause of
+# it recurring: an earlier live memory bump (16Gi -> 32Gi, to clear a
+# concurrent OOMKill) only doubled KOSHA_SEGMENT_CACHE_MAX_BYTES/
+# KOSHA_SEGMENT_LIVE_MAX_BYTES (RAM-bounding) and KOSHA_CACHE_MAX_BYTES
+# (disk-bounding) together, but not the container's own ephemeral-storage
+# limit — so the disk cache budget (24Gi) ended up exceeding the still-20Gi
+# hard limit, guaranteeing eviction once the cache filled. Doubling
+# ephemeral-storage alongside the rest preserves the same ~40%-headroom
+# ratio the original sizing established (24Gi cache budget / 40Gi limit =
+# 60% used, matching 12Gi/20Gi before) rather than just raising one knob and
+# leaving the others to drift out of proportion again.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,33 +69,33 @@ spec:
           env:
             # Overrides the ConfigMap's 40GiB value (see comment above) —
             # explicit container env wins over envFrom on key collision.
-            # ~10GiB leaves ~6GiB of the 16Gi limit for process baseline +
+            # ~20GiB leaves ~12GiB of the 32Gi limit for process baseline +
             # concurrent per-request working memory, so the cache evicts
             # gracefully instead of the pod getting OOMKilled.
             - name: KOSHA_SEGMENT_CACHE_MAX_BYTES
-              value: "10737418240"
-            # ~12GiB on-disk cache budget, well under the 20Gi
+              value: "21474836480"
+            # ~24GiB on-disk cache budget, well under the 40Gi
             # ephemeral-storage limit (see comment above) — the cache's own
             # LRU eviction is what should bite first, not a pod eviction.
             - name: KOSHA_CACHE_MAX_BYTES
-              value: "12884901888"
+              value: "25769803776"
             # Live-bytes watermark (cache-resident + pinned by in-flight
             # searches — see kosha_query::MemoryLedger). Must be set
             # explicitly here: the code default is 2× the cache budget
-            # (20GiB), which exceeds the 16Gi container limit. 12GiB leaves
-            # ~4GiB of the limit for process baseline + working memory of
+            # (40GiB), which exceeds the 32Gi container limit. 24GiB leaves
+            # ~8GiB of the limit for process baseline + working memory of
             # the (KOSHA_MAX_CONCURRENT_SEARCHES, default 8) concurrent
-            # scoring passes. Same 12GiB figure as KOSHA_CACHE_MAX_BYTES
+            # scoring passes. Same 24GiB figure as KOSHA_CACHE_MAX_BYTES
             # above by coincidence, not by coupling — that one bounds disk
             # (emptyDir/ephemeral-storage), this one bounds RAM.
             - name: KOSHA_SEGMENT_LIVE_MAX_BYTES
-              value: "12884901888"
+              value: "25769803776"
           resources:
             requests:
               cpu: "2"
-              ephemeral-storage: "5Gi"
-              memory: "8Gi"
+              ephemeral-storage: "10Gi"
+              memory: "16Gi"
             limits:
               cpu: "4"
-              ephemeral-storage: "20Gi"
-              memory: "16Gi"
+              ephemeral-storage: "40Gi"
+              memory: "32Gi"
