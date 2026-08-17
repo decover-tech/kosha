@@ -8,7 +8,7 @@
 # materialize, cold-vs-cached opens.
 #
 # Prereqs:
-#   - kubectl context pointed at the staging cluster (decoverai-nonprod)
+#   - kubectl context pointed at the staging cluster
 #   - KOSHA_API_KEY exported (any valid staging key)
 #
 # Usage:

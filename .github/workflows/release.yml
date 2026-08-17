@@ -42,7 +42,7 @@ name: Release
 # trust scoped to this repo's main branch + v* tags). The ECR registry is
 # derived from the role's account at login, so pointing the secret at a role
 # in another account moves the push there with no workflow change. Staging
-# uses a role in account 010928200670 (push rights only to decover/kosha
+# uses a role in the staging account (push rights only to decover/kosha
 # there) so the staging cluster pulls in-account, like every other service.
 #
 # Docker Hub: requires repo secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
@@ -50,8 +50,8 @@ name: Release
 #
 # Deploy: after each successful merge, deploy-staging (push to main) and
 # deploy-production (v* tags) call deploy-eks.yml (reusable) to
-# kustomize-apply k8s/{stage,prod} to the real EKS clusters
-# (decoverai-nonprod / decoverai-prod) and force a rollout restart, since
+# kustomize-apply k8s/{stage,prod} to the real EKS clusters (named by each
+# environment's EKS_CLUSTER_NAME secret) and force a rollout restart, since
 # `kubectl apply` alone is a no-op when a floating tag string like `:main`
 # hasn't changed. Each needs its own GitHub Environment ("staging" /
 # "production") with secrets AWS_GITHUB_ROLE_ARN (must also have EKS RBAC —

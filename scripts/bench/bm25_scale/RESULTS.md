@@ -17,13 +17,13 @@ Generated via `generate_corpus.py --docs 10000000 --avg-bytes 900 --seed 42`:
 | Avg bytes/doc | 855.97 |
 | Vocabulary | 50,000 terms, Zipfian (s=1.07) |
 | Queries | 2,000, sampled from the same term distribution |
-| S3 handle | `s3://decoverai-nonprod-kosha-bench/bm25-scale/10M-docs-900b-seed42/` |
+| S3 handle | `s3://<bench-bucket>/bm25-scale/10M-docs-900b-seed42/` |
 
 Regenerating with the same `--seed 42` reproduces this corpus exactly.
 
 ## OpenSearch — result
 
-Domain: `decoverai-nonprod-search` (staging, 2× `r8g.large.search`), index
+Domain: staging OpenSearch (2× `r8g.large.search`), index
 `bm25-bench-10m`, 5 shards / 1 replica, BM25 k1=1.2/b=0.75, forcemerged to 5
 segments/shard after load. Both runs: 961/961 successes, 0 errors, achieved
 ~8.0 QPS.
