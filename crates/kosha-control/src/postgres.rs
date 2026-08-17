@@ -61,6 +61,69 @@ impl PgStore {
         Ok(Self { pool, rt })
     }
 
+    /// Bounded attempts for the initial connect, mirroring
+    /// `s3_storage::FETCH_MAX_ATTEMPTS`'s reasoning: a pod's very first
+    /// connect frequently races pod-startup conditions that resolve within
+    /// seconds (CNI not yet routable, Postgres briefly out of free
+    /// connections during a rolling restart, DNS not yet warm) — a single
+    /// attempt turns any of those into a permanent, silent failure (see
+    /// `connect_with_retry`'s doc comment for the incident this fixes).
+    const CONNECT_MAX_ATTEMPTS: u32 = 5;
+
+    /// The backoff delay before each retry (not the initial attempt) — a
+    /// plain `Vec` rather than inlined into `connect_with_retry`'s loop so
+    /// the schedule itself has a direct, network-free unit test. Starts at
+    /// 500ms, doubles, capped at 5s so a raised `CONNECT_MAX_ATTEMPTS`
+    /// later can't silently balloon total startup wait.
+    fn connect_retry_backoff_schedule() -> Vec<Duration> {
+        let mut delay = Duration::from_millis(500);
+        let cap = Duration::from_secs(5);
+        let mut schedule = Vec::new();
+        for _ in 1..Self::CONNECT_MAX_ATTEMPTS {
+            schedule.push(delay);
+            delay = (delay * 2).min(cap);
+        }
+        schedule
+    }
+
+    /// `new`, retried with backoff before giving up.
+    ///
+    /// Fixes a real incident: a single failed connect attempt at boot
+    /// (`pool timed out while waiting for an open connection`, most likely
+    /// pod-startup network-readiness timing, not Postgres actually being
+    /// down) used to be indistinguishable from "Postgres doesn't exist" —
+    /// the caller fell back to an empty in-memory control plane
+    /// permanently for that pod's lifetime, with `/healthz`/`/readyz`
+    /// still reporting healthy, so Kubernetes kept routing real traffic to
+    /// a pod that silently had zero namespaces. `CONNECT_MAX_ATTEMPTS`
+    /// attempts with the schedule above (~500ms+1s+2s+4s ≈ 7.5s of backoff,
+    /// plus each attempt's own `acquire_timeout`) absorbs exactly that
+    /// class of transient blip before the caller has to decide what to do
+    /// about a *genuinely* unreachable Postgres (see
+    /// `main.rs`'s control-plane init, which now treats that as fatal
+    /// rather than silently degrading).
+    pub fn connect_with_retry(database_url: &str) -> Result<Self, String> {
+        let mut backoffs = Self::connect_retry_backoff_schedule().into_iter();
+        let mut last_err = String::new();
+        for attempt in 1..=Self::CONNECT_MAX_ATTEMPTS {
+            match Self::new(database_url) {
+                Ok(store) => return Ok(store),
+                Err(e) => {
+                    last_err = e;
+                    if let Some(delay) = backoffs.next() {
+                        eprintln!(
+                            "WARN: postgres connect failed (attempt {attempt}/{}): {last_err}; \
+                             retrying in {delay:?}",
+                            Self::CONNECT_MAX_ATTEMPTS
+                        );
+                        std::thread::sleep(delay);
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
+
     /// Validate an API key against the database.
     /// Returns the tenant_id if the key is valid and not revoked.
     pub fn validate_api_key(&self, api_key: &str) -> Option<String> {
@@ -346,4 +409,41 @@ impl ControlStore for PgStore {
             row.0 as usize
         })
     }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn connect_retry_backoff_schedule_doubles_from_500ms_capped_at_5s() {
+        let schedule = PgStore::connect_retry_backoff_schedule();
+        // CONNECT_MAX_ATTEMPTS attempts => CONNECT_MAX_ATTEMPTS - 1 backoff delays.
+        assert_eq!(schedule.len(), (PgStore::CONNECT_MAX_ATTEMPTS - 1) as usize);
+        assert_eq!(schedule[0], Duration::from_millis(500));
+        assert_eq!(schedule[1], Duration::from_secs(1));
+        assert_eq!(schedule[2], Duration::from_secs(2));
+        assert_eq!(schedule[3], Duration::from_secs(4));
+    }
+
+    #[test]
+    fn connect_retry_backoff_schedule_never_exceeds_the_5s_cap() {
+        // Guards against a future CONNECT_MAX_ATTEMPTS bump silently
+        // ballooning total startup wait — the cap must hold regardless of
+        // how many attempts are configured.
+        for delay in PgStore::connect_retry_backoff_schedule() {
+            assert!(
+                delay <= Duration::from_secs(5),
+                "delay {delay:?} exceeds the 5s cap"
+            );
+        }
+    }
+
+    // `connect_with_retry` itself (the loop against a real/unreachable
+    // Postgres) is intentionally not unit-tested here — no network access
+    // in this test binary, and DNS-resolution failure timing for an
+    // unreachable host isn't hermetic (varies by environment, can hang
+    // without egress). Covered instead by the schedule tests above (the
+    // retry *shape* is what regresses silently) plus live validation
+    // against a real pool-timeout on staging.
 }

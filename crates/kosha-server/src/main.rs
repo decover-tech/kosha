@@ -909,17 +909,52 @@ impl AppState {
         let control_store: Box<dyn ControlStore> = if let Ok(db_url) = std::env::var("DATABASE_URL")
         {
             #[cfg(feature = "postgres")]
-            match kosha_control::PgStore::new(&db_url) {
+            match kosha_control::PgStore::connect_with_retry(&db_url) {
                 Ok(store) => {
                     control_plane_kind = "postgres";
                     println!("control plane: postgres ({})", redact_database_url(&db_url));
                     Box::new(store)
                 }
                 Err(e) => {
-                    eprintln!(
-                        "WARN: failed to connect to postgres, falling back to in-memory: {e}"
-                    );
-                    Box::new(kosha_control::Controller::new())
+                    // DATABASE_URL being *set* means Postgres is this
+                    // deployment's intended control plane, not an optional
+                    // extra — a pod that can't reach it after
+                    // `connect_with_retry`'s retries has an empty namespace
+                    // registry and cannot correctly serve any namespace.
+                    // Silently falling back used to leave exactly that pod
+                    // running with `/healthz`/`/readyz` both green, so
+                    // Kubernetes kept routing real traffic to it
+                    // indefinitely (only a manual pod restart recovered
+                    // it — see the incident this fixes). Exiting here
+                    // instead means the process never binds the listener,
+                    // so no probe ever reports this pod healthy and the
+                    // ordinary CrashLoopBackOff/restart cycle takes over —
+                    // the standard, alertable way to surface "an essential
+                    // dependency is unreachable at boot".
+                    //
+                    // `KOSHA_POSTGRES_FALLBACK_ON_ERROR=1` is an explicit
+                    // escape hatch back to the old (dangerous) silent
+                    // fallback, for emergency ops use only.
+                    let fallback_allowed = std::env::var("KOSHA_POSTGRES_FALLBACK_ON_ERROR")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    if fallback_allowed {
+                        eprintln!(
+                            "WARN: failed to connect to postgres after retries, falling back to \
+                             in-memory (KOSHA_POSTGRES_FALLBACK_ON_ERROR=1): {e}"
+                        );
+                        Box::new(kosha_control::Controller::new())
+                    } else {
+                        eprintln!(
+                            "FATAL: failed to connect to postgres after retries: {e}. \
+                             DATABASE_URL is set, so an empty in-memory control plane would \
+                             silently serve zero namespaces while still passing health checks. \
+                             Exiting so Kubernetes restarts this pod instead. Set \
+                             KOSHA_POSTGRES_FALLBACK_ON_ERROR=1 to opt back into the old \
+                             silent-fallback behavior."
+                        );
+                        std::process::exit(1);
+                    }
                 }
             }
             #[cfg(not(feature = "postgres"))]
