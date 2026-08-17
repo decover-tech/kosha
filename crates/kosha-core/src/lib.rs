@@ -154,7 +154,7 @@ impl Default for Bm25Params {
 
 // ─── Filter types ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum FilterClause {
     Term {
@@ -174,6 +174,99 @@ pub enum FilterClause {
     },
 }
 
+/// Clause keys `FilterClause` accepts, as reported in parse errors.
+const FILTER_CLAUSE_KEYS: [&str; 5] = ["term", "terms", "range", "bool", "match_all"];
+
+/// Deserialized by dispatching on the clause's single key rather than with
+/// `#[serde(untagged)]`.
+///
+/// Untagged deserialization tries variants in order and takes the first that
+/// fits, which made `MatchAll` a catch-all: every field of every variant is
+/// either defaulted or an `Option`, so an object with an unrecognized key —
+/// `{"bogus": 1}`, or OpenSearch's `{"bool": {"filter": [...]}}` once
+/// `BoolFilter` started rejecting `filter` — deserialized as
+/// `MatchAll { match_all: None }` and silently matched *everything* rather
+/// than erroring. On `/search` that quietly returns the whole namespace; on
+/// `/delete` (delete-by-query) it would quietly delete it. See issue #170.
+impl<'de> Deserialize<'de> for FilterClause {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let expected = || FILTER_CLAUSE_KEYS.join(", ");
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value.as_object().ok_or_else(|| {
+            D::Error::custom(format!(
+                "filter clause must be a JSON object with exactly one of: {}",
+                expected()
+            ))
+        })?;
+
+        let mut keys = obj.keys();
+        let key = keys.next().ok_or_else(|| {
+            D::Error::custom(format!(
+                "empty filter clause; expected exactly one of: {}. Use \
+                 {{\"match_all\": {{}}}} to match every document",
+                expected()
+            ))
+        })?;
+        if let Some(extra) = keys.next() {
+            return Err(D::Error::custom(format!(
+                "filter clause must have exactly one key, found `{key}` and \
+                 `{extra}`; wrap multiple clauses in a `bool`"
+            )));
+        }
+
+        // `from_value` on the inner value only — the key was matched above, so
+        // an error here is about the clause body, not the clause kind.
+        let inner = obj.get(key).cloned().unwrap_or(serde_json::Value::Null);
+        fn body<T, E>(v: serde_json::Value) -> Result<T, E>
+        where
+            T: serde::de::DeserializeOwned,
+            E: serde::de::Error,
+        {
+            serde_json::from_value(v).map_err(E::custom)
+        }
+
+        match key.as_str() {
+            "term" => Ok(FilterClause::Term { term: body(inner)? }),
+            "terms" => Ok(FilterClause::Terms {
+                terms: body(inner)?,
+            }),
+            "range" => Ok(FilterClause::Range {
+                range: body(inner)?,
+            }),
+            "bool" => Ok(FilterClause::Bool { bool: body(inner)? }),
+            "match_all" => Ok(FilterClause::MatchAll {
+                match_all: Some(inner),
+            }),
+            other => {
+                let hint = match other {
+                    "filter" => {
+                        " — Kosha's native filter has no `filter` clause; \
+                         OpenSearch's `bool.filter` is spelled `bool.must` here"
+                    }
+                    "must" | "must_not" | "should" | "minimum_should_match" => {
+                        " — these belong inside a `bool` clause, e.g. \
+                         {\"bool\": {\"must\": [...]}}"
+                    }
+                    "match" | "match_phrase" | "wildcard" | "exists" | "prefix" => {
+                        " — full-text and wildcard matching is not part of the \
+                         filter language; use the query text instead"
+                    }
+                    _ => "",
+                };
+                Err(D::Error::custom(format!(
+                    "unknown filter clause `{other}`, expected one of: {}{hint}",
+                    expected()
+                )))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeBound {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,7 +279,12 @@ pub struct RangeBound {
     pub lt: Option<String>,
 }
 
+/// `deny_unknown_fields` so OpenSearch's `bool.filter` is rejected with a
+/// clear error instead of deserializing to an all-empty `BoolFilter`, which
+/// matches every document (issue #170). Kosha's native equivalent of
+/// `bool.filter` is `bool.must`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BoolFilter {
     #[serde(default)]
     pub must: Vec<FilterClause>,
@@ -1075,6 +1173,151 @@ pub struct FilterStore {
     pub string_fields: std::collections::HashMap<String, Vec<(u32, String)>>,
     pub integer_fields: std::collections::HashMap<String, Vec<(u32, i64)>>,
     pub float_fields: std::collections::HashMap<String, Vec<(u32, f64)>>,
+}
+
+#[cfg(test)]
+mod filter_clause_parsing {
+    //! Issue #170: an unrecognized filter key must be rejected, never
+    //! silently parsed into something that matches every document. The
+    //! consequence is asymmetric — on `/search` a match-everything filter
+    //! quietly returns the whole namespace, and on `/delete` (delete-by-query)
+    //! it would quietly delete it.
+    use super::*;
+
+    fn parse(s: &str) -> Result<FilterClause, serde_json::Error> {
+        serde_json::from_str(s)
+    }
+
+    #[test]
+    fn opensearch_bool_filter_key_is_rejected() {
+        // The reported case: `bool.filter` is OpenSearch's spelling; Kosha's
+        // native equivalent is `bool.must`. This used to deserialize into an
+        // all-empty BoolFilter that matched everything.
+        let err = parse(r#"{"bool": {"filter": [{"term": {"a": "b"}}]}}"#)
+            .expect_err("bool.filter must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown field `filter`"), "{msg}");
+        assert!(
+            msg.contains("must"),
+            "error should name the native key: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_clause_does_not_fall_through_to_match_all() {
+        // Untagged deserialization made MatchAll a catch-all, because every
+        // field of every variant is defaulted or Option: `{"bogus": 1}` parsed
+        // as MatchAll { match_all: None }.
+        let err = parse(r#"{"bogus": 1}"#).expect_err("unknown clause must be rejected");
+        assert!(
+            err.to_string().contains("unknown filter clause `bogus`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bool_inner_clauses_are_validated_recursively() {
+        let err = parse(r#"{"bool": {"must": [{"bogus": 1}]}}"#)
+            .expect_err("nested unknown clause must be rejected");
+        assert!(
+            err.to_string().contains("unknown filter clause `bogus`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn empty_clause_is_rejected_rather_than_matching_everything() {
+        let err = parse("{}").expect_err("empty clause must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("empty filter clause"), "{msg}");
+        assert!(
+            msg.contains("match_all"),
+            "error should point at the explicit form: {msg}"
+        );
+    }
+
+    #[test]
+    fn multiple_keys_are_rejected() {
+        let err = parse(r#"{"term": {"a": "b"}, "terms": {"c": ["d"]}}"#)
+            .expect_err("two clause keys must be rejected");
+        assert!(err.to_string().contains("exactly one key"), "{err}");
+    }
+
+    #[test]
+    fn bool_only_keys_at_clause_level_get_a_hint() {
+        let err = parse(r#"{"must": [{"term": {"a": "b"}}]}"#).expect_err("must is not a clause");
+        assert!(err.to_string().contains("inside a `bool` clause"), "{err}");
+    }
+
+    #[test]
+    fn non_object_clause_is_rejected() {
+        assert!(parse("[]").is_err());
+        assert!(parse("\"term\"").is_err());
+        assert!(parse("null").is_err());
+    }
+
+    #[test]
+    fn every_valid_clause_still_parses() {
+        assert!(matches!(
+            parse(r#"{"term": {"a": "b"}}"#).unwrap(),
+            FilterClause::Term { .. }
+        ));
+        assert!(matches!(
+            parse(r#"{"terms": {"a": ["b", "c"]}}"#).unwrap(),
+            FilterClause::Terms { .. }
+        ));
+        assert!(matches!(
+            parse(r#"{"range": {"n": {"gte": "1", "lt": "9"}}}"#).unwrap(),
+            FilterClause::Range { .. }
+        ));
+        assert!(matches!(
+            parse(r#"{"match_all": {}}"#).unwrap(),
+            FilterClause::MatchAll { .. }
+        ));
+
+        let nested = parse(
+            r#"{"bool": {"must": [{"term": {"a": "b"}}],
+                        "must_not": [{"terms": {"c": ["d"]}}],
+                        "should": [{"range": {"n": {"gte": "1"}}}],
+                        "minimum_should_match": 2}}"#,
+        )
+        .unwrap();
+        match nested {
+            FilterClause::Bool { bool } => {
+                assert_eq!(bool.must.len(), 1);
+                assert_eq!(bool.must_not.len(), 1);
+                assert_eq!(bool.should.len(), 1);
+                assert_eq!(bool.minimum_should_match, 2);
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bool_defaults_are_unchanged() {
+        match parse(r#"{"bool": {"must": [{"term": {"a": "b"}}]}}"#).unwrap() {
+            FilterClause::Bool { bool } => {
+                assert!(bool.must_not.is_empty());
+                assert!(bool.should.is_empty());
+                assert_eq!(bool.minimum_should_match, 1);
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trips_through_serialize() {
+        for s in [
+            r#"{"term":{"a":"b"}}"#,
+            r#"{"terms":{"a":["b","c"]}}"#,
+            r#"{"match_all":{}}"#,
+            r#"{"bool":{"must":[{"term":{"a":"b"}}],"must_not":[],"should":[],"minimum_should_match":1}}"#,
+        ] {
+            let parsed = parse(s).unwrap();
+            let back = serde_json::to_string(&parsed).unwrap();
+            assert!(parse(&back).is_ok(), "re-parse of {back} failed");
+        }
+    }
 }
 
 #[cfg(test)]
