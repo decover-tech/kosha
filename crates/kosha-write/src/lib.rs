@@ -18,7 +18,6 @@ use kosha_segment::SegmentWriter;
 use compaction::select_merge_inputs;
 
 struct NamespaceBuffer {
-    #[allow(dead_code)]
     namespace: NamespaceId,
     documents: Vec<Document>,
     segment_counter: u64,
@@ -60,6 +59,17 @@ struct NamespaceHandle {
     /// At most one compaction in flight per namespace. Held across merge I/O
     /// while `state` is released (DESIGN.md §7.1).
     compact: Mutex<()>,
+    /// At most one flush's segment-write I/O in flight per namespace, held
+    /// across `SegmentWriter` disk I/O while `state` is released — mirrors
+    /// `compact` above, for the same reason. Without this, `flush_namespace`
+    /// used to hold `state` for the full I/O duration, so every concurrent
+    /// `index_documents`/`flush_namespace` call for the namespace (even pure
+    /// bookkeeping) queued up behind one flush's disk cost. Under bursty
+    /// small-batch writes (every call triggering its own index+flush pair)
+    /// this produced unbounded tail latency — confirmed live: the identical
+    /// `/flush` call took anywhere from 0.7s to >20s back-to-back with no
+    /// other change. See issue #176.
+    flush_io: Mutex<()>,
 }
 
 /// Thread-safe indexer with per-namespace isolation (DESIGN.md §7.1).
@@ -145,6 +155,7 @@ impl Indexer {
                 Arc::new(NamespaceHandle {
                     state: Mutex::new(NamespaceState::new()),
                     compact: Mutex::new(()),
+                    flush_io: Mutex::new(()),
                 })
             })
             .clone()
@@ -332,7 +343,12 @@ impl Indexer {
         let id_set: HashSet<&DocumentId> = ids.iter().collect();
         let handle = self.ns_handle(&namespace);
 
-        {
+        // `needs_flush` is decided under `state` but acted on after it's
+        // released — flush_namespace re-acquires state itself for its own
+        // (much shorter) phase 1. Calling the old synchronous
+        // flush_namespace_in from here would hold this lock across the
+        // segment-write I/O, exactly the contention issue #176 fixes.
+        let needs_flush = {
             let mut state = handle.state.lock().unwrap();
             if let Some(buf) = state.buffer.as_mut() {
                 buf.documents.retain(|doc| !id_set.contains(&doc.id));
@@ -356,15 +372,10 @@ impl Indexer {
                 &self.bm25_params,
             );
             buf.documents.extend(documents);
-            if buf.documents.len() >= flush_threshold {
-                Self::flush_namespace_in(
-                    &mut state,
-                    &namespace,
-                    &self.data_dir,
-                    self.wal_enabled,
-                    &self.wal,
-                )?;
-            }
+            buf.documents.len() >= flush_threshold
+        };
+        if needs_flush {
+            self.flush_namespace(&namespace)?;
         }
         Ok(count)
     }
@@ -575,18 +586,93 @@ impl Indexer {
         }))
     }
 
+    /// Flush whatever's buffered for `namespace` into a new segment.
+    ///
+    /// Three phases, only the first and last of which hold `state` — see
+    /// `NamespaceHandle::flush_io`'s doc comment for why. This is the public
+    /// entry point (the `/flush` handler and `index_documents`'s
+    /// auto-flush-on-threshold both call it); `rewrite_documents`'s internal
+    /// auto-flush still uses the synchronous `flush_namespace_in` below,
+    /// since it's already deep inside a `state`-locked critical section
+    /// doing other bookkeeping — see issue #176 for that as a known,
+    /// separate follow-up.
     pub fn flush_namespace(&self, namespace: &NamespaceId) -> Result<(), KoshaError> {
         let handle = self.ns_handle(namespace);
-        let mut state = handle.state.lock().unwrap();
-        Self::flush_namespace_in(
-            &mut state,
-            namespace,
-            &self.data_dir,
-            self.wal_enabled,
-            &self.wal,
-        )
+
+        // Phase 1 (state locked, cheap): snapshot whatever's buffered.
+        // Released immediately after — concurrent index_documents/flush
+        // calls for this namespace stay unblocked while phase 2 runs.
+        let snapshot = {
+            let mut state = handle.state.lock().unwrap();
+            Self::take_flush_snapshot_in(&mut state)
+        };
+        let Some((docs, seg_id, bm25_params)) = snapshot else {
+            return Ok(());
+        };
+
+        // Phase 2 (flush_io locked, state free): the actual segment write.
+        // Still serialized against other flushes for this namespace (segment
+        // files and the WAL-clear below stay ordered), but no longer blocks
+        // index_documents's cheap state access while it runs.
+        let footer = {
+            let _io_guard = handle.flush_io.lock().unwrap();
+            let seg_dir = self.data_dir.join(&namespace.0).join(seg_id.0.as_str());
+            let mut writer = SegmentWriter::new(seg_id.clone(), seg_dir);
+            for doc in &docs {
+                writer.add_document(doc.id.clone(), doc.fields.clone());
+            }
+            writer.finalize(bm25_params)?
+        };
+
+        // WAL no longer needed for flushed data.
+        if self.wal_enabled {
+            if let Ok(mut wal_guard) = self.wal.lock() {
+                wal_guard.clear().ok();
+            }
+        }
+
+        // Phase 3 (state locked, cheap): commit the new segment.
+        {
+            let mut state = handle.state.lock().unwrap();
+            Self::remember_flushed_ids_in(&mut state, &seg_id, &docs);
+            state.known = true;
+            state.manifest.version += 1;
+            state.manifest.segments.push(ManifestEntry {
+                segment_id: seg_id,
+                doc_count: footer.doc_count,
+            });
+            state.manifest.remember_segment_footer(footer);
+        }
+        Ok(())
     }
 
+    /// Take whatever's currently buffered for flushing — the state-locked
+    /// "phase 1" half of `flush_namespace`, kept separate so phase 2's disk
+    /// I/O never runs while `state` is held. `None` if there's nothing
+    /// buffered (matches the prior single-function early return).
+    fn take_flush_snapshot_in(
+        state: &mut NamespaceState,
+    ) -> Option<(Vec<Document>, SegmentId, Bm25Params)> {
+        let buf = state.buffer.as_mut()?;
+        if buf.documents.is_empty() {
+            return None;
+        }
+        let docs = std::mem::take(&mut buf.documents);
+        let seg_id = SegmentId(format!(
+            "{}-{:06x}",
+            buf.namespace.0.replace('/', "_"),
+            buf.segment_counter
+        ));
+        buf.segment_counter += 1;
+        let bm25_params = buf.bm25_params.clone();
+        Some((docs, seg_id, bm25_params))
+    }
+
+    /// Synchronous flush used only by callers already holding `state` for
+    /// other bookkeeping in the same critical section (`rewrite_documents`,
+    /// `append_documents_in`) — see `flush_namespace`'s doc comment. Unlike
+    /// `flush_namespace`, this holds `state` across the segment-write I/O;
+    /// not fixed here, tracked as a known follow-up in issue #176.
     fn flush_namespace_in(
         state: &mut NamespaceState,
         namespace: &NamespaceId,
@@ -1446,6 +1532,57 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].fields[0].value, "second");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for issue #176: `flush_namespace` used to hold
+    /// `state` for the entire segment-write I/O duration, so
+    /// `index_documents` (cheap bookkeeping — buffer append, WAL append,
+    /// upsert checks) for the same namespace queued up behind whatever
+    /// flush's disk I/O currently held the lock. Under bursty small-batch
+    /// writes (confirmed live: the identical `/flush` call took anywhere
+    /// from 0.7s to >20s back-to-back with no other change) this produced
+    /// unbounded tail latency.
+    ///
+    /// `flush_io` is the lock meant to carry that I/O cost instead of
+    /// `state`. Assert directly, not by timing (flaky): holding `flush_io`
+    /// — simulating another flush's segment write in progress — must not
+    /// block a concurrent `index_documents` call for the same namespace.
+    #[test]
+    fn flush_io_lock_does_not_block_concurrent_state_access() {
+        let dir = std::env::temp_dir().join("kosha-test-flush-io-independent");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let idx = std::sync::Arc::new(Indexer::new(dir.clone()));
+
+        let handle = idx.ns_handle(&ns);
+        let _io_guard = handle.flush_io.lock().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let idx2 = idx.clone();
+        let ns2 = ns.clone();
+        std::thread::spawn(move || {
+            idx2.index_documents(
+                ns2,
+                vec![Document {
+                    id: DocumentId("d1".into()),
+                    fields: vec![Field::text("title", "hello")],
+                }],
+            )
+            .unwrap();
+            tx.send(()).unwrap();
+        });
+
+        // If index_documents were blocked on flush_io (the pre-fix
+        // behavior), this would hang until the test harness's own timeout —
+        // 2s is generous slack for a call that should complete in
+        // microseconds when the locks are actually independent.
+        rx.recv_timeout(std::time::Duration::from_secs(2)).expect(
+            "index_documents blocked on flush_io — state and flush_io must \
+             be independent locks, see issue #176",
+        );
+
+        drop(_io_guard);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
