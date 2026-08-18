@@ -7,7 +7,7 @@ pub use compaction::{
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use kosha_core::{
     Bm25Params, Document, DocumentId, FilterClause, FilterStore, KoshaError, Manifest,
@@ -54,6 +54,21 @@ impl NamespaceState {
     }
 }
 
+/// Singleflight coordinator for `flush_namespace` — see its doc comment.
+/// `generation` counts completed rounds (a "round" is one leader's full
+/// snapshot -> I/O -> commit cycle, possibly repeated in place if `pending`
+/// was set partway through); waiters block on `NamespaceHandle::flush_done`
+/// until it advances past the value they observed.
+struct FlushCoord {
+    in_progress: bool,
+    pending: bool,
+    generation: u64,
+    /// Set (alongside bumping `generation`) if the round that just finished
+    /// failed, so waiters who piggybacked on it know not to treat it as a
+    /// silent success. Cleared at the start of the next round.
+    last_round_error: Option<String>,
+}
+
 struct NamespaceHandle {
     state: Mutex<NamespaceState>,
     /// At most one compaction in flight per namespace. Held across merge I/O
@@ -70,6 +85,22 @@ struct NamespaceHandle {
     /// `/flush` call took anywhere from 0.7s to >20s back-to-back with no
     /// other change. See issue #176.
     flush_io: Mutex<()>,
+    /// Coalescing on top of `flush_io`: `flush_io` only stops flushes from
+    /// blocking `state`, it doesn't stop N concurrent small flush calls from
+    /// each paying their own full segment-write I/O cost, serialized one
+    /// after another. `kosha_client.bulk()` calls `/flush` after *every*
+    /// single `bulk()` call, so bursty small-batch writes (the shadow-write
+    /// mirror under real document-upload traffic, or any real-time ingestion
+    /// workload) turn into exactly that pattern — confirmed live even after
+    /// the `flush_io` fix: 14 flush timeouts in 2 minutes under sustained
+    /// concurrent writes to one namespace (see #176/#177 follow-up
+    /// discussion). `flush_coord`/`flush_done` implement a singleflight
+    /// pattern: while one round is running, later callers don't start their
+    /// own — they mark `pending` and wait for the current leader's
+    /// guaranteed extra pass (see `flush_namespace`) instead of each doing a
+    /// dedicated `SegmentWriter` cycle for their own tiny batch.
+    flush_coord: Mutex<FlushCoord>,
+    flush_done: Condvar,
 }
 
 /// Thread-safe indexer with per-namespace isolation (DESIGN.md §7.1).
@@ -156,6 +187,13 @@ impl Indexer {
                     state: Mutex::new(NamespaceState::new()),
                     compact: Mutex::new(()),
                     flush_io: Mutex::new(()),
+                    flush_coord: Mutex::new(FlushCoord {
+                        in_progress: false,
+                        pending: false,
+                        generation: 0,
+                        last_round_error: None,
+                    }),
+                    flush_done: Condvar::new(),
                 })
             })
             .clone()
@@ -586,22 +624,87 @@ impl Indexer {
         }))
     }
 
-    /// Flush whatever's buffered for `namespace` into a new segment.
+    /// Flush whatever's buffered for `namespace` into a new segment(s).
     ///
-    /// Three phases, only the first and last of which hold `state` — see
-    /// `NamespaceHandle::flush_io`'s doc comment for why. This is the public
-    /// entry point (the `/flush` handler and `index_documents`'s
-    /// auto-flush-on-threshold both call it); `rewrite_documents`'s internal
-    /// auto-flush still uses the synchronous `flush_namespace_in` below,
-    /// since it's already deep inside a `state`-locked critical section
-    /// doing other bookkeeping — see issue #176 for that as a known,
-    /// separate follow-up.
+    /// Singleflight-coordinated (`NamespaceHandle::flush_coord`/`flush_done`
+    /// — see their doc comments for why this exists on top of `flush_io`).
+    /// Only one caller at a time actually runs a flush pass
+    /// (`run_one_flush_pass`); everyone else who calls this while a pass is
+    /// running marks `pending` and waits — the running leader, before
+    /// declaring itself done, checks `pending` and runs one more pass in
+    /// place if it's set. Since each pass's own snapshot picks up
+    /// *everything* currently buffered, a `pending` flag set at any point
+    /// during a pass is guaranteed to be covered by that pass's own
+    /// follow-up, without the waiter needing a dedicated `SegmentWriter`
+    /// cycle for what might be a handful of documents.
+    ///
+    /// This is the public entry point (the `/flush` handler and
+    /// `index_documents`'s auto-flush-on-threshold both call it);
+    /// `rewrite_documents`'s internal auto-flush still uses the synchronous
+    /// `flush_namespace_in` below, since it's already deep inside a
+    /// `state`-locked critical section doing other bookkeeping — see issue
+    /// #176 for that as a known, separate follow-up.
     pub fn flush_namespace(&self, namespace: &NamespaceId) -> Result<(), KoshaError> {
         let handle = self.ns_handle(namespace);
 
+        // Become the leader for this round, or piggyback on whoever's
+        // already running one.
+        {
+            let mut coord = handle.flush_coord.lock().unwrap();
+            if coord.in_progress {
+                coord.pending = true;
+                let target_gen = coord.generation;
+                let coord = handle
+                    .flush_done
+                    .wait_while(coord, |c| c.generation <= target_gen)
+                    .unwrap();
+                // The round we piggybacked on might have failed -- we can't
+                // just claim success on its behalf. KoshaError isn't Clone,
+                // so reconstruct an equivalent I/O error from its message
+                // rather than silently swallowing the failure.
+                return match &coord.last_round_error {
+                    None => Ok(()),
+                    Some(msg) => Err(KoshaError::Io(std::io::Error::other(format!(
+                        "flush failed for a coalesced round: {msg}"
+                    )))),
+                };
+            }
+            coord.in_progress = true;
+        }
+
+        // Leader: keep running passes until nobody asked for another one
+        // while we worked.
+        loop {
+            let result = self.run_one_flush_pass(namespace, &handle);
+
+            let mut coord = handle.flush_coord.lock().unwrap();
+            if result.is_ok() && coord.pending {
+                coord.pending = false;
+                drop(coord);
+                continue;
+            }
+            coord.in_progress = false;
+            coord.pending = false;
+            coord.generation += 1;
+            coord.last_round_error = result.as_ref().err().map(|e| e.to_string());
+            drop(coord);
+            handle.flush_done.notify_all();
+            return result;
+        }
+    }
+
+    /// One leader's snapshot -> segment-write I/O -> manifest-commit cycle
+    /// -- the unit of work `flush_namespace`'s singleflight loop repeats as
+    /// needed. Only ever called by the current `flush_coord` leader; not
+    /// meant to run concurrently with itself for one namespace.
+    fn run_one_flush_pass(
+        &self,
+        namespace: &NamespaceId,
+        handle: &NamespaceHandle,
+    ) -> Result<(), KoshaError> {
         // Phase 1 (state locked, cheap): snapshot whatever's buffered.
-        // Released immediately after — concurrent index_documents/flush
-        // calls for this namespace stay unblocked while phase 2 runs.
+        // Released immediately after — concurrent index_documents calls for
+        // this namespace stay unblocked while phase 2 runs.
         let snapshot = {
             let mut state = handle.state.lock().unwrap();
             Self::take_flush_snapshot_in(&mut state)
@@ -611,9 +714,11 @@ impl Indexer {
         };
 
         // Phase 2 (flush_io locked, state free): the actual segment write.
-        // Still serialized against other flushes for this namespace (segment
-        // files and the WAL-clear below stay ordered), but no longer blocks
-        // index_documents's cheap state access while it runs.
+        // Still serialized against other passes for this namespace (segment
+        // files and the WAL-clear below stay ordered) -- singleflight above
+        // already ensures there's at most one pass running per namespace at
+        // a time, so this is really just documenting that invariant, not
+        // adding a second layer of contention.
         let footer = {
             let _io_guard = handle.flush_io.lock().unwrap();
             let seg_dir = self.data_dir.join(&namespace.0).join(seg_id.0.as_str());
@@ -1583,6 +1688,137 @@ mod tests {
         );
 
         drop(_io_guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for the follow-up to #176/#177: `flush_io` alone
+    /// stops one flush's I/O from blocking `state`, but doesn't stop N
+    /// concurrent `flush_namespace` calls from each paying their own full
+    /// `SegmentWriter` I/O cost, serialized one after another —
+    /// `kosha_client.bulk()` calls `/flush` after every single `bulk()`
+    /// call, so this is exactly the pattern real bursty small-batch writes
+    /// produce. Confirmed live even after #177: 14 flush timeouts in 2
+    /// minutes under sustained concurrent writes to one namespace.
+    ///
+    /// Proves the singleflight coordinator actually coalesces: many threads
+    /// each add one document and call `flush_namespace` concurrently
+    /// (barrier-synchronized to maximize overlap) — asserts (a) every
+    /// document is durably present afterward (coalescing must not lose
+    /// data) and (b) the number of segments created is far smaller than the
+    /// number of flush calls (coalescing must actually reduce I/O, not just
+    /// avoid blocking `state`).
+    #[test]
+    fn concurrent_flush_calls_coalesce_into_fewer_segment_writes() {
+        let dir = std::env::temp_dir().join("kosha-test-flush-coalescing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let idx = std::sync::Arc::new(Indexer::new(dir.clone()));
+
+        const N: usize = 40;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let idx = idx.clone();
+                let ns = ns.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    idx.index_documents(
+                        ns.clone(),
+                        vec![Document {
+                            id: DocumentId(format!("d{i}")),
+                            fields: vec![Field::text("title", "hello")],
+                        }],
+                    )
+                    .unwrap();
+                    barrier.wait(); // maximize concurrent flush_namespace overlap
+                    idx.flush_namespace(&ns).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let manifest = idx.manifest(&ns).unwrap().clone();
+        let total_docs: u32 = manifest.segments.iter().map(|s| s.doc_count).sum();
+        assert_eq!(
+            total_docs,
+            N as u32,
+            "coalescing must not lose documents — expected {N}, found {total_docs} \
+             across {} segment(s)",
+            manifest.segments.len()
+        );
+        assert!(
+            manifest.segments.len() < N / 2,
+            "expected coalescing to produce far fewer than {N} segments for {N} \
+             concurrent flush calls, got {} — singleflight isn't actually \
+             coalescing overlapping requests",
+            manifest.segments.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `flush_namespace` call that piggybacks on another thread's
+    /// in-flight round (rather than becoming the leader itself) must still
+    /// only return once its own data is durable — not the instant it
+    /// observes `in_progress`. Exercises the actual piggyback branch
+    /// directly (deterministic, not relying on scheduler timing) by holding
+    /// `flush_coord` in the "in progress" state on the test thread while a
+    /// second thread calls `flush_namespace`, then completing that round
+    /// from the test thread and confirming the waiter unblocks with the
+    /// data committed.
+    #[test]
+    fn piggybacked_flush_waits_for_the_leaders_round_to_actually_finish() {
+        let dir = std::env::temp_dir().join("kosha-test-flush-piggyback");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let idx = std::sync::Arc::new(Indexer::new(dir.clone()));
+
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("d1".into()),
+                fields: vec![Field::text("title", "hello")],
+            }],
+        )
+        .unwrap();
+
+        let handle = idx.ns_handle(&ns);
+        {
+            let mut coord = handle.flush_coord.lock().unwrap();
+            coord.in_progress = true;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let idx2 = idx.clone();
+        let ns2 = ns.clone();
+        std::thread::spawn(move || {
+            idx2.flush_namespace(&ns2).unwrap();
+            tx.send(()).unwrap();
+        });
+
+        // The waiter should be blocked (piggybacking), not returned yet —
+        // give it a moment to reach the wait, then confirm it hasn't
+        // finished prematurely.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            rx.try_recv().is_err(),
+            "flush_namespace returned before the round it piggybacked on \
+             actually completed"
+        );
+
+        // Now finish the "leader" round the test thread was simulating.
+        {
+            let mut coord = handle.flush_coord.lock().unwrap();
+            coord.in_progress = false;
+            coord.generation += 1;
+        }
+        handle.flush_done.notify_all();
+
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("piggybacked flush_namespace never returned after its round finished");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
