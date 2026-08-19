@@ -91,11 +91,15 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
     format!("{tenant}/{namespace}")
 }
 
+#[cfg(feature = "s3")]
+mod hydration_budget;
 #[cfg(feature = "migrate")]
 mod migrate;
 #[cfg(feature = "s3")]
 mod s3_storage;
 
+#[cfg(feature = "s3")]
+use hydration_budget::{HydrationBudget, RequestHydration};
 use kosha_cache::Cache;
 #[cfg(feature = "s3")]
 use kosha_core::StorageBackend;
@@ -127,12 +131,31 @@ struct AppState {
     /// (`KOSHA_HYDRATE_CONCURRENCY`, default 16). See `ensure_segments_local`.
     #[cfg(feature = "s3")]
     hydrate_concurrency: usize,
-    /// Byte ceiling on how much a single hydration batch will queue for
-    /// concurrent S3 download at once (`KOSHA_HYDRATE_BYTE_BUDGET`, default
-    /// 1GiB). Unlike `hydrate_concurrency` (file count), this bounds actual
-    /// memory — see `hydrate_from_s3_budgeted`/`chunk_by_byte_budget`.
+    /// Byte ceiling on hydration volume in flight at once
+    /// (`KOSHA_HYDRATE_BYTE_BUDGET`, default 1GiB). Unlike
+    /// `hydrate_concurrency` (file count), this bounds volume — applied two
+    /// ways, because the two hydration paths learn file sizes at different
+    /// times:
+    ///   * pre-GET, by `chunk_by_byte_budget` in `hydrate_from_s3_budgeted`,
+    ///     wherever a `list_with_sizes` already supplied sizes (the
+    ///     full-segment path);
+    ///   * post-send, by `hydration_budget`, from each response's
+    ///     `Content-Length` — the only option on the scoring path, which
+    ///     skips the per-segment LIST on purpose and so passes size `0` for
+    ///     every file.
     #[cfg(feature = "s3")]
     hydrate_byte_budget: u64,
+    /// Process-wide in-flight byte gate shared by every hydration fetch —
+    /// see [`hydration_budget`]. Capacity is `hydrate_byte_budget`.
+    #[cfg(feature = "s3")]
+    hydration_budget: Arc<HydrationBudget>,
+    /// Ceiling on the bytes one search request may hydrate before it is shed
+    /// with a 429 (`KOSHA_HYDRATE_REQUEST_MAX_BYTES`, default 2GiB). A cold
+    /// search that would pull multiple GB is not a search that will finish
+    /// inside anyone's client timeout; failing it fast beats grinding
+    /// through the fetch while holding a hydration permit.
+    #[cfg(feature = "s3")]
+    hydrate_request_max_bytes: u64,
     /// GET fan-out for known-small-file hydration — the scoring set,
     /// footer prefetch, and page doc stores (`ensure_scoring_files_local`
     /// / `ensure_files_local`). Separate from `hydrate_concurrency`
@@ -537,6 +560,19 @@ struct HydrationOutcome {
     /// against only that same stale subset forever (not self-healing —
     /// only a pod restart, which drops the cache, recovered it).
     bloom_pruned: bool,
+    /// `true` when this request hit its hydration byte ceiling
+    /// (`KOSHA_HYDRATE_REQUEST_MAX_BYTES`) or waited out the process-wide
+    /// in-flight byte budget, and stopped fetching on purpose.
+    ///
+    /// `missing` is populated either way — the files really aren't local —
+    /// but the distinction matters to the client: a shed is load-shedding
+    /// (HTTP 429, retry with backoff, the same contract
+    /// `Semaphore::acquire_or_shed` and `kosha_query::MemoryLedger` already
+    /// use), whereas a non-shed `missing` is a genuine S3 failure (HTTP
+    /// 503). Reporting a shed as a 503 would tell a caller its data is
+    /// broken when the server merely declined to pull multiple GB inside
+    /// one request.
+    shed: bool,
 }
 
 /// Cached verdict for `completed_hydrations`: NOT a single "namespace is
@@ -1193,6 +1229,16 @@ impl AppState {
             );
         }
 
+        // Resolved once: it is both the per-batch pre-GET chunk size and the
+        // capacity of the process-wide in-flight gate (see the field docs on
+        // `hydrate_byte_budget`).
+        #[cfg(feature = "s3")]
+        let hydrate_byte_budget = std::env::var("KOSHA_HYDRATE_BYTE_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(1024 * 1024 * 1024);
+
         Self {
             controller: Mutex::new(control_store),
             indexer,
@@ -1208,17 +1254,25 @@ impl AppState {
                 .and_then(|v| v.parse().ok())
                 .filter(|n| *n > 0)
                 .unwrap_or(16),
-            // 1GiB default: with the default KOSHA_MAX_CONCURRENT_HYDRATIONS
-            // (4), worst case is 4 owner batches × 1GiB = 4GiB of hydration
-            // buffers at once — comfortable inside the query pod's 16Gi
-            // limit (deployment-query-resources-patch.yaml) alongside
-            // KOSHA_SEGMENT_CACHE_MAX_BYTES and process baseline.
+            // 1GiB default. Process-wide, not per-batch:
+            // KOSHA_MAX_CONCURRENT_HYDRATIONS batches all reserve against
+            // the same `hydration_budget`, so adding hydration ops no longer
+            // multiplies the bound the way the pre-GET chunker alone did. (Process heap is bounded
+            // separately, and by construction: response bodies stream to
+            // disk — see `s3_storage::stream_body_to_file`.)
             #[cfg(feature = "s3")]
-            hydrate_byte_budget: std::env::var("KOSHA_HYDRATE_BYTE_BUDGET")
+            hydrate_byte_budget,
+            #[cfg(feature = "s3")]
+            hydration_budget: Arc::new(HydrationBudget::new(
+                hydrate_byte_budget,
+                hydration_budget::DEFAULT_BUDGET_WAIT,
+            )),
+            #[cfg(feature = "s3")]
+            hydrate_request_max_bytes: std::env::var("KOSHA_HYDRATE_REQUEST_MAX_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|n| *n > 0)
-                .unwrap_or(1024 * 1024 * 1024),
+                .unwrap_or(hydration_budget::DEFAULT_REQUEST_MAX_BYTES),
             #[cfg(feature = "s3")]
             scoring_hydrate_concurrency: std::env::var("KOSHA_SCORING_HYDRATE_CONCURRENCY")
                 .ok()
@@ -1385,7 +1439,12 @@ impl AppState {
             let needs_filters = query_needs_filter_store(&query);
             let needs_vectors = query.knn.is_some();
             let t_ns = std::time::Instant::now();
-            let outcome = self.hydrate_segments_for_search(&ns, &manifest, &query);
+            let outcome = self.hydrate_segments_for_search(
+                &ns,
+                &manifest,
+                &query,
+                &RequestHydration::unlimited(),
+            );
             let _ = tombstones;
             let dur = t_ns.elapsed();
             // query.filter is always None above, so bloom_pruned is always
@@ -1458,8 +1517,13 @@ impl AppState {
                 let mut blob_bytes = 0u64;
                 let mut blob_missing = 0usize;
                 for chunk in seg_paths.chunks(8) {
-                    let o =
-                        self.ensure_posting_blobs_local(&ns, manifest.version, chunk, &all_blobs);
+                    let o = self.ensure_posting_blobs_local(
+                        &ns,
+                        manifest.version,
+                        chunk,
+                        &all_blobs,
+                        &RequestHydration::unlimited(),
+                    );
                     blob_files += o.files_fetched;
                     blob_bytes += o.bytes_fetched;
                     blob_missing += o.missing.len();
@@ -1496,15 +1560,21 @@ impl AppState {
                 // 100% of queries 503'd). Prefetching here moves that cost
                 // into the readiness gate, batched like the blobs so the
                 // hydration semaphore is never held for the whole namespace.
-                // Chunks of 2, not 8: the S3 fetch buffers each file's whole
-                // body in memory, and post-compaction doc stores are the
-                // largest files in a segment — two multi-GB bodies in flight
-                // is plenty.
+                // Chunks of 2, not 8: post-compaction doc stores are the
+                // largest files in a segment, and a fat batch of them holds
+                // the hydration permit (and a large slice of the in-flight
+                // byte budget) away from live queries for its whole
+                // duration. This used to be a heap constraint as well — the
+                // fetch buffered each body whole — which streaming to disk
+                // has removed, so whether 2 is still the right number is now
+                // a throughput question to measure, not a memory one.
                 let t_ds = std::time::Instant::now();
                 let mut ds_files = 0usize;
                 let mut ds_bytes = 0u64;
+                let warmup_request = RequestHydration::unlimited();
                 for chunk in seg_paths.chunks(2) {
-                    let (files, bytes) = self.ensure_files_local(chunk, "doc_store.bin");
+                    let (files, bytes) =
+                        self.ensure_files_local(chunk, "doc_store.bin", &warmup_request);
                     ds_files += files;
                     ds_bytes += bytes;
                 }
@@ -1547,14 +1617,16 @@ impl AppState {
                 let mut vec_files = 0usize;
                 let mut vec_bytes = 0u64;
                 for chunk in seg_paths.chunks(8) {
-                    let (files, bytes) = self.ensure_files_local(chunk, "vector.offsets");
+                    let (files, bytes) =
+                        self.ensure_files_local(chunk, "vector.offsets", &warmup_request);
                     vec_files += files;
                     vec_bytes += bytes;
                 }
-                // Same chunks-of-2 as doc stores: vector.idx bodies are
-                // buffered whole in memory during fetch.
+                // Same chunks-of-2 as doc stores, for the same
+                // permit-fairness reason.
                 for chunk in seg_paths.chunks(2) {
-                    let (files, bytes) = self.ensure_files_local(chunk, "vector.idx");
+                    let (files, bytes) =
+                        self.ensure_files_local(chunk, "vector.idx", &warmup_request);
                     vec_files += files;
                     vec_bytes += bytes;
                 }
@@ -1769,6 +1841,12 @@ impl AppState {
             return HydrationOutcome::default();
         };
 
+        // Full-segment hydration serves index/replace/compact/admin work,
+        // not a user-facing search: a partial fetch there is worse than a
+        // slow one, so these never shed on a byte ceiling. They still
+        // reserve against the process-wide in-flight budget.
+        let request = RequestHydration::unlimited();
+
         let mut outcome = HydrationOutcome::default();
         let (owned, waiting) = partition_for_hydration(
             &self.in_flight_segments,
@@ -1822,7 +1900,7 @@ impl AppState {
                 // replicas when the lease store is configured. Full-segment
                 // fetches keep the conservative fan-out — batches here can
                 // include multi-hundred-MB doc stores.
-                self.hydrate_files(s3, &logical_paths, self.hydrate_concurrency);
+                self.hydrate_files(s3, &logical_paths, self.hydrate_concurrency, &request);
             }
 
             drop(_permit);
@@ -1841,38 +1919,61 @@ impl AppState {
     }
 
     /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs from
-    /// S3, chunked so no single `read_many` call is ever asked to hold more
-    /// than `hydrate_byte_budget` bytes' worth of files concurrently
-    /// in-flight.
+    /// S3, chunked so no single `read_many` call is ever asked to queue more
+    /// than `hydrate_byte_budget` bytes' worth of files at once.
     ///
     /// `hydrate_concurrency` alone bounds *file count* in flight, not
-    /// memory — a batch of `hydrate_concurrency` (default 16) large HNSW
+    /// volume — a batch of `hydrate_concurrency` (default 16) large HNSW
     /// vector files is a very different footprint than 16 footer.jsons, and
     /// nothing before this compared a batch's actual byte size against the
-    /// pod's memory before firing it off. Sizes come from `list_with_sizes`'
-    /// S3-reported object sizes, projected ahead of any fetch — this is the
-    /// one dimension none of the other hydration knobs
-    /// (`KOSHA_HYDRATE_CONCURRENCY`, `KOSHA_MAX_CONCURRENT_HYDRATIONS`) or
-    /// cache knobs (`KOSHA_CACHE_MAX_BYTES`, `KOSHA_SEGMENT_CACHE_MAX_BYTES`)
-    /// bound.
+    /// pod's capacity before firing it off. Sizes come from
+    /// `list_with_sizes`' S3-reported object sizes, projected ahead of any
+    /// fetch.
+    ///
+    /// That projection is only available where the caller already paid for a
+    /// LIST. Callers that deliberately skip it (`ensure_scoring_files_local`
+    /// and `ensure_files_local`, which know their file names a priori) pass
+    /// size `0`, so this chunker cannot bound them at all — every one of
+    /// their files lands in a single chunk. `request` and the process-wide
+    /// `hydration_budget` are what cover that case, from the `Content-Length`
+    /// each GET response carries; see [`hydration_budget`].
     #[cfg(feature = "s3")]
     fn hydrate_from_s3_budgeted(
         &self,
         s3: &s3_storage::S3Storage,
         files: &[(String, u64)],
         concurrency: usize,
+        request: &Arc<RequestHydration>,
     ) {
         let chunks = chunk_by_byte_budget(files, self.hydrate_byte_budget);
         let total_chunks = chunks.len();
         for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+            // A request that blew its byte ceiling mid-batch stops here
+            // rather than working through the remaining chunks it has
+            // already decided not to serve.
+            if request.is_shed() {
+                println!(
+                    "hydrate_files shed: stopped at chunk {}/{} after {:.1}MB \
+                     (KOSHA_HYDRATE_REQUEST_MAX_BYTES)",
+                    chunk_idx + 1,
+                    total_chunks,
+                    request.fetched_bytes() as f64 / (1024.0 * 1024.0),
+                );
+                break;
+            }
             let paths: Vec<String> = chunk.into_iter().map(|(path, _size)| path).collect();
             let t_chunk = Instant::now();
-            let results = s3.read_many(&paths, concurrency);
+            let results = s3.read_many(&paths, concurrency, Some(&self.hydration_budget), request);
             // Aggregate per-file timing into the cold-read "next lever"
             // instrument (plan Tier 1 O13): rank-orders GET vs write vs
             // fan-out so the *next* change (raise concurrency vs skip bytes
             // vs reduce writes) is chosen from data, not guess. `cached`
             // files (already local) and failures are tracked separately.
+            // `budget_wait_ms` is the exception to the per-chunk framing —
+            // it is the *request's* cumulative wait on the in-flight byte
+            // budget so far, which is the figure worth reading when asking
+            // whether `KOSHA_HYDRATE_BYTE_BUDGET` is the thing throttling
+            // cold search.
             let mut fetched = 0u64;
             let mut bytes = 0u64;
             let mut get_sum = 0.0f64;
@@ -1880,6 +1981,7 @@ impl AppState {
             let mut get_max = 0.0f64;
             let mut cached = 0u64;
             let mut failed = 0u64;
+            let mut shed = 0u64;
             for (path, result) in &results {
                 match result {
                     Ok(stats) => {
@@ -1896,6 +1998,13 @@ impl AppState {
                         }
                         self.cache.note_external_write(path);
                     }
+                    // A shed is a deliberate admission decision, not a
+                    // download failure — counting it as one would turn one
+                    // over-budget request into hundreds of WARN lines and
+                    // hide real S3 errors in the noise.
+                    Err(KoshaError::Overloaded(_)) => {
+                        shed += 1;
+                    }
                     Err(e) => {
                         failed += 1;
                         eprintln!("WARN: S3 download failed for {path}: {e}");
@@ -1904,18 +2013,21 @@ impl AppState {
             }
             let wall_ms = t_chunk.elapsed().as_secs_f64() * 1e3;
             println!(
-                "hydrate_files timing: chunk={}/{} fetched={} cached={} failed={} \
-                 bytes={:.1}MB wall_ms={:.1} get_ms={:.1}(max={:.1}) write_ms={:.1} concurrency={}",
+                "hydrate_files timing: chunk={}/{} fetched={} cached={} failed={} shed={} \
+                 bytes={:.1}MB wall_ms={:.1} get_ms={:.1}(max={:.1}) write_ms={:.1} \
+                 budget_wait_ms={:.1} concurrency={}",
                 chunk_idx + 1,
                 total_chunks,
                 fetched,
                 cached,
                 failed,
+                shed,
                 bytes as f64 / (1024.0 * 1024.0),
                 wall_ms,
                 get_sum,
                 get_max,
                 write_sum,
+                request.wait_ms(),
                 concurrency,
             );
         }
@@ -1933,7 +2045,12 @@ impl AppState {
     #[cfg(feature = "s3")]
     /// Returns `(files_fetched, bytes_fetched)` — already-local files cost
     /// nothing and aren't counted.
-    fn ensure_files_local(&self, seg_paths: &[PathBuf], file_name: &str) -> (usize, u64) {
+    fn ensure_files_local(
+        &self,
+        seg_paths: &[PathBuf],
+        file_name: &str,
+        request: &Arc<RequestHydration>,
+    ) -> (usize, u64) {
         let Some(ref s3) = self.s3_storage else {
             return (0, 0);
         };
@@ -1955,7 +2072,12 @@ impl AppState {
         if logical_paths.is_empty() {
             return (0, 0);
         }
-        self.hydrate_files(s3, &logical_paths, self.scoring_hydrate_concurrency);
+        self.hydrate_files(
+            s3,
+            &logical_paths,
+            self.scoring_hydrate_concurrency,
+            request,
+        );
         // Bytes counted post-fetch from local metadata (sizes weren't known
         // up front); already-local files were filtered out above so this
         // counts only what this call actually moved.
@@ -1994,6 +2116,7 @@ impl AppState {
         s3: &s3_storage::S3Storage,
         files: &[(String, u64)],
         concurrency: usize,
+        request: &Arc<RequestHydration>,
     ) {
         if files.is_empty() {
             return;
@@ -2004,14 +2127,14 @@ impl AppState {
         #[cfg(feature = "postgres")]
         {
             if let (Some(leases), Some(own_addr)) = (&self.hydration_leases, &self.own_addr) {
-                self.hydrate_files_coordinated(s3, files, leases, own_addr, concurrency);
+                self.hydrate_files_coordinated(s3, files, leases, own_addr, concurrency, request);
                 for (path, _) in files {
                     self.cache.unpin(path);
                 }
                 return;
             }
         }
-        self.hydrate_from_s3_budgeted(s3, files, concurrency);
+        self.hydrate_from_s3_budgeted(s3, files, concurrency, request);
         for (path, _) in files {
             self.cache.unpin(path);
         }
@@ -2030,6 +2153,7 @@ impl AppState {
         leases: &kosha_control::HydrationLeaseStore,
         own_addr: &str,
         concurrency: usize,
+        request: &Arc<RequestHydration>,
     ) {
         // Comfortably longer than a single-file S3 GET + local write should
         // ever take, so a lease only outlives its owner when that owner has
@@ -2049,6 +2173,14 @@ impl AppState {
                 kosha_control::HydrationLease::OwnedBy(peer_addr) => {
                     match self.fetch_from_peer(&peer_addr, path) {
                         Ok(bytes) => {
+                            // Peer-fetched bytes are hydration too — charge
+                            // them so a request can't route around its
+                            // ceiling just because another replica happened
+                            // to own the lease. (`fetch_from_peer` buffers
+                            // the file whole; making *that* stream needs a
+                            // raw-bytes response path on
+                            // `GET /internal/segment`, tracked separately.)
+                            request.charge(bytes.len() as u64);
                             if let Err(e) = self.cache.put_bytes(path, &bytes) {
                                 eprintln!(
                                     "WARN: failed to persist peer-fetched {path} from \
@@ -2070,7 +2202,7 @@ impl AppState {
 
         // Owned (plus peer-fallback) paths go straight to S3, through the
         // same byte-budgeted chunking as uncoordinated hydration.
-        self.hydrate_from_s3_budgeted(s3, &fetch_from_s3, concurrency);
+        self.hydrate_from_s3_budgeted(s3, &fetch_from_s3, concurrency, request);
 
         // Release only after our own fetch attempt is done (success or
         // failure) — releasing earlier could let a waiter's peer-fetch land
@@ -2161,6 +2293,7 @@ impl AppState {
         ns: &NamespaceId,
         manifest: &kosha_core::Manifest,
         query: &SearchQuery,
+        request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
         let term_prune = term_bloom_prune_for_query(query);
         let needs_bloom_check = query.filter.is_some() || term_prune.is_some();
@@ -2191,7 +2324,7 @@ impl AppState {
         // manifests fall back to hydrating footer.json for pruning and
         // format detection.
         let (footer_files, footer_bytes) =
-            self.ensure_files_local(&missing_manifest_footer_paths, "footer.json");
+            self.ensure_files_local(&missing_manifest_footer_paths, "footer.json", request);
 
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
@@ -2220,9 +2353,15 @@ impl AppState {
             needs_vectors,
             needs_filters,
             &paths_with_manifest_footer,
+            request,
         );
-        let postings_outcome =
-            self.ensure_posting_blobs_local(ns, manifest.version, &to_hydrate, &posting_files);
+        let postings_outcome = self.ensure_posting_blobs_local(
+            ns,
+            manifest.version,
+            &to_hydrate,
+            &posting_files,
+            request,
+        );
         outcome.files_fetched += postings_outcome.files_fetched;
         outcome.bytes_fetched += postings_outcome.bytes_fetched;
         outcome.missing.extend(postings_outcome.missing);
@@ -2235,6 +2374,11 @@ impl AppState {
         // treat this outcome as proof the whole namespace is hydrated; see
         // `HydrationOutcome::bloom_pruned`.
         outcome.bloom_pruned = needs_bloom_check;
+        // A shed request's `missing` list is real (those files genuinely
+        // aren't local), but the caller must not report it as a hydration
+        // *failure* — nothing failed, the request declined to pull that
+        // much. See `HydrationOutcome::shed`.
+        outcome.shed = request.is_shed();
         outcome
     }
 
@@ -2305,6 +2449,7 @@ impl AppState {
         needs_vectors: bool,
         needs_filters: bool,
         paths_with_manifest_footer: &std::collections::HashSet<PathBuf>,
+        request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
             return HydrationOutcome::default();
@@ -2325,9 +2470,17 @@ impl AppState {
 
             // Sizes are unknown without a per-segment LIST round trip —
             // avoiding that round trip is half the point of this path (file
-            // names are known a priori). 0 sizes mean the byte budget can't
-            // chunk the batch, which is acceptable: the scoring set
-            // excludes the bulk doc stores, so per-file sizes are small.
+            // names are known a priori). 0 sizes mean `chunk_by_byte_budget`
+            // cannot chunk this batch at all: every file below lands in one
+            // chunk, fanned out `scoring_hydrate_concurrency` (64) wide.
+            //
+            // That used to be waved off as "the scoring set excludes the
+            // bulk doc stores, so per-file sizes are small." It isn't:
+            // `inverted.idx` grows with a segment's vocabulary, and one cold
+            // search on staging pulled 177 files / 4,974 MB through here
+            // (~28 MB average) in a single chunk. Volume on this path is
+            // instead bounded by `hydration_budget`, from each response's
+            // `Content-Length` — see the `hydrate_byte_budget` field docs.
             let mut logical_paths: Vec<(String, u64)> = Vec::new();
             for (seg_path, _) in &owned {
                 let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
@@ -2406,7 +2559,12 @@ impl AppState {
                     owned.len(),
                     self.scoring_hydrate_concurrency
                 );
-                self.hydrate_files(s3, &logical_paths, self.scoring_hydrate_concurrency);
+                self.hydrate_files(
+                    s3,
+                    &logical_paths,
+                    self.scoring_hydrate_concurrency,
+                    request,
+                );
                 // Bytes counted post-fetch (sizes weren't known up front);
                 // every path here was absent before the fetch, so this
                 // counts only what this call actually moved.
@@ -2452,6 +2610,7 @@ impl AppState {
         ns: &NamespaceId,
         manifest: &kosha_core::Manifest,
         query: &SearchQuery,
+        request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
         let posting_files = posting_blob_files_for_query(query);
         if posting_files.is_empty() {
@@ -2462,7 +2621,7 @@ impl AppState {
             .iter()
             .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
             .collect();
-        self.ensure_posting_blobs_local(ns, manifest.version, &seg_paths, &posting_files)
+        self.ensure_posting_blobs_local(ns, manifest.version, &seg_paths, &posting_files, request)
     }
 
     #[cfg(feature = "s3")]
@@ -2472,6 +2631,7 @@ impl AppState {
         manifest_version: u64,
         seg_paths: &[PathBuf],
         posting_files: &[String],
+        request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
             return HydrationOutcome::default();
@@ -2513,7 +2673,12 @@ impl AppState {
                 seg_paths.len(),
                 self.scoring_hydrate_concurrency
             );
-            self.hydrate_files(s3, &logical_paths, self.scoring_hydrate_concurrency);
+            self.hydrate_files(
+                s3,
+                &logical_paths,
+                self.scoring_hydrate_concurrency,
+                request,
+            );
         }
 
         // Post-fetch verification only needs to re-stat what we actually
@@ -2554,6 +2719,10 @@ impl AppState {
             );
         }
 
+        // Set here as well as in `hydrate_segments_for_search`: on a warm
+        // namespace the cached hydration verdict routes a query straight to
+        // this function, and its outcome is the only one the handler sees.
+        outcome.shed = request.is_shed();
         outcome
     }
 
@@ -3587,6 +3756,12 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         }
     }
 
+    // One accountant for everything this request hydrates — footer prefetch,
+    // scoring set, posting blobs, and the page's doc stores all share it, so
+    // the ceiling covers the request's whole cost rather than each batch's.
+    // See `hydration_budget`.
+    #[cfg(feature = "s3")]
+    let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
     // Footer-first hydrate: bloom-prune before downloading full segments.
     let t_hydrate = Instant::now();
     #[cfg(feature = "s3")]
@@ -3626,9 +3801,10 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             // shards as zero hits (non-deterministically per pod). It is
             // sub-ms when the shards are already local: one metadata stat
             // per term-shard per split segment.
-            state.ensure_query_posting_blobs(&ns, &manifest, &query)
+            state.ensure_query_posting_blobs(&ns, &manifest, &query, &hydration_request)
         } else {
-            let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
+            let outcome =
+                state.hydrate_segments_for_search(&ns, &manifest, &query, &hydration_request);
             // Cache what this pass verified: the static scoring set is
             // local for this manifest version, so future warm queries with
             // matching-or-lesser needs skip the per-segment static checks
@@ -3662,8 +3838,8 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             }
             outcome
         };
-        if !outcome.missing.is_empty() {
-            return json_error(503, &hydration_failed_message(&outcome.missing));
+        if let Some(error) = hydration_error_response(&outcome) {
+            return error;
         }
         outcome
     };
@@ -3693,7 +3869,11 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // instead of re-paying N per-doc S3 ranged GETs every time.
     #[cfg(feature = "s3")]
     let ensure_doc_store = |segs: &[std::path::PathBuf]| {
-        let (files, bytes) = state.ensure_files_local(segs, "doc_store.bin");
+        // Same accountant as the scoring-set fetch above: the page's doc
+        // stores are hundreds of MB per segment and were previously outside
+        // every byte gate — the request pays for them, so the request's
+        // ceiling has to cover them.
+        let (files, bytes) = state.ensure_files_local(segs, "doc_store.bin", &hydration_request);
         if files > 0 {
             println!(
                 "page hydrate: fetched {files} doc store(s) ({:.1} MB)",
@@ -3752,6 +3932,13 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                     .unwrap()
                     .remove(&(ns.0.clone(), manifest.version));
                 state.posting_blob_presence.lock().unwrap().remove(&ns.0);
+                // A page-materialize fetch that crossed the request's byte
+                // ceiling leaves the doc store absent, which surfaces here
+                // as an IO error. It is a shed, not a fault — report it as
+                // one.
+                if hydration_request.is_shed() {
+                    return hydration_shed_response();
+                }
             }
             search_error_response(&e)
         }
@@ -3960,6 +4147,13 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         (m, t)
     };
 
+    // One accountant for everything this request hydrates — footer prefetch,
+    // scoring set, posting blobs, and the page's doc stores all share it, so
+    // the ceiling covers the request's whole cost rather than each batch's.
+    // See `hydration_budget`.
+    #[cfg(feature = "s3")]
+    let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
+
     let t_hydrate = Instant::now();
     #[cfg(feature = "s3")]
     let hydration = {
@@ -3979,9 +4173,10 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         let outcome = if cached_covers {
             // Posting blobs are per-query and outside the cached verdict —
             // see `handle_search_post` for the full rationale.
-            state.ensure_query_posting_blobs(&ns, &manifest, &query)
+            state.ensure_query_posting_blobs(&ns, &manifest, &query, &hydration_request)
         } else {
-            let outcome = state.hydrate_segments_for_search(&ns, &manifest, &query);
+            let outcome =
+                state.hydrate_segments_for_search(&ns, &manifest, &query, &hydration_request);
             // Only merge when unfiltered — see `HydrationOutcome::bloom_pruned`
             // and `handle_search_post` for the full rationale.
             if outcome.missing.is_empty() && !outcome.bloom_pruned {
@@ -3995,8 +4190,8 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
             }
             outcome
         };
-        if !outcome.missing.is_empty() {
-            return json_error(503, &hydration_failed_message(&outcome.missing));
+        if let Some(error) = hydration_error_response(&outcome) {
+            return error;
         }
         outcome
     };
@@ -4022,7 +4217,11 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     // `doc_store.bin` per page-segment on first miss, then local seeks).
     #[cfg(feature = "s3")]
     let ensure_doc_store = |segs: &[std::path::PathBuf]| {
-        let (files, bytes) = state.ensure_files_local(segs, "doc_store.bin");
+        // Same accountant as the scoring-set fetch above: the page's doc
+        // stores are hundreds of MB per segment and were previously outside
+        // every byte gate — the request pays for them, so the request's
+        // ceiling has to cover them.
+        let (files, bytes) = state.ensure_files_local(segs, "doc_store.bin", &hydration_request);
         if files > 0 {
             println!(
                 "page hydrate: fetched {files} doc store(s) ({:.1} MB)",
@@ -4059,11 +4258,20 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
             // that function for the rationale (a stale verdict could
             // cause the retry to also skip hydration and fail again).
             #[cfg(feature = "s3")]
-            state
-                .completed_hydrations
-                .lock()
-                .unwrap()
-                .remove(&(ns.0.clone(), manifest.version));
+            {
+                state
+                    .completed_hydrations
+                    .lock()
+                    .unwrap()
+                    .remove(&(ns.0.clone(), manifest.version));
+                // A page-materialize fetch that crossed the request's byte
+                // ceiling leaves the doc store absent, which surfaces here
+                // as an IO error. It is a shed, not a fault — report it as
+                // one.
+                if hydration_request.is_shed() {
+                    return hydration_shed_response();
+                }
+            }
             search_error_response(&e)
         }
     }
@@ -4340,8 +4548,17 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
             // evict processed segments while later ones stream in.
             #[cfg(feature = "s3")]
             {
-                state.ensure_files_local(std::slice::from_ref(&seg_path), "footer.json");
-                state.ensure_files_local(std::slice::from_ref(&seg_path), "doc_store.bin");
+                let backfill_request = RequestHydration::unlimited();
+                state.ensure_files_local(
+                    std::slice::from_ref(&seg_path),
+                    "footer.json",
+                    &backfill_request,
+                );
+                state.ensure_files_local(
+                    std::slice::from_ref(&seg_path),
+                    "doc_store.bin",
+                    &backfill_request,
+                );
             }
 
             match SegmentReader::backfill_offset_tables(&seg_path) {
@@ -4625,7 +4842,7 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
             .iter()
             .map(|seg| format!("{}/{}/footer.json", ns.0, seg))
             .collect();
-        s3.read_many(&footer_paths, 16);
+        s3.read_many(&footer_paths, 16, None, &RequestHydration::unlimited());
 
         let mut footers = Vec::with_capacity(seg_ids.len());
         let mut unreadable = Vec::new();
@@ -4799,6 +5016,44 @@ fn posting_blob_files_for_query(query: &SearchQuery) -> Vec<String> {
     let mut files: Vec<String> = files.into_iter().collect();
     files.sort();
     files
+}
+
+/// The error response a hydration outcome demands, or `None` when the search
+/// may proceed.
+///
+/// Both search handlers share this so the shed/failure distinction can't
+/// drift between them: a shed is load-shedding (429, retry with backoff —
+/// the same contract `Semaphore::acquire_or_shed` and
+/// `kosha_query::MemoryLedger` already use), a non-shed `missing` list is a
+/// genuine S3 failure (503). The shed check comes first because a shed
+/// request also has a non-empty `missing` list — it stopped fetching on
+/// purpose — and reporting that as a 503 would tell the caller its data is
+/// broken when the server merely declined to pull multiple GB in one
+/// request.
+#[cfg(feature = "s3")]
+fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
+    if outcome.shed {
+        return Some(hydration_shed_response());
+    }
+    if !outcome.missing.is_empty() {
+        return Some(json_error(503, &hydration_failed_message(&outcome.missing)));
+    }
+    None
+}
+
+/// The 429 a hydration shed produces. Shared by the pre-scoring check and
+/// the post-scoring one: page materialization fetches doc stores through the
+/// same request accountant (`ensure_doc_store`), so a request can also cross
+/// its ceiling *after* scoring — at which point the missing doc store
+/// surfaces as an IO error. Reporting that as a 500 would call a deliberate
+/// admission decision a server bug.
+#[cfg(feature = "s3")]
+fn hydration_shed_response() -> String {
+    json_error(
+        429,
+        "search overloaded: this query needs more segment data than one request \
+         may hydrate — the namespace is still warming, retry with backoff",
+    )
 }
 
 /// Error message for a search that can't proceed because hydrating one or
@@ -5562,6 +5817,34 @@ mod tests {
         let _ = fs::remove_dir_all(&legacy);
     }
 
+    /// A shed and a hydration failure both leave a non-empty `missing`
+    /// list; only the status code tells the client which happened, and only
+    /// one of them means "your data is broken."
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_shed_hydration_is_a_429_while_a_real_failure_is_a_503() {
+        let shed = HydrationOutcome {
+            missing: vec!["ns/seg-1".to_string()],
+            shed: true,
+            ..Default::default()
+        };
+        let response = hydration_error_response(&shed).expect("shed must not proceed");
+        assert!(response.starts_with("HTTP/1.1 429"), "got: {response}");
+
+        let failed = HydrationOutcome {
+            missing: vec!["ns/seg-1".to_string()],
+            shed: false,
+            ..Default::default()
+        };
+        let response = hydration_error_response(&failed).expect("failure must not proceed");
+        assert!(response.starts_with("HTTP/1.1 503"), "got: {response}");
+
+        assert!(
+            hydration_error_response(&HydrationOutcome::default()).is_none(),
+            "a clean hydration proceeds"
+        );
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn hydration_failed_message_lists_and_truncates() {
@@ -5830,7 +6113,12 @@ mod tests {
             no_cache: None,
         };
 
-        let unfiltered = state.hydrate_segments_for_search(&ns, &manifest, &base_query);
+        let unfiltered = state.hydrate_segments_for_search(
+            &ns,
+            &manifest,
+            &base_query,
+            &RequestHydration::unlimited(),
+        );
         assert!(
             !unfiltered.bloom_pruned,
             "an unfiltered query's to_hydrate set covers every segment — safe to cache as \
@@ -5841,7 +6129,12 @@ mod tests {
         filtered_query.filter = Some(kosha_core::FilterClause::Term {
             term: HashMap::from([("matter_id".to_string(), "some-matter".to_string())]),
         });
-        let filtered = state.hydrate_segments_for_search(&ns, &manifest, &filtered_query);
+        let filtered = state.hydrate_segments_for_search(
+            &ns,
+            &manifest,
+            &filtered_query,
+            &RequestHydration::unlimited(),
+        );
         assert!(
             filtered.bloom_pruned,
             "a filtered query's to_hydrate set only covers the segments its own filter value's \
@@ -5961,7 +6254,12 @@ mod tests {
             "warmup's probe query must not need filters.bin/vector.idx — this is exactly \
              what makes its success unable to prove either file is local"
         );
-        let outcome = state.hydrate_segments_for_search(&ns, &manifest, &warmup_like);
+        let outcome = state.hydrate_segments_for_search(
+            &ns,
+            &manifest,
+            &warmup_like,
+            &RequestHydration::unlimited(),
+        );
         assert!(outcome.missing.is_empty() && !outcome.bloom_pruned);
         state
             .completed_hydrations
@@ -6025,7 +6323,12 @@ mod tests {
         let needs_filters_3 = query_needs_filter_store(&sorted_unfiltered);
         let needs_vectors_3 = sorted_unfiltered.knn.is_some();
         assert!(needs_filters_3, "sorting by a real field needs filters.bin");
-        let outcome3 = state.hydrate_segments_for_search(&ns, &manifest, &sorted_unfiltered);
+        let outcome3 = state.hydrate_segments_for_search(
+            &ns,
+            &manifest,
+            &sorted_unfiltered,
+            &RequestHydration::unlimited(),
+        );
         assert!(
             outcome3.missing.is_empty() && !outcome3.bloom_pruned,
             "unfiltered (no query.filter/term-prune) means to_hydrate covers every segment — \

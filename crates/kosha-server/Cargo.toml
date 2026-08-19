@@ -33,7 +33,12 @@ once_cell = "1"
 serde_json = { workspace = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "time"], optional = true }
+# `io-util` is what provides `AsyncWriteExt`, used to stream S3 response
+# bodies chunk-by-chunk into the local cache instead of buffering whole
+# objects (see s3_storage::stream_body_to_file). It resolves today via
+# feature unification with aws-sdk-s3's own tokio dependency; naming it
+# here keeps this crate compiling if that ever changes.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "time"], optional = true }
 # Not optional/migrate-gated: also used for query→ingest write forwarding
 # (see main.rs's is_write_path/forward_to_ingest), a core server feature
 # independent of the `migrate` CLI subcommand.
