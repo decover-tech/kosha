@@ -812,7 +812,34 @@ impl AppState {
             .and_then(|v| v.parse().ok())
             .filter(|n| *n > 0)
             .unwrap_or(1000);
-        let indexer = Indexer::new(data_dir.clone()).with_flush_threshold(flush_threshold);
+        // `KOSHA_MAX_CONCURRENT_FLUSH_WRITERS` / `KOSHA_MIN_DOCS_PER_FLUSH_WRITER`:
+        // bound on how many `SegmentWriter`s a single flush round can run
+        // concurrently for one namespace, and how much buffered backlog a
+        // round needs before it splits across more than one (see
+        // kosha-write's `run_one_flush_pass`). Defaults (4 / 250) mean a
+        // round only pays for real thread-level parallelism once its
+        // snapshot is at least 1000 docs (4 x 250) — right around
+        // `flush_threshold`'s own default, so a namespace that's fallen
+        // behind under sustained concurrent ingest (issue #176's follow-up:
+        // 100% `/flush` timeout under real sustained load, not just a
+        // burst) uses the full writer pool instead of draining one segment
+        // at a time. Set `KOSHA_MAX_CONCURRENT_FLUSH_WRITERS=1` to fall back
+        // to strictly single-writer-per-namespace behavior.
+        let max_concurrent_flush_writers: usize =
+            std::env::var("KOSHA_MAX_CONCURRENT_FLUSH_WRITERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(4);
+        let min_docs_per_flush_writer: usize = std::env::var("KOSHA_MIN_DOCS_PER_FLUSH_WRITER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(250);
+        let indexer = Indexer::new(data_dir.clone())
+            .with_flush_threshold(flush_threshold)
+            .with_max_concurrent_flush_writers(max_concurrent_flush_writers)
+            .with_min_docs_per_flush_writer(min_docs_per_flush_writer);
 
         // `KOSHA_SEGMENT_CACHE_CAPACITY` / `KOSHA_SEGMENT_CACHE_MAX_BYTES`:
         // how many parsed segments the searcher keeps resident in memory
@@ -6665,8 +6692,18 @@ mod tests {
         let m = ctrl
             .manifest(&NamespaceId(ns.into()))
             .expect("auto-flush must persist the manifest to the control store");
-        assert_eq!(m.segments.len(), 1);
-        assert_eq!(m.segments[0].doc_count, 1000);
+        // A single auto-flush round no longer means a single segment: with
+        // parallel flush writers (see kosha-write's run_one_flush_pass), a
+        // 1000-doc buffer that crosses the default
+        // min_docs_per_flush_writer (250) threshold is split across
+        // multiple concurrently-written segments instead of one. The
+        // regression this test actually guards against -- that auto-flush
+        // persists the manifest to the control store at all -- only cares
+        // that every buffered document survived, not how many segments it
+        // landed in.
+        let total_docs: u32 = m.segments.iter().map(|e| e.doc_count).sum();
+        assert_eq!(total_docs, 1000);
+        assert!(!m.segments.is_empty());
     }
 
     #[test]

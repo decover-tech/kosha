@@ -74,33 +74,96 @@ struct NamespaceHandle {
     /// At most one compaction in flight per namespace. Held across merge I/O
     /// while `state` is released (DESIGN.md §7.1).
     compact: Mutex<()>,
-    /// At most one flush's segment-write I/O in flight per namespace, held
-    /// across `SegmentWriter` disk I/O while `state` is released — mirrors
-    /// `compact` above, for the same reason. Without this, `flush_namespace`
-    /// used to hold `state` for the full I/O duration, so every concurrent
-    /// `index_documents`/`flush_namespace` call for the namespace (even pure
-    /// bookkeeping) queued up behind one flush's disk cost. Under bursty
-    /// small-batch writes (every call triggering its own index+flush pair)
-    /// this produced unbounded tail latency — confirmed live: the identical
-    /// `/flush` call took anywhere from 0.7s to >20s back-to-back with no
-    /// other change. See issue #176.
-    flush_io: Mutex<()>,
-    /// Coalescing on top of `flush_io`: `flush_io` only stops flushes from
-    /// blocking `state`, it doesn't stop N concurrent small flush calls from
-    /// each paying their own full segment-write I/O cost, serialized one
-    /// after another. `kosha_client.bulk()` calls `/flush` after *every*
-    /// single `bulk()` call, so bursty small-batch writes (the shadow-write
-    /// mirror under real document-upload traffic, or any real-time ingestion
-    /// workload) turn into exactly that pattern — confirmed live even after
-    /// the `flush_io` fix: 14 flush timeouts in 2 minutes under sustained
-    /// concurrent writes to one namespace (see #176/#177 follow-up
-    /// discussion). `flush_coord`/`flush_done` implement a singleflight
-    /// pattern: while one round is running, later callers don't start their
-    /// own — they mark `pending` and wait for the current leader's
-    /// guaranteed extra pass (see `flush_namespace`) instead of each doing a
-    /// dedicated `SegmentWriter` cycle for their own tiny batch.
+    /// Bounded pool of concurrent segment-write "slots" for this namespace —
+    /// see `run_one_flush_pass`'s doc comment for the full parallel-flush
+    /// design this backs.
+    ///
+    /// This used to be a plain `Mutex<()>` (`flush_io`) held across the
+    /// *entire* `SegmentWriter` I/O for a flush pass while `state` was
+    /// released — mirroring `compact` above. That fixed `flush_namespace`
+    /// blocking `index_documents`'s cheap bookkeeping behind disk I/O
+    /// (issue #176 / PR #177), and PR #178 added singleflight coalescing on
+    /// top so N concurrent small `/flush` calls collapse into far fewer
+    /// segment writes. Both were validated with synthetic bursts. **Live
+    /// production traffic then found the remaining gap**: a real, sustained
+    /// (multi-minute, not bursty) ingest from multiple concurrent backend
+    /// workers can arrive faster than one writer can drain it to disk, no
+    /// matter how well the arrivals are coalesced — coalescing reduces the
+    /// *number* of segment-write cycles needed, but a strict single-writer
+    /// namespace can still only ever run one of them at a time, so a
+    /// sustained-enough arrival rate builds an ever-growing backlog and
+    /// every caller queued behind it times out, indefinitely, not just
+    /// during a brief burst (755-document real ingest via
+    /// `decover-tech/backend`'s shadow-write path: 100% `/flush` timeout for
+    /// the full multi-minute duration).
+    ///
+    /// Widened from exactly-one to a configurable bound
+    /// (`Indexer::max_concurrent_flush_writers`) so a flush round with
+    /// enough buffered backlog to justify it can drain the namespace's
+    /// buffer with multiple `SegmentWriter`s running concurrently, each
+    /// writing a distinct segment. Acquiring a permit here is the actual
+    /// backstop on how many segment writes run at once; `run_one_flush_pass`
+    /// already caps the number of chunks it spawns at this pool's capacity,
+    /// so in normal operation a chunk never has to wait on a permit here —
+    /// this exists so that bound is enforced structurally, not just by
+    /// chunk-count arithmetic that could have a bug.
+    writer_slots: WriterSlots,
+    /// Coalescing on top of `writer_slots`: even with parallel writers,
+    /// still no reason to spin up a brand new round for every tiny
+    /// concurrent `/flush` call when one is already running.
+    /// `kosha_client.bulk()` calls `/flush` after *every* single `bulk()`
+    /// call, so bursty small-batch writes (the shadow-write mirror under
+    /// real document-upload traffic, or any real-time ingestion workload)
+    /// turn into exactly that pattern. `flush_coord`/`flush_done` implement
+    /// a singleflight pattern: while one round is running, later callers
+    /// don't start their own — they mark `pending` and wait for the current
+    /// leader's guaranteed extra pass (see `flush_namespace`) instead of
+    /// each doing a dedicated `SegmentWriter` cycle for their own tiny
+    /// batch. A round that picks up a large-enough backlog (because
+    /// multiple callers piled up pending work, or because a burst simply
+    /// arrived faster than one round could drain it) is exactly where
+    /// `writer_slots` kicks in and that one round uses more than one
+    /// concurrent writer to drain it.
     flush_coord: Mutex<FlushCoord>,
     flush_done: Condvar,
+}
+
+/// Bounded counting semaphore backing `NamespaceHandle::writer_slots`. Not a
+/// general-purpose primitive — small and specific to bounding concurrent
+/// `SegmentWriter`s for one namespace's flush round.
+struct WriterSlots {
+    available: Mutex<usize>,
+    released: Condvar,
+}
+
+impl WriterSlots {
+    fn new(capacity: usize) -> Self {
+        Self {
+            available: Mutex::new(capacity.max(1)),
+            released: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> WriterSlotGuard<'_> {
+        let mut avail = self.available.lock().unwrap();
+        while *avail == 0 {
+            avail = self.released.wait(avail).unwrap();
+        }
+        *avail -= 1;
+        WriterSlotGuard { slots: self }
+    }
+}
+
+struct WriterSlotGuard<'a> {
+    slots: &'a WriterSlots,
+}
+
+impl Drop for WriterSlotGuard<'_> {
+    fn drop(&mut self) {
+        let mut avail = self.slots.available.lock().unwrap();
+        *avail += 1;
+        self.slots.released.notify_one();
+    }
 }
 
 /// Thread-safe indexer with per-namespace isolation (DESIGN.md §7.1).
@@ -117,6 +180,16 @@ pub struct Indexer {
     wal_enabled: bool,
     namespaces: Mutex<HashMap<NamespaceId, Arc<NamespaceHandle>>>,
     compaction_policy: CompactionPolicy,
+    /// Upper bound on concurrent `SegmentWriter`s for one namespace's flush
+    /// round (see `NamespaceHandle::writer_slots` / `run_one_flush_pass`).
+    /// 1 reproduces the pre-parallel single-writer-per-namespace behavior.
+    max_concurrent_flush_writers: usize,
+    /// A flush round only splits its buffered snapshot across more than one
+    /// concurrent writer once there's at least this many documents *per*
+    /// writer to hand out — keeps light bursts (a handful of buffered docs,
+    /// the common case) on the cheap single-writer path instead of paying
+    /// thread-spawn overhead for work too small to benefit from it.
+    min_docs_per_flush_writer: usize,
 }
 
 impl Indexer {
@@ -134,6 +207,8 @@ impl Indexer {
             wal_enabled: true,
             namespaces: Mutex::new(HashMap::new()),
             compaction_policy: CompactionPolicy::default(),
+            max_concurrent_flush_writers: 4,
+            min_docs_per_flush_writer: 250,
         };
 
         // Recover un-flushed documents from WAL on startup.
@@ -179,6 +254,18 @@ impl Indexer {
         &self.compaction_policy
     }
 
+    /// See `Indexer::max_concurrent_flush_writers`. `n` is floored at 1.
+    pub fn with_max_concurrent_flush_writers(mut self, n: usize) -> Self {
+        self.max_concurrent_flush_writers = n.max(1);
+        self
+    }
+
+    /// See `Indexer::min_docs_per_flush_writer`. `n` is floored at 1.
+    pub fn with_min_docs_per_flush_writer(mut self, n: usize) -> Self {
+        self.min_docs_per_flush_writer = n.max(1);
+        self
+    }
+
     fn ns_handle(&self, namespace: &NamespaceId) -> Arc<NamespaceHandle> {
         let mut map = self.namespaces.lock().unwrap();
         map.entry(namespace.clone())
@@ -186,7 +273,7 @@ impl Indexer {
                 Arc::new(NamespaceHandle {
                     state: Mutex::new(NamespaceState::new()),
                     compact: Mutex::new(()),
-                    flush_io: Mutex::new(()),
+                    writer_slots: WriterSlots::new(self.max_concurrent_flush_writers),
                     flush_coord: Mutex::new(FlushCoord {
                         in_progress: false,
                         pending: false,
@@ -627,8 +714,8 @@ impl Indexer {
     /// Flush whatever's buffered for `namespace` into a new segment(s).
     ///
     /// Singleflight-coordinated (`NamespaceHandle::flush_coord`/`flush_done`
-    /// — see their doc comments for why this exists on top of `flush_io`).
-    /// Only one caller at a time actually runs a flush pass
+    /// — see their doc comments for why this exists on top of
+    /// `writer_slots`). Only one caller at a time actually runs a flush pass
     /// (`run_one_flush_pass`); everyone else who calls this while a pass is
     /// running marks `pending` and waits — the running leader, before
     /// declaring itself done, checks `pending` and runs one more pass in
@@ -637,6 +724,14 @@ impl Indexer {
     /// during a pass is guaranteed to be covered by that pass's own
     /// follow-up, without the waiter needing a dedicated `SegmentWriter`
     /// cycle for what might be a handful of documents.
+    ///
+    /// A pass itself is no longer strictly single-writer: `run_one_flush_pass`
+    /// splits a large-enough snapshot into multiple chunks and writes their
+    /// segments concurrently (bounded by `NamespaceHandle::writer_slots`).
+    /// This is what raises the sustained-throughput ceiling beyond what
+    /// singleflight coalescing alone could — see `writer_slots`'s doc
+    /// comment for the live incident (100% `/flush` timeout under sustained
+    /// concurrent ingest) that motivated it.
     ///
     /// This is the public entry point (the `/flush` handler and
     /// `index_documents`'s auto-flush-on-threshold both call it);
@@ -697,80 +792,247 @@ impl Indexer {
     /// -- the unit of work `flush_namespace`'s singleflight loop repeats as
     /// needed. Only ever called by the current `flush_coord` leader; not
     /// meant to run concurrently with itself for one namespace.
+    ///
+    /// Phase 2 (the actual segment write) is where this differs from the
+    /// pre-parallel version: the buffered snapshot is split into 1..=
+    /// `max_concurrent_flush_writers` chunks (see `take_flush_chunks_in`),
+    /// each with its own `SegmentId`, and — when there's more than one --
+    /// they're written concurrently instead of one at a time. This is what
+    /// actually raises the namespace's write throughput ceiling: coalescing
+    /// (#178) reduces how many *rounds* a burst of small flush calls needs,
+    /// but every round still only ran one `SegmentWriter` at a time, so a
+    /// sustained arrival rate that outpaces one writer thread built an
+    /// unbounded backlog no matter how well the arrivals were coalesced --
+    /// see `NamespaceHandle::writer_slots`'s doc comment for the live
+    /// incident this fixes.
     fn run_one_flush_pass(
         &self,
         namespace: &NamespaceId,
         handle: &NamespaceHandle,
     ) -> Result<(), KoshaError> {
-        // Phase 1 (state locked, cheap): snapshot whatever's buffered.
+        // Phase 1 (state locked, cheap): snapshot whatever's buffered and
+        // split it into chunks, each with its own reserved SegmentId.
         // Released immediately after — concurrent index_documents calls for
-        // this namespace stay unblocked while phase 2 runs.
-        let snapshot = {
+        // this namespace stay unblocked while phase 2 runs. Reserving every
+        // chunk's segment_counter value in this one state-locked pass is
+        // what keeps concurrent segment IDs collision-free: by the time
+        // phase 2 spawns writer threads, every chunk already owns a
+        // distinct, already-incremented counter value.
+        let chunks = {
             let mut state = handle.state.lock().unwrap();
-            Self::take_flush_snapshot_in(&mut state)
+            Self::take_flush_chunks_in(
+                &mut state,
+                self.max_concurrent_flush_writers,
+                self.min_docs_per_flush_writer,
+            )
         };
-        let Some((docs, seg_id, bm25_params)) = snapshot else {
+        if chunks.is_empty() {
             return Ok(());
+        }
+
+        // Phase 2 (state free): write every chunk's segment.
+        //
+        // A single chunk (the common case under light load -- see
+        // take_flush_chunks_in) runs directly on this thread: identical cost
+        // to the pre-parallel version, no thread-spawn overhead for work
+        // that wouldn't benefit from it. More than one chunk means the
+        // backlog crossed min_docs_per_flush_writer, so it's worth paying
+        // for real concurrency. `writer_slots` bounds how many
+        // `SegmentWriter`s actually run at once -- `chunks.len()` is already
+        // <= its capacity by construction, so this is the structural
+        // backstop, not the primary bound.
+        let ns_dir = self.data_dir.join(&namespace.0);
+        let results: Vec<(
+            SegmentId,
+            Vec<Document>,
+            Result<kosha_core::Footer, KoshaError>,
+        )> = if chunks.len() == 1 {
+            let (docs, seg_id, bm25_params) = chunks.into_iter().next().unwrap();
+            vec![Self::write_flush_chunk(
+                &ns_dir,
+                handle,
+                docs,
+                seg_id,
+                bm25_params,
+            )]
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .map(|(docs, seg_id, bm25_params)| {
+                        let ns_dir = &ns_dir;
+                        scope.spawn(move || {
+                            Self::write_flush_chunk(ns_dir, handle, docs, seg_id, bm25_params)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("segment-writer thread panicked"))
+                    .collect()
+            })
         };
 
-        // Phase 2 (flush_io locked, state free): the actual segment write.
-        // Still serialized against other passes for this namespace (segment
-        // files and the WAL-clear below stay ordered) -- singleflight above
-        // already ensures there's at most one pass running per namespace at
-        // a time, so this is really just documenting that invariant, not
-        // adding a second layer of contention.
-        let footer = {
-            let _io_guard = handle.flush_io.lock().unwrap();
-            let seg_dir = self.data_dir.join(&namespace.0).join(seg_id.0.as_str());
-            let mut writer = SegmentWriter::new(seg_id.clone(), seg_dir);
-            for doc in &docs {
-                writer.add_document(doc.id.clone(), doc.fields.clone());
+        // Every chunk's finalize() outcome is now known. A chunk that failed
+        // must have its documents go back into the buffer -- not be
+        // silently dropped -- so "every buffered document ends up in
+        // exactly one segment" still holds on partial failure, same as it
+        // held (trivially, with only one chunk) before this change.
+        let mut failed_docs: Vec<Document> = Vec::new();
+        let mut first_err: Option<KoshaError> = None;
+        let mut succeeded: Vec<(SegmentId, Vec<Document>, kosha_core::Footer)> = Vec::new();
+        for (seg_id, docs, result) in results {
+            match result {
+                Ok(footer) => succeeded.push((seg_id, docs, footer)),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    failed_docs.extend(docs);
+                }
             }
-            writer.finalize(bm25_params)?
-        };
+        }
 
-        // WAL no longer needed for flushed data.
+        // WAL bookkeeping (state free): every chunk that succeeded is now
+        // durably on disk and no longer needs its WAL backing. A chunk that
+        // failed is about to go back into the buffer below and needs FRESH
+        // WAL backing instead of its old (about to be cleared) one. Order
+        // matters: clear first, then re-append the restored docs, so a
+        // crash can never observe them sitting in the buffer without WAL
+        // cover -- mirrors index_documents's own WAL-before-buffer
+        // ordering.
+        //
+        // Clearing unconditionally (not just "if nothing failed") matches
+        // the pre-existing single-writer behavior this replaces: the WAL
+        // here is shared across the whole Indexer, not scoped per
+        // namespace, so a clear from one namespace's flush could already --
+        // before this change -- drop still-unflushed WAL records belonging
+        // to a different namespace's buffer if they happened to land
+        // between this round's snapshot and this clear. That race predates
+        // this change (it's inherent to WalWriter::clear()'s all-files
+        // semantics, see its doc comment) and isn't introduced or widened
+        // here; fixing it would mean reworking WalWriter into a
+        // per-namespace or checkpointed log, out of scope for this change,
+        // same as #177/#178 scoping `flush_namespace_in` out. What this
+        // change does guarantee, and is new: within one flush round, a
+        // chunk that fails can never have its own documents' WAL backing
+        // wiped without a fresh replacement -- see
+        // partial_writer_failure_preserves_documents_and_wal_safety.
         if self.wal_enabled {
             if let Ok(mut wal_guard) = self.wal.lock() {
                 wal_guard.clear().ok();
+                if !failed_docs.is_empty() {
+                    wal_guard.append(namespace, &failed_docs).ok();
+                }
             }
         }
 
-        // Phase 3 (state locked, cheap): commit the new segment.
+        // Phase 3 (state locked, cheap): commit every succeeded chunk's
+        // segment and restore any failed chunk's documents to the buffer.
+        // Order among succeeded chunks doesn't matter for correctness --
+        // manifest.segments is an unordered set of live segments -- so
+        // committing them all under one lock acquisition (rather than one
+        // per chunk) is simpler and no less correct, and still keeps state
+        // held only for cheap bookkeeping, never across I/O.
         {
             let mut state = handle.state.lock().unwrap();
-            Self::remember_flushed_ids_in(&mut state, &seg_id, &docs);
-            state.known = true;
-            state.manifest.version += 1;
-            state.manifest.segments.push(ManifestEntry {
-                segment_id: seg_id,
-                doc_count: footer.doc_count,
-            });
-            state.manifest.remember_segment_footer(footer);
+            for (seg_id, docs, footer) in succeeded {
+                Self::remember_flushed_ids_in(&mut state, &seg_id, &docs);
+                state.known = true;
+                state.manifest.version += 1;
+                state.manifest.segments.push(ManifestEntry {
+                    segment_id: seg_id,
+                    doc_count: footer.doc_count,
+                });
+                state.manifest.remember_segment_footer(footer);
+            }
+            if !failed_docs.is_empty() {
+                let buf = Self::buffer_mut_in(
+                    &mut state,
+                    namespace.clone(),
+                    &self.data_dir,
+                    &self.bm25_params,
+                );
+                buf.documents.extend(failed_docs);
+            }
         }
-        Ok(())
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
-    /// Take whatever's currently buffered for flushing — the state-locked
-    /// "phase 1" half of `flush_namespace`, kept separate so phase 2's disk
-    /// I/O never runs while `state` is held. `None` if there's nothing
-    /// buffered (matches the prior single-function early return).
-    fn take_flush_snapshot_in(
-        state: &mut NamespaceState,
-    ) -> Option<(Vec<Document>, SegmentId, Bm25Params)> {
-        let buf = state.buffer.as_mut()?;
-        if buf.documents.is_empty() {
-            return None;
+    /// Write one flush chunk's segment to disk. Bounded by `writer_slots` so
+    /// at most `max_concurrent_flush_writers` of these run at once for a
+    /// namespace, whether called directly (single-chunk fast path) or from
+    /// a `thread::scope`-spawned thread (multi-chunk path) in
+    /// `run_one_flush_pass`. Returns the outcome rather than propagating an
+    /// error so a sibling chunk's failure can't take down chunks that
+    /// already succeeded -- the caller decides how to handle a mix of
+    /// `Ok`/`Err` results across chunks.
+    fn write_flush_chunk(
+        ns_dir: &Path,
+        handle: &NamespaceHandle,
+        docs: Vec<Document>,
+        seg_id: SegmentId,
+        bm25_params: Bm25Params,
+    ) -> (
+        SegmentId,
+        Vec<Document>,
+        Result<kosha_core::Footer, KoshaError>,
+    ) {
+        let _permit = handle.writer_slots.acquire();
+        let seg_dir = ns_dir.join(seg_id.0.as_str());
+        let mut writer = SegmentWriter::new(seg_id.clone(), seg_dir);
+        for doc in &docs {
+            writer.add_document(doc.id.clone(), doc.fields.clone());
         }
+        let result = writer.finalize(bm25_params);
+        (seg_id, docs, result)
+    }
+
+    /// Take whatever's currently buffered for flushing and split it into up
+    /// to `max_writers` chunks, each with its own freshly-reserved
+    /// `SegmentId` -- the state-locked "phase 1" half of a flush round, kept
+    /// separate so phase 2's disk I/O never runs while `state` is held.
+    /// Empty (not `Vec` of one empty chunk) if there's nothing buffered,
+    /// matching the prior single-function early return.
+    ///
+    /// Splits into more than one chunk only once there's at least
+    /// `min_docs_per_writer` documents *per* writer to give it -- a handful
+    /// of buffered docs (the common case under light load) always yields
+    /// exactly one chunk, matching pre-parallel behavior exactly.
+    fn take_flush_chunks_in(
+        state: &mut NamespaceState,
+        max_writers: usize,
+        min_docs_per_writer: usize,
+    ) -> Vec<(Vec<Document>, SegmentId, Bm25Params)> {
+        let Some(buf) = state.buffer.as_mut() else {
+            return Vec::new();
+        };
+        if buf.documents.is_empty() {
+            return Vec::new();
+        }
+        let total = buf.documents.len();
+        let max_writers = max_writers.max(1);
+        let min_docs_per_writer = min_docs_per_writer.max(1);
+        let n_chunks = (total / min_docs_per_writer).clamp(1, max_writers);
+
         let docs = std::mem::take(&mut buf.documents);
-        let seg_id = SegmentId(format!(
-            "{}-{:06x}",
-            buf.namespace.0.replace('/', "_"),
-            buf.segment_counter
-        ));
-        buf.segment_counter += 1;
         let bm25_params = buf.bm25_params.clone();
-        Some((docs, seg_id, bm25_params))
+        let ns_prefix = buf.namespace.0.replace('/', "_");
+
+        let chunk_size = total.div_ceil(n_chunks);
+        let mut chunks = Vec::with_capacity(n_chunks);
+        let mut iter = docs.into_iter().peekable();
+        while iter.peek().is_some() {
+            let piece: Vec<Document> = (&mut iter).take(chunk_size).collect();
+            let seg_id = SegmentId(format!("{}-{:06x}", ns_prefix, buf.segment_counter));
+            buf.segment_counter += 1;
+            chunks.push((piece, seg_id, bm25_params.clone()));
+        }
+        chunks
     }
 
     /// Synchronous flush used only by callers already holding `state` for
@@ -1649,19 +1911,22 @@ mod tests {
     /// from 0.7s to >20s back-to-back with no other change) this produced
     /// unbounded tail latency.
     ///
-    /// `flush_io` is the lock meant to carry that I/O cost instead of
-    /// `state`. Assert directly, not by timing (flaky): holding `flush_io`
-    /// — simulating another flush's segment write in progress — must not
-    /// block a concurrent `index_documents` call for the same namespace.
+    /// `writer_slots` (formerly a single `flush_io: Mutex<()>`) is what
+    /// carries that I/O cost instead of `state`. Assert directly, not by
+    /// timing (flaky): holding *every* writer slot — simulating every
+    /// concurrent segment write this namespace is allowed to have in
+    /// flight at once — must not block a concurrent `index_documents` call
+    /// for the same namespace.
     #[test]
-    fn flush_io_lock_does_not_block_concurrent_state_access() {
+    fn writer_slots_fully_occupied_does_not_block_concurrent_state_access() {
         let dir = std::env::temp_dir().join("kosha-test-flush-io-independent");
         let _ = std::fs::remove_dir_all(&dir);
         let ns = NamespaceId("test".into());
-        let idx = std::sync::Arc::new(Indexer::new(dir.clone()));
+        let idx =
+            std::sync::Arc::new(Indexer::new(dir.clone()).with_max_concurrent_flush_writers(3));
 
         let handle = idx.ns_handle(&ns);
-        let _io_guard = handle.flush_io.lock().unwrap();
+        let _permits: Vec<_> = (0..3).map(|_| handle.writer_slots.acquire()).collect();
 
         let (tx, rx) = std::sync::mpsc::channel();
         let idx2 = idx.clone();
@@ -1678,23 +1943,25 @@ mod tests {
             tx.send(()).unwrap();
         });
 
-        // If index_documents were blocked on flush_io (the pre-fix
-        // behavior), this would hang until the test harness's own timeout —
-        // 2s is generous slack for a call that should complete in
-        // microseconds when the locks are actually independent.
+        // If index_documents were blocked on writer_slots (the pre-fix
+        // behavior, when it was flush_io), this would hang until the test
+        // harness's own timeout — 2s is generous slack for a call that
+        // should complete in microseconds when the locks are actually
+        // independent.
         rx.recv_timeout(std::time::Duration::from_secs(2)).expect(
-            "index_documents blocked on flush_io — state and flush_io must \
-             be independent locks, see issue #176",
+            "index_documents blocked on writer_slots — state and writer_slots \
+             must be independent locks, see issue #176",
         );
 
-        drop(_io_guard);
+        drop(_permits);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Regression test for the follow-up to #176/#177: `flush_io` alone
-    /// stops one flush's I/O from blocking `state`, but doesn't stop N
-    /// concurrent `flush_namespace` calls from each paying their own full
-    /// `SegmentWriter` I/O cost, serialized one after another —
+    /// Regression test for the follow-up to #176/#177: `flush_io` (now
+    /// `writer_slots`) alone stops one flush's I/O from blocking `state`,
+    /// but doesn't stop N concurrent `flush_namespace` calls from each
+    /// paying their own full `SegmentWriter` I/O cost, serialized one after
+    /// another —
     /// `kosha_client.bulk()` calls `/flush` after every single `bulk()`
     /// call, so this is exactly the pattern real bursty small-batch writes
     /// produce. Confirmed live even after #177: 14 flush timeouts in 2
@@ -2262,6 +2529,240 @@ mod tests {
         assert!(
             !idx.needs_compaction(&ns)
                 || after.segments.iter().filter(|e| e.doc_count < 3).count() < 2
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Proves genuine multi-writer parallelism, not just coalescing: a
+    /// single `flush_namespace` call on a namespace with a large enough
+    /// buffered backlog produces MULTIPLE segments from that ONE call, each
+    /// written by its own concurrent `SegmentWriter`. This is the opposite
+    /// direction from `concurrent_flush_calls_coalesce_into_fewer_segment_writes`
+    /// (many calls -> fewer segments); together they cover both halves of
+    /// the design: light bursts stay cheap (one writer, well-coalesced),
+    /// sustained backlogs actually use the configured writer pool instead
+    /// of draining it one segment at a time — see issue #176's follow-up
+    /// discussion for the live incident (100% `/flush` timeout under
+    /// sustained concurrent ingest) neither #177 nor #178 alone fixed.
+    #[test]
+    fn large_backlog_flush_uses_multiple_concurrent_segment_writers() {
+        let dir = std::env::temp_dir().join("kosha-test-parallel-writer-backlog");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let idx = Indexer::new(dir.clone())
+            .with_flush_threshold(10_000) // avoid auto-flush interfering
+            .with_max_concurrent_flush_writers(4)
+            .with_min_docs_per_flush_writer(10);
+
+        let docs: Vec<Document> = (0..100)
+            .map(|i| Document {
+                id: DocumentId(format!("d{i}")),
+                fields: vec![Field::text("title", format!("doc {i}"))],
+            })
+            .collect();
+        idx.index_documents(ns.clone(), docs).unwrap();
+
+        idx.flush_namespace(&ns).unwrap();
+
+        let manifest = idx.manifest(&ns).unwrap().clone();
+        assert_eq!(
+            manifest.segments.len(),
+            4,
+            "100 docs / 10 min-docs-per-writer, capped at 4 writers, should \
+             produce exactly 4 concurrently-written segments from one flush \
+             call, got {}",
+            manifest.segments.len()
+        );
+        let total: u32 = manifest.segments.iter().map(|e| e.doc_count).sum();
+        assert_eq!(
+            total, 100,
+            "no documents lost across concurrent chunk writers"
+        );
+        let seg_ids: HashSet<&SegmentId> =
+            manifest.segments.iter().map(|e| &e.segment_id).collect();
+        assert_eq!(
+            seg_ids.len(),
+            4,
+            "segment IDs must stay collision-free across concurrent writers"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression/design test for the WAL-safety tradeoff documented on
+    /// `run_one_flush_pass`: a chunk that fails inside a multi-writer flush
+    /// round must not lose its documents, and must not have its WAL backing
+    /// wiped without a fresh replacement. Forces the 2nd of 3 concurrent
+    /// chunks to fail deterministically by pre-occupying the exact path its
+    /// `SegmentWriter` needs to create as a directory with a plain file, so
+    /// `create_dir_all` inside `finalize()` errors for that chunk only.
+    #[test]
+    fn partial_writer_failure_preserves_documents_and_wal_safety() {
+        let dir = std::env::temp_dir().join("kosha-test-parallel-writer-partial-failure");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let idx = Indexer::new(dir.clone())
+            .with_flush_threshold(10_000)
+            .with_max_concurrent_flush_writers(3)
+            .with_min_docs_per_flush_writer(2);
+
+        let docs: Vec<Document> = (0..6)
+            .map(|i| Document {
+                id: DocumentId(format!("d{i}")),
+                fields: vec![Field::text("title", format!("doc {i}"))],
+            })
+            .collect();
+        idx.index_documents(ns.clone(), docs).unwrap();
+
+        // 6 docs / 2 min-per-writer, capped at 3 writers -> 3 chunks of 2
+        // docs, segment IDs "test-000000".."test-000002" (fresh namespace,
+        // counter starts at 0 -- the ns dir doesn't exist yet when
+        // index_documents above initializes the buffer). Block the middle
+        // chunk by occupying its segment directory path with a plain file
+        // before it ever calls finalize().
+        let ns_dir = dir.join(&ns.0);
+        std::fs::create_dir_all(&ns_dir).unwrap();
+        let blocked_seg_dir = ns_dir.join("test-000001");
+        std::fs::write(&blocked_seg_dir, b"not a directory").unwrap();
+
+        let result = idx.flush_namespace(&ns);
+        assert!(
+            result.is_err(),
+            "a chunk whose segment dir collides with an existing file must fail the round"
+        );
+
+        let manifest = idx.manifest(&ns).unwrap().clone();
+        assert_eq!(
+            manifest.segments.len(),
+            2,
+            "the 2 chunks that succeeded must still be committed despite the 3rd failing"
+        );
+        let committed: u32 = manifest.segments.iter().map(|e| e.doc_count).sum();
+        assert_eq!(committed, 4, "2 succeeded chunks x 2 docs each");
+
+        // The failed chunk's 2 documents must still be visible somewhere
+        // (buffered, not lost) -- all 6 original ids must resolve.
+        let all_ids: Vec<DocumentId> = (0..6).map(|i| DocumentId(format!("d{i}"))).collect();
+        let visible = idx.existing_ids(&ns, &all_ids).unwrap();
+        assert_eq!(
+            visible.len(),
+            6,
+            "all 6 original docs must still be visible (4 flushed, 2 buffered)"
+        );
+
+        // WAL must back exactly the 2 restored (still-unflushed) docs — not
+        // 0 (would mean data loss on crash) and not more than 2 (would mean
+        // stale WAL entries for the already-durable segments were never
+        // cleared).
+        let wal_dir = dir.join("_wal");
+        let records = crate::wal::WalWriter::recover(&wal_dir).unwrap();
+        let wal_doc_count: usize = records.iter().map(|r| r.documents.len()).sum();
+        assert_eq!(
+            wal_doc_count, 2,
+            "WAL must back exactly the failed chunk's still-unflushed \
+             documents, not the durably-flushed ones and not zero"
+        );
+
+        // Clear the blocker and retry: the restored documents must flush
+        // successfully and the namespace end up with all 6 docs.
+        std::fs::remove_file(&blocked_seg_dir).unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let manifest = idx.manifest(&ns).unwrap().clone();
+        let total: u32 = manifest.segments.iter().map(|e| e.doc_count).sum();
+        assert_eq!(total, 6, "all 6 documents durable after retry");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The core correctness proof for this change: many threads sustain
+    /// concurrent index+flush against ONE namespace over several
+    /// overlapping rounds — the actual shape of the production incident
+    /// this fixes (`decover-tech/backend`'s shadow-write mechanism mirrors
+    /// every real write from multiple concurrent workers onto Kosha,
+    /// sustained over minutes, not one short burst). Every document indexed
+    /// must be durably present exactly once afterward: no data loss, no
+    /// duplication, no segment ID collision under real concurrent
+    /// parallel-writer execution — not just coalescing, which
+    /// `concurrent_flush_calls_coalesce_into_fewer_segment_writes` already
+    /// covers.
+    #[test]
+    fn concurrent_writes_to_one_namespace_no_data_loss_under_sustained_load() {
+        let dir = std::env::temp_dir().join("kosha-test-parallel-writer-stress");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let idx = std::sync::Arc::new(
+            Indexer::new(dir.clone())
+                .with_max_concurrent_flush_writers(3)
+                .with_min_docs_per_flush_writer(4),
+        );
+
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 15;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let idx = idx.clone();
+                let ns = ns.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    for round in 0..ROUNDS {
+                        idx.index_documents(
+                            ns.clone(),
+                            vec![Document {
+                                id: DocumentId(format!("t{t}-r{round}")),
+                                fields: vec![Field::text(
+                                    "title",
+                                    format!("thread {t} round {round}"),
+                                )],
+                            }],
+                        )
+                        .unwrap();
+                        // maximize concurrent flush_namespace overlap each round
+                        barrier.wait();
+                        idx.flush_namespace(&ns).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let manifest = idx.manifest(&ns).unwrap().clone();
+
+        // No segment ID collisions.
+        let seg_ids: HashSet<&SegmentId> =
+            manifest.segments.iter().map(|e| &e.segment_id).collect();
+        assert_eq!(
+            seg_ids.len(),
+            manifest.segments.len(),
+            "duplicate segment IDs in manifest — concurrent writers collided \
+             on segment_counter"
+        );
+
+        // No data loss / no duplication: read back every doc_id from every
+        // segment and compare against the exact expected set.
+        let mut found_ids: HashSet<String> = HashSet::new();
+        for entry in &manifest.segments {
+            let reader =
+                kosha_segment::SegmentReader::open(dir.join(&ns.0).join(&entry.segment_id.0))
+                    .unwrap();
+            for record in reader.iter_doc_records() {
+                let record = record.unwrap();
+                assert!(
+                    found_ids.insert(record.doc_id.0.clone()),
+                    "doc {} appears in more than one segment — duplicate write",
+                    record.doc_id.0
+                );
+            }
+        }
+        let expected: HashSet<String> = (0..THREADS)
+            .flat_map(|t| (0..ROUNDS).map(move |r| format!("t{t}-r{r}")))
+            .collect();
+        assert_eq!(
+            found_ids, expected,
+            "every indexed document must be durably present exactly once"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
