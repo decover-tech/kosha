@@ -12,8 +12,11 @@
 
 use std::fmt::{self, Debug, Formatter};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use kosha_core::{KoshaError, LocalStorage, StorageBackend};
+
+use crate::hydration_budget::{HydrationBudget, RequestHydration};
 
 /// Join a configured key prefix with a logical (unprefixed) path, the same
 /// way for every call site — `S3Storage::s3_key` and the concurrent fetch
@@ -300,6 +303,8 @@ impl S3Storage {
         &self,
         paths: &[String],
         max_concurrent: usize,
+        budget: Option<&Arc<HydrationBudget>>,
+        request: &Arc<RequestHydration>,
     ) -> Vec<(String, Result<FetchStats, KoshaError>)> {
         if paths.is_empty() {
             return Vec::new();
@@ -308,6 +313,8 @@ impl S3Storage {
         let bucket = self.bucket.clone();
         let prefix = self.prefix.clone();
         let client = self.client.clone();
+        let budget = budget.cloned();
+        let request = Arc::clone(request);
         let mut pending: std::collections::VecDeque<String> = paths.to_vec().into();
         let max_concurrent = max_concurrent.max(1);
 
@@ -323,8 +330,19 @@ impl S3Storage {
                     let bucket = bucket.clone();
                     let prefix = prefix.clone();
                     let local_root = local_root.clone();
+                    let budget = budget.clone();
+                    let request = Arc::clone(&request);
                     set.spawn(async move {
-                        let result = fetch_one(&client, &bucket, &prefix, &local_root, &path).await;
+                        let result = fetch_one(
+                            &client,
+                            &bucket,
+                            &prefix,
+                            &local_root,
+                            &path,
+                            budget,
+                            request,
+                        )
+                        .await;
                         (path, result)
                     });
                 };
@@ -594,9 +612,9 @@ impl S3Storage {
 const FETCH_MAX_ATTEMPTS: u32 = 4;
 
 /// The backoff delay before each retry (not the initial attempt) — a plain
-/// `Vec` rather than inlined into `get_object_with_retry`'s loop so the
-/// schedule itself (attempt count, doubling, starting value) has a direct,
-/// network-free unit test.
+/// `Vec` rather than inlined into either retry loop so the schedule itself
+/// (attempt count, doubling, starting value) has a direct, network-free
+/// unit test.
 fn retry_backoff_schedule() -> Vec<std::time::Duration> {
     let mut delay = std::time::Duration::from_millis(100);
     let mut schedule = Vec::new();
@@ -607,15 +625,15 @@ fn retry_backoff_schedule() -> Vec<std::time::Duration> {
     schedule
 }
 
-async fn get_object_with_retry(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-) -> Result<aws_sdk_s3::primitives::AggregatedBytes, KoshaError> {
-    get_object_with_retry_ranged(client, bucket, key, None).await
-}
-
-/// `get_object_with_retry` with an optional HTTP `Range` header value
+/// Fetch an object (or one `Range` of it) into memory with bounded retry.
+///
+/// Whole-object hydration does **not** come through here — it streams to
+/// disk via [`get_object_streamed_with_retry`] instead, so that nothing ever
+/// holds a whole segment file in the heap. This path serves the ranged
+/// page-materialize reads, whose spans are KBs and belong to exactly one
+/// in-flight response.
+///
+/// The `range` is an HTTP `Range` header value
 /// (e.g. `bytes=0-1023`) — `None` fetches the whole object. One function so
 /// ranged page-materialize GETs share the whole-file path's retry/backoff
 /// behavior instead of growing their own.
@@ -664,13 +682,17 @@ async fn get_object_with_retry_ranged(
 }
 
 /// Per-file timing for [`S3Storage::read_many`]: rank-orders where the
-/// wall-clock of a hydration batch goes. `get_ms` covers the whole S3 GET
-/// (including bounded retry/backoff), `write_ms` the `tokio::fs::write`.
-/// `bytes` is the decompressed object length; `cached` marks a no-op local
-/// hit (every field but `cached` is zero then). Aggregated by
-/// `hydrate_from_s3_budgeted` into the greppable `hydrate_files timing:`
-/// line — the cold-read plan's "next lever" instrument: is cold wall-clock
-/// GET-bound, write-bound, or fan-out-bound?
+/// wall-clock of a hydration batch goes. The two phases used to be strictly
+/// sequential (GET the whole object into memory, then write it); the body is
+/// now streamed to disk, so they interleave. They are still reported
+/// disjointly and still sum to the fetch's cost: `write_ms` is the time
+/// spent inside local writes, `get_ms` the rest of the transfer (request,
+/// bounded retry/backoff, waiting on the network). `bytes` is the
+/// decompressed object length; `cached` marks a no-op local hit (every field
+/// but `cached` is zero then). Aggregated by `hydrate_from_s3_budgeted` into
+/// the greppable `hydrate_files timing:` line — the cold-read plan's "next
+/// lever" instrument: is cold wall-clock GET-bound, write-bound, or
+/// fan-out-bound?
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FetchStats {
     pub get_ms: f64,
@@ -681,19 +703,27 @@ pub struct FetchStats {
 
 /// Fetch one logical path for [`S3Storage::read_many`]: serve from local
 /// disk if already present, otherwise GET from S3 (with bounded retry —
-/// see [`get_object_with_retry`]) and persist it there.
+/// see [`get_object_streamed_with_retry`]) and persist it there.
 ///
 /// Returns [`FetchStats`], not the bytes — every caller of `read_many` only
 /// ever wants "is this file on disk now" plus rank-ordering timing, so a
 /// cache hit here is a pure existence check (no read at all), and a cache
 /// miss doesn't pay for an extra copy into an owned `Vec<u8>` nobody was
 /// going to read either.
+///
+/// `budget`/`request` are the byte-level admission gate (see
+/// [`crate::hydration_budget`]): the object's size is learned from the GET
+/// response's `Content-Length` — no LIST round trip — then charged to the
+/// request and reserved against the process-wide in-flight cap before its
+/// body is streamed.
 async fn fetch_one(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
     local_root: &Path,
     path: &str,
+    budget: Option<Arc<HydrationBudget>>,
+    request: Arc<RequestHydration>,
 ) -> Result<FetchStats, KoshaError> {
     let local_path = local_root.join(path);
     // A zero-byte file is never a valid segment artifact — it's the residue
@@ -710,12 +740,16 @@ async fn fetch_one(
         _ => {}
     }
 
+    // A request already over its ceiling stops here rather than issuing yet
+    // another GET — the point of the ceiling is to stop early, not to
+    // discover at the end of the file list that it should have.
+    if request.is_shed() {
+        return Err(KoshaError::Overloaded(format!(
+            "hydration of {path} skipped: request already over its byte ceiling"
+        )));
+    }
+
     let s3_key = join_s3_key(prefix, path);
-    let t_get = std::time::Instant::now();
-    let bytes = get_object_with_retry(client, bucket, &s3_key).await?;
-    let get_ms = t_get.elapsed().as_secs_f64() * 1e3;
-    let raw = bytes.into_bytes();
-    let n = raw.len() as u64;
 
     if let Some(parent) = local_path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
@@ -733,23 +767,190 @@ async fn fetch_one(
         std::process::id(),
         TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let t_write = std::time::Instant::now();
-    if let Err(e) = tokio::fs::write(&tmp_path, raw).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(KoshaError::Io(e));
-    }
+    let t_transfer = std::time::Instant::now();
+    let streamed =
+        get_object_streamed_with_retry(client, bucket, &s3_key, &tmp_path, budget, &request).await;
+    let transfer_ms = t_transfer.elapsed().as_secs_f64() * 1e3;
+    let streamed = match streamed {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e);
+        }
+    };
     if let Err(e) = tokio::fs::rename(&tmp_path, &local_path).await {
         let _ = tokio::fs::remove_file(&tmp_path).await;
+        request.refund(streamed.bytes);
         return Err(KoshaError::Io(e));
     }
-    let write_ms = t_write.elapsed().as_secs_f64() * 1e3;
 
     Ok(FetchStats {
-        get_ms,
-        write_ms,
-        bytes: n,
+        // Disjoint by construction: local write time is measured inside the
+        // transfer window and subtracted back out, so the two columns of
+        // `hydrate_files timing:` read exactly as they did before the body
+        // was streamed.
+        get_ms: (transfer_ms - streamed.write_ms).max(0.0),
+        write_ms: streamed.write_ms,
+        bytes: streamed.bytes,
         cached: false,
     })
+}
+
+/// What one streamed fetch cost: bytes landed on disk, and how much of the
+/// transfer window went into local writes.
+struct StreamedFetch {
+    bytes: u64,
+    write_ms: f64,
+}
+
+/// Stream a whole object to `tmp_path` with the same bounded retry as
+/// [`get_object_with_retry_ranged`], charging its size against the hydration
+/// budget once the response headers reveal it.
+///
+/// Retries cover the *whole* attempt (request + body). A body that fails
+/// mid-stream leaves a partial temp file, which the next attempt truncates
+/// via `File::create` — a half-written file must never be renamed into
+/// place, where every existence check in the hydration path would read it as
+/// complete.
+async fn get_object_streamed_with_retry(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    tmp_path: &Path,
+    budget: Option<Arc<HydrationBudget>>,
+    request: &Arc<RequestHydration>,
+) -> Result<StreamedFetch, KoshaError> {
+    let mut backoffs = retry_backoff_schedule().into_iter();
+    let mut last_err = None;
+    for attempt in 1..=FETCH_MAX_ATTEMPTS {
+        let result: Result<StreamedFetch, KoshaError> = async {
+            let resp = client
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(|e| KoshaError::NotFound(format!("S3 get_object: {e}")))?;
+
+            // `Content-Length` is the size the scoring hydration path never
+            // knew up front (it skips the per-segment LIST on purpose), and
+            // it arrives with the response headers — before a single body
+            // byte is buffered. This is the hook the byte budget hangs off.
+            let projected = resp.content_length().unwrap_or(0).max(0) as u64;
+            if !request.charge(projected) {
+                return Err(KoshaError::Overloaded(format!(
+                    "hydration of {key} would put this request over its byte ceiling"
+                )));
+            }
+            let _permit = match budget.as_ref() {
+                Some(budget) => {
+                    let t_wait = std::time::Instant::now();
+                    let permit = budget.acquire(projected);
+                    request.record_wait(t_wait.elapsed());
+                    match permit {
+                        Some(permit) => Some(permit),
+                        None => {
+                            request.refund(projected);
+                            request.mark_shed();
+                            return Err(KoshaError::Overloaded(format!(
+                                "hydration of {key} waited out the in-flight byte budget"
+                            )));
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            let streamed = stream_body_to_file(resp.body, tmp_path).await;
+            match streamed {
+                Ok(streamed) => {
+                    // Charged from `Content-Length`; reconcile against what
+                    // actually landed so the request's running total stays
+                    // truthful even if a store under-reports.
+                    if streamed.bytes < projected {
+                        request.refund(projected - streamed.bytes);
+                    } else if streamed.bytes > projected {
+                        request.charge(streamed.bytes - projected);
+                    }
+                    Ok(streamed)
+                }
+                Err(e) => {
+                    request.refund(projected);
+                    Err(e)
+                }
+            }
+        }
+        .await;
+
+        match result {
+            Ok(streamed) => return Ok(streamed),
+            Err(e) => {
+                // A shed is a deliberate decision, not a transient failure —
+                // retrying it would just burn the backoff schedule against a
+                // ceiling that has not moved.
+                if matches!(e, KoshaError::Overloaded(_)) {
+                    return Err(e);
+                }
+                if let Some(delay) = backoffs.next() {
+                    eprintln!(
+                        "WARN: S3 get_object for {key} failed (attempt {attempt}/{FETCH_MAX_ATTEMPTS}): \
+                         {e}; retrying in {delay:?}"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("at least one attempt runs, so an exhausted loop always has an error"))
+}
+
+/// Write a GET response body to `tmp_path` chunk by chunk, returning what it
+/// cost.
+///
+/// The whole point is that the object is never resident in the process at
+/// once. The previous `body.collect()` → `tokio::fs::write(tmp, raw)` held
+/// every in-flight object entirely in the heap: at the fan-out this path
+/// runs (`KOSHA_SCORING_HYDRATE_CONCURRENCY` = 64, up to
+/// `KOSHA_MAX_CONCURRENT_HYDRATIONS` = 4 batches) a namespace of ~28 MB
+/// `inverted.idx` files put gigabytes of transient buffers behind a single
+/// cold search — the OOM this function exists to remove. Peak is now one
+/// chunk per in-flight fetch, whatever the object's size.
+async fn stream_body_to_file(
+    mut body: aws_sdk_s3::primitives::ByteStream,
+    tmp_path: &Path,
+) -> Result<StreamedFetch, KoshaError> {
+    use tokio::io::AsyncWriteExt;
+
+    let t_create = std::time::Instant::now();
+    let mut file = tokio::fs::File::create(tmp_path)
+        .await
+        .map_err(KoshaError::Io)?;
+    let mut write_ms = t_create.elapsed().as_secs_f64() * 1e3;
+    let mut bytes = 0u64;
+
+    loop {
+        match body.next().await {
+            Some(Ok(chunk)) => {
+                let t_write = std::time::Instant::now();
+                file.write_all(&chunk).await.map_err(KoshaError::Io)?;
+                write_ms += t_write.elapsed().as_secs_f64() * 1e3;
+                bytes += chunk.len() as u64;
+            }
+            Some(Err(e)) => {
+                return Err(KoshaError::NotFound(format!("S3 read body: {e}")));
+            }
+            None => break,
+        }
+    }
+
+    // `tokio::fs::File` buffers, so the flush is what makes the bytes real
+    // before the caller renames the temp file into place.
+    let t_flush = std::time::Instant::now();
+    file.flush().await.map_err(KoshaError::Io)?;
+    write_ms += t_flush.elapsed().as_secs_f64() * 1e3;
+
+    Ok(StreamedFetch { bytes, write_ms })
 }
 
 /// Fetch one exact byte span for [`S3Storage::read_ranges`]: serve it from
@@ -877,7 +1078,7 @@ mod tests {
     /// (`scripts/bench/bm25_scale/RESULTS.md`): "hydration S3 GETs have no
     /// retry." A throttled/transient GET during a fan-out burst used to
     /// WARN once and leave the segment permanently incomplete. This checks
-    /// the schedule `get_object_with_retry` actually retries against
+    /// the schedule both retry loops actually retry against
     /// (attempt count, doubling, starting value) without needing a live S3
     /// endpoint.
     #[test]
@@ -892,6 +1093,57 @@ mod tests {
             ],
             "FETCH_MAX_ATTEMPTS=4 total attempts means 3 retries between them"
         );
+    }
+
+    /// The whole point of streaming: bytes land on disk without the object
+    /// ever being resident in one buffer. Exercised through a real
+    /// `ByteStream` (chunked, as an S3 body is) with no network involved.
+    #[test]
+    fn streams_body_to_file_without_buffering_the_whole_object() {
+        let dir = std::env::temp_dir().join(format!("kosha-stream-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_path = dir.join("part.tmp");
+        let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let streamed = rt
+            .block_on(stream_body_to_file(
+                aws_sdk_s3::primitives::ByteStream::from(payload.clone()),
+                &tmp_path,
+            ))
+            .expect("stream succeeds");
+
+        assert_eq!(streamed.bytes, payload.len() as u64);
+        assert_eq!(
+            std::fs::read(&tmp_path).unwrap(),
+            payload,
+            "every chunk must land, in order"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second attempt must not append to the first attempt's partial file:
+    /// `File::create` truncates, so a retried fetch writes the object once,
+    /// not twice. A doubled file would rename into place looking complete.
+    #[test]
+    fn a_retried_stream_truncates_the_previous_attempts_partial_file() {
+        let dir = std::env::temp_dir().join(format!("kosha-retry-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_path = dir.join("part.tmp");
+        std::fs::write(&tmp_path, vec![0xffu8; 4096]).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let payload = b"the real object".to_vec();
+        let streamed = rt
+            .block_on(stream_body_to_file(
+                aws_sdk_s3::primitives::ByteStream::from(payload.clone()),
+                &tmp_path,
+            ))
+            .expect("stream succeeds");
+
+        assert_eq!(streamed.bytes, payload.len() as u64);
+        assert_eq!(std::fs::read(&tmp_path).unwrap(), payload);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
