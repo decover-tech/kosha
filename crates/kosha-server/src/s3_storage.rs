@@ -556,19 +556,83 @@ impl S3Storage {
         })
     }
 
-    /// Whether S3 actually has *any* object under `logical_dir` — a
-    /// ground-truth durability check, unlike `StorageBackend::exists`
-    /// (which only checks local disk) or `list_with_sizes`/`list` (which
-    /// fall back to local on an empty S3 listing, so they can't distinguish
-    /// "durable in S3" from "only ever existed on this node's disk"). Used
-    /// by the ingest-pod boot-time reconciliation sweep (`AppState::new`)
-    /// to find segments that a prior process crashed or raced before
-    /// uploading — see `sync_unsynced_segments_to_s3`'s doc comment for the
-    /// incident this closes.
-    pub fn segment_durable_in_s3(&self, logical_dir: &str) -> bool {
-        self.list_remote_with_sizes(logical_dir)
-            .map(|entries| !entries.is_empty())
-            .unwrap_or(false)
+    /// The file names S3 actually holds under `logical_dir` — ground truth,
+    /// unlike `StorageBackend::exists` (local disk only) or
+    /// `list_with_sizes`/`list` (which fall back to local on an empty S3
+    /// listing, so they can't distinguish "durable in S3" from "only ever
+    /// existed on this node's disk"). An empty result means the prefix is
+    /// absent from S3 *or* the listing failed; either way the caller must
+    /// treat the segment as not durable. Used by the ingest-pod boot-time
+    /// reconciliation sweep (`AppState::new`) to find segments a prior
+    /// process crashed or raced before uploading — see
+    /// `sync_unsynced_segments_to_s3`'s doc comment for the incident that
+    /// closes.
+    ///
+    /// Returns names, not a bool, because "any object exists" is too weak a
+    /// durability test: a segment whose upload died partway through — every
+    /// file but one — satisfied it, so reconciliation declared it durable
+    /// and never repaired it. Two staging segments reached production
+    /// missing only their `doc_store.offsets` sidecar and stayed that way
+    /// (issue #179). The caller diffs this against the local directory
+    /// instead.
+    /// Fully paginated, unlike `list_remote_with_sizes`: the caller uploads
+    /// whatever this listing *doesn't* name, so a truncated page would read
+    /// as "missing" and re-upload a whole segment. A split-format segment
+    /// already carries ~262 objects (256 posting shards plus the rest),
+    /// close enough to the 1000-key page limit to be worth not relying on.
+    pub fn segment_files_in_s3(&self, logical_dir: &str) -> Vec<String> {
+        let mut prefix = self.s3_key(logical_dir);
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let prefix_for_strip = prefix.clone();
+
+        let listed: Result<Vec<String>, KoshaError> = self.rt.block_on(async move {
+            let mut out = Vec::new();
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                if let Some(token) = continuation.take() {
+                    req = req.continuation_token(token);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                for obj in resp.contents() {
+                    if let Some(key) = obj.key() {
+                        let relative = key
+                            .strip_prefix(&prefix_for_strip)
+                            .unwrap_or(key)
+                            .trim_start_matches('/');
+                        // Immediate children only, matching the local
+                        // directory listing this is diffed against.
+                        if !relative.is_empty() && !relative.contains('/') {
+                            out.push(relative.to_string());
+                        }
+                    }
+                }
+                match resp.next_continuation_token() {
+                    Some(t) => continuation = Some(t.to_string()),
+                    None => break,
+                }
+            }
+            Ok(out)
+        });
+        match listed {
+            Ok(names) => names,
+            Err(e) => {
+                // Distinguishable from "prefix is absent" only by this log:
+                // both yield an empty list, and an empty list means the
+                // caller re-uploads from local disk. Re-uploading a segment
+                // that is in fact durable is wasteful but safe; the reverse
+                // is data loss.
+                eprintln!("WARN: S3 list failed for segment '{logical_dir}': {e}");
+                Vec::new()
+            }
+        }
     }
 
     /// Like the `StorageBackend::list` trait method (same remote-first,
