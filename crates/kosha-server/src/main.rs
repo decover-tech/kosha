@@ -771,6 +771,101 @@ fn segments_needing_sync<'a>(
         .collect()
 }
 
+/// Whether hydration should fetch a segment's `doc_store.offsets` sidecar
+/// (Lazy open) or its full `doc_store.bin` (legacy eager open).
+///
+/// The sidecar arrived with `Footer::format_version` 1, so the version is
+/// the only honest predictor of its existence. Compare against 1, not
+/// `SEGMENT_FORMAT_VERSION` — that constant moves with every format change
+/// (already 2 for the lazy inverted index) and would misclassify every v1
+/// segment as legacy, silently re-fetching all their doc stores.
+///
+/// `manifest_format_version` is the version from the manifest's inline
+/// footer snapshot, when it carries one; `disk_format_version` is the
+/// already-local `footer.json`'s.
+///
+/// This used to treat *the mere presence* of a manifest footer snapshot as
+/// proof of lazy capability. Modern manifests snapshot a footer for every
+/// segment they list, legacy ones included, so any format_version-0 segment
+/// in a modern manifest was classified Lazy: hydration then chased a
+/// `doc_store.offsets` that was never written, never fetched the
+/// `doc_store.bin` sitting right there in S3, and the whole search 503'd
+/// with "segment hydration failed" (issue #179).
+#[cfg(feature = "s3")]
+fn segment_is_lazy_capable(
+    has_local_offsets: bool,
+    manifest_format_version: Option<u32>,
+    disk_format_version: Option<u32>,
+) -> bool {
+    if has_local_offsets {
+        return true;
+    }
+    // The manifest snapshot wins when present: it is authoritative for the
+    // segment and needs no disk read.
+    match manifest_format_version.or(disk_format_version) {
+        Some(version) => version >= 1,
+        // No footer anywhere to consult — assume legacy and fetch the bulk
+        // doc store. Slower, always correct; the reverse guess is a 503.
+        None => false,
+    }
+}
+
+/// Whether a segment came out of hydration with *no* usable doc store and
+/// must fall back to fetching the bulk `doc_store.bin`.
+///
+/// `SegmentReader::open` needs one of the two: `doc_store.offsets` (Lazy) or
+/// `doc_store.bin` (eager). Having neither is the only combination it cannot
+/// work with, and it is reachable — a segment classified Lazy is sent to
+/// score with just the sidecar, so if that sidecar isn't in S3 the segment
+/// has nothing. See the fallback in `ensure_scoring_files_local` (#179).
+#[cfg(feature = "s3")]
+fn segment_needs_doc_store_fallback(seg_path: &Path) -> bool {
+    !file_present_nonempty(&seg_path.join("doc_store.offsets"))
+        && !file_present_nonempty(&seg_path.join("doc_store.bin"))
+}
+
+/// Names of the regular files in `seg_dir`, or an empty vec if it can't be
+/// read (missing directory included).
+#[cfg(feature = "s3")]
+fn local_segment_file_names(seg_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(seg_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|name| !is_transient_segment_file(name))
+        .collect()
+}
+
+/// Whether a file in a segment directory is write-path scaffolding rather
+/// than segment content: `fetch_one` and `atomic_write` both stage through
+/// uniquely-suffixed temp files before renaming into place, and a
+/// reconciliation sweep that happens to run mid-write must not upload one.
+#[cfg(feature = "s3")]
+fn is_transient_segment_file(name: &str) -> bool {
+    name.contains(".tmp.") || name.ends_with(".tmp")
+}
+
+/// Which of `seg_dir`'s local files S3 doesn't have, given the remote
+/// listing. Sorted, so the log line and any test read deterministically.
+///
+/// The unit of durability is the file, not the prefix: reconciliation used
+/// to ask only whether S3 held *any* object for the segment, so an upload
+/// that died partway through — every file present but one — was declared
+/// durable and never repaired. See `S3Storage::segment_files_in_s3`.
+#[cfg(feature = "s3")]
+fn local_segment_files_missing_in_s3(seg_dir: &Path, remote: &[String]) -> Vec<String> {
+    let remote: std::collections::HashSet<&str> = remote.iter().map(String::as_str).collect();
+    let mut missing: Vec<String> = local_segment_file_names(seg_dir)
+        .into_iter()
+        .filter(|name| !remote.contains(name.as_str()))
+        .collect();
+    missing.sort();
+    missing
+}
+
 /// Upload every file in `seg_dir` to S3. Returns `true` only if every file
 /// uploaded successfully — a partial upload must not be treated as durable.
 ///
@@ -782,22 +877,30 @@ fn sync_segment_dir_to_s3(s3: &s3_storage::S3Storage, data_dir: &Path, seg_dir: 
     if !seg_dir.exists() {
         return false;
     }
-    let Ok(entries) = std::fs::read_dir(seg_dir) else {
+    let names = local_segment_file_names(seg_dir);
+    if names.is_empty() {
         return false;
-    };
+    }
+    sync_segment_files_to_s3(s3, data_dir, seg_dir, &names)
+}
+
+/// Upload exactly `names` from `seg_dir`. Returns `true` only if every one
+/// uploaded — the caller records durability off this, so a partial result
+/// must read as failure.
+#[cfg(feature = "s3")]
+fn sync_segment_files_to_s3(
+    s3: &s3_storage::S3Storage,
+    data_dir: &Path,
+    seg_dir: &Path,
+    names: &[String],
+) -> bool {
+    let rel = seg_dir
+        .strip_prefix(data_dir)
+        .unwrap_or(seg_dir)
+        .to_string_lossy();
     let mut all_ok = true;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let rel = seg_dir
-            .strip_prefix(data_dir)
-            .unwrap_or(seg_dir)
-            .to_string_lossy();
+    for name in names {
+        let path = seg_dir.join(name);
         let s3_path = format!("{rel}/{name}");
         match std::fs::read(&path) {
             Ok(data) => {
@@ -1077,21 +1180,45 @@ impl AppState {
                         if let Some(ref s3) = s3_storage {
                             for entry in &manifest.segments {
                                 let rel = format!("{}/{}", ns.0, entry.segment_id.0);
-                                if s3.segment_durable_in_s3(&rel) {
-                                    synced_segments.insert((ns.clone(), entry.segment_id.clone()));
-                                    continue;
-                                }
                                 let seg_path = data_dir.join(&ns.0).join(&entry.segment_id.0);
-                                if sync_segment_dir_to_s3(s3, &data_dir, &seg_path) {
-                                    synced_segments.insert((ns.clone(), entry.segment_id.clone()));
-                                    reconciled_missing += 1;
-                                    println!(
-                                        "reconciliation: uploaded segment missing from S3: {rel}"
-                                    );
-                                } else {
+                                // Diff against the local directory rather
+                                // than asking "does S3 have anything here":
+                                // a segment whose upload died partway
+                                // through passed that test and was declared
+                                // durable forever, which is how two staging
+                                // segments ended up permanently missing
+                                // just their `doc_store.offsets` (#179).
+                                let remote = s3.segment_files_in_s3(&rel);
+                                let missing = local_segment_files_missing_in_s3(&seg_path, &remote);
+                                if remote.is_empty() && missing.is_empty() {
+                                    // Nothing in S3 and nothing local to
+                                    // upload — unrecoverable, same as before.
                                     eprintln!(
                                         "WARN: reconciliation found segment {rel} durable in \
                                          neither S3 nor local disk — data loss, cannot recover"
+                                    );
+                                    continue;
+                                }
+                                if missing.is_empty() {
+                                    synced_segments.insert((ns.clone(), entry.segment_id.clone()));
+                                    continue;
+                                }
+                                if sync_segment_files_to_s3(s3, &data_dir, &seg_path, &missing) {
+                                    synced_segments.insert((ns.clone(), entry.segment_id.clone()));
+                                    reconciled_missing += 1;
+                                    println!(
+                                        "reconciliation: uploaded {} file(s) missing from S3 for \
+                                         segment {rel}: {}",
+                                        missing.len(),
+                                        missing.join(", "),
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "WARN: reconciliation could not upload {} missing \
+                                         file(s) for segment {rel} ({}) — segment stays \
+                                         incomplete in S3",
+                                        missing.len(),
+                                        missing.join(", "),
                                     );
                                 }
                             }
@@ -2305,11 +2432,23 @@ impl AppState {
             .iter()
             .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
             .collect();
-        let paths_with_manifest_footer: std::collections::HashSet<PathBuf> = manifest
+        // Path → the snapshot's `format_version`. Deliberately not a
+        // `HashSet` of "has a snapshot": presence answers "can we skip
+        // fetching footer.json", which is not the same question as "did the
+        // writer emit a doc_store.offsets sidecar". Conflating the two is
+        // what made a legacy segment chase a sidecar that never existed —
+        // see `segment_is_lazy_capable`.
+        let manifest_footer_versions: std::collections::HashMap<PathBuf, u32> = manifest
             .segments
             .iter()
-            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_some())
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .filter_map(|entry| {
+                manifest.segment_footer(&entry.segment_id).map(|footer| {
+                    (
+                        self.data_dir.join(&ns.0).join(&entry.segment_id.0),
+                        footer.format_version,
+                    )
+                })
+            })
             .collect();
 
         let missing_manifest_footer_paths: Vec<PathBuf> = manifest
@@ -2352,7 +2491,7 @@ impl AppState {
             &to_hydrate,
             needs_vectors,
             needs_filters,
-            &paths_with_manifest_footer,
+            &manifest_footer_versions,
             request,
         );
         let postings_outcome = self.ensure_posting_blobs_local(
@@ -2448,7 +2587,7 @@ impl AppState {
         seg_paths: &[PathBuf],
         needs_vectors: bool,
         needs_filters: bool,
-        paths_with_manifest_footer: &std::collections::HashSet<PathBuf>,
+        manifest_footer_versions: &std::collections::HashMap<PathBuf, u32>,
         request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
@@ -2461,7 +2600,7 @@ impl AppState {
                 p,
                 needs_vectors,
                 needs_filters,
-                paths_with_manifest_footer.contains(p),
+                manifest_footer_versions.contains_key(p),
             )
         });
 
@@ -2490,7 +2629,7 @@ impl AppState {
 
                 // `footer.json` is needed only for legacy manifests that do
                 // not carry a footer snapshot.
-                if !paths_with_manifest_footer.contains(seg_path)
+                if !manifest_footer_versions.contains_key(seg_path)
                     && !file_present_nonempty(&seg_path.join("footer.json"))
                 {
                     logical_paths.push((format!("{s3_prefix}/footer.json"), 0));
@@ -2504,19 +2643,17 @@ impl AppState {
 
                 // doc_store: Lazy segments need only the offsets sidecar;
                 // legacy (format_version 0) segments need the full
-                // doc_store.bin because eager open parses it. Decide via the
-                // already-local footer's format_version. NOTE: compare
-                // against 1 — the version that introduced the offsets
-                // sidecar — not SEGMENT_FORMAT_VERSION, which moves with
-                // every format change (it's already 2 for the lazy inverted
-                // index) and would misclassify every v1 segment as legacy,
-                // silently re-fetching all their doc stores.
+                // doc_store.bin because eager open parses it. See
+                // `segment_is_lazy_capable` for how that's decided and what
+                // it used to get wrong.
                 let has_offsets = file_present_nonempty(&seg_path.join("doc_store.offsets"));
-                let lazy_capable = has_offsets
-                    || paths_with_manifest_footer.contains(seg_path)
-                    || SegmentReader::read_footer(seg_path)
-                        .map(|ft| ft.format_version >= 1)
-                        .unwrap_or(false);
+                let lazy_capable = segment_is_lazy_capable(
+                    has_offsets,
+                    manifest_footer_versions.get(seg_path).copied(),
+                    SegmentReader::read_footer(seg_path)
+                        .ok()
+                        .map(|ft| ft.format_version),
+                );
                 if lazy_capable {
                     if !has_offsets {
                         logical_paths.push((format!("{s3_prefix}/doc_store.offsets"), 0));
@@ -2576,6 +2713,58 @@ impl AppState {
                 }
             }
 
+            // Doc-store fallback (issue #179). A segment classified Lazy is
+            // sent to score with only its offsets sidecar — `doc_store.bin`
+            // is deliberately deferred to page materialize. When that
+            // sidecar turns out not to exist in S3 at all, the segment ends
+            // up with *neither* doc-store file locally, which is the one
+            // combination `SegmentReader::open` cannot work with: the
+            // request 503s with "segment hydration failed" even though the
+            // bulk `doc_store.bin` is sitting in S3 and the reader's eager
+            // path would read it perfectly well.
+            //
+            // Two staging segments are in exactly that state — one written
+            // three weeks before it was noticed — so this is a standing data
+            // shape, not a transient. Fall back to the eager file rather
+            // than failing the search. It is the expensive path (that is
+            // why Lazy exists), but a slow answer beats a hard error, and it
+            // self-heals: once `doc_store.bin` is local, later queries on
+            // this segment are served from disk.
+            //
+            // A transient S3 failure on the sidecar lands here too, and gets
+            // the same treatment for the same reason.
+            let mut fallback_paths: Vec<(String, u64)> = Vec::new();
+            for (seg_path, _) in &owned {
+                if !segment_needs_doc_store_fallback(seg_path) {
+                    continue;
+                }
+                let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+                    continue;
+                };
+                let s3_prefix = rel_path.to_string_lossy().into_owned();
+                eprintln!(
+                    "WARN: segment {s3_prefix} has no doc_store.offsets in S3; falling back to \
+                     the eager doc_store.bin path. The sidecar is missing at rest and should be \
+                     repaired (POST /v1/admin/backfill-offset-tables), otherwise every cold \
+                     query on this segment pays the full doc store."
+                );
+                fallback_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
+            }
+            if !fallback_paths.is_empty() {
+                self.hydrate_files(
+                    s3,
+                    &fallback_paths,
+                    self.scoring_hydrate_concurrency,
+                    request,
+                );
+                for (path, _) in &fallback_paths {
+                    if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
+                        outcome.files_fetched += 1;
+                        outcome.bytes_fetched += m.len();
+                    }
+                }
+            }
+
             drop(_permit);
             complete_owned(&self.in_flight_segments, &owned);
         }
@@ -2589,7 +2778,7 @@ impl AppState {
                     p,
                     needs_vectors,
                     needs_filters,
-                    paths_with_manifest_footer.contains(*p),
+                    manifest_footer_versions.contains_key(*p),
                 )
             })
             .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
@@ -5725,6 +5914,146 @@ mod tests {
     #[test]
     fn chunk_by_byte_budget_empty_input_yields_no_chunks() {
         assert!(chunk_by_byte_budget(&[], 100).is_empty());
+    }
+
+    /// Issue #179's root cause on the read side. Modern manifests snapshot
+    /// a footer for *every* segment they list, legacy ones included, so
+    /// "the manifest has a footer for this segment" says nothing about
+    /// whether the writer emitted a `doc_store.offsets` sidecar. Treating
+    /// it as if it did sent hydration chasing a file that was never
+    /// written, and the search 503'd with `doc_store.bin` sitting right
+    /// there in S3.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_manifest_footer_snapshot_alone_does_not_make_a_segment_lazy_capable() {
+        assert!(
+            !segment_is_lazy_capable(false, Some(0), None),
+            "format_version 0 is legacy — no sidecar exists, fetch doc_store.bin"
+        );
+        assert!(
+            segment_is_lazy_capable(false, Some(1), None),
+            "format_version 1 introduced the sidecar"
+        );
+        assert!(
+            segment_is_lazy_capable(false, Some(2), None),
+            "later versions still have it"
+        );
+        // The manifest snapshot is authoritative when present, even if a
+        // stale footer.json on disk disagrees.
+        assert!(
+            !segment_is_lazy_capable(false, Some(0), Some(2)),
+            "manifest snapshot wins over the on-disk footer"
+        );
+        assert!(
+            segment_is_lazy_capable(false, None, Some(1)),
+            "no snapshot → fall back to the on-disk footer"
+        );
+        assert!(
+            !segment_is_lazy_capable(false, None, None),
+            "no footer anywhere → assume legacy; a wrong guess the other way is a 503"
+        );
+        assert!(
+            segment_is_lazy_capable(true, None, None),
+            "a sidecar already on disk settles it regardless of any footer"
+        );
+    }
+
+    /// The other half of #179: with the sidecar absent from S3 and
+    /// `doc_store.bin` deferred, a segment can reach scoring with neither
+    /// doc-store file — the one state `SegmentReader::open` cannot use.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_segment_with_neither_doc_store_file_falls_back_to_the_bulk_file() {
+        let dir = std::env::temp_dir().join("kosha-test-doc-store-fallback");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        assert!(
+            segment_needs_doc_store_fallback(&dir),
+            "neither file present → must fetch doc_store.bin rather than 503"
+        );
+
+        fs::write(dir.join("doc_store.offsets"), b"x").unwrap();
+        assert!(
+            !segment_needs_doc_store_fallback(&dir),
+            "the sidecar is enough — never pull the bulk file on the scoring path"
+        );
+
+        fs::remove_file(dir.join("doc_store.offsets")).unwrap();
+        fs::write(dir.join("doc_store.bin"), b"x").unwrap();
+        assert!(
+            !segment_needs_doc_store_fallback(&dir),
+            "the eager file alone is also enough"
+        );
+
+        // A zero-byte file is the residue of an interrupted write, not a
+        // usable doc store — same rule the rest of the hydration path uses.
+        fs::write(dir.join("doc_store.bin"), b"").unwrap();
+        assert!(
+            segment_needs_doc_store_fallback(&dir),
+            "a zero-byte doc store must not count as present"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Reconciliation's durability test used to be "does S3 hold *any*
+    /// object for this segment", which a partially-uploaded segment passes
+    /// — so it was recorded as durable and never repaired. Both staging
+    /// segments in #179 are in exactly this shape: everything present but
+    /// `doc_store.offsets`.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn durability_is_diffed_per_file_not_per_prefix() {
+        let dir = std::env::temp_dir().join("kosha-test-durability-diff");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for f in [
+            "footer.json",
+            "inverted.idx",
+            "filters.bin",
+            "doc_store.bin",
+            "doc_store.offsets",
+        ] {
+            fs::write(dir.join(f), b"x").unwrap();
+        }
+
+        let remote = vec![
+            "footer.json".to_string(),
+            "inverted.idx".to_string(),
+            "filters.bin".to_string(),
+            "doc_store.bin".to_string(),
+        ];
+        assert_eq!(
+            local_segment_files_missing_in_s3(&dir, &remote),
+            vec!["doc_store.offsets".to_string()],
+            "the one missing file must be found, not masked by its siblings"
+        );
+
+        let complete = {
+            let mut r = remote.clone();
+            r.push("doc_store.offsets".to_string());
+            r
+        };
+        assert!(
+            local_segment_files_missing_in_s3(&dir, &complete).is_empty(),
+            "a fully-uploaded segment needs no repair"
+        );
+
+        // Mid-write scaffolding must never be uploaded: it is renamed away
+        // moments later, leaving an S3 object nothing will ever read.
+        fs::write(dir.join(".doc_store.bin.tmp.123.4"), b"x").unwrap();
+        fs::write(dir.join("doc_store.tmp.123.5"), b"x").unwrap();
+        assert!(
+            local_segment_files_missing_in_s3(&dir, &complete).is_empty(),
+            "temp files are not segment content"
+        );
+
+        assert_eq!(
+            local_segment_files_missing_in_s3(&dir.join("does-not-exist"), &[]),
+            Vec::<String>::new(),
+            "a segment with no local copy has nothing to repair from"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "s3")]
