@@ -12,10 +12,9 @@
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dot: dimension mismatch");
     let mut acc = [0.0f32; 8];
-    let ca = a.chunks_exact(8);
-    let cb = b.chunks_exact(8);
-    let (ra, rb) = (ca.remainder(), cb.remainder());
-    for (xa, xb) in ca.zip(cb) {
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (xa, xb) in ca.iter().zip(cb.iter()) {
         for l in 0..8 {
             acc[l] += xa[l] * xb[l];
         }
