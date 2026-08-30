@@ -72,12 +72,33 @@ spec:
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
+          # Cold start is dominated by the control-plane restore, which reads
+          # every segment ref for every namespace out of S3 before the server
+          # binds :8080. On 2026-08-29 the staging ingest pod was rescheduled
+          # onto a fresh r5dn node, so the instance-store hostPath cache was
+          # empty; the restore then took 93-101s (3,280 segment refs, ~126MB
+          # pulled from S3) while liveness — initialDelay 15s, period 20s,
+          # failureThreshold 3 — killed the container at ~55-75s. Nothing was
+          # listening yet, so every probe got "connection refused" and the pod
+          # crashlooped 127 times over 8h with kosha-ingest-service holding
+          # zero endpoints. A startupProbe is the fix: liveness and readiness
+          # stay suspended until it first succeeds, so a cold restore gets a
+          # 600s budget while a warm one still goes ready in ~10s. The budget
+          # scales with segment count, so keep it generous.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 60
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 20
+            timeoutSeconds: 5
           resources:
             # ephemeral-storage now only covers the container filesystem
             # (logs, /tmp) — the segment cache is on the instance-store
