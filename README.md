@@ -15,6 +15,14 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 > aggregation, and HNSW vector search. RRF fusion and rerank are Phase 2
 > (DESIGN.md §3.1).
 
+## Install
+
+| Artifact | Where | Get it |
+| --- | --- | --- |
+| Server image | [Docker Hub — `ravidecoverai/kosha`](https://hub.docker.com/r/ravidecoverai/kosha) | `docker pull ravidecoverai/kosha:latest` |
+| Python client | [PyPI — `kosha-client`](https://pypi.org/project/kosha-client/) | `pip install kosha-client` |
+| CLI | not published to crates.io yet | `cargo install --path crates/kosha-cli` |
+
 ## Supported features
 
 ### Query
@@ -72,8 +80,8 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 - HTTP/JSON `/v1` API — `documents`, `search`, `flush`, `delete`, `exists`, `stats` — with the Phase 1 unversioned routes still served for backward compatibility.
 - `proto/kosha/v1/kosha.proto` is the canonical API contract and the source for generated stubs and the OpenAPI spec.
-- `kosha` CLI: health, index, search, flush, delete, stats, admin commands, named profiles, `--json` output, and a `kosha curl` escape hatch.
-- OpenSearch-compatible Python client: `search`, `index`, `bulk`, `count`, `update`, `delete_by_query`, `update_by_query`, `scroll`, plus `indices` and `tasks` namespaces, translating the ES query DSL to Kosha's native shape.
+- `kosha` CLI (built from `crates/kosha-cli`, not yet on crates.io): health, index, search, flush, delete, stats, admin commands, named profiles, `--json` output, and a `kosha curl` escape hatch.
+- OpenSearch-compatible Python client, [`kosha-client` on PyPI](https://pypi.org/project/kosha-client/): `search`, `index`, `bulk`, `count`, `update`, `delete_by_query`, `update_by_query`, `scroll`, plus `indices` and `tasks` namespaces, translating the ES query DSL to Kosha's native shape.
 
 ### Not supported yet
 
@@ -132,7 +140,12 @@ kosha stats -n quickstart-demo
 See [crates/kosha-cli/README.md](crates/kosha-cli/README.md) for profiles
 (`~/.kosha/config.toml`), `--json` output, and the `kosha curl` escape hatch.
 
-The Python client still works the same way for application code:
+The Python client ([`kosha-client` on PyPI](https://pypi.org/project/kosha-client/))
+still works the same way for application code:
+
+```bash
+pip install kosha-client
+```
 
 ```python
 from kosha_client import KoshaClient
@@ -168,11 +181,14 @@ auto-created.
 
 ### Run with Docker
 
-Pre-built multi-arch images are published to GHCR on every merge to `main`
-(`:main`) and for every `v*` tag (`:0.2.5`, `:0.2`, `:latest`):
+Pre-built images are published to Docker Hub at
+[`ravidecoverai/kosha`](https://hub.docker.com/r/ravidecoverai/kosha) — `:main`
+on every merge to `main`, and `:latest` plus the semver tags (`:0.1.0`, `:0.1`)
+for every `v*` tag. Tagged releases are multi-arch (amd64 + arm64); `:main` is
+amd64 only.
 
-    docker pull ghcr.io/decover-tech/kosha:latest
-    docker run --rm -p 8080:8080 ghcr.io/decover-tech/kosha:latest
+    docker pull ravidecoverai/kosha:latest
+    docker run --rm -p 8080:8080 ravidecoverai/kosha:latest
     curl localhost:8080/healthz   # -> ok
 
 Or build locally:
