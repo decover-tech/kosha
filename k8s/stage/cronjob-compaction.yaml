@@ -1,0 +1,93 @@
+# Scheduled compaction for the staging paragraph namespace.
+#
+# There is no "compaction pod" to deploy, despite DESIGN.md §5 describing
+# three node types: `KOSHA_ROLE` is read once (main.rs:2921) and used only
+# in a log line (main.rs:2954). The behavioural split is `KOSHA_INGEST_HOST`
+# — set means "forward writes to the ingest", unset means "execute them
+# locally". A pod started with KOSHA_ROLE=compaction and no
+# KOSHA_INGEST_HOST would therefore come up as a *second write-executing
+# ingest*, mutating the same manifests as the real one with no coordination
+# between them, and would compact nothing anyway because no code path
+# triggers compaction at startup.
+#
+# The only thing that actually compacts is POST /v1/admin/compact-namespace
+# on the existing ingest, so that is what this calls.
+#
+# Why it is needed: paragraph_index_hnsw reached 1,529 segments at manifest
+# version ~5460 with a 12MB manifest, because KoshaClient.bulk() issues an
+# explicit /flush after every batch — one segment per <=500 documents,
+# which bypasses KOSHA_FLUSH_THRESHOLD entirely. That sprawl is what makes
+# ingest cold start ~100s, makes full-namespace scans hydrate 1.69GiB of
+# filters.bin in a single request, and makes one scan page cost ~17s
+# (materialize_ms=13764 merge-sorting across all those segments).
+#
+# Uses curl rather than kosha-cli: the CLI has no compact command, and the
+# image ships only kosha-server (Dockerfile:35) with no HTTP client.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kosha-compaction
+  namespace: kosha
+spec:
+  # Daily, off-peak UTC. Compaction hydrates the whole namespace (22.35GiB
+  # for paragraph_index_hnsw, vectors included) onto the ingest pod and
+  # competes with live write traffic on that single pod, so it should not
+  # overlap the working day or a catch-up run.
+  schedule: "0 4 * * *"
+  timeZone: Etc/UTC
+  # A second run starting while the first is still merging would have two
+  # compactions racing on one manifest.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Start suspended: enable deliberately once a first manual run has been
+  # observed end to end on this namespace.
+  suspend: true
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      # Hard ceiling well past a realistic run. The endpoint is synchronous
+      # and hydrates the full namespace before merging anything.
+      activeDeadlineSeconds: 10800
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: compact
+              image: curlimages/curl:8.11.1
+              env:
+                - name: KOSHA_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: kosha-secret
+                      key: bootstrap-api-key
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  # Addresses the ingest Service directly. kosha-service
+                  # routes to query pods, which would only forward this
+                  # back to the ingest anyway.
+                  URL="http://kosha-ingest-service.kosha.svc.cluster.local:8080/v1/admin/compact-namespace"
+                  for NS in paragraph_index_hnsw findings_index; do
+                    echo "compacting ${NS}"
+                    # --max-time is generous because the handler runs the
+                    # whole hydrate-then-merge inside the request. If it is
+                    # exceeded the merge still continues server-side; the
+                    # ingest pod log is the source of truth for the result,
+                    # not this exit code.
+                    curl -sS --fail-with-body --max-time 9000 \
+                      -H "Authorization: Bearer ${KOSHA_API_KEY}" \
+                      -H "Content-Type: application/json" \
+                      -X POST -d "{\"namespace\":\"${NS}\",\"mode\":\"tiered\"}" \
+                      "${URL}"
+                    echo
+                  done
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "64Mi"
+                limits:
+                  cpu: "200m"
+                  memory: "128Mi"
