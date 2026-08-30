@@ -90,6 +90,42 @@ spec:
             # (emptyDir/ephemeral-storage), this one bounds RAM.
             - name: KOSHA_SEGMENT_LIVE_MAX_BYTES
               value: "25769803776"
+            # Readiness-gated prefetch of the scoring scaffolding
+            # (footer.json + inverted.idx + doc_store.offsets) for every
+            # segment in the manifest, hydrated with
+            # RequestHydration::unlimited().
+            #
+            # Added because full-namespace scans on paragraph_index_hnsw
+            # 429'd with "search overloaded: this query needs more segment
+            # data than one request may hydrate": at 1,529 segments a
+            # match_all needs scaffolding from all of them at once, which
+            # exceeds the per-request hydration budget on a cold pod (logs
+            # showed shed=32 / shed=28). That scan shape is what
+            # backend's catchup_es_to_kosha.py pages ids with, so the
+            # OpenSearch delta could not be reconciled at all. Warmup
+            # bypasses the per-request budget by construction rather than
+            # raising it for every query on the pod.
+            - name: KOSHA_WARMUP_NAMESPACES
+              value: "paragraph_index_hnsw"
+            # Posting blobs OFF, against the code default.
+            #
+            # Bytes are not the reason — measured against the live manifest,
+            # the static scaffolding is 0.19 GiB over 4,587 files and adding
+            # posting blobs only reaches 0.33 GiB, both far inside the
+            # 24 GiB KOSHA_CACHE_MAX_BYTES above. File *count* is: those
+            # blobs are 206,756 objects, and warmup is readiness-gated, so
+            # fetching them holds /readyz at 503 for the whole pass. The
+            # comparable 214,558-file hydration on the ingest pod took ~25
+            # minutes; paying that on every rollout and every HPA scale-up
+            # (min 2 / max 6) is a bad trade for a prefetch whose stated
+            # purpose is avoiding a first-query convoy.
+            #
+            # Nothing needed here wants them: warmup's own probe query is
+            # empty, and the scan this exists for is match_all with no query
+            # text, so no term shards are read. Leave this on only if a
+            # future workload on these pods is BM25-heavy from cold.
+            - name: KOSHA_WARMUP_POSTING_BLOBS
+              value: "0"
           resources:
             requests:
               cpu: "2"
