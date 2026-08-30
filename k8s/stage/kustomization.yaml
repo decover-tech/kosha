@@ -14,6 +14,7 @@ namespace: kosha
 
 resources:
   - ../base
+  - cronjob-compaction.yaml
 
 patches:
   - path: configmap-patch.yaml

@@ -66,6 +66,19 @@ spec:
                 secretKeyRef:
                   name: kosha-secret
                   key: bootstrap-api-key
+            # Admin routes on this pod are synchronous and long:
+            # /v1/admin/compact-namespace hydrates the entire namespace
+            # (22.35GiB for staging's paragraph_index_hnsw, vectors
+            # included) and merges it inside the request. The default is
+            # 300s, so such a call answers into a dead socket while the
+            # work continues server-side, leaving the caller with no way to
+            # tell success from failure. This is a per-syscall read/write
+            # budget, not a request deadline (see the comment where it is
+            # parsed), so raising it costs nothing for normal traffic — it
+            # only stops a slow handler's response from being unsendable.
+            # 1800 matches what deployment-query.yaml already carries.
+            - name: KOSHA_HTTP_IO_TIMEOUT_SECS
+              value: "1800"
           readinessProbe:
             httpGet:
               path: /healthz
