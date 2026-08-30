@@ -85,12 +85,27 @@ spec:
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
+          # Same cold-start race as the ingest Deployment (see the comment
+          # there): a query pod on a fresh node has to restore every segment
+          # ref from S3 before it binds, which outruns the liveness budget and
+          # crashloops the pod. These two survived only because they were last
+          # scheduled when the corpus was smaller — the next node recycle would
+          # have hit it. Liveness/readiness stay suspended until this first
+          # succeeds.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 60
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 20
+            timeoutSeconds: 5
           resources:
             # Placeholder — overridden by stage/prod overlay patches. Base
             # stays small/no-op like the rest of this file's defaults.
