@@ -15,6 +15,81 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 > aggregation, and HNSW vector search. RRF fusion and rerank are Phase 2
 > (DESIGN.md §3.1).
 
+## Install
+
+| Artifact | Where | Get it |
+| --- | --- | --- |
+| Server image | [Docker Hub — `ravidecoverai/kosha`](https://hub.docker.com/r/ravidecoverai/kosha) | `docker pull ravidecoverai/kosha:latest` |
+| Python client | [PyPI — `kosha-client`](https://pypi.org/project/kosha-client/) | `pip install kosha-client` |
+| CLI | not published to crates.io yet | `cargo install --path crates/kosha-cli` |
+
+## Supported features
+
+### Query
+
+| Feature | Notes |
+| --- | --- |
+| BM25 lexical search | Tunable `k1` / `b` per request (defaults 1.2 / 0.75) |
+| `operator: and` / `or` | AND (default) requires every query term; OR scores the union |
+| Block-max WAND | Skip-list postings, rarest-first probe ordering, leapfrog AND join |
+| `match_phrase` | Positional postings, configurable `slop` |
+| `wildcard` | Per-field pattern match, case-insensitive by default |
+| kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
+| Hybrid retrieval | A `knn` clause and `query_text` in one request; vector and BM25 hits merged per segment |
+| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `bool` (`must` / `must_not` / `should` / `minimum_should_match`), `match_all` |
+| kNN-scoped filters | `knn.filter` restricts vector candidates; the top-level `filter` still governs the merged result set |
+| Sorting | Multi-field `sort` over stored fields, plus `_id` |
+| Pagination | `from` / `max_results`, and an OpenSearch-style `search_after` cursor |
+| Highlighting | Per-field, with configurable `pre_tags` / `post_tags` |
+| Aggregations | `terms`, `cardinality`, `composite` |
+| Total-hit accounting | Capped counting with an `eq` / `gte` relation (`track_total_hits`-style), overridable per query via `exact_total_hits` / `total_hits_cap` |
+| Degradation signal | `knn_degraded_segments` reports segments whose vector search failed, so a 200 with silently missing neighbors is visible to the caller |
+
+### Indexing and writes
+
+- Bulk document indexing, with field types `Text`, `Keyword`, `Integer`, `Float`, `Date`, `Boolean`, `Vector`.
+- Upsert by document id — segments holding a prior version of an id are rewritten.
+- Delete by query (tombstone-based) and a document `exists` check.
+- Write-ahead log for buffered documents, replayed on restart.
+- Auto-flush at a configurable document threshold (`KOSHA_FLUSH_THRESHOLD`), plus an explicit `flush`.
+- Size-tiered compaction with a cap on merged-segment size (5 GiB default), triggered by the admin endpoint or the compaction CronJob.
+
+### Storage and caching
+
+- S3 as the source of truth; any S3-compatible endpoint works (MinIO locally, path-style supported).
+- Local NVMe read-through cache, size-bounded with LRU eviction.
+- Lazy segment loading — the doc store, filter columns, and postings are read on demand, with ranged GETs for doc-store pages instead of whole-blob fetches.
+- In-memory parsed-segment cache governed by a live-bytes ledger and an admission gate, with a per-request hydration byte budget and bounded hydration concurrency.
+- Posting-blob presence cache, postings cache, and vector-postings cache.
+- Whole-response result cache for `POST /search` (bypassable per query with `no_cache`).
+- Cross-replica hydration leases in Postgres: one pod fetches a cold segment from S3, its peers stream the bytes from it over `GET /internal/segment/...` rather than stampeding S3.
+- Bloom filters over terms and filter fields, so a segment that cannot match is skipped without being read.
+- Namespace warmup on boot, gated behind `/readyz` so traffic is not routed to a cold pod.
+
+### Control plane and operations
+
+- Namespace registry and manifest store, in-memory by default or Postgres-backed (`postgres` feature + `DATABASE_URL`), with compare-and-swap manifest publishes.
+- Multi-tenancy: every API key maps to a tenant prefix that scopes all namespace access.
+- Read/write split: query pods forward every mutating route to `KOSHA_INGEST_HOST` and serve reads locally.
+- Backpressure controls: max concurrent searches, search queue depth and timeout, hydration concurrency, admission timeout.
+- `GET /healthz` (liveness), `GET /readyz` (readiness), `GET /v1/stats` and per-namespace stats.
+- Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace, import a namespace.
+- Schema migrations via `kosha-server migrate`.
+
+### API and clients
+
+- HTTP/JSON `/v1` API — `documents`, `search`, `flush`, `delete`, `exists`, `stats` — with the Phase 1 unversioned routes still served for backward compatibility.
+- `proto/kosha/v1/kosha.proto` is the canonical API contract and the source for generated stubs and the OpenAPI spec.
+- `kosha` CLI (built from `crates/kosha-cli`, not yet on crates.io): health, index, search, flush, delete, stats, admin commands, named profiles, `--json` output, and a `kosha curl` escape hatch.
+- OpenSearch-compatible Python client, [`kosha-client` on PyPI](https://pypi.org/project/kosha-client/): `search`, `index`, `bulk`, `count`, `update`, `delete_by_query`, `update_by_query`, `scroll`, plus `indices` and `tasks` namespaces, translating the ES query DSL to Kosha's native shape.
+
+### Not supported yet
+
+- RRF fusion and reranking (Phase 2, DESIGN.md §3.1).
+- Configurable analyzers — tokenization is fixed (whitespace split, ASCII-punctuation trim, lowercase). The `analyzer` field exists in the schema proto but is not honored.
+- gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
+- `kosha-vector-spfresh` (SPFresh/SPANN with LIRE rebalancing) is a standalone, benchmarked prototype; it is not wired into the segment format or the query path.
+
 ## Repository layout
 
     crates/
@@ -65,7 +140,12 @@ kosha stats -n quickstart-demo
 See [crates/kosha-cli/README.md](crates/kosha-cli/README.md) for profiles
 (`~/.kosha/config.toml`), `--json` output, and the `kosha curl` escape hatch.
 
-The Python client still works the same way for application code:
+The Python client ([`kosha-client` on PyPI](https://pypi.org/project/kosha-client/))
+still works the same way for application code:
+
+```bash
+pip install kosha-client
+```
 
 ```python
 from kosha_client import KoshaClient
@@ -101,11 +181,14 @@ auto-created.
 
 ### Run with Docker
 
-Pre-built multi-arch images are published to GHCR on every merge to `main`
-(`:main`) and for every `v*` tag (`:0.2.5`, `:0.2`, `:latest`):
+Pre-built images are published to Docker Hub at
+[`ravidecoverai/kosha`](https://hub.docker.com/r/ravidecoverai/kosha) — `:main`
+on every merge to `main`, and `:latest` plus the semver tags (`:0.1.0`, `:0.1`)
+for every `v*` tag. Tagged releases are multi-arch (amd64 + arm64); `:main` is
+amd64 only.
 
-    docker pull ghcr.io/decover-tech/kosha:latest
-    docker run --rm -p 8080:8080 ghcr.io/decover-tech/kosha:latest
+    docker pull ravidecoverai/kosha:latest
+    docker run --rm -p 8080:8080 ravidecoverai/kosha:latest
     curl localhost:8080/healthz   # -> ok
 
 Or build locally:
