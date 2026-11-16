@@ -7,6 +7,7 @@
     "term-on-numeric-field": "term/terms filters only consult string-typed fields, so a term on an Integer/Float field never matches (FilterApplier::apply_term reads store.string_fields only)",
     "numeric-sort-lexicographic": "Integer/Float fields sort as strings, so 10 sorts before 9 (build_sort_value_maps stringifies values; compare_candidate_sort_keys compares strings)",
     "id-score-sort-uses-wand": "Sorting by _id, or by _score asc, still takes the block-max WAND path (gated on sort_value_fields, which excludes _id/_score), so the page is the top-k BY SCORE re-sorted rather than the first k in the requested order; hidden on segments with tombstones",
+    "missing-posting-shard-503": "S3 path only: a query term that hashes to a posting shard the segment never wrote (empty shards are skipped by the writer, common in small segments) is still requested from S3 during hydration; the 404 fails the whole search with 503 'segment hydration failed' (kosha-server posting_blob_files_for_query does not consult the segment's TOC). The listed checks are the ones seed 1 trips at the 10-doc segment written in the 'deletes' step",
     "delete-count-includes-tombstoned": "delete-by-query's 'deleted' count includes docs that were already tombstoned (Indexer::delete_by_query counts every filter match in each segment)"
   },
 
@@ -21,6 +22,12 @@
     "*:sort/integer-asc:ids": "numeric-sort-lexicographic",
     "*:sort/score-asc:ids": "id-score-sort-uses-wand",
     "*:walk/after-id:walk": "id-score-sort-uses-wand",
-    "deletes:delete-count:*": "delete-count-includes-tombstoned"
+    "deletes:delete-count:*": "delete-count-includes-tombstoned",
+    "deletes:bm25/or-missing-term:status": "missing-posting-shard-503",
+    "deletes:bm25/params-k1-2-b0:status": "missing-posting-shard-503",
+    "deletes:tok/dots:status": "missing-posting-shard-503",
+    "deletes:tok/non-ascii:status": "missing-posting-shard-503",
+    "deletes:sort/score-asc:status": "missing-posting-shard-503",
+    "deletes:page/past-end:status": "missing-posting-shard-503"
   }
 }
