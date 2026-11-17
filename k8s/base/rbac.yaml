@@ -49,6 +49,12 @@ rules:
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Added for the staging compaction CronJob (k8s/stage/cronjob-compaction.yaml).
+  # It landed after this Role was last applied, so every deploy since then
+  # failed at `kubectl apply` with "cannot get resource cronjobs".
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
