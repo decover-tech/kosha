@@ -1,0 +1,11 @@
+# Overlay for the repo-root docker-compose.yml that makes segment layout
+# deterministic for the conformance suite (one explicit flush = one segment),
+# so the reference model can predict exact per-segment BM25 scores.
+#
+#   docker compose -f docker-compose.yml \
+#     -f scripts/conformance/docker-compose.conformance.yml up --build -d
+services:
+  kosha-server:
+    environment:
+      KOSHA_FLUSH_THRESHOLD: "1000000"
+      KOSHA_MAX_CONCURRENT_FLUSH_WRITERS: "1"

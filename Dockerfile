@@ -30,7 +30,13 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 kosha
+    && useradd --system --uid 10001 kosha \
+    # Pre-create the default KOSHA_DATA_DIR owned by the runtime user: a
+    # named volume mounted here (docker-compose.yml) copies this ownership,
+    # whereas a missing dir makes Docker create the volume root-owned and
+    # the first flush fails with EACCES.
+    && mkdir -p /var/lib/kosha/data \
+    && chown -R kosha /var/lib/kosha
 
 COPY --from=builder /app/target/release/kosha-server /usr/local/bin/kosha-server
 
