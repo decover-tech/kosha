@@ -139,6 +139,24 @@ class KoshaClient:
 
     # ── Search ─────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _wants_refresh(params: dict) -> bool:
+        """Whether a write asked to be visible on return (ES ``refresh``).
+
+        ``True``/``"true"``/``""`` (bare ``?refresh``) and ``"wait_for"`` all
+        mean "searchable when this call returns" — Kosha has no async
+        refresh to wait on, so both are an explicit ``/flush``. Anything else
+        (the default) leaves visibility to the server's idle-buffer flush
+        (``KOSHA_FLUSH_MAX_AGE_MS``, ~1 s), like ES's ``refresh_interval``.
+        """
+        refresh = params.get("refresh", False)
+        if isinstance(refresh, bool):
+            return refresh
+        return str(refresh).strip().lower() in ("", "true", "wait_for")
+
+    def _flush(self, namespace: str) -> None:
+        self._request("POST", "flush", {"namespace": namespace})
+
     def _resolve_ns(self, index):
         """Resolve namespace from opensearch_dsl index parameter (can be list)."""
         ns = index or self._namespace
@@ -737,6 +755,8 @@ class KoshaClient:
         }
         payload = {"namespace": ns, "documents": [doc]}
         result = self._request("POST", "index", body=payload)
+        if self._wants_refresh(params):
+            self._flush(ns)
         return {
             "_index": ns,
             "_id": id or "",
@@ -756,6 +776,14 @@ class KoshaClient:
         Accepts the standard OpenSearch bulk body format (action+source lines
         as a list or newline-delimited string) and indexes each document via
         Kosha.
+
+        Documents are visible on return only with ``refresh=True`` or
+        ``refresh="wait_for"`` (ES semantics); otherwise the server publishes
+        them within ~1 s (``KOSHA_FLUSH_MAX_AGE_MS``) or as soon as its
+        buffer reaches ``KOSHA_FLUSH_THRESHOLD``. Flushing after every batch
+        unconditionally — as this method used to — cut one segment per
+        ≤500-doc chunk (1,529 segments and a 12 MB manifest on one staging
+        namespace, issue #241).
         """
         default_ns = self._resolve_ns(index)
         # (namespace, op, doc) triples in original order — response items must
@@ -837,11 +865,13 @@ class KoshaClient:
             self._request(
                 "POST", "index", body={"namespace": doc_ns, "documents": docs}
             )
-            self._request("POST", "flush", {"namespace": doc_ns})
         for doc_ns, docs in updates_by_ns.items():
             self._request(
                 "POST", "replace", body={"namespace": doc_ns, "documents": docs}
             )
+        if self._wants_refresh(params):
+            for doc_ns in dict.fromkeys([*docs_by_ns, *updates_by_ns]):
+                self._flush(doc_ns)
 
         return {
             "errors": bool(errors),
@@ -1165,7 +1195,8 @@ class IndexOps:
         return {"acknowledged": True}
 
     def refresh(self, index: str | None = None, **params: Any) -> dict:
-        logger.info("IndexOps.refresh — no-op (Kosha has no refresh cycle)")
+        """Make every write to ``index`` searchable now (one ``/flush``)."""
+        self._client._flush(self._client._resolve_ns(index))
         return {"_shards": {"total": 1, "successful": 1, "failed": 0}}
 
     def get(self, index: str, **params: Any) -> dict:

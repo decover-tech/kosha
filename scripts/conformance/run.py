@@ -30,9 +30,10 @@ Usage:
       --api-key sk-kosha-dev \\
       --restart-cmd "scripts/conformance/compose_restart_cold.sh"
 
-The server must run with KOSHA_MAX_CONCURRENT_FLUSH_WRITERS=1 and a large
-KOSHA_FLUSH_THRESHOLD so one flush produces exactly one segment; otherwise
-the per-segment score checks cannot be predicted (``--spawn`` sets both).
+The server must run with KOSHA_MAX_CONCURRENT_FLUSH_WRITERS=1, a large
+KOSHA_FLUSH_THRESHOLD and KOSHA_FLUSH_MAX_AGE_MS=0 (no idle-buffer flush
+timer) so segments come only from explicit flushes, one per flush; otherwise
+the per-segment score checks cannot be predicted (``--spawn`` sets all three).
 
 Exit status: 0 when every check passed or failed only as listed in
 expected_failures.json; 1 on any unexpected failure. With --strict, an
@@ -172,6 +173,7 @@ class Spawned:
                 "KOSHA_DATA_DIR": os.path.join(self.dir, "data"),
                 "KOSHA_FLUSH_THRESHOLD": "1000000",
                 "KOSHA_MAX_CONCURRENT_FLUSH_WRITERS": "1",
+                "KOSHA_FLUSH_MAX_AGE_MS": "0",
             }
         )
         if self.database_url:

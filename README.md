@@ -51,7 +51,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 - Upsert by document id — segments holding a prior version of an id are rewritten.
 - Delete by query (tombstone-based) and a document `exists` check.
 - Write-ahead log for buffered documents, replayed on restart.
-- Auto-flush at a configurable document threshold (`KOSHA_FLUSH_THRESHOLD`), plus an explicit `flush`.
+- Auto-flush at a configurable document threshold (`KOSHA_FLUSH_THRESHOLD`), plus an explicit `flush` that makes writes visible immediately. A buffer that stays below the threshold is flushed and published once it has been pending for `KOSHA_FLUSH_MAX_AGE_MS` (default 1000; `0` disables), similar to Elasticsearch's `refresh_interval`. The Python client flushes only on `refresh=True` / `"wait_for"` or `indices.refresh()`, not after every bulk batch.
 - Size-tiered compaction with a cap on merged-segment size (5 GiB default), triggered by the admin endpoint or the compaction CronJob.
 
 ### Storage and caching

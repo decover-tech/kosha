@@ -56,7 +56,8 @@ docs = [
     {"index": {"_index": NAMESPACE, "_id": "doc-3"}},
     {"title": "merger analysis", "content": "The proposed merger raises antitrust concerns under Section 7 of the Clayton Act."},
 ]
-result = client.bulk(body=docs)
+# refresh="wait_for": searchable on return (otherwise within ~1 s).
+result = client.bulk(body=docs, refresh="wait_for")
 print(f"   Indexed: {sum(1 for i in result.get('items', []) if i.get('index', {}).get('status') == 201)} documents")
 
 
@@ -73,7 +74,7 @@ for h in hits:
 
 # ── 4. Flush + verify ────────────────────────────────────────────────────────
 section("4. Flush + re-search")
-# The client already flushes after bulk in Phase 1, but demonstrate the explicit call.
+# bulk(refresh="wait_for") above already flushed; this is the raw explicit call.
 resp = client._transport.request("POST", "flush", body={"namespace": NAMESPACE})
 print(f"   Flush: {resp}")
 
