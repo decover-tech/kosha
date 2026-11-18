@@ -2052,6 +2052,7 @@ dependencies = [
  "aws-sigv4",
  "aws-smithy-runtime-api",
  "base64",
+ "crc32fast",
  "http 1.5.0",
  "kosha-cache",
  "kosha-control",

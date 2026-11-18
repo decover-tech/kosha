@@ -29,6 +29,8 @@ mod hydration_budget;
 mod migrate;
 #[cfg(feature = "s3")]
 mod s3_storage;
+#[cfg(feature = "s3")]
+mod segment_commit;
 
 #[cfg(feature = "s3")]
 use hydration_budget::{HydrationBudget, RequestHydration};
@@ -52,6 +54,10 @@ struct AppState {
     admin_auth_key: Option<String>,
     internal_service_key: Option<String>,
     publication_locks: Mutex<HashMap<NamespaceId, Arc<Mutex<()>>>>,
+    /// Hydrated segment files that failed their `_COMMIT` size/CRC check
+    /// (#231), counting refetch failures again. Reported in `/stats`.
+    #[cfg(feature = "s3")]
+    segment_checksum_failures: std::sync::atomic::AtomicU64,
     indexer: Indexer,
     searcher: Searcher,
     /// Local segment / SSD cache root (`KOSHA_DATA_DIR`). Never authoritative
@@ -704,48 +710,42 @@ fn segments_needing_sync<'a>(
         .collect()
 }
 
-/// Upload every file in `seg_dir` to S3. Returns `true` only if every file
-/// uploaded successfully — a partial upload must not be treated as durable.
+/// Upload a segment directory to S3 and commit it: every data file first,
+/// in a fixed (sorted) order, then the `_COMMIT` marker last, listing each
+/// file's size and CRC32 (#231). Only a segment whose `_COMMIT` landed
+/// counts as durable (`S3Storage::segment_durability`), so a crash or a
+/// failed PUT partway through leaves a prefix that reconciliation will
+/// re-upload instead of trusting.
+///
+/// Refuses to commit a directory that is missing any required segment file
+/// locally: committing it would publish a segment that can never be opened.
 ///
 /// Free function (not an `AppState` method) so both `AppState::sync_to_s3`
-/// and the boot-time reconciliation sweep in `AppState::new` — which runs
-/// before `self` exists — can share it.
+/// and the boot-time reconciliation sweep in `AppState::new`, which runs
+/// before `self` exists, can share it.
 #[cfg(feature = "s3")]
-fn sync_segment_dir_to_s3(s3: &s3_storage::S3Storage, data_dir: &Path, seg_dir: &Path) -> bool {
-    if !seg_dir.exists() {
-        return false;
+fn sync_segment_dir_to_s3(
+    s3: &s3_storage::S3Storage,
+    data_dir: &Path,
+    seg_dir: &Path,
+) -> Result<(), String> {
+    let rel = seg_dir
+        .strip_prefix(data_dir)
+        .unwrap_or(seg_dir)
+        .to_string_lossy()
+        .into_owned();
+    if !seg_dir.is_dir() {
+        return Err(format!("segment {rel} not on local disk"));
     }
-    let Ok(entries) = std::fs::read_dir(seg_dir) else {
-        return false;
-    };
-    let mut all_ok = true;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let rel = seg_dir
-            .strip_prefix(data_dir)
-            .unwrap_or(seg_dir)
-            .to_string_lossy();
-        let s3_path = format!("{rel}/{name}");
-        match std::fs::read(&path) {
-            Ok(data) => {
-                if let Err(e) = s3.write(&s3_path, &data) {
-                    eprintln!("WARN: S3 upload failed for {s3_path}: {e}");
-                    all_ok = false;
-                }
-            }
-            Err(e) => {
-                eprintln!("WARN: failed to read {s3_path} for upload: {e}");
-                all_ok = false;
-            }
+    for req in segment_commit::REQUIRED_SEGMENT_FILES {
+        if !file_present_nonempty(&seg_dir.join(req)) {
+            return Err(format!(
+                "segment {rel} is missing required file {req} locally"
+            ));
         }
     }
-    all_ok
+    s3.sync_segment_dir(Path::new(&rel))
+        .map_err(|e| format!("S3 upload of segment {rel} failed: {e}"))
 }
 
 impl AppState {
@@ -1010,22 +1010,29 @@ impl AppState {
                         if let Some(ref s3) = s3_storage {
                             for entry in &manifest.segments {
                                 let rel = format!("{}/{}", ns.0, entry.segment_id.0);
-                                if s3.segment_durable_in_s3(&rel) {
+                                let durability = s3.segment_durability(&rel);
+                                if durability.is_durable() {
                                     synced_segments.insert((ns.clone(), entry.segment_id.clone()));
                                     continue;
                                 }
                                 let seg_path = data_dir.join(&ns.0).join(&entry.segment_id.0);
-                                if sync_segment_dir_to_s3(s3, &data_dir, &seg_path) {
-                                    synced_segments.insert((ns.clone(), entry.segment_id.clone()));
-                                    reconciled_missing += 1;
-                                    println!(
-                                        "reconciliation: uploaded segment missing from S3: {rel}"
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "WARN: reconciliation found segment {rel} durable in \
-                                         neither S3 nor local disk — data loss, cannot recover"
-                                    );
+                                match sync_segment_dir_to_s3(s3, &data_dir, &seg_path) {
+                                    Ok(()) => {
+                                        synced_segments
+                                            .insert((ns.clone(), entry.segment_id.clone()));
+                                        reconciled_missing += 1;
+                                        println!(
+                                            "reconciliation: re-uploaded segment not durable in \
+                                             S3 ({durability:?}): {rel}"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "WARN: reconciliation found segment {rel} not durable \
+                                             in S3 ({durability:?}) and could not re-upload it \
+                                             ({e}) — data loss unless another copy exists"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1180,6 +1187,8 @@ impl AppState {
                 .ok()
                 .filter(|k| !k.is_empty()),
             publication_locks: Mutex::new(HashMap::new()),
+            #[cfg(feature = "s3")]
+            segment_checksum_failures: std::sync::atomic::AtomicU64::new(0),
             indexer,
             searcher,
             data_dir,
@@ -1724,50 +1733,26 @@ impl AppState {
                 .map(|e| e.segment_id.clone())
                 .collect()
         };
+        let Some(ref s3) = self.s3_storage else {
+            return Ok(());
+        };
         for segment_id in pending {
             let seg_path = self.data_dir.join(&ns.0).join(&segment_id.0);
-            // Only mark synced on full success — a partial failure (some
-            // files uploaded, some didn't) must be retried by a future
-            // publish call, never treated as durable.
-            if self.sync_to_s3(&seg_path) {
-                self.synced_segments
-                    .lock()
-                    .unwrap()
-                    .insert((ns.clone(), segment_id));
-            } else {
-                return Err(KoshaError::NotFound(format!(
-                    "failed uploading segment {}",
-                    segment_id.0
-                )));
-            }
+            // Only mark synced once the segment is committed (`_COMMIT`
+            // written last, #231). A partial upload must be retried by a
+            // future publish call, never treated as durable.
+            sync_segment_dir_to_s3(s3, &self.data_dir, &seg_path).map_err(KoshaError::NotFound)?;
+            self.synced_segments
+                .lock()
+                .unwrap()
+                .insert((ns.clone(), segment_id));
         }
         Ok(())
     }
 
-    /// Sync a segment directory to S3. Returns `true` only if every file in
-    /// the directory uploaded successfully — callers use this to decide
-    /// whether the segment is now durable (see `sync_unsynced_segments_to_s3`
-    /// and the boot-time reconciliation sweep in `AppState::new`); a partial
-    /// upload must not be recorded as done.
+    /// See [`segment_commit::REQUIRED_SEGMENT_FILES`].
     #[cfg(feature = "s3")]
-    fn sync_to_s3(&self, seg_dir: &Path) -> bool {
-        let Some(ref s3) = self.s3_storage else {
-            return false;
-        };
-        sync_segment_dir_to_s3(s3, &self.data_dir, seg_dir)
-    }
-
-    /// The files that must all be present for a segment to be usable by the
-    /// searcher. `vector.idx` is intentionally excluded — Phase 1 lexical
-    /// queries never load it (see `kosha_query`'s lazy vector loading), so
-    /// its absence must not count as an incomplete segment.
-    #[cfg(feature = "s3")]
-    const REQUIRED_SEGMENT_FILES: [&'static str; 4] = [
-        "footer.json",
-        "doc_store.bin",
-        "inverted.idx",
-        "filters.bin",
-    ];
+    const REQUIRED_SEGMENT_FILES: [&'static str; 4] = segment_commit::REQUIRED_SEGMENT_FILES;
 
     #[cfg(feature = "s3")]
     fn segment_is_complete(seg_path: &Path) -> bool {
@@ -1886,7 +1871,44 @@ impl AppState {
                 // replicas when the lease store is configured. Full-segment
                 // fetches keep the conservative fan-out — batches here can
                 // include multi-hundred-MB doc stores.
+                // Files already on disk before this call were verified (or
+                // trusted) when they first landed; only check what this call
+                // actually fetches, so a warm segment isn't re-read in full.
+                let fetched: Vec<(String, u64)> = logical_paths
+                    .iter()
+                    .filter(|(p, _)| !file_present_nonempty(&self.data_dir.join(p)))
+                    .cloned()
+                    .collect();
                 self.hydrate_files(s3, &logical_paths, self.hydrate_concurrency, &request);
+
+                // Check freshly fetched files against the segment's `_COMMIT`
+                // (#231). A mismatch is deleted and refetched once. If it
+                // still mismatches, it is deleted again, so the segment
+                // reports as incomplete (`outcome.missing`) and the caller
+                // fails the request instead of serving corrupt bytes.
+                let bad = verify_fetched_against_commit(&self.data_dir, &fetched);
+                if !bad.is_empty() {
+                    self.segment_checksum_failures
+                        .fetch_add(bad.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let retry: Vec<(String, u64)> = fetched
+                        .iter()
+                        .filter(|(p, _)| bad.contains(p))
+                        .cloned()
+                        .collect();
+                    self.hydrate_files(s3, &retry, self.hydrate_concurrency, &request);
+                    let still_bad = verify_fetched_against_commit(&self.data_dir, &retry);
+                    if !still_bad.is_empty() {
+                        self.segment_checksum_failures.fetch_add(
+                            still_bad.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        eprintln!(
+                            "ERROR: segment file(s) fail their _COMMIT checksum after refetch, \
+                             refusing to serve: {}",
+                            still_bad.join(", ")
+                        );
+                    }
+                }
             }
 
             drop(_permit);
@@ -2712,29 +2734,102 @@ impl AppState {
         outcome
     }
 
-    /// Upload a single file from a local segment dir to S3.
+    /// Re-upload files that an admin backfill rewrote in place inside an
+    /// already-uploaded segment (e.g. `footer.json`), then refresh that
+    /// segment's `_COMMIT` so its recorded sizes/CRCs match the new bytes.
+    /// Without the refresh, a rewritten file would fail the commit check
+    /// (`S3Storage::segment_durability`) and hydration verification, even
+    /// though it is valid. Legacy segments with no `_COMMIT` are left
+    /// without one: a marker built from only the rewritten files would
+    /// wrongly vouch for the rest of the segment.
+    ///
+    /// The marker is still written last, so a failure partway through
+    /// leaves the old marker and fails the size/CRC check for the rewritten
+    /// file. Reconciliation then re-uploads the segment.
     #[cfg(feature = "s3")]
-    fn sync_file_to_s3(&self, seg_dir: &Path, file_name: &str) {
+    fn sync_files_to_s3(&self, seg_dir: &Path, file_names: &[&str]) -> Result<(), String> {
         let Some(ref s3) = self.s3_storage else {
-            return;
+            return Ok(());
         };
-        let path = seg_dir.join(file_name);
-        if !path.is_file() {
-            return;
-        }
-        let Ok(rel) = seg_dir.strip_prefix(&self.data_dir) else {
-            return;
-        };
-        let s3_path = format!("{}/{file_name}", rel.to_string_lossy());
-        match std::fs::read(&path) {
-            Ok(data) => {
-                if let Err(e) = s3.write(&s3_path, &data) {
-                    eprintln!("WARN: S3 upload failed for {s3_path}: {e}");
-                }
+        let rel = seg_dir
+            .strip_prefix(&self.data_dir)
+            .map_err(|_| format!("{} is outside data_dir", seg_dir.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let commit = s3
+            .read_segment_commit(&rel)
+            .map_err(|e| format!("read {rel}/{}: {e}", segment_commit::COMMIT_FILE))?;
+        let mut entries = Vec::new();
+        for file_name in file_names {
+            let path = seg_dir.join(file_name);
+            if !path.is_file() {
+                continue;
             }
-            Err(e) => eprintln!("WARN: failed to read {s3_path} for upload: {e}"),
+            let s3_path = format!("{rel}/{file_name}");
+            let data = std::fs::read(&path)
+                .map_err(|e| format!("failed to read {s3_path} for upload: {e}"))?;
+            s3.write(&s3_path, &data)
+                .map_err(|e| format!("S3 upload failed for {s3_path}: {e}"))?;
+            entries.push(segment_commit::SegmentCommit::entry(file_name, &data));
+        }
+        if let Some(mut commit) = commit {
+            for e in entries {
+                commit.upsert(e);
+            }
+            let commit_path = format!("{rel}/{}", segment_commit::COMMIT_FILE);
+            s3.write(&commit_path, &commit.to_bytes())
+                .map_err(|e| format!("S3 upload failed for {commit_path}: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Verify freshly fetched segment files (`logical_path` = `ns/segment/file`,
+/// relative to `data_dir`) against the `_COMMIT` of their segment, when that
+/// segment has one locally. Every file that fails is deleted from local disk
+/// and returned. Files of segments without a local `_COMMIT` (legacy
+/// segments, or a marker that wasn't fetched) and files the marker doesn't
+/// list are accepted unchecked.
+#[cfg(feature = "s3")]
+fn verify_fetched_against_commit(data_dir: &Path, fetched: &[(String, u64)]) -> Vec<String> {
+    let mut commits: HashMap<String, Option<segment_commit::SegmentCommit>> = HashMap::new();
+    let mut bad = Vec::new();
+    for (logical, _) in fetched {
+        let Some((seg_rel, name)) = logical.rsplit_once('/') else {
+            continue;
+        };
+        if name == segment_commit::COMMIT_FILE {
+            continue;
+        }
+        let commit = commits.entry(seg_rel.to_string()).or_insert_with(|| {
+            let path = data_dir.join(seg_rel).join(segment_commit::COMMIT_FILE);
+            match std::fs::read(&path) {
+                Ok(bytes) => match segment_commit::SegmentCommit::from_bytes(&bytes) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        eprintln!("WARN: ignoring unreadable {}: {e}", path.display());
+                        None
+                    }
+                },
+                Err(_) => None,
+            }
+        });
+        let Some(commit) = commit else {
+            continue;
+        };
+        let path = data_dir.join(logical);
+        // A file that didn't arrive at all is hydration's "missing" case,
+        // reported separately. Here we only judge bytes that landed.
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Err(e) = commit.verify(name, &data) {
+            eprintln!("ERROR: checksum mismatch in segment {seg_rel}: {e}");
+            std::fs::remove_file(&path).ok();
+            bad.push(logical.clone());
         }
     }
+    bad
 }
 
 /// Parse a default-on boolean env toggle: unset or any other value → true;
@@ -3892,6 +3987,12 @@ fn handle_stats(state: &AppState) -> String {
     #[cfg(not(feature = "s3"))]
     let (s3_enabled, s3_bucket, s3_prefix): (bool, Option<String>, Option<String>) =
         (false, None, None);
+    #[cfg(feature = "s3")]
+    let segment_checksum_failures = state
+        .segment_checksum_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "s3"))]
+    let segment_checksum_failures = 0u64;
 
     json_ok(&serde_json::json!({
         "total_documents": total_docs,
@@ -3901,6 +4002,7 @@ fn handle_stats(state: &AppState) -> String {
         "cache_root": state.cache.root().display().to_string(),
         "cache_size_bytes": state.cache.total_size(),
         "s3_enabled": s3_enabled,
+        "segment_checksum_failures": segment_checksum_failures,
         "s3_bucket": s3_bucket,
         "s3_prefix": s3_prefix,
     }))
@@ -4653,7 +4755,12 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
             Ok(_) => {
                 rebuilt += 1;
                 #[cfg(feature = "s3")]
-                state.sync_file_to_s3(seg_path, "footer.json");
+                if let Err(e) = state.sync_files_to_s3(seg_path, &["footer.json"]) {
+                    errors.push(format!(
+                        "{}: rebuilt locally but S3 sync failed: {e}",
+                        entry.segment_id.0
+                    ));
+                }
             }
             Err(e) => errors.push(format!("{}: {e}", entry.segment_id.0)),
         }
@@ -4782,9 +4889,14 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
             match SegmentReader::backfill_offset_tables(&seg_path) {
                 Ok(_) => {
                     #[cfg(feature = "s3")]
+                    if let Err(e) =
+                        state.sync_files_to_s3(&seg_path, &["doc_store.offsets", "footer.json"])
                     {
-                        state.sync_file_to_s3(&seg_path, "doc_store.offsets");
-                        state.sync_file_to_s3(&seg_path, "footer.json");
+                        eprintln!(
+                            "WARN: backfill: ns={} segment={} rewritten locally but S3 sync \
+                             failed: {e}",
+                            ns.0, entry.segment_id.0,
+                        );
                     }
                     done += 1;
                     println!(

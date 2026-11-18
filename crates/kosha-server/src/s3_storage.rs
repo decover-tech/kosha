@@ -17,6 +17,7 @@ use std::sync::Arc;
 use kosha_core::{KoshaError, LocalStorage, StorageBackend};
 
 use crate::hydration_budget::{HydrationBudget, RequestHydration};
+use crate::segment_commit;
 
 /// Join a configured key prefix with a logical (unprefixed) path, the same
 /// way for every call site — `S3Storage::s3_key` and the concurrent fetch
@@ -167,32 +168,67 @@ impl S3Storage {
         join_s3_key(&self.prefix, path)
     }
 
-    /// Upload every regular file in a locally-built segment directory.
+    /// Upload a locally-built segment directory and commit it (#231): every
+    /// data file first, in sorted order, then the `_COMMIT` marker last,
+    /// listing each file's size and CRC32. Only a segment whose `_COMMIT`
+    /// landed counts as durable (`segment_durability`), so a failure
+    /// partway through leaves a prefix that reconciliation will re-upload.
+    /// The marker is also written locally, so this node's later
+    /// verification sees the same record S3 has.
     ///
     /// `logical_dir` is relative to the storage root, for example
-    /// `paragraph_index_hnsw/paragraph_index_hnsw-000001`. Segment files are
-    /// immutable, so callers only need to invoke this for newly-built
-    /// segments.
+    /// `paragraph_index_hnsw/paragraph_index_hnsw-000001`. Callers check
+    /// that the directory holds a complete segment.
     pub fn sync_segment_dir(&self, logical_dir: &Path) -> Result<(), KoshaError> {
         let local_dir = Path::new(&self.local.root).join(logical_dir);
+        let mut names: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(&local_dir).map_err(KoshaError::Io)? {
             let entry = entry.map_err(KoshaError::Io)?;
-            let path = entry.path();
-            if !path.is_file() {
+            if !entry.path().is_file() {
                 continue;
             }
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            let logical_path = logical_dir.join(name).to_string_lossy().into_owned();
-            self.upload_to_s3(&path, &self.s3_key(&logical_path))?;
+            // A local `_COMMIT` from an earlier attempt is rebuilt, never
+            // uploaded ahead of the files it vouches for. In-progress
+            // atomic-write temps are never segment data: writer temps are
+            // `.{name}.tmp.{pid}.{n}`, hydration temps `{stem}.tmp.{pid}.{n}`.
+            if name == segment_commit::COMMIT_FILE
+                || name.starts_with('.')
+                || name.contains(".tmp.")
+            {
+                continue;
+            }
+            names.push(name);
         }
-        Ok(())
+        names.sort();
+
+        let mut files = Vec::with_capacity(names.len());
+        for name in &names {
+            let path = local_dir.join(name);
+            let data = std::fs::read(&path).map_err(KoshaError::Io)?;
+            let logical_path = logical_dir.join(name).to_string_lossy().into_owned();
+            files.push(segment_commit::SegmentCommit::entry(name, &data));
+            self.upload_bytes(data, &self.s3_key(&logical_path))?;
+        }
+        let commit = segment_commit::SegmentCommit::new(files).to_bytes();
+        let commit_path = logical_dir
+            .join(segment_commit::COMMIT_FILE)
+            .to_string_lossy()
+            .into_owned();
+        self.local.write(&commit_path, &commit)?;
+        self.upload_bytes(commit, &self.s3_key(&commit_path))
     }
 
-    /// Upload a local file to S3. Uses multi-part upload for files > 5MB.
+    /// Upload a local file to S3. See `upload_bytes`.
     fn upload_to_s3(&self, local_path: &Path, s3_key: &str) -> Result<(), KoshaError> {
         let data = std::fs::read(local_path).map_err(KoshaError::Io)?;
+        self.upload_bytes(data, s3_key)
+    }
+
+    /// Upload bytes to S3. Uses multi-part upload for payloads > 5MB.
+    fn upload_bytes(&self, data: Vec<u8>, s3_key: &str) -> Result<(), KoshaError> {
         let size = data.len();
 
         let client = self.client.clone();
@@ -556,19 +592,86 @@ impl S3Storage {
         })
     }
 
-    /// Whether S3 actually has *any* object under `logical_dir` — a
-    /// ground-truth durability check, unlike `StorageBackend::exists`
-    /// (which only checks local disk) or `list_with_sizes`/`list` (which
-    /// fall back to local on an empty S3 listing, so they can't distinguish
-    /// "durable in S3" from "only ever existed on this node's disk"). Used
-    /// by the ingest-pod boot-time reconciliation sweep (`AppState::new`)
-    /// to find segments that a prior process crashed or raced before
-    /// uploading — see `sync_unsynced_segments_to_s3`'s doc comment for the
-    /// incident this closes.
-    pub fn segment_durable_in_s3(&self, logical_dir: &str) -> bool {
-        self.list_remote_with_sizes(logical_dir)
-            .map(|entries| !entries.is_empty())
-            .unwrap_or(false)
+    /// Ground-truth durability check for one segment prefix, unlike
+    /// `StorageBackend::exists` (local disk only) or `list_with_sizes`/`list`
+    /// (which fall back to local on an empty S3 listing, so they can't tell
+    /// "durable in S3" from "only ever existed on this node's disk").
+    ///
+    /// Durable means a `_COMMIT` marker exists and every file it records is
+    /// present at the recorded size. Segments uploaded before the marker
+    /// existed instead need every required file present and non-empty. See
+    /// `segment_commit` (#231). The old check here was "any object exists",
+    /// which counted a segment whose upload died halfway as durable.
+    ///
+    /// Used by the ingest-pod boot-time reconciliation sweep
+    /// (`AppState::new`) to find segments a prior process crashed or raced
+    /// before fully uploading.
+    pub fn segment_durability(&self, logical_dir: &str) -> segment_commit::Durability {
+        let listing = match self.list_remote_with_sizes(logical_dir) {
+            Ok(l) => l,
+            Err(e) => {
+                return segment_commit::Durability::Incomplete(format!("S3 list failed: {e}"))
+            }
+        };
+        if !listing
+            .iter()
+            .any(|(n, _)| n == segment_commit::COMMIT_FILE)
+        {
+            return segment_commit::assess_listing(&listing, None);
+        }
+        let commit = self
+            .read_remote(&format!("{logical_dir}/{}", segment_commit::COMMIT_FILE))
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| segment_commit::SegmentCommit::from_bytes(&bytes));
+        match &commit {
+            Ok(c) => segment_commit::assess_listing(&listing, Some(Ok(c))),
+            Err(e) => segment_commit::assess_listing(&listing, Some(Err(e.as_str()))),
+        }
+    }
+
+    /// Fetch the remote `_COMMIT` of a segment, if S3 lists one. `Ok(None)`
+    /// means S3 has no marker for it (a legacy segment); errors are list,
+    /// GET or parse failures, which callers must not mistake for "absent".
+    pub fn read_segment_commit(
+        &self,
+        logical_dir: &str,
+    ) -> Result<Option<segment_commit::SegmentCommit>, KoshaError> {
+        let listing = self.list_remote_with_sizes(logical_dir)?;
+        if !listing
+            .iter()
+            .any(|(n, _)| n == segment_commit::COMMIT_FILE)
+        {
+            return Ok(None);
+        }
+        let bytes = self.read_remote(&format!("{logical_dir}/{}", segment_commit::COMMIT_FILE))?;
+        segment_commit::SegmentCommit::from_bytes(&bytes)
+            .map(Some)
+            .map_err(KoshaError::CorruptSegment)
+    }
+
+    /// GET an object straight from S3, bypassing (and not populating) the
+    /// local cache. For small control objects such as `_COMMIT`, where a
+    /// stale local copy would defeat the point of asking S3.
+    pub fn read_remote(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(path);
+        self.rt.block_on(async move {
+            let resp = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| KoshaError::NotFound(format!("S3 get_object {key}: {e}")))?;
+            let bytes = resp
+                .body
+                .collect()
+                .await
+                .map_err(|e| KoshaError::NotFound(format!("S3 read body {key}: {e}")))?
+                .into_bytes();
+            Ok(bytes.to_vec())
+        })
     }
 
     /// Like the `StorageBackend::list` trait method (same remote-first,
