@@ -216,6 +216,8 @@ mod tests {
             version: 1,
             segments,
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         }
     }
 

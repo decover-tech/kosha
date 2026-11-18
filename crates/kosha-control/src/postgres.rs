@@ -33,6 +33,33 @@ struct SegmentEntry {
     footer: Option<Footer>,
 }
 
+fn decode_manifest(version: u64, segments_json: &str) -> Option<Manifest> {
+    if let Ok(mut manifest) = serde_json::from_str::<Manifest>(segments_json) {
+        manifest.version = version;
+        return Some(manifest);
+    }
+    let entries: Vec<SegmentEntry> = serde_json::from_str(segments_json).ok()?;
+    let mut manifest = Manifest {
+        version,
+        segments: entries
+            .iter()
+            .map(|e| ManifestEntry {
+                segment_id: SegmentId(e.segment_id.clone()),
+                doc_count: e.doc_count,
+            })
+            .collect(),
+        segment_footers: Default::default(),
+        wal_checkpoint: 0,
+        tombstones: Default::default(),
+    };
+    for entry in entries {
+        if let Some(footer) = entry.footer {
+            manifest.remember_segment_footer(footer);
+        }
+    }
+    Some(manifest)
+}
+
 impl PgStore {
     /// Create a new Postgres-backed store.
     ///
@@ -281,42 +308,14 @@ impl ControlStore for PgStore {
             .ok()?;
 
             let (version, segments_json) = row?;
-            let entries: Vec<SegmentEntry> = serde_json::from_str(&segments_json).ok()?;
-            let mut manifest = Manifest {
-                version: version as u64,
-                segments: entries
-                    .iter()
-                    .map(|e| ManifestEntry {
-                        segment_id: SegmentId(e.segment_id.clone()),
-                        doc_count: e.doc_count,
-                    })
-                    .collect(),
-                segment_footers: Default::default(),
-            };
-            for entry in entries {
-                if let Some(footer) = entry.footer {
-                    manifest.remember_segment_footer(footer);
-                }
-            }
-            Some(manifest)
+            decode_manifest(version as u64, &segments_json)
         })
     }
 
     fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError> {
         let id_str = id.0.clone();
         let version = manifest.version as i64;
-        let segments_json = serde_json::to_string(
-            &manifest
-                .segments
-                .iter()
-                .map(|s| SegmentEntry {
-                    segment_id: s.segment_id.0.clone(),
-                    doc_count: s.doc_count,
-                    footer: manifest.segment_footer(&s.segment_id).cloned(),
-                })
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+        let segments_json = serde_json::to_string(&manifest)?;
 
         self.rt.block_on(async {
             // kosha.manifests has a FK to kosha.namespaces — ensure the
@@ -351,18 +350,7 @@ impl ControlStore for PgStore {
         new_manifest: Manifest,
     ) -> Result<(), KoshaError> {
         let id_str = id.0.clone();
-        let segments_json = serde_json::to_string(
-            &new_manifest
-                .segments
-                .iter()
-                .map(|s| SegmentEntry {
-                    segment_id: s.segment_id.0.clone(),
-                    doc_count: s.doc_count,
-                    footer: new_manifest.segment_footer(&s.segment_id).cloned(),
-                })
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+        let segments_json = serde_json::to_string(&new_manifest)?;
 
         self.rt.block_on(async {
             // An absent manifest row counts as version 0, so the first
@@ -472,4 +460,26 @@ mod retry_tests {
     // without egress). Covered instead by the schedule tests above (the
     // retry *shape* is what regresses silently) plus live validation
     // against a real pool-timeout on staging.
+}
+
+#[cfg(test)]
+mod manifest_encoding_tests {
+    use super::*;
+    #[test]
+    fn legacy_and_durable_manifests_round_trip() {
+        let legacy = decode_manifest(7, r#"[{"segment_id":"s","doc_count":2}]"#).unwrap();
+        assert_eq!(legacy.segments.len(), 1);
+        assert_eq!(legacy.wal_checkpoint, 0);
+        assert!(legacy.tombstones.is_empty());
+        let mut durable = legacy;
+        durable.wal_checkpoint = 42;
+        durable
+            .tombstones
+            .insert(SegmentId("s".into()), std::collections::HashSet::from([1]));
+        let encoded = serde_json::to_string(&durable).unwrap();
+        let decoded = decode_manifest(8, &encoded).unwrap();
+        assert_eq!(decoded.version, 8);
+        assert_eq!(decoded.wal_checkpoint, 42);
+        assert_eq!(decoded.tombstones, durable.tombstones);
+    }
 }

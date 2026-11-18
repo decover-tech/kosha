@@ -17,6 +17,7 @@ use kosha_segment::SegmentWriter;
 
 use compaction::select_merge_inputs;
 
+#[derive(Clone)]
 struct NamespaceBuffer {
     namespace: NamespaceId,
     documents: Vec<Document>,
@@ -25,6 +26,7 @@ struct NamespaceBuffer {
 }
 
 /// Mutable per-namespace write state (DESIGN.md §7.1).
+#[derive(Clone)]
 struct NamespaceState {
     buffer: Option<NamespaceBuffer>,
     manifest: Manifest,
@@ -36,6 +38,9 @@ struct NamespaceState {
     /// True once a manifest has been created or restored for this namespace.
     /// Distinguishes "unknown namespace" from "empty namespace".
     known: bool,
+    wal_sequence: u64,
+    recovered: Vec<(u64, Vec<Document>)>,
+    replay_required: bool,
 }
 
 impl NamespaceState {
@@ -46,10 +51,15 @@ impl NamespaceState {
                 version: 0,
                 segments: Vec::new(),
                 segment_footers: Default::default(),
+                wal_checkpoint: 0,
+                tombstones: Default::default(),
             },
             tombstones: HashMap::new(),
             id_index: None,
             known: false,
+            wal_sequence: 0,
+            recovered: Vec::new(),
+            replay_required: false,
         }
     }
 }
@@ -70,6 +80,7 @@ struct FlushCoord {
 }
 
 struct NamespaceHandle {
+    mutation: Mutex<()>,
     state: Mutex<NamespaceState>,
     /// At most one compaction in flight per namespace. Held across merge I/O
     /// while `state` is released (DESIGN.md §7.1).
@@ -212,8 +223,10 @@ impl Indexer {
         };
 
         // Recover un-flushed documents from WAL on startup.
-        if let Ok(records) = crate::wal::WalWriter::recover(&wal_dir) {
-            for record in &records {
+        {
+            let records =
+                crate::wal::WalWriter::recover_sequenced(&wal_dir).expect("WAL recovery failed");
+            for (seq, record) in &records {
                 let handle = idx.ns_handle(&record.namespace);
                 let mut state = handle.state.lock().unwrap();
                 let buf = Self::buffer_mut_in(
@@ -223,6 +236,9 @@ impl Indexer {
                     &idx.bm25_params,
                 );
                 buf.documents.extend(record.documents.clone());
+                state.wal_sequence = state.wal_sequence.max(*seq);
+                state.recovered.push((*seq, record.documents.clone()));
+                state.known = true;
             }
         }
 
@@ -271,6 +287,7 @@ impl Indexer {
         map.entry(namespace.clone())
             .or_insert_with(|| {
                 Arc::new(NamespaceHandle {
+                    mutation: Mutex::new(()),
                     state: Mutex::new(NamespaceState::new()),
                     compact: Mutex::new(()),
                     writer_slots: WriterSlots::new(self.max_concurrent_flush_writers),
@@ -315,30 +332,53 @@ impl Indexer {
     pub fn delete_by_query(
         &self,
         namespace: &NamespaceId,
-        manifest: &Manifest,
+        _manifest: &Manifest,
         filter: &FilterClause,
     ) -> Result<usize, KoshaError> {
         let handle = self.ns_handle(namespace);
+        let _mutation = handle.mutation.lock().unwrap();
         let mut state = handle.state.lock().unwrap();
-        let mut total = 0;
-        for entry in &manifest.segments {
+        self.replay_recovered_in(namespace, &mut state)?;
+        // Include buffered documents in the deletion's snapshot.
+        Self::flush_namespace_in(
+            &mut state,
+            namespace,
+            &self.data_dir,
+            self.wal_enabled,
+            &self.wal,
+        )?;
+        // First compute every match; read failure must not leave a partial
+        // deletion in memory that the caller was told failed.
+        let mut changes = Vec::new();
+        for entry in &state.manifest.segments {
             let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
-            if !seg_dir.exists() {
-                continue;
-            }
             let reader = kosha_segment::SegmentReader::open(seg_dir)?;
             let store = reader.filter_store();
-            let all: HashSet<u32> = (0..reader.doc_count()).collect();
+            let all: HashSet<u32> = (0..reader.doc_count())
+                .filter(|seq| {
+                    !state
+                        .tombstones
+                        .get(&entry.segment_id)
+                        .is_some_and(|set| set.contains(seq))
+                })
+                .collect();
             let matching = crate::apply_filter_delete(filter, &store, &all)?;
+            changes.push((entry.segment_id.clone(), matching));
+        }
+        let total = changes.iter().map(|(_, ids)| ids.len()).sum();
+        for (segment, matching) in changes {
             if !matching.is_empty() {
-                total += matching.len();
                 state
                     .tombstones
-                    .entry(entry.segment_id.clone())
+                    .entry(segment)
                     .or_default()
                     .extend(matching);
             }
         }
+        if total > 0 {
+            state.manifest.version += 1;
+        }
+        state.manifest.tombstones = state.tombstones.clone();
         Ok(total)
     }
 
@@ -475,20 +515,21 @@ impl Indexer {
         // segment-write I/O, exactly the contention issue #176 fixes.
         let needs_flush = {
             let mut state = handle.state.lock().unwrap();
-            if let Some(buf) = state.buffer.as_mut() {
-                buf.documents.retain(|doc| !id_set.contains(&doc.id));
-            }
             if Self::has_flushed_ids_in(&mut state, &namespace, &self.data_dir, &ids)? {
                 drop(state);
                 return self.rewrite_documents(namespace, documents, false);
             }
 
             if self.wal_enabled {
-                if let Ok(mut wal) = self.wal.lock() {
-                    wal.append(&namespace, &documents).ok();
-                }
+                let mut wal = self.wal.lock().unwrap();
+                wal.append(&namespace, &documents)?;
+                state.wal_sequence = wal.last_sequence();
             }
 
+            if let Some(buf) = state.buffer.as_mut() {
+                buf.documents.retain(|doc| !id_set.contains(&doc.id));
+            }
+            state.known = true;
             let flush_threshold = self.flush_threshold;
             let buf = Self::buffer_mut_in(
                 &mut state,
@@ -535,119 +576,149 @@ impl Indexer {
         }
 
         let handle = self.ns_handle(&namespace);
+        let _mutation = handle.mutation.lock().unwrap();
         let mut state = handle.state.lock().unwrap();
 
-        // Include buffered versions in the segment scan.
-        Self::flush_namespace_in(
-            &mut state,
-            &namespace,
-            &self.data_dir,
-            self.wal_enabled,
-            &self.wal,
-        )?;
-        let replacement_ids: HashSet<&str> =
-            documents.iter().map(|doc| doc.id.0.as_str()).collect();
-        let manifest = state.manifest.clone();
-        let mut replaced_segments = HashSet::new();
-        let mut carried_documents = Vec::new();
-        // Latest segment wins when the same id was appended more than once.
-        let mut existing_fields: HashMap<String, Vec<kosha_core::Field>> = HashMap::new();
+        self.replay_recovered_in(&namespace, &mut state)?;
+        self.rewrite_documents_in(namespace, documents, merge, &mut state)
+    }
 
-        for entry in &manifest.segments {
-            let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
-            if !seg_dir.exists() {
-                continue;
+    fn replay_recovered_in(
+        &self,
+        namespace: &NamespaceId,
+        state: &mut NamespaceState,
+    ) -> Result<(), KoshaError> {
+        if state.replay_required {
+            let docs = state
+                .buffer
+                .as_ref()
+                .map(|b| b.documents.clone())
+                .unwrap_or_default();
+            if !docs.is_empty() {
+                self.rewrite_documents_in(namespace.clone(), docs, false, state)?;
             }
-            let reader = kosha_segment::SegmentReader::open(seg_dir)?;
-            if !reader
-                .iter_doc_meta()
-                .any(|meta| replacement_ids.contains(meta.doc_id))
-            {
-                continue;
-            }
+            state.replay_required = false;
+        }
+        Ok(())
+    }
 
-            replaced_segments.insert(entry.segment_id.clone());
-            let tombstones = state.tombstones.get(&entry.segment_id).cloned();
-            // `?`: same reasoning as compact_namespace_with_options — a doc
-            // that fails to read must abort the rewrite, not be silently
-            // excluded from carried_documents (that would durably drop it
-            // from the namespace once the rewritten segment is published).
-            for record in reader.iter_doc_records() {
-                let record = record?;
-                if tombstones
-                    .as_ref()
-                    .is_some_and(|set| set.contains(&record.doc_seq))
+    fn rewrite_documents_in(
+        &self,
+        namespace: NamespaceId,
+        documents: Vec<Document>,
+        merge: bool,
+        state: &mut NamespaceState,
+    ) -> Result<usize, KoshaError> {
+        let original = state.clone();
+        let result = (|| {
+            // Include buffered versions in the segment scan.
+            Self::flush_namespace_in(
+                state,
+                &namespace,
+                &self.data_dir,
+                self.wal_enabled,
+                &self.wal,
+            )?;
+            let replacement_ids: HashSet<&str> =
+                documents.iter().map(|doc| doc.id.0.as_str()).collect();
+            let manifest = state.manifest.clone();
+            let mut replaced_segments = HashSet::new();
+            let mut carried_documents = Vec::new();
+            // Latest segment wins when the same id was appended more than once.
+            let mut existing_fields: HashMap<String, Vec<kosha_core::Field>> = HashMap::new();
+
+            for entry in &manifest.segments {
+                let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                let reader = kosha_segment::SegmentReader::open(seg_dir)?;
+                if !reader
+                    .iter_doc_meta()
+                    .any(|meta| replacement_ids.contains(meta.doc_id))
                 {
                     continue;
                 }
-                if replacement_ids.contains(record.doc_id.0.as_str()) {
-                    if merge {
-                        existing_fields.insert(record.doc_id.0.clone(), record.fields.clone());
+
+                replaced_segments.insert(entry.segment_id.clone());
+                let tombstones = state.tombstones.get(&entry.segment_id).cloned();
+                // `?`: same reasoning as compact_namespace_with_options — a doc
+                // that fails to read must abort the rewrite, not be silently
+                // excluded from carried_documents (that would durably drop it
+                // from the namespace once the rewritten segment is published).
+                for record in reader.iter_doc_records() {
+                    let record = record?;
+                    if tombstones
+                        .as_ref()
+                        .is_some_and(|set| set.contains(&record.doc_seq))
+                    {
+                        continue;
+                    }
+                    if replacement_ids.contains(record.doc_id.0.as_str()) {
+                        if merge {
+                            existing_fields.insert(record.doc_id.0.clone(), record.fields.clone());
+                        }
+                    } else {
+                        carried_documents.push(Document {
+                            id: record.doc_id.clone(),
+                            fields: record.fields.clone(),
+                        });
+                    }
+                }
+            }
+
+            if !replaced_segments.is_empty() {
+                state
+                    .manifest
+                    .segments
+                    .retain(|entry| !replaced_segments.contains(&entry.segment_id));
+                state.manifest.version += 1;
+                state.known = true;
+                for segment_id in &replaced_segments {
+                    state.tombstones.remove(segment_id);
+                }
+            }
+
+            let count = documents.len();
+            for document in documents {
+                let merged = if merge {
+                    match existing_fields.remove(&document.id.0) {
+                        Some(base_fields) => Document {
+                            id: document.id,
+                            fields: merge_fields(base_fields, document.fields),
+                        },
+                        None => document,
                     }
                 } else {
-                    carried_documents.push(Document {
-                        id: record.doc_id.clone(),
-                        fields: record.fields.clone(),
-                    });
-                }
+                    document
+                };
+                carried_documents.push(merged);
             }
-        }
+            state.id_index = None;
+            // Bypass upsert re-entry: these ids were just removed from live
+            // segments, so the append path is correct and avoids a rewrite loop.
+            Self::append_documents_in(
+                state,
+                namespace.clone(),
+                carried_documents,
+                &self.data_dir,
+                &self.bm25_params,
+                self.flush_threshold,
+                self.wal_enabled,
+                &self.wal,
+            )?;
+            Self::flush_namespace_in(
+                state,
+                &namespace,
+                &self.data_dir,
+                self.wal_enabled,
+                &self.wal,
+            )?;
 
-        if !replaced_segments.is_empty() {
-            state
-                .manifest
-                .segments
-                .retain(|entry| !replaced_segments.contains(&entry.segment_id));
-            state.manifest.version += 1;
-            state.known = true;
-            for segment_id in &replaced_segments {
-                state.tombstones.remove(segment_id);
-            }
+            // Superseded immutable files remain available to older snapshots.
+            Ok(count)
+        })();
+        if result.is_err() {
+            *state = original;
         }
-
-        let count = documents.len();
-        for document in documents {
-            let merged = if merge {
-                match existing_fields.remove(&document.id.0) {
-                    Some(base_fields) => Document {
-                        id: document.id,
-                        fields: merge_fields(base_fields, document.fields),
-                    },
-                    None => document,
-                }
-            } else {
-                document
-            };
-            carried_documents.push(merged);
-        }
-        state.id_index = None;
-        // Bypass upsert re-entry: these ids were just removed from live
-        // segments, so the append path is correct and avoids a rewrite loop.
-        Self::append_documents_in(
-            &mut state,
-            namespace.clone(),
-            carried_documents,
-            &self.data_dir,
-            &self.bm25_params,
-            self.flush_threshold,
-            self.wal_enabled,
-            &self.wal,
-        )?;
-        Self::flush_namespace_in(
-            &mut state,
-            &namespace,
-            &self.data_dir,
-            self.wal_enabled,
-            &self.wal,
-        )?;
-        drop(state);
-
-        // The manifest no longer references these immutable segments.
-        for segment_id in replaced_segments {
-            let seg_dir = self.data_dir.join(&namespace.0).join(segment_id.0);
-            std::fs::remove_dir_all(seg_dir).ok();
-        }
-        Ok(count)
+        result
     }
 
     /// Append without upsert checks. Used by segment rewrite after old
@@ -667,9 +738,9 @@ impl Indexer {
             return Ok(0);
         }
         if wal_enabled {
-            if let Ok(mut wal_guard) = wal.lock() {
-                wal_guard.append(&namespace, &documents).ok();
-            }
+            let mut wal_guard = wal.lock().unwrap();
+            wal_guard.append(&namespace, &documents)?;
+            state.wal_sequence = wal_guard.last_sequence();
         }
         let count = documents.len();
         {
@@ -810,6 +881,7 @@ impl Indexer {
         namespace: &NamespaceId,
         handle: &NamespaceHandle,
     ) -> Result<(), KoshaError> {
+        let _mutation = handle.mutation.lock().unwrap();
         // Phase 1 (state locked, cheap): snapshot whatever's buffered and
         // split it into chunks, each with its own reserved SegmentId.
         // Released immediately after — concurrent index_documents calls for
@@ -818,13 +890,16 @@ impl Indexer {
         // what keeps concurrent segment IDs collision-free: by the time
         // phase 2 spawns writer threads, every chunk already owns a
         // distinct, already-incremented counter value.
-        let chunks = {
+        let (chunks, checkpoint) = {
             let mut state = handle.state.lock().unwrap();
-            Self::take_flush_chunks_in(
+            self.replay_recovered_in(namespace, &mut state)?;
+            let checkpoint = state.wal_sequence;
+            let chunks = Self::take_flush_chunks_in(
                 &mut state,
                 self.max_concurrent_flush_writers,
                 self.min_docs_per_flush_writer,
-            )
+            );
+            (chunks, checkpoint)
         };
         if chunks.is_empty() {
             return Ok(());
@@ -893,38 +968,22 @@ impl Indexer {
             }
         }
 
-        // WAL bookkeeping (state free): every chunk that succeeded is now
-        // durably on disk and no longer needs its WAL backing. A chunk that
-        // failed is about to go back into the buffer below and needs FRESH
-        // WAL backing instead of its old (about to be cleared) one. Order
-        // matters: clear first, then re-append the restored docs, so a
-        // crash can never observe them sitting in the buffer without WAL
-        // cover -- mirrors index_documents's own WAL-before-buffer
-        // ordering.
-        //
-        // Clearing unconditionally (not just "if nothing failed") matches
-        // the pre-existing single-writer behavior this replaces: the WAL
-        // here is shared across the whole Indexer, not scoped per
-        // namespace, so a clear from one namespace's flush could already --
-        // before this change -- drop still-unflushed WAL records belonging
-        // to a different namespace's buffer if they happened to land
-        // between this round's snapshot and this clear. That race predates
-        // this change (it's inherent to WalWriter::clear()'s all-files
-        // semantics, see its doc comment) and isn't introduced or widened
-        // here; fixing it would mean reworking WalWriter into a
-        // per-namespace or checkpointed log, out of scope for this change,
-        // same as #177/#178 scoping `flush_namespace_in` out. What this
-        // change does guarantee, and is new: within one flush round, a
-        // chunk that fails can never have its own documents' WAL backing
-        // wiped without a fresh replacement -- see
-        // partial_writer_failure_preserves_documents_and_wal_safety.
-        if self.wal_enabled {
-            if let Ok(mut wal_guard) = self.wal.lock() {
-                wal_guard.clear().ok();
-                if !failed_docs.is_empty() {
-                    wal_guard.append(namespace, &failed_docs).ok();
-                }
+        // A failed round publishes no partial snapshot. Keep every input
+        // in the WAL and restore it ahead of newer buffered writes.
+        if let Some(error) = first_err {
+            for (_, docs, _) in succeeded {
+                failed_docs.extend(docs);
             }
+            let mut state = handle.state.lock().unwrap();
+            let buf = Self::buffer_mut_in(
+                &mut state,
+                namespace.clone(),
+                &self.data_dir,
+                &self.bm25_params,
+            );
+            failed_docs.append(&mut buf.documents);
+            buf.documents = dedupe_documents_last_wins(failed_docs);
+            return Err(error);
         }
 
         // Phase 3 (state locked, cheap): commit every succeeded chunk's
@@ -936,6 +995,7 @@ impl Indexer {
         // held only for cheap bookkeeping, never across I/O.
         {
             let mut state = handle.state.lock().unwrap();
+            state.manifest.wal_checkpoint = state.manifest.wal_checkpoint.max(checkpoint);
             for (seg_id, docs, footer) in succeeded {
                 Self::remember_flushed_ids_in(&mut state, &seg_id, &docs);
                 state.known = true;
@@ -957,10 +1017,7 @@ impl Indexer {
             }
         }
 
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// Write one flush chunk's segment to disk. Bounded by `writer_slots` so
@@ -1019,7 +1076,7 @@ impl Indexer {
         let min_docs_per_writer = min_docs_per_writer.max(1);
         let n_chunks = (total / min_docs_per_writer).clamp(1, max_writers);
 
-        let docs = std::mem::take(&mut buf.documents);
+        let docs = dedupe_documents_last_wins(std::mem::take(&mut buf.documents));
         let bm25_params = buf.bm25_params.clone();
         let ns_prefix = buf.namespace.0.replace('/', "_");
 
@@ -1054,7 +1111,7 @@ impl Indexer {
             if buf.documents.is_empty() {
                 return Ok(());
             }
-            let docs = std::mem::take(&mut buf.documents);
+            let docs = dedupe_documents_last_wins(std::mem::take(&mut buf.documents));
             let seg_id = SegmentId(format!(
                 "{}-{:06x}",
                 namespace.0.replace('/', "_"),
@@ -1070,14 +1127,17 @@ impl Indexer {
         for doc in &docs {
             writer.add_document(doc.id.clone(), doc.fields.clone());
         }
-        let footer = writer.finalize(bm25_params)?;
-
-        // WAL no longer needed for flushed data.
-        if wal_enabled {
-            if let Ok(mut wal_guard) = wal.lock() {
-                wal_guard.clear().ok();
+        let footer = match writer.finalize(bm25_params) {
+            Ok(footer) => footer,
+            Err(e) => {
+                state.buffer.as_mut().unwrap().documents = docs;
+                return Err(e);
             }
-        }
+        };
+
+        // WAL reclamation waits for durable manifest publication.
+        let _ = (wal_enabled, wal);
+        state.manifest.wal_checkpoint = state.wal_sequence;
 
         Self::remember_flushed_ids_in(state, &seg_id, &docs);
 
@@ -1303,13 +1363,6 @@ impl Indexer {
             state.id_index = None;
         }
 
-        for seg_id in &old_segment_ids {
-            let seg_dir = ns_dir.join(&seg_id.0);
-            if seg_dir.exists() {
-                std::fs::remove_dir_all(&seg_dir).ok();
-            }
-        }
-
         let segments_after = self
             .manifest_cloned(namespace)
             .map(|m| m.segments.len())
@@ -1351,6 +1404,14 @@ impl Indexer {
     pub fn restore_manifest(&self, namespace: NamespaceId, manifest: Manifest) {
         let handle = self.ns_handle(&namespace);
         let mut state = handle.state.lock().unwrap();
+        if state.known && state.manifest.version > manifest.version {
+            return;
+        }
+        self.wal
+            .lock()
+            .unwrap()
+            .advance_past(manifest.wal_checkpoint);
+        state.wal_sequence = state.wal_sequence.max(manifest.wal_checkpoint);
         let max_counter = manifest
             .segments
             .iter()
@@ -1366,6 +1427,22 @@ impl Indexer {
             buf.segment_counter = buf.segment_counter.max(max + 1);
         }
         state.id_index = None;
+        if !state.recovered.is_empty() {
+            let replay: Vec<Document> = std::mem::take(&mut state.recovered)
+                .into_iter()
+                .filter(|(seq, _)| *seq > manifest.wal_checkpoint)
+                .flat_map(|(_, docs)| docs)
+                .collect();
+            let buf = Self::buffer_mut_in(
+                &mut state,
+                namespace.clone(),
+                &self.data_dir,
+                &self.bm25_params,
+            );
+            buf.documents = dedupe_documents_last_wins(replay);
+            state.replay_required = !buf.documents.is_empty() && !manifest.segments.is_empty();
+        }
+        state.tombstones = manifest.tombstones.clone();
         state.manifest = manifest;
         state.known = true;
     }
@@ -1384,8 +1461,11 @@ impl Indexer {
     ///   tombstones.
     ///
     /// Local changes since the base (new flushes, local compactions) are
-    /// kept. The version becomes `max(local, remote) + 1`, so it always
-    /// moves past the stored one.
+    /// kept. Deletions are unioned: the remote's tombstones are added to
+    /// every segment that survives the rebase, so a delete the other writer
+    /// published isn't undone. `wal_checkpoint` stays local, since it
+    /// describes this process's WAL. The version becomes
+    /// `max(local, remote) + 1`, so it always moves past the stored one.
     ///
     /// This does not reconcile two writers that both rewrote the same
     /// segments, or that minted the same segment id. Fencing a single
@@ -1441,10 +1521,27 @@ impl Indexer {
             );
             buf.segment_counter = buf.segment_counter.max(max + 1);
         }
+        let kept: HashSet<SegmentId> = state
+            .manifest
+            .segments
+            .iter()
+            .map(|e| e.segment_id.clone())
+            .collect();
+        for (seg, seqs) in &remote.tombstones {
+            if kept.contains(seg) {
+                state
+                    .tombstones
+                    .entry(seg.clone())
+                    .or_default()
+                    .extend(seqs.iter().copied());
+            }
+        }
         state.manifest.version = state.manifest.version.max(remote.version) + 1;
         state.id_index = None;
         state.known = true;
-        state.manifest.clone()
+        let mut manifest = state.manifest.clone();
+        manifest.tombstones = state.tombstones.clone();
+        manifest
     }
 
     pub fn manifest(&self, namespace: &NamespaceId) -> Option<Manifest> {
@@ -1458,7 +1555,31 @@ impl Indexer {
         if !state.known {
             return None;
         }
-        Some(state.manifest.clone())
+        let mut manifest = state.manifest.clone();
+        manifest.tombstones = state.tombstones.clone();
+        Some(manifest)
+    }
+
+    pub fn needs_recovery_hydration(&self, namespace: &NamespaceId) -> bool {
+        self.ns_handle(namespace)
+            .state
+            .lock()
+            .unwrap()
+            .replay_required
+    }
+
+    pub fn acknowledge_manifest(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+    ) -> Result<(), KoshaError> {
+        if self.wal_enabled {
+            self.wal
+                .lock()
+                .unwrap()
+                .clear_through(namespace, manifest.wal_checkpoint)?;
+        }
+        Ok(())
     }
 
     pub fn namespaces(&self) -> Vec<NamespaceId> {
@@ -1736,6 +1857,187 @@ fn range_check_str(val: &str, bound: &RangeBound) -> bool {
 mod tests {
     use super::*;
     use kosha_core::{DocumentId, Field, FilterClause};
+
+    #[test]
+    fn regression_delete_survives_manifest_restore_and_covers_buffer() {
+        let dir = std::env::temp_dir().join("kosha-regression-delete-durable");
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("ns".into());
+        for id in ["flushed", "buffered"] {
+            idx.index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId(id.into()),
+                    fields: vec![Field::keyword("status", "remove")],
+                }],
+            )
+            .unwrap();
+            if id == "flushed" {
+                idx.flush_namespace(&ns).unwrap();
+            }
+        }
+        let before = idx.manifest(&ns).unwrap();
+        let filter = FilterClause::Term {
+            term: HashMap::from([("status".into(), "remove".into())]),
+        };
+        let deleted = idx.delete_by_query(&ns, &before, &filter).unwrap();
+        assert_eq!(deleted, 2, "deletion must include buffered documents");
+        let published = idx.manifest(&ns).unwrap();
+        assert!(published.version > before.version);
+        let restored = Indexer::new(dir.clone());
+        restored.restore_manifest(ns.clone(), published);
+        assert!(restored
+            .existing_ids(
+                &ns,
+                &[DocumentId("flushed".into()), DocumentId("buffered".into())]
+            )
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn regression_recovered_upsert_replaces_committed_version() {
+        let dir = std::env::temp_dir().join("kosha-regression-replay-upsert");
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("ns".into());
+        let doc = |text: &str| Document {
+            id: DocumentId("same".into()),
+            fields: vec![Field::text("text", text)],
+        };
+        idx.index_documents(ns.clone(), vec![doc("old")]).unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let committed = idx.manifest(&ns).unwrap();
+        idx.acknowledge_manifest(&ns, &committed).unwrap();
+        // Crash after a new upsert's WAL append, before its segment commit.
+        idx.wal.lock().unwrap().append(&ns, &[doc("new")]).unwrap();
+        let restart = Indexer::new(dir.clone());
+        restart.restore_manifest(ns.clone(), committed);
+        restart.flush_namespace(&ns).unwrap();
+        let manifest = restart.manifest(&ns).unwrap();
+        assert_eq!(
+            manifest.segments.iter().map(|e| e.doc_count).sum::<u32>(),
+            1
+        );
+        let reader = kosha_segment::SegmentReader::open(
+            dir.join("ns").join(&manifest.segments[0].segment_id.0),
+        )
+        .unwrap();
+        assert_eq!(
+            reader.iter_doc_records().next().unwrap().unwrap().fields[0].value,
+            "new"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn regression_fresh_disk_advances_wal_past_remote_checkpoint() {
+        let dir = std::env::temp_dir().join("kosha-regression-fresh-wal");
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("a".into());
+        let mut manifest = NamespaceState::new().manifest;
+        manifest.wal_checkpoint = 100;
+        manifest.version = 5;
+        idx.restore_manifest(ns.clone(), manifest);
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("new".into()),
+                fields: vec![Field::text("text", "new")],
+            }],
+        )
+        .unwrap();
+        let records = wal::WalWriter::recover_sequenced(&dir.join("_wal")).unwrap();
+        assert!(records[0].0 > 100);
+        idx.flush_namespace(&ns).unwrap();
+        assert!(idx.manifest(&ns).unwrap().wal_checkpoint > 100);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn regression_published_checkpoint_preserves_later_writes_and_replay() {
+        let dir = std::env::temp_dir().join("kosha-regression-checkpoint");
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("a".into());
+        let doc = |id: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", id)],
+        };
+        idx.index_documents(ns.clone(), vec![doc("published")])
+            .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let manifest = idx.manifest(&ns).unwrap();
+        idx.index_documents(ns.clone(), vec![doc("later")]).unwrap();
+        idx.index_documents(NamespaceId("b".into()), vec![doc("other")])
+            .unwrap();
+        // Crash after publishing, before reclamation: checkpoint prevents replay
+        // of already committed records without dropping later writes.
+        let restart = Indexer::new(dir.clone());
+        restart.restore_manifest(ns.clone(), manifest.clone());
+        restart.flush_namespace(&ns).unwrap();
+        assert_eq!(
+            restart
+                .manifest(&ns)
+                .unwrap()
+                .segments
+                .iter()
+                .map(|e| e.doc_count)
+                .sum::<u32>(),
+            2
+        );
+        idx.acknowledge_manifest(&ns, &manifest).unwrap();
+        let records = wal::WalWriter::recover(&dir.join("_wal")).unwrap();
+        let ids: HashSet<_> = records
+            .iter()
+            .flat_map(|r| r.documents.iter().map(|d| d.id.0.as_str()))
+            .collect();
+        assert_eq!(ids, HashSet::from(["later", "other"]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn regression_flush_preserves_other_namespace_wal() {
+        let dir = std::env::temp_dir().join("kosha-regression-wal-isolation");
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = Indexer::new(dir.clone());
+        for ns in ["a", "b"] {
+            idx.index_documents(
+                NamespaceId(ns.into()),
+                vec![Document {
+                    id: DocumentId(ns.into()),
+                    fields: vec![Field::text("text", ns)],
+                }],
+            )
+            .unwrap();
+        }
+        idx.flush_namespace(&NamespaceId("a".into())).unwrap();
+        let recovered = wal::WalWriter::recover(&dir.join("_wal")).unwrap();
+        assert!(recovered.iter().any(|r| r.namespace.0 == "b"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn regression_failed_wal_append_rejects_write() {
+        let dir = std::env::temp_dir().join("kosha-regression-wal-error");
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = Indexer::new(dir.clone());
+        std::fs::remove_dir_all(dir.join("_wal")).unwrap();
+        std::fs::write(dir.join("_wal"), b"blocked").unwrap();
+        assert!(idx
+            .index_documents(
+                NamespaceId("a".into()),
+                vec![Document {
+                    id: DocumentId("a".into()),
+                    fields: vec![Field::text("text", "a")],
+                }]
+            )
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn delete_by_query_tombstones() {
@@ -2201,7 +2503,10 @@ mod tests {
         let manifest = idx.manifest(&ns).unwrap().clone();
         assert_eq!(manifest.segments.len(), 1);
         assert_ne!(manifest.segments[0].segment_id, old_segment);
-        assert!(!dir.join(&ns.0).join(&old_segment.0).exists());
+        assert!(
+            dir.join(&ns.0).join(&old_segment.0).exists(),
+            "older readers retain access until cache reclamation"
+        );
 
         let reader = kosha_segment::SegmentReader::open(
             dir.join(&ns.0).join(&manifest.segments[0].segment_id.0),
@@ -2310,7 +2615,7 @@ mod tests {
         assert_eq!(reader.doc_count(), 4);
 
         // Old segment directories should be deleted.
-        assert!(std::fs::read_dir(dir.join("test")).unwrap().count() == 1);
+        assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2709,36 +3014,17 @@ mod tests {
             "a chunk whose segment dir collides with an existing file must fail the round"
         );
 
-        let manifest = idx.manifest(&ns).unwrap().clone();
-        assert_eq!(
-            manifest.segments.len(),
-            2,
-            "the 2 chunks that succeeded must still be committed despite the 3rd failing"
+        assert!(
+            idx.manifest(&ns).unwrap().segments.is_empty(),
+            "a failed round must not expose partial segments"
         );
-        let committed: u32 = manifest.segments.iter().map(|e| e.doc_count).sum();
-        assert_eq!(committed, 4, "2 succeeded chunks x 2 docs each");
-
-        // The failed chunk's 2 documents must still be visible somewhere
-        // (buffered, not lost) -- all 6 original ids must resolve.
         let all_ids: Vec<DocumentId> = (0..6).map(|i| DocumentId(format!("d{i}"))).collect();
-        let visible = idx.existing_ids(&ns, &all_ids).unwrap();
+        assert_eq!(idx.existing_ids(&ns, &all_ids).unwrap().len(), 6);
+        let records = crate::wal::WalWriter::recover(&dir.join("_wal")).unwrap();
         assert_eq!(
-            visible.len(),
+            records.iter().map(|r| r.documents.len()).sum::<usize>(),
             6,
-            "all 6 original docs must still be visible (4 flushed, 2 buffered)"
-        );
-
-        // WAL must back exactly the 2 restored (still-unflushed) docs — not
-        // 0 (would mean data loss on crash) and not more than 2 (would mean
-        // stale WAL entries for the already-durable segments were never
-        // cleared).
-        let wal_dir = dir.join("_wal");
-        let records = crate::wal::WalWriter::recover(&wal_dir).unwrap();
-        let wal_doc_count: usize = records.iter().map(|r| r.documents.len()).sum();
-        assert_eq!(
-            wal_doc_count, 2,
-            "WAL must back exactly the failed chunk's still-unflushed \
-             documents, not the durably-flushed ones and not zero"
+            "all records remain recoverable until publication"
         );
 
         // Clear the blocker and retry: the restored documents must flush

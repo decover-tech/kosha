@@ -2473,34 +2473,20 @@ impl Searcher {
             // Per-segment HashMap keeps hybrid merge O(k), not O(hits·k).
             // (A no-op on an empty `knn_results`, same as before this
             // block existed — no separate emptiness gate needed.)
-            if !seg_hits.is_empty() {
-                // Hybrid blend: only docs already in `seg_hits` (i.e. that
-                // passed the lexical/filter legs) receive their vector
-                // contribution — the over-fetched tail just means more of
-                // the surviving docs get their true vector score instead
-                // of missing the old top-`k` cut.
-                for (doc_seq, knn_score) in knn_results {
-                    if let Some(existing) = seg_hits.get_mut(&doc_seq) {
-                        *existing = *existing * 0.5 + knn_score * 0.5 * 100.0;
-                    }
+            for (kept, (doc_seq, score)) in knn_results
+                .into_iter()
+                .filter(|(doc_seq, _)| {
+                    !is_tombstoned(*doc_seq) && reader.doc_meta(*doc_seq).is_some()
+                })
+                .enumerate()
+            {
+                if kept >= knn.k {
+                    break;
                 }
-            } else {
-                // Pure kNN search for this segment: keep the top `knn.k`
-                // *live* candidates. The list is score-descending, so stop
-                // once k survivors are in.
-                let mut kept = 0usize;
-                for (doc_seq, score) in knn_results {
-                    if kept >= knn.k {
-                        break;
-                    }
-                    if is_tombstoned(doc_seq) {
-                        continue;
-                    }
-                    if reader.doc_meta(doc_seq).is_some() {
-                        seg_hits.insert(doc_seq, (score + 1.0) * 10.0);
-                        kept += 1;
-                    }
-                }
+                seg_hits
+                    .entry(doc_seq)
+                    .and_modify(|lexical| *lexical = *lexical * 0.5 + score * 0.5 * 100.0)
+                    .or_insert((score + 1.0) * 10.0);
             }
         }
 
@@ -2508,6 +2494,19 @@ impl Searcher {
         // docs in this segment — decoupled from the (possibly truncated)
         // candidate list built below, mirroring the WAND paths'
         // total_hits/candidates split (see `SegmentOutput`).
+        let aggs = if query.aggs.is_empty() {
+            HashMap::new()
+        } else {
+            let wanted: HashSet<u32> = seg_hits.keys().copied().collect();
+            let store = filter_store
+                .as_ref()
+                .expect("aggregations require filter store");
+            query
+                .aggs
+                .iter()
+                .map(|(name, agg)| (name.clone(), aggregate_matches(store, &wanted, agg)))
+                .collect()
+        };
         let total_hits = seg_hits.len();
 
         // Cut to this segment's top `effective_k` by score *before* paying
@@ -2588,28 +2587,6 @@ impl Searcher {
             });
         }
 
-        // ── Aggregations (this segment's own contribution only) ──
-        let mut aggs = HashMap::new();
-        for (agg_name, agg) in &query.aggs {
-            let store = filter_store
-                .as_ref()
-                .expect("aggregations require filter_store");
-            match agg {
-                Aggregation::Terms { terms } => {
-                    let result = compute_single_aggregation(store, &terms.field);
-                    aggs.insert(agg_name.clone(), result);
-                }
-                Aggregation::Cardinality { cardinality } => {
-                    let result = compute_cardinality(store, &cardinality.field);
-                    aggs.insert(agg_name.clone(), result);
-                }
-                Aggregation::Composite { composite } => {
-                    let result = compute_composite(store, composite);
-                    aggs.insert(agg_name.clone(), result);
-                }
-            }
-        }
-
         Ok(Some(SegmentOutput {
             candidates,
             aggs,
@@ -2683,6 +2660,7 @@ impl Searcher {
         >,
         doc_store_hydrator: DocStoreHydrator<'_>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
+        let tombstones = tombstones.or(Some(&manifest.tombstones));
         let mut phase_stats = SearchPhaseStats::default();
         if manifest.segments.is_empty() {
             return Ok((
@@ -2739,18 +2717,7 @@ impl Searcher {
         phase_stats.admit_wall_ms = t_admit.elapsed().as_secs_f64() * 1e3;
 
         let query_terms = tokenize(&query.query_text);
-        let phrase_terms_for_prune = query.match_phrase.as_ref().map(|mp| tokenize(&mp.phrase));
-        // Term-bloom prune before open. Wildcard expansion needs the segment
-        // vocabulary, so it cannot be pruned here (OR over unknown terms).
-        let term_prune: Option<(Vec<String>, TermBloomMode)> = if query.wildcard.is_some() {
-            None
-        } else if let Some(ref pt) = phrase_terms_for_prune {
-            Some((pt.clone(), TermBloomMode::And))
-        } else if !query_terms.is_empty() {
-            Some((query_terms.clone(), TermBloomMode::And))
-        } else {
-            None
-        };
+        let term_prune = term_bloom_prune_for_query(query);
 
         // Score-only candidates (#37): defer `fields.clone()` until after
         // top-k / page selection so clone+sort cost scales with page size,
@@ -2829,7 +2796,7 @@ impl Searcher {
         let t_materialize = Instant::now();
 
         let mut candidates: Vec<HitCandidate> = Vec::new();
-        let mut all_aggs: HashMap<String, AggregationResults> = HashMap::new();
+        let mut all_aggs: HashMap<String, AggregationState> = HashMap::new();
         // Total hits summed across segments. Replaces the old
         // `candidates.len()` base. The block-max WAND early-termination
         // path returns only the top-`from+max_results` candidates but
@@ -2850,17 +2817,8 @@ impl Searcher {
             if output.knn_segment_degraded {
                 knn_degraded_segments += 1;
             }
-            // Last-segment-wins per agg name, same reduction the old
-            // sequential loop did via repeated `all_aggs.insert(...)`.
-            // `segment_outputs` is in manifest order, so this is
-            // behavior-identical to before — not a new source of
-            // nondeterminism from parallelizing the scoring above. Note:
-            // this was already a pre-existing simplification (each named
-            // aggregation reflects only the last segment that computed it,
-            // not a true cross-segment merge) — unrelated to this change,
-            // called out separately rather than silently fixed here.
             for (agg_name, result) in output.aggs {
-                all_aggs.insert(agg_name, result);
+                all_aggs.entry(agg_name).or_default().merge(result);
             }
         }
 
@@ -3006,18 +2964,7 @@ impl Searcher {
             page.push(doc);
         }
 
-        // Merge aggregations across segments.
-        let merged_aggs = if all_aggs.is_empty() {
-            None
-        } else {
-            // Use the first segment's aggs (all segments have the same data).
-            Some(all_aggs.into_values().next().unwrap_or(AggregationResults {
-                per_document: None,
-                total_documents: None,
-                matched_docs: None,
-                extra: HashMap::new(),
-            }))
-        };
+        let merged_aggs = finish_aggregations(query, all_aggs);
 
         phase_stats.materialize_wall_ms = t_materialize.elapsed().as_secs_f64() * 1e3;
 
@@ -3584,7 +3531,7 @@ struct HitCandidate {
 /// score alone — still have `total_hits == candidates.len()`.
 struct SegmentOutput {
     candidates: Vec<HitCandidate>,
-    aggs: HashMap<String, AggregationResults>,
+    aggs: HashMap<String, AggregationState>,
     total_hits: usize,
     /// True when the multi-term join stopped counting early under a
     /// count budget (capped mode): `total_hits` is then a lower bound
@@ -3696,6 +3643,218 @@ fn candidate_sort_value<'a>(
 }
 
 // ─── Aggregation functions ──────────────────────────────────────────────────
+
+/// Lossless intermediate state: trim buckets and count distinct values only
+/// after merging all segments, never on a per-segment top-N.
+#[derive(Default)]
+struct AggregationState {
+    buckets: std::collections::BTreeMap<Vec<String>, usize>,
+}
+
+impl AggregationState {
+    fn merge(&mut self, other: Self) {
+        for (key, count) in other.buckets {
+            *self.buckets.entry(key).or_default() += count;
+        }
+    }
+}
+
+fn aggregation_sources(agg: &Aggregation) -> Vec<(String, String)> {
+    match agg {
+        Aggregation::Terms { terms } => vec![(terms.field.clone(), terms.field.clone())],
+        Aggregation::Cardinality { cardinality } => {
+            vec![(cardinality.field.clone(), cardinality.field.clone())]
+        }
+        Aggregation::Composite { composite } => composite
+            .sources
+            .iter()
+            .flat_map(|source| {
+                let mut entries: Vec<_> = source
+                    .source
+                    .iter()
+                    .map(|(name, spec)| (name.clone(), spec.terms.field.clone()))
+                    .collect();
+                entries.sort();
+                entries
+            })
+            .collect(),
+    }
+}
+
+fn aggregate_matches(
+    store: &FilterStore,
+    wanted: &HashSet<u32>,
+    agg: &Aggregation,
+) -> AggregationState {
+    let sources = aggregation_sources(agg);
+    let values: Vec<HashMap<u32, HashSet<String>>> = sources
+        .iter()
+        .map(|(_, field)| {
+            let mut result: HashMap<u32, HashSet<String>> = HashMap::new();
+            if let Some(entries) = store.string_fields.get(field) {
+                for (doc, value) in entries {
+                    if wanted.contains(doc) {
+                        result.entry(*doc).or_default().insert(value.clone());
+                    }
+                }
+            }
+            if let Some(entries) = store.integer_fields.get(field) {
+                for (doc, value) in entries {
+                    if wanted.contains(doc) {
+                        result.entry(*doc).or_default().insert(value.to_string());
+                    }
+                }
+            }
+            if let Some(entries) = store.float_fields.get(field) {
+                for (doc, value) in entries {
+                    if wanted.contains(doc) {
+                        result.entry(*doc).or_default().insert(value.to_string());
+                    }
+                }
+            }
+            result
+        })
+        .collect();
+    let mut state = AggregationState::default();
+    if sources.is_empty() {
+        return state;
+    }
+    for doc in wanted {
+        let mut keys = vec![Vec::new()];
+        for field in &values {
+            let Some(options) = field.get(doc) else {
+                keys.clear();
+                break;
+            };
+            keys = keys
+                .into_iter()
+                .flat_map(|prefix| {
+                    options.iter().map(move |value| {
+                        let mut key = prefix.clone();
+                        key.push(value.clone());
+                        key
+                    })
+                })
+                .collect();
+        }
+        for key in keys {
+            *state.buckets.entry(key).or_default() += 1;
+        }
+    }
+    state
+}
+
+fn finish_aggregations(
+    query: &SearchQuery,
+    mut states: HashMap<String, AggregationState>,
+) -> Option<AggregationResults> {
+    if query.aggs.is_empty() {
+        return None;
+    }
+    let mut output = serde_json::Map::new();
+    for (name, agg) in &query.aggs {
+        let state = states.remove(name).unwrap_or_default();
+        let value = match agg {
+            Aggregation::Terms { terms } => {
+                let mut buckets: Vec<AggBucket> = state
+                    .buckets
+                    .into_iter()
+                    .map(|(key, doc_count)| AggBucket {
+                        key: key[0].clone(),
+                        doc_count,
+                    })
+                    .collect();
+                buckets.sort_by(|a, b| {
+                    b.doc_count
+                        .cmp(&a.doc_count)
+                        .then_with(|| a.key.cmp(&b.key))
+                });
+                buckets.truncate(terms.size);
+                serde_json::to_value(AggBucketResult { buckets }).unwrap()
+            }
+            Aggregation::Cardinality { .. } => serde_json::json!({"value": state.buckets.len()}),
+            Aggregation::Composite { composite } => {
+                let sources = aggregation_sources(agg);
+                let after: Option<Vec<String>> = composite.after.as_ref().map(|cursor| {
+                    sources
+                        .iter()
+                        .map(|(name, _)| cursor.get(name).cloned().unwrap_or_default())
+                        .collect()
+                });
+                let buckets: Vec<AggCompositeBucket> = state
+                    .buckets
+                    .into_iter()
+                    .filter(|(key, _)| after.as_ref().is_none_or(|after| key > after))
+                    .take(composite.size)
+                    .map(|(key, doc_count)| AggCompositeBucket {
+                        key: sources
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .zip(key)
+                            .collect(),
+                        doc_count,
+                    })
+                    .collect();
+                let after_key = buckets.last().map(|b| b.key.clone());
+                serde_json::to_value(AggCompositeResult { buckets, after_key }).unwrap()
+            }
+        };
+        output.insert(name.clone(), value);
+    }
+    // Preserve the historical named fields while retaining every arbitrary
+    // aggregation name in the flattened `extra` map.
+    let mut result = AggregationResults {
+        per_document: None,
+        total_documents: None,
+        matched_docs: None,
+        extra: HashMap::new(),
+    };
+    for (name, value) in output {
+        match name.as_str() {
+            "per_document" if value.get("buckets").is_some() => {
+                if let Ok(parsed) = serde_json::from_value(value.clone()) {
+                    result.per_document = Some(parsed);
+                } else {
+                    result.extra.insert(name, value);
+                }
+            }
+            "total_documents" if value.get("value").is_some() => {
+                result.total_documents = Some(serde_json::from_value(value).unwrap())
+            }
+            "matched_docs" if value.get("buckets").is_some() => {
+                if let Ok(parsed) = serde_json::from_value(value.clone()) {
+                    result.matched_docs = Some(parsed);
+                } else {
+                    result.extra.insert(name, value);
+                }
+            }
+            _ => {
+                result.extra.insert(name, value);
+            }
+        }
+    }
+    Some(result)
+}
+
+pub fn term_bloom_prune_for_query(query: &SearchQuery) -> Option<(Vec<String>, TermBloomMode)> {
+    // Hybrid retrieval is a union: lexical absence says nothing about the
+    // vector leg. Wildcards need vocabulary expansion before pruning.
+    if query.knn.is_some() || query.wildcard.is_some() {
+        return None;
+    }
+    let (terms, mode) = if let Some(phrase) = &query.match_phrase {
+        (tokenize(&phrase.phrase), TermBloomMode::And)
+    } else {
+        (
+            tokenize(&query.query_text),
+            match query.operator {
+                Some(kosha_core::QueryOperator::Or) => TermBloomMode::Or,
+                _ => TermBloomMode::And,
+            },
+        )
+    };
+    (!terms.is_empty()).then_some((terms, mode))
+}
 
 pub fn compute_single_aggregation(store: &FilterStore, field: &str) -> AggregationResults {
     // Borrowed key while counting — one `String` alloc per *distinct*
@@ -3893,6 +4052,182 @@ mod tests {
         }
     }
 
+    fn regression_corpus() -> (std::path::PathBuf, NamespaceId, Manifest) {
+        let root = std::env::temp_dir().join(format!(
+            "kosha-regression-query-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ns = NamespaceId("ns".into());
+        let mut manifest = Manifest {
+            version: 1,
+            segments: vec![],
+            segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
+        };
+        for (segment, docs) in [
+            (
+                "a",
+                vec![
+                    ("a1", "apple", "red"),
+                    ("a2", "apple", "blue"),
+                    ("a3", "noise", "excluded"),
+                ],
+            ),
+            (
+                "b",
+                vec![("b1", "banana", "red"), ("b2", "banana", "green")],
+            ),
+        ] {
+            let id = SegmentId(segment.into());
+            let mut writer = SegmentWriter::new(id.clone(), root.join("ns").join(segment));
+            for (doc, text, color) in docs {
+                writer.add_document(
+                    DocumentId(doc.into()),
+                    vec![
+                        Field::text("text", text),
+                        Field::keyword("color", color),
+                        Field {
+                            name: "embedding".into(),
+                            field_type: kosha_core::FieldType::Vector,
+                            value: if segment == "b" {
+                                "[1.0,0.0]".into()
+                            } else {
+                                "[0.0,1.0]".into()
+                            },
+                        },
+                    ],
+                );
+            }
+            let footer = writer.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id: id,
+                doc_count: footer.doc_count,
+            });
+            manifest.remember_segment_footer(footer);
+        }
+        (root, ns, manifest)
+    }
+
+    #[test]
+    fn regression_composite_merges_before_pagination_and_uses_source_names() {
+        let (root, ns, manifest) = regression_corpus();
+        let mut query = mk_query("", 0);
+        query.filter = Some(serde_json::from_value(serde_json::json!({"match_all":{}})).unwrap());
+        query.aggs = serde_json::from_value(serde_json::json!({
+            "page":{"composite":{"size":2,"sources":[{"label":{"terms":{"field":"color"}}}],"after":{"label":"excluded"}}}
+        })).unwrap();
+        let result = Searcher::new(root.clone())
+            .search(&ns, &manifest, &query, None)
+            .unwrap();
+        let json = serde_json::to_value(result.aggregations.unwrap()).unwrap();
+        assert_eq!(
+            json["page"]["buckets"],
+            serde_json::json!([
+                {"key":{"label":"green"},"doc_count":1},
+                {"key":{"label":"red"},"doc_count":2}
+            ])
+        );
+        assert_eq!(
+            json["page"]["after_key"],
+            serde_json::json!({"label":"red"})
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regression_aggregation_filter_counts_all_matches_not_just_page() {
+        let (root, ns, manifest) = regression_corpus();
+        let mut query = mk_query("", 1);
+        query.filter =
+            Some(serde_json::from_value(serde_json::json!({"term":{"color":"red"}})).unwrap());
+        query.aggs =
+            serde_json::from_value(serde_json::json!({"per_document":{"terms":{"field":"color"}}}))
+                .unwrap();
+        let result = Searcher::new(root.clone())
+            .search(&ns, &manifest, &query, None)
+            .unwrap();
+        assert_eq!(result.results.len(), 1);
+        let buckets = result.aggregations.unwrap().per_document.unwrap().buckets;
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].doc_count, 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regression_or_bloom_keeps_single_term_segments() {
+        let (root, ns, manifest) = regression_corpus();
+        let mut query = mk_query("apple banana", 10);
+        query.operator = Some(kosha_core::QueryOperator::Or);
+        assert_eq!(
+            Searcher::new(root.clone())
+                .search(&ns, &manifest, &query, None)
+                .unwrap()
+                .total_hits,
+            4
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regression_hybrid_bloom_keeps_vector_only_segments() {
+        let (root, ns, manifest) = regression_corpus();
+        let mut query = mk_query("apple", 10);
+        query.knn = Some(serde_json::from_value(serde_json::json!({"field":"embedding", "vector":[1.0,0.0], "k":2, "num_candidates":100})).unwrap());
+        let result = Searcher::new(root.clone())
+            .search(&ns, &manifest, &query, None)
+            .unwrap();
+        assert!(result.results.iter().any(|d| d.doc_id.0 == "b1"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regression_aggregations_merge_all_segments_and_distinct_values() {
+        let (root, ns, manifest) = regression_corpus();
+        let mut query = mk_query("", 0);
+        query.filter = Some(serde_json::from_value(serde_json::json!({"match_all":{}})).unwrap());
+        query.aggs = serde_json::from_value(serde_json::json!({
+            "colors":{"terms":{"field":"color", "size":10}},
+            "distinct":{"cardinality":{"field":"color"}}
+        }))
+        .unwrap();
+        let result = Searcher::new(root.clone())
+            .search(&ns, &manifest, &query, None)
+            .unwrap();
+        let aggs = serde_json::to_value(result.aggregations.unwrap()).unwrap();
+        let buckets: Vec<kosha_core::AggBucket> =
+            serde_json::from_value(aggs["colors"]["buckets"].clone()).unwrap();
+        assert_eq!(
+            buckets.iter().find(|b| b.key == "red").unwrap().doc_count,
+            2
+        );
+        assert_eq!(aggs["distinct"]["value"], 4);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regression_aggregations_respect_query_and_tombstones_before_paging() {
+        let (root, ns, manifest) = regression_corpus();
+        let mut query = mk_query("apple", 0);
+        query.aggs =
+            serde_json::from_value(serde_json::json!({"colors":{"terms":{"field":"color"}}}))
+                .unwrap();
+        let tombstones = HashMap::from([(SegmentId("a".into()), HashSet::from([1]))]);
+        let result = Searcher::new(root.clone())
+            .search(&ns, &manifest, &query, Some(&tombstones))
+            .unwrap();
+        let aggs = serde_json::to_value(result.aggregations.unwrap()).unwrap();
+        let buckets: Vec<kosha_core::AggBucket> =
+            serde_json::from_value(aggs["colors"]["buckets"].clone()).unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].key, "red");
+        assert_eq!(buckets[0].doc_count, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn capped_mode_early_exit_preserves_page_and_reports_gte() {
         // V2 of the cap: with a count budget, the multi-term join may stop
@@ -3933,6 +4268,8 @@ mod tests {
                 doc_count: 600,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -4062,6 +4399,8 @@ mod tests {
                 doc_count: n as u32,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -4148,6 +4487,8 @@ mod tests {
                 })
                 .collect(),
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -4313,6 +4654,8 @@ mod tests {
                 version: 1,
                 segments: entries,
                 segment_footers: Default::default(),
+                wal_checkpoint: 0,
+                tombstones: Default::default(),
             },
             all,
         )
@@ -4569,6 +4912,8 @@ mod tests {
             version: 1,
             segments,
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
 
         // Reproduce the production regime exactly, independent of how this
@@ -4730,6 +5075,8 @@ mod tests {
                 doc_count: 1,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let result = searcher.search(
             &NamespaceId("test".into()),
@@ -4780,6 +5127,8 @@ mod tests {
                 },
             ],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -4847,6 +5196,8 @@ mod tests {
             version: 1,
             segments,
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -4929,6 +5280,8 @@ mod tests {
                 },
             ],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let result = searcher
             .search(
@@ -5023,6 +5376,8 @@ mod tests {
                 doc_count: 3,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut query = mk_query("", 10);
@@ -5097,6 +5452,8 @@ mod tests {
                 doc_count: 1,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -5180,6 +5537,8 @@ mod tests {
                 },
             ],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
 
         // Generous entry-count cap (10) but a byte budget that fits s1 alone,
@@ -5294,6 +5653,8 @@ mod tests {
                 doc_count: 2,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -5350,6 +5711,8 @@ mod tests {
                 doc_count: 2,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
@@ -5399,6 +5762,8 @@ mod tests {
                 doc_count: 40,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5565,6 +5930,8 @@ mod tests {
             version: 1,
             segments: entries,
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mk_knn_q = |num_candidates: usize| {
@@ -5687,6 +6054,8 @@ mod tests {
             version: 1,
             segments: entries,
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 1);
@@ -5753,6 +6122,8 @@ mod tests {
                 doc_count: 2,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -5814,6 +6185,8 @@ mod tests {
                 doc_count: 2,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -5880,6 +6253,8 @@ mod tests {
                 doc_count: 40,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         (dir, manifest)
     }
@@ -5994,6 +6369,8 @@ mod tests {
                 doc_count: 1,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         // Fresh searcher (no warm in-memory segment cache) so opening the
         // segment for these searches goes through the real `try_read_doc_index`
@@ -6069,6 +6446,8 @@ mod tests {
                 })
                 .collect(),
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         // Fresh searcher so each segment is actually opened (Lazy), not
         // served from a warm cache populated by an earlier call here.
@@ -6184,6 +6563,8 @@ mod tests {
                 doc_count: 2,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -6230,6 +6611,8 @@ mod tests {
                 doc_count: 2,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -6284,6 +6667,8 @@ mod tests {
                 doc_count: n as u32,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -6377,6 +6762,8 @@ mod tests {
                 },
             ],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -6417,6 +6804,8 @@ mod tests {
                 doc_count: 3,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -6472,6 +6861,8 @@ mod tests {
                 doc_count: n as u32,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         }
     }
 
@@ -6520,6 +6911,8 @@ mod tests {
                 doc_count: n as u32,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         }
     }
 
@@ -6704,6 +7097,8 @@ mod tests {
                 doc_count: n as u32,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -6839,6 +7234,8 @@ mod tests {
                 doc_count: 150,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
 
         // Baseline (uncorrupted): "alpha beta" intersects, "beta" matches.
@@ -6929,6 +7326,8 @@ mod tests {
                 doc_count: 150,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         // Open + warm the segment so the reader is cached, THEN evict
@@ -6978,6 +7377,8 @@ mod tests {
                 doc_count: n as u32,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7122,6 +7523,8 @@ mod tests {
                 doc_count: n as u32,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7181,6 +7584,8 @@ mod tests {
                 doc_count: 300,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -7260,6 +7665,8 @@ mod tests {
                 doc_count: n as u32,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -7305,6 +7712,8 @@ mod tests {
                 doc_count: 3,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -7402,6 +7811,8 @@ mod tests {
                 doc_count: 3,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -7473,6 +7884,8 @@ mod tests {
                 doc_count: 5,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut id_sort = std::collections::HashMap::new();
@@ -7584,6 +7997,8 @@ mod tests {
                 doc_count: n as u32,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -7650,6 +8065,8 @@ mod tests {
                 doc_count: n as u32,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -7699,6 +8116,8 @@ mod tests {
                 doc_count: 2,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7771,6 +8190,8 @@ mod tests {
                 },
             ],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -7854,6 +8275,8 @@ mod tests {
             version: 1,
             segments: manifest_segments,
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -7924,6 +8347,8 @@ mod tests {
                 doc_count: 1,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
