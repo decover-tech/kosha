@@ -58,6 +58,9 @@ pub struct SegmentWriter {
     filter_integer: HashMap<String, Vec<(u32, i64)>>,
     filter_float: HashMap<String, Vec<(u32, f64)>>,
     vectors: Vec<(u32, Vec<f32>)>,
+    /// See [`text_filter_ignore_above`]. Captured per writer so tests can
+    /// override it without touching the process-wide env.
+    text_filter_ignore_above: Option<u32>,
 }
 
 impl SegmentWriter {
@@ -83,7 +86,17 @@ impl SegmentWriter {
             filter_integer: HashMap::new(),
             filter_float: HashMap::new(),
             vectors: Vec::new(),
+            text_filter_ignore_above: text_filter_ignore_above(),
         }
+    }
+
+    /// Override the `Text` → filter-column cap for this writer (`None`
+    /// disables it). Production writers use the
+    /// `KOSHA_TEXT_FILTER_IGNORE_ABOVE` default; see
+    /// [`text_filter_ignore_above`].
+    pub fn with_text_filter_ignore_above(mut self, cap: Option<u32>) -> Self {
+        self.text_filter_ignore_above = cap;
+        self
     }
 
     pub fn add_document(&mut self, doc_id: DocumentId, fields: Vec<Field>) {
@@ -134,10 +147,18 @@ impl SegmentWriter {
                     }
                 }
                 FieldType::Text => {
-                    self.filter_string
-                        .entry(field.name.clone())
-                        .or_default()
-                        .push((doc_seq, field.value.clone()));
+                    // Clients map every JSON string to `Text` (there is no
+                    // schema), so short Text values — ids, statuses, paths —
+                    // are what production term filters run against and must
+                    // stay filterable. Long ones are prose bodies nobody
+                    // exact-matches; copying them made `filters.bin` and the
+                    // footer blooms a second copy of the corpus (#243).
+                    if text_value_within_cap(&field.value, self.text_filter_ignore_above) {
+                        self.filter_string
+                            .entry(field.name.clone())
+                            .or_default()
+                            .push((doc_seq, field.value.clone()));
+                    }
                 }
                 FieldType::Vector => {
                     if let Ok(vec) = serde_json::from_str::<Vec<f32>>(&field.value) {
@@ -461,6 +482,7 @@ impl SegmentWriter {
                 self.inverted_index.keys().map(|s| s.as_str()),
             )),
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
+            text_filter_ignore_above: self.text_filter_ignore_above,
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -1075,6 +1097,56 @@ fn postings_write_version() -> u32 {
     })
 }
 
+/// Default for [`text_filter_ignore_above`]: Elasticsearch's dynamic-mapping
+/// `keyword` subfield cap, so data backfilled from ES keeps exactly the
+/// exact-match filterability it had there.
+pub const DEFAULT_TEXT_FILTER_IGNORE_ABOVE: u32 = 256;
+
+/// Max length, in chars, of a `Text` value `SegmentWriter` copies into
+/// `filters.bin` / `filter_blooms` — `KOSHA_TEXT_FILTER_IGNORE_ABOVE`, a
+/// positive integer, or `off` to copy every value (pre-#243 behavior).
+/// Default [`DEFAULT_TEXT_FILTER_IGNORE_ABOVE`]. Longer values remain fully
+/// searchable via BM25 and are still returned in hits; they just cannot be
+/// matched by `term`/`terms`/`range` filters, sorted on, or aggregated.
+/// Keyword/Boolean/Date values are never capped. Read once.
+fn text_filter_ignore_above() -> Option<u32> {
+    static CAP: OnceLock<Option<u32>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        parse_text_filter_ignore_above(
+            std::env::var("KOSHA_TEXT_FILTER_IGNORE_ABOVE")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_text_filter_ignore_above(raw: Option<&str>) -> Option<u32> {
+    match raw.map(str::trim) {
+        None | Some("") => Some(DEFAULT_TEXT_FILTER_IGNORE_ABOVE),
+        Some(v) if v.eq_ignore_ascii_case("off") => None,
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                eprintln!(
+                    "WARN: KOSHA_TEXT_FILTER_IGNORE_ABOVE={v} not supported \
+                     (accepted: positive integer, off) — using \
+                     {DEFAULT_TEXT_FILTER_IGNORE_ABOVE}"
+                );
+                Some(DEFAULT_TEXT_FILTER_IGNORE_ABOVE)
+            }
+        },
+    }
+}
+
+/// Whether a `Text` value is short enough to copy into the filter columns.
+/// Counted in chars (not bytes) to match ES `ignore_above`; the byte-length
+/// check short-circuits the common case without walking the string.
+fn text_value_within_cap(value: &str, cap: Option<u32>) -> bool {
+    let Some(cap) = cap else { return true };
+    let cap = cap as usize;
+    value.len() <= cap || value.chars().count() <= cap
+}
+
 /// The vector-index version `finalize` writes — `KOSHA_VECTOR_WRITE_VERSION`,
 /// accepted values `1` (legacy flat, no magic — full parse + `build_hnsw` on
 /// every open), `2` (posting-based, raw magnitudes), `3` (posting-based,
@@ -1139,6 +1211,19 @@ pub fn all_posting_blob_files() -> Vec<String> {
     (0..POSTING_BLOB_SHARDS)
         .map(posting_blob_file_for_id)
         .collect()
+}
+
+/// Shards actually referenced by a split index's TOC. Empty shard files
+/// are not written, so hydration must not request them merely because a
+/// query term hashes to that shard. Does not read posting payloads.
+pub fn posting_blob_inventory(
+    segment_dir: &Path,
+) -> Result<std::collections::HashSet<String>, KoshaError> {
+    let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
+    let index = SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None)?;
+    Ok((0..index.term_count)
+        .map(|i| posting_blob_file_for_id(index.raw_entry(i).2))
+        .collect())
 }
 
 pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
@@ -5324,6 +5409,132 @@ mod tests {
         assert!(term_bloom.may_contain("hello"));
         assert!(!term_bloom.may_contain("absent-term-xyz"));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #243: long `Text` values (prose bodies) stay out of `filters.bin` and
+    /// the footer blooms, while short ones (ids, statuses — what clients
+    /// actually filter on, since every JSON string arrives as `Text`) stay
+    /// filterable. The long value must remain BM25-searchable and returned
+    /// verbatim from the doc store.
+    #[test]
+    fn long_text_values_skip_filter_columns() {
+        let dir = std::env::temp_dir().join("kosha-test-seg-text-ignore-above");
+        let _ = fs::remove_dir_all(&dir);
+        let body = "contract dispute ".repeat(40); // 680 chars
+        let mut w = SegmentWriter::new(SegmentId("test".into()), dir.clone())
+            .with_text_filter_ignore_above(Some(256));
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![
+                Field::text("content", body.clone()),
+                Field::text("matterId", "m1"),
+                Field::keyword("tag", "x".repeat(1000)),
+            ],
+        );
+        w.add_document(
+            DocumentId("d2".into()),
+            vec![Field::text("content", "short body")],
+        );
+        let footer = w.finalize(Bm25Params::default()).unwrap();
+        assert_eq!(footer.text_filter_ignore_above, Some(256));
+
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let store = r.filter_store();
+        assert_eq!(
+            store.string_fields["matterId"],
+            vec![(0, "m1".to_string())],
+            "short Text stays filterable"
+        );
+        assert_eq!(
+            store.string_fields["content"],
+            vec![(1, "short body".to_string())],
+            "only the over-cap Text value is dropped, per value not per field"
+        );
+        assert_eq!(
+            store.string_fields["tag"].len(),
+            1,
+            "Keyword is never capped — it is the explicit exact-match type"
+        );
+
+        let blooms = SegmentReader::read_footer(&dir)
+            .unwrap()
+            .filter_blooms
+            .expect("blooms written");
+        assert!(blooms["content"].may_contain("short body"));
+        assert!(blooms["matterId"].may_contain("m1"));
+
+        assert!(
+            !r.postings("dispute").unwrap().is_empty(),
+            "over-cap Text is still tokenized into the inverted index"
+        );
+        let doc = r.doc_record_full(0).unwrap().expect("doc 0");
+        let stored = doc
+            .fields
+            .iter()
+            .find(|f| f.name == "content")
+            .expect("content stored");
+        assert_eq!(stored.value, body, "doc store keeps the full value");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_filter_cap_off_copies_every_value() {
+        let dir = std::env::temp_dir().join("kosha-test-seg-text-ignore-above-off");
+        let _ = fs::remove_dir_all(&dir);
+        let body = "y".repeat(5000);
+        let mut w = SegmentWriter::new(SegmentId("test".into()), dir.clone())
+            .with_text_filter_ignore_above(None);
+        w.add_document(
+            DocumentId("d1".into()),
+            vec![Field::text("content", body.clone())],
+        );
+        let footer = w.finalize(Bm25Params::default()).unwrap();
+        assert_eq!(footer.text_filter_ignore_above, None);
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert_eq!(r.filter_store().string_fields["content"], vec![(0, body)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_filter_cap_counts_chars_not_bytes() {
+        // 4 chars, 12 bytes: under a 4-char cap despite exceeding it in bytes,
+        // matching ES `ignore_above` (a char count).
+        assert!(text_value_within_cap("日本語文", Some(4)));
+        assert!(!text_value_within_cap("日本語文字", Some(4)));
+        assert!(text_value_within_cap("abcd", Some(4)));
+        assert!(!text_value_within_cap("abcde", Some(4)));
+        assert!(text_value_within_cap(&"z".repeat(100_000), None));
+    }
+
+    #[test]
+    fn parse_text_filter_ignore_above_values() {
+        let d = Some(DEFAULT_TEXT_FILTER_IGNORE_ABOVE);
+        assert_eq!(parse_text_filter_ignore_above(None), d);
+        assert_eq!(parse_text_filter_ignore_above(Some("")), d);
+        assert_eq!(parse_text_filter_ignore_above(Some("1024")), Some(1024));
+        assert_eq!(parse_text_filter_ignore_above(Some(" OFF ")), None);
+        assert_eq!(parse_text_filter_ignore_above(Some("0")), d);
+        assert_eq!(parse_text_filter_ignore_above(Some("lots")), d);
+    }
+
+    #[test]
+    fn footer_without_text_cap_field_deserializes_as_uncapped() {
+        // Footers written before #243 (and every manifest row carrying one)
+        // have no `text_filter_ignore_above` key.
+        let dir = std::env::temp_dir().join("kosha-test-seg-text-cap-legacy-footer");
+        let _ = fs::remove_dir_all(&dir);
+        let mut w = SegmentWriter::new(SegmentId("test".into()), dir.clone());
+        w.add_document(DocumentId("d1".into()), vec![Field::text("t", "a")]);
+        w.finalize(Bm25Params::default()).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("footer.json")).unwrap()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("text_filter_ignore_above");
+        let footer: Footer = serde_json::from_value(json).unwrap();
+        assert_eq!(footer.text_filter_ignore_above, None);
         let _ = fs::remove_dir_all(&dir);
     }
 

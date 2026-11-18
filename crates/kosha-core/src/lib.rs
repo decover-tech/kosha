@@ -1,3 +1,4 @@
+pub mod deletes;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -560,9 +561,12 @@ impl StorageBackend for LocalStorage {
 
 /// A single WAL record: a batch of documents for one namespace at a point in time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WalRecord {
     pub namespace: NamespaceId,
     pub documents: Vec<Document>,
+    #[serde(default)]
+    pub deleted_ids: Vec<DocumentId>,
     pub timestamp: u64,
 }
 
@@ -576,6 +580,7 @@ impl WalRecord {
         Self {
             namespace,
             documents,
+            deleted_ids: Vec::new(),
             timestamp,
         }
     }
@@ -634,6 +639,18 @@ pub struct Footer {
     /// older segments regardless of this number.
     #[serde(default)]
     pub format_version: u32,
+    /// `ignore_above` cap (in chars) the writer applied to `Text` values
+    /// before copying them into `filters.bin` and `filter_blooms` (issue
+    /// #243). A `Text` value longer than this is still tokenized into the
+    /// inverted index and stored in the doc store, but is not filterable,
+    /// sortable or aggregatable by exact value — the same semantics as
+    /// Elasticsearch's dynamic-mapping `keyword` subfield (`ignore_above:
+    /// 256`). `None` means no cap: a segment written before the cap existed
+    /// (every `Text` value was copied) or one written with the cap disabled.
+    /// Informational only — `filters.bin`'s byte layout is unchanged, so
+    /// readers need not consult it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_filter_ignore_above: Option<u32>,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -953,6 +970,10 @@ pub struct Manifest {
     /// Durable deletions, shared by ingest and query replicas.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tombstones: HashMap<SegmentId, std::collections::HashSet<u32>>,
+    /// Immutable deletion generations keyed by segment. `tombstones` remains
+    /// readable for legacy manifests and is populated in memory by readers.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub deletion_vectors: HashMap<SegmentId, deletes::DeletionVector>,
 }
 
 impl Manifest {

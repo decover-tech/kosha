@@ -73,6 +73,7 @@ fn main() {
         wal_checkpoint: 0,
         wal_origin: None,
         tombstones: Default::default(),
+        deletion_vectors: Default::default(),
     };
     let searcher = Searcher::new(work);
 
