@@ -2454,11 +2454,10 @@ impl AppState {
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
             if needs_bloom_check {
-                let footer = manifest
-                    .segment_footer(&entry.segment_id)
-                    .cloned()
-                    .or_else(|| SegmentReader::read_footer(&seg_path).ok());
-                if let Some(footer) = footer.as_ref() {
+                let footer = manifest.footer_or_read(&entry.segment_id, || {
+                    SegmentReader::read_footer(&seg_path).ok()
+                });
+                if let Some(footer) = footer.as_deref() {
                     if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
                         continue;
                     }
@@ -3061,14 +3060,25 @@ fn plan_posting_blob_fetch(
     let mut newly_confirmed: Vec<(String, String)> = Vec::new();
 
     for seg_path in seg_paths {
-        if !is_split(seg_path) {
-            continue;
-        }
         let Ok(rel_path) = seg_path.strip_prefix(data_dir) else {
             continue;
         };
         let s3_prefix = rel_path.to_string_lossy().into_owned();
         let cached_shards = cached.get(&s3_prefix);
+        // Every shard this query needs is already confirmed for this
+        // segment: nothing to plan. Checked before `is_split`, which opens
+        // the segment's `inverted.idx` to read its format version. That
+        // probe ran for every candidate segment on every search, to learn
+        // something that cannot change: a segment with confirmed shards is
+        // a split segment. On staging the stage it belongs to took 33 ms of
+        // a 50 ms warm keyword search and 95 ms of a 117 ms phrase search,
+        // growing with the number of candidate segments.
+        if cached_shards.is_some_and(|set| posting_files.iter().all(|f| set.contains(f.as_str()))) {
+            continue;
+        }
+        if !is_split(seg_path) {
+            continue;
+        }
         for file_name in posting_files {
             if cached_shards.is_some_and(|set| set.contains(file_name.as_str())) {
                 continue; // already confirmed present this (version, eviction_generation)
@@ -6985,6 +6995,47 @@ mod tests {
     /// re-stated — the whole point is to turn an `fs::metadata` syscall
     /// into a `HashSet` lookup on a warm namespace.
     #[cfg(feature = "s3")]
+    #[test]
+    fn plan_posting_blob_fetch_skips_the_format_probe_when_all_shards_are_cached() {
+        use std::cell::Cell;
+
+        let seg = PathBuf::from("/data/ns/seg-1");
+        let posting_files = vec!["postings-00.bin".to_string(), "postings-01.bin".to_string()];
+        let mut cached = HashMap::new();
+        cached.insert(
+            "ns/seg-1".to_string(),
+            std::collections::HashSet::from([
+                "postings-00.bin".to_string(),
+                "postings-01.bin".to_string(),
+            ]),
+        );
+        let probes = Cell::new(0);
+        let plan = |files: &[String]| {
+            plan_posting_blob_fetch(
+                std::slice::from_ref(&seg),
+                files,
+                Path::new("/data"),
+                &cached,
+                |_| {
+                    probes.set(probes.get() + 1);
+                    true
+                },
+                |_| false,
+            )
+        };
+
+        // Both shards confirmed: the segment is skipped without opening it.
+        let (to_fetch, confirmed) = plan(&posting_files);
+        assert_eq!(probes.get(), 0);
+        assert!(to_fetch.is_empty() && confirmed.is_empty());
+
+        // A shard that is not confirmed still goes through the probe and is
+        // planned for fetching.
+        let (to_fetch, _) = plan(&["postings-02.bin".to_string()]);
+        assert_eq!(probes.get(), 1);
+        assert_eq!(to_fetch, vec![("ns/seg-1/postings-02.bin".to_string(), 0)]);
+    }
+
     #[test]
     fn plan_posting_blob_fetch_skips_stat_for_cached_pairs() {
         use std::cell::Cell;

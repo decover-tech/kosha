@@ -1094,7 +1094,9 @@ impl Searcher {
         segment_id: &str,
         seg_dir: PathBuf,
         load_vectors: bool,
-        footer: Option<kosha_core::Footer>,
+        // Borrowed: only a cold open needs its own copy, and most calls
+        // find the segment already open.
+        footer: Option<&kosha_core::Footer>,
         permit: Option<&AdmissionPermit>,
         stats: Option<&OpenStatsCollector>,
     ) -> Result<Arc<TrackedSegment>, KoshaError> {
@@ -1117,7 +1119,7 @@ impl Searcher {
         let reader = SegmentReader::open_with_footer_options(
             seg_dir,
             load_vectors,
-            footer,
+            footer.cloned(),
             Some(postings_account),
         )?;
         let tracked = Arc::new(TrackedSegment::new(
@@ -1231,7 +1233,7 @@ impl Searcher {
                 &entry.segment_id.0,
                 seg_dir,
                 load_vectors,
-                manifest.segment_footer(&entry.segment_id).cloned(),
+                manifest.segment_footer(&entry.segment_id),
                 Some(&permit),
                 None,
             ) {
@@ -1320,11 +1322,10 @@ impl Searcher {
                 // up most of `num_candidates`, leaving the matter actually
                 // being searched with a fraction of the probes asked for.
                 if prunable {
-                    let footer = manifest
-                        .segment_footer(&entry.segment_id)
-                        .cloned()
-                        .or_else(|| SegmentReader::read_footer(&seg_dir).ok());
-                    if let Some(footer) = footer.as_ref() {
+                    let footer = manifest.footer_or_read(&entry.segment_id, || {
+                        SegmentReader::read_footer(&seg_dir).ok()
+                    });
+                    if let Some(footer) = footer.as_deref() {
                         if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
                             return None;
                         }
@@ -1336,7 +1337,7 @@ impl Searcher {
                         &entry.segment_id.0,
                         seg_dir,
                         true,
-                        manifest.segment_footer(&entry.segment_id).cloned(),
+                        manifest.segment_footer(&entry.segment_id),
                         Some(permit),
                         Some(open_stats),
                     )
@@ -1405,10 +1406,13 @@ impl Searcher {
 
         // Prune via footer blooms before opening inverted/filters/vectors.
         if query.has_prunable_filter() || term_prune.is_some() {
-            let footer = manifest_footer
-                .cloned()
-                .or_else(|| SegmentReader::read_footer(&seg_dir).ok());
-            if let Some(footer) = footer.as_ref() {
+            let footer = match manifest_footer {
+                Some(footer) => Some(std::borrow::Cow::Borrowed(footer)),
+                None => SegmentReader::read_footer(&seg_dir)
+                    .ok()
+                    .map(std::borrow::Cow::Owned),
+            };
+            if let Some(footer) = footer.as_deref() {
                 if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
                     OpenStatsCollector::count(&open_stats.pruned_filter_bloom);
                     return Ok(None);
@@ -1430,7 +1434,7 @@ impl Searcher {
             &entry.segment_id.0,
             seg_dir,
             query.knn.is_some(),
-            manifest_footer.cloned(),
+            manifest_footer,
             Some(permit),
             Some(open_stats),
         )?;
@@ -1814,9 +1818,7 @@ impl Searcher {
                         // an exact total down the general path, because an
                         // OpenSearch `match` is OR by default and that is
                         // what the client sends.
-                        if count_budget.is_none() {
-                            return None;
-                        }
+                        count_budget?;
                         // ── Multi-term block-max OR: WAND pivot join ──
                         //
                         // Union membership doesn't need every cursor to
@@ -6082,6 +6084,15 @@ mod tests {
             (0, 2)
         );
 
+        // One word, OR, exact total (what the backend sends): fast path.
+        let mut or_exact = filtered.clone();
+        or_exact.operator = Some(kosha_core::QueryOperator::Or);
+        or_exact.exact_total_hits = Some(true);
+        let (_, stats) = searcher
+            .search_with_stats(&ns, &manifest, &or_exact, None)
+            .unwrap();
+        assert_eq!((stats.scored_fast_path, stats.scored_general_path), (2, 0));
+
         // A term no segment holds: both skipped by the term bloom.
         let (_, stats) = searcher
             .search_with_stats(&ns, &manifest, &mk_query("zzznotaword", 5), None)
@@ -6126,11 +6137,7 @@ mod tests {
         or.operator = Some(kosha_core::QueryOperator::Or);
 
         let and_result = searcher.search(&ns, &manifest, &and, None).unwrap();
-        let (or_result, stats) = searcher
-            .search_with_stats(&ns, &manifest, &or, None)
-            .unwrap();
-        // Test branch only: the counters show it really took the fast path.
-        assert_eq!((stats.scored_fast_path, stats.scored_general_path), (2, 0));
+        let or_result = searcher.search(&ns, &manifest, &or, None).unwrap();
         assert_eq!(or_result.total_hits, 14);
         assert_eq!(or_result.total_hits, and_result.total_hits);
         assert_eq!(or_result.total_hits_relation, TotalHitsRelation::Eq);
