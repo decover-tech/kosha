@@ -1388,8 +1388,12 @@ impl Searcher {
         // The filter or a tombstone rules the document out. The scoring
         // loops below were written against tombstones alone; a filter is
         // the same question, so they ask this for both.
-        let rejected = |doc_seq: u32| -> bool { !accept(doc_seq) };
+        // False when every document of the segment is acceptable. The hot
+        // loops test this plain bool first, so a query with no filter on a
+        // segment with no deletes pays one predictable branch per posting
+        // and never calls into the set lookups at all.
         let restricted = filter_set.is_some() || segment_tombstones.is_some();
+        let rejected = |doc_seq: u32| -> bool { restricted && !accept(doc_seq) };
 
         let needs_filter_store = !sort_value_fields.is_empty() || !query.aggs.is_empty();
         let filter_store = if needs_filter_store {
@@ -2162,7 +2166,7 @@ impl Searcher {
                 for (term, postings) in &term_postings {
                     let df = doc_frequencies.get(term).copied().unwrap_or(0);
                     for posting in postings.iter() {
-                        if !accept(posting.doc_id) {
+                        if restricted && !accept(posting.doc_id) {
                             continue;
                         }
                         if let Some(meta) = reader.doc_meta(posting.doc_id) {
@@ -2208,7 +2212,7 @@ impl Searcher {
                     .1
                     .iter()
                     .map(|p| p.doc_id)
-                    .filter(|doc_seq| accept(*doc_seq))
+                    .filter(|doc_seq| !restricted || accept(*doc_seq))
                     .collect();
                 for term_index in 0..term_postings.len() {
                     if term_index == shortest {
