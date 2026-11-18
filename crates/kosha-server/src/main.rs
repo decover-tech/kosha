@@ -1444,6 +1444,7 @@ impl AppState {
                 collapse: None,
                 source_includes: None,
                 source_excludes: None,
+                profile: None,
             };
             let needs_filters = query_needs_filter_store(&query);
             let needs_vectors = query.knn.is_some();
@@ -2228,17 +2229,37 @@ impl AppState {
         for (path, _) in files {
             self.cache.pin(path);
         }
+        // For the search profile: which of these were not local before the
+        // batch, so what landed can be attributed to this request by kind
+        // of file. One stat per file, on a path that is about to do an S3
+        // round trip per file anyway.
+        let absent_before: Vec<&str> = files
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .filter(|path| !self.data_dir.join(path).exists())
+            .collect();
+        let started = Instant::now();
         #[cfg(feature = "postgres")]
-        {
-            if let (Some(leases), Some(own_addr)) = (&self.hydration_leases, &self.own_addr) {
+        let coordinated = match (&self.hydration_leases, &self.own_addr) {
+            (Some(leases), Some(own_addr)) => {
                 self.hydrate_files_coordinated(s3, files, leases, own_addr, concurrency, request);
-                for (path, _) in files {
-                    self.cache.unpin(path);
-                }
-                return;
+                true
             }
+            _ => false,
+        };
+        #[cfg(not(feature = "postgres"))]
+        let coordinated = false;
+        if !coordinated {
+            self.hydrate_from_s3_budgeted(s3, files, concurrency, request);
         }
-        self.hydrate_from_s3_budgeted(s3, files, concurrency, request);
+        let landed: Vec<(&'static str, u64)> = absent_before
+            .iter()
+            .filter_map(|path| {
+                let size = std::fs::metadata(self.data_dir.join(path)).ok()?.len();
+                Some((hydration_budget::file_kind(path), size))
+            })
+            .collect();
+        request.record_fetch(started.elapsed(), &landed);
         for (path, _) in files {
             self.cache.unpin(path);
         }
@@ -4274,7 +4295,105 @@ fn handle_stats(state: &AppState) -> String {
 
 // ─── POST /search (JSON body, supports filters) ─────────────────────────────
 
+/// Stage timings of one search, measured by the handler.
+struct SearchStages {
+    total_ms: f64,
+    parse_ms: f64,
+    manifest_check_ms: f64,
+    /// Making the scoring set local before scoring starts.
+    fetch_ms: f64,
+    slot_wait_ms: f64,
+    write_response_ms: f64,
+}
+
+fn round_ms(ms: f64) -> f64 {
+    (ms * 1000.0).round() / 1000.0
+}
+
+/// The profile block returned for a `profile: true` search: where the
+/// request's time went, stage by stage, and the counts behind each stage.
+///
+/// `stages_ms` are consecutive and non-overlapping, measured on one thread,
+/// so they sum to `total_ms` up to `unaccounted_ms` (the gaps between
+/// stages: cache lookups, building the hydration plan). Times under
+/// `scoring` and `open` whose name ends in `_summed_ms` are added up across
+/// the worker threads that score segments in parallel; they describe how
+/// much work was done, not how long the request waited, and are not part of
+/// the sum.
+fn search_profile(
+    state: &AppState,
+    stages: SearchStages,
+    phases: &kosha_query::SearchPhaseStats,
+    fetch: serde_json::Value,
+    response_bytes: usize,
+) -> serde_json::Value {
+    let stage_sum = stages.parse_ms
+        + stages.manifest_check_ms
+        + stages.fetch_ms
+        + stages.slot_wait_ms
+        + phases.admit_wall_ms
+        + phases.score_wall_ms
+        + phases.materialize_wall_ms
+        + stages.write_response_ms;
+    serde_json::json!({
+        "pod": std::env::var("HOSTNAME").unwrap_or_default(),
+        "total_ms": round_ms(stages.total_ms),
+        "stages_ms": {
+            "parse_request": round_ms(stages.parse_ms),
+            "manifest_check": round_ms(stages.manifest_check_ms),
+            "fetch_from_s3": round_ms(stages.fetch_ms),
+            "wait_for_scoring_slot": round_ms(stages.slot_wait_ms),
+            "memory_admission": round_ms(phases.admit_wall_ms),
+            "scoring": round_ms(phases.score_wall_ms),
+            "build_page": round_ms(phases.materialize_wall_ms),
+            "write_response": round_ms(stages.write_response_ms),
+        },
+        "unaccounted_ms": round_ms(stages.total_ms - stage_sum),
+        // Everything this request made local, before scoring and while
+        // building the page.
+        "fetch": fetch,
+        "open": {
+            "segments_opened_cold": phases.open_cold,
+            "segments_already_open": phases.open_cached,
+            "cold_open_summed_ms": round_ms(phases.open_total_ms),
+        },
+        "scoring": {
+            "segments": {
+                "total": phases.segments_total,
+                "not_local": phases.segments_absent,
+                "skipped_by_filter_bloom": phases.pruned_filter_bloom,
+                "skipped_by_term_bloom": phases.pruned_term_bloom,
+                "filter_matched_nothing": phases.filter_empty,
+                "fast_path": phases.scored_fast_path,
+                "general_path": phases.scored_general_path,
+            },
+            "filter_bitmaps": {
+                "built": phases.filter_sets_built,
+                "reused": phases.filter_sets_reused,
+                "build_summed_ms": round_ms(phases.filter_build_ms),
+            },
+            "work_summed_ms": round_ms(phases.score_cpu_ms),
+            "candidates": phases.candidates,
+            "knn_postings_probed": phases.knn_postings_probed,
+        },
+        "page": {
+            "merge_ms": round_ms(phases.merge_ms),
+            "fetch_document_bodies_ms": round_ms(phases.page_fetch_ms),
+            "read_documents_ms": round_ms(phases.page_read_ms),
+            "documents": phases.page_docs,
+        },
+        "response_bytes": response_bytes,
+        "pod_cache": {
+            "nvme_bytes": state.cache.total_size(),
+        },
+    })
+}
+
 fn handle_search_post(body: &[u8], state: &AppState) -> String {
+    // Stage boundaries for the search profile (`SearchQuery::profile`). A
+    // clock read per stage whether or not a profile was asked for; the
+    // profile block itself is only built on request.
+    let t_request = Instant::now();
     // Parse the full JSON body that includes namespace alongside SearchQuery fields.
     let body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -4291,9 +4410,14 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         Err(e) => return json_error(400, &format!("invalid search query: {e}")),
     };
 
+    let profiling = query.profile.unwrap_or(false);
+    let parse_ms = t_request.elapsed().as_secs_f64() * 1e3;
+
+    let t_manifest = Instant::now();
     if let Err(e) = state.refresh_query_namespace(&ns) {
         return search_error_response(&e);
     }
+    let manifest_check_ms = t_manifest.elapsed().as_secs_f64() * 1e3;
 
     // Shared, not copied: see `Indexer::manifest_shared`.
     let Some(snapshot) = state.indexer.manifest_shared(&ns) else {
@@ -4313,7 +4437,9 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // inlined (see `canonical_query_for_cache`): a 1024-dim vector is
     // ~14KB of JSON. Deletions are part of a versioned snapshot; immutable
     // generation references also participate in cache identity.
-    let cache_key = if result_cache_budget() > 0 && !query.no_cache.unwrap_or(false) {
+    // A profiled request always executes: a cached response has no stages
+    // to report.
+    let cache_key = if result_cache_budget() > 0 && !query.no_cache.unwrap_or(false) && !profiling {
         canonical_query_for_cache(&query).map(|mut canonical| {
             let mut generations: Vec<_> = manifest
                 .deletion_vectors
@@ -4470,7 +4596,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         tombstones,
         doc_store_hydrator,
     ) {
-        Ok((result, phases)) => {
+        Ok((mut result, phases)) => {
             log_search_timing(
                 &ns,
                 &hydration,
@@ -4480,7 +4606,38 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                 result.total_hits,
                 result.knn_degraded_segments,
             );
-            let resp = json_ok(&result);
+            let t_write = Instant::now();
+            let mut resp = json_ok(&result);
+            if profiling {
+                let write_response_ms = t_write.elapsed().as_secs_f64() * 1e3;
+                #[cfg(feature = "s3")]
+                let fetch = serde_json::json!({
+                    "files": hydration.files_fetched,
+                    "bytes": hydration_request.fetched_bytes(),
+                    "download_ms": round_ms(hydration_request.fetch_ms()),
+                    "wait_for_slot_ms": round_ms(hydration_request.wait_ms()),
+                    "by_type": hydration_request.fetched_by_kind_json(),
+                });
+                #[cfg(not(feature = "s3"))]
+                let fetch = serde_json::Value::Null;
+                result.profile = Some(search_profile(
+                    state,
+                    SearchStages {
+                        total_ms: t_request.elapsed().as_secs_f64() * 1e3,
+                        parse_ms,
+                        manifest_check_ms,
+                        fetch_ms: hydrate_ms,
+                        slot_wait_ms: queue_ms,
+                        write_response_ms,
+                    },
+                    &phases,
+                    fetch,
+                    resp.len(),
+                ));
+                // Serialized a second time, now carrying the profile. The
+                // time reported for writing the response is the first.
+                resp = json_ok(&result);
+            }
             // Only successful responses enter the cache, after the search
             // proved every needed file readable.
             if let Some(key) = cache_key {
@@ -4715,6 +4872,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         collapse: None,
         source_includes: None,
         source_excludes: None,
+        profile: None,
     };
 
     if let Err(e) = state.refresh_query_namespace(&ns) {
@@ -7466,6 +7624,7 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            profile: None,
         };
 
         let unfiltered = state.hydrate_segments_for_search(
@@ -7602,6 +7761,7 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            profile: None,
         };
         let verdict_key = (ns.0.clone(), manifest.version);
 
@@ -8339,6 +8499,103 @@ mod tests {
     }
 
     #[test]
+    fn profiled_search_returns_stages_that_account_for_the_total() {
+        let state = test_state();
+        let ns = "test-ns-profile";
+        let req = IndexRequest {
+            namespace: NamespaceId(ns.into()),
+            documents: (0..20)
+                .map(|i| Document {
+                    id: DocumentId(format!("d{i}")),
+                    fields: vec![Field::text("title", "hello world")],
+                })
+                .collect(),
+        };
+        let body = serde_json::to_vec(&req).unwrap();
+        route(
+            "POST /index HTTP/1.1\r\n",
+            &HashMap::new(),
+            &body,
+            "test",
+            &state,
+        );
+        let flush = serde_json::to_vec(&serde_json::json!({"namespace": ns})).unwrap();
+        route(
+            "POST /flush HTTP/1.1\r\n",
+            &HashMap::new(),
+            &flush,
+            "test",
+            &state,
+        );
+
+        let search = |profile: bool| -> serde_json::Value {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "namespace": ns, "query_text": "hello", "max_results": 5, "profile": profile,
+            }))
+            .unwrap();
+            let resp = route(
+                "POST /search HTTP/1.1\r\n",
+                &HashMap::new(),
+                &body,
+                "test",
+                &state,
+            );
+            let (status, _, body) = parse(&resp);
+            assert!(status.contains("200"), "search: {resp}");
+            serde_json::from_str(body).unwrap()
+        };
+
+        // Not asked for: no profile in the response at all.
+        assert!(search(false).get("profile").is_none());
+
+        let result = search(true);
+        let profile = &result["profile"];
+        let stages = profile["stages_ms"].as_object().expect("stages_ms");
+        for stage in [
+            "parse_request",
+            "manifest_check",
+            "fetch_from_s3",
+            "wait_for_scoring_slot",
+            "memory_admission",
+            "scoring",
+            "build_page",
+            "write_response",
+        ] {
+            assert!(
+                stages[stage].as_f64().is_some_and(|ms| ms >= 0.0),
+                "{stage}: {profile}"
+            );
+        }
+        // Stages are consecutive on one thread: they sum to the total, less
+        // the gaps between them, and the gaps are small and not negative.
+        let sum: f64 = stages.values().map(|v| v.as_f64().unwrap()).sum();
+        let total = profile["total_ms"].as_f64().unwrap();
+        let gap = profile["unaccounted_ms"].as_f64().unwrap();
+        assert!((sum + gap - total).abs() < 0.01, "{profile}");
+        assert!(gap >= -0.01, "stages overlap: {profile}");
+        assert!(
+            gap <= total * 0.5 + 1.0,
+            "most of the time is unexplained: {profile}"
+        );
+
+        let segments = &profile["scoring"]["segments"];
+        let counted: u64 = [
+            "not_local",
+            "skipped_by_filter_bloom",
+            "skipped_by_term_bloom",
+            "filter_matched_nothing",
+            "fast_path",
+            "general_path",
+        ]
+        .iter()
+        .map(|k| segments[*k].as_u64().unwrap())
+        .sum();
+        assert_eq!(counted, segments["total"].as_u64().unwrap(), "{profile}");
+        assert_eq!(profile["page"]["documents"], 5);
+        assert!(profile["response_bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
     fn auto_flush_during_index_persists_manifest() {
         // Regression: index_documents auto-flushes when the buffer hits the
         // flush threshold (1000) — that manifest update was never persisted.
@@ -8513,6 +8770,7 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            profile: None,
         };
         let with_vec = |v: Vec<f32>, k: usize| {
             let mut q = base.clone();

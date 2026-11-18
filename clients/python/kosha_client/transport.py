@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import date, datetime
@@ -65,6 +67,12 @@ class Transport:
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_on_timeout = retry_on_timeout
+        self._timing = threading.local()
+
+    def last_timing(self) -> dict:
+        """Encode / round-trip / decode times and sizes of this thread's
+        last successful request."""
+        return dict(getattr(self._timing, "value", {}))
 
     def request(
         self, method: str, path: str, body: Any = None
@@ -75,7 +83,9 @@ class Transport:
         The caller is responsible for constructing the full path.
         """
         url = f"{self.base_url}/{path.lstrip('/')}"
+        t_encode = time.perf_counter()
         data = json.dumps(body, default=json_default).encode() if body is not None else None
+        encode_ms = (time.perf_counter() - t_encode) * 1000
 
         req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Content-Type", "application/json")
@@ -85,8 +95,22 @@ class Transport:
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
+                t_send = time.perf_counter()
                 resp = urllib.request.urlopen(req, timeout=self.timeout)
-                return json.loads(resp.read().decode())
+                raw = resp.read()
+                t_received = time.perf_counter()
+                result = json.loads(raw.decode())
+                # Timing of the last successful request on this thread, for
+                # callers that report where a request's time went. A few
+                # clock reads; nothing is kept beyond the latest request.
+                self._timing.value = {
+                    "encode_ms": round(encode_ms, 3),
+                    "round_trip_ms": round((t_received - t_send) * 1000, 3),
+                    "decode_ms": round((time.perf_counter() - t_received) * 1000, 3),
+                    "request_bytes": len(data) if data is not None else 0,
+                    "response_bytes": len(raw),
+                }
+                return result
             except urllib.error.HTTPError as e:
                 body_bytes = e.read()
                 try:
@@ -103,7 +127,6 @@ class Transport:
                 if isinstance(e, urllib.error.URLError) and not self.retry_on_timeout:
                     break
                 if attempt < self.max_retries:
-                    import time
                     time.sleep(0.1 * (2 ** attempt))
                 continue
 

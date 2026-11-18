@@ -576,6 +576,7 @@ fn build_search_query(
         collapse: None,
         source_includes: None,
         source_excludes: None,
+        profile: None,
     }
 }
 
@@ -597,6 +598,7 @@ mod tests {
             total_hits_relation: relation,
             aggregations: None,
             knn_degraded_segments: None,
+            profile: None,
         };
         assert_eq!(
             format_total_hits_line(&mk(3, kosha_core::TotalHitsRelation::Eq)),

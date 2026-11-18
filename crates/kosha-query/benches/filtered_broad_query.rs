@@ -99,6 +99,7 @@ fn main() {
         collapse: None,
         source_includes: None,
         source_excludes: None,
+        profile: None,
     };
 
     // Warm the segment cache.

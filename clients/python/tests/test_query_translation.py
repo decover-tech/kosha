@@ -464,3 +464,36 @@ def test_delete_by_query_refuses_a_query_it_cannot_fully_express(monkeypatch):
     assert calls == []
     with pytest.raises(KoshaRequestError):
         client.delete_by_query(index="idx", body={})
+
+
+def test_profile_flag_is_sent_and_the_breakdown_is_returned(monkeypatch):
+    client = KoshaClient(hosts=["http://localhost:9"], api_key="k", namespace="idx")
+    sent = {}
+
+    def fake_request(method, path, body=None):
+        sent.update(body=body)
+        return {
+            "results": [],
+            "total_hits": 0,
+            "profile": {"total_ms": 12.5, "stages_ms": {"scoring": 9.0}},
+        }
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    monkeypatch.setattr(
+        client._transport,
+        "last_timing",
+        lambda: {"encode_ms": 0.1, "round_trip_ms": 14.0, "decode_ms": 0.2,
+                 "request_bytes": 80, "response_bytes": 120},
+    )
+    plain = client.search(index="idx", body={"query": {"match": {"content": "a"}}})
+    assert "profile" not in sent["body"] and "profile" not in plain
+
+    out = client.search(index="idx", body={"profile": True, "query": {"match": {"content": "a"}}})
+    assert sent["body"]["profile"] is True
+    profile = out["profile"]
+    assert profile["server"]["stages_ms"] == {"scoring": 9.0}
+    c = profile["client"]
+    assert c["round_trip_ms"] == 14.0 and c["decode_response_ms"] == 0.2
+    # Round trip minus the server's own total: network and connection.
+    assert c["network_and_connection_ms"] == 1.5
+    assert c["response_bytes"] == 120 and c["translate_request_ms"] >= 0

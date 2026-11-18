@@ -178,20 +178,56 @@ class KoshaClient:
         """
         ns = self._resolve_ns(index)
         body = body or {}
+        t_start = time.perf_counter()
         kosha_body, context = self._translate_search(body, params)
         kosha_body["namespace"] = ns
+        translate_ms = (time.perf_counter() - t_start) * 1000
 
-        start = time.monotonic()
         try:
-            result = self._request("POST", "search", body=kosha_body)
+            result, http = self._search_request(kosha_body)
         except KoshaRequestError as e:
             if e.status_code == 404:
                 # An index nothing has been written to yet: no hits.
-                result = {"results": [], "total_hits": 0}
+                result, http = {"results": [], "total_hits": 0}, {}
             else:
                 raise
-        took_ms = int((time.monotonic() - start) * 1000)
-        return self._build_search_response(result, took_ms, context)
+        took_ms = int((time.perf_counter() - t_start) * 1000)
+        t_build = time.perf_counter()
+        response = self._build_search_response(result, took_ms, context)
+        if kosha_body.get("profile"):
+            # Where the time went, end to end. `server` is Kosha's own
+            # breakdown; `client` is what this library added around it.
+            # `round_trip_ms` minus the server's `total_ms` is the network
+            # and the server's connection handling.
+            server = result.get("profile") or {}
+            round_trip_ms = http.get("round_trip_ms", 0.0)
+            response["profile"] = {
+                "client": {
+                    "translate_request_ms": round(translate_ms, 3),
+                    "encode_request_ms": http.get("encode_ms", 0.0),
+                    "round_trip_ms": round_trip_ms,
+                    "decode_response_ms": http.get("decode_ms", 0.0),
+                    "build_response_ms": round(
+                        (time.perf_counter() - t_build) * 1000, 3
+                    ),
+                    "network_and_connection_ms": round(
+                        max(0.0, round_trip_ms - server.get("total_ms", 0.0)), 3
+                    ),
+                    "request_bytes": http.get("request_bytes", 0),
+                    "response_bytes": http.get("response_bytes", 0),
+                    "total_ms": round((time.perf_counter() - t_start) * 1000, 3),
+                },
+                "server": server,
+            }
+        return response
+
+    def _search_request(self, kosha_body: dict) -> tuple[dict, dict]:
+        """POST a search; also return the transport's timing of it (encode,
+        round trip, decode, sizes). Goes through ``_request`` like every
+        other call, so retries and error handling are unchanged."""
+        result = self._request("POST", "search", body=kosha_body)
+        timing = getattr(self._transport, "last_timing", None)
+        return result, (timing() if callable(timing) else {})
 
     # ── Query translation ──────────────────────────────────────────────────
 
@@ -654,6 +690,11 @@ class KoshaClient:
             kosha["exact_total_hits"] = True
         elif isinstance(track, int) and not isinstance(track, bool) and track > 0:
             kosha["total_hits_cap"] = track
+
+        if body.get("profile"):
+            # OpenSearch has a `profile` flag too; Kosha's returns a stage
+            # timing breakdown (see `search`).
+            kosha["profile"] = True
 
         collapse = body.get("collapse")
         if collapse:

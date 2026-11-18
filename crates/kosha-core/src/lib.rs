@@ -1264,6 +1264,12 @@ pub struct SearchQuery {
     /// is by far the largest field and almost never read back.
     #[serde(default)]
     pub source_excludes: Option<Vec<String>>,
+    /// Return a timing breakdown of this search in `SearchResult.profile`:
+    /// how long each stage took and the counts behind it. A profiled
+    /// request does not read or fill the whole-response cache, so what it
+    /// reports is always a real execution.
+    #[serde(default)]
+    pub profile: Option<bool>,
 }
 
 /// See `SearchQuery.collapse`.
@@ -1396,6 +1402,9 @@ pub struct SearchResult {
     /// told a degraded response from a healthy one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knn_degraded_segments: Option<u32>,
+    /// Timing breakdown, present only when the request set `profile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<serde_json::Value>,
 }
 
 // ─── Indexing types ────────────────────────────────────────────────────────

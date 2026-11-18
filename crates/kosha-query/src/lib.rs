@@ -290,10 +290,14 @@ impl TrackedSegment {
     ///
     /// `key` is the clause's canonical JSON, computed once per request by
     /// the caller rather than once per segment here.
-    fn filter_set(&self, key: &str, clause: &FilterClause) -> Arc<DocSet> {
+    ///
+    /// Also returns how long the evaluation took, or `None` when the set
+    /// came from the cache.
+    fn filter_set(&self, key: &str, clause: &FilterClause) -> (Arc<DocSet>, Option<Duration>) {
         if let Some(set) = self.filter_sets.lock().unwrap().get(key) {
-            return Arc::clone(set);
+            return (Arc::clone(set), None);
         }
+        let started = Instant::now();
         // Evaluated outside the lock: two requests racing on a new filter
         // both compute it, and one result is dropped. That is cheaper than
         // making every other request for this segment wait behind a scan.
@@ -307,7 +311,7 @@ impl TrackedSegment {
             cache.clear();
         }
         cache.insert(key.to_string(), Arc::clone(&set));
-        set
+        (set, Some(started.elapsed()))
     }
 }
 
@@ -932,6 +936,45 @@ pub struct SearchPhaseStats {
     /// Under the global probe budget it should land near
     /// `num_candidates` for the whole query. Zero for non-kNN queries.
     pub knn_postings_probed: usize,
+
+    // ── Scoring pass, by segment ──
+    // Every segment in the manifest lands in exactly one of these.
+    /// Segments in the manifest.
+    pub segments_total: usize,
+    /// Not on local disk when scoring ran (pruned before hydration, or the
+    /// fetch did not happen): contributes nothing.
+    pub segments_absent: usize,
+    /// Skipped because the filter's values are not in the segment's blooms.
+    pub pruned_filter_bloom: usize,
+    /// Skipped because the query's terms are not in the segment's term bloom.
+    pub pruned_term_bloom: usize,
+    /// Opened, but the filter matched no document in it.
+    pub filter_empty: usize,
+    /// Scored on the block-max WAND path.
+    pub scored_fast_path: usize,
+    /// Scored on the general path (every match scored).
+    pub scored_general_path: usize,
+    /// Filter bitmaps evaluated for this request vs reused from a segment's
+    /// cache, and the summed evaluation time across workers.
+    pub filter_sets_built: usize,
+    pub filter_sets_reused: usize,
+    pub filter_build_ms: f64,
+    /// Summed time inside `score_segment` across workers (cold opens
+    /// included). Divide by `score_wall_ms` for the effective parallelism.
+    pub score_cpu_ms: f64,
+    /// Candidates the segments handed to the reduce step.
+    pub candidates: usize,
+
+    // ── Building the page (the parts of `materialize_wall_ms`) ──
+    /// Merging and ordering candidates across segments.
+    pub merge_ms: f64,
+    /// Waiting for the page's document bodies to be made local.
+    pub page_fetch_ms: f64,
+    /// Reading the page's documents from disk, highlighting, and dropping
+    /// fields that were not requested.
+    pub page_read_ms: f64,
+    /// Documents on the returned page.
+    pub page_docs: usize,
 }
 
 /// Shared-atomic collector threaded through the parallel scoring pass to
@@ -945,6 +988,34 @@ struct OpenStatsCollector {
     /// Vector postings hydrated across segments (kNN only) — see
     /// [`SearchPhaseStats::knn_postings_probed`].
     knn_postings: AtomicUsize,
+    absent: AtomicUsize,
+    pruned_filter_bloom: AtomicUsize,
+    pruned_term_bloom: AtomicUsize,
+    filter_empty: AtomicUsize,
+    fast_path: AtomicUsize,
+    general_path: AtomicUsize,
+    filter_built: AtomicUsize,
+    filter_reused: AtomicUsize,
+    filter_build_nanos: AtomicU64,
+    score_nanos: AtomicU64,
+}
+
+impl OpenStatsCollector {
+    /// One per segment, counted once per request: never per posting.
+    fn count(counter: &AtomicUsize) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn filter_set(&self, built: Option<Duration>) {
+        match built {
+            Some(took) => {
+                Self::count(&self.filter_built);
+                self.filter_build_nanos
+                    .fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+            }
+            None => Self::count(&self.filter_reused),
+        }
+    }
 }
 
 pub struct Searcher {
@@ -1328,6 +1399,7 @@ impl Searcher {
     ) -> Result<Option<SegmentOutput>, KoshaError> {
         let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
         if !seg_dir.exists() {
+            OpenStatsCollector::count(&open_stats.absent);
             return Ok(None);
         }
 
@@ -1338,10 +1410,12 @@ impl Searcher {
                 .or_else(|| SegmentReader::read_footer(&seg_dir).ok());
             if let Some(footer) = footer.as_ref() {
                 if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
+                    OpenStatsCollector::count(&open_stats.pruned_filter_bloom);
                     return Ok(None);
                 }
                 if let Some((terms, mode)) = term_prune {
                     if !segment_may_contain_terms(terms, *mode, footer.term_bloom.as_ref()) {
+                        OpenStatsCollector::count(&open_stats.pruned_term_bloom);
                         return Ok(None);
                     }
                 }
@@ -1371,11 +1445,16 @@ impl Searcher {
         // query could not take the block-max WAND path and paid to score
         // every match in the segment first.
         let filter_set: Option<Arc<DocSet>> = match (&query.filter, &filter_keys.query) {
-            (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)),
+            (Some(clause), Some(key)) => {
+                let (set, built) = reader.filter_set(key, clause);
+                open_stats.filter_set(built);
+                Some(set)
+            }
             _ => None,
         };
         if filter_set.as_ref().is_some_and(|set| set.is_empty()) {
             // The bloom said "maybe"; the real answer is no document here.
+            OpenStatsCollector::count(&open_stats.filter_empty);
             return Ok(None);
         }
         let segment_tombstones = tombstones
@@ -2107,6 +2186,7 @@ impl Searcher {
                     })
                 };
                 if let Some(output) = wand_attempt() {
+                    OpenStatsCollector::count(&open_stats.fast_path);
                     return Ok(Some(output));
                 }
                 // Corruption detected: fall through to the general path,
@@ -2351,7 +2431,11 @@ impl Searcher {
             // top `k` by closer vectors from other matters and then thrown
             // away by the filter.
             let knn_filter_set: Option<Arc<DocSet>> = match (&knn.filter, &filter_keys.knn) {
-                (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)),
+                (Some(clause), Some(key)) => {
+                    let (set, built) = reader.filter_set(key, clause);
+                    open_stats.filter_set(built);
+                    Some(set)
+                }
                 _ => None,
             };
             let knn_accept = |doc_seq: u32| -> bool {
@@ -2626,6 +2710,7 @@ impl Searcher {
             }
         }
 
+        OpenStatsCollector::count(&open_stats.general_path);
         Ok(Some(SegmentOutput {
             candidates,
             aggs,
@@ -2727,6 +2812,7 @@ impl Searcher {
                     // No segments existed to search, degraded or otherwise —
                     // distinct from "searched N segments, 0 degraded".
                     knn_degraded_segments: None,
+                    profile: None,
                 },
                 phase_stats,
             ));
@@ -2832,7 +2918,8 @@ impl Searcher {
             .par_iter()
             .map(|entry| {
                 let manifest_footer = manifest.segment_footer(&entry.segment_id);
-                self.score_segment(
+                let segment_started = Instant::now();
+                let output = self.score_segment(
                     namespace,
                     entry,
                     query,
@@ -2846,7 +2933,12 @@ impl Searcher {
                     &open_stats,
                     knn_cutoff,
                     &filter_keys,
-                )
+                );
+                open_stats.score_nanos.fetch_add(
+                    segment_started.elapsed().as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+                output
             })
             .collect::<Result<Vec<Option<SegmentOutput>>, KoshaError>>()?
             .into_iter()
@@ -2857,6 +2949,19 @@ impl Searcher {
         phase_stats.open_cached = open_stats.cached.load(Ordering::Relaxed);
         phase_stats.open_total_ms = open_stats.open_nanos.load(Ordering::Relaxed) as f64 / 1e6;
         phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
+        let load = |counter: &AtomicUsize| counter.load(Ordering::Relaxed);
+        phase_stats.segments_total = manifest.segments.len();
+        phase_stats.segments_absent = load(&open_stats.absent);
+        phase_stats.pruned_filter_bloom = load(&open_stats.pruned_filter_bloom);
+        phase_stats.pruned_term_bloom = load(&open_stats.pruned_term_bloom);
+        phase_stats.filter_empty = load(&open_stats.filter_empty);
+        phase_stats.scored_fast_path = load(&open_stats.fast_path);
+        phase_stats.scored_general_path = load(&open_stats.general_path);
+        phase_stats.filter_sets_built = load(&open_stats.filter_built);
+        phase_stats.filter_sets_reused = load(&open_stats.filter_reused);
+        phase_stats.filter_build_ms =
+            open_stats.filter_build_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        phase_stats.score_cpu_ms = open_stats.score_nanos.load(Ordering::Relaxed) as f64 / 1e6;
         let t_materialize = Instant::now();
 
         let mut candidates: Vec<HitCandidate> = Vec::new();
@@ -2994,6 +3099,9 @@ impl Searcher {
         // short-circuits the callback on every subsequent warm query —
         // warm page reads become sub-millisecond local seeks instead of
         // N per-doc S3 ranged GETs every time.
+        phase_stats.candidates = candidates.len();
+        phase_stats.merge_ms = t_materialize.elapsed().as_secs_f64() * 1e3;
+        let t_page_fetch = Instant::now();
         if let Some(ensure_doc_store) = doc_store_hydrator {
             let mut page_seg_paths: Vec<PathBuf> = Vec::new();
             for cand in &candidates[from..to] {
@@ -3016,6 +3124,8 @@ impl Searcher {
         // `doc_store.bin` is now guaranteed local for every page-segment
         // (either it pre-existed, or the hydrator just persisted it above),
         // so `doc_record_full` succeeds without any further S3 round-trip.
+        phase_stats.page_fetch_ms = t_page_fetch.elapsed().as_secs_f64() * 1e3;
+        let t_page_read = Instant::now();
         let mut page = Vec::with_capacity(to - from);
         for cand in &candidates[from..to] {
             let Some(doc_rec) = cand.reader.doc_record_full(cand.doc_seq)? else {
@@ -3060,6 +3170,8 @@ impl Searcher {
 
         let merged_aggs = finish_aggregations(query, all_aggs);
 
+        phase_stats.page_read_ms = t_page_read.elapsed().as_secs_f64() * 1e3;
+        phase_stats.page_docs = page.len();
         phase_stats.materialize_wall_ms = t_materialize.elapsed().as_secs_f64() * 1e3;
 
         Ok((
@@ -3069,6 +3181,7 @@ impl Searcher {
                 total_hits_relation,
                 aggregations: merged_aggs,
                 knn_degraded_segments: query.knn.as_ref().map(|_| knn_degraded_segments),
+                profile: None,
             },
             phase_stats,
         ))
@@ -4290,6 +4403,7 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            profile: None,
         }
     }
 
@@ -5909,6 +6023,86 @@ mod tests {
     }
 
     #[test]
+    fn phase_stats_put_every_segment_in_exactly_one_bucket() {
+        // The search profile is only useful if its counts are right: each
+        // segment of the manifest must be counted once, under the one thing
+        // that happened to it.
+        let dir = std::env::temp_dir().join("kosha-test-phase-stats");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ns, mut manifest) = mk_matter_corpus(&dir);
+        // A third entry whose directory does not exist: "not local".
+        manifest.segments.push(ManifestEntry {
+            segment_id: SegmentId("missing".into()),
+            doc_count: 1,
+        });
+        let searcher = Searcher::new(dir.clone());
+        let buckets = |s: &SearchPhaseStats| {
+            s.segments_absent
+                + s.pruned_filter_bloom
+                + s.pruned_term_bloom
+                + s.filter_empty
+                + s.scored_fast_path
+                + s.scored_general_path
+        };
+
+        // Unfiltered single term: both real segments on the fast path.
+        let (_, stats) = searcher
+            .search_with_stats(&ns, &manifest, &mk_query("contract", 5), None)
+            .unwrap();
+        assert_eq!(stats.segments_total, 3);
+        assert_eq!(buckets(&stats), 3, "{stats:?}");
+        assert_eq!((stats.segments_absent, stats.scored_fast_path), (1, 2));
+        assert_eq!(stats.filter_sets_built + stats.filter_sets_reused, 0);
+        assert_eq!(stats.page_docs, 5);
+        assert!(stats.candidates >= 5);
+
+        // Filtered: still the fast path, one filter bitmap per segment,
+        // built the first time and reused the second.
+        let mut filtered = mk_query("contract", 5);
+        filtered.filter = Some(matter_filter("m1"));
+        let (_, first) = searcher
+            .search_with_stats(&ns, &manifest, &filtered, None)
+            .unwrap();
+        assert_eq!(buckets(&first), 3, "{first:?}");
+        assert_eq!(first.scored_fast_path, 2);
+        assert_eq!((first.filter_sets_built, first.filter_sets_reused), (2, 0));
+        let (_, second) = searcher
+            .search_with_stats(&ns, &manifest, &filtered, None)
+            .unwrap();
+        assert_eq!(
+            (second.filter_sets_built, second.filter_sets_reused),
+            (0, 2)
+        );
+
+        // A term no segment holds: both skipped by the term bloom.
+        let (_, stats) = searcher
+            .search_with_stats(&ns, &manifest, &mk_query("zzznotaword", 5), None)
+            .unwrap();
+        assert_eq!(buckets(&stats), 3, "{stats:?}");
+        assert_eq!(stats.pruned_term_bloom, 2);
+
+        // An aggregation takes the general path.
+        let mut with_agg = mk_query("contract", 0);
+        with_agg.aggs.insert(
+            "per_document".into(),
+            serde_json::from_str(r#"{"terms": {"field": "documentId", "size": 10}}"#).unwrap(),
+        );
+        let (_, stats) = searcher
+            .search_with_stats(&ns, &manifest, &with_agg, None)
+            .unwrap();
+        assert_eq!(buckets(&stats), 3, "{stats:?}");
+        assert_eq!(stats.scored_general_path, 2);
+
+        // The parts of building the page never exceed the whole.
+        assert!(
+            stats.merge_ms + stats.page_fetch_ms + stats.page_read_ms
+                <= stats.materialize_wall_ms + 0.5,
+            "{stats:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn match_phrase_no_slop() {
         // Positions: doc has "quick" at 0, "brown" at 1, "fox" at 2.
         let postings: Vec<Vec<u32>> = vec![vec![0u32], vec![1u32], vec![2u32]];
@@ -6290,6 +6484,7 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            profile: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
@@ -8499,6 +8694,7 @@ mod tests {
                     collapse: None,
                     source_includes: None,
                     source_excludes: None,
+                    profile: None,
                 },
                 None,
             )
@@ -8603,6 +8799,7 @@ mod tests {
                     collapse: None,
                     source_includes: None,
                     source_excludes: None,
+                    profile: None,
                 },
                 None,
             )
@@ -8682,6 +8879,7 @@ mod tests {
                     collapse: None,
                     source_includes: None,
                     source_excludes: None,
+                    profile: None,
                 },
                 None,
             )
@@ -8714,6 +8912,7 @@ mod tests {
                     collapse: None,
                     source_includes: None,
                     source_excludes: None,
+                    profile: None,
                 },
                 None,
             )
@@ -8990,6 +9189,7 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            profile: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -9078,6 +9278,7 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            profile: None,
         };
 
         let first = searcher.search(&ns, &manifest, &q, None).unwrap();
@@ -9157,6 +9358,7 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            profile: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
