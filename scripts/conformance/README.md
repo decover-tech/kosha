@@ -47,7 +47,7 @@ known-bug check), `--strict` (also fail when a known bug *didn't* trip).
 | `one-segment` | First flush. |
 | `many-segments` | Five more flushes. BM25 statistics are per segment, so scores now depend on layout. |
 | `upserts` | Already-flushed ids re-indexed (segment rewrite path). Buffered ids replaced before their first flush. |
-| `deletes` | Delete-by-query, a delete issued while matching docs are still buffered, and deleted ids re-indexed. |
+| `deletes` | Delete-by-query, a delete issued while matching docs are still buffered (they are flushed and deleted too), and deleted ids re-indexed. |
 | `compacted` | Tiered compaction via `POST /v1/admin/compact-namespace`. |
 | `restarted` | Server restarted. With the compose script, the local cache is wiped first, so every segment hydrates from S3. |
 

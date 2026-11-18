@@ -243,6 +243,10 @@ class Oracle:
             self.buffer = OrderedDict()
 
     def delete(self, flt: Dict) -> int:
+        # Delete-by-query flushes buffered docs into a segment first, so a
+        # buffered match is deleted too instead of reappearing after the
+        # next flush (#238, fixed in #263: Indexer::delete_by_query).
+        self.flush()
         n = 0
         for seg in self.segments:
             for d in seg.live():
