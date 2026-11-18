@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use kosha_core::{
-    segment_may_contain_terms, segment_may_match, AggBucket, AggBucketResult, AggCompositeBucket,
-    AggCompositeResult, AggMetricResult, Aggregation, AggregationResults, Bm25Params, DocumentId,
-    FieldType, FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry, NamespaceId,
-    ScoredDocument, SearchQuery, SearchResult, SortSpec, TermBloomMode, TotalHitsRelation,
+    segment_may_contain_terms, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
+    AggMetricResult, Aggregation, AggregationResults, Bm25Params, DocSet, DocumentId, FieldType,
+    FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry, NamespaceId, ScoredDocument,
+    SearchQuery, SearchResult, SortSpec, TermBloomMode, TotalHitsRelation,
 };
 use kosha_segment::{
     tokenize, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
@@ -258,7 +258,15 @@ pub struct TrackedSegment {
     reader: SegmentReader,
     bytes: u64,
     ledger: Arc<MemoryLedger>,
+    /// Filter clause (as canonical JSON) → the documents of this segment
+    /// that pass it. See [`Self::filter_set`].
+    filter_sets: Mutex<HashMap<String, Arc<DocSet>>>,
 }
+
+/// Filter sets kept per segment before the cache is cleared and refilled.
+/// One set is `doc_count / 8` bytes (a few KB), so this bounds the cache at
+/// well under a megabyte per segment however many distinct filters arrive.
+const MAX_FILTER_SETS_PER_SEGMENT: usize = 64;
 
 impl TrackedSegment {
     fn new(reader: SegmentReader, bytes: u64, ledger: Arc<MemoryLedger>) -> Self {
@@ -267,7 +275,39 @@ impl TrackedSegment {
             reader,
             bytes,
             ledger,
+            filter_sets: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The documents of this segment that pass `clause`, evaluated once and
+    /// then reused for as long as the segment stays open.
+    ///
+    /// Segments are immutable, so the answer depends only on the clause.
+    /// Nearly every request repeats a filter this segment has already seen
+    /// (the matter it belongs to, its in-scope flag), which turns filtering
+    /// from a scan over every document's field values into one hash lookup
+    /// per segment and one bit test per candidate.
+    ///
+    /// `key` is the clause's canonical JSON, computed once per request by
+    /// the caller rather than once per segment here.
+    fn filter_set(&self, key: &str, clause: &FilterClause) -> Arc<DocSet> {
+        if let Some(set) = self.filter_sets.lock().unwrap().get(key) {
+            return Arc::clone(set);
+        }
+        // Evaluated outside the lock: two requests racing on a new filter
+        // both compute it, and one result is dropped. That is cheaper than
+        // making every other request for this segment wait behind a scan.
+        let set = Arc::new(kosha_core::evaluate_filter(
+            clause,
+            &self.reader.filter_store(),
+            self.reader.doc_count(),
+        ));
+        let mut cache = self.filter_sets.lock().unwrap();
+        if cache.len() >= MAX_FILTER_SETS_PER_SEGMENT {
+            cache.clear();
+        }
+        cache.insert(key.to_string(), Arc::clone(&set));
+        set
     }
 }
 
@@ -691,216 +731,25 @@ pub fn match_phrase_score(
 pub struct FilterApplier;
 
 impl FilterApplier {
+    /// The subset of `candidates` that passes `clause`.
+    ///
+    /// Kept for callers that hold a candidate set. The search path itself
+    /// uses the segment-wide [`kosha_core::DocSet`] directly (see
+    /// `TrackedSegment::filter_set`), which is evaluated once per segment
+    /// and filter and then reused.
     pub fn apply(
         clause: &FilterClause,
         store: &FilterStore,
         candidates: &HashSet<u32>,
     ) -> Result<HashSet<u32>, KoshaError> {
-        match clause {
-            FilterClause::Term { term } => Self::apply_term(term, store, candidates),
-            FilterClause::Terms { terms } => Self::apply_terms(terms, store, candidates),
-            FilterClause::Range { range } => Self::apply_range(range, store, candidates),
-            FilterClause::Bool { bool: b } => Self::apply_bool(b, store, candidates),
-            FilterClause::MatchAll { .. } => Ok(candidates.clone()),
-        }
+        let doc_count = candidates.iter().max().map_or(0, |max| max + 1);
+        let passing = kosha_core::evaluate_filter(clause, store, doc_count);
+        Ok(candidates
+            .iter()
+            .copied()
+            .filter(|doc_seq| passing.contains(*doc_seq))
+            .collect())
     }
-
-    fn apply_term(
-        term: &HashMap<String, String>,
-        store: &FilterStore,
-        candidates: &HashSet<u32>,
-    ) -> Result<HashSet<u32>, KoshaError> {
-        let mut result = HashSet::new();
-        for (field, value) in term {
-            if let Some(entries) = store.string_fields.get(field) {
-                for &(doc_seq, ref val) in entries {
-                    if candidates.contains(&doc_seq) && val == value {
-                        result.insert(doc_seq);
-                    }
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    fn apply_terms(
-        terms: &HashMap<String, Vec<String>>,
-        store: &FilterStore,
-        candidates: &HashSet<u32>,
-    ) -> Result<HashSet<u32>, KoshaError> {
-        let mut result = HashSet::new();
-        for (field, values) in terms {
-            let value_set: HashSet<&str> = values.iter().map(|s| s.as_str()).collect();
-            if let Some(entries) = store.string_fields.get(field) {
-                for &(doc_seq, ref val) in entries {
-                    if candidates.contains(&doc_seq) && value_set.contains(val.as_str()) {
-                        result.insert(doc_seq);
-                    }
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    fn apply_range(
-        range: &HashMap<String, kosha_core::RangeBound>,
-        store: &FilterStore,
-        candidates: &HashSet<u32>,
-    ) -> Result<HashSet<u32>, KoshaError> {
-        let mut result = HashSet::new();
-        for (field, bound) in range {
-            if let Some(entries) = store.integer_fields.get(field) {
-                for &(doc_seq, val) in entries {
-                    if candidates.contains(&doc_seq) && check_i64(val, bound) {
-                        result.insert(doc_seq);
-                    }
-                }
-            } else if let Some(entries) = store.float_fields.get(field) {
-                for &(doc_seq, val) in entries {
-                    if candidates.contains(&doc_seq) && check_f64(val, bound) {
-                        result.insert(doc_seq);
-                    }
-                }
-            } else if let Some(entries) = store.string_fields.get(field) {
-                for &(doc_seq, ref val) in entries {
-                    if candidates.contains(&doc_seq) && check_str(val, bound) {
-                        result.insert(doc_seq);
-                    }
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    fn apply_bool(
-        b: &kosha_core::BoolFilter,
-        store: &FilterStore,
-        candidates: &HashSet<u32>,
-    ) -> Result<HashSet<u32>, KoshaError> {
-        let mut working: Option<HashSet<u32>> = None;
-
-        if !b.must.is_empty() {
-            let mut acc = candidates.clone();
-            for clause in &b.must {
-                acc = Self::apply(clause, store, &acc)?;
-            }
-            working = Some(acc);
-        }
-        if !b.must_not.is_empty() {
-            let base = working.take().unwrap_or_else(|| candidates.clone());
-            let mut excluded = HashSet::new();
-            for clause in &b.must_not {
-                excluded.extend(Self::apply(clause, store, &base)?);
-            }
-            working = Some(base.difference(&excluded).copied().collect());
-        }
-        if !b.should.is_empty() {
-            let base = working.take().unwrap_or_else(|| candidates.clone());
-            let mut scores: HashMap<u32, usize> = HashMap::new();
-            for clause in &b.should {
-                for doc_seq in Self::apply(clause, store, &base)? {
-                    *scores.entry(doc_seq).or_default() += 1;
-                }
-            }
-            let passed: HashSet<u32> = scores
-                .into_iter()
-                .filter(|(_, c)| *c >= b.minimum_should_match)
-                .map(|(d, _)| d)
-                .collect();
-            working = Some(if base.is_empty() {
-                passed
-            } else {
-                base.intersection(&passed).copied().collect()
-            });
-        }
-        Ok(working.unwrap_or_else(|| candidates.clone()))
-    }
-}
-
-fn check_i64(val: i64, bound: &kosha_core::RangeBound) -> bool {
-    if let Some(ref gte) = bound.gte {
-        if let Ok(b) = gte.parse::<i64>() {
-            if val < b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref gt) = bound.gt {
-        if let Ok(b) = gt.parse::<i64>() {
-            if val <= b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lte) = bound.lte {
-        if let Ok(b) = lte.parse::<i64>() {
-            if val > b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lt) = bound.lt {
-        if let Ok(b) = lt.parse::<i64>() {
-            if val >= b {
-                return false;
-            }
-        }
-    }
-    true
-}
-fn check_f64(val: f64, bound: &kosha_core::RangeBound) -> bool {
-    if let Some(ref gte) = bound.gte {
-        if let Ok(b) = gte.parse::<f64>() {
-            if val < b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref gt) = bound.gt {
-        if let Ok(b) = gt.parse::<f64>() {
-            if val <= b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lte) = bound.lte {
-        if let Ok(b) = lte.parse::<f64>() {
-            if val > b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lt) = bound.lt {
-        if let Ok(b) = lt.parse::<f64>() {
-            if val >= b {
-                return false;
-            }
-        }
-    }
-    true
-}
-fn check_str(val: &str, bound: &kosha_core::RangeBound) -> bool {
-    if let Some(ref gte) = bound.gte {
-        if val < gte.as_str() {
-            return false;
-        }
-    }
-    if let Some(ref gt) = bound.gt {
-        if val <= gt.as_str() {
-            return false;
-        }
-    }
-    if let Some(ref lte) = bound.lte {
-        if val > lte.as_str() {
-            return false;
-        }
-    }
-    if let Some(ref lt) = bound.lt {
-        if val >= lt.as_str() {
-            return false;
-        }
-    }
-    true
 }
 
 // ─── Highlight applier ──────────────────────────────────────────────────────
@@ -1370,11 +1219,13 @@ impl Searcher {
         &self,
         namespace: &NamespaceId,
         manifest: &Manifest,
+        query: &SearchQuery,
         knn: &kosha_core::KnnQuery,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
     ) -> Option<(f32, usize)> {
         let requested = knn.num_candidates.max(1);
+        let prunable = query.has_prunable_filter();
         // Distances from every segment's centroids, gathered in parallel —
         // zero posting I/O, centroids are already resident from open. Kept
         // untruncated per-segment (unlike the pre-corpus-scaling version):
@@ -1391,6 +1242,22 @@ impl Searcher {
                 let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
                 if !seg_dir.exists() {
                     return None;
+                }
+                // A segment the filter rules out is never probed, so its
+                // centroids must not take a share of the budget either. In
+                // a namespace shared by many matters they otherwise soaked
+                // up most of `num_candidates`, leaving the matter actually
+                // being searched with a fraction of the probes asked for.
+                if prunable {
+                    let footer = manifest
+                        .segment_footer(&entry.segment_id)
+                        .cloned()
+                        .or_else(|| SegmentReader::read_footer(&seg_dir).ok());
+                    if let Some(footer) = footer.as_ref() {
+                        if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
+                            return None;
+                        }
+                    }
                 }
                 let reader = self
                     .open_segment(
@@ -1455,6 +1322,9 @@ impl Searcher {
         // flat segments, or budgeting disabled) — fall back to per-segment
         // `nprobe`.
         knn_cutoff: Option<(f32, usize)>,
+        // Canonical JSON of `query.filter` and `query.knn.filter`, computed
+        // once per request: the key into each segment's filter-set cache.
+        filter_keys: &FilterKeys,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
         let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
         if !seg_dir.exists() {
@@ -1462,15 +1332,13 @@ impl Searcher {
         }
 
         // Prune via footer blooms before opening inverted/filters/vectors.
-        if query.filter.is_some() || term_prune.is_some() {
+        if query.has_prunable_filter() || term_prune.is_some() {
             let footer = manifest_footer
                 .cloned()
                 .or_else(|| SegmentReader::read_footer(&seg_dir).ok());
             if let Some(footer) = footer.as_ref() {
-                if let Some(ref filter) = query.filter {
-                    if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
-                        return Ok(None);
-                    }
+                if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
+                    return Ok(None);
                 }
                 if let Some((terms, mode)) = term_prune {
                     if !segment_may_contain_terms(terms, *mode, footer.term_bloom.as_ref()) {
@@ -1479,13 +1347,6 @@ impl Searcher {
                 }
             }
         }
-
-        let is_tombstoned = |doc_seq: u32| -> bool {
-            tombstones.is_some_and(|t| {
-                t.get(&entry.segment_id)
-                    .is_some_and(|seqs| seqs.contains(&doc_seq))
-            })
-        };
 
         // Lexical/BM25 queries (no query.knn) never touch vectors or the
         // HNSW graph — skip loading both so keyword search latency stops
@@ -1500,24 +1361,64 @@ impl Searcher {
             Some(open_stats),
         )?;
         let total_docs = reader.doc_count();
-        let needs_filter_store = query.filter.is_some()
-            || query.knn.as_ref().is_some_and(|k| k.filter.is_some())
-            || !sort_value_fields.is_empty()
-            || !query.aggs.is_empty();
+
+        // ── Which documents of this segment may be a hit at all ──
+        // The filter is resolved to a set up front (cached on the segment,
+        // see `TrackedSegment::filter_set`) and deleted documents are
+        // looked up in the segment's tombstones. Every scoring path below
+        // asks about a candidate *before* it is counted or scored.
+        // Filtering used to happen after scoring, which is why a filtered
+        // query could not take the block-max WAND path and paid to score
+        // every match in the segment first.
+        let filter_set: Option<Arc<DocSet>> = match (&query.filter, &filter_keys.query) {
+            (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)),
+            _ => None,
+        };
+        if filter_set.as_ref().is_some_and(|set| set.is_empty()) {
+            // The bloom said "maybe"; the real answer is no document here.
+            return Ok(None);
+        }
+        let segment_tombstones = tombstones
+            .and_then(|t| t.get(&entry.segment_id))
+            .filter(|seqs| !seqs.is_empty());
+        let accept = |doc_seq: u32| -> bool {
+            filter_set.as_ref().is_none_or(|set| set.contains(doc_seq))
+                && !segment_tombstones.is_some_and(|seqs| seqs.contains(&doc_seq))
+        };
+        // The filter or a tombstone rules the document out. The scoring
+        // loops below were written against tombstones alone; a filter is
+        // the same question, so they ask this for both.
+        let rejected = |doc_seq: u32| -> bool { !accept(doc_seq) };
+        let restricted = filter_set.is_some() || segment_tombstones.is_some();
+
+        let needs_filter_store = !sort_value_fields.is_empty() || !query.aggs.is_empty();
         let filter_store = if needs_filter_store {
             Some(reader.filter_store())
         } else {
             None
         };
+        // Scored with the request's k1/b, as the API documents. The values
+        // stored in the segment were used here instead, so a request's
+        // parameters were silently ignored. Nothing on disk depends on
+        // them: block summaries store the raw term frequency and field
+        // length, and the score ceiling is computed from those here.
         let scorer = Bm25Scorer::new(
             total_docs,
             reader.avg_field_length(),
-            reader.bm25_params().clone(),
+            query.bm25_params.clone(),
         );
 
         let has_query =
             !query_terms.is_empty() || query.wildcard.is_some() || query.match_phrase.is_some();
         let has_only_filter = !has_query && query.filter.is_some();
+        // A filter-only request for no hits (`size: 0`), with no kNN leg
+        // and nothing to aggregate, needs only the number of passing
+        // documents, not each of them materialized as a candidate.
+        let count_only_filter = has_only_filter
+            && query.knn.is_none()
+            && query.aggs.is_empty()
+            && query.from.saturating_add(query.max_results) == 0;
+        let mut filter_only_count: Option<usize> = None;
 
         // Per-segment hits keyed by doc_seq for O(1) kNN hybrid merge.
         // Score only — `DocumentId` (an owned `String` allocation) is
@@ -1634,14 +1535,19 @@ impl Searcher {
             // of the cap, since safely stopping the walk itself needs a
             // per-term suffix-max upper bound the postings v5 skip table
             // doesn't carry yet (tracked as follow-up work).
-            let segment_has_tombstones = tombstones.is_some_and(|t| {
-                t.get(&entry.segment_id)
-                    .is_some_and(|seqs| !seqs.is_empty())
-            });
+            // True when some document of the segment may be ruled out, by
+            // the filter or by a tombstone. The single-term arm then has to
+            // count the accepted postings instead of taking the term's
+            // document frequency.
+            let segment_has_tombstones = restricted;
+            // A filter no longer rules the fast path out: each arm asks
+            // `rejected` per candidate, exactly as it already did for
+            // tombstones, so a filtered query is pruned like an unfiltered
+            // one. Every request scoped to a matter carries a filter, so
+            // this is the path nearly all of them take.
             let can_block_max_wand = !effective_terms.is_empty()
                 && !is_wildcard_mode
                 && phrase_tokenized.is_none()
-                && query.filter.is_none()
                 && query.knn.is_none()
                 && query.search_after.as_ref().is_none_or(|a| a.is_empty())
                 && query.sort.is_empty()
@@ -1719,8 +1625,7 @@ impl Searcher {
                                 if !source.read_block(block, &mut postings) {
                                     return None;
                                 }
-                                count +=
-                                    postings.iter().filter(|p| !is_tombstoned(p.doc_id)).count();
+                                count += postings.iter().filter(|p| !rejected(p.doc_id)).count();
                             }
                             count
                         } else {
@@ -1795,7 +1700,7 @@ impl Searcher {
                                 return None;
                             }
                             for sp in &buf {
-                                if is_tombstoned(sp.doc_id) {
+                                if rejected(sp.doc_id) {
                                     continue;
                                 }
                                 if let Some(meta) = reader.doc_meta(sp.doc_id) {
@@ -1951,7 +1856,7 @@ impl Searcher {
                                 }
                             }
 
-                            if is_tombstoned(pivot_doc) {
+                            if rejected(pivot_doc) {
                                 for i in 0..cursors.len() {
                                     if cur[i] == Some(pivot_doc) {
                                         cur[i] = pivot_doc
@@ -2106,7 +2011,7 @@ impl Searcher {
                         // *counted*) — then score it only if its summed
                         // per-term block ceiling says it could still make the
                         // page.
-                        if is_tombstoned(candidate) {
+                        if rejected(candidate) {
                             let Some(next) = candidate.checked_add(1) else {
                                 break;
                             };
@@ -2224,19 +2129,37 @@ impl Searcher {
                 doc_frequencies.insert(t, p.len() as u32);
             }
 
-            // ── Postings AND/OR: AND for multi-term queries, OR for wildcard
-            //    or an explicit `operator: or` ──
+            // ── Postings AND/OR ──
+            // AND for a multi-term query and for a phrase (a phrase needs
+            // every one of its terms in the document before positions are
+            // worth looking at); OR for a wildcard expansion, an explicit
+            // `operator: or`, or a single term.
+            //
+            // `accept` is asked before anything is scored, so a document the
+            // filter or a tombstone rules out costs one bit test, not a
+            // `doc_meta` lookup and a BM25 evaluation per term.
             let mut scored: HashMap<u32, f64> = HashMap::new();
+            let is_phrase = phrase_tokenized.is_some();
             let use_and = term_postings.len() > 1
                 && !is_wildcard_mode
-                && phrase_tokenized.is_none()
-                && operator == kosha_core::QueryOperator::And;
+                && (is_phrase || operator == kosha_core::QueryOperator::And);
+            // `postings_for_terms` only returns terms this segment contains.
+            // A phrase with a term missing here can match nothing here.
+            let phrase_term_missing = phrase_tokenized.is_some_and(|terms| {
+                let wanted: HashSet<&str> = terms.iter().map(String::as_str).collect();
+                let present: HashSet<&str> = term_postings.iter().map(|(t, _)| *t).collect();
+                wanted.iter().any(|t| !present.contains(t))
+            });
 
-            if !use_and {
-                // OR mode (wildcard, phrase, or single term): score any matching doc.
+            if phrase_term_missing {
+                // No candidate at all.
+            } else if !use_and {
                 for (term, postings) in &term_postings {
                     let df = doc_frequencies.get(term).copied().unwrap_or(0);
                     for posting in postings.iter() {
+                        if !accept(posting.doc_id) {
+                            continue;
+                        }
                         if let Some(meta) = reader.doc_meta(posting.doc_id) {
                             let score =
                                 scorer.score_term(posting.term_frequency, df, meta.field_length);
@@ -2245,42 +2168,66 @@ impl Searcher {
                     }
                 }
             } else {
-                // Multi-term AND: build per-term doc→posting maps once,
-                // intersect starting from the shortest list, then score
-                // via O(1) lookup. The previous path rebuilt a map for
-                // intersection but re-scanned each postings list with
-                // `.find()` while scoring (~O(hits · postings)) — that
-                // dominated warm multi-term latency (see scoring_profile).
-                let term_maps: Vec<(&str, HashMap<u32, &kosha_core::Posting>, u32)> = term_postings
-                    .iter()
-                    .map(|(term, postings)| {
-                        let df = doc_frequencies.get(term).copied().unwrap_or(0);
-                        let map = postings.iter().map(|p| (p.doc_id, p)).collect();
-                        (*term, map, df)
-                    })
-                    .collect();
-
-                let mut and_candidates: Vec<u32> = {
-                    let shortest = term_maps.iter().min_by_key(|(_, m, _)| m.len()).unwrap();
-                    shortest.1.keys().copied().collect()
+                // Intersect starting from the shortest list. Postings are
+                // stored in ascending doc order in every format the writer
+                // emits, so membership in another list is a binary search;
+                // legacy unordered segments get a per-term map instead (the
+                // earlier code built that map for every segment, i.e. hashed
+                // every posting of every term whatever the intersection
+                // turned out to be).
+                let ordered = reader.has_ordered_postings();
+                let maps: Vec<HashMap<u32, &kosha_core::Posting>> = if ordered {
+                    Vec::new()
+                } else {
+                    term_postings
+                        .iter()
+                        .map(|(_, postings)| postings.iter().map(|p| (p.doc_id, p)).collect())
+                        .collect()
                 };
-                for (_, map, _) in &term_maps {
-                    and_candidates.retain(|doc_id| map.contains_key(doc_id));
+                let lookup = |term_index: usize, doc_seq: u32| -> Option<&kosha_core::Posting> {
+                    if ordered {
+                        let postings: &[kosha_core::Posting] = &term_postings[term_index].1;
+                        postings
+                            .binary_search_by_key(&doc_seq, |p| p.doc_id)
+                            .ok()
+                            .map(|i| &postings[i])
+                    } else {
+                        maps[term_index].get(&doc_seq).copied()
+                    }
+                };
+
+                let shortest = (0..term_postings.len())
+                    .min_by_key(|&i| term_postings[i].1.len())
+                    .expect("use_and implies at least two terms");
+                let mut and_candidates: Vec<u32> = term_postings[shortest]
+                    .1
+                    .iter()
+                    .map(|p| p.doc_id)
+                    .filter(|doc_seq| accept(*doc_seq))
+                    .collect();
+                for term_index in 0..term_postings.len() {
+                    if term_index == shortest {
+                        continue;
+                    }
+                    and_candidates.retain(|doc_seq| lookup(term_index, *doc_seq).is_some());
                     if and_candidates.is_empty() {
                         break;
                     }
                 }
 
-                for doc_id in and_candidates {
-                    if let Some(meta) = reader.doc_meta(doc_id) {
+                for doc_seq in and_candidates {
+                    if let Some(meta) = reader.doc_meta(doc_seq) {
+                        // Summed in query-term order, as the WAND join does,
+                        // so both paths round identically.
                         let mut total_score = 0.0;
-                        for (_, map, df) in &term_maps {
-                            if let Some(p) = map.get(&doc_id) {
+                        for (term_index, (term, _)) in term_postings.iter().enumerate() {
+                            if let Some(p) = lookup(term_index, doc_seq) {
+                                let df = doc_frequencies.get(term).copied().unwrap_or(0);
                                 total_score +=
-                                    scorer.score_term(p.term_frequency, *df, meta.field_length);
+                                    scorer.score_term(p.term_frequency, df, meta.field_length);
                             }
                         }
-                        scored.insert(doc_id, total_score);
+                        scored.insert(doc_seq, total_score);
                     }
                 }
             }
@@ -2347,51 +2294,33 @@ impl Searcher {
                 }
             }
 
-            // Apply filter to this segment's scored docs *before* merging
-            // into candidates. Filtering after the segment loop previously
-            // dropped hits from earlier segments.
-            let passed_filter: Option<HashSet<u32>> = if let Some(ref clause) = query.filter {
-                let filter_candidates: HashSet<u32> = scored.keys().copied().collect();
-                Some(FilterApplier::apply(
-                    clause,
-                    filter_store
-                        .as_ref()
-                        .expect("query.filter requires filter_store"),
-                    &filter_candidates,
-                )?)
-            } else {
-                None
-            };
-
+            // `accept` already ran on every candidate above.
             for (doc_seq, score) in scored {
-                if is_tombstoned(doc_seq) {
-                    continue;
-                }
-                if let Some(ref passed) = passed_filter {
-                    if !passed.contains(&doc_seq) {
-                        continue;
-                    }
-                }
                 if reader.doc_meta(doc_seq).is_some() {
                     seg_hits.insert(doc_seq, score);
                 }
             }
         } else if has_only_filter {
-            let all_candidates: HashSet<u32> = (0..total_docs).collect();
-            let passed = FilterApplier::apply(
-                query.filter.as_ref().unwrap(),
-                filter_store
-                    .as_ref()
-                    .expect("filter-only query requires filter_store"),
-                &all_candidates,
-            )?;
-            for doc_seq in passed {
-                if is_tombstoned(doc_seq) {
-                    continue;
-                }
-                if let Some(meta) = reader.doc_meta(doc_seq) {
-                    let score = scorer.score_term(1, total_docs, meta.field_length);
-                    seg_hits.insert(doc_seq, score);
+            let set = filter_set
+                .as_ref()
+                .expect("a filter-only query has a filter set");
+            if count_only_filter {
+                // Nothing will be returned or ranked from this segment's
+                // hits, so only their number is needed.
+                filter_only_count = Some(if segment_tombstones.is_some() {
+                    set.iter().filter(|doc_seq| accept(*doc_seq)).count()
+                } else {
+                    set.count()
+                });
+            } else {
+                for doc_seq in set.iter() {
+                    if !accept(doc_seq) {
+                        continue;
+                    }
+                    if let Some(meta) = reader.doc_meta(doc_seq) {
+                        let score = scorer.score_term(1, total_docs, meta.field_length);
+                        seg_hits.insert(doc_seq, score);
+                    }
                 }
             }
         }
@@ -2401,21 +2330,35 @@ impl Searcher {
         // isn't a v2 segment) ──
         let mut knn_segment_degraded = false;
         if let Some(ref knn) = query.knn {
-            // Tombstones, the kNN-scoped filter, and the top-level filter
-            // all reject candidates *after* the per-segment kNN has cut to
-            // `k` — so a selective filter (or deletes landing near the
-            // query vector) could void most or all of the k and silently
-            // return a short page. Over-fetch whenever post-kNN rejection
-            // is possible, then truncate back to `k` survivors below.
-            let can_reject = knn.filter.is_some()
-                || query.filter.is_some()
-                || tombstones
-                    .is_some_and(|t| t.get(&entry.segment_id).is_some_and(|s| !s.is_empty()));
-            let fetch_k = if can_reject {
-                knn.k.saturating_mul(knn_overfetch_factor())
-            } else {
-                knn.k
+            // The kNN-scoped filter, the top-level filter and tombstones
+            // all decide which documents may be a vector hit, and they are
+            // applied *inside* the probe: a posting's vectors are only
+            // scored for documents `knn_accept` lets through.
+            //
+            // They used to be applied after the segment had already cut to
+            // its top `k` (times an over-fetch factor). In a namespace
+            // shared by many matters that returned few or no hits for a
+            // small matter: its nearest neighbours were crowded out of the
+            // top `k` by closer vectors from other matters and then thrown
+            // away by the filter.
+            let knn_filter_set: Option<Arc<DocSet>> = match (&knn.filter, &filter_keys.knn) {
+                (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)),
+                _ => None,
             };
+            let knn_accept = |doc_seq: u32| -> bool {
+                knn_filter_set
+                    .as_ref()
+                    .is_none_or(|set| set.contains(doc_seq))
+                    && accept(doc_seq)
+            };
+            let knn_restricted = restricted || knn_filter_set.is_some();
+            let knn_accept_dyn: Option<&dyn Fn(u32) -> bool> = if knn_restricted {
+                Some(&knn_accept)
+            } else {
+                None
+            };
+            let nothing_passes = knn_filter_set.as_ref().is_some_and(|set| set.is_empty());
+            let fetch_k = knn.k;
             // `knn.num_candidates` is a WHOLE-QUERY probe budget, not a
             // per-segment one. When the query layer managed to compute a
             // global cutoff, probe only centroids inside it; the union
@@ -2423,29 +2366,45 @@ impl Searcher {
             // query. Falling back to per-segment `nprobe` (no cutoff) is
             // correct but pays `num_candidates` in EVERY segment, so total
             // probe depth scales with segment count.
-            let probe = match knn_cutoff {
-                Some((cutoff, effective_budget)) => reader
-                    .knn_search_within(&knn.vector, fetch_k, cutoff, effective_budget)
-                    .map(|r| {
-                        r.map(|(results, probes)| {
-                            open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
-                            results
-                        })
-                    }),
-                None => reader
-                    .knn_search(&knn.vector, fetch_k, knn.num_candidates)
-                    .map(|r| {
-                        r.inspect(|_| {
-                            // Per-segment fallback probes up to `num_candidates`
-                            // in THIS segment; record the ceiling so the metric
-                            // still reflects the fan-out being paid.
-                            open_stats
-                                .knn_postings
-                                .fetch_add(knn.num_candidates, Ordering::Relaxed);
-                        })
-                    }),
+            let probe = if nothing_passes {
+                Some(Ok(Vec::new()))
+            } else {
+                match knn_cutoff {
+                    Some((cutoff, effective_budget)) => reader
+                        .knn_search_within_filtered(
+                            &knn.vector,
+                            fetch_k,
+                            cutoff,
+                            effective_budget,
+                            knn_accept_dyn,
+                        )
+                        .map(|r| {
+                            r.map(|(results, probes)| {
+                                open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
+                                results
+                            })
+                        }),
+                    None => reader
+                        .knn_search_filtered(
+                            &knn.vector,
+                            fetch_k,
+                            knn.num_candidates,
+                            knn_accept_dyn,
+                        )
+                        .map(|r| {
+                            r.inspect(|_| {
+                                // Per-segment fallback probes up to
+                                // `num_candidates` in THIS segment; record the
+                                // ceiling so the metric still reflects the
+                                // fan-out being paid.
+                                open_stats
+                                    .knn_postings
+                                    .fetch_add(knn.num_candidates, Ordering::Relaxed);
+                            })
+                        }),
+                }
             };
-            let mut knn_results: Vec<(u32, f64)> = match probe {
+            let knn_results: Vec<(u32, f64)> = match probe {
                 Some(Ok(results)) => results,
                 Some(Err(e)) => {
                     eprintln!(
@@ -2461,13 +2420,33 @@ impl Searcher {
                     Vec::new()
                 }
                 None if !reader.vector_store.vectors.is_empty() => {
+                    // Legacy segments (pre-v2 vector index). The HNSW walk
+                    // cannot be filtered from inside, so it over-fetches and
+                    // filters afterwards; the flat scan sees every vector
+                    // and filters exactly.
                     if let Some(ref hnsw) = reader.hnsw_map {
+                        let take = if knn_restricted {
+                            fetch_k.saturating_mul(knn_overfetch_factor())
+                        } else {
+                            fetch_k
+                        };
                         let query_point = kosha_segment::CosinePoint(knn.vector.clone());
                         let mut search = instant_distance::Search::default();
                         hnsw.search(&query_point, &mut search)
-                            .take(fetch_k)
+                            .take(take)
                             .map(|item| (*item.value, (1.0 - item.distance as f64).max(0.0)))
+                            .filter(|(doc_seq, _)| knn_accept(*doc_seq))
+                            .take(fetch_k)
                             .collect()
+                    } else if knn_restricted {
+                        let allowed: Vec<(u32, Vec<f32>)> = reader
+                            .vector_store
+                            .vectors
+                            .iter()
+                            .filter(|(doc_seq, _)| knn_accept(*doc_seq))
+                            .cloned()
+                            .collect();
+                        flat_knn(&knn.vector, &allowed, fetch_k)
                     } else {
                         flat_knn(&knn.vector, &reader.vector_store.vectors, fetch_k)
                     }
@@ -2490,31 +2469,14 @@ impl Searcher {
                     Vec::new()
                 }
             };
-            // `knn.filter` — accepted on the wire since the field was
-            // introduced but silently ignored until now. It scopes the kNN
-            // candidates themselves (which docs may be vector matches);
-            // the top-level `query.filter` continues to govern the merged
-            // result set as before.
-            if let Some(ref clause) = knn.filter {
-                let candidates: HashSet<u32> = knn_results.iter().map(|(d, _)| *d).collect();
-                let passed = FilterApplier::apply(
-                    clause,
-                    filter_store
-                        .as_ref()
-                        .expect("knn.filter requires filter_store"),
-                    &candidates,
-                )?;
-                knn_results.retain(|(d, _)| passed.contains(d));
-            }
             // Merge with this segment's BM25 hits or use kNN directly.
             // Per-segment HashMap keeps hybrid merge O(k), not O(hits·k).
             // (A no-op on an empty `knn_results`, same as before this
             // block existed — no separate emptiness gate needed.)
             for (kept, (doc_seq, score)) in knn_results
                 .into_iter()
-                .filter(|(doc_seq, _)| {
-                    !is_tombstoned(*doc_seq) && reader.doc_meta(*doc_seq).is_some()
-                })
+                // Filters and tombstones were applied inside the probe.
+                .filter(|(doc_seq, _)| reader.doc_meta(*doc_seq).is_some())
                 .enumerate()
             {
                 if kept >= knn.k {
@@ -2544,7 +2506,7 @@ impl Searcher {
                 .map(|(name, agg)| (name.clone(), aggregate_matches(store, &wanted, agg)))
                 .collect()
         };
-        let total_hits = seg_hits.len();
+        let total_hits = filter_only_count.unwrap_or(seg_hits.len());
 
         // Cut to this segment's top `effective_k` by score *before* paying
         // the `DocumentId` allocation — same discipline `BoundedTopK`
@@ -2799,6 +2761,7 @@ impl Searcher {
         let count_budget = (!exact).then_some(cap);
 
         let open_stats = OpenStatsCollector::default();
+        let filter_keys = FilterKeys::for_query(query);
 
         // ── global kNN probe budget ────────────────────────────────────
         // `num_candidates` is a whole-query budget. Applied per segment
@@ -2811,7 +2774,7 @@ impl Searcher {
         // then let each segment probe only inside it.
         let knn_cutoff = match query.knn {
             Some(ref knn) if knn_global_budget_enabled() => {
-                self.global_probe_cutoff(namespace, manifest, knn, &permit, &open_stats)
+                self.global_probe_cutoff(namespace, manifest, query, knn, &permit, &open_stats)
             }
             _ => None,
         };
@@ -2835,6 +2798,7 @@ impl Searcher {
                     &permit,
                     &open_stats,
                     knn_cutoff,
+                    &filter_keys,
                 )
             })
             .collect::<Result<Vec<Option<SegmentOutput>>, KoshaError>>()?
@@ -2886,8 +2850,26 @@ impl Searcher {
         // walking ~10⁶ candidates and reporting "at least 10,000" for free.
         // `exact_total_hits: true` (per query, or `KOSHA_EXACT_TOTAL_HITS`
         // engine-wide) restores the old unconditional-exact behavior.
-        let (total_hits, total_hits_relation) =
+        let (mut total_hits, total_hits_relation) =
             resolve_total_hits(total_hits, exact, cap, any_capped);
+
+        // A vector-only query asks for the `k` nearest documents. Each
+        // segment answers with its own nearest `k`, so the union holds up
+        // to `k` per segment: keep the nearest `k` overall and report that
+        // many. The sum of the per-segment counts (`k` times the number of
+        // segments) said nothing about the query.
+        if let Some(knn) = query.knn.as_ref().filter(|_| query.is_pure_knn()) {
+            if candidates.len() > knn.k {
+                candidates.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
+                });
+                candidates.truncate(knn.k);
+            }
+            total_hits = candidates.len();
+        }
 
         // ── Sort (score-only / sort-key candidates — no full field payloads) ──
         let sort_cmp = |a: &HitCandidate, b: &HitCandidate| -> std::cmp::Ordering {
@@ -3697,6 +3679,31 @@ fn candidate_sort_value<'a>(
 
 // ─── Aggregation functions ──────────────────────────────────────────────────
 
+/// A request's filters as canonical JSON: the keys into each segment's
+/// filter-set cache (`TrackedSegment::filter_set`). Serialized once per
+/// request here instead of once per segment.
+#[derive(Debug, Default)]
+struct FilterKeys {
+    /// `SearchQuery::filter`.
+    query: Option<String>,
+    /// `SearchQuery::knn.filter`.
+    knn: Option<String>,
+}
+
+impl FilterKeys {
+    fn for_query(query: &SearchQuery) -> Self {
+        let key = |clause: &FilterClause| serde_json::to_string(clause).ok();
+        Self {
+            query: query.filter.as_ref().and_then(key),
+            knn: query
+                .knn
+                .as_ref()
+                .and_then(|knn| knn.filter.as_ref())
+                .and_then(key),
+        }
+    }
+}
+
 /// Lossless intermediate state: trim buckets and count distinct values only
 /// after merging all segments, never on a per-segment top-N.
 #[derive(Default)]
@@ -4102,6 +4109,9 @@ mod tests {
             total_hits_cap: None,
             operator: None,
             no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
         }
     }
 
@@ -5380,6 +5390,227 @@ mod tests {
         assert!(matched.contains(&"held".to_string()));
     }
 
+    /// Two segments, two matters, three documents with several pages each.
+    /// Every chunk says "contract"; only matter `m1` pages 1 say "breach".
+    /// Vectors point along x for matter `m1` and along y for `m2`, with a
+    /// small per-page tilt so they are distinct.
+    fn mk_matter_corpus(dir: &std::path::Path) -> (NamespaceId, Manifest) {
+        let ns = NamespaceId("test".into());
+        let mut entries = Vec::new();
+        // (segment, [(document, matter, pages)])
+        type SegmentLayout<'a> = (&'a str, &'a [(&'a str, &'a str, u32)]);
+        let layout: [SegmentLayout; 2] = [
+            ("s1", &[("docA", "m1", 12), ("docB", "m2", 3)]),
+            ("s2", &[("docC", "m1", 2), ("docB", "m2", 4)]),
+        ];
+        for (seg, docs) in layout {
+            let mut w = SegmentWriter::new(SegmentId(seg.into()), dir.join(&ns.0).join(seg));
+            let mut count = 0u32;
+            for (doc, matter, pages) in docs {
+                for page in 1..=*pages {
+                    let text = if *matter == "m1" && page == 1 {
+                        "contract breach contract"
+                    } else {
+                        "contract"
+                    };
+                    let tilt = page as f32 * 0.01;
+                    let vector = if *matter == "m1" {
+                        vec![1.0, tilt, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                    } else {
+                        vec![tilt, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                    };
+                    w.add_document(
+                        DocumentId(format!("{seg}-{doc}-p{page:02}")),
+                        vec![
+                            Field::text("content", text),
+                            Field::keyword("documentId", *doc),
+                            Field::keyword("matterId", *matter),
+                            Field::integer("pageNumber", page as i64),
+                            Field::vector("contentEmbedding", vector),
+                        ],
+                    );
+                    count += 1;
+                }
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: SegmentId(seg.into()),
+                doc_count: count,
+            });
+        }
+        (
+            ns,
+            Manifest {
+                version: 1,
+                segments: entries,
+                segment_footers: Default::default(),
+                wal_checkpoint: 0,
+                wal_origin: None,
+                tombstones: Default::default(),
+                deletion_vectors: Default::default(),
+            },
+        )
+    }
+
+    fn matter_filter(matter: &str) -> FilterClause {
+        // The backend's nesting: bool.filter -> bool.should.
+        serde_json::from_value(serde_json::json!({"bool": {"filter": [{"bool": {"should": [
+            {"term": {"matterId": matter}}, {"term": {"productionId": matter}}]}}]}}))
+        .unwrap()
+    }
+
+    fn field<'a>(doc: &'a ScoredDocument, name: &str) -> Option<&'a str> {
+        doc.fields
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.value.as_str())
+    }
+
+    #[test]
+    fn filtered_keyword_search_counts_and_ranks_only_the_matter() {
+        let dir = std::env::temp_dir().join("kosha-test-filtered-keyword");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ns, manifest) = mk_matter_corpus(&dir);
+        let searcher = Searcher::new(dir.clone());
+
+        // 21 chunks say "contract": 14 in m1, 7 in m2.
+        let mut query = mk_query("contract", 5);
+        query.exact_total_hits = Some(true);
+        assert_eq!(
+            searcher
+                .search(&ns, &manifest, &query, None)
+                .unwrap()
+                .total_hits,
+            21
+        );
+
+        query.filter = Some(matter_filter("m1"));
+        let r = searcher.search(&ns, &manifest, &query, None).unwrap();
+        assert_eq!(r.total_hits, 14, "single-term WAND path, filtered");
+        assert_eq!(r.results.len(), 5);
+        assert!(r.results.iter().all(|d| field(d, "matterId") == Some("m1")));
+
+        // Multi-term AND and OR joins under the same filter.
+        let mut and = mk_query("contract breach", 5);
+        and.exact_total_hits = Some(true);
+        and.filter = Some(matter_filter("m1"));
+        assert_eq!(
+            searcher
+                .search(&ns, &manifest, &and, None)
+                .unwrap()
+                .total_hits,
+            2
+        );
+        and.filter = Some(matter_filter("m2"));
+        assert_eq!(
+            searcher
+                .search(&ns, &manifest, &and, None)
+                .unwrap()
+                .total_hits,
+            0
+        );
+        let mut or = mk_query_or("contract breach", 5);
+        or.filter = Some(matter_filter("m2"));
+        let r = searcher.search(&ns, &manifest, &or, None).unwrap();
+        assert_eq!(r.total_hits, 7);
+        assert!(r.results.iter().all(|d| field(d, "matterId") == Some("m2")));
+
+        // A filter-only count, and a matter nothing belongs to.
+        let mut count = mk_query("", 0);
+        count.exact_total_hits = Some(true);
+        count.filter = Some(matter_filter("m2"));
+        assert_eq!(
+            searcher
+                .search(&ns, &manifest, &count, None)
+                .unwrap()
+                .total_hits,
+            7
+        );
+        count.filter = Some(matter_filter("nobody"));
+        assert_eq!(
+            searcher
+                .search(&ns, &manifest, &count, None)
+                .unwrap()
+                .total_hits,
+            0
+        );
+
+        // Deleted documents are neither counted nor returned.
+        let mut tombstones = HashMap::new();
+        tombstones.insert(SegmentId("s2".into()), HashSet::from([0u32, 1u32]));
+        query.filter = Some(matter_filter("m1"));
+        let r = searcher
+            .search(&ns, &manifest, &query, Some(&tombstones))
+            .unwrap();
+        assert_eq!(r.total_hits, 12, "docC's two chunks are deleted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phrase_with_a_filter_matches_the_phrase_inside_the_matter() {
+        let dir = std::env::temp_dir().join("kosha-test-filtered-phrase");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ns, manifest) = mk_matter_corpus(&dir);
+        let searcher = Searcher::new(dir.clone());
+        let mut query = mk_query("", 10);
+        query.exact_total_hits = Some(true);
+        query.match_phrase = Some(kosha_core::MatchPhraseQuery {
+            field: "content".into(),
+            phrase: "contract breach".into(),
+            slop: 0,
+        });
+        query.filter = Some(matter_filter("m1"));
+        let r = searcher.search(&ns, &manifest, &query, None).unwrap();
+        assert_eq!(r.total_hits, 2, "docA page 1 and docC page 1");
+        query.filter = Some(matter_filter("m2"));
+        assert_eq!(
+            searcher
+                .search(&ns, &manifest, &query, None)
+                .unwrap()
+                .total_hits,
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_filter_is_applied_inside_the_probe() {
+        let dir = std::env::temp_dir().join("kosha-test-knn-prefilter");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ns, manifest) = mk_matter_corpus(&dir);
+        let searcher = Searcher::new(dir.clone());
+        // The query vector points at matter m1. Without a filter the
+        // nearest chunks are all m1's.
+        let mut query = mk_query("", 3);
+        query.knn = Some(kosha_core::KnnQuery {
+            field: "contentEmbedding".into(),
+            vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            k: 3,
+            num_candidates: 100,
+            filter: None,
+        });
+        let r = searcher.search(&ns, &manifest, &query, None).unwrap();
+        assert_eq!(r.results.len(), 3);
+        assert!(r.results.iter().all(|d| field(d, "matterId") == Some("m1")));
+        assert_eq!(r.total_hits, 3, "a vector query matches the k it asked for");
+
+        // Restricted to m2, whose vectors are all far away: a filter
+        // applied after the top-k cut would return nothing here.
+        query.knn.as_mut().unwrap().filter = Some(matter_filter("m2"));
+        let r = searcher.search(&ns, &manifest, &query, None).unwrap();
+        assert_eq!(r.results.len(), 3, "the three nearest chunks OF m2");
+        assert!(r.results.iter().all(|d| field(d, "matterId") == Some("m2")));
+        assert_eq!(r.knn_degraded_segments, Some(0));
+
+        // A matter with no documents returns nothing, rather than
+        // unfiltered neighbours.
+        query.knn.as_mut().unwrap().filter = Some(matter_filter("nobody"));
+        let r = searcher.search(&ns, &manifest, &query, None).unwrap();
+        assert!(r.results.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn match_phrase_no_slop() {
         // Positions: doc has "quick" at 0, "brown" at 1, "fox" at 2.
@@ -5759,6 +5990,9 @@ mod tests {
             total_hits_cap: None,
             operator: None,
             no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
@@ -7965,6 +8199,9 @@ mod tests {
                     total_hits_cap: None,
                     operator: None,
                     no_cache: None,
+                    collapse: None,
+                    source_includes: None,
+                    source_excludes: None,
                 },
                 None,
             )
@@ -8066,6 +8303,9 @@ mod tests {
                     total_hits_cap: None,
                     operator: None,
                     no_cache: None,
+                    collapse: None,
+                    source_includes: None,
+                    source_excludes: None,
                 },
                 None,
             )
@@ -8142,6 +8382,9 @@ mod tests {
                     total_hits_cap: None,
                     operator: None,
                     no_cache: None,
+                    collapse: None,
+                    source_includes: None,
+                    source_excludes: None,
                 },
                 None,
             )
@@ -8171,6 +8414,9 @@ mod tests {
                     total_hits_cap: None,
                     operator: None,
                     no_cache: None,
+                    collapse: None,
+                    source_includes: None,
+                    source_excludes: None,
                 },
                 None,
             )
@@ -8444,6 +8690,9 @@ mod tests {
             total_hits_cap: None,
             operator: None,
             no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -8529,6 +8778,9 @@ mod tests {
             total_hits_cap: None,
             operator: None,
             no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
         };
 
         let first = searcher.search(&ns, &manifest, &q, None).unwrap();
@@ -8605,6 +8857,9 @@ mod tests {
             total_hits_cap: None,
             operator: None,
             no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);

@@ -38,7 +38,7 @@ use kosha_cache::Cache;
 #[cfg(feature = "s3")]
 use kosha_core::StorageBackend;
 #[cfg(feature = "s3")]
-use kosha_core::{segment_may_contain_terms, segment_may_match, TermBloomMode};
+use kosha_core::{segment_may_contain_terms, TermBloomMode};
 use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::DocStoreHydrator;
 use kosha_query::Searcher;
@@ -1434,6 +1434,9 @@ impl AppState {
                 total_hits_cap: None,
                 operator: None,
                 no_cache: None,
+                collapse: None,
+                source_includes: None,
+                source_excludes: None,
             };
             let needs_filters = query_needs_filter_store(&query);
             let needs_vectors = query.knn.is_some();
@@ -2370,7 +2373,7 @@ impl AppState {
         request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
         let term_prune = term_bloom_prune_for_query(query);
-        let needs_bloom_check = query.filter.is_some() || term_prune.is_some();
+        let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
         let needs_vectors = query.knn.is_some();
         let needs_filters = query_needs_filter_store(query);
         let posting_files = posting_blob_files_for_query(query);
@@ -2408,10 +2411,8 @@ impl AppState {
                     .cloned()
                     .or_else(|| SegmentReader::read_footer(&seg_path).ok());
                 if let Some(footer) = footer.as_ref() {
-                    if let Some(ref filter) = query.filter {
-                        if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
-                            continue;
-                        }
+                    if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
+                        continue;
                     }
                     if let Some((ref terms, mode)) = term_prune {
                         if !segment_may_contain_terms(terms, mode, footer.term_bloom.as_ref()) {
@@ -4634,6 +4635,9 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         total_hits_cap: None,
         operator: None,
         no_cache: None,
+        collapse: None,
+        source_includes: None,
+        source_excludes: None,
     };
 
     if let Err(e) = state.refresh_query_namespace(&ns) {
@@ -5492,13 +5496,7 @@ fn term_bloom_prune_for_query(query: &SearchQuery) -> Option<(Vec<String>, TermB
 /// doc metadata, and page doc stores.
 #[cfg(feature = "s3")]
 fn query_needs_filter_store(query: &SearchQuery) -> bool {
-    query.filter.is_some()
-        || !query.aggs.is_empty()
-        || query.sort.iter().any(|spec| {
-            spec.fields
-                .keys()
-                .any(|field| field != "_score" && field != "_id")
-        })
+    query.needs_filter_columns()
 }
 
 #[cfg(feature = "s3")]
@@ -7378,6 +7376,9 @@ mod tests {
             total_hits_cap: None,
             operator: None,
             no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
         };
 
         let unfiltered = state.hydrate_segments_for_search(
@@ -7511,6 +7512,9 @@ mod tests {
             total_hits_cap: None,
             operator: None,
             no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
         };
         let verdict_key = (ns.0.clone(), manifest.version);
 
@@ -8419,6 +8423,9 @@ mod tests {
             total_hits_cap: None,
             operator: None,
             no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
         };
         let with_vec = |v: Vec<f32>, k: usize| {
             let mut q = base.clone();

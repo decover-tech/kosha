@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use kosha_core::{
     Bm25Params, Document, DocumentId, FilterClause, FilterStore, KoshaError, Manifest,
-    ManifestEntry, NamespaceId, RangeBound, SegmentId,
+    ManifestEntry, NamespaceId, SegmentId,
 };
 use kosha_segment::SegmentWriter;
 
@@ -1746,185 +1746,16 @@ pub fn apply_filter_delete(
     store: &FilterStore,
     candidates: &HashSet<u32>,
 ) -> Result<HashSet<u32>, KoshaError> {
-    match filter {
-        FilterClause::Term { term } => {
-            let mut result = HashSet::new();
-            for (field, value) in term {
-                if let Some(entries) = store.string_fields.get(field) {
-                    for &(ds, ref v) in entries {
-                        if candidates.contains(&ds) && v == value {
-                            result.insert(ds);
-                        }
-                    }
-                }
-            }
-            Ok(result)
-        }
-        FilterClause::Terms { terms } => {
-            let mut result = HashSet::new();
-            for (field, values) in terms {
-                let vs: HashSet<&str> = values.iter().map(|s| s.as_str()).collect();
-                if let Some(entries) = store.string_fields.get(field) {
-                    for &(ds, ref v) in entries {
-                        if candidates.contains(&ds) && vs.contains(v.as_str()) {
-                            result.insert(ds);
-                        }
-                    }
-                }
-            }
-            Ok(result)
-        }
-        FilterClause::Range { range } => {
-            let mut result = HashSet::new();
-            for (field, bound) in range {
-                if let Some(entries) = store.integer_fields.get(field) {
-                    for &(ds, val) in entries {
-                        if candidates.contains(&ds) && range_check_i64(val, bound) {
-                            result.insert(ds);
-                        }
-                    }
-                } else if let Some(entries) = store.float_fields.get(field) {
-                    for &(ds, val) in entries {
-                        if candidates.contains(&ds) && range_check_f64(val, bound) {
-                            result.insert(ds);
-                        }
-                    }
-                } else if let Some(entries) = store.string_fields.get(field) {
-                    for &(ds, ref v) in entries {
-                        if candidates.contains(&ds) && range_check_str(v, bound) {
-                            result.insert(ds);
-                        }
-                    }
-                }
-            }
-            Ok(result)
-        }
-        FilterClause::Bool { bool: b } => {
-            let mut working: Option<HashSet<u32>> = None;
-            if !b.must.is_empty() {
-                let mut acc = candidates.clone();
-                for c in &b.must {
-                    acc = apply_filter_delete(c, store, &acc)?;
-                }
-                working = Some(acc);
-            }
-            if !b.must_not.is_empty() {
-                let base = working.take().unwrap_or_else(|| candidates.clone());
-                let mut excluded = HashSet::new();
-                for c in &b.must_not {
-                    excluded.extend(apply_filter_delete(c, store, &base)?);
-                }
-                working = Some(base.difference(&excluded).copied().collect());
-            }
-            if !b.should.is_empty() {
-                let base = working.take().unwrap_or_else(|| candidates.clone());
-                let mut scores: HashMap<u32, usize> = HashMap::new();
-                for c in &b.should {
-                    for ds in apply_filter_delete(c, store, &base)? {
-                        *scores.entry(ds).or_default() += 1;
-                    }
-                }
-                let passed: HashSet<u32> = scores
-                    .into_iter()
-                    .filter(|(_, c)| *c >= b.minimum_should_match)
-                    .map(|(d, _)| d)
-                    .collect();
-                working = Some(if base.is_empty() {
-                    passed
-                } else {
-                    base.intersection(&passed).copied().collect()
-                });
-            }
-            Ok(working.unwrap_or_else(|| candidates.clone()))
-        }
-        FilterClause::MatchAll { .. } => Ok(candidates.clone()),
-    }
-}
-
-fn range_check_i64(val: i64, bound: &RangeBound) -> bool {
-    if let Some(ref gte) = bound.gte {
-        if let Ok(b) = gte.parse::<i64>() {
-            if val < b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref gt) = bound.gt {
-        if let Ok(b) = gt.parse::<i64>() {
-            if val <= b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lte) = bound.lte {
-        if let Ok(b) = lte.parse::<i64>() {
-            if val > b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lt) = bound.lt {
-        if let Ok(b) = lt.parse::<i64>() {
-            if val >= b {
-                return false;
-            }
-        }
-    }
-    true
-}
-fn range_check_f64(val: f64, bound: &RangeBound) -> bool {
-    if let Some(ref gte) = bound.gte {
-        if let Ok(b) = gte.parse::<f64>() {
-            if val < b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref gt) = bound.gt {
-        if let Ok(b) = gt.parse::<f64>() {
-            if val <= b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lte) = bound.lte {
-        if let Ok(b) = lte.parse::<f64>() {
-            if val > b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lt) = bound.lt {
-        if let Ok(b) = lt.parse::<f64>() {
-            if val >= b {
-                return false;
-            }
-        }
-    }
-    true
-}
-fn range_check_str(val: &str, bound: &RangeBound) -> bool {
-    if let Some(ref gte) = bound.gte {
-        if val < gte.as_str() {
-            return false;
-        }
-    }
-    if let Some(ref gt) = bound.gt {
-        if val <= gt.as_str() {
-            return false;
-        }
-    }
-    if let Some(ref lte) = bound.lte {
-        if val > lte.as_str() {
-            return false;
-        }
-    }
-    if let Some(ref lt) = bound.lt {
-        if val >= lt.as_str() {
-            return false;
-        }
-    }
-    true
+    // The one filter implementation, shared with search (kosha-core's
+    // `docset`), so a delete matches exactly the documents a search with
+    // the same filter returns.
+    let doc_count = candidates.iter().max().map_or(0, |max| max + 1);
+    let passing = kosha_core::evaluate_filter(filter, store, doc_count);
+    Ok(candidates
+        .iter()
+        .copied()
+        .filter(|doc_seq| passing.contains(*doc_seq))
+        .collect())
 }
 
 #[cfg(test)]

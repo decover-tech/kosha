@@ -1,18 +1,9 @@
 {
   "_comment": "Known engine bugs the suite currently trips. 'checks' maps fnmatch globs over check ids (<checkpoint>:<query id>:<aspect>) to a key in 'bugs'. Delete a bug and its globs when it is fixed. Some bugs only show up for certain segment layouts, so a listed check that passes is reported but only fails the run under --strict.",
   "bugs": {
-    "or-pruned-as-and": "operator=or queries are segment-pruned with the AND term bloom, so a segment missing ANY query term is skipped and docs matching only some terms disappear (kosha-query search(): term_prune always uses TermBloomMode::And)",
-    "bm25-params-ignored": "Per-request bm25_params are ignored: Bm25Scorer is built from the segment's stored params (reader.bm25_params()), not query.bm25_params, although the README advertises per-request k1/b",
-    "term-on-numeric-field": "term/terms filters only consult string-typed fields, so a term on an Integer/Float field never matches (FilterApplier::apply_term reads store.string_fields only)",
     "numeric-sort-lexicographic": "Integer/Float fields sort as strings, so 10 sorts before 9 (build_sort_value_maps stringifies values; compare_candidate_sort_keys compares strings)"
   },
   "checks": {
-    "*:bm25/or*:total": "or-pruned-as-and",
-    "*:bm25/or*:ids": "or-pruned-as-and",
-    "*:bm25/params-*:scores": "bm25-params-ignored",
-    "*:bm25/params-*:ids": "bm25-params-ignored",
-    "*:filter/term-on-integer:total": "term-on-numeric-field",
-    "*:filter/term-on-integer:ids": "term-on-numeric-field",
     "*:sort/float-desc:ids": "numeric-sort-lexicographic",
     "*:sort/integer-asc:ids": "numeric-sort-lexicographic"
   }

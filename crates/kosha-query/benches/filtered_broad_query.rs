@@ -96,6 +96,9 @@ fn main() {
         total_hits_cap: None,
         operator: None,
         no_cache: None,
+        collapse: None,
+        source_includes: None,
+        source_excludes: None,
     };
 
     // Warm the segment cache.
