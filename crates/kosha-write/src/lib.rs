@@ -44,6 +44,38 @@ struct NamespaceState {
     recovered: Vec<(u64, kosha_core::WalRecord)>,
     recovered_deletes: HashSet<DocumentId>,
     replay_required: bool,
+    /// The manifest as last handed to a search, with what it was built
+    /// from — see [`Indexer::manifest_shared`].
+    shared_manifest: Option<(ManifestStamp, Arc<Manifest>)>,
+}
+
+/// What a shared manifest snapshot was built from. Two equal stamps mean
+/// the snapshot is still what `publication_snapshot` would build.
+///
+/// The version covers every publish (flush, rewrite, compaction, restore
+/// of a newer manifest). Deletes add tombstones between publishes, which
+/// the tombstone counts cover: within one version tombstones only grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManifestStamp {
+    version: u64,
+    segments: usize,
+    footers: usize,
+    tombstoned_segments: usize,
+    tombstones: usize,
+    deletion_vectors: usize,
+}
+
+impl ManifestStamp {
+    fn of(state: &NamespaceState) -> Self {
+        Self {
+            version: state.manifest.version,
+            segments: state.manifest.segments.len(),
+            footers: state.manifest.segment_footers.len(),
+            tombstoned_segments: state.tombstones.len(),
+            tombstones: state.tombstones.values().map(HashSet::len).sum(),
+            deletion_vectors: state.manifest.deletion_vectors.len(),
+        }
+    }
 }
 
 impl NamespaceState {
@@ -68,6 +100,7 @@ impl NamespaceState {
             recovered: Vec::new(),
             recovered_deletes: HashSet::new(),
             replay_required: false,
+            shared_manifest: None,
         }
     }
 }
@@ -1539,6 +1572,7 @@ impl Indexer {
         state.tombstones = manifest.tombstones.clone();
         state.published_version = manifest.version;
         state.manifest = manifest;
+        state.shared_manifest = None;
         state.known = true;
     }
 
@@ -1549,6 +1583,48 @@ impl Indexer {
     pub fn manifest_cloned(&self, namespace: &NamespaceId) -> Option<Manifest> {
         self.publication_snapshot(namespace)
             .map(|(_, manifest)| manifest)
+    }
+
+    /// The namespace's manifest version, without cloning the manifest.
+    pub fn manifest_version(&self, namespace: &NamespaceId) -> Option<u64> {
+        let map = self.namespaces.lock().unwrap();
+        let handle = map.get(namespace)?;
+        let state = handle.state.lock().unwrap();
+        state.known.then_some(state.manifest.version)
+    }
+
+    /// The manifest for a search (tombstones included), shared rather than
+    /// copied: the same value [`Indexer::manifest_cloned`] returns.
+    ///
+    /// A manifest carries a footer for every segment, each with its term
+    /// and filter blooms, so copying it is megabytes of allocation for a
+    /// namespace of a few hundred segments, and every search made that copy
+    /// before doing any work. This hands out one shared copy and rebuilds
+    /// it only when the namespace changes (see [`ManifestStamp`]).
+    pub fn manifest_shared(&self, namespace: &NamespaceId) -> Option<Arc<Manifest>> {
+        let map = self.namespaces.lock().unwrap();
+        let handle = map.get(namespace)?;
+        let mut state = handle.state.lock().unwrap();
+        if !state.known {
+            return None;
+        }
+        let stamp = ManifestStamp::of(&state);
+        if let Some((cached, manifest)) = state.shared_manifest.as_ref() {
+            if *cached == stamp {
+                return Some(Arc::clone(manifest));
+            }
+        }
+        let mut manifest = state.manifest.clone();
+        manifest.tombstones = state.tombstones.clone();
+        manifest.deletion_vectors.retain(|segment, _| {
+            manifest
+                .segments
+                .iter()
+                .any(|entry| &entry.segment_id == segment)
+        });
+        let manifest = Arc::new(manifest);
+        state.shared_manifest = Some((stamp, Arc::clone(&manifest)));
+        Some(manifest)
     }
 
     /// Capture the CAS anchor and candidate under one namespace lock. The

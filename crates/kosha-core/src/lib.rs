@@ -28,6 +28,17 @@ pub trait ControlStore: Send + Sync {
         self.manifest(id).cloned()
     }
 
+    /// The stored manifest's version, without its segment list.
+    ///
+    /// A query replica asks this before every search to learn whether the
+    /// ingest node has published since it last looked, so it has to be
+    /// cheap: the manifest itself carries a footer for every segment and
+    /// runs to megabytes for a few hundred segments. The default reads the
+    /// whole manifest; stores that can do better override it.
+    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
+        self.manifest_cloned(id).map(|manifest| manifest.version)
+    }
+
     /// Persist a manifest for a namespace (upsert, last-write-wins).
     ///
     /// Used by the node to publish the current segment list after flush so

@@ -178,6 +178,9 @@ impl ControlStore for Controller {
     fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut Manifest> {
         self.manifest_mut(id)
     }
+    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
+        self.manifest(id).map(|manifest| manifest.version)
+    }
     fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError> {
         self.save_manifest(id, manifest)
     }

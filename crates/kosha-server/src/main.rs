@@ -1073,11 +1073,18 @@ impl AppState {
             println!("write-path requests will be forwarded to ingest at {h}");
             reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(
+                    // Matches the server's own request I/O timeout
+                    // (`KOSHA_HTTP_IO_TIMEOUT_SECS`). The previous default of 30 s
+                    // was shorter than a busy ingest node can take to answer a
+                    // write that waits for a flush: concurrent bulk writes queue
+                    // behind each other's flushes, and the ones that waited
+                    // longest came back as a 503 "forward to ingest failed"
+                    // although the ingest node then completed them.
                     std::env::var("KOSHA_INGEST_PROXY_TIMEOUT_SECS")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .filter(|n| *n > 0)
-                        .unwrap_or(30),
+                        .unwrap_or(300),
                 ))
                 .build()
                 .expect("failed to build ingest-forwarding HTTP client")
@@ -1687,6 +1694,26 @@ impl AppState {
     /// control store, so the segment list survives restarts.
     fn refresh_query_namespace(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
         if self.ingest_host.is_some() {
+            // Ask for the version first. This runs before every search on a
+            // query replica, and it used to read and parse the namespace's
+            // whole manifest row each time (megabytes for a few hundred
+            // segments) while holding the control-store lock every other
+            // search was waiting on, then clone the local manifest to
+            // compare one integer. The manifest is only fetched when the
+            // stored version is ahead.
+            let stored = self
+                .controller
+                .lock()
+                .unwrap()
+                .manifest_version(ns)
+                .ok_or_else(|| KoshaError::NamespaceNotFound(ns.clone()))?;
+            if self
+                .indexer
+                .manifest_version(ns)
+                .is_some_and(|local| local >= stored)
+            {
+                return Ok(());
+            }
             let mut manifest = self
                 .controller
                 .lock()
@@ -1695,8 +1722,8 @@ impl AppState {
                 .ok_or_else(|| KoshaError::NamespaceNotFound(ns.clone()))?;
             if self
                 .indexer
-                .manifest_cloned(ns)
-                .is_none_or(|local| local.version < manifest.version)
+                .manifest_version(ns)
+                .is_none_or(|local| local < manifest.version)
             {
                 kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
                     let path = vector.path(ns, segment)?;
@@ -4215,15 +4242,12 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         return search_error_response(&e);
     }
 
-    let (manifest, tombstones) = {
-        let indexer = &state.indexer;
-        let m = match indexer.manifest_cloned(&ns) {
-            Some(m) => m,
-            None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
-        };
-        let t = Some(m.tombstones.clone());
-        (m, t)
+    // Shared, not copied: see `Indexer::manifest_shared`.
+    let Some(snapshot) = state.indexer.manifest_shared(&ns) else {
+        return json_error(404, &format!("namespace '{}' not found", ns.0));
     };
+    let manifest: &kosha_core::Manifest = &snapshot;
+    let tombstones = Some(&manifest.tombstones);
 
     // ── Whole-response result cache ─────────────────────────────────────
     // Real query traffic is Zipfian in queries too; identical requests
@@ -4301,10 +4325,10 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             // shards as zero hits (non-deterministically per pod). It is
             // sub-ms when the shards are already local: one metadata stat
             // per term-shard per split segment.
-            state.ensure_query_posting_blobs(&ns, &manifest, &query, &hydration_request)
+            state.ensure_query_posting_blobs(&ns, manifest, &query, &hydration_request)
         } else {
             let outcome =
-                state.hydrate_segments_for_search(&ns, &manifest, &query, &hydration_request);
+                state.hydrate_segments_for_search(&ns, manifest, &query, &hydration_request);
             // Cache what this pass verified: the static scoring set is
             // local for this manifest version, so future warm queries with
             // matching-or-lesser needs skip the per-segment static checks
@@ -4388,9 +4412,9 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
 
     match state.searcher.search_with_doc_store_hydrator(
         &ns,
-        &manifest,
+        manifest,
         &query,
-        tombstones.as_ref(),
+        tombstones,
         doc_store_hydrator,
     ) {
         Ok((result, phases)) => {
@@ -4644,15 +4668,12 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         return search_error_response(&e);
     }
 
-    let (manifest, tombstones) = {
-        let indexer = &state.indexer;
-        let m = match indexer.manifest_cloned(&ns) {
-            Some(m) => m,
-            None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
-        };
-        let t = Some(m.tombstones.clone());
-        (m, t)
+    // Shared, not copied: see `Indexer::manifest_shared`.
+    let Some(snapshot) = state.indexer.manifest_shared(&ns) else {
+        return json_error(404, &format!("namespace '{}' not found", ns.0));
     };
+    let manifest: &kosha_core::Manifest = &snapshot;
+    let tombstones = Some(&manifest.tombstones);
 
     // One accountant for everything this request hydrates — footer prefetch,
     // scoring set, posting blobs, and the page's doc stores all share it, so
@@ -4680,10 +4701,10 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         let outcome = if cached_covers {
             // Posting blobs are per-query and outside the cached verdict —
             // see `handle_search_post` for the full rationale.
-            state.ensure_query_posting_blobs(&ns, &manifest, &query, &hydration_request)
+            state.ensure_query_posting_blobs(&ns, manifest, &query, &hydration_request)
         } else {
             let outcome =
-                state.hydrate_segments_for_search(&ns, &manifest, &query, &hydration_request);
+                state.hydrate_segments_for_search(&ns, manifest, &query, &hydration_request);
             // Only merge when unfiltered — see `HydrationOutcome::bloom_pruned`
             // and `handle_search_post` for the full rationale.
             if outcome.missing.is_empty() && !outcome.bloom_pruned {
@@ -4743,9 +4764,9 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
 
     match state.searcher.search_with_doc_store_hydrator(
         &ns,
-        &manifest,
+        manifest,
         &query,
-        tombstones.as_ref(),
+        tombstones,
         doc_store_hydrator,
     ) {
         Ok((result, phases)) => {
