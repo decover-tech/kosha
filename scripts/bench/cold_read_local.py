@@ -53,6 +53,9 @@ S3_ENV = {
     "KOSHA_S3_SECRET_KEY": "kosha-dev-secret",
     "AWS_DEFAULT_REGION": "us-east-1",
     "DATABASE_URL": "postgresql://kosha:kosha-dev@127.0.0.1:5432/kosha",
+    # This harness sends no API key; the server refuses to start with no keys
+    # unless auth is explicitly disabled.
+    "KOSHA_AUTH": "disabled",
 }
 
 TIMING_RE = re.compile(r"search timing: .*")

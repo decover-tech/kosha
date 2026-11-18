@@ -17,80 +17,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-/// Map of valid API keys → tenant id.
-///
-/// Loaded from, in priority order:
-///   1. Postgres `kosha.api_keys` table (if DATABASE_URL + postgres feature)
-///   2. `KOSHA_API_KEYS` env var (format: `key1=tenant1,key2=tenant2`)
-///   3. `KOSHA_API_KEY` env var (single key, tenant = "default")
-///   4. Empty (dev mode — no auth required)
-static API_KEYS: once_cell::sync::Lazy<HashMap<String, String>> =
-    once_cell::sync::Lazy::new(load_api_keys);
-
-fn load_api_keys() -> HashMap<String, String> {
-    // 1. Postgres-backed keys (staging/production).
-    if let Ok(db_url) = std::env::var("DATABASE_URL") {
-        #[cfg(feature = "postgres")]
-        match kosha_control::PgStore::new(&db_url) {
-            Ok(store) => {
-                let keys = store.list_api_keys(None).unwrap_or_default();
-                if !keys.is_empty() {
-                    let map: HashMap<String, String> = keys
-                        .into_iter()
-                        .map(|(key, tenant, _desc)| (key, tenant))
-                        .collect();
-                    println!("api keys: loaded {} key(s) from postgres", map.len());
-                    return map;
-                }
-                println!("api keys: no keys found in postgres, falling back to env vars");
-            }
-            Err(e) => {
-                eprintln!("api keys: failed to connect to postgres: {e}, falling back to env vars");
-            }
-        }
-        #[cfg(not(feature = "postgres"))]
-        {
-            let _ = db_url;
-            println!("api keys: DATABASE_URL set but postgres feature disabled, using env vars");
-        }
-    }
-
-    // 2. Multi-tenant env var.
-    if let Ok(keys) = std::env::var("KOSHA_API_KEYS") {
-        let map: HashMap<_, _> = keys
-            .split(',')
-            .filter_map(|pair| {
-                pair.split_once('=')
-                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-            })
-            .collect();
-        if !map.is_empty() {
-            println!(
-                "api keys: loaded {} key(s) from KOSHA_API_KEYS env var",
-                map.len()
-            );
-            return map;
-        }
-    }
-
-    // 3. Single-tenant env var.
-    if let Ok(key) = std::env::var("KOSHA_API_KEY") {
-        println!("api keys: single key from KOSHA_API_KEY env var");
-        let mut m = HashMap::new();
-        m.insert(key, "default".to_string());
-        return m;
-    }
-
-    // 4. Dev mode — no auth.
-    println!("api keys: none configured — dev mode (no auth)");
-    HashMap::new()
-}
-
 /// Extract the tenant prefix from a namespace for isolation.
 fn tenant_namespace(tenant: &str, namespace: &str) -> String {
     format!("{tenant}/{namespace}")
 }
 
+mod auth;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 #[cfg(feature = "migrate")]
@@ -2972,6 +2904,10 @@ fn main() {
         }
     }
 
+    // Load keys and fail closed before anything else, so a misconfigured
+    // pod exits instead of serving unauthenticated traffic.
+    auth::init_global();
+
     let role = std::env::var("KOSHA_ROLE").unwrap_or_else(|_| "query".into());
     let port = std::env::var("KOSHA_HTTP_PORT").unwrap_or_else(|_| "8080".into());
     let data_dir = std::env::var("KOSHA_DATA_DIR").unwrap_or_else(|_| "/var/lib/kosha/data".into());
@@ -3070,6 +3006,21 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         }
     }
 
+    // Reject oversized bodies from the declared length, before reading (or
+    // allocating) any of it.
+    let max_body = auth::max_body_bytes();
+    if content_length > max_body {
+        let resp = json_error(
+            413,
+            &format!(
+                "request body of {content_length} bytes exceeds the {max_body}-byte limit \
+                 (KOSHA_MAX_BODY_BYTES)"
+            ),
+        );
+        stream.write_all(resp.as_bytes()).ok();
+        return Ok(());
+    }
+
     let mut body = Vec::new();
     if content_length > 0 {
         reader
@@ -3150,10 +3101,12 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
 /// Extract and validate the API key from request headers.
 /// Returns the tenant id on success, or a 401 response string on failure.
 fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
-    // Dev mode: if no keys configured, allow all requests.
-    if API_KEYS.is_empty() {
-        return Ok("dev".to_string());
-    }
+    let store = match auth::global() {
+        // Only reachable with an explicit `KOSHA_AUTH=disabled`; an empty
+        // key set no longer means "auth off" (see `auth::init_global`).
+        auth::Auth::Disabled => return Ok("dev".to_string()),
+        auth::Auth::Keys(store) => store,
+    };
 
     let api_key: Option<&str> = headers
         .get("authorization")
@@ -3169,11 +3122,12 @@ fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
                     None
                 }
             })
-        });
+        })
+        .map(str::trim);
 
     match api_key {
-        Some(key) => match API_KEYS.get(key) {
-            Some(tenant) => Ok(tenant.clone()),
+        Some(key) => match store.lookup(key) {
+            Some(tenant) => Ok(tenant),
             None => Err(json_error_body(401, "invalid API key")),
         },
         None => Err(json_error_body(
@@ -3336,6 +3290,21 @@ fn route(
                 return json_error(400, "invalid namespace");
             }
         }
+        let bare_path = path.split('?').next().unwrap_or(path);
+        let is_legacy = matches!(
+            bare_path,
+            "/index" | "/exists" | "/replace" | "/search" | "/flush" | "/delete" | "/stats"
+        );
+        if is_legacy {
+            if !auth::legacy_routes_enabled() {
+                return json_error(
+                    410,
+                    "unversioned routes are disabled (KOSHA_LEGACY_ROUTES=off); \
+                     use /v1/namespaces/{ns}/...",
+                );
+            }
+            auth::record_legacy_use(tenant, bare_path);
+        }
         if path == "/stats" || path == "/v1/stats" {
             return if service_authorized(headers, state.admin_auth_key.as_deref()) {
                 handle_stats(state)
@@ -3343,7 +3312,6 @@ fn route(
                 json_error(403, "use namespace-scoped stats")
             };
         }
-        let bare_path = path.split('?').next().unwrap_or(path);
         if method == "POST"
             && [
                 "/index", "/exists", "/replace", "/search", "/flush", "/delete",
@@ -5165,34 +5133,31 @@ fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Try to create via PgStore (only works with postgres feature).
+    // Create via the shared Postgres pool (only with the postgres feature).
     #[cfg(feature = "postgres")]
     {
-        let controller = state.controller.lock().unwrap();
-        // Downcast the Box<dyn ControlStore> to see if it's a PgStore.
-        // We use a simple approach: look for "postgres" in the store type name.
-        // Check if DATABASE_URL is set (indicating PgStore).
-        drop(controller);
-
+        let _ = state;
+        let auth::Auth::Keys(store) = auth::global() else {
+            return json_error(400, "API keys are disabled (KOSHA_AUTH=disabled)");
+        };
         if std::env::var("DATABASE_URL").is_err() {
             return json_error(400, "Postgres not configured (DATABASE_URL not set)");
         }
-
-        // Re-create connection for the admin operation.
-        // This is a simplified approach — in production, share the pool.
-        match std::env::var("DATABASE_URL") {
-            Ok(db_url) => match kosha_control::PgStore::new(&db_url) {
-                Ok(store) => match store.create_api_key(tenant_id, description) {
-                    Ok(api_key) => json_ok(&serde_json::json!({
-                        "api_key": api_key,
-                        "tenant_id": tenant_id,
-                        "description": description,
-                    })),
-                    Err(e) => json_error(500, &format!("failed to create key: {e}")),
-                },
-                Err(e) => json_error(500, &format!("failed to connect to postgres: {e}")),
-            },
-            Err(_) => json_error(400, "Postgres not configured"),
+        let Some(pg) = store.pg() else {
+            return json_error(500, "failed to connect to postgres");
+        };
+        match pg.create_api_key(tenant_id, description) {
+            Ok(api_key) => {
+                // Usable on this pod right away; other pods pick it up on
+                // their next key refresh.
+                store.insert_db_key(api_key.clone(), tenant_id.to_string());
+                json_ok(&serde_json::json!({
+                    "api_key": api_key,
+                    "tenant_id": tenant_id,
+                    "description": description,
+                }))
+            }
+            Err(e) => json_error(500, &format!("failed to create key: {e}")),
         }
     }
 
@@ -5427,9 +5392,13 @@ fn search_error_response(e: &KoshaError) -> String {
 fn json_error(status_code: u16, message: &str) -> String {
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
-        403 => "403 Forbidden",
         400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        403 => "403 Forbidden",
         404 => "404 Not Found",
+        409 => "409 Conflict",
+        410 => "410 Gone",
+        413 => "413 Payload Too Large",
         429 => "429 Too Many Requests",
         500 => "500 Internal Server Error",
         503 => "503 Service Unavailable",

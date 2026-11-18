@@ -109,6 +109,20 @@ Phase 1 persistence knobs (also used by stage/prod Deployments):
 | `KOSHA_S3_ACCESS_KEY` / `KOSHA_S3_SECRET_KEY` | Or standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` |
 | `KOSHA_DATA_DIR` | Local SSD/cache root (never authoritative when S3 is on) |
 
+Auth knobs (see `crates/kosha-server/src/auth.rs` and the README's tenant
+isolation section):
+
+| Env | Purpose |
+|-----|---------|
+| `KOSHA_API_KEY` | Tenant key for tenant `default` |
+| `KOSHA_API_KEYS` | Tenant keys, `key1=tenant1,key2=tenant2` |
+| `KOSHA_ADMIN_API_KEY` | Admin credential for `/v1/admin/*` and global `/stats` |
+| `KOSHA_INTERNAL_API_KEY` | Peer credential for `/internal/*` segment hydration |
+| `KOSHA_AUTH=disabled` | Run with auth off (every request is tenant `dev`). Without it, a server with no credential configured (env or Postgres `kosha.api_keys`) refuses to start |
+| `KOSHA_API_KEY_REFRESH_SECS` | How often Postgres keys are re-read (default 30), so created keys work and deleted keys stop working without a restart |
+| `KOSHA_MAX_BODY_BYTES` | Request body cap, larger bodies get 413 (default 64 MiB) |
+| `KOSHA_LEGACY_ROUTES=off` | Unversioned `/index`, `/search`, ... routes answer 410. Usage per tenant is logged (`legacy route usage:`) to track the cutover |
+
 On startup the server logs which control plane and S3 backend it bound, and
 how many manifests it restored. `/stats` exposes `control_plane`,
 `cache_root`, `cache_size_bytes`, and `s3_enabled`.

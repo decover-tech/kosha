@@ -105,6 +105,11 @@ existing data automatically.
 - Both service capabilities are disabled when their respective secret is unset.
   Ordinary API-key configuration remains `KOSHA_API_KEY` / `KOSHA_API_KEYS` or
   the Postgres key registry. Namespace-scoped stats remain available to tenants.
+- The server refuses to start when no credential is configured at all, unless
+  `KOSHA_AUTH=disabled` is set explicitly (local development only). Postgres keys
+  are re-read every `KOSHA_API_KEY_REFRESH_SECS` (default 30), request bodies are
+  capped at `KOSHA_MAX_BODY_BYTES` (default 64 MiB, 413 above it), and
+  `KOSHA_LEGACY_ROUTES=off` turns the unversioned routes into 410s.
 
 A successful flush uploads its segment snapshot before publishing its manifest.
 Upload and manifest-store failures return errors and remain retryable. Buffered
