@@ -940,6 +940,12 @@ pub struct Manifest {
     /// back to `footer.json` when an entry is missing.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub segment_footers: HashMap<SegmentId, Footer>,
+    /// WAL records through this sequence are represented by this manifest.
+    #[serde(default)]
+    pub wal_checkpoint: u64,
+    /// Durable deletions, shared by ingest and query replicas.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tombstones: HashMap<SegmentId, std::collections::HashSet<u32>>,
 }
 
 impl Manifest {
