@@ -699,7 +699,7 @@ class KoshaClient:
 
     # Aggregation types Kosha computes. A sub-aggregation is refused rather
     # than ignored: the caller would read buckets that are not there.
-    _AGG_TYPES = ("terms", "cardinality", "composite", "max", "min")
+    _AGG_TYPES = ("terms", "cardinality", "composite")
 
     @classmethod
     def _extract_aggs(cls, body: dict | None) -> dict | None:

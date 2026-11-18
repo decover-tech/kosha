@@ -3910,21 +3910,36 @@ fn aggregate_matches(
         .iter()
         .map(|(_, field)| {
             let mut result: HashMap<u32, HashSet<String>> = HashMap::new();
-            if let Some(entries) = store.string_fields.get(field) {
+            // `<field>.keyword` names the same stored column (see
+            // `kosha_core::base_field_name`), and a list value stored as
+            // JSON text counts once under each of its elements, as a
+            // multi-valued field does in OpenSearch.
+            if let Some(entries) = kosha_core::lookup_field(&store.string_fields, field) {
                 for (doc, value) in entries {
-                    if wanted.contains(doc) {
-                        result.entry(*doc).or_default().insert(value.clone());
+                    if !wanted.contains(doc) {
+                        continue;
+                    }
+                    let values = result.entry(*doc).or_default();
+                    match value
+                        .starts_with('[')
+                        .then(|| kosha_core::list_elements(value))
+                        .flatten()
+                    {
+                        Some(elements) => values.extend(elements),
+                        None => {
+                            values.insert(value.clone());
+                        }
                     }
                 }
             }
-            if let Some(entries) = store.integer_fields.get(field) {
+            if let Some(entries) = kosha_core::lookup_field(&store.integer_fields, field) {
                 for (doc, value) in entries {
                     if wanted.contains(doc) {
                         result.entry(*doc).or_default().insert(value.to_string());
                     }
                 }
             }
-            if let Some(entries) = store.float_fields.get(field) {
+            if let Some(entries) = kosha_core::lookup_field(&store.float_fields, field) {
                 for (doc, value) in entries {
                     if wanted.contains(doc) {
                         result.entry(*doc).or_default().insert(value.to_string());

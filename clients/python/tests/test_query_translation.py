@@ -363,7 +363,6 @@ def test_aggregations_pass_through_and_sub_aggregations_are_refused():
     aggs = {
         "per_document": {"terms": {"field": "documentId", "size": 1000}},
         "total_documents": {"cardinality": {"field": "documentId", "precision_threshold": 40000}},
-        "last_page": {"max": {"field": "pageNumber"}},
     }
     assert translate({"size": 0, "aggs": aggs})["aggs"] == aggs
     message = refused(
@@ -378,6 +377,7 @@ def test_aggregations_pass_through_and_sub_aggregations_are_refused():
     )
     assert "sub-aggregations" in message
     assert "top_hits" in refused({"aggs": {"one": {"top_hits": {"size": 1}}}})
+    assert "max" in refused({"aggs": {"last_page": {"max": {"field": "pageNumber"}}}})
 
 
 def test_response_reports_relation_sort_values_collapse_fields_and_highlight():
