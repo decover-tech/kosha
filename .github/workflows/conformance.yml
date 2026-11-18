@@ -28,6 +28,7 @@ jobs:
         run: |
           python3 scripts/conformance/run.py \
             --host http://localhost:8080 --api-key sk-kosha-dev \
+            --admin-key sk-kosha-admin-dev \
             --restart-cmd scripts/conformance/compose_restart_cold.sh \
             --out conformance-report.json
 

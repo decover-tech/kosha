@@ -68,16 +68,20 @@ SCORE_REL_TOL = 1e-6
 
 
 class Kosha:
-    def __init__(self, host: str, api_key: str, namespace: str):
+    def __init__(self, host: str, api_key: str, namespace: str, admin_key: str, tenant: str):
         self.host = host.rstrip("/")
         self.api_key = api_key
         self.ns = namespace
+        # Admin routes need the dedicated admin credential and address the
+        # namespace by its stored, tenant-qualified name.
+        self.admin_key = admin_key
+        self.tenant = tenant
 
-    def call(self, method: str, path: str, body: Optional[Dict] = None, timeout: float = 120):
+    def call(self, method: str, path: str, body: Optional[Dict] = None, timeout: float = 120, key: Optional[str] = None):
         data = json.dumps(body).encode() if body is not None else None
         for attempt in range(6):
             req = urllib.request.Request(self.host + path, data=data, method=method)
-            req.add_header("Authorization", "Bearer " + self.api_key)
+            req.add_header("Authorization", "Bearer " + (key or self.api_key))
             req.add_header("Content-Type", "application/json")
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -96,8 +100,8 @@ class Kosha:
     def ns_path(self, suffix: str) -> str:
         return "/v1/namespaces/%s/%s" % (self.ns, suffix)
 
-    def must(self, method: str, path: str, body: Optional[Dict] = None):
-        status, out = self.call(method, path, body)
+    def must(self, method: str, path: str, body: Optional[Dict] = None, key: Optional[str] = None):
+        status, out = self.call(method, path, body, key=key)
         if status != 200:
             raise RuntimeError("%s %s -> %s %s" % (method, path, status, out))
         return out
@@ -113,7 +117,12 @@ class Kosha:
         return self.must("POST", self.ns_path("delete"), {"filter": flt}).get("deleted")
 
     def compact(self) -> Dict:
-        return self.must("POST", "/v1/admin/compact-namespace", {"namespace": self.ns})
+        return self.must(
+            "POST",
+            "/v1/admin/compact-namespace",
+            {"namespace": "%s/%s" % (self.tenant, self.ns)},
+            key=self.admin_key,
+        )
 
     def stats(self):
         return self.call("GET", self.ns_path("stats"))
@@ -144,11 +153,12 @@ class Kosha:
 class Spawned:
     """A kosha-server child process with a throwaway data dir."""
 
-    def __init__(self, binary: str, port: int, api_key: str, database_url: Optional[str]):
+    def __init__(self, binary: str, port: int, api_key: str, admin_key: str, database_url: Optional[str]):
         self.binary = os.path.abspath(binary)
         self.database_url = database_url
         self.port = port
         self.api_key = api_key
+        self.admin_key = admin_key
         self.dir = tempfile.mkdtemp(prefix="kosha-conformance-")
         self.proc: Optional[subprocess.Popen] = None
 
@@ -157,6 +167,7 @@ class Spawned:
         env.update(
             {
                 "KOSHA_API_KEY": self.api_key,
+                "KOSHA_ADMIN_API_KEY": self.admin_key,
                 "KOSHA_HTTP_PORT": str(self.port),
                 "KOSHA_DATA_DIR": os.path.join(self.dir, "data"),
                 "KOSHA_FLUSH_THRESHOLD": "1000000",
@@ -410,12 +421,13 @@ def run(args, kosha: Kosha, restart) -> Results:
         got = kosha.delete(flt)
         want = oracle.delete(flt)
         res.record("deletes:delete-count:%s" % json.dumps(flt, sort_keys=True), got == want, "" if got == want else "deleted %s, want %d" % (got, want))
-    # Delete-by-query only sees flushed docs: a buffered match must survive.
+    # Delete-by-query flushes first, so buffered matches are deleted too and
+    # can't reappear after the next flush (#238).
     docs = corpus.batch(seed, mid, n - mid)
     both(lambda: kosha.index(docs), lambda: oracle.index(docs))
     flt = {"term": {"tags": "sealed"}}
     got, want = kosha.delete(flt), oracle.delete(flt)
-    res.record("deletes:delete-count:buffered-untouched", got == want, "" if got == want else "deleted %s, want %d" % (got, want))
+    res.record("deletes:delete-count:buffered-included", got == want, "" if got == want else "deleted %s, want %d" % (got, want))
     both(kosha.flush, oracle.flush)
     # Re-index a few deleted ids: they must come back with the new content.
     dead = sorted(set(scratch.live_docs()) - set(oracle.live_docs()))[:10]
@@ -479,6 +491,16 @@ def main() -> int:
     target.add_argument("--spawn", metavar="BINARY", help="start this kosha-server binary with a throwaway data dir")
     target.add_argument("--host", help="URL of an already-running server")
     p.add_argument("--api-key", default=os.environ.get("KOSHA_API_KEY", "sk-conformance"))
+    p.add_argument(
+        "--admin-key",
+        default=os.environ.get("KOSHA_ADMIN_API_KEY", "sk-conformance-admin"),
+        help="KOSHA_ADMIN_API_KEY of the server (compaction is an admin route)",
+    )
+    p.add_argument(
+        "--tenant",
+        default="default",
+        help="tenant that --api-key belongs to; namespaces are stored as <tenant>/<ns>",
+    )
     p.add_argument("--port", type=int, default=18080, help="port for --spawn")
     p.add_argument(
         "--database-url",
@@ -499,12 +521,12 @@ def main() -> int:
     ns = args.namespace or "conformance-%d-%d" % (args.seed, int(time.time()))
     spawned = None
     if args.spawn:
-        spawned = Spawned(args.spawn, args.port, args.api_key, args.database_url)
+        spawned = Spawned(args.spawn, args.port, args.api_key, args.admin_key, args.database_url)
         spawned.start()
-        kosha = Kosha("http://127.0.0.1:%d" % args.port, args.api_key, ns)
+        kosha = Kosha("http://127.0.0.1:%d" % args.port, args.api_key, ns, args.admin_key, args.tenant)
         restart = spawned.restart if args.database_url else None
     else:
-        kosha = Kosha(args.host, args.api_key, ns)
+        kosha = Kosha(args.host, args.api_key, ns, args.admin_key, args.tenant)
         restart = (lambda: subprocess.run(args.restart_cmd, shell=True, check=True)) if args.restart_cmd else None
     try:
         kosha.wait_healthy()
