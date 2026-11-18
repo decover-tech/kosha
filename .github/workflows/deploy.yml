@@ -26,13 +26,87 @@ on:
           - staging
         default: staging
       image_tag:
-        description: "Image tag to deploy (blank = main for staging, latest for production). Use this to redeploy a specific version."
+        description: "Image tag to deploy (blank = main for staging, latest for production). Use this to redeploy a specific version. Ignored when build_from_ref is on."
         required: false
         type: string
+      build_from_ref:
+        description: "Staging only: build an image from the branch this run was started on, push it to the staging ECR, and deploy that image. Without this, the branch's manifests are applied with an image that already exists, so the branch's code is NOT what runs."
+        required: false
+        type: boolean
+        default: false
 
 jobs:
+  # Build an image from the ref this run was dispatched on and push it to the
+  # staging ECR under its own tag. `release.yml` only builds on pushes to
+  # main and on v* tags, so until this job existed a branch's code could not
+  # reach staging without merging it: "Deploy to EKS" from a branch applied
+  # that branch's manifests with main's image.
+  #
+  # Staging only. Production images still come only from main and v* tags
+  # (release.yml). `:main` is never written here, so a branch build cannot
+  # replace what staging tracks by default.
+  #
+  # Who can run this: workflow_dispatch requires write access to the
+  # repository. A pull request from a fork cannot trigger it and does not
+  # receive these secrets.
+  build:
+    name: Build image from ${{ github.ref_name }}
+    if: inputs.build_from_ref && inputs.environment == 'staging'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Same environment as the deploy job, so the AWS role sees the same OIDC
+    # subject it already accepts for deploys from a branch.
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write # AWS OIDC
+    outputs:
+      image_tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          # branch-<name with unsafe characters replaced>-<short sha>, e.g.
+          # branch-perf-latency-instrumentation-9e07621. Docker tags allow
+          # [A-Za-z0-9_.-] and at most 128 characters.
+          slug="$(printf '%s' "${GITHUB_REF_NAME}" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-100)"
+          echo "value=branch-${slug}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Only to read the public `:main` image's build cache without hitting
+      # anonymous pull limits. Nothing is pushed to Docker Hub from here.
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push (ECR)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          provenance: false
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/decover/kosha:${{ steps.tag.outputs.value }}
+          cache-from: type=registry,ref=ravidecoverai/kosha:main
+
   deploy:
     name: Deploy to EKS (${{ inputs.environment }})
+    needs: build
+    # Run when the build succeeded, and also when it was not asked for.
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: nonprod-runner-kosha
     environment: ${{ inputs.environment }}
     permissions:
@@ -43,7 +117,7 @@ jobs:
       - uses: ./.github/actions/deploy-eks
         with:
           environment: ${{ inputs.environment }}
-          image_tag: ${{ inputs.image_tag }}
+          image_tag: ${{ needs.build.outputs.image_tag || inputs.image_tag }}
           aws_role_arn: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
           database_url: ${{ secrets.KOSHA_DATABASE_URL }}
           kosha_api_key: ${{ secrets.KOSHA_API_KEY }}
