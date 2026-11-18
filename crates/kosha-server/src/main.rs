@@ -97,6 +97,8 @@ mod hydration_budget;
 mod migrate;
 #[cfg(feature = "s3")]
 mod s3_storage;
+#[cfg(feature = "s3")]
+mod segment_commit;
 
 #[cfg(feature = "s3")]
 use hydration_budget::{HydrationBudget, RequestHydration};
@@ -176,6 +178,20 @@ struct AppState {
     /// immutable, so once durable, always durable).
     #[cfg(feature = "s3")]
     synced_segments: Mutex<std::collections::HashSet<(NamespaceId, kosha_core::SegmentId)>>,
+    /// The last manifest this process published to (or restored from) the
+    /// control store, per namespace: its version, which is the
+    /// `expected_version` of the next compare-and-swap, and its segment set,
+    /// which is the base for rebasing after a lost CAS. See
+    /// `publish_namespace` (#230).
+    published: Mutex<HashMap<NamespaceId, PublishedBase>>,
+    /// Serializes `publish_namespace` per namespace. Concurrent publishes
+    /// of one namespace would otherwise race on `published` and CAS against
+    /// each other inside a single process.
+    publish_locks: Mutex<HashMap<NamespaceId, Arc<Mutex<()>>>>,
+    /// Hydrated segment files that failed their `_COMMIT` size/CRC check
+    /// (#231), counting refetch failures again. Reported in `/stats`.
+    #[cfg(feature = "s3")]
+    segment_checksum_failures: std::sync::atomic::AtomicU64,
     /// Segments currently being hydrated from S3, keyed by local segment
     /// path. Guards against every concurrent request against a cold
     /// namespace independently re-fetching the same segments — see
@@ -771,48 +787,65 @@ fn segments_needing_sync<'a>(
         .collect()
 }
 
-/// Upload every file in `seg_dir` to S3. Returns `true` only if every file
-/// uploaded successfully — a partial upload must not be treated as durable.
+/// Upload a segment directory to S3 and commit it: every data file first,
+/// in a fixed (sorted) order, then the `_COMMIT` marker last, listing each
+/// file's size and CRC32 (#231). Only a segment whose `_COMMIT` landed
+/// counts as durable (`S3Storage::segment_durability`), so a crash or a
+/// failed PUT partway through leaves a prefix that reconciliation will
+/// re-upload instead of trusting.
+///
+/// Refuses to commit a directory that is missing any required segment file
+/// locally: committing it would publish a segment that can never be opened.
 ///
 /// Free function (not an `AppState` method) so both `AppState::sync_to_s3`
-/// and the boot-time reconciliation sweep in `AppState::new` — which runs
-/// before `self` exists — can share it.
+/// and the boot-time reconciliation sweep in `AppState::new`, which runs
+/// before `self` exists, can share it.
 #[cfg(feature = "s3")]
-fn sync_segment_dir_to_s3(s3: &s3_storage::S3Storage, data_dir: &Path, seg_dir: &Path) -> bool {
-    if !seg_dir.exists() {
-        return false;
+fn sync_segment_dir_to_s3(
+    s3: &s3_storage::S3Storage,
+    data_dir: &Path,
+    seg_dir: &Path,
+) -> Result<(), String> {
+    let rel = seg_dir
+        .strip_prefix(data_dir)
+        .unwrap_or(seg_dir)
+        .to_string_lossy()
+        .into_owned();
+    if !seg_dir.is_dir() {
+        return Err(format!("segment {rel} not on local disk"));
     }
-    let Ok(entries) = std::fs::read_dir(seg_dir) else {
-        return false;
-    };
-    let mut all_ok = true;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let rel = seg_dir
-            .strip_prefix(data_dir)
-            .unwrap_or(seg_dir)
-            .to_string_lossy();
-        let s3_path = format!("{rel}/{name}");
-        match std::fs::read(&path) {
-            Ok(data) => {
-                if let Err(e) = s3.write(&s3_path, &data) {
-                    eprintln!("WARN: S3 upload failed for {s3_path}: {e}");
-                    all_ok = false;
-                }
-            }
-            Err(e) => {
-                eprintln!("WARN: failed to read {s3_path} for upload: {e}");
-                all_ok = false;
-            }
+    for req in segment_commit::REQUIRED_SEGMENT_FILES {
+        if !file_present_nonempty(&seg_dir.join(req)) {
+            return Err(format!(
+                "segment {rel} is missing required file {req} locally"
+            ));
         }
     }
-    all_ok
+    s3.sync_segment_dir(Path::new(&rel))
+        .map_err(|e| format!("S3 upload of segment {rel} failed: {e}"))
+}
+
+/// What this process last published for a namespace: see
+/// `AppState::published`. The default (version 0, no segments) is a
+/// namespace that has never been published, which is also what the control
+/// store's compare-and-swap treats an absent manifest as.
+#[derive(Debug, Clone, Default)]
+struct PublishedBase {
+    version: u64,
+    segment_ids: std::collections::HashSet<kosha_core::SegmentId>,
+}
+
+impl PublishedBase {
+    fn of(manifest: &kosha_core::Manifest) -> Self {
+        Self {
+            version: manifest.version,
+            segment_ids: manifest
+                .segments
+                .iter()
+                .map(|e| e.segment_id.clone())
+                .collect(),
+        }
+    }
 }
 
 impl AppState {
@@ -1056,10 +1089,12 @@ impl AppState {
         let mut synced_segments = std::collections::HashSet::new();
         let mut restored = 0usize;
         let mut restored_segments = 0usize;
+        let mut published: HashMap<NamespaceId, PublishedBase> = HashMap::new();
         #[cfg(feature = "s3")]
         let mut reconciled_missing = 0usize;
         for ns in control_store.list_namespaces() {
             if let Some(manifest) = control_store.manifest_cloned(&ns) {
+                published.insert(ns.clone(), PublishedBase::of(&manifest));
                 if !manifest.segments.is_empty() {
                     restored_segments += manifest.segments.len();
 
@@ -1077,22 +1112,29 @@ impl AppState {
                         if let Some(ref s3) = s3_storage {
                             for entry in &manifest.segments {
                                 let rel = format!("{}/{}", ns.0, entry.segment_id.0);
-                                if s3.segment_durable_in_s3(&rel) {
+                                let durability = s3.segment_durability(&rel);
+                                if durability.is_durable() {
                                     synced_segments.insert((ns.clone(), entry.segment_id.clone()));
                                     continue;
                                 }
                                 let seg_path = data_dir.join(&ns.0).join(&entry.segment_id.0);
-                                if sync_segment_dir_to_s3(s3, &data_dir, &seg_path) {
-                                    synced_segments.insert((ns.clone(), entry.segment_id.clone()));
-                                    reconciled_missing += 1;
-                                    println!(
-                                        "reconciliation: uploaded segment missing from S3: {rel}"
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "WARN: reconciliation found segment {rel} durable in \
-                                         neither S3 nor local disk — data loss, cannot recover"
-                                    );
+                                match sync_segment_dir_to_s3(s3, &data_dir, &seg_path) {
+                                    Ok(()) => {
+                                        synced_segments
+                                            .insert((ns.clone(), entry.segment_id.clone()));
+                                        reconciled_missing += 1;
+                                        println!(
+                                            "reconciliation: re-uploaded segment not durable in \
+                                             S3 ({durability:?}): {rel}"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "WARN: reconciliation found segment {rel} not durable \
+                                             in S3 ({durability:?}) and could not re-upload it \
+                                             ({e}) — data loss unless another copy exists"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1281,6 +1323,10 @@ impl AppState {
                 .unwrap_or(64),
             #[cfg(feature = "s3")]
             synced_segments: Mutex::new(synced_segments),
+            published: Mutex::new(published),
+            publish_locks: Mutex::new(HashMap::new()),
+            #[cfg(feature = "s3")]
+            segment_checksum_failures: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "s3")]
             in_flight_segments: Mutex::new(HashMap::new()),
             // Each hydration operation can itself fan out up to
@@ -1681,107 +1727,210 @@ impl AppState {
         );
     }
 
-    /// Persist the indexer's current manifest for a namespace into the
-    /// control store, so the segment list survives restarts.
-    fn persist_manifest(&self, ns: &NamespaceId) {
-        let manifest = self.indexer.manifest_cloned(ns);
-        if let Some(manifest) = manifest {
-            let mut ctrl = self.controller.lock().unwrap();
-            match ctrl.save_manifest(ns, &manifest) {
+    /// Unconditionally overwrite the control store's manifest with the
+    /// indexer's current one (last-write-wins). Only for the admin
+    /// import-namespace endpoint, whose whole purpose is to replace a
+    /// manifest wholesale from what S3 holds. Every write path goes through
+    /// the compare-and-swap in `publish_namespace` instead.
+    fn force_save_manifest(&self, ns: &NamespaceId) -> Result<(), String> {
+        let Some(manifest) = self.indexer.manifest_cloned(ns) else {
+            return Ok(());
+        };
+        let lock = self.publish_lock(ns);
+        let _guard = lock.lock().unwrap();
+        self.controller
+            .lock()
+            .unwrap()
+            .save_manifest(ns, &manifest)
+            .map_err(|e| format!("failed to save manifest for '{}': {e}", ns.0))?;
+        self.published
+            .lock()
+            .unwrap()
+            .insert(ns.clone(), PublishedBase::of(&manifest));
+        Ok(())
+    }
+
+    fn publish_lock(&self, ns: &NamespaceId) -> Arc<Mutex<()>> {
+        self.publish_locks
+            .lock()
+            .unwrap()
+            .entry(ns.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Make the indexer's current manifest for `ns` durable and visible
+    /// (#230):
+    ///
+    /// 1. Upload and commit (`_COMMIT`, #231) every segment it references
+    ///    that this process hasn't already committed to S3. Any failure
+    ///    aborts before the control store is touched, so a manifest never
+    ///    points at a segment that S3 lacks.
+    /// 2. Compare-and-swap it into the control store, expecting the version
+    ///    this process last published. If another writer published in
+    ///    between, fold its changes in (`Indexer::rebase_manifest`) and
+    ///    retry, a bounded number of times.
+    ///
+    /// Errors are returned, not logged and swallowed: callers fail the HTTP
+    /// request (5xx), so a client never gets a success for a flush that
+    /// isn't durable. The segments stay on local disk, and the next publish
+    /// of the namespace (a retry, or any later write) picks them up.
+    fn publish_namespace(&self, ns: &NamespaceId) -> Result<(), String> {
+        const MAX_ATTEMPTS: usize = 5;
+        let lock = self.publish_lock(ns);
+        let _guard = lock.lock().unwrap();
+        for attempt in 1..=MAX_ATTEMPTS {
+            let Some(local) = self.indexer.manifest_cloned(ns) else {
+                return Ok(());
+            };
+            let base = self
+                .published
+                .lock()
+                .unwrap()
+                .get(ns)
+                .cloned()
+                .unwrap_or_default();
+            if local.version == base.version {
+                // Already published (e.g. by a concurrent caller whose
+                // publish covered this caller's flush too).
+                return Ok(());
+            }
+
+            #[cfg(feature = "s3")]
+            self.sync_unsynced_segments_to_s3(ns, &local)?;
+
+            let cas = self.controller.lock().unwrap().compare_and_swap_manifest(
+                ns,
+                base.version,
+                local.clone(),
+            );
+            match cas {
                 Ok(()) => {
                     println!(
-                        "control plane: saved manifest ns={} version={} segments={} backend={}",
+                        "control plane: published manifest ns={} version={} (was {}) \
+                         segments={} backend={}",
                         ns.0,
-                        manifest.version,
-                        manifest.segments.len(),
+                        local.version,
+                        base.version,
+                        local.segments.len(),
                         self.control_plane_kind
                     );
+                    self.published
+                        .lock()
+                        .unwrap()
+                        .insert(ns.clone(), PublishedBase::of(&local));
+                    return Ok(());
+                }
+                Err(KoshaError::ManifestConflict(msg)) => {
+                    // Another writer published since our base. Reload what
+                    // it published and rebase onto it. A missing manifest
+                    // here can only be a failed read (a conflict means a
+                    // row exists), and rebasing onto "nothing" would drop
+                    // every segment in our base, so stop instead.
+                    let remote = self.controller.lock().unwrap().manifest_cloned(ns);
+                    let Some(remote) = remote else {
+                        return Err(format!(
+                            "manifest CAS conflict for '{}' ({msg}) and the stored manifest \
+                             could not be re-read",
+                            ns.0
+                        ));
+                    };
+                    eprintln!(
+                        "WARN: manifest CAS conflict ns={} attempt={attempt}/{MAX_ATTEMPTS}: \
+                         {msg}; rebasing local version {} onto stored version {}",
+                        ns.0, local.version, remote.version
+                    );
+                    self.indexer.rebase_manifest(ns, &base.segment_ids, &remote);
+                    self.published
+                        .lock()
+                        .unwrap()
+                        .insert(ns.clone(), PublishedBase::of(&remote));
                 }
                 Err(e) => {
-                    eprintln!("WARN: failed to persist manifest for '{}': {e}", ns.0);
+                    return Err(format!("failed to publish manifest for '{}': {e}", ns.0));
                 }
             }
         }
+        Err(format!(
+            "failed to publish manifest for '{}': still conflicting after {MAX_ATTEMPTS} attempts",
+            ns.0
+        ))
     }
 
-    /// After a flush: persist the manifest and upload any not-yet-synced
-    /// segment(s) to S3.
-    fn publish_namespace(&self, ns: &NamespaceId) {
-        self.persist_manifest(ns);
-        #[cfg(feature = "s3")]
-        self.sync_unsynced_segments_to_s3(ns);
-    }
-
-    /// Upload every segment in `ns`'s current manifest that this process
-    /// hasn't already durably synced to S3.
+    /// Upload and commit every segment in `manifest` that this process
+    /// hasn't already committed to S3. Returns an error naming every
+    /// segment that failed. The caller must not publish `manifest` then.
     ///
-    /// Used to upload only `manifest.segments.last()` — correct for one
-    /// flush at a time, but not under concurrent flushes: the bulk loader's
-    /// N-way concurrent batches can each trigger an auto-flush, and two
-    /// `publish_namespace` calls racing each other can both read the
-    /// manifest *after* both flushes appended, so both see the same
-    /// segment as "last" — whichever segment got superseded as "last" by a
-    /// later append before its own publish call ran was never uploaded by
-    /// anyone. This is what caused 174 of 376 segments in a real benchmark
-    /// run to exist only on the ingest node's local disk: an ingest node
-    /// loss would have been a permanent, silent loss of that data.
-    ///
-    /// Tracking exactly which segments this process has already uploaded
-    /// (`synced_segments`) and re-scanning the whole current manifest on
-    /// every publish call closes the race: whichever call runs — first,
-    /// last, concurrently with others — picks up everything still
-    /// outstanding, and steady-state (one flush at a time) still only
-    /// re-examines one new segment per call, same cost as before.
+    /// Scans the whole manifest, not just the newest segment. Under
+    /// concurrent flushes (the bulk loader's N-way batches each
+    /// auto-flushing), uploading only `segments.last()` let a segment that
+    /// was superseded as "last" before its own publish call ran go
+    /// unuploaded. That once left 174 of 376 segments of a benchmark run
+    /// only on the ingest node's local disk. Tracking exactly which segments
+    /// are committed (`synced_segments`) closes that race, and
+    /// steady-state still only examines one new segment per call.
     #[cfg(feature = "s3")]
-    fn sync_unsynced_segments_to_s3(&self, ns: &NamespaceId) {
-        let Some(manifest) = self.indexer.manifest_cloned(ns) else {
-            return;
+    fn sync_unsynced_segments_to_s3(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> Result<(), String> {
+        let Some(ref s3) = self.s3_storage else {
+            return Ok(());
         };
         let pending: Vec<kosha_core::SegmentId> = {
             let synced = self.synced_segments.lock().unwrap();
-            segments_needing_sync(&manifest, &synced, ns)
+            segments_needing_sync(manifest, &synced, ns)
                 .into_iter()
                 .map(|e| e.segment_id.clone())
                 .collect()
         };
+        let mut failures = Vec::new();
         for segment_id in pending {
             let seg_path = self.data_dir.join(&ns.0).join(&segment_id.0);
-            // Only mark synced on full success — a partial failure (some
-            // files uploaded, some didn't) must be retried by a future
-            // publish call, never treated as durable.
-            if self.sync_to_s3(&seg_path) {
-                self.synced_segments
-                    .lock()
-                    .unwrap()
-                    .insert((ns.clone(), segment_id));
+            match sync_segment_dir_to_s3(s3, &self.data_dir, &seg_path) {
+                Ok(()) => {
+                    self.synced_segments
+                        .lock()
+                        .unwrap()
+                        .insert((ns.clone(), segment_id));
+                }
+                Err(e) => {
+                    // A segment this process didn't write (another
+                    // writer's, folded in by a rebase) isn't on local disk.
+                    // That writer committed it before publishing, so
+                    // accept it if S3 says it's durable.
+                    if !seg_path.is_dir()
+                        && s3
+                            .segment_durability(&format!("{}/{}", ns.0, segment_id.0))
+                            .is_durable()
+                    {
+                        self.synced_segments
+                            .lock()
+                            .unwrap()
+                            .insert((ns.clone(), segment_id));
+                        continue;
+                    }
+                    eprintln!("WARN: segment upload failed: {e}");
+                    failures.push(e);
+                }
             }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} segment(s) of '{}' not durable in S3: {}",
+                failures.len(),
+                ns.0,
+                failures.join("; ")
+            ))
         }
     }
 
-    /// Sync a segment directory to S3. Returns `true` only if every file in
-    /// the directory uploaded successfully — callers use this to decide
-    /// whether the segment is now durable (see `sync_unsynced_segments_to_s3`
-    /// and the boot-time reconciliation sweep in `AppState::new`); a partial
-    /// upload must not be recorded as done.
+    /// See [`segment_commit::REQUIRED_SEGMENT_FILES`].
     #[cfg(feature = "s3")]
-    fn sync_to_s3(&self, seg_dir: &Path) -> bool {
-        let Some(ref s3) = self.s3_storage else {
-            return false;
-        };
-        sync_segment_dir_to_s3(s3, &self.data_dir, seg_dir)
-    }
-
-    /// The files that must all be present for a segment to be usable by the
-    /// searcher. `vector.idx` is intentionally excluded — Phase 1 lexical
-    /// queries never load it (see `kosha_query`'s lazy vector loading), so
-    /// its absence must not count as an incomplete segment.
-    #[cfg(feature = "s3")]
-    const REQUIRED_SEGMENT_FILES: [&'static str; 4] = [
-        "footer.json",
-        "doc_store.bin",
-        "inverted.idx",
-        "filters.bin",
-    ];
+    const REQUIRED_SEGMENT_FILES: [&'static str; 4] = segment_commit::REQUIRED_SEGMENT_FILES;
 
     #[cfg(feature = "s3")]
     fn segment_is_complete(seg_path: &Path) -> bool {
@@ -1900,7 +2049,44 @@ impl AppState {
                 // replicas when the lease store is configured. Full-segment
                 // fetches keep the conservative fan-out — batches here can
                 // include multi-hundred-MB doc stores.
+                // Files already on disk before this call were verified (or
+                // trusted) when they first landed; only check what this call
+                // actually fetches, so a warm segment isn't re-read in full.
+                let fetched: Vec<(String, u64)> = logical_paths
+                    .iter()
+                    .filter(|(p, _)| !file_present_nonempty(&self.data_dir.join(p)))
+                    .cloned()
+                    .collect();
                 self.hydrate_files(s3, &logical_paths, self.hydrate_concurrency, &request);
+
+                // Check freshly fetched files against the segment's `_COMMIT`
+                // (#231). A mismatch is deleted and refetched once. If it
+                // still mismatches, it is deleted again, so the segment
+                // reports as incomplete (`outcome.missing`) and the caller
+                // fails the request instead of serving corrupt bytes.
+                let bad = verify_fetched_against_commit(&self.data_dir, &fetched);
+                if !bad.is_empty() {
+                    self.segment_checksum_failures
+                        .fetch_add(bad.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let retry: Vec<(String, u64)> = fetched
+                        .iter()
+                        .filter(|(p, _)| bad.contains(p))
+                        .cloned()
+                        .collect();
+                    self.hydrate_files(s3, &retry, self.hydrate_concurrency, &request);
+                    let still_bad = verify_fetched_against_commit(&self.data_dir, &retry);
+                    if !still_bad.is_empty() {
+                        self.segment_checksum_failures.fetch_add(
+                            still_bad.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        eprintln!(
+                            "ERROR: segment file(s) fail their _COMMIT checksum after refetch, \
+                             refusing to serve: {}",
+                            still_bad.join(", ")
+                        );
+                    }
+                }
             }
 
             drop(_permit);
@@ -2726,29 +2912,102 @@ impl AppState {
         outcome
     }
 
-    /// Upload a single file from a local segment dir to S3.
+    /// Re-upload files that an admin backfill rewrote in place inside an
+    /// already-uploaded segment (e.g. `footer.json`), then refresh that
+    /// segment's `_COMMIT` so its recorded sizes/CRCs match the new bytes.
+    /// Without the refresh, a rewritten file would fail the commit check
+    /// (`S3Storage::segment_durability`) and hydration verification, even
+    /// though it is valid. Legacy segments with no `_COMMIT` are left
+    /// without one: a marker built from only the rewritten files would
+    /// wrongly vouch for the rest of the segment.
+    ///
+    /// The marker is still written last, so a failure partway through
+    /// leaves the old marker and fails the size/CRC check for the rewritten
+    /// file. Reconciliation then re-uploads the segment.
     #[cfg(feature = "s3")]
-    fn sync_file_to_s3(&self, seg_dir: &Path, file_name: &str) {
+    fn sync_files_to_s3(&self, seg_dir: &Path, file_names: &[&str]) -> Result<(), String> {
         let Some(ref s3) = self.s3_storage else {
-            return;
+            return Ok(());
         };
-        let path = seg_dir.join(file_name);
-        if !path.is_file() {
-            return;
-        }
-        let Ok(rel) = seg_dir.strip_prefix(&self.data_dir) else {
-            return;
-        };
-        let s3_path = format!("{}/{file_name}", rel.to_string_lossy());
-        match std::fs::read(&path) {
-            Ok(data) => {
-                if let Err(e) = s3.write(&s3_path, &data) {
-                    eprintln!("WARN: S3 upload failed for {s3_path}: {e}");
-                }
+        let rel = seg_dir
+            .strip_prefix(&self.data_dir)
+            .map_err(|_| format!("{} is outside data_dir", seg_dir.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let commit = s3
+            .read_segment_commit(&rel)
+            .map_err(|e| format!("read {rel}/{}: {e}", segment_commit::COMMIT_FILE))?;
+        let mut entries = Vec::new();
+        for file_name in file_names {
+            let path = seg_dir.join(file_name);
+            if !path.is_file() {
+                continue;
             }
-            Err(e) => eprintln!("WARN: failed to read {s3_path} for upload: {e}"),
+            let s3_path = format!("{rel}/{file_name}");
+            let data = std::fs::read(&path)
+                .map_err(|e| format!("failed to read {s3_path} for upload: {e}"))?;
+            s3.write(&s3_path, &data)
+                .map_err(|e| format!("S3 upload failed for {s3_path}: {e}"))?;
+            entries.push(segment_commit::SegmentCommit::entry(file_name, &data));
+        }
+        if let Some(mut commit) = commit {
+            for e in entries {
+                commit.upsert(e);
+            }
+            let commit_path = format!("{rel}/{}", segment_commit::COMMIT_FILE);
+            s3.write(&commit_path, &commit.to_bytes())
+                .map_err(|e| format!("S3 upload failed for {commit_path}: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Verify freshly fetched segment files (`logical_path` = `ns/segment/file`,
+/// relative to `data_dir`) against the `_COMMIT` of their segment, when that
+/// segment has one locally. Every file that fails is deleted from local disk
+/// and returned. Files of segments without a local `_COMMIT` (legacy
+/// segments, or a marker that wasn't fetched) and files the marker doesn't
+/// list are accepted unchecked.
+#[cfg(feature = "s3")]
+fn verify_fetched_against_commit(data_dir: &Path, fetched: &[(String, u64)]) -> Vec<String> {
+    let mut commits: HashMap<String, Option<segment_commit::SegmentCommit>> = HashMap::new();
+    let mut bad = Vec::new();
+    for (logical, _) in fetched {
+        let Some((seg_rel, name)) = logical.rsplit_once('/') else {
+            continue;
+        };
+        if name == segment_commit::COMMIT_FILE {
+            continue;
+        }
+        let commit = commits.entry(seg_rel.to_string()).or_insert_with(|| {
+            let path = data_dir.join(seg_rel).join(segment_commit::COMMIT_FILE);
+            match std::fs::read(&path) {
+                Ok(bytes) => match segment_commit::SegmentCommit::from_bytes(&bytes) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        eprintln!("WARN: ignoring unreadable {}: {e}", path.display());
+                        None
+                    }
+                },
+                Err(_) => None,
+            }
+        });
+        let Some(commit) = commit else {
+            continue;
+        };
+        let path = data_dir.join(logical);
+        // A file that didn't arrive at all is hydration's "missing" case,
+        // reported separately. Here we only judge bytes that landed.
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Err(e) = commit.verify(name, &data) {
+            eprintln!("ERROR: checksum mismatch in segment {seg_rel}: {e}");
+            std::fs::remove_file(&path).ok();
+            bad.push(logical.clone());
         }
     }
+    bad
 }
 
 /// Parse a default-on boolean env toggle: unset or any other value → true;
@@ -3396,7 +3655,21 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
             // including vectors — unlike the search path, there's no
             // per-call signal here for whether vectors matter, so always
             // fetch them.
-            state.ensure_segments_local(&paths, true);
+            let outcome = state.ensure_segments_local(&paths, true);
+            // Proceeding without a segment would silently treat its
+            // documents as absent: a re-index or replace would duplicate
+            // them, and /exists would deny them. Fail closed instead. This
+            // includes segments whose files failed their _COMMIT checksum.
+            if !outcome.missing.is_empty() {
+                return json_error(
+                    503,
+                    &format!(
+                        "{} segment(s) could not be hydrated or failed verification: {}",
+                        outcome.missing.len(),
+                        outcome.missing.join(", ")
+                    ),
+                );
+            }
         }
     }
 
@@ -3423,7 +3696,12 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     // An auto-flush updated the segment list — publish manifest + S3 so the
     // write survives restarts (explicit flushes go through publish_namespace too).
     if manifest_changed {
-        state.publish_namespace(&ns);
+        if let Err(e) = state.publish_namespace(&ns) {
+            return json_error(
+                503,
+                &format!("documents indexed but the auto-flush is not durable yet: {e}"),
+            );
+        }
     }
 
     json_ok(&IndexResponse {
@@ -3471,7 +3749,21 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
             // including vectors — unlike the search path, there's no
             // per-call signal here for whether vectors matter, so always
             // fetch them.
-            state.ensure_segments_local(&paths, true);
+            let outcome = state.ensure_segments_local(&paths, true);
+            // Proceeding without a segment would silently treat its
+            // documents as absent: a re-index or replace would duplicate
+            // them, and /exists would deny them. Fail closed instead. This
+            // includes segments whose files failed their _COMMIT checksum.
+            if !outcome.missing.is_empty() {
+                return json_error(
+                    503,
+                    &format!(
+                        "{} segment(s) could not be hydrated or failed verification: {}",
+                        outcome.missing.len(),
+                        outcome.missing.join(", ")
+                    ),
+                );
+            }
         }
     }
 
@@ -3533,7 +3825,21 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
             // including vectors — unlike the search path, there's no
             // per-call signal here for whether vectors matter, so always
             // fetch them.
-            state.ensure_segments_local(&paths, true);
+            let outcome = state.ensure_segments_local(&paths, true);
+            // Proceeding without a segment would silently treat its
+            // documents as absent: a re-index or replace would duplicate
+            // them, and /exists would deny them. Fail closed instead. This
+            // includes segments whose files failed their _COMMIT checksum.
+            if !outcome.missing.is_empty() {
+                return json_error(
+                    503,
+                    &format!(
+                        "{} segment(s) could not be hydrated or failed verification: {}",
+                        outcome.missing.len(),
+                        outcome.missing.join(", ")
+                    ),
+                );
+            }
         }
     }
 
@@ -3548,7 +3854,9 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
         let mut controller = state.controller.lock().unwrap();
         controller.ensure_namespace(namespace.clone());
     }
-    state.publish_namespace(&namespace);
+    if let Err(e) = state.publish_namespace(&namespace) {
+        return json_error(503, &format!("documents replaced but not durable yet: {e}"));
+    }
 
     json_ok(&IndexResponse {
         indexed_count: count,
@@ -3581,17 +3889,24 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
     }
 
     // Publish manifest(s) to the control store and upload segments to S3.
-    match ns {
-        Some(ref name) => state.publish_namespace(&NamespaceId(name.clone())),
-        None => {
-            let all: Vec<NamespaceId> = {
-                let indexer = &state.indexer;
-                indexer.namespaces()
-            };
-            for ns_id in &all {
-                state.publish_namespace(ns_id);
-            }
-        }
+    // Any failure fails the flush: a client must not be told a flush
+    // succeeded while its segments are only on this node's disk.
+    let targets: Vec<NamespaceId> = match ns {
+        Some(ref name) => vec![NamespaceId(name.clone())],
+        None => state.indexer.namespaces(),
+    };
+    let errors: Vec<String> = targets
+        .iter()
+        .filter_map(|ns_id| state.publish_namespace(ns_id).err())
+        .collect();
+    if !errors.is_empty() {
+        return json_error(
+            503,
+            &format!(
+                "flushed locally but not durably published: {}",
+                errors.join("; ")
+            ),
+        );
     }
 
     json_ok(&serde_json::json!({"status": "flushed"}))
@@ -3682,6 +3997,12 @@ fn handle_stats(state: &AppState) -> String {
     #[cfg(not(feature = "s3"))]
     let (s3_enabled, s3_bucket, s3_prefix): (bool, Option<String>, Option<String>) =
         (false, None, None);
+    #[cfg(feature = "s3")]
+    let segment_checksum_failures = state
+        .segment_checksum_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "s3"))]
+    let segment_checksum_failures = 0u64;
 
     json_ok(&serde_json::json!({
         "total_documents": total_docs,
@@ -3691,6 +4012,7 @@ fn handle_stats(state: &AppState) -> String {
         "cache_root": state.cache.root().display().to_string(),
         "cache_size_bytes": state.cache.total_size(),
         "s3_enabled": s3_enabled,
+        "segment_checksum_failures": segment_checksum_failures,
         "s3_bucket": s3_bucket,
         "s3_prefix": s3_prefix,
     }))
@@ -4435,7 +4757,12 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
             Ok(_) => {
                 rebuilt += 1;
                 #[cfg(feature = "s3")]
-                state.sync_file_to_s3(seg_path, "footer.json");
+                if let Err(e) = state.sync_files_to_s3(seg_path, &["footer.json"]) {
+                    errors.push(format!(
+                        "{}: rebuilt locally but S3 sync failed: {e}",
+                        entry.segment_id.0
+                    ));
+                }
             }
             Err(e) => errors.push(format!("{}: {e}", entry.segment_id.0)),
         }
@@ -4564,9 +4891,14 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
             match SegmentReader::backfill_offset_tables(&seg_path) {
                 Ok(_) => {
                     #[cfg(feature = "s3")]
+                    if let Err(e) =
+                        state.sync_files_to_s3(&seg_path, &["doc_store.offsets", "footer.json"])
                     {
-                        state.sync_file_to_s3(&seg_path, "doc_store.offsets");
-                        state.sync_file_to_s3(&seg_path, "footer.json");
+                        eprintln!(
+                            "WARN: backfill: ns={} segment={} rewritten locally but S3 sync \
+                             failed: {e}",
+                            ns.0, entry.segment_id.0,
+                        );
                     }
                     done += 1;
                     println!(
@@ -4717,11 +5049,12 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
         Err(e) => return json_error(500, &format!("compaction error: {e}")),
     };
 
-    // Persist the merged manifest and upload the new segment to S3 — same
-    // path a normal flush uses (sync_latest_segment_to_s3 picks up the
-    // compacted segment because compact_namespace pushes it last).
+    // Commit the merged segment to S3 and CAS the new manifest — the same
+    // path a normal flush uses.
     if result.merged {
-        state.publish_namespace(&ns);
+        if let Err(e) = state.publish_namespace(&ns) {
+            return json_error(503, &format!("compacted locally but not published: {e}"));
+        }
     }
 
     let segments_after = state
@@ -4879,7 +5212,9 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
             let mut ctrl = state.controller.lock().unwrap();
             ctrl.ensure_namespace(ns.clone());
         }
-        state.persist_manifest(&ns);
+        if let Err(e) = state.force_save_manifest(&ns) {
+            return json_error(503, &e);
+        }
 
         json_ok(&serde_json::json!({
             "namespace": ns.0,
@@ -7105,6 +7440,236 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         AppState::new(dir)
+    }
+
+    // ─── #230: CAS manifest publish ─────────────────────────────────────
+
+    fn index_and_flush(state: &AppState, ns: &NamespaceId, id: &str) {
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![kosha_core::Document {
+                    id: kosha_core::DocumentId(id.into()),
+                    fields: vec![kosha_core::Field::text("body", format!("hello {id}"))],
+                }],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(ns).unwrap();
+    }
+
+    fn stored(state: &AppState, ns: &NamespaceId) -> kosha_core::Manifest {
+        state
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_cloned(ns)
+            .unwrap()
+    }
+
+    fn seg_ids(m: &kosha_core::Manifest) -> Vec<String> {
+        let mut v: Vec<String> = m.segments.iter().map(|e| e.segment_id.0.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn publish_creates_then_advances_manifest_and_is_idempotent() {
+        let state = test_state();
+        let ns = NamespaceId("cas-basic".into());
+        index_and_flush(&state, &ns, "a");
+        state.publish_namespace(&ns).unwrap();
+        let v1 = stored(&state, &ns);
+        assert_eq!(v1.segments.len(), 1);
+        assert_eq!(v1.version, state.indexer.manifest(&ns).unwrap().version);
+
+        // Nothing changed: a second publish is a no-op, not a conflict.
+        state.publish_namespace(&ns).unwrap();
+        assert_eq!(stored(&state, &ns).version, v1.version);
+
+        index_and_flush(&state, &ns, "b");
+        state.publish_namespace(&ns).unwrap();
+        let v2 = stored(&state, &ns);
+        assert_eq!(v2.segments.len(), 2);
+        assert!(v2.version > v1.version);
+    }
+
+    /// Acceptance criterion from #230: two writers publishing to the same
+    /// namespace must not lose segments. A second writer's publish
+    /// (simulated by a CAS straight into the control store) lands between
+    /// our flush and our publish. Our CAS must lose, rebase and keep both
+    /// sides' segments.
+    #[test]
+    fn publish_conflict_rebases_and_keeps_both_writers_segments() {
+        let state = test_state();
+        let ns = NamespaceId("cas-conflict".into());
+        index_and_flush(&state, &ns, "a");
+        state.publish_namespace(&ns).unwrap();
+        let base = stored(&state, &ns);
+
+        // The other writer appends its own segment and publishes first.
+        let mut theirs = base.clone();
+        theirs.version = base.version + 1;
+        theirs.segments.push(kosha_core::ManifestEntry {
+            segment_id: kosha_core::SegmentId("other-writer-seg".into()),
+            doc_count: 7,
+        });
+        state
+            .controller
+            .lock()
+            .unwrap()
+            .compare_and_swap_manifest(&ns, base.version, theirs.clone())
+            .unwrap();
+
+        index_and_flush(&state, &ns, "b");
+        let ours = state.indexer.manifest(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let after = stored(&state, &ns);
+        let mut expected: Vec<String> = seg_ids(&ours);
+        expected.push("other-writer-seg".into());
+        expected.sort();
+        assert_eq!(seg_ids(&after), expected, "no writer's segment may be lost");
+        assert!(after.version > theirs.version);
+        // The local indexer now serves the rebased manifest too.
+        assert_eq!(seg_ids(&state.indexer.manifest(&ns).unwrap()), expected);
+    }
+
+    /// A remote compaction that removed segments from the shared base must
+    /// win over our stale copy of them, while our new segment survives.
+    #[test]
+    fn publish_conflict_applies_remote_removals() {
+        let state = test_state();
+        let ns = NamespaceId("cas-remote-compact".into());
+        index_and_flush(&state, &ns, "a");
+        index_and_flush(&state, &ns, "b");
+        state.publish_namespace(&ns).unwrap();
+        let base = stored(&state, &ns);
+        assert_eq!(base.segments.len(), 2);
+
+        let merged = kosha_core::ManifestEntry {
+            segment_id: kosha_core::SegmentId("remote-merged".into()),
+            doc_count: 2,
+        };
+        let theirs = kosha_core::Manifest {
+            version: base.version + 1,
+            segments: vec![merged],
+            segment_footers: Default::default(),
+        };
+        state
+            .controller
+            .lock()
+            .unwrap()
+            .compare_and_swap_manifest(&ns, base.version, theirs)
+            .unwrap();
+
+        index_and_flush(&state, &ns, "c");
+        let ours_new: Vec<String> = seg_ids(&state.indexer.manifest(&ns).unwrap())
+            .into_iter()
+            .filter(|id| !base.segments.iter().any(|e| &e.segment_id.0 == id))
+            .collect();
+        assert_eq!(ours_new.len(), 1);
+        state.publish_namespace(&ns).unwrap();
+
+        let mut expected = vec!["remote-merged".to_string(), ours_new[0].clone()];
+        expected.sort();
+        assert_eq!(seg_ids(&stored(&state, &ns)), expected);
+    }
+
+    /// Concurrent flush+publish from many threads in one process: the
+    /// stored manifest must end up equal to the indexer's, with every
+    /// flushed segment present.
+    #[test]
+    fn concurrent_publishes_lose_no_segments() {
+        let state = Arc::new(test_state());
+        let ns = NamespaceId("cas-concurrent".into());
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let state = Arc::clone(&state);
+                let ns = ns.clone();
+                std::thread::spawn(move || {
+                    for i in 0..4 {
+                        index_and_flush(&state, &ns, &format!("t{t}-{i}"));
+                        state.publish_namespace(&ns).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let local = state.indexer.manifest(&ns).unwrap();
+        let remote = stored(&state, &ns);
+        assert_eq!(remote.version, local.version);
+        assert_eq!(seg_ids(&remote), seg_ids(&local));
+        let docs: u64 = remote.segments.iter().map(|e| e.doc_count as u64).sum();
+        assert_eq!(docs, 32);
+    }
+
+    /// A control store that fails every manifest write, to check that
+    /// publish errors reach the client instead of being logged and dropped.
+    struct FailingStore(kosha_control::Controller);
+
+    impl ControlStore for FailingStore {
+        fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
+            self.0.create_namespace(id)
+        }
+        fn ensure_namespace(&mut self, id: NamespaceId) {
+            self.0.ensure_namespace(id)
+        }
+        fn has_namespace(&self, id: &NamespaceId) -> bool {
+            self.0.has_namespace(id)
+        }
+        fn manifest(&self, id: &NamespaceId) -> Option<&kosha_core::Manifest> {
+            self.0.manifest(id)
+        }
+        fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut kosha_core::Manifest> {
+            self.0.manifest_mut(id)
+        }
+        fn save_manifest(
+            &mut self,
+            _: &NamespaceId,
+            _: &kosha_core::Manifest,
+        ) -> Result<(), KoshaError> {
+            Err(KoshaError::NotFound("db down".into()))
+        }
+        fn compare_and_swap_manifest(
+            &mut self,
+            _: &NamespaceId,
+            _: u64,
+            _: kosha_core::Manifest,
+        ) -> Result<(), KoshaError> {
+            Err(KoshaError::NotFound("db down".into()))
+        }
+        fn list_namespaces(&self) -> Vec<NamespaceId> {
+            ControlStore::list_namespaces(&self.0)
+        }
+        fn namespace_count(&self) -> usize {
+            ControlStore::namespace_count(&self.0)
+        }
+    }
+
+    #[test]
+    fn flush_returns_5xx_when_manifest_publish_fails() {
+        let state = test_state();
+        *state.controller.lock().unwrap() =
+            Box::new(FailingStore(kosha_control::Controller::new()));
+        let ns = NamespaceId("cas-fail".into());
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![kosha_core::Document {
+                    id: kosha_core::DocumentId("a".into()),
+                    fields: vec![kosha_core::Field::text("body", "hello")],
+                }],
+            )
+            .unwrap();
+        let resp = handle_flush(br#"{"namespace":"cas-fail"}"#, &state);
+        let (status, _, body) = parse(&resp);
+        assert!(status.contains("503"), "got {status}: {body}");
+        assert!(body.contains("db down"), "{body}");
+        assert!(state.publish_namespace(&ns).is_err());
     }
 
     fn rc_key(ns: &str, v: u64, q: &str) -> (String, u64, String) {

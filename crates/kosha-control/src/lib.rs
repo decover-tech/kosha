@@ -103,27 +103,27 @@ impl Controller {
 
     /// Atomically update the manifest for a namespace (compare-and-swap style).
     ///
-    /// Returns an error if the manifest version doesn't match, indicating a
-    /// concurrent modification.
+    /// A namespace with no stored manifest counts as version 0 (and is
+    /// registered on success). Returns [`KoshaError::ManifestConflict`] if
+    /// the stored version doesn't match, indicating a concurrent
+    /// modification.
     pub fn compare_and_swap_manifest(
         &mut self,
         id: &NamespaceId,
         expected_version: u64,
         new_manifest: Manifest,
     ) -> Result<(), KoshaError> {
-        let current = self
-            .manifests
-            .get_mut(id)
-            .ok_or_else(|| KoshaError::NamespaceNotFound(id.clone()))?;
-
-        if current.version != expected_version {
-            return Err(KoshaError::NotFound(format!(
-                "manifest version mismatch: expected {expected_version}, got {}",
-                current.version
+        let current_version = self.manifests.get(id).map(|m| m.version).unwrap_or(0);
+        if current_version != expected_version {
+            return Err(KoshaError::ManifestConflict(format!(
+                "{}: expected version {expected_version}, found {current_version}",
+                id.0
             )));
         }
-
-        *current = new_manifest;
+        if !self.namespaces.contains(id) {
+            self.namespaces.push(id.clone());
+        }
+        self.manifests.insert(id.clone(), new_manifest);
         Ok(())
     }
 
@@ -278,6 +278,32 @@ mod tests {
             segments: vec![],
             segment_footers: Default::default(),
         };
-        assert!(ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2).is_err());
+        assert!(matches!(
+            ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2),
+            Err(KoshaError::ManifestConflict(_))
+        ));
+    }
+
+    #[test]
+    fn cas_treats_absent_manifest_as_version_zero() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("fresh".into());
+        let m = |v| Manifest {
+            version: v,
+            segments: vec![],
+            segment_footers: Default::default(),
+        };
+        // Expecting a version that was never published is a conflict.
+        assert!(matches!(
+            ctrl.compare_and_swap_manifest(&ns, 3, m(4)),
+            Err(KoshaError::ManifestConflict(_))
+        ));
+        assert!(!ctrl.has_namespace(&ns));
+        // First publish of a new namespace: expected 0, registers it.
+        ctrl.compare_and_swap_manifest(&ns, 0, m(1)).unwrap();
+        assert!(ctrl.has_namespace(&ns));
+        assert_eq!(ctrl.manifest(&ns).unwrap().version, 1);
+        // A second "first publish" racing the first one loses.
+        assert!(ctrl.compare_and_swap_manifest(&ns, 0, m(1)).is_err());
     }
 }

@@ -31,6 +31,12 @@ pub trait ControlStore: Send + Sync {
     /// concurrency, use `compare_and_swap_manifest` instead.
     fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError>;
 
+    /// Replace the manifest only if the stored version equals
+    /// `expected_version`. A namespace with no stored manifest counts as
+    /// version 0, so the first publish of a new namespace is
+    /// `expected_version = 0`; that also registers the namespace. A
+    /// mismatch returns [`KoshaError::ManifestConflict`], and any other
+    /// error is a storage failure.
     fn compare_and_swap_manifest(
         &mut self,
         id: &NamespaceId,
@@ -1138,6 +1144,11 @@ pub enum KoshaError {
     /// Transient by construction — callers should retry with backoff, which
     /// the Python `kosha_client` already does. Maps to HTTP 429.
     Overloaded(String),
+    /// A `compare_and_swap_manifest` lost: the stored manifest's version is
+    /// not the one the caller expected, because another writer published
+    /// first. The caller should reload, rebase and retry, not treat it as a
+    /// storage failure.
+    ManifestConflict(String),
 }
 
 impl std::fmt::Display for KoshaError {
@@ -1151,6 +1162,7 @@ impl std::fmt::Display for KoshaError {
             Self::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
             Self::CorruptSegment(msg) => write!(f, "corrupt segment data: {msg}"),
             Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
+            Self::ManifestConflict(msg) => write!(f, "manifest conflict: {msg}"),
         }
     }
 }

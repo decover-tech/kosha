@@ -365,21 +365,47 @@ impl ControlStore for PgStore {
         .map_err(|e| KoshaError::NotFound(e.to_string()))?;
 
         self.rt.block_on(async {
-            let result = sqlx::query(
-                "UPDATE kosha.manifests \
-                 SET version = $1, segments_json = $2, updated_at = NOW() \
-                 WHERE namespace_id = $3 AND version = $4",
-            )
-            .bind(new_manifest.version as i64)
-            .bind(&segments_json)
-            .bind(&id_str)
-            .bind(expected_version as i64)
-            .execute(&self.pool)
-            .await;
-
+            // An absent manifest row counts as version 0, so the first
+            // publish of a new namespace (expected 0) is an insert. ON
+            // CONFLICT turns it into the same version-guarded update, so
+            // exactly one of two racing first-publishers wins.
+            // kosha.manifests has an FK to kosha.namespaces, so register
+            // the namespace first.
+            let result = if expected_version == 0 {
+                sqlx::query("INSERT INTO kosha.namespaces (id) VALUES ($1) ON CONFLICT DO NOTHING")
+                    .bind(&id_str)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| KoshaError::NotFound(e.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO kosha.manifests (namespace_id, version, segments_json) \
+                     VALUES ($3, $1, $2) \
+                     ON CONFLICT (namespace_id) DO UPDATE \
+                     SET version = EXCLUDED.version, segments_json = EXCLUDED.segments_json, \
+                         updated_at = NOW() \
+                     WHERE kosha.manifests.version = 0",
+                )
+                .bind(new_manifest.version as i64)
+                .bind(&segments_json)
+                .bind(&id_str)
+                .execute(&self.pool)
+                .await
+            } else {
+                sqlx::query(
+                    "UPDATE kosha.manifests \
+                     SET version = $1, segments_json = $2, updated_at = NOW() \
+                     WHERE namespace_id = $3 AND version = $4",
+                )
+                .bind(new_manifest.version as i64)
+                .bind(&segments_json)
+                .bind(&id_str)
+                .bind(expected_version as i64)
+                .execute(&self.pool)
+                .await
+            };
             match result {
-                Ok(r) if r.rows_affected() == 0 => Err(KoshaError::NotFound(format!(
-                    "manifest CAS failed for {id_str}: version mismatch or namespace not found"
+                Ok(r) if r.rows_affected() == 0 => Err(KoshaError::ManifestConflict(format!(
+                    "{id_str}: stored manifest is not at expected version {expected_version}"
                 ))),
                 Ok(_) => Ok(()),
                 Err(e) => Err(KoshaError::NotFound(e.to_string())),

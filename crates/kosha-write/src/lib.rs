@@ -1370,6 +1370,83 @@ impl Indexer {
         state.known = true;
     }
 
+    /// Fold another writer's published manifest changes into this
+    /// namespace's local manifest, after a manifest compare-and-swap lost
+    /// (#230). Returns the rebased local manifest, which the caller
+    /// publishes with `expected_version = remote.version`.
+    ///
+    /// `base_ids` is the segment set of the last manifest *this* process
+    /// published (or restored at boot). Relative to that base:
+    /// - segments the remote added are appended locally (with their
+    ///   footers), unless already present;
+    /// - segments the remote removed (e.g. a compaction merged them away)
+    ///   are dropped locally, together with their footers and in-memory
+    ///   tombstones.
+    ///
+    /// Local changes since the base (new flushes, local compactions) are
+    /// kept. The version becomes `max(local, remote) + 1`, so it always
+    /// moves past the stored one.
+    ///
+    /// This does not reconcile two writers that both rewrote the same
+    /// segments, or that minted the same segment id. Fencing a single
+    /// writer per namespace is #254's job; this only keeps a lost CAS from
+    /// dropping either side's new segments.
+    pub fn rebase_manifest(
+        &self,
+        namespace: &NamespaceId,
+        base_ids: &HashSet<SegmentId>,
+        remote: &Manifest,
+    ) -> Manifest {
+        let handle = self.ns_handle(namespace);
+        let mut state = handle.state.lock().unwrap();
+        let remote_ids: HashSet<&SegmentId> =
+            remote.segments.iter().map(|e| &e.segment_id).collect();
+        let remote_removed: HashSet<SegmentId> = base_ids
+            .iter()
+            .filter(|id| !remote_ids.contains(id))
+            .cloned()
+            .collect();
+
+        state
+            .manifest
+            .segments
+            .retain(|e| !remote_removed.contains(&e.segment_id));
+        for id in &remote_removed {
+            state.manifest.segment_footers.remove(id);
+            state.tombstones.remove(id);
+        }
+        let local_ids: HashSet<SegmentId> = state
+            .manifest
+            .segments
+            .iter()
+            .map(|e| e.segment_id.clone())
+            .collect();
+        let mut max_counter = None;
+        for entry in &remote.segments {
+            if base_ids.contains(&entry.segment_id) || local_ids.contains(&entry.segment_id) {
+                continue;
+            }
+            state.manifest.segments.push(entry.clone());
+            if let Some(footer) = remote.segment_footer(&entry.segment_id) {
+                state.manifest.remember_segment_footer(footer.clone());
+            }
+            max_counter = max_counter.max(segment_flush_counter(&entry.segment_id));
+        }
+        if let Some(max) = max_counter {
+            let buf = Self::buffer_mut_in(
+                &mut state,
+                namespace.clone(),
+                &self.data_dir,
+                &self.bm25_params,
+            );
+            buf.segment_counter = buf.segment_counter.max(max + 1);
+        }
+        state.manifest.version = state.manifest.version.max(remote.version) + 1;
+        state.id_index = None;
+        state.known = true;
+        state.manifest.clone()
+    }
+
     pub fn manifest(&self, namespace: &NamespaceId) -> Option<Manifest> {
         self.manifest_cloned(namespace)
     }
