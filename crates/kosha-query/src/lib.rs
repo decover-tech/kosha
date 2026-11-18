@@ -1023,7 +1023,9 @@ impl Searcher {
         segment_id: &str,
         seg_dir: PathBuf,
         load_vectors: bool,
-        footer: Option<kosha_core::Footer>,
+        // Borrowed: only a cold open needs its own copy, and most calls
+        // find the segment already open.
+        footer: Option<&kosha_core::Footer>,
         permit: Option<&AdmissionPermit>,
         stats: Option<&OpenStatsCollector>,
     ) -> Result<Arc<TrackedSegment>, KoshaError> {
@@ -1046,7 +1048,7 @@ impl Searcher {
         let reader = SegmentReader::open_with_footer_options(
             seg_dir,
             load_vectors,
-            footer,
+            footer.cloned(),
             Some(postings_account),
         )?;
         let tracked = Arc::new(TrackedSegment::new(
@@ -1160,7 +1162,7 @@ impl Searcher {
                 &entry.segment_id.0,
                 seg_dir,
                 load_vectors,
-                manifest.segment_footer(&entry.segment_id).cloned(),
+                manifest.segment_footer(&entry.segment_id),
                 Some(&permit),
                 None,
             ) {
@@ -1249,11 +1251,10 @@ impl Searcher {
                 // up most of `num_candidates`, leaving the matter actually
                 // being searched with a fraction of the probes asked for.
                 if prunable {
-                    let footer = manifest
-                        .segment_footer(&entry.segment_id)
-                        .cloned()
-                        .or_else(|| SegmentReader::read_footer(&seg_dir).ok());
-                    if let Some(footer) = footer.as_ref() {
+                    let footer = manifest.footer_or_read(&entry.segment_id, || {
+                        SegmentReader::read_footer(&seg_dir).ok()
+                    });
+                    if let Some(footer) = footer.as_deref() {
                         if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
                             return None;
                         }
@@ -1265,7 +1266,7 @@ impl Searcher {
                         &entry.segment_id.0,
                         seg_dir,
                         true,
-                        manifest.segment_footer(&entry.segment_id).cloned(),
+                        manifest.segment_footer(&entry.segment_id),
                         Some(permit),
                         Some(open_stats),
                     )
@@ -1333,10 +1334,13 @@ impl Searcher {
 
         // Prune via footer blooms before opening inverted/filters/vectors.
         if query.has_prunable_filter() || term_prune.is_some() {
-            let footer = manifest_footer
-                .cloned()
-                .or_else(|| SegmentReader::read_footer(&seg_dir).ok());
-            if let Some(footer) = footer.as_ref() {
+            let footer = match manifest_footer {
+                Some(footer) => Some(std::borrow::Cow::Borrowed(footer)),
+                None => SegmentReader::read_footer(&seg_dir)
+                    .ok()
+                    .map(std::borrow::Cow::Owned),
+            };
+            if let Some(footer) = footer.as_deref() {
                 if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
                     return Ok(None);
                 }
@@ -1356,7 +1360,7 @@ impl Searcher {
             &entry.segment_id.0,
             seg_dir,
             query.knn.is_some(),
-            manifest_footer.cloned(),
+            manifest_footer,
             Some(permit),
             Some(open_stats),
         )?;
@@ -1735,9 +1739,7 @@ impl Searcher {
                         // an exact total down the general path, because an
                         // OpenSearch `match` is OR by default and that is
                         // what the client sends.
-                        if count_budget.is_none() {
-                            return None;
-                        }
+                        count_budget?;
                         // ── Multi-term block-max OR: WAND pivot join ──
                         //
                         // Union membership doesn't need every cursor to
