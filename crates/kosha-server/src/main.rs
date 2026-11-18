@@ -17,80 +17,30 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-/// Map of valid API keys → tenant id.
-///
-/// Loaded from, in priority order:
-///   1. Postgres `kosha.api_keys` table (if DATABASE_URL + postgres feature)
-///   2. `KOSHA_API_KEYS` env var (format: `key1=tenant1,key2=tenant2`)
-///   3. `KOSHA_API_KEY` env var (single key, tenant = "default")
-///   4. Empty (dev mode — no auth required)
-static API_KEYS: once_cell::sync::Lazy<HashMap<String, String>> =
-    once_cell::sync::Lazy::new(load_api_keys);
-
-fn load_api_keys() -> HashMap<String, String> {
-    // 1. Postgres-backed keys (staging/production).
-    if let Ok(db_url) = std::env::var("DATABASE_URL") {
-        #[cfg(feature = "postgres")]
-        match kosha_control::PgStore::new(&db_url) {
-            Ok(store) => {
-                let keys = store.list_api_keys(None).unwrap_or_default();
-                if !keys.is_empty() {
-                    let map: HashMap<String, String> = keys
-                        .into_iter()
-                        .map(|(key, tenant, _desc)| (key, tenant))
-                        .collect();
-                    println!("api keys: loaded {} key(s) from postgres", map.len());
-                    return map;
-                }
-                println!("api keys: no keys found in postgres, falling back to env vars");
-            }
-            Err(e) => {
-                eprintln!("api keys: failed to connect to postgres: {e}, falling back to env vars");
-            }
-        }
-        #[cfg(not(feature = "postgres"))]
-        {
-            let _ = db_url;
-            println!("api keys: DATABASE_URL set but postgres feature disabled, using env vars");
-        }
-    }
-
-    // 2. Multi-tenant env var.
-    if let Ok(keys) = std::env::var("KOSHA_API_KEYS") {
-        let map: HashMap<_, _> = keys
-            .split(',')
-            .filter_map(|pair| {
-                pair.split_once('=')
-                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-            })
-            .collect();
-        if !map.is_empty() {
-            println!(
-                "api keys: loaded {} key(s) from KOSHA_API_KEYS env var",
-                map.len()
-            );
-            return map;
-        }
-    }
-
-    // 3. Single-tenant env var.
-    if let Ok(key) = std::env::var("KOSHA_API_KEY") {
-        println!("api keys: single key from KOSHA_API_KEY env var");
-        let mut m = HashMap::new();
-        m.insert(key, "default".to_string());
-        return m;
-    }
-
-    // 4. Dev mode — no auth.
-    println!("api keys: none configured — dev mode (no auth)");
-    HashMap::new()
-}
-
 /// Extract the tenant prefix from a namespace for isolation.
 fn tenant_namespace(tenant: &str, namespace: &str) -> String {
     format!("{tenant}/{namespace}")
 }
 
+/// A caller-supplied (unscoped) namespace name must stay inside its tenant
+/// prefix: no path separators, no `.`/`..` segments (namespace names are
+/// joined onto the data dir and S3 prefix), no control characters.
+fn validate_namespace_name(namespace: &str) -> Result<(), String> {
+    if namespace.is_empty()
+        || namespace == "."
+        || namespace == ".."
+        || namespace.contains('/')
+        || namespace.contains('\\')
+        || namespace.chars().any(char::is_control)
+    {
+        return Err(format!("invalid namespace name {namespace:?}"));
+    }
+    Ok(())
+}
+
+mod auth;
+#[cfg(test)]
+mod auth_route_tests;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 #[cfg(feature = "migrate")]
@@ -2945,6 +2895,10 @@ fn main() {
         .unwrap_or(300);
     let addr = format!("0.0.0.0:{port}");
 
+    // Auth first: with no keys configured (and no explicit
+    // KOSHA_AUTH=disabled) this exits before the slow manifest restore.
+    auth::init_global();
+
     let state = AppState::new_shared(PathBuf::from(data_dir.clone()));
     // Bind the listener first so a slow warmup doesn't delay the port;
     // `/readyz` keeps HPA/kube endpoints from sending traffic while it
@@ -3016,6 +2970,21 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         }
     }
 
+    // Reject oversized bodies from the declared length, before reading (or
+    // allocating) any of it.
+    let max_body = auth::max_body_bytes();
+    if content_length > max_body {
+        let resp = json_error(
+            413,
+            &format!(
+                "request body of {content_length} bytes exceeds the {max_body}-byte limit \
+                 (KOSHA_MAX_BODY_BYTES)"
+            ),
+        );
+        stream.write_all(resp.as_bytes()).ok();
+        return Ok(());
+    }
+
     let mut body = Vec::new();
     if content_length > 0 {
         reader
@@ -3062,13 +3031,19 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
 
     // ── API key authentication ──────────────────────────────────────────
     // Per proto/kosha/v1/kosha.proto: Authorization: Bearer <key> or X-Api-Key.
-    let tenant = match authenticate(&headers) {
-        Ok(t) => t,
+    let principal = match authenticate(auth::global(), &headers) {
+        Ok(p) => p,
         Err(resp) => {
             stream.write_all(resp.as_bytes()).ok();
             return Ok(());
         }
     };
+    // Admin-only and disabled-legacy routes are refused here too, so a
+    // query pod doesn't forward a request the ingest pod would refuse.
+    if let Some(resp) = authorize_route(&request_line, &principal) {
+        stream.write_all(resp.as_bytes()).ok();
+        return Ok(());
+    }
 
     // ── Query/ingest role routing ────────────────────────────────────────
     // A query-role pod (KOSHA_INGEST_HOST set) forwards write-path requests
@@ -3080,46 +3055,209 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         (Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
             forward_to_ingest(client, ingest_host, &request_line, &headers, &body)
         }
-        _ => route(&request_line, &headers, &body, &tenant, state),
+        _ => route_as(&request_line, &headers, &body, &principal, state),
     };
     stream.write_all(response.as_bytes()).ok();
     Ok(())
 }
 
 /// Extract and validate the API key from request headers.
-/// Returns the tenant id on success, or a 401 response string on failure.
-fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
-    // Dev mode: if no keys configured, allow all requests.
-    if API_KEYS.is_empty() {
-        return Ok("dev".to_string());
-    }
-
-    let api_key: Option<&str> = headers
-        .get("authorization")
-        .map(|v| v.as_str())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .or_else(|| headers.get("x-api-key").map(|v| v.as_str()))
-        .or_else(|| {
-            // Check case-insensitively for x-api-key (raw headers may preserve case)
-            headers.iter().find_map(|(k, v)| {
-                if k.eq_ignore_ascii_case("x-api-key") {
-                    Some(v.as_str())
-                } else {
-                    None
-                }
-            })
-        });
-
-    match api_key {
-        Some(key) => match API_KEYS.get(key) {
-            Some(tenant) => Ok(tenant.clone()),
-            None => Err(json_error_body(401, "invalid API key")),
-        },
+/// Returns the caller's principal on success, or a 401 response on failure.
+/// Fails closed: an empty key set rejects every request — only an explicit
+/// `KOSHA_AUTH=disabled` (`Auth::Disabled`) lets requests through unkeyed.
+fn authenticate(
+    auth: &auth::Auth,
+    headers: &HashMap<String, String>,
+) -> Result<auth::Principal, String> {
+    let store = match auth {
+        auth::Auth::Disabled => return Ok(auth::Principal::dev()),
+        auth::Auth::Keys(store) => store,
+    };
+    match auth::presented_key(headers) {
+        Some(key) => store
+            .lookup(key)
+            .ok_or_else(|| json_error_body(401, "invalid API key")),
         None => Err(json_error_body(
             401,
             "missing API key — use Authorization: Bearer <key> or X-Api-Key header",
         )),
     }
+}
+
+/// Route-level authorization, checked before dispatch: admin-only paths
+/// (`/v1/admin/*`, `/internal/*`) need an admin key, and the legacy
+/// unversioned routes answer 410 when `KOSHA_LEGACY_ROUTES=off`.
+fn authorize_route(request_line: &str, principal: &auth::Principal) -> Option<String> {
+    authorize_route_with(request_line, principal, auth::legacy_routes_enabled())
+}
+
+fn authorize_route_with(
+    request_line: &str,
+    principal: &auth::Principal,
+    legacy_enabled: bool,
+) -> Option<String> {
+    let path = parse_method_and_path(request_line)
+        .map(|(_, p)| p)
+        .unwrap_or("");
+    let admin_only =
+        path == "/v1/admin" || path.starts_with("/v1/admin/") || path.starts_with("/internal/");
+    if admin_only && !principal.admin {
+        return Some(json_error(403, "this route requires an admin API key"));
+    }
+    if !legacy_enabled && legacy_route_name(request_line).is_some() {
+        return Some(json_error(
+            410,
+            "legacy unversioned routes are disabled on this server (KOSHA_LEGACY_ROUTES=off); \
+             use /v1/namespaces/{namespace}/...",
+        ));
+    }
+    None
+}
+
+/// The legacy (pre-v1) route a request line targets, if any. Uses the same
+/// prefix matching as `route_as`'s legacy dispatch.
+fn legacy_route_name(request_line: &str) -> Option<&'static str> {
+    const LEGACY: &[(&str, &str)] = &[
+        ("POST /index", "/index"),
+        ("POST /exists", "/exists"),
+        ("POST /replace", "/replace"),
+        ("GET /search", "/search"),
+        ("POST /search", "/search"),
+        ("POST /flush", "/flush"),
+        ("POST /delete", "/delete"),
+        ("GET /stats", "/stats"),
+    ];
+    LEGACY
+        .iter()
+        .find(|(prefix, _)| request_line.starts_with(prefix))
+        .map(|(_, name)| *name)
+}
+
+/// Resolve the `namespace` a legacy route's JSON body names into the
+/// caller's tenant scope (`{tenant}/{namespace}`), exactly like the v1
+/// routes do from the path. Admin keys keep addressing namespaces by raw
+/// name (bare pre-tenancy names like `paragraph_index_hnsw`, or a fully
+/// qualified `tenant/ns`), which is how every caller behaved before.
+///
+/// `allow_missing` is for `/flush`, where an absent namespace means "flush
+/// everything" (scoped to the tenant by the caller).
+fn scope_legacy_body<'a>(
+    body: &'a [u8],
+    principal: &auth::Principal,
+    allow_missing: bool,
+) -> Result<std::borrow::Cow<'a, [u8]>, String> {
+    if principal.admin {
+        return Ok(std::borrow::Cow::Borrowed(body));
+    }
+    let mut val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return Err(json_error(400, &format!("invalid JSON: {e}"))),
+    };
+    let Some(obj) = val.as_object_mut() else {
+        return Err(json_error(400, "request body must be a JSON object"));
+    };
+    match obj.get("namespace") {
+        None if allow_missing => return Ok(std::borrow::Cow::Borrowed(body)),
+        None => return Err(json_error(400, "missing 'namespace'")),
+        Some(serde_json::Value::String(ns)) => {
+            if let Err(e) = validate_namespace_name(ns) {
+                return Err(json_error(400, &e));
+            }
+            let scoped = tenant_namespace(&principal.tenant, ns);
+            obj.insert("namespace".into(), serde_json::json!(scoped));
+        }
+        Some(_) => return Err(json_error(400, "'namespace' must be a string")),
+    }
+    serde_json::to_vec(&val)
+        .map(std::borrow::Cow::Owned)
+        .map_err(|e| json_error(500, &format!("re-encode failed: {e}")))
+}
+
+/// `GET /search?ns=...` counterpart of `scope_legacy_body`: rewrites the
+/// `ns` query parameter into the caller's tenant scope.
+fn scope_legacy_search_get(
+    request_line: &str,
+    principal: &auth::Principal,
+) -> Result<String, String> {
+    if principal.admin {
+        return Ok(request_line.to_string());
+    }
+    let mut parts = request_line.splitn(3, ' ');
+    let (method, target, rest) = (
+        parts.next().unwrap_or(""),
+        parts.next().unwrap_or(""),
+        parts.next().unwrap_or(""),
+    );
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let mut found = false;
+    let mut pairs = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        match pair.split_once('=') {
+            Some(("ns", v)) => {
+                let ns = url_decode(v);
+                validate_namespace_name(&ns).map_err(|e| json_error(400, &e))?;
+                let scoped = tenant_namespace(&principal.tenant, &ns);
+                pairs.push(format!("ns={}", url_encode_component(&scoped)));
+                found = true;
+            }
+            _ => pairs.push(pair.to_string()),
+        }
+    }
+    if !found {
+        return Err(json_error(400, "missing 'ns' query parameter"));
+    }
+    Ok(format!("{method} {path}?{} {rest}", pairs.join("&")))
+}
+
+/// Percent-encode a query-string value (unreserved characters and `/`
+/// pass through) — the inverse of `url_decode` for `ns=` rewriting.
+fn url_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Run a legacy route: record per-tenant usage, scope the body's namespace
+/// into the caller's tenant, then call the (unscoped) handler.
+fn legacy_scoped(
+    route_name: &str,
+    principal: &auth::Principal,
+    body: &[u8],
+    handler: impl FnOnce(&[u8]) -> String,
+) -> String {
+    auth::record_legacy_use(&principal.tenant, route_name);
+    match scope_legacy_body(body, principal, false) {
+        Ok(scoped) => handler(&scoped),
+        Err(resp) => resp,
+    }
+}
+
+/// Legacy `POST /flush` with no namespace for a non-admin key: flush (and
+/// publish) only the caller's own namespaces, never every tenant's.
+fn handle_flush_tenant(tenant: &str, state: &AppState) -> String {
+    let prefix = format!("{tenant}/");
+    let own: Vec<NamespaceId> = state
+        .indexer
+        .namespaces()
+        .into_iter()
+        .filter(|ns| ns.0.starts_with(&prefix))
+        .collect();
+    for ns in &own {
+        if let Err(e) = state.indexer.flush_namespace(ns) {
+            return json_error(500, &format!("flush error: {e}"));
+        }
+    }
+    for ns in &own {
+        state.publish_namespace(ns);
+    }
+    json_ok(&serde_json::json!({"status": "flushed"}))
 }
 
 /// True for every write-mutating route `route()` dispatches to a
@@ -3222,13 +3360,37 @@ fn parse_method_and_path(request_line: &str) -> Option<(&str, &str)> {
     Some((method, path))
 }
 
+/// Test shorthand: dispatch as an admin principal for `tenant` (the
+/// pre-auth behavior every existing route test was written against).
+#[cfg(test)]
 fn route(
     request_line: &str,
-    _headers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
     body: &[u8],
     tenant: &str,
     state: &AppState,
 ) -> String {
+    let principal = auth::Principal {
+        tenant: tenant.to_string(),
+        admin: true,
+    };
+    route_as(request_line, headers, body, &principal, state)
+}
+
+fn route_as(
+    request_line: &str,
+    _headers: &HashMap<String, String>,
+    body: &[u8],
+    principal: &auth::Principal,
+    state: &AppState,
+) -> String {
+    if let Some(resp) = authorize_route(request_line, principal) {
+        return resp;
+    }
+    let tenant = principal.tenant.as_str();
+    // Non-admin keys only ever see their own tenant's namespaces in stats.
+    let stats_scope = (!principal.admin).then_some(tenant);
+
     // ── v1 proto-defined routes ────────────────────────────────────────────
     // proto/kosha/v1/kosha.proto is the canonical source of truth for paths.
     if request_line.starts_with("GET /v1/healthz") {
@@ -3256,7 +3418,7 @@ fn route(
     }
 
     if request_line.starts_with("GET /v1/stats") {
-        return handle_stats(state);
+        return handle_stats(state, stats_scope);
     }
 
     if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/stats") {
@@ -3287,8 +3449,9 @@ fn route(
     // ── Internal, pod-to-pod only ────────────────────────────────────────
     // Never called by clients — only by a peer replica that lost the
     // `hydration_leases` claim race for this file (see `fetch_from_peer`).
-    // Goes through the same tenant API-key auth as every other route above
-    // (no separate internal secret); peers present their own KOSHA_API_KEY.
+    // Requires an admin key (`authorize_route`): it serves raw segment
+    // bytes of any tenant. Peers present their own KOSHA_API_KEY, which is
+    // the bootstrap admin key.
     if request_line.starts_with("GET /internal/segment/") {
         #[cfg(all(feature = "s3", feature = "postgres"))]
         {
@@ -3310,36 +3473,50 @@ fn route(
         return json_ok(&serde_json::json!({"status": "ok"}));
     }
 
+    // Every legacy route resolves the caller's namespace through the same
+    // tenant scoping as the v1 routes (see `scope_legacy_body`).
     if request_line.starts_with("POST /index") {
-        return handle_index(body, state);
+        return legacy_scoped("/index", principal, body, |b| handle_index(b, state));
     }
 
     if request_line.starts_with("POST /exists") {
-        return handle_exists(body, state);
+        return legacy_scoped("/exists", principal, body, |b| handle_exists(b, state));
     }
 
     if request_line.starts_with("POST /replace") {
-        return handle_replace(body, state);
+        return legacy_scoped("/replace", principal, body, |b| handle_replace(b, state));
     }
 
     if request_line.starts_with("GET /search") {
-        return handle_search_get(request_line, state);
+        auth::record_legacy_use(tenant, "/search");
+        return match scope_legacy_search_get(request_line, principal) {
+            Ok(scoped_line) => handle_search_get(&scoped_line, state),
+            Err(resp) => resp,
+        };
     }
 
     if request_line.starts_with("POST /search") {
-        return handle_search_post(body, state);
+        return legacy_scoped("/search", principal, body, |b| handle_search_post(b, state));
     }
 
     if request_line.starts_with("POST /flush") {
-        return handle_flush(body, state);
+        auth::record_legacy_use(tenant, "/flush");
+        return match scope_legacy_body(body, principal, true) {
+            Ok(scoped) if !principal.admin && !body_has_namespace(&scoped) => {
+                handle_flush_tenant(tenant, state)
+            }
+            Ok(scoped) => handle_flush(&scoped, state),
+            Err(resp) => resp,
+        };
     }
 
     if request_line.starts_with("POST /delete") {
-        return handle_delete(body, state);
+        return legacy_scoped("/delete", principal, body, |b| handle_delete(b, state));
     }
 
     if request_line.starts_with("GET /stats") {
-        return handle_stats(state);
+        auth::record_legacy_use(tenant, "/stats");
+        return handle_stats(state, stats_scope);
     }
 
     json_error(404, "not found")
@@ -3361,7 +3538,18 @@ fn extract_namespace(request_line: &str, prefix: &str, suffix: &str) -> Option<S
     if ns.is_empty() || ns.contains('/') {
         return None;
     }
-    Some(url_decode(ns))
+    // Validate the *decoded* name too: `%2F`/`..` must not escape the
+    // tenant prefix once joined onto the data dir / S3 prefix.
+    let ns = url_decode(ns);
+    validate_namespace_name(&ns).ok()?;
+    Some(ns)
+}
+
+/// Whether a (JSON object) body names a `namespace`.
+fn body_has_namespace(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|v| v.get("namespace").is_some())
 }
 
 // ─── POST /index ────────────────────────────────────────────────────────────
@@ -3641,7 +3829,11 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
 
 // ─── GET /stats ──────────────────────────────────────────────────────────────
 
-fn handle_stats(state: &AppState) -> String {
+/// `tenant_scope`: `None` (admin) lists every namespace plus cache/S3
+/// details; `Some(tenant)` lists only that tenant's namespaces, by their
+/// unscoped names, and omits deployment internals.
+fn handle_stats(state: &AppState, tenant_scope: Option<&str>) -> String {
+    let tenant_prefix = tenant_scope.map(|t| format!("{t}/"));
     // Snapshot indexer stats before the cache-size walk — that walk can take
     // tens of seconds on a large cache and must not interleave with the
     // per-namespace bookkeeping below.
@@ -3652,6 +3844,13 @@ fn handle_stats(state: &AppState) -> String {
         let mut total_segments: usize = 0;
 
         for ns in indexer.namespaces() {
+            let display_name = match &tenant_prefix {
+                None => ns.0.as_str(),
+                Some(prefix) => match ns.0.strip_prefix(prefix.as_str()) {
+                    Some(own) => own,
+                    None => continue,
+                },
+            };
             let manifest = match indexer.manifest(&ns) {
                 Some(m) => m,
                 None => continue,
@@ -3661,7 +3860,7 @@ fn handle_stats(state: &AppState) -> String {
             total_segments += manifest.segments.len();
 
             namespaces.push(serde_json::json!({
-                "namespace": ns.0,
+                "namespace": display_name,
                 "documents": ns_docs,
                 "segments": manifest.segments.len(),
                 "version": manifest.version,
@@ -3682,6 +3881,16 @@ fn handle_stats(state: &AppState) -> String {
     #[cfg(not(feature = "s3"))]
     let (s3_enabled, s3_bucket, s3_prefix): (bool, Option<String>, Option<String>) =
         (false, None, None);
+
+    if tenant_scope.is_some() {
+        return json_ok(&serde_json::json!({
+            "total_documents": total_docs,
+            "total_segments": total_segments,
+            "namespaces": namespaces,
+            "control_plane": state.control_plane_kind,
+            "s3_enabled": s3_enabled,
+        }));
+    }
 
     json_ok(&serde_json::json!({
         "total_documents": total_docs,
@@ -4891,8 +5100,11 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
 
 /// POST /v1/admin/api-keys — create a new API key for a tenant.
 ///
-/// Requires existing admin API key (from KOSHA_API_KEY env var or DB).
+/// Admin key required (enforced by `authorize_route`). The new key is a
+/// tenant (non-admin) key; it works on this pod immediately and on every
+/// other pod after its next key refresh (`KOSHA_API_KEY_REFRESH_SECS`).
 /// Request body: {"tenant_id": "acme-corp", "description": "staging key"}
+#[allow(unused_variables)]
 fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String {
     let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -4903,40 +5115,38 @@ fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String
         Some(t) => t,
         None => return json_error(400, "missing 'tenant_id'"),
     };
+    // The tenant id becomes a namespace prefix, so it obeys the same rules.
+    if let Err(e) = validate_namespace_name(tenant_id) {
+        return json_error(400, &format!("invalid 'tenant_id': {e}"));
+    }
 
     let description = req
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Try to create via PgStore (only works with postgres feature).
     #[cfg(feature = "postgres")]
     {
-        let controller = state.controller.lock().unwrap();
-        // Downcast the Box<dyn ControlStore> to see if it's a PgStore.
-        // We use a simple approach: look for "postgres" in the store type name.
-        // Check if DATABASE_URL is set (indicating PgStore).
-        drop(controller);
-
+        let auth::Auth::Keys(store) = auth::global() else {
+            return json_error(400, "API keys are not in use (KOSHA_AUTH=disabled)");
+        };
         if std::env::var("DATABASE_URL").is_err() {
             return json_error(400, "Postgres not configured (DATABASE_URL not set)");
         }
-
-        // Re-create connection for the admin operation.
-        // This is a simplified approach — in production, share the pool.
-        match std::env::var("DATABASE_URL") {
-            Ok(db_url) => match kosha_control::PgStore::new(&db_url) {
-                Ok(store) => match store.create_api_key(tenant_id, description) {
-                    Ok(api_key) => json_ok(&serde_json::json!({
-                        "api_key": api_key,
-                        "tenant_id": tenant_id,
-                        "description": description,
-                    })),
-                    Err(e) => json_error(500, &format!("failed to create key: {e}")),
-                },
-                Err(e) => json_error(500, &format!("failed to connect to postgres: {e}")),
-            },
-            Err(_) => json_error(400, "Postgres not configured"),
+        // Shared pool owned by the key store, not a fresh connection per call.
+        let Some(pg) = store.pg() else {
+            return json_error(500, "failed to connect to postgres");
+        };
+        match pg.create_api_key(tenant_id, description) {
+            Ok(api_key) => {
+                store.insert_db_key(api_key.clone(), tenant_id.to_string());
+                json_ok(&serde_json::json!({
+                    "api_key": api_key,
+                    "tenant_id": tenant_id,
+                    "description": description,
+                }))
+            }
+            Err(e) => json_error(500, &format!("failed to create key: {e}")),
         }
     }
 
@@ -5187,7 +5397,12 @@ fn json_error(status_code: u16, message: &str) -> String {
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        403 => "403 Forbidden",
         404 => "404 Not Found",
+        409 => "409 Conflict",
+        410 => "410 Gone",
+        413 => "413 Payload Too Large",
         429 => "429 Too Many Requests",
         500 => "500 Internal Server Error",
         503 => "503 Service Unavailable",
