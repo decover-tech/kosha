@@ -774,19 +774,29 @@ impl BloomFilter {
         filter
     }
 
+    /// Whether `value` may be in the set (`false` is definite).
+    ///
+    /// Reads the `k` bits it needs straight out of the base64 text, one
+    /// 4-character group each. It used to decode the whole filter into a
+    /// fresh buffer on every call, and a search asks this of every
+    /// segment's term bloom for every query term, twice (when choosing what
+    /// to fetch and again when scoring).
+    ///
+    /// A filter that cannot be read (empty, or a bit that falls outside the
+    /// text) cannot prune: the answer is `true`.
     pub fn may_contain(&self, value: &str) -> bool {
-        let bits = match decode_base64(&self.bits_b64) {
-            Some(b) if !b.is_empty() && self.num_bits > 0 => b,
-            _ => return true, // corrupt/empty → cannot prune
-        };
+        if self.num_bits == 0 || self.bits_b64.is_empty() {
+            return true;
+        }
+        let text = self.bits_b64.as_bytes();
         let m = self.num_bits as u64;
         let (h1, h2) = bloom_hashes(value);
         for i in 0..self.k {
             let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) % m;
-            let idx = (bit / 8) as usize;
-            let mask = 1u8 << (bit % 8);
-            if idx >= bits.len() || bits[idx] & mask == 0 {
-                return false;
+            match base64_byte(text, (bit / 8) as usize) {
+                Some(byte) if byte & (1u8 << (bit % 8)) == 0 => return false,
+                Some(_) => {}
+                None => return true,
             }
         }
         true
@@ -961,40 +971,33 @@ fn encode_base64(data: &[u8]) -> String {
     out
 }
 
-fn decode_base64(s: &str) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u8> {
+/// Byte `index` of the data a base64 string encodes, decoding only the
+/// 4-character group that byte sits in. `None` if the group is missing,
+/// malformed, or padded at that position.
+fn base64_byte(text: &[u8], index: usize) -> Option<u8> {
+    fn val(c: u8) -> Option<u32> {
         match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
             b'+' => Some(62),
             b'/' => Some(63),
             b'=' => Some(0),
             _ => None,
         }
     }
-    let bytes = s.as_bytes();
-    if !bytes.len().is_multiple_of(4) {
+    let start = index / 3 * 4;
+    let group = text.get(start..start + 4)?;
+    let position = index % 3;
+    // Byte 1 of a group is absent when its third character is padding, and
+    // byte 2 when its fourth is.
+    if position > 0 && group[position + 1] == b'=' {
         return None;
     }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
-        let (a, b, c, d) = (
-            val(chunk[0])?,
-            val(chunk[1])?,
-            val(chunk[2])?,
-            val(chunk[3])?,
-        );
-        let n = (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
-        out.push(((n >> 16) & 0xff) as u8);
-        if chunk[2] != b'=' {
-            out.push(((n >> 8) & 0xff) as u8);
-        }
-        if chunk[3] != b'=' {
-            out.push((n & 0xff) as u8);
-        }
-    }
-    Some(out)
+    let n = group
+        .iter()
+        .try_fold(0u32, |n, &c| Some((n << 6) | val(c)?))?;
+    Some((n >> (16 - 8 * position)) as u8)
 }
 
 /// Whether a segment with the given footer blooms might satisfy `filter`.
@@ -1684,6 +1687,53 @@ mod filter_clause_parsing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_byte_reads_any_byte_without_decoding_the_rest() {
+        // Lengths 1..=8 cover every padding shape; 300 spans many groups.
+        for len in (1..=8).chain([300]) {
+            let data: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let text = encode_base64(&data);
+            for (i, byte) in data.iter().enumerate() {
+                assert_eq!(
+                    base64_byte(text.as_bytes(), i),
+                    Some(*byte),
+                    "len {len} byte {i}"
+                );
+            }
+            assert_eq!(
+                base64_byte(text.as_bytes(), len),
+                None,
+                "one past the end, len {len}"
+            );
+        }
+        assert_eq!(base64_byte(b"!!!!", 0), None, "malformed group");
+    }
+
+    #[test]
+    fn bloom_answers_are_unchanged_by_reading_bits_in_place() {
+        let values: Vec<String> = (0..500).map(|i| format!("term{i}")).collect();
+        let bloom = BloomFilter::build(values.iter().map(String::as_str));
+        assert!(
+            values.iter().all(|v| bloom.may_contain(v)),
+            "no false negatives"
+        );
+        let false_positives = (0..2000)
+            .filter(|i| bloom.may_contain(&format!("absent{i}")))
+            .count();
+        assert!(false_positives < 200, "{false_positives} of 2000");
+        // Unreadable filters cannot prune.
+        let empty = BloomFilter {
+            bits_b64: String::new(),
+            ..bloom.clone()
+        };
+        assert!(empty.may_contain("anything"));
+        let truncated = BloomFilter {
+            bits_b64: bloom.bits_b64[..8].to_string(),
+            ..bloom
+        };
+        assert!(values.iter().all(|v| truncated.may_contain(v)));
+    }
 
     #[test]
     fn ids_wrap_strings() {
