@@ -1567,15 +1567,7 @@ impl Searcher {
                 // external stream with no ordering validation, so they take
                 // the order-agnostic general path (a debug_assert alone
                 // would let a release build silently drop hits).
-                && reader.has_ordered_postings()
-                // OR's WAND join relies on skip-ahead pruning to stay fast,
-                // which is exactly what makes an exact union count
-                // impossible (see the join's doc comment below) — an OR
-                // query in exact-count mode takes the general path's full
-                // union scan instead. AND is unaffected: count_budget ==
-                // None there just disables early exit and walks to
-                // completion on the SAME leapfrog algorithm.
-                && (operator == kosha_core::QueryOperator::And || count_budget.is_some());
+                && reader.has_ordered_postings();
             if can_block_max_wand {
                 // The whole WAND attempt is fallible: a corrupt v5 block
                 // detected mid-walk yields `None`, and the query falls
@@ -1730,6 +1722,22 @@ impl Searcher {
                     }
 
                     if operator == kosha_core::QueryOperator::Or {
+                        // An exact union count needs every member visited,
+                        // and this join's speed comes from skipping them
+                        // (see below), so an exact-count OR over several
+                        // terms takes the general path's full union scan.
+                        //
+                        // That check sits here, after the single-term arms,
+                        // and not in the gate above. With one term present
+                        // in the segment OR and AND are the same query, and
+                        // the single-term walk counts exactly. Gating on
+                        // the operator sent every single-word search with
+                        // an exact total down the general path, because an
+                        // OpenSearch `match` is OR by default and that is
+                        // what the client sends.
+                        if count_budget.is_none() {
+                            return None;
+                        }
                         // ── Multi-term block-max OR: WAND pivot join ──
                         //
                         // Union membership doesn't need every cursor to
@@ -5905,6 +5913,45 @@ mod tests {
             .iter()
             .all(|d| field(d, "contentEmbedding").is_none()));
         assert!(r.results.iter().all(|d| field(d, "content").is_some()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_term_or_with_exact_total_matches_and() {
+        // What the backend sends for a one-word search: a `match` (OR by
+        // default) with `track_total_hits: true`. With one term, OR and AND
+        // are the same query and must give the same exact answer.
+        let dir = std::env::temp_dir().join("kosha-test-single-term-or");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ns, manifest) = mk_matter_corpus(&dir);
+        let searcher = Searcher::new(dir.clone());
+        let mut and = mk_query("contract", 5);
+        and.exact_total_hits = Some(true);
+        and.filter = Some(matter_filter("m1"));
+        let mut or = and.clone();
+        or.operator = Some(kosha_core::QueryOperator::Or);
+
+        let and_result = searcher.search(&ns, &manifest, &and, None).unwrap();
+        let or_result = searcher.search(&ns, &manifest, &or, None).unwrap();
+        assert_eq!(or_result.total_hits, 14);
+        assert_eq!(or_result.total_hits, and_result.total_hits);
+        assert_eq!(or_result.total_hits_relation, TotalHitsRelation::Eq);
+        let ids = |r: &SearchResult| {
+            r.results
+                .iter()
+                .map(|d| d.doc_id.0.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&or_result), ids(&and_result));
+
+        // Two words, exact total, OR: a real union, still counted exactly
+        // (14 chunks of m1 say "contract"; "breach" adds none that do not).
+        let mut two = mk_query_or("contract breach", 5);
+        two.exact_total_hits = Some(true);
+        two.filter = Some(matter_filter("m1"));
+        let result = searcher.search(&ns, &manifest, &two, None).unwrap();
+        assert_eq!(result.total_hits, 14);
+        assert_eq!(result.total_hits_relation, TotalHitsRelation::Eq);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
