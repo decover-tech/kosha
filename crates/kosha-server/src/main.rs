@@ -992,7 +992,7 @@ impl AppState {
         #[cfg(feature = "s3")]
         let mut reconciled_missing = 0usize;
         for ns in control_store.list_namespaces() {
-            if let Some(manifest) = control_store.manifest_cloned(&ns) {
+            if let Some(mut manifest) = control_store.manifest_cloned(&ns) {
                 if !manifest.segments.is_empty() {
                     restored_segments += manifest.segments.len();
 
@@ -1038,6 +1038,15 @@ impl AppState {
                         }
                     }
                 }
+                kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
+                    let path = vector.path(&ns, segment)?;
+                    #[cfg(feature = "s3")]
+                    if let Some(ref s3) = s3_storage {
+                        return s3.read(&path);
+                    }
+                    Ok(std::fs::read(data_dir.join(path))?)
+                })
+                .expect("cannot restore manifest deletion bitmaps");
                 indexer.restore_manifest(ns, manifest);
                 restored += 1;
             }
@@ -1633,7 +1642,7 @@ impl AppState {
     /// control store, so the segment list survives restarts.
     fn refresh_query_namespace(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
         if self.ingest_host.is_some() {
-            let manifest = self
+            let mut manifest = self
                 .controller
                 .lock()
                 .unwrap()
@@ -1644,6 +1653,14 @@ impl AppState {
                 .manifest_cloned(ns)
                 .is_none_or(|local| local.version < manifest.version)
             {
+                kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
+                    let path = vector.path(ns, segment)?;
+                    #[cfg(feature = "s3")]
+                    if let Some(ref s3) = self.s3_storage {
+                        return s3.read(&path);
+                    }
+                    Ok(std::fs::read(self.data_dir.join(path))?)
+                })?;
                 self.indexer.restore_manifest(ns.clone(), manifest);
             }
         }
@@ -1687,7 +1704,7 @@ impl AppState {
             .or_default()
             .clone();
         let _guard = lock.lock().unwrap();
-        let Some((expected_version, manifest)) = self.indexer.publication_snapshot(ns) else {
+        let Some((expected_version, manifest)) = self.indexer.prepare_publication(ns)? else {
             return Ok(());
         };
         upload(&manifest)?;
@@ -1746,6 +1763,13 @@ impl AppState {
                 .lock()
                 .unwrap()
                 .insert((ns.clone(), segment_id));
+        }
+        if let Some(ref s3) = self.s3_storage {
+            for (segment, vector) in &manifest.deletion_vectors {
+                let path = vector.path(ns, segment)?;
+                let bytes = std::fs::read(self.data_dir.join(&path))?;
+                s3.write(&path, &bytes)?;
+            }
         }
         Ok(())
     }
@@ -2664,7 +2688,7 @@ impl AppState {
             posting_blob_cache_lookup(&cache, &ns.0, manifest_version, eviction_gen)
         };
 
-        let (logical_paths, mut newly_confirmed) = plan_posting_blob_fetch(
+        let (mut logical_paths, mut newly_confirmed) = plan_posting_blob_fetch(
             seg_paths,
             posting_files,
             &self.data_dir,
@@ -2674,6 +2698,13 @@ impl AppState {
         );
 
         let mut outcome = HydrationOutcome::default();
+        match prune_unwritten_posting_blobs(&self.data_dir, &mut logical_paths) {
+            Ok(absent) => newly_confirmed.extend(absent),
+            Err(error) => {
+                outcome.missing.push(error.to_string());
+                return outcome;
+            }
+        }
         if !logical_paths.is_empty() {
             println!(
                 "cache miss: hydrating {} posting blob(s) across {} segment(s) (fan-out={})",
@@ -2907,6 +2938,39 @@ fn plan_posting_blob_fetch(
     }
 
     (logical_paths, newly_confirmed)
+}
+
+/// Cache a TOC-proven absence as resolved, just like a present shard:
+/// immutable segments cannot later gain terms. Unreadable TOCs fail closed.
+#[cfg(feature = "s3")]
+fn prune_unwritten_posting_blobs(
+    data_dir: &Path,
+    paths: &mut Vec<(String, u64)>,
+) -> Result<Vec<(String, String)>, KoshaError> {
+    let mut inventories = HashMap::new();
+    for (path, _) in paths.iter() {
+        if let Some((segment, _)) = path.rsplit_once('/') {
+            if !inventories.contains_key(segment) {
+                inventories.insert(
+                    segment.to_owned(),
+                    kosha_segment::posting_blob_inventory(&data_dir.join(segment))?,
+                );
+            }
+        }
+    }
+    let mut absent = Vec::new();
+    paths.retain(|(path, _)| {
+        let Some((segment, file)) = path.rsplit_once('/') else {
+            return true;
+        };
+        if inventories[segment].contains(file) {
+            true
+        } else {
+            absent.push((segment.to_owned(), file.to_owned()));
+            false
+        }
+    });
+    Ok(absent)
 }
 
 /// `posting_blob_presence` type alias — spelled out at each use site
@@ -4050,22 +4114,22 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // kNN queries are cacheable too — ANN probing is deterministic for a
     // fixed manifest — but their embedding is digested rather than
     // inlined (see `canonical_query_for_cache`): a 1024-dim vector is
-    // ~14KB of JSON, which would bloat every key and turn each lookup
-    // into a long string compare. Deliberately NOT cached: requests that
-    // opt out (`no_cache`) and namespaces with live tombstones —
-    // tombstones flow to the searcher outside the manifest, so a
-    // version-keyed entry could serve deleted docs (verify-then-relax is
-    // a follow-up, skip-when-present is the safe v1).
-    let has_tombstones = tombstones
-        .as_ref()
-        .is_some_and(|t| t.values().any(|s| !s.is_empty()));
-    let cache_key =
-        if result_cache_budget() > 0 && !query.no_cache.unwrap_or(false) && !has_tombstones {
-            canonical_query_for_cache(&query)
-                .map(|canonical| (ns.0.clone(), manifest.version, canonical))
-        } else {
-            None
-        };
+    // ~14KB of JSON. Deletions are part of a versioned snapshot; immutable
+    // generation references also participate in cache identity.
+    let cache_key = if result_cache_budget() > 0 && !query.no_cache.unwrap_or(false) {
+        canonical_query_for_cache(&query).map(|mut canonical| {
+            let mut generations: Vec<_> = manifest
+                .deletion_vectors
+                .iter()
+                .map(|(segment, vector)| (&segment.0, &vector.generation))
+                .collect();
+            generations.sort_unstable();
+            canonical.push_str(&serde_json::to_string(&generations).unwrap());
+            (ns.0.clone(), manifest.version, canonical)
+        })
+    } else {
+        None
+    };
     if let Some(ref key) = cache_key {
         if let Some(resp) = state.result_cache.lock().unwrap().lookup(key) {
             return resp;
@@ -5100,6 +5164,7 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
         wal_checkpoint: 0,
         wal_origin: None,
         tombstones: Default::default(),
+        deletion_vectors: Default::default(),
     }
 }
 
@@ -5657,6 +5722,136 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "s3")]
+    #[test]
+    fn no_op_publication_preserves_legacy_inline_delete_representation() {
+        let state = test_state();
+        let ns = NamespaceId("legacy-deletes".into());
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId("d".into()),
+                    fields: vec![Field::text("text", "hello")],
+                }],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        let mut legacy = state.indexer.manifest(&ns).unwrap();
+        legacy.version += 1;
+        legacy.tombstones.insert(
+            legacy.segments[0].segment_id.clone(),
+            [0].into_iter().collect(),
+        );
+        state
+            .controller
+            .lock()
+            .unwrap()
+            .save_manifest(&ns, &legacy)
+            .unwrap();
+        state.indexer.restore_manifest(ns.clone(), legacy.clone());
+        state.publish_namespace(&ns).unwrap();
+        assert!(state
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_cloned(&ns)
+            .unwrap()
+            .same_contents(&legacy));
+    }
+
+    #[test]
+    fn tiny_upsert_segments_only_hydrate_shards_present_in_the_toc() {
+        let state = test_state();
+        let segment = state.data_dir.join("ns/s1");
+        let mut writer =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("s1".into()), segment.clone());
+        writer.add_document(DocumentId("d".into()), vec![Field::text("text", "hello")]);
+        writer.finalize(kosha_core::Bm25Params::default()).unwrap();
+        let present = kosha_segment::posting_blob_file_for_term("hello");
+        let absent = kosha_segment::all_posting_blob_files()
+            .into_iter()
+            .find(|file| file != &present)
+            .unwrap();
+        fs::remove_file(segment.join(&present)).unwrap(); // evicted, still required
+        let mut fetch = vec![
+            (format!("ns/s1/{present}"), 0),
+            (format!("ns/s1/{absent}"), 0),
+        ];
+        let resolved = prune_unwritten_posting_blobs(&state.data_dir, &mut fetch).unwrap();
+        assert_eq!(fetch, vec![(format!("ns/s1/{present}"), 0)]);
+        assert_eq!(resolved, vec![("ns/s1".into(), absent)]);
+        fs::write(segment.join("inverted.idx"), b"corrupt").unwrap();
+        assert!(prune_unwritten_posting_blobs(&state.data_dir, &mut fetch).is_err());
+    }
+
+    #[test]
+    fn deletion_upload_failure_keeps_old_manifest_and_wal_for_retry() {
+        let state = test_state();
+        let ns = NamespaceId("delete-upload".into());
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId("d".into()),
+                    fields: vec![Field::text("text", "hello")],
+                }],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+        let old = state
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_cloned(&ns)
+            .unwrap();
+        state
+            .indexer
+            .delete_by_query(
+                &ns,
+                &old,
+                &kosha_core::FilterClause::MatchAll {
+                    match_all: Some(serde_json::json!({})),
+                },
+            )
+            .unwrap();
+        let failed = state.publish_namespace_with(&ns, |candidate| {
+            assert_eq!(candidate.deletion_vectors.len(), 1);
+            for (segment, vector) in &candidate.deletion_vectors {
+                let bytes = std::fs::read(state.data_dir.join(vector.path(&ns, segment)?))?;
+                assert_eq!(vector.decode(&bytes, 1)?.len(), 1);
+            }
+            Err(KoshaError::NotFound(
+                "injected sidecar upload failure".into(),
+            ))
+        });
+        assert!(failed.is_err());
+        assert!(state
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_cloned(&ns)
+            .unwrap()
+            .same_contents(&old));
+        assert!(
+            kosha_write::wal::WalWriter::recover(&state.data_dir.join("_wal"))
+                .unwrap()
+                .iter()
+                .any(|r| !r.deleted_ids.is_empty())
+        );
+        state.publish_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap(); // identical bitmap snapshot retry
+
+        assert!(
+            kosha_write::wal::WalWriter::recover(&state.data_dir.join("_wal"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn lost_commit_reply_is_retryable_without_losing_the_next_flush() {
         let shared = SharedManifestStore {
@@ -5937,13 +6132,36 @@ mod tests {
             &ingest,
         );
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let published = copy_manifest();
+        assert!(
+            published.tombstones.is_empty(),
+            "published deletes live in sidecars"
+        );
+        assert_eq!(published.deletion_vectors.len(), 1);
+        let (segment, vector) = published.deletion_vectors.iter().next().unwrap();
+        let path = ingest.data_dir.join(vector.path(&ns, segment).unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
         query
             .controller
             .lock()
             .unwrap()
-            .save_manifest(&ns, &copy_manifest())
+            .save_manifest(&ns, &published)
             .unwrap();
+        let failed = handle_search_post(search, &query);
+        assert!(
+            failed.starts_with("HTTP/1.1 500"),
+            "missing deletion generation must fail closed: {failed}"
+        );
+        std::fs::write(&path, bytes).unwrap();
         assert!(handle_search_post(search, &query).contains("\"total_hits\":0"));
+        let hits = query.result_cache.lock().unwrap().hits;
+        assert!(handle_search_post(search, &query).contains("\"total_hits\":0"));
+        assert_eq!(
+            query.result_cache.lock().unwrap().hits,
+            hits + 1,
+            "deletes must not disable result caching"
+        );
     }
 
     #[test]
@@ -6211,6 +6429,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         // Simulate: an earlier publish call already confirmed seg-2
         // synced (e.g. it was "last" at the time it ran), but seg-1 and
@@ -6887,6 +7106,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
@@ -7019,6 +7239,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),

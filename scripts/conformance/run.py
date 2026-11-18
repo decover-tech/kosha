@@ -12,7 +12,7 @@ Checkpoints, in order:
   buffered       docs indexed but not flushed  -> nothing may be visible
   one-segment    first flush
   many-segments  several more flushes          -> per-segment BM25 statistics
-  upserts        re-index flushed and buffered ids (segment rewrite path)
+  upserts        re-index flushed and buffered ids (mark-deleted + append path)
   deletes        delete-by-query, delete vs. unflushed docs, re-index of a
                  deleted id
   compacted      tiered compaction via the admin endpoint
@@ -153,7 +153,8 @@ class Kosha:
 class Spawned:
     """A kosha-server child process with a throwaway data dir."""
 
-    def __init__(self, binary: str, port: int, api_key: str, admin_key: str, database_url: Optional[str]):
+    def __init__(self, binary: str, port: int, api_key: str, admin_key: str, database_url: Optional[str], cold_restart: bool = False):
+        self.cold_restart = cold_restart
         self.binary = os.path.abspath(binary)
         self.database_url = database_url
         self.port = port
@@ -190,6 +191,8 @@ class Spawned:
 
     def restart(self) -> None:
         self.stop()
+        if self.cold_restart:
+            shutil.rmtree(os.path.join(self.dir, "data"), ignore_errors=True)
         self.start()
 
     def cleanup(self, keep: bool) -> None:
@@ -400,7 +403,7 @@ def run(args, kosha: Kosha, restart) -> Results:
         both(kosha.flush, oracle.flush)
     checkpoint("many-segments", res, kosha, oracle, qs, walks)
 
-    # upserts: flushed ids (segment rewrite), then buffered ids replaced
+    # upserts: flushed ids (mark-deleted + append), then buffered ids replaced
     # before their first flush.
     flushed = [corpus.make_doc(seed, i, 1) for i in range(0, tail_start, 37)]
     both(lambda: kosha.index(flushed[: len(flushed) // 2]), lambda: oracle.index(flushed[: len(flushed) // 2]))
@@ -435,6 +438,11 @@ def run(args, kosha: Kosha, restart) -> Results:
     both(lambda: kosha.index(revived), lambda: oracle.index(revived))
     both(kosha.flush, oracle.flush)
     checkpoint("deletes", res, kosha, oracle, qs, walks)
+
+    if args.cold_restart and restart is not None:
+        restart()
+        kosha.wait_healthy()
+        checkpoint("deletes-restarted", res, kosha, oracle, qs, walks)
 
     # compacted
     out = kosha.compact()
@@ -508,6 +516,7 @@ def main() -> int:
         help="Postgres control plane for --spawn. Without it the server keeps manifests in memory, "
         "so a restart forgets the namespace and the 'restarted' checkpoint is skipped",
     )
+    p.add_argument("--cold-restart", action="store_true", help="clear the spawned server cache on restart; requires Postgres and S3")
     p.add_argument("--restart-cmd", help="shell command that restarts the --host server (enables the 'restarted' checkpoint)")
     p.add_argument("--namespace", help="default: conformance-<seed>-<unix time>")
     p.add_argument("--seed", type=int, default=1)
@@ -517,11 +526,13 @@ def main() -> int:
     p.add_argument("--strict", action="store_true", help="also fail when an expected failure passes")
     p.add_argument("--verbose", action="store_true", help="list every expected failure, not just the bugs")
     args = p.parse_args()
+    if args.cold_restart and not (args.spawn and args.database_url and os.environ.get("KOSHA_S3_BUCKET")):
+        p.error("--cold-restart requires --spawn, --database-url and KOSHA_S3_BUCKET")
 
     ns = args.namespace or "conformance-%d-%d" % (args.seed, int(time.time()))
     spawned = None
     if args.spawn:
-        spawned = Spawned(args.spawn, args.port, args.api_key, args.admin_key, args.database_url)
+        spawned = Spawned(args.spawn, args.port, args.api_key, args.admin_key, args.database_url, args.cold_restart)
         spawned.start()
         kosha = Kosha("http://127.0.0.1:%d" % args.port, args.api_key, ns, args.admin_key, args.tenant)
         restart = spawned.restart if args.database_url else None

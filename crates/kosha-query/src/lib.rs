@@ -1550,7 +1550,15 @@ impl Searcher {
         let phrase_tokenized = phrase_match.as_ref().map(|p| &p.0);
 
         // ── BM25 scoring with positions for phrase ──
-        if !effective_terms.is_empty() || phrase_tokenized.is_some() {
+        // Bloom filters may have false positives. AND requires every term
+        // in the actual TOC, including in tiny replacement segments. Keep
+        // vector-only hybrid matches eligible when the lexical side is empty.
+        let missing_required_term = !is_wildcard_mode
+            && operator == kosha_core::QueryOperator::And
+            && effective_terms
+                .iter()
+                .any(|term| !reader.contains_term(term));
+        if (!effective_terms.is_empty() || phrase_tokenized.is_some()) && !missing_required_term {
             let terms_for_bm25 = if let Some(ref pt) = phrase_tokenized {
                 pt
             } else {
@@ -1612,9 +1620,8 @@ impl Searcher {
             //     handles and that the early-termination path would
             //     silently short-circuit (agg slices, filter comparisons,
             //     phrase re-ranking, knn-only hybrid merge, …).
-            //   * tombstones: even a sparse tombstone set changes `total_hits`
-            //     by some-doc subtraction — fording a fall-back to the full
-            //     path where total_hits = candidates.len() remains exact.
+            // Deletion membership is tested before counting/scoring. Block
+            // bounds remain conservative when documents are deleted.
             //
             // Every path above stays exact per segment, on purpose — no
             // pruning here ever bends a count (the KIZC lesson: a pruning
@@ -1637,9 +1644,8 @@ impl Searcher {
                 && query.filter.is_none()
                 && query.knn.is_none()
                 && query.search_after.as_ref().is_none_or(|a| a.is_empty())
-                && sort_value_fields.is_empty()
+                && query.sort.is_empty()
                 && query.aggs.is_empty()
-                && !segment_has_tombstones
                 // The leapfrog join's gallop is only correct on strictly
                 // ascending postings. Every current writer format
                 // guarantees that; legacy v1 Eager segments parse an
@@ -1664,10 +1670,8 @@ impl Searcher {
                 // instead would truncate AND intersections or report an
                 // exact-looking total_hits with missing candidates.
                 let wand_attempt = || -> Option<SegmentOutput> {
-                    // Terms absent from this segment are omitted (not treated as
-                    // empty lists) — mirroring the general path, whose AND
-                    // intersection runs over whatever `postings_for_terms`
-                    // returns, i.e. only the terms present in this segment.
+                    // Required AND terms were verified in the TOC above;
+                    // absent optional OR terms can be omitted here.
                     //
                     // v5 (skip-split) segments hand back block-lazy skip-table
                     // views: positions bytes are never decoded on this path,
@@ -1708,7 +1712,20 @@ impl Searcher {
                     if let [source] = sources.as_slice() {
                         // ── Single present term: block-by-block walk ──
                         let df = source.doc_count() as u32;
-                        let total_hits = source.doc_count();
+                        let total_hits = if segment_has_tombstones {
+                            let mut count = 0;
+                            let mut postings = Vec::new();
+                            for block in 0..source.block_count() {
+                                if !source.read_block(block, &mut postings) {
+                                    return None;
+                                }
+                                count +=
+                                    postings.iter().filter(|p| !is_tombstoned(p.doc_id)).count();
+                            }
+                            count
+                        } else {
+                            source.doc_count()
+                        };
                         if effective_k == 0 {
                             // Pure count-only: skip all scoring; total_hits IS df.
                             return Some(SegmentOutput {
@@ -1778,6 +1795,9 @@ impl Searcher {
                                 return None;
                             }
                             for sp in &buf {
+                                if is_tombstoned(sp.doc_id) {
+                                    continue;
+                                }
                                 if let Some(meta) = reader.doc_meta(sp.doc_id) {
                                     let score =
                                         scorer.score_term(sp.term_frequency, df, meta.field_length);
@@ -1931,6 +1951,16 @@ impl Searcher {
                                 }
                             }
 
+                            if is_tombstoned(pivot_doc) {
+                                for i in 0..cursors.len() {
+                                    if cur[i] == Some(pivot_doc) {
+                                        cur[i] = pivot_doc
+                                            .checked_add(1)
+                                            .and_then(|next| cursors[i].advance_to(next));
+                                    }
+                                }
+                                continue 'or_join;
+                            }
                             total_hits += 1;
                             if let Some(meta) = reader.doc_meta(pivot_doc) {
                                 // Query-term order (0..cursors.len()), not
@@ -2076,6 +2106,13 @@ impl Searcher {
                         // *counted*) — then score it only if its summed
                         // per-term block ceiling says it could still make the
                         // page.
+                        if is_tombstoned(candidate) {
+                            let Some(next) = candidate.checked_add(1) else {
+                                break;
+                            };
+                            target = next;
+                            continue 'join;
+                        }
                         total_hits += 1;
                         if effective_k > 0 {
                             if let Some(meta) = reader.doc_meta(candidate) {
@@ -2660,6 +2697,22 @@ impl Searcher {
         >,
         doc_store_hydrator: DocStoreHydrator<'_>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
+        let mut hydrated;
+        let manifest = if manifest
+            .deletion_vectors
+            .keys()
+            .any(|segment| !manifest.tombstones.contains_key(segment))
+        {
+            hydrated = manifest.clone();
+            kosha_core::deletes::hydrate(&mut hydrated, |segment, vector| {
+                Ok(std::fs::read(
+                    self.data_dir.join(vector.path(namespace, segment)?),
+                )?)
+            })?;
+            &hydrated
+        } else {
+            manifest
+        };
         let tombstones = tombstones.or(Some(&manifest.tombstones));
         let mut phase_stats = SearchPhaseStats::default();
         if manifest.segments.is_empty() {
@@ -4068,6 +4121,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         for (segment, docs) in [
             (
@@ -4272,6 +4326,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -4404,6 +4459,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -4493,6 +4549,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -4661,6 +4718,7 @@ mod tests {
                 wal_checkpoint: 0,
                 wal_origin: None,
                 tombstones: Default::default(),
+                deletion_vectors: Default::default(),
             },
             all,
         )
@@ -4920,6 +4978,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
 
         // Reproduce the production regime exactly, independent of how this
@@ -5084,6 +5143,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let result = searcher.search(
             &NamespaceId("test".into()),
@@ -5137,6 +5197,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5207,6 +5268,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5292,6 +5354,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let result = searcher
             .search(
@@ -5389,6 +5452,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut query = mk_query("", 10);
@@ -5466,6 +5530,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -5552,6 +5617,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
 
         // Generous entry-count cap (10) but a byte budget that fits s1 alone,
@@ -5669,6 +5735,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -5728,6 +5795,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
@@ -5780,6 +5848,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5949,6 +6018,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mk_knn_q = |num_candidates: usize| {
@@ -6074,6 +6144,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 1);
@@ -6143,6 +6214,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -6207,6 +6279,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -6276,6 +6349,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         (dir, manifest)
     }
@@ -6393,6 +6467,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         // Fresh searcher (no warm in-memory segment cache) so opening the
         // segment for these searches goes through the real `try_read_doc_index`
@@ -6471,6 +6546,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         // Fresh searcher so each segment is actually opened (Lazy), not
         // served from a warm cache populated by an earlier call here.
@@ -6589,6 +6665,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -6638,6 +6715,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -6695,6 +6773,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -6791,6 +6870,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -6834,6 +6914,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -6892,6 +6973,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         }
     }
 
@@ -6943,6 +7025,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         }
     }
 
@@ -7130,6 +7213,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7268,6 +7352,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
 
         // Baseline (uncorrupted): "alpha beta" intersects, "beta" matches.
@@ -7361,6 +7446,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         // Open + warm the segment so the reader is cached, THEN evict
@@ -7413,6 +7499,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7440,17 +7527,9 @@ mod tests {
     }
 
     #[test]
-    fn multi_term_wand_absent_term_intersects_present_terms_only() {
-        // Two layers of absent-term handling, and the WAND gate must
-        // preserve both:
-        //   1. With a term bloom in the footer, an absent term AND-prunes
-        //      the whole segment before scoring — zero hits on any path.
-        //   2. Without a bloom (legacy footers, bloom false positives),
-        //      `postings_for_terms` omits the absent term and the general
-        //      path intersects only present terms — "alpha nosuchterm"
-        //      behaves like "alpha". The gate routes that one present term
-        //      through the single-term block walk; it must not treat the
-        //      absent term as an empty list and fabricate zero hits.
+    fn multi_term_wand_absent_term_requires_all_terms() {
+        // Bloom pruning and exact TOC checks must agree: an AND query
+        // with an absent required term is empty on both scoring paths.
         let dir = std::env::temp_dir().join("kosha-test-wand-absent-term");
         let _ = std::fs::remove_dir_all(&dir);
         let ns = NamespaceId("test".into());
@@ -7473,8 +7552,7 @@ mod tests {
         assert_eq!(wand.total_hits, 0, "term bloom AND-prunes the segment");
         assert_eq!(legacy.total_hits, 0);
 
-        // Layer 2: strip the term bloom (pre-bloom segment) → in-segment
-        // present-terms-only intersection semantics.
+        // Without the bloom, the exact TOC check still rejects the segment.
         let mut footer = SegmentReader::read_footer(&seg_dir).unwrap();
         footer.term_bloom = None;
         std::fs::write(
@@ -7494,7 +7572,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(wand.total_hits, 200, "every doc contains alpha");
+        assert_eq!(wand.total_hits, 0, "AND requires the absent term too");
         assert_eq!(wand.total_hits, legacy.total_hits);
         assert_eq!(page_ids(&wand), page_ids(&legacy));
 
@@ -7560,6 +7638,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7622,6 +7701,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -7633,9 +7713,108 @@ mod tests {
     }
 
     #[test]
-    fn multi_term_wand_tombstones_fall_back_to_exact_full_path() {
-        // A segment with live tombstones must bypass the WAND gate — the
-        // pruned join can't subtract tombstoned docs from its exact count.
+    fn and_missing_a_term_is_empty_even_without_a_bloom_filter() {
+        let dir = std::env::temp_dir().join("kosha-and-missing-no-bloom");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_wand_corpus(&dir, &ns.0, 60);
+        let path = dir.join("test/s1/footer.json");
+        let mut footer: kosha_core::Footer =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        footer.term_bloom = None;
+        std::fs::write(path, serde_json::to_vec(&footer).unwrap()).unwrap();
+        let searcher = Searcher::new(dir.clone());
+        for query in [
+            mk_query("alpha absentterm", 10),
+            force_legacy(mk_query("alpha absentterm", 10)),
+        ] {
+            let result = searcher.search(&ns, &manifest, &query, None).unwrap();
+            assert_eq!(result.total_hits, 0);
+            assert!(result.results.is_empty());
+        }
+        assert!(
+            searcher
+                .search(&ns, &manifest, &mk_query_or("alpha absentterm", 10), None)
+                .unwrap()
+                .total_hits
+                > 0
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deletes_with_custom_sort_preserve_full_candidate_order() {
+        let dir = std::env::temp_dir().join("kosha-deleted-sort-parity");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_or_corpus(&dir, &ns.0, 600);
+        let searcher = Searcher::new(dir.clone());
+        let tombstones = HashMap::from([(SegmentId("s1".into()), HashSet::from([0, 3, 6]))]);
+        for field in ["_id", "_score"] {
+            let mut query = mk_query("solar", 10);
+            query.sort = vec![kosha_core::SortSpec {
+                fields: HashMap::from([(
+                    field.into(),
+                    kosha_core::SortOrder {
+                        order: "asc".into(),
+                    },
+                )]),
+            }];
+            let actual = searcher
+                .search(&ns, &manifest, &query, Some(&tombstones))
+                .unwrap();
+            let expected = searcher
+                .search(&ns, &manifest, &force_legacy(query), Some(&tombstones))
+                .unwrap();
+            assert_eq!(page_ids(&actual), page_ids(&expected), "{field}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deleted_wand_single_and_or_match_exhaustive_scoring() {
+        let dir = std::env::temp_dir().join("kosha-deleted-wand-parity");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_or_corpus(&dir, &ns.0, 1200);
+        let searcher = Searcher::new(dir.clone());
+        for deleted in [
+            (0..1200).filter(|id| id % 5 != 0).collect(),
+            (0..1200).collect(),
+        ] {
+            let tombstones = HashMap::from([(SegmentId("s1".into()), deleted)]);
+            for text in ["solar", "solar lunar"] {
+                for operator in [
+                    kosha_core::QueryOperator::And,
+                    kosha_core::QueryOperator::Or,
+                ] {
+                    for k in [0, 1, 20] {
+                        let mut q = mk_query(text, k);
+                        q.operator = Some(operator);
+                        let actual = searcher
+                            .search(&ns, &manifest, &q, Some(&tombstones))
+                            .unwrap();
+                        let reference = searcher
+                            .search(&ns, &manifest, &force_legacy(q), Some(&tombstones))
+                            .unwrap();
+                        assert_eq!(
+                            actual.total_hits, reference.total_hits,
+                            "{text} {operator:?} k={k}"
+                        );
+                        assert_eq!(page_ids(&actual), page_ids(&reference));
+                        for (a, b) in actual.results.iter().zip(&reference.results) {
+                            assert!((a.score - b.score).abs() < 1e-9);
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn multi_term_wand_tombstones_match_exact_full_path() {
+        // Deleted hits are excluded before WAND counting and scoring.
         let dir = std::env::temp_dir().join("kosha-test-wand-tombstone");
         let _ = std::fs::remove_dir_all(&dir);
         let ns = NamespaceId("test".into());
@@ -7704,6 +7883,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -7752,6 +7932,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -7852,6 +8033,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -7926,6 +8108,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut id_sort = std::collections::HashMap::new();
@@ -8040,6 +8223,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -8109,6 +8293,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -8161,6 +8346,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8236,6 +8422,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -8322,6 +8509,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -8395,6 +8583,7 @@ mod tests {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {

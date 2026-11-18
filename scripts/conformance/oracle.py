@@ -9,15 +9,9 @@ What it models, and where each rule comes from in the engine:
 Visibility (kosha-write ``Indexer``)
   * Indexed documents sit in a per-namespace buffer and are NOT searchable
     until a flush turns the buffer into a segment.
-  * Re-indexing an id that is still buffered replaces the buffered copy.
-  * Re-indexing an id that is live in a segment rewrites every segment
-    holding any id in the batch: the buffer is flushed first, the affected
-    segments are dropped, and their other live docs plus the new versions
-    are written out as one new segment (``rewrite_documents``). Re-indexing
-    an id whose only copy is tombstoned is an ordinary buffered append.
-  * Delete-by-query tombstones matching docs in *flushed* segments only.
-    Buffered docs are not visible, so delete-by-query does not see them —
-    the same as Elasticsearch's delete_by_query against unrefreshed docs.
+  * Re-indexing a live flushed id marks the old version deleted and appends
+    only the replacement batch as a new segment. Unrelated buffers stay buffered.
+  * Delete-by-query flushes the buffer first, then tombstones all matches.
   * Compaction merges every segment under the size cap into one segment of
     live docs, dropping tombstoned docs.
 
@@ -220,22 +214,11 @@ class Oracle:
         if not any(i in flushed for i in latest):
             self.buffer.update(latest)
             return
-        # rewrite_documents: flush, drop every segment holding a replaced id,
-        # carry their other live docs, append the new versions, flush again.
-        self.flush()
-        flushed = self._segment_ids()
-        hit = {id(flushed[i]) for i in latest if i in flushed}
-        carried: List[Doc] = []
-        keep = []
+        # Existing segments remain immutable. Mark old versions deleted and
+        # append only the incoming documents as one new segment.
         for seg in self.segments:
-            if id(seg) in hit:
-                carried.extend(d for d in seg.live() if d.id not in latest)
-            else:
-                keep.append(seg)
-        self.segments = keep
-        new_docs = carried + list(latest.values())
-        if new_docs:
-            self.segments.append(Segment(new_docs))
+            seg.tombstones.update(d.id for d in seg.live() if d.id in latest)
+        self.segments.append(Segment(list(latest.values())))
 
     def flush(self) -> None:
         if self.buffer:

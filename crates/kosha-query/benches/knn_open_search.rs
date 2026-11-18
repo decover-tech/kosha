@@ -130,6 +130,7 @@ fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, dim: us
         wal_checkpoint: 0,
         wal_origin: None,
         tombstones: Default::default(),
+        deletion_vectors: Default::default(),
     }
 }
 

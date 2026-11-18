@@ -117,3 +117,13 @@ check that passes (`xpass`) only fails the run under `--strict`.
 - **Next pass:** kNN/hybrid (recall@k against brute force), aggregations
   (#215), and fault injection (deleting a `doc_store.offsets` sidecar from
   MinIO to reproduce #179/#184).
+
+The suite uses `--admin-key` (default `sk-conformance-admin`) for compaction.
+Spawned-server mode configures the supplied credential; the compose overlay uses
+`sk-kosha-admin-dev` (pass it with `--admin-key` as above);
+when targeting another server, supply its configured admin key explicitly.
+The oracle models mark-deleted + append upserts and flush-before-delete semantics.
+
+For a spawned S3-backed server, `--cold-restart --database-url ...` clears only
+its temporary local cache before checking both deleted and compacted snapshots.
+This verifies that referenced deletion bitmaps and segment data survive remotely.

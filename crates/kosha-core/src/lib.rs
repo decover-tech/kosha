@@ -1,3 +1,4 @@
+pub mod deletes;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -560,9 +561,12 @@ impl StorageBackend for LocalStorage {
 
 /// A single WAL record: a batch of documents for one namespace at a point in time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WalRecord {
     pub namespace: NamespaceId,
     pub documents: Vec<Document>,
+    #[serde(default)]
+    pub deleted_ids: Vec<DocumentId>,
     pub timestamp: u64,
 }
 
@@ -576,6 +580,7 @@ impl WalRecord {
         Self {
             namespace,
             documents,
+            deleted_ids: Vec::new(),
             timestamp,
         }
     }
@@ -953,6 +958,10 @@ pub struct Manifest {
     /// Durable deletions, shared by ingest and query replicas.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tombstones: HashMap<SegmentId, std::collections::HashSet<u32>>,
+    /// Immutable deletion generations keyed by segment. `tombstones` remains
+    /// readable for legacy manifests and is populated in memory by readers.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub deletion_vectors: HashMap<SegmentId, deletes::DeletionVector>,
 }
 
 impl Manifest {

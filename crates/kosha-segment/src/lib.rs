@@ -1141,6 +1141,19 @@ pub fn all_posting_blob_files() -> Vec<String> {
         .collect()
 }
 
+/// Shards actually referenced by a split index's TOC. Empty shard files
+/// are not written, so hydration must not request them merely because a
+/// query term hashes to that shard. Does not read posting payloads.
+pub fn posting_blob_inventory(
+    segment_dir: &Path,
+) -> Result<std::collections::HashSet<String>, KoshaError> {
+    let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
+    let index = SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None)?;
+    Ok((0..index.term_count)
+        .map(|i| posting_blob_file_for_id(index.raw_entry(i).2))
+        .collect())
+}
+
 pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
     let Some(header) = read_inverted_header(&segment_dir.join("inverted.idx")) else {
         return false;

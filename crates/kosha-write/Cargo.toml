@@ -13,8 +13,13 @@ kosha-core = { path = "../kosha-core" }
 kosha-segment = { path = "../kosha-segment" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+crc32c = "0.6"
 uuid = { version = "1", features = ["v4"] }
 
 [[bench]]
 name = "sustained_concurrent_flush"
+harness = false
+
+[[bench]]
+name = "upsert_write_amplification"
 harness = false
