@@ -530,6 +530,8 @@ impl Publisher {
                 version: existing.version,
                 segments: Vec::new(),
                 segment_footers: Default::default(),
+                wal_checkpoint: 0,
+                tombstones: Default::default(),
             },
             PublishMode::Append => existing.clone(),
         };
@@ -632,6 +634,8 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
             version: 0,
             segments: Vec::new(),
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         });
         // Restore to advance segment IDs beyond an existing/partial run.
         // Replace mode: Publisher publishes only this run's segments.

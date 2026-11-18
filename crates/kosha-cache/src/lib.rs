@@ -92,6 +92,9 @@ impl Cache {
                 let Ok(meta) = entry.metadata() else {
                     continue;
                 };
+                if path == root.join("_wal") {
+                    continue;
+                }
                 if meta.is_dir() {
                     walk(&path, root, out);
                 } else if let Ok(rel) = path.strip_prefix(root) {
@@ -595,6 +598,23 @@ mod tests {
         cache.unpin("never-pinned-key");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_eviction_never_removes_recovery_log_or_sequence() {
+        let dir = std::env::temp_dir().join("kosha-test-cache-wal-safety");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("_wal")).unwrap();
+        fs::write(dir.join("_wal/sequence"), b"100").unwrap();
+        fs::write(dir.join("_wal/record.wal"), [1u8; 100]).unwrap();
+        let cache = Cache::with_max_bytes(dir.clone(), Some(1));
+        cache.put_bytes("ns/seg/large.bin", &[0u8; 10]).unwrap();
+        assert_eq!(fs::read(dir.join("_wal/sequence")).unwrap(), b"100");
+        assert_eq!(
+            fs::read(dir.join("_wal/record.wal")).unwrap(),
+            vec![1u8; 100]
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
