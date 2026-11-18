@@ -53,6 +53,7 @@ impl Controller {
                 segments: Vec::new(),
                 segment_footers: Default::default(),
                 wal_checkpoint: 0,
+                wal_origin: None,
                 tombstones: Default::default(),
             },
         );
@@ -70,6 +71,7 @@ impl Controller {
                     segments: Vec::new(),
                     segment_footers: Default::default(),
                     wal_checkpoint: 0,
+                    wal_origin: None,
                     tombstones: Default::default(),
                 },
             );
@@ -115,16 +117,26 @@ impl Controller {
         expected_version: u64,
         new_manifest: Manifest,
     ) -> Result<(), KoshaError> {
+        if !self.manifests.contains_key(id) && expected_version == 0 {
+            self.ensure_namespace(id.clone());
+        }
         let current = self
             .manifests
             .get_mut(id)
-            .ok_or_else(|| KoshaError::NamespaceNotFound(id.clone()))?;
-
-        if current.version != expected_version {
-            return Err(KoshaError::NotFound(format!(
-                "manifest version mismatch: expected {expected_version}, got {}",
-                current.version
-            )));
+            .ok_or_else(|| KoshaError::ManifestConflict {
+                namespace: id.clone(),
+                expected: expected_version,
+                actual: None,
+            })?;
+        if current.same_contents(&new_manifest) {
+            return Ok(());
+        }
+        if current.version != expected_version || new_manifest.version <= expected_version {
+            return Err(KoshaError::ManifestConflict {
+                namespace: id.clone(),
+                expected: expected_version,
+                actual: Some(current.version),
+            });
         }
 
         *current = new_manifest;
@@ -189,6 +201,34 @@ mod tests {
     use kosha_core::ManifestEntry;
 
     #[test]
+    fn cas_bootstrap_retries_and_rejects_nonadvancing_snapshots() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("cas".into());
+        let candidate = Manifest {
+            version: 3,
+            segments: vec![],
+            segment_footers: Default::default(),
+            wal_checkpoint: 2,
+            wal_origin: Some("writer-a".into()),
+            tombstones: Default::default(),
+        };
+        ctrl.compare_and_swap_manifest(&ns, 0, candidate.clone())
+            .unwrap();
+        ctrl.compare_and_swap_manifest(&ns, 0, candidate.clone())
+            .unwrap();
+        let mut different = candidate.clone();
+        different.wal_origin = Some("writer-b".into());
+        assert!(matches!(
+            ctrl.compare_and_swap_manifest(&ns, 3, different),
+            Err(KoshaError::ManifestConflict { .. })
+        ));
+        assert!(ctrl.manifest(&ns).unwrap().same_contents(&candidate));
+        let mut older = candidate.clone();
+        older.version = 2;
+        assert!(ctrl.compare_and_swap_manifest(&ns, 3, older).is_err());
+    }
+
+    #[test]
     fn create_and_list_namespaces() {
         let mut ctrl = Controller::new();
         let ns = NamespaceId("org1/matter42".into());
@@ -230,6 +270,7 @@ mod tests {
                 }],
                 segment_footers: Default::default(),
                 wal_checkpoint: 0,
+                wal_origin: None,
                 tombstones: Default::default(),
             },
         )
@@ -246,6 +287,7 @@ mod tests {
                 segments: vec![],
                 segment_footers: Default::default(),
                 wal_checkpoint: 0,
+                wal_origin: None,
                 tombstones: Default::default(),
             },
         )
@@ -271,6 +313,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
 
@@ -288,6 +331,7 @@ mod tests {
             segments: vec![],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         assert!(ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2).is_err());

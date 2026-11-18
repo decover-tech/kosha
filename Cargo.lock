@@ -2084,6 +2084,7 @@ dependencies = [
  "kosha-segment",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

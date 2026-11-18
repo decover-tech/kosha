@@ -71,6 +71,7 @@ fn main() {
         segments: entries,
         segment_footers: Default::default(),
         wal_checkpoint: 0,
+        wal_origin: None,
         tombstones: Default::default(),
     };
     let searcher = Searcher::new(work);

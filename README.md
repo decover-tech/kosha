@@ -113,6 +113,20 @@ WAL records are reclaimed only through the published namespace checkpoint,
 without removing later writes or another namespace's records. Partial parallel
 flush failures restore the entire snapshot for retry.
 
+Publication uses compare-and-swap against the writer's last committed manifest
+version. Concurrent writers cannot replace each other's snapshots: a stale
+writer returns an error and retains its WAL. Automatic conflict rebasing is not
+implemented; restart the stale writer with its existing data directory to load
+the published manifest and replay its pending writes. Retrying an identical
+committed snapshot is safe after a lost commit response. Segment object keys
+include a random writer identifier to avoid collisions before publication.
+
+Each WAL directory has a persistent origin identifier. New manifest checkpoints
+apply only to that origin, so another writer's checkpoint cannot discard local
+pending writes during recovery. Preserve the entire WAL directory, including
+its `origin` file, across restarts. Legacy checkpoints without an origin retain
+their previous recovery behavior; upgrade all writers before concurrent use.
+
 Delete tombstones and WAL checkpoints are stored in the manifest. Query-role
 pods refresh the published manifest before searches, including cache lookups.
 Superseded segment files are retained for older readers and publication snapshots;
@@ -204,6 +218,11 @@ channel via `rust-toolchain.toml`), Docker, and optionally `pre-commit`.
     cargo fmt --all -- --check                 # formatting (CI gate)
     cargo clippy --all-targets -- -D warnings  # linting (CI gate)
     pre-commit install                         # optional: run gates on commit
+
+The Postgres CAS integration test races independent writers and checks retries.
+Run it against a dedicated disposable database:
+
+    KOSHA_TEST_DATABASE_URL=postgres://... cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored
 
 ### Local S3 (MinIO)
 

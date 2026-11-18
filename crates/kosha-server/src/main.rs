@@ -1098,10 +1098,9 @@ impl AppState {
                             }
                         }
                     }
-
-                    indexer.restore_manifest(ns, manifest);
-                    restored += 1;
                 }
+                indexer.restore_manifest(ns, manifest);
+                restored += 1;
             }
         }
         println!(
@@ -1747,14 +1746,15 @@ impl AppState {
             .or_default()
             .clone();
         let _guard = lock.lock().unwrap();
-        let Some(manifest) = self.indexer.manifest_cloned(ns) else {
+        let Some((expected_version, manifest)) = self.indexer.publication_snapshot(ns) else {
             return Ok(());
         };
         upload(&manifest)?;
-        self.controller
-            .lock()
-            .unwrap()
-            .save_manifest(ns, &manifest)?;
+        self.controller.lock().unwrap().compare_and_swap_manifest(
+            ns,
+            expected_version,
+            manifest.clone(),
+        )?;
         self.indexer.acknowledge_manifest(ns, &manifest)?;
         Ok(())
     }
@@ -5018,6 +5018,7 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
         segments,
         segment_footers,
         wal_checkpoint: 0,
+        wal_origin: None,
         tombstones: Default::default(),
     }
 }
@@ -5518,6 +5519,191 @@ mod tests {
     use kosha_core::{Document, DocumentId, Field};
     use std::fs;
 
+    #[derive(Clone)]
+    struct SharedManifestStore {
+        inner: Arc<Mutex<kosha_control::Controller>>,
+        lose_next_commit_reply: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl ControlStore for SharedManifestStore {
+        fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
+            self.inner.lock().unwrap().create_namespace(id)
+        }
+        fn ensure_namespace(&mut self, id: NamespaceId) {
+            self.inner.lock().unwrap().ensure_namespace(id);
+        }
+        fn has_namespace(&self, id: &NamespaceId) -> bool {
+            self.inner.lock().unwrap().has_namespace(id)
+        }
+        fn manifest(&self, _: &NamespaceId) -> Option<&kosha_core::Manifest> {
+            None
+        }
+        fn manifest_mut(&mut self, _: &NamespaceId) -> Option<&mut kosha_core::Manifest> {
+            None
+        }
+        fn manifest_cloned(&self, id: &NamespaceId) -> Option<kosha_core::Manifest> {
+            self.inner.lock().unwrap().manifest(id).cloned()
+        }
+        fn save_manifest(
+            &mut self,
+            id: &NamespaceId,
+            manifest: &kosha_core::Manifest,
+        ) -> Result<(), KoshaError> {
+            self.inner.lock().unwrap().save_manifest(id, manifest)
+        }
+        fn compare_and_swap_manifest(
+            &mut self,
+            id: &NamespaceId,
+            expected: u64,
+            manifest: kosha_core::Manifest,
+        ) -> Result<(), KoshaError> {
+            self.inner
+                .lock()
+                .unwrap()
+                .compare_and_swap_manifest(id, expected, manifest)?;
+            if self
+                .lose_next_commit_reply
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(KoshaError::NotFound("injected lost commit reply".into()));
+            }
+            Ok(())
+        }
+        fn list_namespaces(&self) -> Vec<NamespaceId> {
+            self.inner.lock().unwrap().list_namespaces().to_vec()
+        }
+        fn namespace_count(&self) -> usize {
+            self.inner.lock().unwrap().namespace_count()
+        }
+    }
+
+    #[test]
+    fn lost_commit_reply_is_retryable_without_losing_the_next_flush() {
+        let shared = SharedManifestStore {
+            inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
+            lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let state = test_state();
+        *state.controller.lock().unwrap() = Box::new(shared.clone());
+        let ns = NamespaceId("retry".into());
+        for (id, expect_error) in [("first", true), ("second", false)] {
+            state
+                .indexer
+                .index_documents(
+                    ns.clone(),
+                    vec![Document {
+                        id: DocumentId(id.into()),
+                        fields: vec![Field::text("text", id)],
+                    }],
+                )
+                .unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+            let result = state.publish_namespace_with(&ns, |_| Ok(()));
+            assert_eq!(result.is_err(), expect_error);
+            if expect_error {
+                assert!(
+                    !kosha_write::wal::WalWriter::recover(&state.data_dir.join("_wal"))
+                        .unwrap()
+                        .is_empty()
+                );
+                state.publish_namespace_with(&ns, |_| Ok(())).unwrap();
+                // No-op flush is safe too: version equality cannot authorize a
+                // different snapshot, but must permit an identical retry.
+                state.publish_namespace_with(&ns, |_| Ok(())).unwrap();
+            }
+        }
+        assert_eq!(shared.manifest_cloned(&ns).unwrap().segments.len(), 2);
+        assert!(
+            kosha_write::wal::WalWriter::recover(&state.data_dir.join("_wal"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn competing_writers_cannot_overwrite_a_published_manifest() {
+        let shared = SharedManifestStore {
+            inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
+            lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let ns = NamespaceId("competing".into());
+        shared.inner.lock().unwrap().ensure_namespace(ns.clone());
+        let first = test_state();
+        let second = test_state();
+        for (state, id) in [(&first, "first"), (&second, "second")] {
+            *state.controller.lock().unwrap() = Box::new(shared.clone());
+            state
+                .indexer
+                .index_documents(
+                    ns.clone(),
+                    vec![Document {
+                        id: DocumentId(id.into()),
+                        fields: vec![Field::text("text", id)],
+                    }],
+                )
+                .unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+        }
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                first.publish_namespace_with(&ns, |_| {
+                    barrier.wait();
+                    Ok(())
+                })
+            });
+            let b = scope.spawn(|| {
+                second.publish_namespace_with(&ns, |_| {
+                    barrier.wait();
+                    Ok(())
+                })
+            });
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_eq!(
+            usize::from(outcomes.0.is_ok()) + usize::from(outcomes.1.is_ok()),
+            1,
+            "exactly one independent writer may publish the initial version"
+        );
+        let (winner, loser) = if outcomes.0.is_ok() {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        let committed = shared.manifest_cloned(&ns).unwrap();
+        assert_eq!(
+            committed.segments[0].segment_id,
+            winner.indexer.manifest(&ns).unwrap().segments[0].segment_id
+        );
+        let rejected_doc = if outcomes.0.is_ok() {
+            "second"
+        } else {
+            "first"
+        };
+        let restarted_loser = Indexer::new(loser.data_dir.clone());
+        restarted_loser.restore_manifest(ns.clone(), committed.clone());
+        assert!(
+            restarted_loser
+                .existing_ids(&ns, &[DocumentId(rejected_doc.into())])
+                .unwrap()
+                .contains(&DocumentId(rejected_doc.into())),
+            "the winner's WAL checkpoint must not discard the loser's unrelated recovery records"
+        );
+        let retry = handle_flush(br#"{"namespace":"competing"}"#, loser);
+        assert!(
+            retry.starts_with("HTTP/1.1 500"),
+            "stale writer must still fail: {retry}"
+        );
+        assert!(
+            !kosha_write::wal::WalWriter::recover(&loser.data_dir.join("_wal"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            shared.manifest_cloned(&ns).unwrap().segments[0].segment_id,
+            committed.segments[0].segment_id
+        );
+    }
+
     struct FailingManifestStore(kosha_control::Controller);
     impl ControlStore for FailingManifestStore {
         fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
@@ -5942,6 +6128,7 @@ mod tests {
             ],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         // Simulate: an earlier publish call already confirmed seg-2
@@ -6617,6 +6804,7 @@ mod tests {
             }],
             segment_footers: HashMap::new(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let base_query = kosha_core::SearchQuery {
@@ -6748,6 +6936,7 @@ mod tests {
             }],
             segment_footers: HashMap::new(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let base_query = kosha_core::SearchQuery {
