@@ -785,15 +785,17 @@ impl AppState {
         // bound on how many `SegmentWriter`s a single flush round can run
         // concurrently for one namespace, and how much buffered backlog a
         // round needs before it splits across more than one (see
-        // kosha-write's `run_one_flush_pass`). Defaults (4 / 250) mean a
-        // round only pays for real thread-level parallelism once its
-        // snapshot is at least 1000 docs (4 x 250) — right around
-        // `flush_threshold`'s own default, so a namespace that's fallen
-        // behind under sustained concurrent ingest (issue #176's follow-up:
-        // 100% `/flush` timeout under real sustained load, not just a
-        // burst) uses the full writer pool instead of draining one segment
-        // at a time. Set `KOSHA_MAX_CONCURRENT_FLUSH_WRITERS=1` to fall back
-        // to strictly single-writer-per-namespace behavior.
+        // kosha-write's `run_one_flush_pass`). Defaults: 4 writers, and
+        // `flush_threshold` docs per writer — so an ordinary threshold flush
+        // writes ONE segment, and only a real backlog (>= 2 x threshold,
+        // a namespace that's fallen behind under sustained concurrent
+        // ingest, issue #176's follow-up) fans out across the writer pool.
+        // The previous fixed default of 250 split every >=500-doc flush
+        // into 250-doc segments, which was the dominant segment-sprawl
+        // source once clients stopped flushing per batch (#241: 20k docs
+        // loaded in 500-doc batches -> 80 segments). Set
+        // `KOSHA_MAX_CONCURRENT_FLUSH_WRITERS=1` to fall back to strictly
+        // single-writer-per-namespace behavior.
         let max_concurrent_flush_writers: usize =
             std::env::var("KOSHA_MAX_CONCURRENT_FLUSH_WRITERS")
                 .ok()
@@ -804,7 +806,7 @@ impl AppState {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|n| *n > 0)
-            .unwrap_or(250);
+            .unwrap_or(flush_threshold);
         let indexer = Indexer::new(data_dir.clone())
             .with_flush_threshold(flush_threshold)
             .with_max_concurrent_flush_writers(max_concurrent_flush_writers)
@@ -1342,6 +1344,46 @@ impl AppState {
                 .spawn(move || state.run_warmup())
                 .expect("failed to spawn warmup thread");
         }
+    }
+
+    /// Start the idle-buffer flush timer (#241) on a pod that accepts
+    /// writes. Clients no longer `/flush` after every bulk batch — that cut
+    /// one segment per ≤500-doc batch — so something must publish a buffer
+    /// that never reaches `KOSHA_FLUSH_THRESHOLD`: the tail of a bulk load,
+    /// or a trickle of single-document writes. This is that something, and
+    /// it bounds write-to-visible latency at about `max_age` (plus one tick)
+    /// the way Elasticsearch's `refresh_interval` does.
+    ///
+    /// `KOSHA_FLUSH_MAX_AGE_MS` (default 1000; `0` disables): how long a
+    /// namespace may hold pending (buffered or WAL-recovered) documents
+    /// before they're flushed and published. Age is measured from the first
+    /// tick that saw the namespace non-empty, so a buffer that keeps
+    /// growing is still flushed on schedule rather than postponed forever.
+    /// Query-role pods (`KOSHA_INGEST_HOST` set) forward writes and hold no
+    /// buffers, so they never start it. An explicit `/flush` stays an
+    /// immediate visibility barrier.
+    fn spawn_idle_flush_timer(self: &Arc<Self>) {
+        let forwards_writes = std::env::var("KOSHA_INGEST_HOST")
+            .ok()
+            .is_some_and(|h| !h.is_empty());
+        if forwards_writes {
+            return;
+        }
+        let Some(max_age) = flush_max_age_from_env() else {
+            return;
+        };
+        let tick = idle_flush_tick(max_age);
+        let state = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("kosha-idle-flush".into())
+            .spawn(move || {
+                let mut pending_since = HashMap::new();
+                loop {
+                    std::thread::sleep(tick);
+                    run_idle_flush_tick(&state, &mut pending_since, max_age, Instant::now());
+                }
+            })
+            .expect("failed to spawn idle-flush thread");
     }
 
     /// Readiness-gate predicate used by the `/readyz` handler: true when no
@@ -3099,6 +3141,7 @@ fn main() {
     // `/readyz` keeps HPA/kube endpoints from sending traffic while it
     // runs (Tier 1 O2). Liveness (`/healthz`) is unaffected.
     state.spawn_warmup();
+    state.spawn_idle_flush_timer();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     println!("kosha-server role={role} listening on {addr} data_dir={data_dir}");
 
@@ -3883,17 +3926,50 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
 
 // ─── POST /flush ────────────────────────────────────────────────────────────
 
+/// Make one namespace's pending writes visible: recovery-hydrate if a WAL
+/// replay needs the flushed segments local, cut a segment from the write
+/// buffer, then publish (S3 upload + manifest CAS). The single-namespace
+/// body of `POST /flush`, shared with the idle-buffer flush timer
+/// (`spawn_idle_flush_timer`) so both take exactly the same path. `Err`
+/// carries a ready-to-send JSON error response.
+fn flush_and_publish_namespace(state: &AppState, namespace: &NamespaceId) -> Result<(), String> {
+    #[cfg(feature = "s3")]
+    if state.indexer.needs_recovery_hydration(namespace) {
+        if let Some(manifest) = state.indexer.manifest_cloned(namespace) {
+            let paths: Vec<_> = manifest
+                .segments
+                .iter()
+                .map(|e| state.data_dir.join(&namespace.0).join(&e.segment_id.0))
+                .collect();
+            let outcome = state.ensure_segments_local(&paths, true);
+            if let Some(error) = hydration_error_response(&outcome) {
+                return Err(error);
+            }
+        }
+    }
+    state
+        .indexer
+        .flush_namespace(namespace)
+        .map_err(|e| json_error(500, &format!("flush error: {e}")))?;
+    state
+        .publish_namespace(namespace)
+        .map_err(|e| json_error(500, &format!("publication failed: {e}")))
+}
+
 fn handle_flush(body: &[u8], state: &AppState) -> String {
     let req: std::collections::HashMap<String, String> =
         serde_json::from_slice(body).unwrap_or_default();
     let ns = req.get("namespace").cloned();
 
+    if let Some(name) = ns {
+        return match flush_and_publish_namespace(state, &NamespaceId(name)) {
+            Ok(()) => json_ok(&serde_json::json!({"status": "flushed"})),
+            Err(error) => error,
+        };
+    }
+
     #[cfg(feature = "s3")]
-    for namespace in ns
-        .as_ref()
-        .map(|n| vec![NamespaceId(n.clone())])
-        .unwrap_or_else(|| state.indexer.namespaces())
-    {
+    for namespace in state.indexer.namespaces() {
         if state.indexer.needs_recovery_hydration(&namespace) {
             if let Some(manifest) = state.indexer.manifest_cloned(&namespace) {
                 let paths: Vec<_> = manifest
@@ -3909,44 +3985,87 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
         }
     }
 
-    {
-        let indexer = &state.indexer;
-        match ns {
-            Some(ref name) => {
-                let namespace = NamespaceId(name.clone());
-                if let Err(e) = indexer.flush_namespace(&namespace) {
-                    return json_error(500, &format!("flush error: {e}"));
-                }
-            }
-            None => {
-                if let Err(e) = indexer.flush_all() {
-                    return json_error(500, &format!("flush error: {e}"));
-                }
-            }
-        }
+    if let Err(e) = state.indexer.flush_all() {
+        return json_error(500, &format!("flush error: {e}"));
     }
 
     // Publish manifest(s) to the control store and upload segments to S3.
-    match ns {
-        Some(ref name) => {
-            if let Err(e) = state.publish_namespace(&NamespaceId(name.clone())) {
-                return json_error(500, &format!("publication failed: {e}"));
-            }
-        }
-        None => {
-            let all: Vec<NamespaceId> = {
-                let indexer = &state.indexer;
-                indexer.namespaces()
-            };
-            for ns_id in &all {
-                if let Err(e) = state.publish_namespace(ns_id) {
-                    return json_error(500, &format!("publication failed: {e}"));
-                }
-            }
+    for ns_id in &state.indexer.namespaces() {
+        if let Err(e) = state.publish_namespace(ns_id) {
+            return json_error(500, &format!("publication failed: {e}"));
         }
     }
 
     json_ok(&serde_json::json!({"status": "flushed"}))
+}
+
+/// Default for `KOSHA_FLUSH_MAX_AGE_MS` — Elasticsearch's default
+/// `refresh_interval`, which is what the Python client's ES-shaped callers
+/// already expect from a bulk write without `refresh`.
+const DEFAULT_FLUSH_MAX_AGE_MS: u64 = 1000;
+
+fn flush_max_age_from_env() -> Option<Duration> {
+    parse_flush_max_age(std::env::var("KOSHA_FLUSH_MAX_AGE_MS").ok().as_deref())
+}
+
+/// `None` disables the idle-flush timer (`0`); unparsable values fall back
+/// to the default rather than silently disabling visibility.
+fn parse_flush_max_age(raw: Option<&str>) -> Option<Duration> {
+    let ms = match raw.map(str::trim) {
+        None | Some("") => DEFAULT_FLUSH_MAX_AGE_MS,
+        Some(v) => match v.parse::<u64>() {
+            Ok(ms) => ms,
+            Err(_) => {
+                eprintln!(
+                    "WARN: KOSHA_FLUSH_MAX_AGE_MS={v} not a number of milliseconds — \
+                     using {DEFAULT_FLUSH_MAX_AGE_MS}"
+                );
+                DEFAULT_FLUSH_MAX_AGE_MS
+            }
+        },
+    };
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// Poll a quarter as often as the age bound so visibility latency is at
+/// most ~1.25 × `max_age`, but never spin faster than every 50 ms.
+fn idle_flush_tick(max_age: Duration) -> Duration {
+    (max_age / 4).max(Duration::from_millis(50))
+}
+
+/// One pass of the idle-flush timer. `pending_since` remembers when each
+/// namespace was first seen with pending documents; a namespace whose
+/// pending age reaches `max_age` is flushed and published, and forgotten
+/// once empty. Returns the namespaces it flushed successfully (for tests).
+/// A failed flush is logged and retried on a later tick — its entry is kept,
+/// so it stays due.
+fn run_idle_flush_tick(
+    state: &AppState,
+    pending_since: &mut HashMap<NamespaceId, Instant>,
+    max_age: Duration,
+    now: Instant,
+) -> Vec<NamespaceId> {
+    let mut flushed = Vec::new();
+    let namespaces = state.indexer.namespaces();
+    pending_since.retain(|ns, _| namespaces.contains(ns));
+    for ns in namespaces {
+        if state.indexer.pending_doc_count(&ns) == 0 {
+            pending_since.remove(&ns);
+            continue;
+        }
+        let since = *pending_since.entry(ns.clone()).or_insert(now);
+        if now.saturating_duration_since(since) < max_age {
+            continue;
+        }
+        match flush_and_publish_namespace(state, &ns) {
+            Ok(()) => {
+                pending_since.remove(&ns);
+                flushed.push(ns);
+            }
+            Err(error) => eprintln!("idle flush of namespace {} failed: {error}", ns.0),
+        }
+    }
+    flushed
 }
 
 // ─── POST /delete (delete by query) ──────────────────────────────────────────
@@ -6216,6 +6335,140 @@ mod tests {
         );
     }
 
+    fn index_one(state: &AppState, ns: &str, id: &str) {
+        state
+            .indexer
+            .index_documents(
+                NamespaceId(ns.into()),
+                vec![Document {
+                    id: DocumentId(id.into()),
+                    fields: vec![Field::text("text", "hello")],
+                }],
+            )
+            .unwrap();
+    }
+
+    fn published_segments(state: &AppState, ns: &str) -> usize {
+        state
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_cloned(&NamespaceId(ns.into()))
+            .map_or(0, |m| m.segments.len())
+    }
+
+    /// #241: a buffer below `KOSHA_FLUSH_THRESHOLD` becomes visible once it
+    /// has been pending for `max_age`, without anyone calling `/flush` —
+    /// and not before.
+    #[test]
+    fn idle_flush_tick_publishes_buffer_after_max_age() {
+        let state = test_state();
+        let max_age = Duration::from_millis(1000);
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+
+        index_one(&state, "ns", "d1");
+        assert!(run_idle_flush_tick(&state, &mut since, max_age, t0).is_empty());
+        assert_eq!(
+            state.indexer.pending_doc_count(&NamespaceId("ns".into())),
+            1
+        );
+
+        // More writes don't reset the clock: age counts from first sighting.
+        index_one(&state, "ns", "d2");
+        let early = t0 + Duration::from_millis(999);
+        assert!(run_idle_flush_tick(&state, &mut since, max_age, early).is_empty());
+        assert_eq!(published_segments(&state, "ns"), 0, "nothing visible yet");
+
+        let due = t0 + max_age;
+        assert_eq!(
+            run_idle_flush_tick(&state, &mut since, max_age, due),
+            vec![NamespaceId("ns".into())]
+        );
+        assert_eq!(
+            state.indexer.pending_doc_count(&NamespaceId("ns".into())),
+            0
+        );
+        assert_eq!(
+            published_segments(&state, "ns"),
+            1,
+            "one segment for both docs"
+        );
+        assert!(since.is_empty(), "flushed namespace is forgotten");
+
+        // Empty namespace: nothing to do, no new segment.
+        let later = due + max_age * 3;
+        assert!(run_idle_flush_tick(&state, &mut since, max_age, later).is_empty());
+        assert_eq!(published_segments(&state, "ns"), 1);
+    }
+
+    /// A namespace whose buffer was drained by someone else (explicit
+    /// `/flush`, threshold auto-flush) between ticks restarts its clock
+    /// instead of being flushed early on the next write.
+    #[test]
+    fn idle_flush_tick_restarts_clock_after_external_flush() {
+        let state = test_state();
+        let max_age = Duration::from_millis(1000);
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+
+        index_one(&state, "ns", "d1");
+        run_idle_flush_tick(&state, &mut since, max_age, t0);
+        let flushed = handle_flush(br#"{"namespace":"ns"}"#, &state);
+        assert!(flushed.starts_with("HTTP/1.1 200"), "{flushed}");
+        run_idle_flush_tick(&state, &mut since, max_age, t0 + Duration::from_millis(500));
+        assert!(since.is_empty());
+
+        index_one(&state, "ns", "d2");
+        let t1 = t0 + Duration::from_millis(1200);
+        assert!(
+            run_idle_flush_tick(&state, &mut since, max_age, t1).is_empty(),
+            "new pending batch starts its own clock at t1"
+        );
+        assert_eq!(
+            run_idle_flush_tick(&state, &mut since, max_age, t1 + max_age),
+            vec![NamespaceId("ns".into())]
+        );
+        assert_eq!(published_segments(&state, "ns"), 2);
+    }
+
+    /// A failed publication keeps the namespace due, so the next tick
+    /// retries instead of waiting another full `max_age`.
+    #[test]
+    fn idle_flush_tick_retries_failed_publication() {
+        let state = test_state();
+        *state.controller.lock().unwrap() =
+            Box::new(FailingManifestStore(kosha_control::Controller::new()));
+        let max_age = Duration::from_millis(1000);
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        index_one(&state, "ns", "d1");
+        run_idle_flush_tick(&state, &mut since, max_age, t0);
+        assert!(run_idle_flush_tick(&state, &mut since, max_age, t0 + max_age).is_empty());
+        assert_eq!(since.get(&NamespaceId("ns".into())), Some(&t0), "still due");
+    }
+
+    #[test]
+    fn parse_flush_max_age_values() {
+        let d = Some(Duration::from_millis(DEFAULT_FLUSH_MAX_AGE_MS));
+        assert_eq!(parse_flush_max_age(None), d);
+        assert_eq!(parse_flush_max_age(Some("")), d);
+        assert_eq!(
+            parse_flush_max_age(Some("250")),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(parse_flush_max_age(Some("0")), None);
+        assert_eq!(parse_flush_max_age(Some("soon")), d);
+        assert_eq!(
+            idle_flush_tick(Duration::from_millis(1000)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            idle_flush_tick(Duration::from_millis(40)),
+            Duration::from_millis(50)
+        );
+    }
+
     #[test]
     fn regression_legacy_routes_cannot_read_another_tenant() {
         let state = test_state();
@@ -8125,8 +8378,14 @@ mod tests {
     }
 
     fn test_state() -> AppState {
+        // A per-process counter, not just the clock: macOS `SystemTime` has
+        // microsecond resolution, so tests running in parallel could get the
+        // same nanos, share a data dir, and race on its WAL `origin` file.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "kosha-test-server-{}",
+            "kosha-test-server-{}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

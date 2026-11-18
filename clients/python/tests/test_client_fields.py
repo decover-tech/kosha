@@ -3,6 +3,8 @@
 import json
 import time
 
+import pytest
+
 from kosha_client.client import KoshaClient
 
 # Stand-in for a real embedding: length must clear _MIN_VECTOR_DIM. Real
@@ -418,7 +420,60 @@ def test_bulk_update_routes_through_replace(monkeypatch):
         {"index": {"_index": "paragraph_index_hnsw", "_id": "chunk-1", "status": 201}},
         {"update": {"_index": "paragraph_index_hnsw", "_id": "chunk-2", "status": 200}},
     ]
-    assert requests[0][:2] == ("POST", "index")
-    assert requests[1][:2] == ("POST", "flush")
-    assert requests[2][:2] == ("POST", "replace")
-    assert requests[2][2]["documents"][0]["id"] == "chunk-2"
+    assert [r[:2] for r in requests] == [("POST", "index"), ("POST", "replace")]
+    assert requests[1][2]["documents"][0]["id"] == "chunk-2"
+
+
+def _recording_client(monkeypatch):
+    client = KoshaClient(hosts=["http://localhost:9"], api_key="k")
+    requests = []
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda method, path, body=None: requests.append((method, path, body)) or {},
+    )
+    return client, requests
+
+
+_TWO_NS_BULK = [
+    {"index": {"_index": "a", "_id": "1"}},
+    {"content": "x"},
+    {"index": {"_index": "b", "_id": "2"}},
+    {"content": "y"},
+    {"update": {"_index": "a", "_id": "3"}},
+    {"doc": {"content": "z"}},
+]
+
+
+def test_bulk_does_not_flush_per_batch_by_default(monkeypatch):
+    # #241: a /flush after every bulk chunk cut one segment per chunk.
+    client, requests = _recording_client(monkeypatch)
+    client.bulk(body=_TWO_NS_BULK)
+    client.bulk(body=_TWO_NS_BULK, refresh=False)
+    client.bulk(body=_TWO_NS_BULK, refresh="false")
+    assert all(path != "flush" for _, path, _ in requests)
+
+
+@pytest.mark.parametrize("refresh", [True, "true", "wait_for", ""])
+def test_bulk_refresh_flushes_each_touched_namespace_once(monkeypatch, refresh):
+    client, requests = _recording_client(monkeypatch)
+    client.bulk(body=_TWO_NS_BULK, refresh=refresh)
+    flushes = [body["namespace"] for _, path, body in requests if path == "flush"]
+    assert flushes == ["a", "b"]
+    # Flushes come after every write, so they cover the replace too.
+    assert [path for _, path, _ in requests][-2:] == ["flush", "flush"]
+
+
+def test_index_refresh_flushes(monkeypatch):
+    client, requests = _recording_client(monkeypatch)
+    client.index(index="a", id="1", body={"content": "x"})
+    assert [path for _, path, _ in requests] == ["index"]
+    client.index(index="a", id="2", body={"content": "y"}, refresh="wait_for")
+    assert [path for _, path, _ in requests] == ["index", "index", "flush"]
+    assert requests[-1][2] == {"namespace": "a"}
+
+
+def test_indices_refresh_flushes_namespace(monkeypatch):
+    client, requests = _recording_client(monkeypatch)
+    client.indices.refresh(index="a")
+    assert requests == [("POST", "flush", {"namespace": "a"})]

@@ -24,7 +24,10 @@ scale-feasibility test of unproven code, not a rerun of this harness.
    rebuilding/redeploying kosha-server with this branch's patch, then a
    config change to set the env var (k8s deployment env, not a ConfigMap key
    today — there's no existing ConfigMap wiring for it, add a literal env
-   entry to `k8s/base/deployment.yaml` or an overlay patch).
+   entry to `k8s/base/deployment.yaml` or an overlay patch). Also set
+   `KOSHA_FLUSH_MAX_AGE_MS=0`: the idle-buffer flush timer (#241, default
+   1 s) would otherwise cut a segment from whatever arrived in the last
+   second instead of waiting for the threshold.
 2. **Segment cache sized for the corpus.** Set `KOSHA_SEGMENT_CACHE_MAX_BYTES`
    comfortably above ~9GB (e.g. `12884901888` for 12GiB) so the "warm" run
    can actually hold the whole corpus resident. Staging's kosha pod already

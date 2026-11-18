@@ -228,7 +228,9 @@ impl Indexer {
             namespaces: Mutex::new(HashMap::new()),
             compaction_policy: CompactionPolicy::default(),
             max_concurrent_flush_writers: 4,
-            min_docs_per_flush_writer: 250,
+            // Matches `flush_threshold`'s default: a threshold flush is one
+            // segment; only a >= 2x backlog splits (#241).
+            min_docs_per_flush_writer: 1000,
         };
 
         // Recover un-flushed documents from WAL on startup.
@@ -1567,6 +1569,28 @@ impl Indexer {
                 .any(|entry| &entry.segment_id == segment)
         });
         Some((state.published_version, manifest))
+    }
+
+    /// Writes accepted for `namespace` but not yet visible to readers: the
+    /// write buffer's documents plus every WAL-recovered record awaiting
+    /// replay — its documents *and* its deletes, since a delete-only record
+    /// also needs a flush + publish to take effect. `0` for an unknown
+    /// namespace (never creates a handle). Used by the server's idle-buffer
+    /// flush timer (`KOSHA_FLUSH_MAX_AGE_MS`) to tell which namespaces still
+    /// have invisible writes.
+    pub fn pending_doc_count(&self, namespace: &NamespaceId) -> usize {
+        let map = self.namespaces.lock().unwrap();
+        let Some(handle) = map.get(namespace) else {
+            return 0;
+        };
+        let state = handle.state.lock().unwrap();
+        let buffered = state.buffer.as_ref().map_or(0, |b| b.documents.len());
+        let recovered: usize = state
+            .recovered
+            .iter()
+            .map(|(_, record)| record.documents.len() + record.deleted_ids.len())
+            .sum();
+        buffered + recovered
     }
 
     /// Materialize immutable sidecars for precisely the snapshot being

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Bulk-load a generate_corpus.py NDJSON corpus into a Kosha namespace.
 
-Deliberately does NOT use kosha_client.KoshaClient.bulk() — that helper calls
-POST /flush after every batch (client.py), which forces one immutable segment
-per batch regardless of server-side flush threshold. At helpers.bulk's usual
-chunk size (500) that's ~20,000 segments for a 10M-doc corpus before any
-compaction — the exact segment-sprawl pathology a bulk loader needs to avoid.
+Deliberately does NOT use kosha_client.KoshaClient.bulk() — before client
+0.2.12 that helper called POST /flush after every batch, which forced one
+immutable segment per batch regardless of server-side flush threshold (issue
+#241). It no longer does unless asked (refresh=True/"wait_for"), but posting
+large batches straight to /index is still the cheapest bulk path.
 
 Instead this script POSTs directly to /index in large batches and never calls
 /flush mid-load: auto-flush is left entirely to the server's
