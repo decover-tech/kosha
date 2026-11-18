@@ -1593,6 +1593,37 @@ impl Indexer {
         state.known.then_some(state.manifest.version)
     }
 
+    /// Replace the footers the manifest carries for segments it still
+    /// references, and bump the version if any were replaced.
+    ///
+    /// The manifest's copy of a footer is the one searches prune with, so a
+    /// footer rewritten on disk (new blooms) changes nothing until it is
+    /// installed here. Returns how many were installed.
+    pub fn replace_segment_footers(
+        &self,
+        namespace: &NamespaceId,
+        footers: Vec<kosha_core::Footer>,
+    ) -> usize {
+        let handle = self.ns_handle(namespace);
+        let mut state = handle.state.lock().unwrap();
+        let mut replaced = 0;
+        for footer in footers {
+            let referenced = state
+                .manifest
+                .segments
+                .iter()
+                .any(|entry| entry.segment_id == footer.segment_id);
+            if referenced {
+                state.manifest.remember_segment_footer(footer);
+                replaced += 1;
+            }
+        }
+        if replaced > 0 {
+            state.manifest.version += 1;
+        }
+        replaced
+    }
+
     /// The manifest for a search (tombstones included), shared rather than
     /// copied: the same value [`Indexer::manifest_cloned`] returns.
     ///

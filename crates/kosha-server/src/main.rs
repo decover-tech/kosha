@@ -2809,6 +2809,59 @@ impl AppState {
             }
         }
 
+        // ── A shard that was never written is not a missing file ──
+        // The writer skips a posting shard no term hashed into, which is
+        // common in small segments. A query term that hashes to such a
+        // shard is simply absent from that segment, but the fetch above
+        // asked S3 for the file anyway, got a 404, and the whole search
+        // failed with a 503 "segment hydration failed".
+        //
+        // For each segment with a shard still missing, list what S3 holds
+        // for it. A shard that is not in the listing was never written:
+        // drop it from `missing` and remember it as resolved, so later
+        // queries do not ask again. A shard that IS listed but did not
+        // arrive is a real failure and stays in `missing`. So does
+        // everything for a segment whose listing fails.
+        //
+        // Dropping a shard here cannot hide lost data: the scorer checks
+        // every query term against the segment's term table and fails the
+        // search if a term the table contains has no readable shard.
+        if !outcome.missing.is_empty() {
+            let mut by_segment: HashMap<String, Vec<String>> = HashMap::new();
+            for rel in outcome.missing.drain(..) {
+                match rel.rsplit_once('/') {
+                    Some((seg_rel, file_name)) => by_segment
+                        .entry(seg_rel.to_string())
+                        .or_default()
+                        .push(file_name.to_string()),
+                    None => by_segment.entry(rel).or_default().push(String::new()),
+                }
+            }
+            for (seg_rel, files) in by_segment {
+                // S3 itself, not the local-fallback listing: only S3 can
+                // say a file was never uploaded. An empty listing means the
+                // whole segment is absent there, which is a failure, not
+                // 256 shards that happen to be empty.
+                let listed: Option<std::collections::HashSet<String>> = s3
+                    .list_remote_with_sizes(&seg_rel)
+                    .ok()
+                    .filter(|entries| !entries.is_empty())
+                    .map(|entries| entries.into_iter().map(|(name, _)| name).collect());
+                for file_name in files {
+                    let never_written = listed
+                        .as_ref()
+                        .is_some_and(|names| !file_name.is_empty() && !names.contains(&file_name));
+                    if never_written {
+                        newly_confirmed.push((seg_rel.clone(), file_name));
+                    } else if file_name.is_empty() {
+                        outcome.missing.push(seg_rel.clone());
+                    } else {
+                        outcome.missing.push(format!("{seg_rel}/{file_name}"));
+                    }
+                }
+            }
+        }
+
         // Fold every pair this call physically confirmed present — via
         // cache-miss stat or post-fetch verification — back into the
         // cache, one lock acquisition regardless of how many pairs were
@@ -4952,6 +5005,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
     // Admin routes rewrite or merge segments — must preserve vectors.
     state.ensure_segments_local(&seg_paths, true);
 
+    let mut new_footers = Vec::new();
     let mut rebuilt = 0usize;
     let mut errors = Vec::new();
     for (entry, seg_path) in manifest.segments.iter().zip(seg_paths.iter()) {
@@ -4960,7 +5014,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
             continue;
         }
         match SegmentReader::rewrite_footer_blooms(seg_path) {
-            Ok(_) => {
+            Ok(footer) => {
                 rebuilt += 1;
                 #[cfg(feature = "s3")]
                 if let Err(e) = state.sync_files_to_s3(seg_path, &["footer.json"]) {
@@ -4968,9 +5022,21 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
                         "{}: rebuilt locally but S3 sync failed: {e}",
                         entry.segment_id.0
                     ));
+                    continue;
                 }
+                new_footers.push(footer);
             }
             Err(e) => errors.push(format!("{}: {e}", entry.segment_id.0)),
+        }
+    }
+
+    // Searches prune with the footer copies inside the manifest, not the
+    // footer.json files just rewritten. Without installing the new footers
+    // and publishing, the rebuild changed files nothing reads: this node
+    // kept pruning with the old blooms, and so did every query replica.
+    if state.indexer.replace_segment_footers(&ns, new_footers) > 0 {
+        if let Err(e) = state.publish_namespace(&ns) {
+            errors.push(format!("blooms rebuilt but manifest publish failed: {e}"));
         }
     }
 
