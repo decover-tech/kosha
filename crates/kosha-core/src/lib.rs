@@ -639,6 +639,18 @@ pub struct Footer {
     /// older segments regardless of this number.
     #[serde(default)]
     pub format_version: u32,
+    /// `ignore_above` cap (in chars) the writer applied to `Text` values
+    /// before copying them into `filters.bin` and `filter_blooms` (issue
+    /// #243). A `Text` value longer than this is still tokenized into the
+    /// inverted index and stored in the doc store, but is not filterable,
+    /// sortable or aggregatable by exact value — the same semantics as
+    /// Elasticsearch's dynamic-mapping `keyword` subfield (`ignore_above:
+    /// 256`). `None` means no cap: a segment written before the cap existed
+    /// (every `Text` value was copied) or one written with the cap disabled.
+    /// Informational only — `filters.bin`'s byte layout is unchanged, so
+    /// readers need not consult it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_filter_ignore_above: Option<u32>,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
