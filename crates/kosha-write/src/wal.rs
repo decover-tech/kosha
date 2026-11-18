@@ -5,6 +5,17 @@ use kosha_core::{
     Document, DocumentId, Field, FieldType, KoshaError, NamespaceId, StorageBackend, WalRecord,
 };
 
+fn durable_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), KoshaError> {
+    use std::io::Write;
+    let temporary = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)?;
+    std::fs::File::open(path.parent().unwrap())?.sync_all()?;
+    Ok(())
+}
+
 /// Write-Ahead Log for durability of buffered documents.
 ///
 /// The WAL stores document batches per namespace in sequential files.
@@ -33,6 +44,7 @@ pub struct WalWriter {
     seq: AtomicU64,
     buffer: Vec<u8>,
     records_in_buffer: u32,
+    record_namespaces: std::collections::BTreeMap<u64, std::collections::HashSet<NamespaceId>>,
 }
 
 impl WalWriter {
@@ -42,6 +54,16 @@ impl WalWriter {
     pub fn new(backend: Box<dyn StorageBackend>, wal_dir: PathBuf) -> Self {
         let seq = Self::next_seq(&wal_dir);
         let file = format!("wal-{:020x}.wal", seq);
+        let mut record_namespaces: std::collections::BTreeMap<
+            u64,
+            std::collections::HashSet<NamespaceId>,
+        > = Default::default();
+        for (sequence, record) in Self::recover_sequenced(&wal_dir).expect("WAL recovery failed") {
+            record_namespaces
+                .entry(sequence)
+                .or_default()
+                .insert(record.namespace);
+        }
         Self {
             backend,
             wal_dir,
@@ -49,6 +71,7 @@ impl WalWriter {
             seq: AtomicU64::new(seq + 1),
             buffer: Vec::new(),
             records_in_buffer: 0,
+            record_namespaces,
         }
     }
 
@@ -70,7 +93,44 @@ impl WalWriter {
                 }
             }
         }
-        max
+        let persisted = std::fs::read_to_string(wal_dir.join("sequence"))
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        max.max(persisted).saturating_add(1)
+    }
+
+    pub fn last_sequence(&self) -> u64 {
+        self.seq.load(Ordering::Relaxed).saturating_sub(2)
+    }
+
+    /// A fresh ingest disk must not reuse sequence numbers already covered
+    /// by the remote manifests restored on startup.
+    pub fn advance_past(&mut self, checkpoint: u64) {
+        if self.seq.load(Ordering::Relaxed) - 1 <= checkpoint {
+            self.current_file = format!("wal-{:020x}.wal", checkpoint + 1);
+            self.seq.store(checkpoint + 2, Ordering::Relaxed);
+        }
+    }
+
+    /// Reclaim only records covered by a successfully published namespace
+    /// manifest. Later writes and every other namespace remain recoverable.
+    pub fn clear_through(
+        &mut self,
+        namespace: &NamespaceId,
+        checkpoint: u64,
+    ) -> Result<(), KoshaError> {
+        let eligible: Vec<u64> = self
+            .record_namespaces
+            .range(..=checkpoint)
+            .filter(|(_, namespaces)| namespaces.len() == 1 && namespaces.contains(namespace))
+            .map(|(seq, _)| *seq)
+            .collect();
+        for seq in eligible {
+            std::fs::remove_file(self.wal_dir.join(format!("wal-{seq:020x}.wal")))?;
+            self.record_namespaces.remove(&seq);
+        }
+        Ok(())
     }
 
     /// Append a batch of documents to the WAL.
@@ -118,7 +178,15 @@ impl WalWriter {
         }
 
         self.records_in_buffer += 1;
-        self.flush_buffer()?;
+        if let Err(e) = self.flush_buffer() {
+            self.buffer.clear();
+            self.records_in_buffer = 0;
+            return Err(e);
+        }
+        self.record_namespaces
+            .entry(self.last_sequence())
+            .or_default()
+            .insert(record.namespace.clone());
         Ok(())
     }
 
@@ -137,7 +205,14 @@ impl WalWriter {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        std::fs::write(&path, &final_buf)?;
+        // Reserve the sequence durably before writing the record. A crash
+        // may leave a gap, but must never reuse a published checkpoint ID.
+        let current = self.seq.load(Ordering::Relaxed) - 1;
+        durable_write(
+            &self.wal_dir.join("sequence"),
+            current.to_string().as_bytes(),
+        )?;
+        durable_write(&path, &final_buf)?;
 
         self.buffer.clear();
         self.records_in_buffer = 0;
@@ -148,8 +223,10 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Remove all WAL files (called after successful flush).
+    /// Explicit administrative reset. Normal flushes use `clear_through`
+    /// only after durable publication.
     pub fn clear(&mut self) -> Result<(), KoshaError> {
+        self.record_namespaces.clear();
         if let Ok(entries) = std::fs::read_dir(&self.wal_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -166,6 +243,13 @@ impl WalWriter {
 
     /// Read all records from all WAL files for recovery.
     pub fn recover(wal_dir: &PathBuf) -> Result<Vec<WalRecord>, KoshaError> {
+        Ok(Self::recover_sequenced(wal_dir)?
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect())
+    }
+
+    pub fn recover_sequenced(wal_dir: &PathBuf) -> Result<Vec<(u64, WalRecord)>, KoshaError> {
         let mut records = Vec::new();
 
         let mut files: Vec<std::path::PathBuf> = Vec::new();
@@ -180,6 +264,12 @@ impl WalWriter {
         files.sort();
 
         for path in &files {
+            let sequence = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("wal-"))
+                .and_then(|s| u64::from_str_radix(s, 16).ok())
+                .ok_or_else(|| KoshaError::NotFound("invalid WAL filename".into()))?;
             let data = std::fs::read(path)?;
             if data.len() < 12 {
                 continue;
@@ -268,11 +358,14 @@ impl WalWriter {
                     }
                     documents.push(Document { id: doc_id, fields });
                 }
-                records.push(WalRecord {
-                    namespace,
-                    documents,
-                    timestamp,
-                });
+                records.push((
+                    sequence,
+                    WalRecord {
+                        namespace,
+                        documents,
+                        timestamp,
+                    },
+                ));
             }
         }
 

@@ -90,6 +90,45 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
 - `kosha-vector-spfresh` (SPFresh/SPANN with LIRE rebalancing) is a standalone, benchmarked prototype; it is not wired into the segment format or the query path.
 
+## Authorization and durability
+
+All client namespace routes, including legacy `/index`, `/search`, `/flush`,
+`/replace`, `/exists`, and `/delete`, resolve an **unqualified namespace name**
+inside the authenticated tenant. Client-supplied paths and qualified names are
+rejected. Legacy callers that previously accessed bare stored namespaces need
+an explicit migration to tenant-scoped namespaces; this change does not rename
+existing data automatically.
+
+- Set `KOSHA_ADMIN_API_KEY` for `/v1/admin/*` and global `/stats` access.
+- Set a separate `KOSHA_INTERNAL_API_KEY` on every peer participating in segment
+  hydration. Tenant API keys do not authorize admin or peer-file access.
+- Both service capabilities are disabled when their respective secret is unset.
+  Ordinary API-key configuration remains `KOSHA_API_KEY` / `KOSHA_API_KEYS` or
+  the Postgres key registry. Namespace-scoped stats remain available to tenants.
+- The server refuses to start when no credential is configured at all, unless
+  `KOSHA_AUTH=disabled` is set explicitly (local development only). Postgres keys
+  are re-read every `KOSHA_API_KEY_REFRESH_SECS` (default 30), request bodies are
+  capped at `KOSHA_MAX_BODY_BYTES` (default 64 MiB, 413 above it), and
+  `KOSHA_LEGACY_ROUTES=off` turns the unversioned routes into 410s.
+
+A successful flush uploads its segment snapshot before publishing its manifest.
+Upload and manifest-store failures return errors and remain retryable. Buffered
+writes use a local, fsynced WAL; they are not S3-durable until a successful flush.
+WAL records are reclaimed only through the published namespace checkpoint,
+without removing later writes or another namespace's records. Partial parallel
+flush failures restore the entire snapshot for retry.
+
+Delete tombstones and WAL checkpoints are stored in the manifest. Query-role
+pods refresh the published manifest before searches, including cache lookups.
+Superseded segment files are retained for older readers and publication snapshots;
+physical cleanup is deferred to cache reclamation rather than immediate unlink.
+
+**Upgrade note:** Postgres `segments_json` now stores the complete manifest
+object, including tombstones and checkpoints. New servers can read the old entry
+arrays. Old servers cannot read the new object format: upgrade ingest and query
+roles together before resuming writes, and do not roll back readers without a
+manifest-format migration. The existing SQL column needs no schema change.
+
 ## Repository layout
 
     crates/

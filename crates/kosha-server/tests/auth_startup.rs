@@ -85,36 +85,51 @@ fn explicit_opt_out_starts_with_auth_disabled() {
     let (mut cmd, port) = server(&[("KOSHA_AUTH", "disabled")]);
     let mut child = cmd.spawn().unwrap();
     wait_healthy(&mut child, port);
-    let r = http(port, "GET /v1/stats HTTP/1.1\r\n\r\n").unwrap();
+    let body = r#"{"namespace":"x"}"#;
+    let r = http(
+        port,
+        &format!(
+            "POST /flush HTTP/1.1\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .unwrap();
     child.kill().ok();
     child.wait().ok();
     assert!(r.starts_with("HTTP/1.1 200"), "{r}");
 }
 
 #[test]
+fn admin_key_alone_is_enough_to_start() {
+    let (mut cmd, port) = server(&[("KOSHA_ADMIN_API_KEY", "sk-admin")]);
+    let mut child = cmd.spawn().unwrap();
+    wait_healthy(&mut child, port);
+    let unkeyed = http(port, "GET /v1/stats HTTP/1.1\r\n\r\n").unwrap();
+    child.kill().ok();
+    child.wait().ok();
+    assert!(unkeyed.starts_with("HTTP/1.1 401"), "{unkeyed}");
+}
+
+#[test]
 fn keyed_server_rejects_unkeyed_and_oversized_requests() {
     let (mut cmd, port) = server(&[
         ("KOSHA_API_KEYS", "sk-tenant=acme"),
-        ("KOSHA_ADMIN_API_KEYS", "sk-admin"),
+        ("KOSHA_ADMIN_API_KEY", "sk-admin"),
         ("KOSHA_MAX_BODY_BYTES", "16"),
     ]);
     let mut child = cmd.spawn().unwrap();
     wait_healthy(&mut child, port);
 
     let unkeyed = http(port, "GET /v1/stats HTTP/1.1\r\n\r\n").unwrap();
-    let tenant_stats = http(
-        port,
-        "GET /v1/stats HTTP/1.1\r\nx-api-key: sk-tenant\r\n\r\n",
-    )
-    .unwrap();
+    let bad_key = http(port, "GET /v1/stats HTTP/1.1\r\nx-api-key: nope\r\n\r\n").unwrap();
     let tenant_admin = http(
         port,
         "POST /v1/admin/compact-namespace HTTP/1.1\r\nauthorization: Bearer sk-tenant\r\ncontent-length: 2\r\n\r\n{}",
     )
     .unwrap();
-    let admin_admin = http(
+    let admin_stats = http(
         port,
-        "POST /v1/admin/compact-namespace HTTP/1.1\r\nauthorization: Bearer sk-admin\r\ncontent-length: 2\r\n\r\n{}",
+        "GET /v1/stats HTTP/1.1\r\nauthorization: Bearer sk-admin\r\n\r\n",
     )
     .unwrap();
     let oversized = http(
@@ -126,8 +141,36 @@ fn keyed_server_rejects_unkeyed_and_oversized_requests() {
     child.wait().ok();
 
     assert!(unkeyed.starts_with("HTTP/1.1 401"), "{unkeyed}");
-    assert!(tenant_stats.starts_with("HTTP/1.1 200"), "{tenant_stats}");
+    assert!(bad_key.starts_with("HTTP/1.1 401"), "{bad_key}");
     assert!(tenant_admin.starts_with("HTTP/1.1 403"), "{tenant_admin}");
-    assert!(admin_admin.starts_with("HTTP/1.1 400"), "{admin_admin}");
+    assert!(admin_stats.starts_with("HTTP/1.1 200"), "{admin_stats}");
     assert!(oversized.starts_with("HTTP/1.1 413"), "{oversized}");
+}
+
+#[test]
+fn legacy_routes_can_be_switched_off() {
+    let (mut cmd, port) = server(&[
+        ("KOSHA_API_KEYS", "sk-tenant=acme"),
+        ("KOSHA_LEGACY_ROUTES", "off"),
+    ]);
+    let mut child = cmd.spawn().unwrap();
+    wait_healthy(&mut child, port);
+    let body = r#"{"namespace":"x"}"#;
+    let legacy = http(
+        port,
+        &format!(
+            "POST /flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .unwrap();
+    let v1 = http(
+        port,
+        "POST /v1/namespaces/x/flush HTTP/1.1\r\nx-api-key: sk-tenant\r\ncontent-length: 2\r\n\r\n{}",
+    )
+    .unwrap();
+    child.kill().ok();
+    child.wait().ok();
+    assert!(legacy.starts_with("HTTP/1.1 410"), "{legacy}");
+    assert!(!v1.starts_with("HTTP/1.1 410"), "{v1}");
 }

@@ -1,128 +1,66 @@
-//! API-key authentication, the admin role, and auth-related server limits.
+//! Tenant API-key loading, fail-closed startup, key refresh, and
+//! auth-related request limits (#235).
 //!
-//! Key sources (all merged; env keys win on a key collision):
+//! Tenant keys (key → tenant) come from, merged (env wins on a collision):
 //!   - Postgres `kosha.api_keys` (when `DATABASE_URL` is set and the
-//!     `postgres` feature is on): tenant keys, never admin. Re-read every
-//!     `KOSHA_API_KEY_REFRESH_SECS` (default 30) by a background thread, so
-//!     keys created through `POST /v1/admin/api-keys` start working and
-//!     revoked/deleted keys stop working without a restart.
-//!   - `KOSHA_API_KEYS` (`key1=tenant1,key2=tenant2`): tenant keys, not admin.
-//!   - `KOSHA_API_KEY` (single key, tenant `default`): the bootstrap key.
-//!     It is an **admin** key — it is what operators, the compaction
-//!     CronJob, and peer replicas (`/internal/segment/*`) already present.
-//!   - `KOSHA_ADMIN_API_KEYS` (`key` or `key=tenant`, comma-separated):
-//!     additional admin keys (tenant defaults to `default`).
+//!     `postgres` feature is on). Re-read every `KOSHA_API_KEY_REFRESH_SECS`
+//!     (default 30) by a background thread, so keys created through
+//!     `POST /v1/admin/api-keys` start working and deleted keys stop working
+//!     without a restart.
+//!   - `KOSHA_API_KEYS` (`key1=tenant1,key2=tenant2`).
+//!   - `KOSHA_API_KEY` (single key, tenant `default`).
 //!
-//! Fail closed: if no key is configured anywhere at startup the server
-//! refuses to start, unless `KOSHA_AUTH=disabled` is set explicitly — which
-//! turns every request into an admin request for tenant `dev` (local
-//! development only).
+//! Admin and peer access is not a property of tenant keys: it is the
+//! dedicated `KOSHA_ADMIN_API_KEY` / `KOSHA_INTERNAL_API_KEY` credentials,
+//! checked in `main.rs` (`service_authorized`).
+//!
+//! Fail closed: if no credential of any kind is configured at startup, the
+//! server refuses to start, unless `KOSHA_AUTH=disabled` is set explicitly.
+//! Then every request is tenant `dev` (local development only). Before this,
+//! an empty key table or a failed Postgres connect silently turned auth off.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-/// Who a request is acting as, after authentication.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Principal {
-    pub tenant: String,
-    /// May call `/v1/admin/*` and `/internal/*`, sees every namespace in
-    /// `/stats`, and addresses namespaces by their raw (unprefixed) name on
-    /// the legacy unversioned routes.
-    pub admin: bool,
-}
-
-impl Principal {
-    /// The principal used for every request when `KOSHA_AUTH=disabled`.
-    pub fn dev() -> Self {
-        Self {
-            tenant: "dev".to_string(),
-            admin: true,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KeyEntry {
-    pub tenant: String,
-    pub admin: bool,
-}
-
-/// Parse the env-var key sources into one map. Empty keys are ignored (an
-/// empty `KOSHA_API_KEY=""` must never make the empty string a valid key).
-pub fn parse_env_keys(
-    api_keys: Option<&str>,
-    api_key: Option<&str>,
-    admin_keys: Option<&str>,
-) -> HashMap<String, KeyEntry> {
+/// Parse the env-var tenant key sources into one map. Empty keys and
+/// tenants are ignored: an empty `KOSHA_API_KEY=""` must never make the
+/// empty string a valid key.
+pub fn parse_env_keys(api_keys: Option<&str>, api_key: Option<&str>) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if let Some(list) = api_keys {
         for pair in list.split(',') {
             if let Some((k, t)) = pair.split_once('=') {
                 let (k, t) = (k.trim(), t.trim());
                 if !k.is_empty() && !t.is_empty() {
-                    map.insert(
-                        k.to_string(),
-                        KeyEntry {
-                            tenant: t.to_string(),
-                            admin: false,
-                        },
-                    );
+                    map.insert(k.to_string(), t.to_string());
                 }
             }
         }
     }
     if let Some(k) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
-        map.insert(
-            k.to_string(),
-            KeyEntry {
-                tenant: "default".to_string(),
-                admin: true,
-            },
-        );
-    }
-    if let Some(list) = admin_keys {
-        for item in list.split(',') {
-            let (k, t) = match item.split_once('=') {
-                Some((k, t)) => (k.trim(), Some(t.trim()).filter(|t| !t.is_empty())),
-                None => (item.trim(), None),
-            };
-            if k.is_empty() {
-                continue;
-            }
-            let tenant = t
-                .map(str::to_string)
-                .or_else(|| map.get(k).map(|e: &KeyEntry| e.tenant.clone()))
-                .unwrap_or_else(|| "default".to_string());
-            map.insert(
-                k.to_string(),
-                KeyEntry {
-                    tenant,
-                    admin: true,
-                },
-            );
-        }
+        map.insert(k.to_string(), "default".to_string());
     }
     map
 }
 
-/// Validated API keys: fixed env keys plus a periodically refreshed
-/// snapshot of the Postgres `kosha.api_keys` table.
+/// Tenant API keys: fixed env keys plus a periodically refreshed snapshot
+/// of the Postgres `kosha.api_keys` table.
 pub struct KeyStore {
-    env: HashMap<String, KeyEntry>,
+    env: HashMap<String, String>,
     /// api_key → tenant, from Postgres. Replaced wholesale on each refresh.
     db: RwLock<HashMap<String, String>>,
     #[cfg(feature = "postgres")]
     database_url: Option<String>,
     /// Shared Postgres handle for key reads and `POST /v1/admin/api-keys`
-    /// (one pool for the process instead of a fresh connection per call).
+    /// (one pool per process instead of a fresh connection per call).
     #[cfg(feature = "postgres")]
     pg: Mutex<Option<std::sync::Arc<kosha_control::PgStore>>>,
 }
 
 impl KeyStore {
     /// A store with only the given keys and no database (tests, env-only).
-    pub fn with_keys(env: HashMap<String, KeyEntry>) -> Self {
+    pub fn with_keys(env: HashMap<String, String>) -> Self {
         Self {
             env,
             db: RwLock::new(HashMap::new()),
@@ -133,20 +71,15 @@ impl KeyStore {
         }
     }
 
-    pub fn lookup(&self, key: &str) -> Option<Principal> {
+    /// The tenant a key belongs to.
+    pub fn lookup(&self, key: &str) -> Option<String> {
         if key.is_empty() {
             return None;
         }
-        if let Some(e) = self.env.get(key) {
-            return Some(Principal {
-                tenant: e.tenant.clone(),
-                admin: e.admin,
-            });
+        if let Some(t) = self.env.get(key) {
+            return Some(t.clone());
         }
-        self.db.read().unwrap().get(key).map(|tenant| Principal {
-            tenant: tenant.clone(),
-            admin: false,
-        })
+        self.db.read().unwrap().get(key).cloned()
     }
 
     pub fn len(&self) -> usize {
@@ -161,7 +94,7 @@ impl KeyStore {
         *self.db.write().unwrap() = keys;
     }
 
-    /// Make a just-created key usable on this pod immediately; other pods
+    /// Make a just-created key usable on this pod immediately. Other pods
     /// pick it up on their next refresh.
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     pub fn insert_db_key(&self, key: String, tenant: String) {
@@ -186,7 +119,7 @@ impl KeyStore {
     }
 
     /// Re-read active keys from Postgres. On error the previous snapshot is
-    /// kept (a transient DB blip must not lock every tenant out).
+    /// kept, so a transient DB blip doesn't lock every tenant out.
     #[cfg(feature = "postgres")]
     pub fn refresh(&self) -> Result<usize, String> {
         if self.database_url.is_none() {
@@ -211,7 +144,7 @@ impl KeyStore {
 }
 
 pub enum Auth {
-    /// `KOSHA_AUTH=disabled`: every request is `Principal::dev()`.
+    /// `KOSHA_AUTH=disabled`: every request is tenant `dev`.
     Disabled,
     Keys(KeyStore),
 }
@@ -220,7 +153,7 @@ static AUTH: OnceLock<Auth> = OnceLock::new();
 
 /// The process-wide auth config. `main` initializes it (`init_global`)
 /// before binding the listener. Unit tests that drive `serve()` without
-/// initializing it get `Disabled`, matching their pre-auth behavior; a
+/// initializing it get `Disabled`, matching their pre-auth behavior. A
 /// non-test binary that somehow skipped init fails closed instead.
 pub fn global() -> &'static Auth {
     AUTH.get_or_init(|| {
@@ -243,16 +176,20 @@ fn env_flag_disabled(var: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_nonempty(var: &str) -> bool {
+    std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
+}
+
 /// Build the auth config from the environment, load keys, start the
-/// refresh thread, and install it globally. Exits the process if no keys
-/// are configured and auth wasn't explicitly disabled.
+/// refresh thread, and install it globally. Exits the process if no
+/// credential is configured and auth wasn't explicitly disabled.
 pub fn init_global() {
     if env_flag_disabled("KOSHA_AUTH") {
         eprintln!(
             "WARNING: ******************************************************************\n\
              WARNING: KOSHA_AUTH=disabled — API key authentication is OFF. Every request\n\
-             WARNING: is treated as an ADMIN request for tenant 'dev'. Local development\n\
-             WARNING: only; never set this on a reachable deployment.\n\
+             WARNING: is treated as tenant 'dev'. Local development only; never set\n\
+             WARNING: this on a reachable deployment.\n\
              WARNING: ******************************************************************"
         );
         let _ = AUTH.set(Auth::Disabled);
@@ -262,10 +199,8 @@ pub fn init_global() {
     let env = parse_env_keys(
         std::env::var("KOSHA_API_KEYS").ok().as_deref(),
         std::env::var("KOSHA_API_KEY").ok().as_deref(),
-        std::env::var("KOSHA_ADMIN_API_KEYS").ok().as_deref(),
     );
-    let admin_count = env.values().filter(|e| e.admin).count();
-    println!("api keys: {} env key(s) ({} admin)", env.len(), admin_count);
+    println!("api keys: {} tenant key(s) from env", env.len());
     #[allow(unused_mut)]
     let mut store = KeyStore::with_keys(env);
 
@@ -286,20 +221,16 @@ pub fn init_global() {
         }
     }
 
-    if store.len() == 0 {
+    let service_keys =
+        env_nonempty("KOSHA_ADMIN_API_KEY") || env_nonempty("KOSHA_INTERNAL_API_KEY");
+    if store.len() == 0 && !service_keys {
         eprintln!(
-            "FATAL: no API keys configured (postgres kosha.api_keys empty or unreachable, \
-             KOSHA_API_KEY / KOSHA_API_KEYS / KOSHA_ADMIN_API_KEYS unset). Refusing to start \
-             with authentication silently open. Configure a key, or set KOSHA_AUTH=disabled \
-             explicitly for local development."
+            "FATAL: no API keys configured (postgres kosha.api_keys empty or unreachable; \
+             KOSHA_API_KEY, KOSHA_API_KEYS, KOSHA_ADMIN_API_KEY and KOSHA_INTERNAL_API_KEY \
+             unset). Refusing to start with authentication silently open. Configure a key, \
+             or set KOSHA_AUTH=disabled explicitly for local development."
         );
         std::process::exit(1);
-    }
-    if admin_count == 0 {
-        println!(
-            "api keys: no admin key configured (KOSHA_API_KEY / KOSHA_ADMIN_API_KEYS) — \
-             /v1/admin/* and /internal/* will return 403 for every caller"
-        );
     }
 
     let _ = AUTH.set(Auth::Keys(store));
@@ -329,21 +260,6 @@ fn refresh_interval() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Extract the presented API key: `Authorization: Bearer <key>` or
-/// `X-Api-Key: <key>` (header names are lower-cased by the request parser).
-pub fn presented_key(headers: &HashMap<String, String>) -> Option<&str> {
-    headers
-        .get("authorization")
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .or_else(|| headers.get("x-api-key").map(|v| v.as_str()))
-        .or_else(|| {
-            headers
-                .iter()
-                .find_map(|(k, v)| k.eq_ignore_ascii_case("x-api-key").then_some(v.as_str()))
-        })
-        .map(str::trim)
-}
-
 /// Maximum accepted request body (`KOSHA_MAX_BODY_BYTES`, default 64 MiB).
 pub fn max_body_bytes() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
@@ -366,8 +282,8 @@ pub fn legacy_routes_enabled() -> bool {
 type UsageWindow = (u64, Option<Instant>);
 
 /// Per-tenant legacy route usage, so the cutover to `/v1` can be tracked
-/// from logs. Logs the first use of each (tenant, route) and then at most
-/// once a minute with the count since the last line, so hot search traffic
+/// from logs. Logs the first use of each (tenant, route), then at most once
+/// a minute with the count since the last line, so hot search traffic
 /// doesn't flood the log.
 pub fn record_legacy_use(tenant: &str, route: &str) {
     static USAGE: OnceLock<Mutex<HashMap<(String, String), UsageWindow>>> = OnceLock::new();
@@ -394,40 +310,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn env_keys_parse_tenants_and_admin_roles() {
-        let m = parse_env_keys(
-            Some("ka=acme, kb=beta,bad,=x,kc="),
-            Some("boot"),
-            Some("ka,kadmin=ops,"),
-        );
-        assert_eq!(
-            m.get("ka"),
-            Some(&KeyEntry {
-                tenant: "acme".into(),
-                admin: true
-            })
-        );
-        assert_eq!(
-            m.get("kb"),
-            Some(&KeyEntry {
-                tenant: "beta".into(),
-                admin: false
-            })
-        );
-        assert_eq!(
-            m.get("boot"),
-            Some(&KeyEntry {
-                tenant: "default".into(),
-                admin: true
-            })
-        );
-        assert_eq!(m.get("kadmin").map(|e| e.tenant.as_str()), Some("ops"));
+    fn env_keys_parse_tenants() {
+        let m = parse_env_keys(Some("ka=acme, kb=beta,bad,=x,kc="), Some("boot"));
+        assert_eq!(m.get("ka").map(String::as_str), Some("acme"));
+        assert_eq!(m.get("kb").map(String::as_str), Some("beta"));
+        assert_eq!(m.get("boot").map(String::as_str), Some("default"));
         assert!(!m.contains_key("") && !m.contains_key("bad") && !m.contains_key("kc"));
     }
 
     #[test]
     fn empty_bootstrap_key_is_not_a_valid_key() {
-        let m = parse_env_keys(None, Some("  "), None);
+        let m = parse_env_keys(None, Some("  "));
         assert!(m.is_empty());
         let store = KeyStore::with_keys(m);
         assert_eq!(store.lookup(""), None);
@@ -435,40 +328,25 @@ mod tests {
 
     #[test]
     fn refreshed_db_keys_are_added_and_revoked_without_restart() {
-        let store = KeyStore::with_keys(parse_env_keys(None, Some("boot"), None));
+        let store = KeyStore::with_keys(parse_env_keys(None, Some("boot")));
         assert_eq!(store.lookup("sk-new"), None);
 
         // A refresh that sees a key created via the admin API.
         store.replace_db_keys(HashMap::from([("sk-new".into(), "acme".into())]));
-        assert_eq!(
-            store.lookup("sk-new"),
-            Some(Principal {
-                tenant: "acme".into(),
-                admin: false
-            })
-        );
+        assert_eq!(store.lookup("sk-new").as_deref(), Some("acme"));
 
-        // A later refresh after the key was revoked/deleted.
+        // A later refresh after the key was deleted.
         store.replace_db_keys(HashMap::new());
         assert_eq!(store.lookup("sk-new"), None);
         // Env keys are unaffected by DB refreshes.
-        assert!(store.lookup("boot").is_some_and(|p| p.admin));
+        assert_eq!(store.lookup("boot").as_deref(), Some("default"));
     }
 
     #[test]
-    fn db_keys_are_never_admin_even_if_colliding_names() {
+    fn inserted_key_is_usable_immediately() {
         let store = KeyStore::with_keys(HashMap::new());
         store.insert_db_key("sk-x".into(), "acme".into());
-        assert_eq!(store.lookup("sk-x").map(|p| p.admin), Some(false));
+        assert_eq!(store.lookup("sk-x").as_deref(), Some("acme"));
         assert_eq!(store.len(), 1);
-    }
-
-    #[test]
-    fn presented_key_reads_bearer_and_x_api_key() {
-        let h = HashMap::from([("authorization".to_string(), "Bearer sk-1".to_string())]);
-        assert_eq!(presented_key(&h), Some("sk-1"));
-        let h = HashMap::from([("x-api-key".to_string(), "sk-2".to_string())]);
-        assert_eq!(presented_key(&h), Some("sk-2"));
-        assert_eq!(presented_key(&HashMap::new()), None);
     }
 }

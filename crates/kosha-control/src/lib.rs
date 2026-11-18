@@ -52,6 +52,8 @@ impl Controller {
                 version: 0,
                 segments: Vec::new(),
                 segment_footers: Default::default(),
+                wal_checkpoint: 0,
+                tombstones: Default::default(),
             },
         );
         Ok(())
@@ -67,6 +69,8 @@ impl Controller {
                     version: 0,
                     segments: Vec::new(),
                     segment_footers: Default::default(),
+                    wal_checkpoint: 0,
+                    tombstones: Default::default(),
                 },
             );
         }
@@ -225,6 +229,8 @@ mod tests {
                     doc_count: 7,
                 }],
                 segment_footers: Default::default(),
+                wal_checkpoint: 0,
+                tombstones: Default::default(),
             },
         )
         .unwrap();
@@ -239,6 +245,8 @@ mod tests {
                 version: 4,
                 segments: vec![],
                 segment_footers: Default::default(),
+                wal_checkpoint: 0,
+                tombstones: Default::default(),
             },
         )
         .unwrap();
@@ -262,6 +270,8 @@ mod tests {
                 doc_count: 10,
             }],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
 
         // CAS with version 0 → should succeed (initial version is 0).
@@ -277,6 +287,8 @@ mod tests {
             version: 2,
             segments: vec![],
             segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            tombstones: Default::default(),
         };
         assert!(ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2).is_err());
     }
