@@ -52,6 +52,7 @@ fn decode_manifest(version: u64, segments_json: &str) -> Option<Manifest> {
         wal_checkpoint: 0,
         wal_origin: None,
         tombstones: Default::default(),
+        deletion_vectors: Default::default(),
     };
     for entry in entries {
         if let Some(footer) = entry.footer {

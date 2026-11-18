@@ -5,7 +5,7 @@ use kosha_core::{
     Document, DocumentId, Field, FieldType, KoshaError, NamespaceId, StorageBackend, WalRecord,
 };
 
-fn durable_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), KoshaError> {
+pub(crate) fn durable_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), KoshaError> {
     use std::io::Write;
     let temporary = path.with_extension("tmp");
     let mut file = std::fs::File::create(&temporary)?;
@@ -21,21 +21,10 @@ fn durable_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), KoshaError>
 /// The WAL stores document batches per namespace in sequential files.
 /// On crash, the WAL is replayed to recover un-flushed documents.
 ///
-/// WAL file format (binary LE):
-///   [magic: u32 = 0x4B57414C]  ("KWAL")
-///   [version: u32 = 1]
-///   [record_count: u32]
-///   for each record:
-///     [ns_len: u32][ns_bytes]
-///     [timestamp: u64]
-///     [doc_count: u32]
-///     for each doc:
-///       [id_len: u32][id_bytes]
-///       [field_count: u32]
-///       for each field:
-///         [name_len: u32][name_bytes]
-///         [field_type: u8]
-///         [val_len: u64][val_bytes]
+/// New files contain one v2 frame: magic, version, payload length (u64),
+/// CRC32C (u32), then a JSON WalRecord. V1 binary records remain readable.
+/// An incomplete final file is discarded atomically; malformed/checksum-failed
+/// records fail recovery closed rather than silently losing acknowledged data.
 pub struct WalWriter {
     #[allow(dead_code)]
     backend: Box<dyn StorageBackend>,
@@ -50,7 +39,7 @@ pub struct WalWriter {
 
 impl WalWriter {
     const MAGIC: u32 = 0x4B57414C;
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
 
     pub fn new(backend: Box<dyn StorageBackend>, wal_dir: PathBuf) -> Self {
         std::fs::create_dir_all(&wal_dir).expect("cannot create WAL directory");
@@ -73,7 +62,27 @@ impl WalWriter {
             u64,
             std::collections::HashSet<NamespaceId>,
         > = Default::default();
-        for (sequence, record) in Self::recover_sequenced(&wal_dir).expect("WAL recovery failed") {
+        let recovered = Self::recover_sequenced(&wal_dir).expect("WAL recovery failed");
+        // A discarded tail must not become a corrupt middle record after
+        // subsequent writes. Preserve it outside the replay file set.
+        let mut paths: Vec<_> = std::fs::read_dir(&wal_dir)
+            .expect("cannot read WAL directory")
+            .map(|entry| entry.expect("cannot read WAL entry").path())
+            .filter(|path| path.extension().is_some_and(|e| e == "wal"))
+            .collect();
+        paths.sort();
+        if let Some(tail) = paths.last() {
+            let bytes = std::fs::read(tail).expect("cannot read WAL tail");
+            if matches!(decode_file(&bytes), Err(KoshaError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof)
+            {
+                std::fs::rename(tail, tail.with_extension("torn"))
+                    .expect("cannot quarantine torn WAL tail");
+                std::fs::File::open(&wal_dir)
+                    .and_then(|dir| dir.sync_all())
+                    .expect("cannot sync WAL repair");
+            }
+        }
+        for (sequence, record) in recovered {
             record_namespaces
                 .entry(sequence)
                 .or_default()
@@ -163,41 +172,19 @@ impl WalWriter {
         self.append_record(&record)
     }
 
+    pub fn append_delete(
+        &mut self,
+        namespace: &NamespaceId,
+        ids: Vec<DocumentId>,
+    ) -> Result<(), KoshaError> {
+        let mut record = WalRecord::new(namespace.clone(), Vec::new());
+        record.deleted_ids = ids;
+        self.append_record(&record)
+    }
+
     fn append_record(&mut self, record: &WalRecord) -> Result<(), KoshaError> {
-        let ns_bytes = record.namespace.0.as_bytes();
-        let doc_count = record.documents.len() as u32;
-
-        // Write to buffer
-        self.buffer
-            .extend_from_slice(&(ns_bytes.len() as u32).to_le_bytes());
-        self.buffer.extend_from_slice(ns_bytes);
-        self.buffer
-            .extend_from_slice(&record.timestamp.to_le_bytes());
-        self.buffer.extend_from_slice(&doc_count.to_le_bytes());
-
-        for doc in &record.documents {
-            let id_bytes = doc.id.0.as_bytes();
-            self.buffer
-                .extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
-            self.buffer.extend_from_slice(id_bytes);
-
-            let field_count = doc.fields.len() as u32;
-            self.buffer.extend_from_slice(&field_count.to_le_bytes());
-
-            for field in &doc.fields {
-                let name_bytes = field.name.as_bytes();
-                self.buffer
-                    .extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-                self.buffer.extend_from_slice(name_bytes);
-                self.buffer.push(field.field_type as u8);
-                let val_bytes = field.value.as_bytes();
-                self.buffer
-                    .extend_from_slice(&(val_bytes.len() as u64).to_le_bytes());
-                self.buffer.extend_from_slice(val_bytes);
-            }
-        }
-
-        self.records_in_buffer += 1;
+        self.buffer = serde_json::to_vec(record)?;
+        self.records_in_buffer = 1;
         if let Err(e) = self.flush_buffer() {
             self.buffer.clear();
             self.records_in_buffer = 0;
@@ -218,7 +205,8 @@ impl WalWriter {
         let mut final_buf = Vec::new();
         final_buf.extend_from_slice(&Self::MAGIC.to_le_bytes());
         final_buf.extend_from_slice(&Self::VERSION.to_le_bytes());
-        final_buf.extend_from_slice(&self.records_in_buffer.to_le_bytes());
+        final_buf.extend_from_slice(&(self.buffer.len() as u64).to_le_bytes());
+        final_buf.extend_from_slice(&crc32c::crc32c(&self.buffer).to_le_bytes());
         final_buf.extend_from_slice(&self.buffer);
 
         let path = self.wal_dir.join(&self.current_file);
@@ -291,101 +279,16 @@ impl WalWriter {
                 .and_then(|s| u64::from_str_radix(s, 16).ok())
                 .ok_or_else(|| KoshaError::NotFound("invalid WAL filename".into()))?;
             let data = std::fs::read(path)?;
-            if data.len() < 12 {
-                continue;
-            }
-            let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-            if magic != Self::MAGIC {
-                continue;
-            }
-            let _version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-            let record_count = u32::from_le_bytes(data[8..12].try_into().unwrap());
-
-            let mut cursor = &data[12..];
-            for _ in 0..record_count {
-                if cursor.len() < 4 {
-                    break;
+            let decoded = decode_file(&data);
+            match decoded {
+                Ok(batch) => records.extend(batch.into_iter().map(|record| (sequence, record))),
+                Err(KoshaError::Io(e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof
+                        && Some(path) == files.last() =>
+                {
+                    break
                 }
-                let ns_len = u32::from_le_bytes(cursor[..4].try_into().unwrap()) as usize;
-                cursor = &cursor[4..];
-                if cursor.len() < ns_len + 8 + 4 {
-                    break;
-                }
-                let ns_bytes = &cursor[..ns_len];
-                let namespace = NamespaceId(String::from_utf8_lossy(ns_bytes).to_string());
-                cursor = &cursor[ns_len..];
-                let timestamp = u64::from_le_bytes(cursor[..8].try_into().unwrap());
-                cursor = &cursor[8..];
-                let doc_count = u32::from_le_bytes(cursor[..4].try_into().unwrap()) as usize;
-                cursor = &cursor[4..];
-
-                let mut documents = Vec::with_capacity(doc_count);
-                for _ in 0..doc_count {
-                    if cursor.len() < 4 {
-                        break;
-                    }
-                    let id_len = u32::from_le_bytes(cursor[..4].try_into().unwrap()) as usize;
-                    cursor = &cursor[4..];
-                    if cursor.len() < id_len + 4 {
-                        break;
-                    }
-                    let id_bytes = &cursor[..id_len];
-                    let doc_id = DocumentId(String::from_utf8_lossy(id_bytes).to_string());
-                    cursor = &cursor[id_len..];
-                    let field_count = u32::from_le_bytes(cursor[..4].try_into().unwrap()) as usize;
-                    cursor = &cursor[4..];
-
-                    let mut fields = Vec::with_capacity(field_count);
-                    for _ in 0..field_count {
-                        if cursor.len() < 4 {
-                            break;
-                        }
-                        let name_len = u32::from_le_bytes(cursor[..4].try_into().unwrap()) as usize;
-                        cursor = &cursor[4..];
-                        if cursor.len() < name_len + 1 {
-                            break;
-                        }
-                        let name_bytes = &cursor[..name_len];
-                        let name = String::from_utf8_lossy(name_bytes).to_string();
-                        cursor = &cursor[name_len..];
-                        let field_type = match cursor[0] {
-                            0 => FieldType::Text,
-                            1 => FieldType::Keyword,
-                            2 => FieldType::Integer,
-                            3 => FieldType::Float,
-                            4 => FieldType::Date,
-                            5 => FieldType::Boolean,
-                            6 => FieldType::Vector,
-                            _ => FieldType::Text,
-                        };
-                        cursor = &cursor[1..];
-                        if cursor.len() < 8 {
-                            break;
-                        }
-                        let val_len = u64::from_le_bytes(cursor[..8].try_into().unwrap()) as usize;
-                        cursor = &cursor[8..];
-                        if cursor.len() < val_len {
-                            break;
-                        }
-                        let val_bytes = &cursor[..val_len];
-                        let value = String::from_utf8_lossy(val_bytes).to_string();
-                        cursor = &cursor[val_len..];
-                        fields.push(Field {
-                            name,
-                            field_type,
-                            value,
-                        });
-                    }
-                    documents.push(Document { id: doc_id, fields });
-                }
-                records.push((
-                    sequence,
-                    WalRecord {
-                        namespace,
-                        documents,
-                        timestamp,
-                    },
-                ));
+                Err(e) => return Err(e),
             }
         }
 
@@ -393,9 +296,196 @@ impl WalWriter {
     }
 }
 
+fn invalid(message: &str) -> KoshaError {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message).into()
+}
+fn torn() -> KoshaError {
+    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "torn WAL tail").into()
+}
+fn take<'a>(input: &mut &'a [u8], n: usize) -> Result<&'a [u8], KoshaError> {
+    if input.len() < n {
+        return Err(torn());
+    }
+    let (value, rest) = input.split_at(n);
+    *input = rest;
+    Ok(value)
+}
+fn u32_value(input: &mut &[u8]) -> Result<u32, KoshaError> {
+    Ok(u32::from_le_bytes(take(input, 4)?.try_into().unwrap()))
+}
+fn u64_value(input: &mut &[u8]) -> Result<u64, KoshaError> {
+    Ok(u64::from_le_bytes(take(input, 8)?.try_into().unwrap()))
+}
+fn string(input: &mut &[u8], n: usize) -> Result<String, KoshaError> {
+    String::from_utf8(take(input, n)?.to_vec()).map_err(|_| invalid("invalid UTF-8 in WAL"))
+}
+fn decode_file(data: &[u8]) -> Result<Vec<WalRecord>, KoshaError> {
+    let mut input = data;
+    if u32_value(&mut input)? != WalWriter::MAGIC {
+        return Err(invalid("invalid WAL magic"));
+    }
+    match u32_value(&mut input)? {
+        2 => {
+            let len = usize::try_from(u64_value(&mut input)?)
+                .map_err(|_| invalid("WAL record too large"))?;
+            let crc = u32_value(&mut input)?;
+            let payload = take(&mut input, len)?;
+            if !input.is_empty() {
+                return Err(invalid("trailing WAL bytes"));
+            }
+            if crc32c::crc32c(payload) != crc {
+                return Err(invalid("WAL checksum mismatch"));
+            }
+            Ok(vec![serde_json::from_slice(payload)?])
+        }
+        1 => {
+            // Legacy files remain readable, but incomplete records are never
+            // partially replayed and unknown field types fail closed.
+            let count = u32_value(&mut input)?;
+            let mut records = Vec::new();
+            for _ in 0..count {
+                let len = u32_value(&mut input)? as usize;
+                let namespace = NamespaceId(string(&mut input, len)?);
+                let timestamp = u64_value(&mut input)?;
+                let docs = u32_value(&mut input)?;
+                let mut documents = Vec::new();
+                for _ in 0..docs {
+                    let len = u32_value(&mut input)? as usize;
+                    let id = DocumentId(string(&mut input, len)?);
+                    let count = u32_value(&mut input)?;
+                    let mut fields = Vec::new();
+                    for _ in 0..count {
+                        let len = u32_value(&mut input)? as usize;
+                        let name = string(&mut input, len)?;
+                        let field_type = match take(&mut input, 1)?[0] {
+                            0 => FieldType::Text,
+                            1 => FieldType::Keyword,
+                            2 => FieldType::Integer,
+                            3 => FieldType::Float,
+                            4 => FieldType::Date,
+                            5 => FieldType::Boolean,
+                            6 => FieldType::Vector,
+                            _ => return Err(invalid("unknown WAL field type")),
+                        };
+                        let len = usize::try_from(u64_value(&mut input)?)
+                            .map_err(|_| invalid("WAL field too large"))?;
+                        let value = string(&mut input, len)?;
+                        fields.push(Field {
+                            name,
+                            field_type,
+                            value,
+                        });
+                    }
+                    documents.push(Document { id, fields });
+                }
+                records.push(WalRecord {
+                    namespace,
+                    timestamp,
+                    documents,
+                    deleted_ids: Vec::new(),
+                });
+            }
+            if !input.is_empty() {
+                return Err(invalid("trailing legacy WAL bytes"));
+            }
+            Ok(records)
+        }
+        _ => Err(invalid("unsupported WAL version")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framed_wal_torn_tail_never_replays_partial_documents_or_deletes() {
+        let dir = std::env::temp_dir().join(format!("kosha-wal-tail-{}", uuid::Uuid::new_v4()));
+        let mut wal = WalWriter::new(
+            Box::new(kosha_core::LocalStorage::new(dir.clone())),
+            dir.clone(),
+        );
+        let ns = NamespaceId("ns".into());
+        wal.append(
+            &ns,
+            &[Document {
+                id: DocumentId("a".into()),
+                fields: vec![Field::text("body", "hello")],
+            }],
+        )
+        .unwrap();
+        wal.append_delete(&ns, vec![DocumentId("a".into())])
+            .unwrap();
+        let tail = dir.join(format!("wal-{:020x}.wal", wal.last_sequence()));
+        let bytes = std::fs::read(&tail).unwrap();
+        assert_eq!(
+            WalWriter::recover(&dir).unwrap()[1].deleted_ids,
+            vec![DocumentId("a".into())]
+        );
+        for end in 0..bytes.len() {
+            std::fs::write(&tail, &bytes[..end]).unwrap();
+            let recovered = WalWriter::recover(&dir).unwrap();
+            assert_eq!(recovered.len(), 1, "tail length {end}");
+            assert_eq!(recovered[0].documents[0].id.0, "a");
+        }
+        let mut corrupt = bytes;
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(&tail, corrupt).unwrap();
+        assert!(WalWriter::recover(&dir).is_err());
+        std::fs::write(&tail, [0u8; 3]).unwrap();
+        let mut restarted = WalWriter::new(
+            Box::new(kosha_core::LocalStorage::new(dir.clone())),
+            dir.clone(),
+        );
+        restarted
+            .append(
+                &ns,
+                &[Document {
+                    id: DocumentId("b".into()),
+                    fields: vec![],
+                }],
+            )
+            .unwrap();
+        drop(restarted);
+        let _second_restart = WalWriter::new(
+            Box::new(kosha_core::LocalStorage::new(dir.clone())),
+            dir.clone(),
+        );
+        assert_eq!(
+            WalWriter::recover(&dir).unwrap().len(),
+            2,
+            "discarded tail must not block a later restart"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_wal_rejects_unknown_field_types_and_partial_records() {
+        let mut data = Vec::new();
+        for n in [WalWriter::MAGIC, 1, 1, 2] {
+            data.extend_from_slice(&n.to_le_bytes());
+        }
+        data.extend_from_slice(b"ns");
+        data.extend_from_slice(&1u64.to_le_bytes());
+        for n in [1u32, 1] {
+            data.extend_from_slice(&n.to_le_bytes());
+        }
+        data.push(b'a');
+        for n in [1u32, 1] {
+            data.extend_from_slice(&n.to_le_bytes());
+        }
+        data.push(b'f');
+        let type_offset = data.len();
+        data.push(0);
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.push(b'v');
+        assert_eq!(decode_file(&data).unwrap()[0].documents[0].id.0, "a");
+        for end in 0..data.len() {
+            assert!(decode_file(&data[..end]).is_err());
+        }
+        data[type_offset] = 255;
+        assert!(decode_file(&data).is_err());
+    }
 
     #[test]
     fn wal_write_and_recover() {

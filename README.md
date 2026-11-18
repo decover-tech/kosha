@@ -132,16 +132,33 @@ pending writes during recovery. Preserve the entire WAL directory, including
 its `origin` file, across restarts. Legacy checkpoints without an origin retain
 their previous recovery behavior; upgrade all writers before concurrent use.
 
-Delete tombstones and WAL checkpoints are stored in the manifest. Query-role
-pods refresh the published manifest before searches, including cache lookups.
-Superseded segment files are retained for older readers and publication snapshots;
-physical cleanup is deferred to cache reclamation rather than immediate unlink.
+Deletes include buffered documents and WAL-log resolved document IDs before
+applying them. New WAL files use checksummed v2 frames; recovery discards an
+incomplete final file and rejects corrupt records. Legacy v1 files remain readable.
+Deletes and writes replay in order, so reinserting a deleted ID remains valid.
+
+Deletion sets are immutable `deletes-{sha256}.roaring` sidecars referenced by the
+manifest. Publication uploads these sidecars before CAS, including new generations
+for segments uploaded earlier. Query pods load and validate the referenced
+bitmaps before installing refreshed manifests; a missing or corrupt bitmap fails
+the request. Result caching includes deletion generations, and WAND filters
+removed documents before counting or scoring them.
+
+Upserts retain old segments, mark prior copies deleted, and write only incoming
+documents into a new segment. Partial replacements read the affected document
+spans and merge fields. Segment I/O runs outside the namespace state lock; the
+new segment and deletion markers become visible together. Compaction reclaims
+these dead copies later. Superseded files remain available to older snapshots;
+S3 garbage collection is still deferred.
 
 **Upgrade note:** Postgres `segments_json` now stores the complete manifest
 object, including tombstones and checkpoints. New servers can read the old entry
 arrays. Old servers cannot read the new object format: upgrade ingest and query
 roles together before resuming writes, and do not roll back readers without a
-manifest-format migration. The existing SQL column needs no schema change.
+manifest-format migration. Servers predating deletion-vector support ignore
+those references, and older WAL readers cannot replay v2 frames: upgrade all
+roles together before accepting writes and preserve the WAL directory. Rolling
+back requires converting both formats. The SQL column needs no schema change.
 
 ## Repository layout
 
@@ -228,6 +245,11 @@ The Postgres CAS integration test races independent writers and checks retries.
 Run it against a dedicated disposable database:
 
     KOSHA_TEST_DATABASE_URL=postgres://... cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored
+
+To measure single-document upsert write amplification against a real 500 MiB
+segment (including its stored filter payload):
+
+    cargo bench -p kosha-write --bench upsert_write_amplification
 
 ### Local S3 (MinIO)
 

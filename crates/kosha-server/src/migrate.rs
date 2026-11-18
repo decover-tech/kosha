@@ -533,6 +533,7 @@ impl Publisher {
                 wal_checkpoint: 0,
                 wal_origin: None,
                 tombstones: Default::default(),
+                deletion_vectors: Default::default(),
             },
             PublishMode::Append => existing.clone(),
         };
@@ -638,6 +639,7 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
+            deletion_vectors: Default::default(),
         });
         // Restore to advance segment IDs beyond an existing/partial run.
         // Replace mode: Publisher publishes only this run's segments.
