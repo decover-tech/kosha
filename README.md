@@ -48,6 +48,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 ### Indexing and writes
 
 - Bulk document indexing, with field types `Text`, `Keyword`, `Integer`, `Float`, `Date`, `Boolean`, `Vector`.
+- `Text` values longer than 256 chars (`KOSHA_TEXT_FILTER_IGNORE_ABOVE`; `off` disables the cap) are full-text searchable and returned in hits, but are not copied into the filter columns, so `term`/`terms`/`range` filters, `sort`, and aggregations do not see them. This matches Elasticsearch's dynamic-mapping `keyword` `ignore_above: 256`. Use `Keyword` for a long value that must be exact-matched.
 - Upsert by document id — segments holding a prior version of an id are rewritten.
 - Delete by query (tombstone-based) and a document `exists` check.
 - Write-ahead log for buffered documents, replayed on restart.
