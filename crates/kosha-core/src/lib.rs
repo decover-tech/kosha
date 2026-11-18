@@ -1151,6 +1151,25 @@ impl Manifest {
         self.segment_footers.get(segment_id)
     }
 
+    /// The segment's footer for pruning: the manifest's own copy, borrowed,
+    /// or `read()` (from the segment's `footer.json`) when the manifest
+    /// carries none.
+    ///
+    /// Borrowed on purpose. A footer holds the segment's term bloom and a
+    /// bloom per filter field, and every search looks at every segment's
+    /// footer; cloning it per segment per search copied megabytes to read a
+    /// few bits.
+    pub fn footer_or_read<'a>(
+        &'a self,
+        segment_id: &SegmentId,
+        read: impl FnOnce() -> Option<Footer>,
+    ) -> Option<std::borrow::Cow<'a, Footer>> {
+        match self.segment_footer(segment_id) {
+            Some(footer) => Some(std::borrow::Cow::Borrowed(footer)),
+            None => read().map(std::borrow::Cow::Owned),
+        }
+    }
+
     pub fn remember_segment_footer(&mut self, footer: Footer) {
         self.segment_footers
             .insert(footer.segment_id.clone(), footer);
