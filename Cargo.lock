@@ -2060,7 +2060,6 @@ dependencies = [
  "kosha-query",
  "kosha-segment",
  "kosha-write",
- "once_cell",
  "reqwest",
  "serde",
  "serde_json",
@@ -2085,6 +2084,7 @@ dependencies = [
  "kosha-segment",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

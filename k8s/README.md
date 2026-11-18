@@ -132,7 +132,7 @@ Consequences worth knowing:
 |--------|---------|
 | `AWS_GITHUB_ROLE_ARN` | OIDC deploy role |
 | `KOSHA_DATABASE_URL` | Postgres URL for control plane. Staging points at the in-cluster Postgres StatefulSet in `decoverai-services` (`postgres-service.decoverai-services.svc.cluster.local:5432/kosha`, not the old RDS instance) — see backend's `deployments/k8s/base/postgres.yaml`. Cross-namespace, so the FQDN is required; the bare `postgres-service` short name won't resolve from the `kosha` namespace. |
-| `KOSHA_API_KEY` | Bootstrap / client API key |
+| `KOSHA_API_KEY` | Bootstrap tenant API key (tenant `default`). Admin and peer access use the separate `KOSHA_ADMIN_API_KEY` / `KOSHA_INTERNAL_API_KEY`. The server refuses to start when no credential is configured at all. |
 | `KOSHA_S3_BUCKET` | Segment bucket name |
 | `KOSHA_S3_PREFIX` | Key prefix (e.g. `segments/`) |
 | `KOSHA_IRSA_ROLE_ARN` | `eks.amazonaws.com/role-arn` value |

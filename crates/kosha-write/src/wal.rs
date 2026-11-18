@@ -40,6 +40,7 @@ pub struct WalWriter {
     #[allow(dead_code)]
     backend: Box<dyn StorageBackend>,
     wal_dir: PathBuf,
+    origin: String,
     current_file: String,
     seq: AtomicU64,
     buffer: Vec<u8>,
@@ -52,6 +53,20 @@ impl WalWriter {
     const VERSION: u32 = 1;
 
     pub fn new(backend: Box<dyn StorageBackend>, wal_dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&wal_dir).expect("cannot create WAL directory");
+        let origin_path = wal_dir.join("origin");
+        let origin = match std::fs::read_to_string(&origin_path) {
+            Ok(origin) => {
+                uuid::Uuid::parse_str(&origin).expect("invalid WAL origin");
+                origin
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let origin = uuid::Uuid::new_v4().to_string();
+                durable_write(&origin_path, origin.as_bytes()).expect("cannot persist WAL origin");
+                origin
+            }
+            Err(e) => panic!("cannot read WAL origin: {e}"),
+        };
         let seq = Self::next_seq(&wal_dir);
         let file = format!("wal-{:020x}.wal", seq);
         let mut record_namespaces: std::collections::BTreeMap<
@@ -67,12 +82,17 @@ impl WalWriter {
         Self {
             backend,
             wal_dir,
+            origin,
             current_file: file,
             seq: AtomicU64::new(seq + 1),
             buffer: Vec::new(),
             records_in_buffer: 0,
             record_namespaces,
         }
+    }
+
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     fn next_seq(wal_dir: &PathBuf) -> u64 {

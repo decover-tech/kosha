@@ -17,80 +17,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-/// Map of valid API keys → tenant id.
-///
-/// Loaded from, in priority order:
-///   1. Postgres `kosha.api_keys` table (if DATABASE_URL + postgres feature)
-///   2. `KOSHA_API_KEYS` env var (format: `key1=tenant1,key2=tenant2`)
-///   3. `KOSHA_API_KEY` env var (single key, tenant = "default")
-///   4. Empty (dev mode — no auth required)
-static API_KEYS: once_cell::sync::Lazy<HashMap<String, String>> =
-    once_cell::sync::Lazy::new(load_api_keys);
-
-fn load_api_keys() -> HashMap<String, String> {
-    // 1. Postgres-backed keys (staging/production).
-    if let Ok(db_url) = std::env::var("DATABASE_URL") {
-        #[cfg(feature = "postgres")]
-        match kosha_control::PgStore::new(&db_url) {
-            Ok(store) => {
-                let keys = store.list_api_keys(None).unwrap_or_default();
-                if !keys.is_empty() {
-                    let map: HashMap<String, String> = keys
-                        .into_iter()
-                        .map(|(key, tenant, _desc)| (key, tenant))
-                        .collect();
-                    println!("api keys: loaded {} key(s) from postgres", map.len());
-                    return map;
-                }
-                println!("api keys: no keys found in postgres, falling back to env vars");
-            }
-            Err(e) => {
-                eprintln!("api keys: failed to connect to postgres: {e}, falling back to env vars");
-            }
-        }
-        #[cfg(not(feature = "postgres"))]
-        {
-            let _ = db_url;
-            println!("api keys: DATABASE_URL set but postgres feature disabled, using env vars");
-        }
-    }
-
-    // 2. Multi-tenant env var.
-    if let Ok(keys) = std::env::var("KOSHA_API_KEYS") {
-        let map: HashMap<_, _> = keys
-            .split(',')
-            .filter_map(|pair| {
-                pair.split_once('=')
-                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-            })
-            .collect();
-        if !map.is_empty() {
-            println!(
-                "api keys: loaded {} key(s) from KOSHA_API_KEYS env var",
-                map.len()
-            );
-            return map;
-        }
-    }
-
-    // 3. Single-tenant env var.
-    if let Ok(key) = std::env::var("KOSHA_API_KEY") {
-        println!("api keys: single key from KOSHA_API_KEY env var");
-        let mut m = HashMap::new();
-        m.insert(key, "default".to_string());
-        return m;
-    }
-
-    // 4. Dev mode — no auth.
-    println!("api keys: none configured — dev mode (no auth)");
-    HashMap::new()
-}
-
 /// Extract the tenant prefix from a namespace for isolation.
 fn tenant_namespace(tenant: &str, namespace: &str) -> String {
     format!("{tenant}/{namespace}")
 }
 
+mod auth;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 #[cfg(feature = "migrate")]
@@ -122,12 +54,6 @@ struct AppState {
     admin_auth_key: Option<String>,
     internal_service_key: Option<String>,
     publication_locks: Mutex<HashMap<NamespaceId, Arc<Mutex<()>>>>,
-    /// The last manifest this process published to (or restored from) the
-    /// control store, per namespace: its version, which is the
-    /// `expected_version` of the next compare-and-swap, and its segment set,
-    /// which is the base for rebasing after a lost CAS. See
-    /// `publish_namespace_with` (#230).
-    published: Mutex<HashMap<NamespaceId, PublishedBase>>,
     /// Hydrated segment files that failed their `_COMMIT` size/CRC check
     /// (#231), counting refetch failures again. Reported in `/stats`.
     #[cfg(feature = "s3")]
@@ -822,29 +748,6 @@ fn sync_segment_dir_to_s3(
         .map_err(|e| format!("S3 upload of segment {rel} failed: {e}"))
 }
 
-/// What this process last published for a namespace: see
-/// `AppState::published`. The default (version 0, no segments) is a
-/// namespace that has never been published, which is also what the control
-/// store's compare-and-swap treats an absent manifest as.
-#[derive(Debug, Clone, Default)]
-struct PublishedBase {
-    version: u64,
-    segment_ids: std::collections::HashSet<kosha_core::SegmentId>,
-}
-
-impl PublishedBase {
-    fn of(manifest: &kosha_core::Manifest) -> Self {
-        Self {
-            version: manifest.version,
-            segment_ids: manifest
-                .segments
-                .iter()
-                .map(|e| e.segment_id.clone())
-                .collect(),
-        }
-    }
-}
-
 impl AppState {
     fn new(data_dir: PathBuf) -> Self {
         std::fs::create_dir_all(&data_dir).ok();
@@ -1086,12 +989,10 @@ impl AppState {
         let mut synced_segments = std::collections::HashSet::new();
         let mut restored = 0usize;
         let mut restored_segments = 0usize;
-        let mut published: HashMap<NamespaceId, PublishedBase> = HashMap::new();
         #[cfg(feature = "s3")]
         let mut reconciled_missing = 0usize;
         for ns in control_store.list_namespaces() {
             if let Some(manifest) = control_store.manifest_cloned(&ns) {
-                published.insert(ns.clone(), PublishedBase::of(&manifest));
                 if !manifest.segments.is_empty() {
                     restored_segments += manifest.segments.len();
 
@@ -1136,10 +1037,9 @@ impl AppState {
                             }
                         }
                     }
-
-                    indexer.restore_manifest(ns, manifest);
-                    restored += 1;
                 }
+                indexer.restore_manifest(ns, manifest);
+                restored += 1;
             }
         }
         println!(
@@ -1287,7 +1187,6 @@ impl AppState {
                 .ok()
                 .filter(|k| !k.is_empty()),
             publication_locks: Mutex::new(HashMap::new()),
-            published: Mutex::new(published),
             #[cfg(feature = "s3")]
             segment_checksum_failures: std::sync::atomic::AtomicU64::new(0),
             indexer,
@@ -1751,21 +1650,12 @@ impl AppState {
         Ok(())
     }
 
-    /// Unconditionally overwrite the control store's manifest with the
-    /// indexer's current one (last-write-wins). Only for the admin
-    /// import-namespace endpoint, whose whole purpose is to replace a
-    /// manifest wholesale from what S3 holds. Every write path goes through
-    /// the compare-and-swap in `publish_namespace_with` instead.
     fn persist_manifest(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
         if let Some(manifest) = self.indexer.manifest_cloned(ns) {
             self.controller
                 .lock()
                 .unwrap()
                 .save_manifest(ns, &manifest)?;
-            self.published
-                .lock()
-                .unwrap()
-                .insert(ns.clone(), PublishedBase::of(&manifest));
         }
         Ok(())
     }
@@ -1784,18 +1674,11 @@ impl AppState {
     /// Serialize publications per namespace and use the same immutable
     /// snapshot for object upload and manifest commit. Failed uploads never
     /// expose a manifest; failed commits remain retryable.
-    ///
-    /// The commit is a compare-and-swap against the version this process
-    /// last published (#230), not a blind upsert. If another writer
-    /// published in between, its changes are folded into the local manifest
-    /// (`Indexer::rebase_manifest`), the rebased snapshot is uploaded and
-    /// committed again, up to a bounded number of attempts.
     fn publish_namespace_with(
         &self,
         ns: &NamespaceId,
-        upload: impl Fn(&kosha_core::Manifest) -> Result<(), KoshaError>,
+        upload: impl FnOnce(&kosha_core::Manifest) -> Result<(), KoshaError>,
     ) -> Result<(), KoshaError> {
-        const MAX_ATTEMPTS: usize = 5;
         let lock = self
             .publication_locks
             .lock()
@@ -1804,67 +1687,17 @@ impl AppState {
             .or_default()
             .clone();
         let _guard = lock.lock().unwrap();
-        for attempt in 1..=MAX_ATTEMPTS {
-            let Some(manifest) = self.indexer.manifest_cloned(ns) else {
-                return Ok(());
-            };
-            let base = self
-                .published
-                .lock()
-                .unwrap()
-                .get(ns)
-                .cloned()
-                .unwrap_or_default();
-            if manifest.version == base.version {
-                // Already published (e.g. by a concurrent caller whose
-                // publish covered this caller's flush too).
-                return Ok(());
-            }
-            upload(&manifest)?;
-            let cas = self.controller.lock().unwrap().compare_and_swap_manifest(
-                ns,
-                base.version,
-                manifest.clone(),
-            );
-            match cas {
-                Ok(()) => {
-                    self.published
-                        .lock()
-                        .unwrap()
-                        .insert(ns.clone(), PublishedBase::of(&manifest));
-                    self.indexer.acknowledge_manifest(ns, &manifest)?;
-                    return Ok(());
-                }
-                Err(KoshaError::ManifestConflict(msg)) => {
-                    // Another writer published since our base. A missing
-                    // manifest here can only be a failed read (a conflict
-                    // means a row exists), and rebasing onto "nothing" would
-                    // drop every segment in our base, so stop instead.
-                    let Some(remote) = self.controller.lock().unwrap().manifest_cloned(ns) else {
-                        return Err(KoshaError::NotFound(format!(
-                            "manifest CAS conflict for '{}' ({msg}) and the stored manifest \
-                             could not be re-read",
-                            ns.0
-                        )));
-                    };
-                    eprintln!(
-                        "WARN: manifest CAS conflict ns={} attempt={attempt}/{MAX_ATTEMPTS}: \
-                         {msg}; rebasing local version {} onto stored version {}",
-                        ns.0, manifest.version, remote.version
-                    );
-                    self.indexer.rebase_manifest(ns, &base.segment_ids, &remote);
-                    self.published
-                        .lock()
-                        .unwrap()
-                        .insert(ns.clone(), PublishedBase::of(&remote));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(KoshaError::ManifestConflict(format!(
-            "'{}' still conflicting after {MAX_ATTEMPTS} publish attempts",
-            ns.0
-        )))
+        let Some((expected_version, manifest)) = self.indexer.publication_snapshot(ns) else {
+            return Ok(());
+        };
+        upload(&manifest)?;
+        self.controller.lock().unwrap().compare_and_swap_manifest(
+            ns,
+            expected_version,
+            manifest.clone(),
+        )?;
+        self.indexer.acknowledge_manifest(ns, &manifest)?;
+        Ok(())
     }
 
     /// Upload every segment in `ns`'s current manifest that this process
@@ -1908,19 +1741,7 @@ impl AppState {
             // Only mark synced once the segment is committed (`_COMMIT`
             // written last, #231). A partial upload must be retried by a
             // future publish call, never treated as durable.
-            match sync_segment_dir_to_s3(s3, &self.data_dir, &seg_path) {
-                Ok(()) => {}
-                // A segment this process didn't write (another writer's,
-                // folded in by a rebase) isn't on local disk. That writer
-                // committed it before publishing, so accept it if S3 says
-                // it's durable.
-                Err(_)
-                    if !seg_path.is_dir()
-                        && s3
-                            .segment_durability(&format!("{}/{}", ns.0, segment_id.0))
-                            .is_durable() => {}
-                Err(e) => return Err(KoshaError::NotFound(e)),
-            }
+            sync_segment_dir_to_s3(s3, &self.data_dir, &seg_path).map_err(KoshaError::NotFound)?;
             self.synced_segments
                 .lock()
                 .unwrap()
@@ -3178,6 +2999,10 @@ fn main() {
         }
     }
 
+    // Load keys and fail closed before anything else, so a misconfigured
+    // pod exits instead of serving unauthenticated traffic.
+    auth::init_global();
+
     let role = std::env::var("KOSHA_ROLE").unwrap_or_else(|_| "query".into());
     let port = std::env::var("KOSHA_HTTP_PORT").unwrap_or_else(|_| "8080".into());
     let data_dir = std::env::var("KOSHA_DATA_DIR").unwrap_or_else(|_| "/var/lib/kosha/data".into());
@@ -3276,6 +3101,21 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         }
     }
 
+    // Reject oversized bodies from the declared length, before reading (or
+    // allocating) any of it.
+    let max_body = auth::max_body_bytes();
+    if content_length > max_body {
+        let resp = json_error(
+            413,
+            &format!(
+                "request body of {content_length} bytes exceeds the {max_body}-byte limit \
+                 (KOSHA_MAX_BODY_BYTES)"
+            ),
+        );
+        stream.write_all(resp.as_bytes()).ok();
+        return Ok(());
+    }
+
     let mut body = Vec::new();
     if content_length > 0 {
         reader
@@ -3356,10 +3196,12 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
 /// Extract and validate the API key from request headers.
 /// Returns the tenant id on success, or a 401 response string on failure.
 fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
-    // Dev mode: if no keys configured, allow all requests.
-    if API_KEYS.is_empty() {
-        return Ok("dev".to_string());
-    }
+    let store = match auth::global() {
+        // Only reachable with an explicit `KOSHA_AUTH=disabled`; an empty
+        // key set no longer means "auth off" (see `auth::init_global`).
+        auth::Auth::Disabled => return Ok("dev".to_string()),
+        auth::Auth::Keys(store) => store,
+    };
 
     let api_key: Option<&str> = headers
         .get("authorization")
@@ -3375,11 +3217,12 @@ fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
                     None
                 }
             })
-        });
+        })
+        .map(str::trim);
 
     match api_key {
-        Some(key) => match API_KEYS.get(key) {
-            Some(tenant) => Ok(tenant.clone()),
+        Some(key) => match store.lookup(key) {
+            Some(tenant) => Ok(tenant),
             None => Err(json_error_body(401, "invalid API key")),
         },
         None => Err(json_error_body(
@@ -3542,6 +3385,21 @@ fn route(
                 return json_error(400, "invalid namespace");
             }
         }
+        let bare_path = path.split('?').next().unwrap_or(path);
+        let is_legacy = matches!(
+            bare_path,
+            "/index" | "/exists" | "/replace" | "/search" | "/flush" | "/delete" | "/stats"
+        );
+        if is_legacy {
+            if !auth::legacy_routes_enabled() {
+                return json_error(
+                    410,
+                    "unversioned routes are disabled (KOSHA_LEGACY_ROUTES=off); \
+                     use /v1/namespaces/{ns}/...",
+                );
+            }
+            auth::record_legacy_use(tenant, bare_path);
+        }
         if path == "/stats" || path == "/v1/stats" {
             return if service_authorized(headers, state.admin_auth_key.as_deref()) {
                 handle_stats(state)
@@ -3549,7 +3407,6 @@ fn route(
                 json_error(403, "use namespace-scoped stats")
             };
         }
-        let bare_path = path.split('?').next().unwrap_or(path);
         if method == "POST"
             && [
                 "/index", "/exists", "/replace", "/search", "/flush", "/delete",
@@ -5241,6 +5098,7 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
         segments,
         segment_footers,
         wal_checkpoint: 0,
+        wal_origin: None,
         tombstones: Default::default(),
     }
 }
@@ -5388,34 +5246,31 @@ fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Try to create via PgStore (only works with postgres feature).
+    // Create via the shared Postgres pool (only with the postgres feature).
     #[cfg(feature = "postgres")]
     {
-        let controller = state.controller.lock().unwrap();
-        // Downcast the Box<dyn ControlStore> to see if it's a PgStore.
-        // We use a simple approach: look for "postgres" in the store type name.
-        // Check if DATABASE_URL is set (indicating PgStore).
-        drop(controller);
-
+        let _ = state;
+        let auth::Auth::Keys(store) = auth::global() else {
+            return json_error(400, "API keys are disabled (KOSHA_AUTH=disabled)");
+        };
         if std::env::var("DATABASE_URL").is_err() {
             return json_error(400, "Postgres not configured (DATABASE_URL not set)");
         }
-
-        // Re-create connection for the admin operation.
-        // This is a simplified approach — in production, share the pool.
-        match std::env::var("DATABASE_URL") {
-            Ok(db_url) => match kosha_control::PgStore::new(&db_url) {
-                Ok(store) => match store.create_api_key(tenant_id, description) {
-                    Ok(api_key) => json_ok(&serde_json::json!({
-                        "api_key": api_key,
-                        "tenant_id": tenant_id,
-                        "description": description,
-                    })),
-                    Err(e) => json_error(500, &format!("failed to create key: {e}")),
-                },
-                Err(e) => json_error(500, &format!("failed to connect to postgres: {e}")),
-            },
-            Err(_) => json_error(400, "Postgres not configured"),
+        let Some(pg) = store.pg() else {
+            return json_error(500, "failed to connect to postgres");
+        };
+        match pg.create_api_key(tenant_id, description) {
+            Ok(api_key) => {
+                // Usable on this pod right away; other pods pick it up on
+                // their next key refresh.
+                store.insert_db_key(api_key.clone(), tenant_id.to_string());
+                json_ok(&serde_json::json!({
+                    "api_key": api_key,
+                    "tenant_id": tenant_id,
+                    "description": description,
+                }))
+            }
+            Err(e) => json_error(500, &format!("failed to create key: {e}")),
         }
     }
 
@@ -5650,9 +5505,13 @@ fn search_error_response(e: &KoshaError) -> String {
 fn json_error(status_code: u16, message: &str) -> String {
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
-        403 => "403 Forbidden",
         400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        403 => "403 Forbidden",
         404 => "404 Not Found",
+        409 => "409 Conflict",
+        410 => "410 Gone",
+        413 => "413 Payload Too Large",
         429 => "429 Too Many Requests",
         500 => "500 Internal Server Error",
         503 => "503 Service Unavailable",
@@ -5740,6 +5599,191 @@ mod tests {
     use super::*;
     use kosha_core::{Document, DocumentId, Field};
     use std::fs;
+
+    #[derive(Clone)]
+    struct SharedManifestStore {
+        inner: Arc<Mutex<kosha_control::Controller>>,
+        lose_next_commit_reply: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl ControlStore for SharedManifestStore {
+        fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
+            self.inner.lock().unwrap().create_namespace(id)
+        }
+        fn ensure_namespace(&mut self, id: NamespaceId) {
+            self.inner.lock().unwrap().ensure_namespace(id);
+        }
+        fn has_namespace(&self, id: &NamespaceId) -> bool {
+            self.inner.lock().unwrap().has_namespace(id)
+        }
+        fn manifest(&self, _: &NamespaceId) -> Option<&kosha_core::Manifest> {
+            None
+        }
+        fn manifest_mut(&mut self, _: &NamespaceId) -> Option<&mut kosha_core::Manifest> {
+            None
+        }
+        fn manifest_cloned(&self, id: &NamespaceId) -> Option<kosha_core::Manifest> {
+            self.inner.lock().unwrap().manifest(id).cloned()
+        }
+        fn save_manifest(
+            &mut self,
+            id: &NamespaceId,
+            manifest: &kosha_core::Manifest,
+        ) -> Result<(), KoshaError> {
+            self.inner.lock().unwrap().save_manifest(id, manifest)
+        }
+        fn compare_and_swap_manifest(
+            &mut self,
+            id: &NamespaceId,
+            expected: u64,
+            manifest: kosha_core::Manifest,
+        ) -> Result<(), KoshaError> {
+            self.inner
+                .lock()
+                .unwrap()
+                .compare_and_swap_manifest(id, expected, manifest)?;
+            if self
+                .lose_next_commit_reply
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(KoshaError::NotFound("injected lost commit reply".into()));
+            }
+            Ok(())
+        }
+        fn list_namespaces(&self) -> Vec<NamespaceId> {
+            self.inner.lock().unwrap().list_namespaces().to_vec()
+        }
+        fn namespace_count(&self) -> usize {
+            self.inner.lock().unwrap().namespace_count()
+        }
+    }
+
+    #[test]
+    fn lost_commit_reply_is_retryable_without_losing_the_next_flush() {
+        let shared = SharedManifestStore {
+            inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
+            lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let state = test_state();
+        *state.controller.lock().unwrap() = Box::new(shared.clone());
+        let ns = NamespaceId("retry".into());
+        for (id, expect_error) in [("first", true), ("second", false)] {
+            state
+                .indexer
+                .index_documents(
+                    ns.clone(),
+                    vec![Document {
+                        id: DocumentId(id.into()),
+                        fields: vec![Field::text("text", id)],
+                    }],
+                )
+                .unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+            let result = state.publish_namespace_with(&ns, |_| Ok(()));
+            assert_eq!(result.is_err(), expect_error);
+            if expect_error {
+                assert!(
+                    !kosha_write::wal::WalWriter::recover(&state.data_dir.join("_wal"))
+                        .unwrap()
+                        .is_empty()
+                );
+                state.publish_namespace_with(&ns, |_| Ok(())).unwrap();
+                // No-op flush is safe too: version equality cannot authorize a
+                // different snapshot, but must permit an identical retry.
+                state.publish_namespace_with(&ns, |_| Ok(())).unwrap();
+            }
+        }
+        assert_eq!(shared.manifest_cloned(&ns).unwrap().segments.len(), 2);
+        assert!(
+            kosha_write::wal::WalWriter::recover(&state.data_dir.join("_wal"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn competing_writers_cannot_overwrite_a_published_manifest() {
+        let shared = SharedManifestStore {
+            inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
+            lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let ns = NamespaceId("competing".into());
+        shared.inner.lock().unwrap().ensure_namespace(ns.clone());
+        let first = test_state();
+        let second = test_state();
+        for (state, id) in [(&first, "first"), (&second, "second")] {
+            *state.controller.lock().unwrap() = Box::new(shared.clone());
+            state
+                .indexer
+                .index_documents(
+                    ns.clone(),
+                    vec![Document {
+                        id: DocumentId(id.into()),
+                        fields: vec![Field::text("text", id)],
+                    }],
+                )
+                .unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+        }
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                first.publish_namespace_with(&ns, |_| {
+                    barrier.wait();
+                    Ok(())
+                })
+            });
+            let b = scope.spawn(|| {
+                second.publish_namespace_with(&ns, |_| {
+                    barrier.wait();
+                    Ok(())
+                })
+            });
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_eq!(
+            usize::from(outcomes.0.is_ok()) + usize::from(outcomes.1.is_ok()),
+            1,
+            "exactly one independent writer may publish the initial version"
+        );
+        let (winner, loser) = if outcomes.0.is_ok() {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        let committed = shared.manifest_cloned(&ns).unwrap();
+        assert_eq!(
+            committed.segments[0].segment_id,
+            winner.indexer.manifest(&ns).unwrap().segments[0].segment_id
+        );
+        let rejected_doc = if outcomes.0.is_ok() {
+            "second"
+        } else {
+            "first"
+        };
+        let restarted_loser = Indexer::new(loser.data_dir.clone());
+        restarted_loser.restore_manifest(ns.clone(), committed.clone());
+        assert!(
+            restarted_loser
+                .existing_ids(&ns, &[DocumentId(rejected_doc.into())])
+                .unwrap()
+                .contains(&DocumentId(rejected_doc.into())),
+            "the winner's WAL checkpoint must not discard the loser's unrelated recovery records"
+        );
+        let retry = handle_flush(br#"{"namespace":"competing"}"#, loser);
+        assert!(
+            retry.starts_with("HTTP/1.1 500"),
+            "stale writer must still fail: {retry}"
+        );
+        assert!(
+            !kosha_write::wal::WalWriter::recover(&loser.data_dir.join("_wal"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            shared.manifest_cloned(&ns).unwrap().segments[0].segment_id,
+            committed.segments[0].segment_id
+        );
+    }
 
     struct FailingManifestStore(kosha_control::Controller);
     impl ControlStore for FailingManifestStore {
@@ -6165,6 +6209,7 @@ mod tests {
             ],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         // Simulate: an earlier publish call already confirmed seg-2
@@ -6840,6 +6885,7 @@ mod tests {
             }],
             segment_footers: HashMap::new(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let base_query = kosha_core::SearchQuery {
@@ -6971,6 +7017,7 @@ mod tests {
             }],
             segment_footers: HashMap::new(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let base_query = kosha_core::SearchQuery {
@@ -7867,207 +7914,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         AppState::new(dir)
-    }
-
-    // ─── #230: CAS manifest publish ─────────────────────────────────────
-
-    fn index_and_flush(state: &AppState, ns: &NamespaceId, id: &str) {
-        state
-            .indexer
-            .index_documents(
-                ns.clone(),
-                vec![kosha_core::Document {
-                    id: kosha_core::DocumentId(id.into()),
-                    fields: vec![kosha_core::Field::text("body", format!("hello {id}"))],
-                }],
-            )
-            .unwrap();
-        state.indexer.flush_namespace(ns).unwrap();
-    }
-
-    fn stored(state: &AppState, ns: &NamespaceId) -> kosha_core::Manifest {
-        state
-            .controller
-            .lock()
-            .unwrap()
-            .manifest_cloned(ns)
-            .unwrap()
-    }
-
-    fn seg_ids(m: &kosha_core::Manifest) -> Vec<String> {
-        let mut v: Vec<String> = m.segments.iter().map(|e| e.segment_id.0.clone()).collect();
-        v.sort();
-        v
-    }
-
-    #[test]
-    fn publish_creates_then_advances_manifest_and_is_idempotent() {
-        let state = test_state();
-        let ns = NamespaceId("cas-basic".into());
-        index_and_flush(&state, &ns, "a");
-        state.publish_namespace(&ns).unwrap();
-        let v1 = stored(&state, &ns);
-        assert_eq!(v1.segments.len(), 1);
-        assert_eq!(v1.version, state.indexer.manifest(&ns).unwrap().version);
-
-        // Nothing changed: a second publish is a no-op, not a conflict.
-        state.publish_namespace(&ns).unwrap();
-        assert_eq!(stored(&state, &ns).version, v1.version);
-
-        index_and_flush(&state, &ns, "b");
-        state.publish_namespace(&ns).unwrap();
-        let v2 = stored(&state, &ns);
-        assert_eq!(v2.segments.len(), 2);
-        assert!(v2.version > v1.version);
-    }
-
-    /// Acceptance criterion from #230: two writers publishing to the same
-    /// namespace must not lose segments. A second writer's publish
-    /// (simulated by a CAS straight into the control store) lands between
-    /// our flush and our publish. Our CAS must lose, rebase and keep both
-    /// sides' segments.
-    #[test]
-    fn publish_conflict_rebases_and_keeps_both_writers_segments() {
-        let state = test_state();
-        let ns = NamespaceId("cas-conflict".into());
-        index_and_flush(&state, &ns, "a");
-        state.publish_namespace(&ns).unwrap();
-        let base = stored(&state, &ns);
-
-        // The other writer appends its own segment and publishes first.
-        let mut theirs = base.clone();
-        theirs.version = base.version + 1;
-        theirs.segments.push(kosha_core::ManifestEntry {
-            segment_id: kosha_core::SegmentId("other-writer-seg".into()),
-            doc_count: 7,
-        });
-        state
-            .controller
-            .lock()
-            .unwrap()
-            .compare_and_swap_manifest(&ns, base.version, theirs.clone())
-            .unwrap();
-
-        index_and_flush(&state, &ns, "b");
-        let ours = state.indexer.manifest(&ns).unwrap();
-        state.publish_namespace(&ns).unwrap();
-
-        let after = stored(&state, &ns);
-        let mut expected: Vec<String> = seg_ids(&ours);
-        expected.push("other-writer-seg".into());
-        expected.sort();
-        assert_eq!(seg_ids(&after), expected, "no writer's segment may be lost");
-        assert!(after.version > theirs.version);
-        // The local indexer now serves the rebased manifest too.
-        assert_eq!(seg_ids(&state.indexer.manifest(&ns).unwrap()), expected);
-    }
-
-    /// A remote compaction that removed segments from the shared base must
-    /// win over our stale copy of them, while our new segment survives.
-    #[test]
-    fn publish_conflict_applies_remote_removals() {
-        let state = test_state();
-        let ns = NamespaceId("cas-remote-compact".into());
-        index_and_flush(&state, &ns, "a");
-        index_and_flush(&state, &ns, "b");
-        state.publish_namespace(&ns).unwrap();
-        let base = stored(&state, &ns);
-        assert_eq!(base.segments.len(), 2);
-
-        let merged = kosha_core::ManifestEntry {
-            segment_id: kosha_core::SegmentId("remote-merged".into()),
-            doc_count: 2,
-        };
-        let theirs = kosha_core::Manifest {
-            version: base.version + 1,
-            segments: vec![merged],
-            segment_footers: Default::default(),
-            wal_checkpoint: base.wal_checkpoint,
-            tombstones: Default::default(),
-        };
-        state
-            .controller
-            .lock()
-            .unwrap()
-            .compare_and_swap_manifest(&ns, base.version, theirs)
-            .unwrap();
-
-        index_and_flush(&state, &ns, "c");
-        let ours_new: Vec<String> = seg_ids(&state.indexer.manifest(&ns).unwrap())
-            .into_iter()
-            .filter(|id| !base.segments.iter().any(|e| &e.segment_id.0 == id))
-            .collect();
-        assert_eq!(ours_new.len(), 1);
-        state.publish_namespace(&ns).unwrap();
-
-        let mut expected = vec!["remote-merged".to_string(), ours_new[0].clone()];
-        expected.sort();
-        assert_eq!(seg_ids(&stored(&state, &ns)), expected);
-    }
-
-    /// Concurrent flush+publish from many threads in one process: the
-    /// stored manifest must end up equal to the indexer's, with every
-    /// flushed segment present.
-    #[test]
-    fn concurrent_publishes_lose_no_segments() {
-        let state = Arc::new(test_state());
-        let ns = NamespaceId("cas-concurrent".into());
-        let handles: Vec<_> = (0..8)
-            .map(|t| {
-                let state = Arc::clone(&state);
-                let ns = ns.clone();
-                std::thread::spawn(move || {
-                    for i in 0..4 {
-                        index_and_flush(&state, &ns, &format!("t{t}-{i}"));
-                        state.publish_namespace(&ns).unwrap();
-                    }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-        let local = state.indexer.manifest(&ns).unwrap();
-        let remote = stored(&state, &ns);
-        assert_eq!(remote.version, local.version);
-        assert_eq!(seg_ids(&remote), seg_ids(&local));
-        let docs: u64 = remote.segments.iter().map(|e| e.doc_count as u64).sum();
-        assert_eq!(docs, 32);
-    }
-
-    /// A delete the other writer published must survive our rebase (#263
-    /// made tombstones durable in the manifest; a CAS rebase must not
-    /// silently undo them).
-    #[test]
-    fn publish_conflict_keeps_remote_tombstones() {
-        let state = test_state();
-        let ns = NamespaceId("cas-remote-delete".into());
-        index_and_flush(&state, &ns, "a");
-        state.publish_namespace(&ns).unwrap();
-        let base = stored(&state, &ns);
-        let seg = base.segments[0].segment_id.clone();
-
-        let mut theirs = base.clone();
-        theirs.version = base.version + 1;
-        theirs
-            .tombstones
-            .insert(seg.clone(), [0u32].into_iter().collect());
-        state
-            .controller
-            .lock()
-            .unwrap()
-            .compare_and_swap_manifest(&ns, base.version, theirs)
-            .unwrap();
-
-        index_and_flush(&state, &ns, "b");
-        state.publish_namespace(&ns).unwrap();
-        let after = stored(&state, &ns);
-        assert!(
-            after.tombstones.get(&seg).is_some_and(|t| t.contains(&0)),
-            "remote delete lost: {:?}",
-            after.tombstones
-        );
-        assert_eq!(after.segments.len(), 2);
     }
 
     fn rc_key(ns: &str, v: u64, q: &str) -> (String, u64, String) {

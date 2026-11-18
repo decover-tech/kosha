@@ -50,6 +50,7 @@ fn decode_manifest(version: u64, segments_json: &str) -> Option<Manifest> {
             .collect(),
         segment_footers: Default::default(),
         wal_checkpoint: 0,
+        wal_origin: None,
         tombstones: Default::default(),
     };
     for entry in entries {
@@ -353,51 +354,37 @@ impl ControlStore for PgStore {
         let segments_json = serde_json::to_string(&new_manifest)?;
 
         self.rt.block_on(async {
-            // An absent manifest row counts as version 0, so the first
-            // publish of a new namespace (expected 0) is an insert. ON
-            // CONFLICT turns it into the same version-guarded update, so
-            // exactly one of two racing first-publishers wins.
-            // kosha.manifests has an FK to kosha.namespaces, so register
-            // the namespace first.
-            let result = if expected_version == 0 {
+            let io_error = |e: sqlx::Error| KoshaError::NotFound(e.to_string());
+            let mut tx = self.pool.begin().await.map_err(io_error)?;
+            // Bootstrap is transactional and never replaces an existing row.
+            if expected_version == 0 {
                 sqlx::query("INSERT INTO kosha.namespaces (id) VALUES ($1) ON CONFLICT DO NOTHING")
-                    .bind(&id_str)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| KoshaError::NotFound(e.to_string()))?;
-                sqlx::query(
-                    "INSERT INTO kosha.manifests (namespace_id, version, segments_json) \
-                     VALUES ($3, $1, $2) \
-                     ON CONFLICT (namespace_id) DO UPDATE \
-                     SET version = EXCLUDED.version, segments_json = EXCLUDED.segments_json, \
-                         updated_at = NOW() \
-                     WHERE kosha.manifests.version = 0",
-                )
-                .bind(new_manifest.version as i64)
-                .bind(&segments_json)
-                .bind(&id_str)
-                .execute(&self.pool)
-                .await
-            } else {
-                sqlx::query(
-                    "UPDATE kosha.manifests \
-                     SET version = $1, segments_json = $2, updated_at = NOW() \
-                     WHERE namespace_id = $3 AND version = $4",
-                )
-                .bind(new_manifest.version as i64)
-                .bind(&segments_json)
-                .bind(&id_str)
-                .bind(expected_version as i64)
-                .execute(&self.pool)
-                .await
-            };
-            match result {
-                Ok(r) if r.rows_affected() == 0 => Err(KoshaError::ManifestConflict(format!(
-                    "{id_str}: stored manifest is not at expected version {expected_version}"
-                ))),
-                Ok(_) => Ok(()),
-                Err(e) => Err(KoshaError::NotFound(e.to_string())),
+                    .bind(&id_str).execute(&mut *tx).await.map_err(io_error)?;
+                sqlx::query("INSERT INTO kosha.manifests (namespace_id, version, segments_json) VALUES ($1, 0, '[]') ON CONFLICT DO NOTHING")
+                    .bind(&id_str).execute(&mut *tx).await.map_err(io_error)?;
             }
+            let result = sqlx::query(
+                "UPDATE kosha.manifests SET version = $1, segments_json = $2, updated_at = NOW() \
+                 WHERE namespace_id = $3 AND version = $4 AND version < $1"
+            ).bind(new_manifest.version as i64).bind(&segments_json).bind(&id_str)
+                .bind(expected_version as i64).execute(&mut *tx).await.map_err(io_error)?;
+            if result.rows_affected() == 0 {
+                // A retry after a lost reply succeeds only for the exact
+                // snapshot already committed. Equal version alone is unsafe.
+                let row: Option<(i64, String)> = sqlx::query_as(
+                    "SELECT version, segments_json FROM kosha.manifests WHERE namespace_id = $1 FOR UPDATE"
+                ).bind(&id_str).fetch_optional(&mut *tx).await.map_err(io_error)?;
+                let same = row.as_ref().and_then(|(version, json)| decode_manifest(*version as u64, json))
+                    .is_some_and(|current| current.same_contents(&new_manifest));
+                if !same {
+                    return Err(KoshaError::ManifestConflict {
+                        namespace: id.clone(), expected: expected_version,
+                        actual: row.map(|(version, _)| version as u64),
+                    });
+                }
+            }
+            tx.commit().await.map_err(io_error)?;
+            Ok(())
         })
     }
 

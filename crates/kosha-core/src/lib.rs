@@ -31,12 +31,9 @@ pub trait ControlStore: Send + Sync {
     /// concurrency, use `compare_and_swap_manifest` instead.
     fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError>;
 
-    /// Replace the manifest only if the stored version equals
-    /// `expected_version`. A namespace with no stored manifest counts as
-    /// version 0, so the first publish of a new namespace is
-    /// `expected_version = 0`; that also registers the namespace. A
-    /// mismatch returns [`KoshaError::ManifestConflict`], and any other
-    /// error is a storage failure.
+    /// Publish only over the writer's last committed version. An identical
+    /// candidate is an idempotent retry, including after a lost commit reply.
+    /// A missing namespace may be created with expected_version = 0.
     fn compare_and_swap_manifest(
         &mut self,
         id: &NamespaceId,
@@ -949,12 +946,32 @@ pub struct Manifest {
     /// WAL records through this sequence are represented by this manifest.
     #[serde(default)]
     pub wal_checkpoint: u64,
+    /// Identity of the WAL whose records the checkpoint covers. Independent
+    /// ingest disks may have overlapping sequence numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_origin: Option<String>,
     /// Durable deletions, shared by ingest and query replicas.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tombstones: HashMap<SegmentId, std::collections::HashSet<u32>>,
 }
 
 impl Manifest {
+    /// Semantic equality, independent of hash-map serialization order.
+    pub fn same_contents(&self, other: &Self) -> bool {
+        if self.tombstones != other.tombstones {
+            return false;
+        }
+        match (serde_json::to_value(self), serde_json::to_value(other)) {
+            (Ok(mut a), Ok(mut b)) => {
+                // Sets serialize as arrays with arbitrary iteration order.
+                a.as_object_mut().unwrap().remove("tombstones");
+                b.as_object_mut().unwrap().remove("tombstones");
+                a == b
+            }
+            _ => false,
+        }
+    }
+
     pub fn segment_footer(&self, segment_id: &SegmentId) -> Option<&Footer> {
         self.segment_footers.get(segment_id)
     }
@@ -1133,6 +1150,11 @@ pub struct IndexResponse {
 #[derive(Debug)]
 pub enum KoshaError {
     NamespaceNotFound(NamespaceId),
+    ManifestConflict {
+        namespace: NamespaceId,
+        expected: u64,
+        actual: Option<u64>,
+    },
     SegmentNotFound(SegmentId),
     Io(std::io::Error),
     Serde(serde_json::Error),
@@ -1150,16 +1172,13 @@ pub enum KoshaError {
     /// Transient by construction — callers should retry with backoff, which
     /// the Python `kosha_client` already does. Maps to HTTP 429.
     Overloaded(String),
-    /// A `compare_and_swap_manifest` lost: the stored manifest's version is
-    /// not the one the caller expected, because another writer published
-    /// first. The caller should reload, rebase and retry, not treat it as a
-    /// storage failure.
-    ManifestConflict(String),
 }
 
 impl std::fmt::Display for KoshaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ManifestConflict { namespace, expected, actual } => write!(f,
+                "manifest conflict for {}: expected version {expected}, actual {actual:?}; stale writer must reload before publishing", namespace.0),
             Self::NamespaceNotFound(id) => write!(f, "namespace not found: {}", id.0),
             Self::SegmentNotFound(id) => write!(f, "segment not found: {}", id.0),
             Self::Io(e) => write!(f, "I/O error: {e}"),
@@ -1168,7 +1187,6 @@ impl std::fmt::Display for KoshaError {
             Self::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
             Self::CorruptSegment(msg) => write!(f, "corrupt segment data: {msg}"),
             Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
-            Self::ManifestConflict(msg) => write!(f, "manifest conflict: {msg}"),
         }
     }
 }

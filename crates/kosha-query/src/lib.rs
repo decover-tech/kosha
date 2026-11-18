@@ -4066,6 +4066,7 @@ mod tests {
             segments: vec![],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         for (segment, docs) in [
@@ -4269,6 +4270,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -4400,6 +4402,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -4488,6 +4491,7 @@ mod tests {
                 .collect(),
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -4655,6 +4659,7 @@ mod tests {
                 segments: entries,
                 segment_footers: Default::default(),
                 wal_checkpoint: 0,
+                wal_origin: None,
                 tombstones: Default::default(),
             },
             all,
@@ -4913,6 +4918,7 @@ mod tests {
             segments,
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
 
@@ -5076,6 +5082,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let result = searcher.search(
@@ -5128,6 +5135,7 @@ mod tests {
             ],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -5197,6 +5205,7 @@ mod tests {
             segments,
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -5281,6 +5290,7 @@ mod tests {
             ],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let result = searcher
@@ -5377,6 +5387,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -5453,6 +5464,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -5538,6 +5550,7 @@ mod tests {
             ],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
 
@@ -5654,6 +5667,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -5712,6 +5726,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -5763,6 +5778,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -5931,6 +5947,7 @@ mod tests {
             segments: entries,
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -6055,6 +6072,7 @@ mod tests {
             segments: entries,
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -6123,6 +6141,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -6186,6 +6205,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -6254,6 +6274,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         (dir, manifest)
@@ -6370,6 +6391,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         // Fresh searcher (no warm in-memory segment cache) so opening the
@@ -6447,6 +6469,7 @@ mod tests {
                 .collect(),
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         // Fresh searcher so each segment is actually opened (Lazy), not
@@ -6564,6 +6587,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -6612,6 +6636,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -6668,6 +6693,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -6763,6 +6789,7 @@ mod tests {
             ],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -6805,6 +6832,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -6862,6 +6890,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         }
     }
@@ -6912,6 +6941,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         }
     }
@@ -7098,6 +7128,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -7235,6 +7266,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
 
@@ -7327,6 +7359,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -7378,6 +7411,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -7524,6 +7558,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -7585,6 +7620,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -7666,6 +7702,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -7713,6 +7750,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -7812,6 +7850,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -7885,6 +7924,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -7998,6 +8038,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -8066,6 +8107,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -8117,6 +8159,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -8191,6 +8234,7 @@ mod tests {
             ],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -8276,6 +8320,7 @@ mod tests {
             segments: manifest_segments,
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
@@ -8348,6 +8393,7 @@ mod tests {
             }],
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());

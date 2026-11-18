@@ -79,6 +79,7 @@ fn build_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
         }],
         segment_footers: Default::default(),
         wal_checkpoint: 0,
+        wal_origin: None,
         tombstones: Default::default(),
     };
     (ns, manifest)
@@ -145,6 +146,7 @@ fn build_term_bloom_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             segments: entries,
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         },
     )
@@ -192,6 +194,7 @@ fn build_broad_query_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             segments: entries,
             segment_footers: Default::default(),
             wal_checkpoint: 0,
+            wal_origin: None,
             tombstones: Default::default(),
         },
     )
