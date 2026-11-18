@@ -1550,7 +1550,12 @@ impl Searcher {
                 && phrase_tokenized.is_none()
                 && query.knn.is_none()
                 && query.search_after.as_ref().is_none_or(|a| a.is_empty())
-                && query.sort.is_empty()
+                // WAND keeps the best `k` by score and nothing else. Any
+                // other order (a stored field, `_id`, `_score` ascending)
+                // needs candidates WAND has already discarded, as does a
+                // collapse, which looks past the first `k` for new groups.
+                && sort_is_default_ranking(&query.sort)
+                && query.collapse.is_none()
                 && query.aggs.is_empty()
                 // The leapfrog join's gallop is only correct on strictly
                 // ascending postings. Every current writer format
@@ -2508,40 +2513,27 @@ impl Searcher {
         };
         let total_hits = filter_only_count.unwrap_or(seg_hits.len());
 
-        // Cut to this segment's top `effective_k` by score *before* paying
-        // the `DocumentId` allocation — same discipline `BoundedTopK`
-        // already applies on the WAND paths, extended to every query shape
-        // that doesn't qualify for WAND (filtered, aggregated, wildcard,
-        // phrase, hybrid-kNN). `select_nth_unstable_by` is O(n), no
-        // allocation beyond the `(f64, u32)` collect below.
-        //
-        // Only safe when the final page order is driven by `score` alone:
-        // `query.sort` non-empty means the page order comes from
-        // `compare_candidate_sort_keys` (a custom field or an explicit
-        // `_id` order — note this is stricter than `sort_value_fields`,
-        // which excludes "_id" too: a `sort: [{"_id": ...}]` query has
-        // `sort_value_fields.is_empty() == true` but doesn't rank by score
-        // at all). A `search_after` cursor needs this segment's *full*
-        // candidate set to locate the cursor position downstream. Cutting
-        // by score first in either case could drop the doc that actually
-        // belongs on the page.
         let effective_k = query.from.saturating_add(query.max_results);
-        let can_truncate =
-            query.sort.is_empty() && query.search_after.as_ref().is_none_or(|a| a.is_empty());
+        let has_cursor = query.search_after.as_ref().is_some_and(|a| !a.is_empty());
+        // The page is ordered by score alone (ties by `_id`), with no
+        // cursor to locate and no grouping: the cheap cut below applies.
+        let score_ranked =
+            sort_is_default_ranking(&query.sort) && !has_cursor && query.collapse.is_none();
 
         let mut ranked: Vec<(f64, u32)> = seg_hits.into_iter().map(|(d, s)| (s, d)).collect();
-        if can_truncate {
+        if score_ranked {
+            // Cut to this segment's top `effective_k` by score *before*
+            // paying the `DocumentId` allocation — the same discipline
+            // `BoundedTopK` applies on the WAND paths.
             if effective_k == 0 {
                 ranked.clear();
             } else if ranked.len() > effective_k {
                 // Tie-break by doc_id string ascending, matching both
-                // `BoundedTopK::rank` and `sort_cmp`'s default-ranking
-                // branch exactly — otherwise a cut among score-tied docs
-                // (common: BM25 scores repeat whenever tf/field_length
-                // repeat) could keep a different doc than the final page
-                // order would have chosen. `doc_meta` is a cheap arena
-                // borrow, not an allocation, so this doesn't reintroduce
-                // the cost this change removes.
+                // `BoundedTopK::rank` and the final page order exactly —
+                // otherwise a cut among score-tied docs (common: BM25
+                // scores repeat whenever tf/field_length repeat) could keep
+                // a different doc than the page would have chosen.
+                // `doc_meta` is a cheap arena borrow, not an allocation.
                 ranked.select_nth_unstable_by(effective_k - 1, |a, b| {
                     b.0.partial_cmp(&a.0)
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -2584,6 +2576,50 @@ impl Searcher {
                 score,
                 sort_values,
             });
+        }
+
+        // ── Cut under a custom order, a cursor or a collapse ──
+        // The page is the first `effective_k` documents (or groups) under
+        // one total order, and anything in the overall first `k` is also
+        // in the first `k` of the segment it came from. So each segment
+        // only has to hand back its own first `k` under that order. These
+        // requests used to hand back every hit they had, and the reduce
+        // step sorted the whole lot to keep one page.
+        if !score_ranked {
+            let rank = |a: &HitCandidate, b: &HitCandidate| {
+                compare_candidates(a, b, &query.sort, sort_value_fields)
+            };
+            // A cursor over an explicit sort: nothing at or before it can
+            // be on the page. (The legacy cursor under default ranking is
+            // positional, so that case is left whole for the reduce step.)
+            let cursor_filtered = has_cursor && !query.sort.is_empty();
+            if cursor_filtered {
+                let after = query.search_after.as_deref().unwrap_or_default();
+                candidates.retain(|cand| {
+                    candidate_is_strictly_after_cursor(cand, after, &query.sort, sort_value_fields)
+                });
+            }
+            if let Some(ref collapse) = query.collapse {
+                candidates.sort_by(rank);
+                keep_first_of_each_group(&mut candidates, &collapse.field, sort_value_fields);
+            }
+            // After the cursor, `from` no longer applies (OpenSearch
+            // semantics): only `max_results` documents can be returned.
+            let keep = if cursor_filtered {
+                Some(query.max_results)
+            } else if has_cursor {
+                None
+            } else {
+                Some(effective_k)
+            };
+            if let Some(keep) = keep {
+                if keep == 0 {
+                    candidates.clear();
+                } else if candidates.len() > keep {
+                    candidates.select_nth_unstable_by(keep - 1, rank);
+                    candidates.truncate(keep);
+                }
+            }
         }
 
         Ok(Some(SegmentOutput {
@@ -2738,7 +2774,14 @@ impl Searcher {
         // top-k / page selection so clone+sort cost scales with page size,
         // not total hit count. Each candidate carries its own `Arc<SegmentReader>`
         // clone so the page can materialize after the segment loop finishes.
-        let sort_value_fields = sort_fields_needing_values(&query.sort);
+        // Stored fields whose values candidates must carry: the sort keys,
+        // plus the collapse field so hits can be grouped by it.
+        let mut sort_value_fields = sort_fields_needing_values(&query.sort);
+        if let Some(ref collapse) = query.collapse {
+            if !sort_value_fields.contains(&collapse.field) {
+                sort_value_fields.push(collapse.field.clone());
+            }
+        }
 
         // Segments are independent until this reduce step, and opening
         // (I/O + parse) plus BM25/kNN scoring is what dominates wall-clock
@@ -2873,14 +2916,19 @@ impl Searcher {
 
         // ── Sort (score-only / sort-key candidates — no full field payloads) ──
         let sort_cmp = |a: &HitCandidate, b: &HitCandidate| -> std::cmp::Ordering {
-            if !query.sort.is_empty() {
-                compare_candidate_sort_keys(a, b, &query.sort, &sort_value_fields)
-            } else {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
-            }
+            compare_candidates(a, b, &query.sort, &sort_value_fields)
+        };
+
+        // ── collapse: the best hit of each group ──
+        // Each segment already kept one hit per group; the same group can
+        // still arrive from several segments, so order everything and keep
+        // the first of each again.
+        let collapsed = if let Some(ref collapse) = query.collapse {
+            candidates.sort_by(sort_cmp);
+            keep_first_of_each_group(&mut candidates, &collapse.field, &sort_value_fields);
+            true
+        } else {
+            false
         };
 
         // ── search_after (cursor pagination) ──
@@ -2895,7 +2943,9 @@ impl Searcher {
             .is_some_and(|after| !after.is_empty());
         let mut page_start = query.from.min(candidates.len());
         if has_search_after {
-            candidates.sort_by(sort_cmp);
+            if !collapsed {
+                candidates.sort_by(sort_cmp);
+            }
             if let Some(ref after) = query.search_after {
                 page_start = candidates
                     .iter()
@@ -2920,7 +2970,7 @@ impl Searcher {
         // what makes cost scale with the page requested (`from +
         // max_results`) instead of total hit count. `to == 0` needs no
         // ordering at all (the page is empty either way).
-        if !has_search_after && to > 0 {
+        if !has_search_after && !collapsed && to > 0 {
             if to < candidates.len() {
                 candidates.select_nth_unstable_by(to - 1, sort_cmp);
                 candidates[..to].sort_by(sort_cmp);
@@ -2995,6 +3045,11 @@ impl Searcher {
                         doc.highlights = Some(highlights);
                     }
                 }
+            }
+            // After highlighting, which reads the field it marks up even
+            // when that field is not being returned.
+            if query.source_includes.is_some() || query.source_excludes.is_some() {
+                doc.fields.retain(|field| query.returns_field(&field.name));
             }
             page.push(doc);
         }
@@ -3545,8 +3600,9 @@ struct HitCandidate {
     doc_seq: u32,
     doc_id: DocumentId,
     score: f64,
-    /// Values for [`sort_fields_needing_values`], parallel to that list.
-    sort_values: Vec<String>,
+    /// Values for the request's stored-field keys (sort keys, then the
+    /// collapse field), parallel to `search_inner`'s `sort_value_fields`.
+    sort_values: Vec<SortValue>,
 }
 
 /// One segment's independent contribution to a query: its scored candidates
@@ -3613,27 +3669,27 @@ fn build_sort_value_maps(
     store: &FilterStore,
     fields: &[String],
     wanted: &HashSet<u32>,
-) -> HashMap<String, HashMap<u32, String>> {
+) -> HashMap<String, HashMap<u32, SortValue>> {
     fields
         .iter()
         .map(|field| {
-            let map = if let Some(entries) = store.string_fields.get(field) {
+            let map = if let Some(entries) = kosha_core::lookup_field(&store.string_fields, field) {
                 entries
                     .iter()
                     .filter(|(seq, _)| wanted.contains(seq))
-                    .map(|(seq, v)| (*seq, v.clone()))
+                    .map(|(seq, v)| (*seq, SortValue::Text(v.clone())))
                     .collect()
-            } else if let Some(entries) = store.integer_fields.get(field) {
+            } else if let Some(entries) = kosha_core::lookup_field(&store.integer_fields, field) {
                 entries
                     .iter()
                     .filter(|(seq, _)| wanted.contains(seq))
-                    .map(|(seq, v)| (*seq, v.to_string()))
+                    .map(|(seq, v)| (*seq, SortValue::Number(*v as f64)))
                     .collect()
-            } else if let Some(entries) = store.float_fields.get(field) {
+            } else if let Some(entries) = kosha_core::lookup_field(&store.float_fields, field) {
                 entries
                     .iter()
                     .filter(|(seq, _)| wanted.contains(seq))
-                    .map(|(seq, v)| (*seq, v.to_string()))
+                    .map(|(seq, v)| (*seq, SortValue::Number(*v)))
                     .collect()
             } else {
                 HashMap::new()
@@ -3646,8 +3702,8 @@ fn build_sort_value_maps(
 fn extract_sort_values(
     doc_seq: u32,
     fields: &[String],
-    sort_value_maps: &HashMap<String, HashMap<u32, String>>,
-) -> Vec<String> {
+    sort_value_maps: &HashMap<String, HashMap<u32, SortValue>>,
+) -> Vec<SortValue> {
     fields
         .iter()
         .map(|field| {
@@ -3655,26 +3711,129 @@ fn extract_sort_values(
                 .get(field)
                 .and_then(|m| m.get(&doc_seq))
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or(SortValue::Missing)
         })
         .collect()
+}
+
+/// A stored field's value on a candidate, kept in its own type so numbers
+/// order as numbers. Stringified, 10 sorted before 9.
+#[derive(Debug, Clone, PartialEq)]
+enum SortValue {
+    /// The document has no value for the field. Orders before every value.
+    Missing,
+    Number(f64),
+    Text(String),
+}
+
+impl SortValue {
+    fn compare(&self, other: &SortValue) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (SortValue::Missing, SortValue::Missing) => Ordering::Equal,
+            (SortValue::Missing, _) => Ordering::Less,
+            (_, SortValue::Missing) => Ordering::Greater,
+            (SortValue::Number(a), SortValue::Number(b)) => {
+                a.partial_cmp(b).unwrap_or(Ordering::Equal)
+            }
+            (SortValue::Text(a), SortValue::Text(b)) => a.cmp(b),
+            // One field holding numbers in one segment and text in another:
+            // not something the writer produces. Order by kind so the
+            // comparison is at least total.
+            (SortValue::Number(_), SortValue::Text(_)) => Ordering::Less,
+            (SortValue::Text(_), SortValue::Number(_)) => Ordering::Greater,
+        }
+    }
+
+    /// Compare with a `search_after` cursor value, which always arrives as
+    /// a string. An empty cursor value means "missing", as it does on the
+    /// way out.
+    fn compare_to_cursor(&self, cursor: &str) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match self {
+            SortValue::Missing => {
+                if cursor.is_empty() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Less
+                }
+            }
+            SortValue::Number(value) => match cursor.trim().parse::<f64>() {
+                Ok(cursor) => value.partial_cmp(&cursor).unwrap_or(Ordering::Equal),
+                Err(_) => Ordering::Greater,
+            },
+            SortValue::Text(value) => value.as_str().cmp(cursor),
+        }
+    }
 }
 
 fn candidate_sort_value<'a>(
     cand: &'a HitCandidate,
     field: &str,
     sort_value_fields: &[String],
-) -> std::borrow::Cow<'a, str> {
-    match field {
-        "_score" => std::borrow::Cow::Owned(format!("{}", cand.score)),
-        "_id" => std::borrow::Cow::Borrowed(cand.doc_id.0.as_str()),
-        _ => sort_value_fields
-            .iter()
-            .position(|f| f == field)
-            .and_then(|i| cand.sort_values.get(i))
-            .map(|s| std::borrow::Cow::Borrowed(s.as_str()))
-            .unwrap_or(std::borrow::Cow::Borrowed("")),
+) -> &'a SortValue {
+    sort_value_fields
+        .iter()
+        .position(|f| f == field)
+        .and_then(|i| cand.sort_values.get(i))
+        .unwrap_or(&SortValue::Missing)
+}
+
+/// True when the page is ordered by score alone, best first, ties by `_id`
+/// ascending: no sort at all, `[_score desc]`, or `[_score desc, _id asc]`.
+/// That is the one order the block-max WAND paths and the per-segment score
+/// cut produce.
+fn sort_is_default_ranking(sort: &[SortSpec]) -> bool {
+    let keys: Vec<(&str, &str)> = sort
+        .iter()
+        .flat_map(|spec| spec.fields.iter())
+        .map(|(field, order)| (field.as_str(), order.order.as_str()))
+        .collect();
+    matches!(
+        keys.as_slice(),
+        [] | [("_score", "desc")] | [("_score", "desc"), ("_id", "asc")]
+    )
+}
+
+/// The order of the result list: the request's sort keys, or score
+/// descending when there are none, with `_id` ascending as the final
+/// tie-break either way. One function for every place that ranks
+/// candidates, so a per-segment cut can never disagree with the page.
+fn compare_candidates(
+    a: &HitCandidate,
+    b: &HitCandidate,
+    sort: &[SortSpec],
+    sort_value_fields: &[String],
+) -> std::cmp::Ordering {
+    if sort.is_empty() {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
+    } else {
+        compare_candidate_sort_keys(a, b, sort, sort_value_fields)
     }
+}
+
+/// Keep the first candidate of each distinct `field` value. `candidates`
+/// must already be in result order, so "first" is "best". Documents with no
+/// value for the field form one group, as in OpenSearch.
+fn keep_first_of_each_group(
+    candidates: &mut Vec<HitCandidate>,
+    field: &str,
+    sort_value_fields: &[String],
+) {
+    let Some(index) = sort_value_fields.iter().position(|f| f == field) else {
+        return;
+    };
+    let mut seen_text: HashSet<String> = HashSet::new();
+    let mut seen_number: HashSet<u64> = HashSet::new();
+    let mut seen_missing = false;
+    candidates.retain(|cand| match cand.sort_values.get(index) {
+        Some(SortValue::Text(value)) => seen_text.insert(value.clone()),
+        Some(SortValue::Number(value)) => seen_number.insert(value.to_bits()),
+        Some(SortValue::Missing) | None => !std::mem::replace(&mut seen_missing, true),
+    });
 }
 
 // ─── Aggregation functions ──────────────────────────────────────────────────
@@ -4024,16 +4183,16 @@ fn candidate_is_strictly_after_cursor(
             if idx >= after.len() {
                 return true;
             }
-            let val = candidate_sort_value(cand, field, sort_value_fields);
             let cursor = &after[idx];
-            let cmp = if field == "_score" {
-                let val_f: f64 = val.parse().unwrap_or(0.0);
-                let cur_f: f64 = cursor.parse().unwrap_or(0.0);
-                val_f
-                    .partial_cmp(&cur_f)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            } else {
-                val.as_ref().cmp(cursor.as_str())
+            let cmp = match field.as_str() {
+                "_score" => {
+                    let cur_f: f64 = cursor.parse().unwrap_or(0.0);
+                    cand.score
+                        .partial_cmp(&cur_f)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }
+                "_id" => cand.doc_id.0.as_str().cmp(cursor.as_str()),
+                _ => candidate_sort_value(cand, field, sort_value_fields).compare_to_cursor(cursor),
             };
             // Interpret comparison in the field's sort direction: "greater"
             // means further along the result list.
@@ -4069,7 +4228,7 @@ fn compare_candidate_sort_keys(
                 _ => {
                     let a_val = candidate_sort_value(a, field, sort_value_fields);
                     let b_val = candidate_sort_value(b, field, sort_value_fields);
-                    a_val.as_ref().cmp(b_val.as_ref())
+                    a_val.compare(b_val)
                 }
             };
             let ord = if order.order == "desc" {
@@ -5608,6 +5767,125 @@ mod tests {
         query.knn.as_mut().unwrap().filter = Some(matter_filter("nobody"));
         let r = searcher.search(&ns, &manifest, &query, None).unwrap();
         assert!(r.results.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collapse_returns_one_hit_per_document_and_keeps_the_doc_count() {
+        let dir = std::env::temp_dir().join("kosha-test-collapse");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ns, manifest) = mk_matter_corpus(&dir);
+        let searcher = Searcher::new(dir.clone());
+        let mut query = mk_query("contract", 10);
+        query.exact_total_hits = Some(true);
+        query.collapse = Some(kosha_core::CollapseSpec {
+            field: "documentId".into(),
+        });
+        let r = searcher.search(&ns, &manifest, &query, None).unwrap();
+        assert_eq!(r.total_hits, 21, "total counts chunks, not groups");
+        let mut docs: Vec<&str> = r
+            .results
+            .iter()
+            .map(|d| field(d, "documentId").unwrap())
+            .collect();
+        assert_eq!(docs.len(), 3, "one hit per document: {docs:?}");
+        docs.sort();
+        assert_eq!(docs, vec!["docA", "docB", "docC"]);
+        // The hit kept for a document is its best one: the same chunk that
+        // ranks first for that document when nothing is collapsed.
+        let mut uncollapsed = mk_query("contract", 100);
+        uncollapsed.exact_total_hits = Some(true);
+        let all = searcher.search(&ns, &manifest, &uncollapsed, None).unwrap();
+        for doc in ["docA", "docB", "docC"] {
+            let best = all
+                .results
+                .iter()
+                .find(|d| field(d, "documentId") == Some(doc))
+                .unwrap();
+            let kept = r
+                .results
+                .iter()
+                .find(|d| field(d, "documentId") == Some(doc))
+                .unwrap();
+            assert_eq!(kept.doc_id, best.doc_id, "best chunk of {doc}");
+        }
+        // And the groups come back in the order of their best chunks.
+        let group_order: Vec<&str> = r
+            .results
+            .iter()
+            .map(|d| field(d, "documentId").unwrap())
+            .collect();
+        let mut first_seen: Vec<&str> = Vec::new();
+        for d in &all.results {
+            let doc = field(d, "documentId").unwrap();
+            if !first_seen.contains(&doc) {
+                first_seen.push(doc);
+            }
+        }
+        assert_eq!(group_order, first_seen);
+
+        // Paging walks groups, not chunks.
+        query.max_results = 2;
+        query.from = 2;
+        let r = searcher.search(&ns, &manifest, &query, None).unwrap();
+        assert_eq!(r.results.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn numeric_sort_orders_numbers_and_pages_with_a_cursor() {
+        let dir = std::env::temp_dir().join("kosha-test-numeric-sort");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ns, manifest) = mk_matter_corpus(&dir);
+        let searcher = Searcher::new(dir.clone());
+        let order = |field: &str, order: &str| SortSpec {
+            fields: HashMap::from([(
+                field.to_string(),
+                SortOrder {
+                    order: order.into(),
+                },
+            )]),
+        };
+        let mut query = mk_query("contract", 4);
+        query.filter = Some(serde_json::from_str(r#"{"term": {"documentId": "docA"}}"#).unwrap());
+        query.sort = vec![order("pageNumber", "desc"), order("_id", "asc")];
+        query.source_includes = Some(vec!["pageNumber".into()]);
+        let r = searcher.search(&ns, &manifest, &query, None).unwrap();
+        let pages: Vec<&str> = r
+            .results
+            .iter()
+            .map(|d| field(d, "pageNumber").unwrap())
+            .collect();
+        // As text this would be 9, 8, 7, 6: "12" < "9".
+        assert_eq!(pages, vec!["12", "11", "10", "9"]);
+        assert!(
+            r.results.iter().all(|d| d.fields.len() == 1),
+            "source_includes keeps only the requested field"
+        );
+
+        // Continue after the last hit of that page.
+        query.search_after = Some(vec!["9".into(), "s1-docA-p09".into()]);
+        let r = searcher.search(&ns, &manifest, &query, None).unwrap();
+        let pages: Vec<&str> = r
+            .results
+            .iter()
+            .map(|d| field(d, "pageNumber").unwrap())
+            .collect();
+        assert_eq!(pages, vec!["8", "7", "6", "5"]);
+
+        // `_id` ascending is not a score order: the first ids, not the
+        // best-scoring chunks re-sorted.
+        let mut by_id = mk_query("contract", 2);
+        by_id.sort = vec![order("_id", "asc")];
+        by_id.source_excludes = Some(vec!["contentEmbedding".into()]);
+        let r = searcher.search(&ns, &manifest, &by_id, None).unwrap();
+        let ids: Vec<&str> = r.results.iter().map(|d| d.doc_id.0.as_str()).collect();
+        assert_eq!(ids, vec!["s1-docA-p01", "s1-docA-p02"]);
+        assert!(r
+            .results
+            .iter()
+            .all(|d| field(d, "contentEmbedding").is_none()));
+        assert!(r.results.iter().all(|d| field(d, "content").is_some()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
