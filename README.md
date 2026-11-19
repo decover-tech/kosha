@@ -73,7 +73,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 - Namespace registry and manifest store, in-memory by default or Postgres-backed (`postgres` feature + `DATABASE_URL`), with compare-and-swap manifest publishes.
 - Multi-tenancy: every API key maps to a tenant prefix that scopes all namespace access.
-- Read/write split: query pods forward every mutating route to `KOSHA_INGEST_HOST` and serve reads locally.
+- Read/write split: query pods forward every mutating route to `KOSHA_INGEST_HOST` and serve reads locally. A background refresher on each query pod polls every namespace's manifest version in one control-store query every `KOSHA_MANIFEST_REFRESH_MS` (default 500; `0` disables it and the pod checks before every search instead) and swaps in manifests that advanced; searches already running finish on the snapshot they started with, and namespaces in `KOSHA_WARMUP_NAMESPACES` have the new version's scoring set fetched before the swap. Searches don't touch the control store unless they pass `max_staleness_seconds` (body field or query parameter) and the namespace was last confirmed current longer ago than that. If the control store is unreachable, query pods keep serving their last-known-good manifests and only a namespace the pod never loaded fails (503). `GET /v1/stats` on a query pod reports per-namespace `manifest_version`, `stored_manifest_version`, `last_refresh_at` (Unix seconds) and `manifest_lag_seconds`, plus a `manifest_refresh` block with error counters and the maximum lag.
 - Backpressure controls: max concurrent searches, search queue depth and timeout, hydration concurrency, admission timeout.
 - `GET /healthz` (liveness), `GET /readyz` (readiness), `GET /v1/stats` and per-namespace stats.
 - Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, import a namespace.
@@ -174,17 +174,38 @@ existing data automatically.
 A successful flush uploads its segment snapshot before publishing its manifest.
 Upload and manifest-store failures return errors and remain retryable. Buffered
 writes use a local, fsynced WAL; they are not S3-durable until a successful flush.
-WAL records are reclaimed only through the published namespace checkpoint,
-without removing later writes or another namespace's records. Partial parallel
-flush failures restore the entire snapshot for retry.
+Concurrent appends are group-committed: one WAL file and one fsync cover every
+record queued while the previous commit ran, and each caller is acknowledged
+only after the fsync covering its own record. Once the previous group held more
+than one record, the committer waits up to `KOSHA_WAL_GROUP_COMMIT_MS` (default
+2; `0` disables the wait) for more, and cuts a group at
+`KOSHA_WAL_GROUP_COMMIT_BYTES` (default 4 MiB). A lone writer never waits.
+Every record has its own log sequence number. WAL records are reclaimed only
+through the published namespace checkpoint: a file shared by several namespaces
+is deleted once each of them has a published checkpoint past its records there,
+so a flush never removes later writes or another namespace's records. Partial
+parallel flush failures restore the entire snapshot for retry.
 
 Publication uses compare-and-swap against the writer's last committed manifest
-version. Concurrent writers cannot replace each other's snapshots: a stale
-writer returns an error and retains its WAL. Automatic conflict rebasing is not
-implemented; restart the stale writer with its existing data directory to load
-the published manifest and replay its pending writes. Retrying an identical
-committed snapshot is safe after a lost commit response. Segment object keys
-include a random writer identifier to avoid collisions before publication.
+version. Concurrent writers cannot replace each other's snapshots. A stale
+writer reads the newer manifest back (resolving its deletion sidecars), rebases
+its unpublished delta onto it and retries the CAS, up to 3 times with jittered
+backoff. The delta is the segments it added, the segments it compacted away and
+its new deletes; deletes on a segment both sides list are merged, and the
+published WAL checkpoint stays the rebasing writer's own. A writer with nothing
+unpublished just adopts the newer manifest. The rebase aborts, leaving local
+state and the WAL untouched, when merging would lose data: both writers
+compacted the same segment, the other writer deleted documents in a segment this
+writer compacted away, or the other writer compacted away a segment that carries
+this writer's unpublished deletes. An unresolved conflict returns HTTP 409.
+Restarting the writer with its existing data directory loads the published
+manifest and replays its pending writes from the WAL. Retrying an identical
+committed snapshot is safe after a lost commit response, and a rebase
+recognizes such a commit as its own. Segment object keys include a random
+writer identifier to avoid collisions before publication. Migration
+(`kosha-server migrate`) and `POST /v1/admin/import-namespace` also publish by
+CAS against the version they read. They never rebase, and they fail instead of
+overwriting a manifest another writer committed (409 for import).
 
 Each WAL directory has a persistent origin identifier. New manifest checkpoints
 apply only to that origin, so another writer's checkpoint cannot discard local
@@ -193,8 +214,11 @@ its `origin` file, across restarts. Legacy checkpoints without an origin retain
 their previous recovery behavior; upgrade all writers before concurrent use.
 
 Deletes include buffered documents and WAL-log resolved document IDs before
-applying them. New WAL files use checksummed v2 frames; recovery discards an
-incomplete final file and rejects corrupt records. Legacy v1 files remain readable.
+applying them. New WAL files hold one or more checksummed v3 frames (the CRC
+covers the record's sequence number and payload); vectors are stored as binary
+f32 rather than JSON text. Recovery keeps every complete frame of a torn final
+file, discards only the incomplete tail, and rejects corrupt records. v1 and v2
+files remain readable.
 Deletes and writes replay in order, so reinserting a deleted ID remains valid.
 
 Deletion sets are immutable `deletes-{sha256}.roaring` sidecars referenced by the
@@ -216,8 +240,8 @@ object, including tombstones and checkpoints. New servers can read the old entry
 arrays. Old servers cannot read the new object format: upgrade ingest and query
 roles together before resuming writes, and do not roll back readers without a
 manifest-format migration. Servers predating deletion-vector support ignore
-those references, and older WAL readers cannot replay v2 frames: upgrade all
-roles together before accepting writes and preserve the WAL directory. Rolling
+those references, and older WAL readers cannot replay v2 or v3 frames: upgrade
+all roles together before accepting writes and preserve the WAL directory. Rolling
 back requires converting both formats. The SQL column needs no schema change.
 
 ## Repository layout

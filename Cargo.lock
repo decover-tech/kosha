@@ -2100,6 +2100,7 @@ name = "kosha-write"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "criterion",
  "kosha-core",
  "kosha-segment",
  "serde",
