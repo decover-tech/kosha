@@ -165,6 +165,11 @@ pub fn assess_listing(
         Some(Ok(commit)) => {
             for f in &commit.files {
                 match size_of(&f.name) {
+                    // Deletion generations are not segment data: they are
+                    // validated by the manifest's checksum, uploaded on
+                    // their own, and garbage-collected once superseded
+                    // (#239). A commit from before that may still list one.
+                    None if kosha_core::gc::deletion_generation_of(&f.name).is_some() => {}
                     None => return Durability::Incomplete(format!("missing {}", f.name)),
                     Some(s) if s != f.size => {
                         return Durability::Incomplete(format!(
@@ -223,6 +228,19 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    fn a_collected_deletion_generation_does_not_make_a_segment_incomplete() {
+        let mut listing = full_listing();
+        let generation = format!("deletes-{}.roaring", "ab".repeat(32));
+        listing.push((generation.clone(), 8));
+        let commit = commit_for(&listing);
+        listing.retain(|(n, _)| *n != generation);
+        assert_eq!(
+            assess_listing(&listing, Some(Ok(&commit))),
+            Durability::Committed
+        );
     }
 
     #[test]

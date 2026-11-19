@@ -16,6 +16,9 @@ serde_json = { workspace = true }
 crc32c = "0.6"
 uuid = { version = "1", features = ["v4"] }
 
+[dev-dependencies]
+kosha-query = { path = "../kosha-query" }
+
 [[bench]]
 name = "sustained_concurrent_flush"
 harness = false

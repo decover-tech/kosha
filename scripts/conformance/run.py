@@ -16,6 +16,9 @@ Checkpoints, in order:
   deletes        delete-by-query, delete vs. unflushed docs, re-index of a
                  deleted id
   compacted      tiered compaction via the admin endpoint
+  gc             segment GC (#239) with zero grace: a dry run must list
+                 exactly the compacted-away segments, a real run deletes
+                 them, and every answer stays exact
   restarted      server restart (only with --spawn or --restart-cmd); with
                  an emptied local cache this exercises cold hydration
 
@@ -123,6 +126,18 @@ class Kosha:
             "POST",
             "/v1/admin/compact-namespace",
             {"namespace": "%s/%s" % (self.tenant, self.ns)},
+            key=self.admin_key,
+        )
+
+    def gc(self, dry_run: bool) -> Dict:
+        return self.must(
+            "POST",
+            "/v1/admin/gc",
+            {
+                "namespace": "%s/%s" % (self.tenant, self.ns),
+                "dry_run": dry_run,
+                "grace_seconds": 0,
+            },
             key=self.admin_key,
         )
 
@@ -453,6 +468,28 @@ def run(args, kosha: Kosha, restart) -> Results:
     oracle.compact()
     print("  compaction: %s" % json.dumps({k: out.get(k) for k in ("segments_before", "segments_after", "segments_merged", "not_hydrated")}))
     checkpoint("compacted", res, kosha, oracle, qs, walks)
+
+    # gc: the compaction's inputs are retired; with zero grace they are
+    # garbage at once. Orphans keep the default (long) grace.
+    merged = int(out.get("segments_merged") or 0)
+    dry = kosha.gc(dry_run=True)["namespaces"][0]
+    retired_segments = sorted(
+        c["segment_id"] for c in dry["candidates"] if c["kind"] == "segment" and c["reason"] == "retired"
+    )
+    res.record(
+        "gc:dry-run-lists-compacted-segments",
+        len(retired_segments) == merged and dry.get("aborted") is None,
+        "merged %d, dry run listed %s" % (merged, retired_segments),
+    )
+    real = kosha.gc(dry_run=False)["namespaces"][0]
+    res.record(
+        "gc:real-run-deletes-them",
+        real["segments_deleted"] == len(dry["candidates"]) - sum(1 for c in dry["candidates"] if c["kind"] != "segment")
+        and real.get("aborted") is None,
+        json.dumps({k: real.get(k) for k in ("segments_deleted", "deletion_vectors_deleted", "bytes_reclaimed", "aborted")}),
+    )
+    print("  gc: %s" % json.dumps({k: real.get(k) for k in ("segments_deleted", "deletion_vectors_deleted", "bytes_reclaimed", "records_pruned")}))
+    checkpoint("gc", res, kosha, oracle, qs, walks)
 
     # restarted
     if restart is not None:

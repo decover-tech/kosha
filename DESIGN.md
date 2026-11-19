@@ -325,7 +325,7 @@ calls.
 
 - Running merges on separate compute so ingest/query pods never pay merge CPU/IO.
 - Fair multi-tenant scheduling and cost controls across namespaces.
-- GC of superseded segments after the manifest-staleness window (§11).
+- Off-pod segment GC. Today GC runs on the write pod (`POST /v1/admin/gc`, §11).
 
 **Durability/visibility tradeoff**: a document is durable (survives any single node failure) as
 soon as its WAL append to S3 acknowledges. It becomes *queryable* once its segment is flushed and
@@ -433,8 +433,34 @@ existing org/user auth context Bach already establishes.
   approach we already accept operationally with ES refresh tuning.
 - **Manifest updates**: conditional (compare-and-swap) writes prevent lost updates from concurrent
   flush/compaction; a losing writer retries against the new base.
-- **Garbage collection**: superseded segments are deleted only after the max manifest-staleness
-  window elapses (i.e., after no query node could plausibly still be holding a reference to them).
+- **Garbage collection** (#239): superseded segments are deleted only after the max
+  manifest-staleness window elapses (i.e., after no query node could plausibly still be holding a
+  reference to them).
+  - *Retirement records.* A publish that drops a segment (compaction, rebase, admin import) or
+    replaces a segment's deletion generation lists it in the manifest's optional `retired` field
+    with `retired_at_ms` and `retired_in_version`. The record rides in the same compare-and-swap as
+    the change, so neither can commit without the other. The control plane keeps only the current
+    manifest (no history, no branches yet), so "referenced" means referenced by the current
+    manifest of some namespace.
+  - *Local disk.* Each pod queues the segments its manifest dropped and removes their directories
+    once all of these hold: `KOSHA_LOCAL_GC_GRACE` (default 5 min) has passed; the dropping
+    version is committed (without S3, local disk is the only copy until then); every search
+    snapshot alive at retirement has been dropped; and the searcher holds no open reader of the
+    segment (readers load the doc store and postings lazily, by path). Removal goes through the
+    disk cache, so its `eviction_generation` bumps and cached presence verdicts are re-checked.
+  - *Object store.* `POST /v1/admin/gc` lists each namespace's prefix. A candidate is a segment
+    prefix or `deletes-*.roaring` object the current manifest does not reference that was either
+    retired more than `KOSHA_GC_GRACE` ago (default 1 h, above any replica's manifest lag) or has
+    no record and whose newest object is older than `KOSHA_GC_ORPHAN_GRACE` (default 24 h: a
+    crashed flush, a losing CAS writer, pre-#239 compactions; long because an upload whose publish
+    has not committed yet looks the same). Untracked prefixes must carry this namespace's
+    segment-id prefix, and prefixes that belong to a nested namespace are skipped. The manifest is
+    re-read right before deleting; if its version moved, the namespace is skipped. `_COMMIT` goes
+    first, so a half-deleted segment never looks durable. The deleted objects' records are then
+    dropped in one more CAS; if that loses a race, the next run prunes records whose objects are
+    gone. Deletion generations are not part of a segment's `_COMMIT` (they are verified by their
+    checksum in the manifest), so dropping a superseded one never makes its segment look
+    incomplete. Dry run is the default.
 
 ## 12. API & Integration with Sage
 

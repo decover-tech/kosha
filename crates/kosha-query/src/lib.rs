@@ -456,6 +456,22 @@ impl SegmentCache {
         self.evict_idle_until(|_len, _total, freed| freed >= needed);
     }
 
+    /// Drop every cached entry for one segment (both `load_vectors`
+    /// variants), pinned or not, and hand back the removed readers. Stale
+    /// recency keys are skipped by the eviction walk.
+    fn remove_segment(&self, namespace: &str, segment_id: &str) -> Vec<Arc<TrackedSegment>> {
+        let mut entries = self.entries.lock().unwrap();
+        let mut removed = Vec::new();
+        for load_vectors in [false, true] {
+            let key = (namespace.to_string(), segment_id.to_string(), load_vectors);
+            if let Some((reader, size)) = entries.remove(&key) {
+                self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                removed.push(reader);
+            }
+        }
+        removed
+    }
+
     /// Shared eviction walk: pop LRU-order entries, evicting the *idle*
     /// ones (strong_count == 1 — the cache's own `Arc` is the only
     /// reference) until `done(len, total_bytes, freed)` says stop.
@@ -951,7 +967,14 @@ pub struct Searcher {
     data_dir: PathBuf,
     segment_cache: SegmentCache,
     ledger: Arc<MemoryLedger>,
+    /// Readers of retired segments, released from the cache by
+    /// [`Searcher::release_segment`] while an in-flight search still held
+    /// them. Keyed by `(namespace, segment_id)`.
+    draining: Mutex<HashMap<(String, String), DrainingReaders>>,
 }
+
+/// Weak handles to the readers of one released segment.
+type DrainingReaders = Vec<std::sync::Weak<TrackedSegment>>;
 
 /// Result of a [`Searcher::warm_segments`] pass — how many segments were
 /// newly opened/cached vs. already resident, and the estimated bytes
@@ -1008,7 +1031,37 @@ impl Searcher {
             data_dir,
             segment_cache: SegmentCache::new(capacity, max_bytes),
             ledger: Arc::new(MemoryLedger::new(max_live_bytes, admission_timeout)),
+            draining: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Stop caching a retired segment and report whether any reader of it
+    /// is still alive (#239).
+    ///
+    /// Drops the segment's cache entries, then checks every reader of it
+    /// this searcher has handed out and not yet seen dropped. `true` means
+    /// an in-flight search still holds one and the segment's files must
+    /// stay on disk (its doc store and postings are read lazily, by path);
+    /// call again later. `false` means nothing can read it any more. A
+    /// search that reopens it after this call puts it back in the cache,
+    /// and the next call removes it again.
+    pub fn release_segment(&self, namespace: &str, segment_id: &str) -> bool {
+        let removed = self.segment_cache.remove_segment(namespace, segment_id);
+        let weak: Vec<std::sync::Weak<TrackedSegment>> =
+            removed.iter().map(Arc::downgrade).collect();
+        // Release the cache's own references (and so their ledger bytes)
+        // before counting who else holds one.
+        drop(removed);
+        let key = (namespace.to_string(), segment_id.to_string());
+        let mut draining = self.draining.lock().unwrap();
+        let list = draining.entry(key.clone()).or_default();
+        list.extend(weak);
+        list.retain(|w| w.strong_count() > 0);
+        let busy = !list.is_empty();
+        if !busy {
+            draining.remove(&key);
+        }
+        busy
     }
 
     /// Return the cached parsed segment for `(namespace, segment_id,
@@ -4326,6 +4379,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         for (segment, docs) in [
             (
@@ -4532,6 +4586,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -4666,6 +4721,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -4757,6 +4813,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -4827,6 +4884,44 @@ mod tests {
     fn ledger_snapshot(searcher: &Searcher) -> (u64, u64, usize) {
         let st = searcher.ledger.state.lock().unwrap();
         (st.live, st.reserved, st.active)
+    }
+
+    #[test]
+    fn release_segment_reports_inflight_readers_until_they_drop() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-release-segment-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s1_dir = mk_segment(&dir, "test", "s1", "alpha");
+        let searcher = Searcher::with_segment_cache_limits(dir.clone(), 10, u64::MAX);
+
+        // Idle in the cache only: released and reported free at once.
+        drop(
+            searcher
+                .open_segment("test", "s1", s1_dir.clone(), false, None, None, None)
+                .unwrap(),
+        );
+        let key = ("test".to_string(), "s1".to_string(), false);
+        assert!(searcher.segment_cache.contains(&key));
+        assert!(!searcher.release_segment("test", "s1"));
+        assert!(!searcher.segment_cache.contains(&key));
+        assert_eq!(
+            searcher.segment_cache.total_bytes.load(Ordering::Relaxed),
+            0
+        );
+
+        // Held by an in-flight search: busy until that reader drops, and the
+        // reader keeps working in the meantime.
+        let held = searcher
+            .open_segment("test", "s1", s1_dir, false, None, None, None)
+            .unwrap();
+        assert!(searcher.release_segment("test", "s1"));
+        assert!(!searcher.segment_cache.contains(&key));
+        assert!(searcher.release_segment("test", "s1"), "still held");
+        assert_eq!(held.doc_count(), 1);
+        drop(held);
+        assert!(!searcher.release_segment("test", "s1"));
+        assert!(searcher.draining.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4927,6 +5022,7 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                retired: Default::default(),
             },
             all,
         )
@@ -5188,6 +5284,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
 
         // Reproduce the production regime exactly, independent of how this
@@ -5354,6 +5451,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let result = searcher.search(
             &NamespaceId("test".into()),
@@ -5409,6 +5507,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5481,6 +5580,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5568,6 +5668,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let result = searcher
             .search(
@@ -5652,6 +5753,7 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                retired: Default::default(),
             },
         )
     }
@@ -6047,6 +6149,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut query = mk_query("", 10);
@@ -6126,6 +6229,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -6214,6 +6318,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
 
         // Generous entry-count cap (10) but a byte budget that fits s1 alone,
@@ -6333,6 +6438,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -6397,6 +6503,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
@@ -6451,6 +6558,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -6622,6 +6730,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mk_knn_q = |num_candidates: usize| {
@@ -6749,6 +6858,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 1);
@@ -6820,6 +6930,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -6886,6 +6997,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -6957,6 +7069,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         (dir, manifest)
     }
@@ -7076,6 +7189,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         // Fresh searcher (no warm in-memory segment cache) so opening the
         // segment for these searches goes through the real `try_read_doc_index`
@@ -7156,6 +7270,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         // Fresh searcher so each segment is actually opened (Lazy), not
         // served from a warm cache populated by an earlier call here.
@@ -7276,6 +7391,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -7327,6 +7443,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -7386,6 +7503,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7484,6 +7602,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -7529,6 +7648,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -7589,6 +7709,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         }
     }
 
@@ -7642,6 +7763,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         }
     }
 
@@ -7831,6 +7953,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7963,6 +8086,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let run = |b: f64| {
@@ -8134,6 +8258,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let scores = |q: SearchQuery| -> Vec<(String, f64)> {
@@ -8294,6 +8419,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
 
         // Baseline (uncorrupted): "alpha beta" intersects, "beta" matches.
@@ -8389,6 +8515,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         // Open + warm the segment so the reader is cached, THEN evict
@@ -8443,6 +8570,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8583,6 +8711,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8647,6 +8776,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -8830,6 +8960,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -8880,6 +9011,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -8985,6 +9117,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -9064,6 +9197,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut id_sort = std::collections::HashMap::new();
@@ -9186,6 +9320,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -9257,6 +9392,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -9311,6 +9447,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -9388,6 +9525,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -9479,6 +9617,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -9557,6 +9696,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {

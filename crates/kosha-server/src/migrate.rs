@@ -539,6 +539,7 @@ impl Publisher {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                retired: Default::default(),
             },
             PublishMode::Append => existing.clone(),
         };
@@ -602,7 +603,23 @@ fn commit_manifest(
     expected: u64,
     manifest: &Manifest,
 ) -> std::result::Result<(), kosha_core::KoshaError> {
-    store.compare_and_swap_manifest(namespace, expected, manifest.clone())
+    let mut manifest = manifest.clone();
+    // A replacement run drops the namespace's previous segments: record
+    // them so segment GC (#239) can delete them after its grace window.
+    if let Some(previous) = store
+        .manifest_cloned(namespace)
+        .filter(|m| m.version == expected)
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        kosha_core::gc::record_retirements(
+            &kosha_core::gc::CommittedRefs::of(&previous),
+            &mut manifest,
+            |_, _| now,
+        );
+    }
+    store.compare_and_swap_manifest(namespace, expected, manifest)
 }
 
 pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
@@ -666,6 +683,7 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         });
         // Restore to advance segment IDs beyond an existing/partial run.
         // Replace mode: Publisher publishes only this run's segments.
@@ -815,6 +833,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         };
         commit_manifest(&mut store, &ns, 0, &manifest(1, "run-1")).unwrap();
         // An ingest writer publishes on top while the run is uploading.

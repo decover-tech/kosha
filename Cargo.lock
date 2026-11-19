@@ -2099,6 +2099,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "kosha-core",
+ "kosha-query",
  "kosha-segment",
  "serde",
  "serde_json",

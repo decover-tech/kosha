@@ -1,4 +1,5 @@
 pub mod deletes;
+pub mod gc;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -592,6 +593,29 @@ pub trait StorageBackend: std::fmt::Debug + Send + Sync {
     fn delete(&self, path: &str) -> Result<(), KoshaError>;
     fn list(&self, path: &str) -> Result<Vec<String>, KoshaError>;
     fn create_dir_all(&self, path: &str) -> Result<(), KoshaError>;
+
+    /// Every object under `prefix`, recursively, with its size and
+    /// last-modified time. Paths are relative to the storage root, like the
+    /// ones the other methods take. Used by segment GC (#239), which must
+    /// see what the object store holds rather than what a manifest says.
+    /// Backends that cannot list return `Unsupported`.
+    fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectMeta>, KoshaError> {
+        let _ = prefix;
+        Err(KoshaError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this storage backend cannot list objects",
+        )))
+    }
+}
+
+/// One stored object, as [`StorageBackend::list_objects`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMeta {
+    /// Path relative to the storage root, `/`-separated.
+    pub path: String,
+    pub size: u64,
+    /// Unix epoch milliseconds.
+    pub last_modified_ms: u64,
 }
 
 /// Local filesystem implementation of StorageBackend.
@@ -686,6 +710,45 @@ impl StorageBackend for LocalStorage {
     }
     fn create_dir_all(&self, path: &str) -> Result<(), KoshaError> {
         Ok(std::fs::create_dir_all(self.root.join(path))?)
+    }
+    fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectMeta>, KoshaError> {
+        fn walk(
+            dir: &std::path::Path,
+            root: &std::path::Path,
+            out: &mut Vec<ObjectMeta>,
+        ) -> std::io::Result<()> {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                let path = entry.path();
+                if meta.is_dir() {
+                    walk(&path, root, out)?;
+                } else if let Ok(rel) = path.strip_prefix(root) {
+                    let last_modified_ms = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_millis() as u64);
+                    out.push(ObjectMeta {
+                        path: rel.to_string_lossy().replace('\\', "/"),
+                        size: meta.len(),
+                        last_modified_ms,
+                    });
+                }
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        // A prefix names a directory here: `ns/` and `ns` list the same.
+        let start = self.root.join(prefix.trim_end_matches('/'));
+        walk(&start, &self.root, &mut out)?;
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
     }
 }
 
@@ -1234,6 +1297,13 @@ pub struct Manifest {
     /// readable for legacy manifests and is populated in memory by readers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub deletion_vectors: HashMap<SegmentId, deletes::DeletionVector>,
+    /// Segments and deletion generations earlier versions referenced and
+    /// this one no longer does, with when they were dropped (#239). Segment
+    /// GC deletes their objects once they have been retired longer than
+    /// the grace window, then drops the record. Optional, so manifests
+    /// written before it existed still parse and older binaries ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<gc::RetiredObject>,
 }
 
 impl Manifest {
@@ -1992,6 +2062,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            retired: Default::default(),
         }
     }
 

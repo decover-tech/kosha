@@ -134,6 +134,7 @@ Consequences worth knowing:
 | `KOSHA_DATABASE_URL` | Postgres URL for control plane. Staging points at the in-cluster Postgres StatefulSet in `decoverai-services` (`postgres-service.decoverai-services.svc.cluster.local:5432/kosha`, not the old RDS instance) — see backend's `deployments/k8s/base/postgres.yaml`. Cross-namespace, so the FQDN is required; the bare `postgres-service` short name won't resolve from the `kosha` namespace. |
 | `KOSHA_API_KEY` | Bootstrap tenant API key (tenant `default`). Admin and peer access use the separate `KOSHA_ADMIN_API_KEY` / `KOSHA_INTERNAL_API_KEY`. The server refuses to start when no credential is configured at all. |
 | `KOSHA_S3_BUCKET` | Segment bucket name |
+| `KOSHA_GC_GRACE` / `KOSHA_GC_ORPHAN_GRACE` | Segment GC (#239): how long a retired segment (default `1h`) or a never-referenced orphan (default `24h`) stays in S3 before `POST /v1/admin/gc` deletes it. `KOSHA_LOCAL_GC_GRACE` (default `5m`) is the same for local disk. |
 | `KOSHA_S3_PREFIX` | Key prefix (e.g. `segments/`) |
 | `KOSHA_IRSA_ROLE_ARN` | `eks.amazonaws.com/role-arn` value |
 | `EKS_CLUSTER_NAME` | Target EKS cluster |
@@ -169,7 +170,10 @@ Notes:
   `kosha-config`. No Kosha API key is needed because this bypasses HTTP.
 - A full run **replaces** the namespace manifest with newly-built segments
   (segment IDs continue past any prior/partial run). Old S3 segments become
-  unreferenced; they can be garbage-collected later. During migration, the
+  unreferenced; segment GC (`POST /v1/admin/gc`, or the suspended
+  `kosha-segment-gc` CronJob) deletes them once they are older than
+  `KOSHA_GC_ORPHAN_GRACE` (default 24h). Run it with `"dry_run": true`
+  first to see what it would delete. During migration, the
   namespace is only partially populated, so keep Sage reads on OpenSearch
   until the Job completes and Kosha is restarted.
 - **Delta catch-up** (missing ids only): pass `--ids-file /path/ids.txt`

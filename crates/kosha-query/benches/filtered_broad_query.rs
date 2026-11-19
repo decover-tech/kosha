@@ -75,6 +75,7 @@ fn main() {
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        retired: Default::default(),
     };
     let searcher = Searcher::new(work);
 
