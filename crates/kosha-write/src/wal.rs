@@ -41,15 +41,34 @@ const VERSION: u32 = 3;
 /// magic + version + lsn + len + crc.
 const FRAME_HEADER: usize = 4 + 4 + 8 + 8 + 4;
 
-/// Durable storage for WAL files. Each file is named by the LSN of its first
-/// record. [`WalWriter`] decides which files a checkpoint covers; the store
-/// only persists, lists, reads and deletes them. The local-disk
-/// implementation is [`LocalWalStore`]; an object-store implementation can
-/// slot in behind the same trait (#236).
+/// Durable storage for WAL files. A file is keyed by an LSN no greater than
+/// its first record's ([`LocalWalStore`] uses exactly the first record's
+/// LSN). [`WalWriter`] decides which files a checkpoint covers; the store
+/// only persists, lists, reads and deletes them. Implementations:
+/// [`LocalWalStore`] (local disk) and
+/// [`ObjectWalStore`](crate::object_wal::ObjectWalStore) (S3, #236).
 pub trait WalStore: Send + Sync + std::fmt::Debug {
     /// Atomically and durably persist one group-commit file. Returns only
     /// after the bytes survive a crash; a failure leaves no visible file.
+    /// A [`conditional`](Self::conditional) store never replaces an
+    /// existing key: it fails with [`std::io::ErrorKind::AlreadyExists`].
     fn append_batch(&self, first_lsn: u64, bytes: &[u8]) -> Result<(), KoshaError>;
+    /// `true` when `append_batch` is a create-if-absent (S3
+    /// `If-None-Match: *`) on a store other writers can reach. The writer
+    /// then keys each group by the first LSN after the previous group, so
+    /// two writers on one stream race for the same key and exactly one
+    /// wins (see [`WalWriter`]).
+    fn conditional(&self) -> bool {
+        false
+    }
+    /// Write-once metadata (`origin`): create `name` unless it exists; an
+    /// existing value is kept and is not an error.
+    fn create_meta(&self, name: &str, bytes: &[u8]) -> Result<(), KoshaError> {
+        match self.read_meta(name)? {
+            Some(_) => Ok(()),
+            None => self.write_meta(name, bytes),
+        }
+    }
     /// First LSNs of every WAL file, ascending.
     fn list(&self) -> Result<Vec<u64>, KoshaError>;
     fn read(&self, first_lsn: u64) -> Result<Vec<u8>, KoshaError>;
@@ -220,10 +239,38 @@ struct WriterState {
     /// Highest published checkpoint per namespace (for this origin).
     checkpoints: HashMap<NamespaceId, u64>,
     files_written: u64,
+    /// Conditional stores only: key of the next group, one past the last
+    /// LSN of the newest group this writer persisted or recovered. It
+    /// does not move when a group fails, so the next group retries the
+    /// same key and a writer that lost a race for it learns so.
+    next_key: u64,
+    /// Bytes of failed conditional puts to `next_key` whose outcome is
+    /// unknown (a timeout may still have landed). A later conflict on that
+    /// key is this writer's own write when the stored bytes match one.
+    ambiguous: Vec<Arc<Vec<u8>>>,
+    /// Set when another writer won a key this writer needed: every later
+    /// append fails until the process restarts and re-reads the stream.
+    fenced: Option<String>,
 }
+
+/// Failed puts remembered for `next_key`; older ones are forgotten, which
+/// can only turn a later self-conflict into a (safe) fence.
+const MAX_AMBIGUOUS_PUTS: usize = 8;
 
 /// Write-Ahead Log for durability of buffered documents. Thread-safe:
 /// appends from many threads are group-committed into shared files.
+///
+/// LSNs are allocated per writer stream (one `origin`), not per namespace:
+/// one group file holds every namespace's records that arrived together,
+/// and a namespace manifest's `(wal_origin, wal_checkpoint)` names the
+/// highest LSN of that origin its segments contain.
+///
+/// On a [`conditional`](WalStore::conditional) store the writer keys group
+/// `n + 1` by the LSN after group `n`'s last record, and persists it with a
+/// create-if-absent. Two processes appending to one stream therefore race
+/// for the same key: one wins, and the loser fails that group, is fenced
+/// (every later append fails) and must restart, which re-reads the stream.
+/// Neither acknowledges a record the other cannot recover.
 pub struct WalWriter {
     store: Arc<dyn WalStore>,
     origin: String,
@@ -231,6 +278,9 @@ pub struct WalWriter {
     state: Mutex<WriterState>,
     wake: Condvar,
 }
+
+/// Records recovered when a [`WalWriter`] opens, with their LSNs, in order.
+pub type RecoveredRecords = Vec<(u64, WalRecord)>;
 
 impl WalWriter {
     /// Local-disk WAL in `wal_dir`, group commit configured from the
@@ -245,31 +295,34 @@ impl WalWriter {
     }
 
     pub fn with_store(store: Arc<dyn WalStore>, config: GroupCommitConfig) -> Self {
-        let origin = match store.read_meta("origin").expect("cannot read WAL origin") {
-            Some(origin) => {
-                let origin = String::from_utf8(origin).expect("invalid WAL origin");
-                uuid::Uuid::parse_str(&origin).expect("invalid WAL origin");
-                origin
-            }
-            None => {
-                let origin = uuid::Uuid::new_v4().to_string();
-                store
-                    .write_meta("origin", origin.as_bytes())
-                    .expect("cannot persist WAL origin");
-                origin
-            }
-        };
-        let recovered = recover_from(store.as_ref()).expect("WAL recovery failed");
+        Self::open(store, config).expect("WAL recovery failed").0
+    }
+
+    /// Open a writer on `store` and return the records it recovered (every
+    /// complete record of every file, in LSN order). Fails instead of
+    /// panicking, for stores that can be briefly unavailable.
+    pub fn open(
+        store: Arc<dyn WalStore>,
+        config: GroupCommitConfig,
+    ) -> Result<(Self, RecoveredRecords), KoshaError> {
+        if store.read_meta("origin")?.is_none() {
+            store.create_meta("origin", uuid::Uuid::new_v4().to_string().as_bytes())?;
+        }
+        // Read back: a concurrent opener of a shared stream may have
+        // created it first.
+        let origin = store
+            .read_meta("origin")?
+            .ok_or_else(|| invalid("WAL origin missing after creation"))?;
+        let origin = String::from_utf8(origin).map_err(|_| invalid("invalid WAL origin"))?;
+        uuid::Uuid::parse_str(&origin).map_err(|_| invalid("invalid WAL origin"))?;
+        let recovered = recover_from(store.as_ref())?;
         if let Some((file, complete_len)) = recovered.torn_tail {
             // A discarded tail must not become a corrupt middle record after
             // subsequent writes.
-            store
-                .truncate_torn_tail(file, complete_len)
-                .expect("cannot quarantine torn WAL tail");
+            store.truncate_torn_tail(file, complete_len)?;
         }
         let persisted = store
-            .read_meta("sequence")
-            .expect("cannot read WAL sequence")
+            .read_meta("sequence")?
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0);
@@ -283,7 +336,7 @@ impl WalWriter {
                 .or_insert(*lsn);
             *max = (*max).max(*lsn);
         }
-        Self {
+        let writer = Self {
             store,
             origin,
             config,
@@ -299,9 +352,13 @@ impl WalWriter {
                 files,
                 checkpoints: HashMap::new(),
                 files_written: 0,
+                next_key: high + 1,
+                ambiguous: Vec::new(),
+                fenced: None,
             }),
             wake: Condvar::new(),
-        }
+        };
+        Ok((writer, recovered.records))
     }
 
     pub fn origin(&self) -> &str {
@@ -505,34 +562,89 @@ impl WalWriter {
         }
         let batch: Vec<PendingRecord> = state.pending.drain(..cut).collect();
         state.pending_bytes -= taken_bytes;
+        let conditional = self.store.conditional();
+        let key = if conditional {
+            state.next_key
+        } else {
+            batch[0].lsn
+        };
+        let fenced = state.fenced.clone();
+        let ambiguous = state.ambiguous.clone();
         drop(state);
 
         let mut bytes = Vec::with_capacity(taken_bytes);
         for record in &batch {
             encode_frame(&mut bytes, record.lsn, &record.payload);
         }
-        let first = batch[0].lsn;
         let last = batch[batch.len() - 1].lsn;
-        let result = self.store.append_batch(first, &bytes);
+        let outcome = match fenced {
+            Some(reason) => GroupOutcome {
+                key,
+                adopted: None,
+                result: Err(GroupFailure::Fenced(reason)),
+            },
+            None if conditional => self.persist_conditional(key, &bytes, &ambiguous),
+            None => GroupOutcome {
+                key,
+                adopted: None,
+                result: self
+                    .store
+                    .append_batch(key, &bytes)
+                    .map_err(GroupFailure::Failed),
+            },
+        };
 
         let mut state = self.state.lock().unwrap();
-        match result {
+        if let Some((file, high, locations)) = outcome.adopted {
+            let entry = state.files.entry(file).or_default();
+            for (lsn, namespace) in locations {
+                let max = entry.entry(namespace).or_insert(lsn);
+                *max = (*max).max(lsn);
+            }
+            state.next_key = state.next_key.max(high + 1);
+            state.ambiguous.clear();
+            state.files_written += 1;
+        }
+        let failure = match outcome.result {
             Ok(()) => {
-                let file = state.files.entry(first).or_default();
+                let file = state.files.entry(outcome.key).or_default();
                 for record in &batch {
                     let max = file.entry(record.namespace.clone()).or_insert(record.lsn);
                     *max = (*max).max(record.lsn);
                 }
                 state.files_written += 1;
-            }
-            Err(e) => {
-                let (kind, message) = match &e {
-                    KoshaError::Io(io) => (io.kind(), io.to_string()),
-                    other => (std::io::ErrorKind::Other, other.to_string()),
-                };
-                for record in &batch {
-                    state.failed.insert(record.lsn, (kind, message.clone()));
+                if conditional {
+                    state.next_key = state.next_key.max(last + 1);
+                    state.ambiguous.clear();
                 }
+                None
+            }
+            Err(GroupFailure::Fenced(reason)) => Some(fenced_error(&reason)),
+            Err(GroupFailure::Lost(error)) => {
+                let reason = format!(
+                    "another writer owns WAL key {} of origin {} ({error})",
+                    outcome.key, self.origin
+                );
+                state.fenced.get_or_insert(reason.clone());
+                Some(fenced_error(&reason))
+            }
+            Err(GroupFailure::Failed(error)) => {
+                if conditional && outcome.key == state.next_key {
+                    if state.ambiguous.len() == MAX_AMBIGUOUS_PUTS {
+                        state.ambiguous.remove(0);
+                    }
+                    state.ambiguous.push(Arc::new(bytes));
+                }
+                Some(error)
+            }
+        };
+        if let Some(e) = failure {
+            let (kind, message) = match &e {
+                KoshaError::Io(io) => (io.kind(), io.to_string()),
+                other => (std::io::ErrorKind::Other, other.to_string()),
+            };
+            for record in &batch {
+                state.failed.insert(record.lsn, (kind, message.clone()));
             }
         }
         state.resolved_through = state.resolved_through.max(last);
@@ -540,6 +652,68 @@ impl WalWriter {
         state.leader_active = false;
         self.wake.notify_all();
         state
+    }
+
+    /// Create the group at `key`. A conflict is this writer's own earlier
+    /// put whose reply was lost when the stored bytes equal a remembered
+    /// failed attempt: that file is adopted and the group retries at the
+    /// key after it. Any other conflict means another writer owns the key.
+    fn persist_conditional(
+        &self,
+        key: u64,
+        bytes: &[u8],
+        ambiguous: &[Arc<Vec<u8>>],
+    ) -> GroupOutcome {
+        let error = match self.store.append_batch(key, bytes) {
+            Ok(()) => {
+                return GroupOutcome {
+                    key,
+                    adopted: None,
+                    result: Ok(()),
+                }
+            }
+            Err(error) if is_conflict(&error) => error,
+            Err(error) => {
+                return GroupOutcome {
+                    key,
+                    adopted: None,
+                    result: Err(GroupFailure::Failed(error)),
+                }
+            }
+        };
+        let stored = if ambiguous.is_empty() {
+            None
+        } else {
+            self.store.read(key).ok()
+        };
+        let decoded = stored
+            .filter(|stored| ambiguous.iter().any(|attempt| **attempt == *stored))
+            .and_then(|stored| decode_frames(&stored, key).ok())
+            .filter(|decoded| !decoded.torn);
+        let Some(decoded) = decoded else {
+            return GroupOutcome {
+                key,
+                adopted: None,
+                result: Err(GroupFailure::Lost(error)),
+            };
+        };
+        let high = decoded.records.last().map_or(key, |(lsn, _)| *lsn);
+        let locations = decoded
+            .records
+            .into_iter()
+            .map(|(lsn, record)| (lsn, record.namespace))
+            .collect();
+        let retry = high + 1;
+        let result = match self.store.append_batch(retry, bytes) {
+            Ok(()) => Ok(()),
+            Err(error) if is_conflict(&error) => Err(GroupFailure::Lost(error)),
+            Err(error) => Err(GroupFailure::Failed(error)),
+        };
+        GroupOutcome {
+            key: retry,
+            adopted: Some((key, high, locations)),
+            result,
+        }
     }
 
     /// Explicit administrative reset. Normal flushes use `clear_through`
@@ -576,6 +750,39 @@ impl WalWriter {
     fn pending_len(&self) -> usize {
         self.state.lock().unwrap().pending.len()
     }
+}
+
+/// An earlier put of this writer that landed although it reported a
+/// failure: `(key, highest LSN, (lsn, namespace) of each record)`.
+type AdoptedFile = (u64, u64, Vec<(u64, NamespaceId)>);
+
+/// Result of persisting one group: the key it was written (or tried) at,
+/// and an [`AdoptedFile`] found on the way.
+struct GroupOutcome {
+    key: u64,
+    adopted: Option<AdoptedFile>,
+    result: Result<(), GroupFailure>,
+}
+
+enum GroupFailure {
+    /// The writer was already fenced.
+    Fenced(String),
+    /// Another writer owns the key: fence this one.
+    Lost(KoshaError),
+    /// The put failed (or its outcome is unknown); the key is retried.
+    Failed(KoshaError),
+}
+
+fn is_conflict(error: &KoshaError) -> bool {
+    matches!(error, KoshaError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists)
+}
+
+fn fenced_error(reason: &str) -> KoshaError {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("WAL writer fenced, restart to re-read the stream: {reason}"),
+    )
+    .into()
 }
 
 struct Recovered {

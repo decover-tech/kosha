@@ -109,7 +109,10 @@ Consequences worth knowing:
   Sizing the cache means choosing instance types in the `NodePool`.
 - **The cache survives pod restarts, not node replacement.** Contents are
   rebuildable from the Postgres manifest + S3 segments, so a Karpenter node
-  swap costs a cold hydration, not data.
+  swap costs a cold hydration, not data. The exception is the default local
+  WAL (`data_dir/_wal`): acknowledged but unflushed writes are lost with the
+  node. Set `KOSHA_WAL_MODE=s3` on the ingest Deployment to keep the WAL in
+  the bucket instead (see the root README, "S3 WAL").
 - **Prod needs the same pool before it deploys.** These constraints live in
   `base/`, so `k8s/prod` inherits them; without the label and taint on the
   prod cluster, the pod sits `Pending` forever.

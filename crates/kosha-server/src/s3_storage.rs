@@ -22,7 +22,7 @@ use crate::segment_commit;
 /// Join a configured key prefix with a logical (unprefixed) path, the same
 /// way for every call site — `S3Storage::s3_key` and the concurrent fetch
 /// path in `read_many` both delegate here so they can't drift apart.
-fn join_s3_key(prefix: &str, path: &str) -> String {
+pub(crate) fn join_s3_key(prefix: &str, path: &str) -> String {
     let path = path.trim_start_matches('/');
     if prefix.is_empty() {
         path.to_string()
@@ -162,6 +162,10 @@ impl S3Storage {
 
     pub fn prefix(&self) -> &str {
         &self.prefix
+    }
+
+    pub fn client(&self) -> &aws_sdk_s3::Client {
+        &self.client
     }
 
     pub fn s3_key(&self, path: &str) -> String {

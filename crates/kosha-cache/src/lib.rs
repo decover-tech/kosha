@@ -92,7 +92,14 @@ impl Cache {
                 let Ok(meta) = entry.metadata() else {
                     continue;
                 };
-                if path == root.join("_wal") {
+                // The WAL and a local WAL kept after moving it to S3
+                // (`_wal.migrated-*`) are not cache content.
+                if dir == root
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name == "_wal" || name.starts_with("_wal.migrated-"))
+                {
                     continue;
                 }
                 if meta.is_dir() {
@@ -607,8 +614,11 @@ mod tests {
         fs::create_dir_all(dir.join("_wal")).unwrap();
         fs::write(dir.join("_wal/sequence"), b"100").unwrap();
         fs::write(dir.join("_wal/record.wal"), [1u8; 100]).unwrap();
+        fs::create_dir_all(dir.join("_wal.migrated-1")).unwrap();
+        fs::write(dir.join("_wal.migrated-1/record.wal"), [2u8; 100]).unwrap();
         let cache = Cache::with_max_bytes(dir.clone(), Some(1));
         cache.put_bytes("ns/seg/large.bin", &[0u8; 10]).unwrap();
+        assert!(dir.join("_wal.migrated-1/record.wal").exists());
         assert_eq!(fs::read(dir.join("_wal/sequence")).unwrap(), b"100");
         assert_eq!(
             fs::read(dir.join("_wal/record.wal")).unwrap(),
