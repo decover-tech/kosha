@@ -157,6 +157,7 @@ fn mk_query(text: &str, knn: Option<KnnQuery>) -> SearchQuery {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
         source_includes: None,
         source_excludes: None,
         rank: None,

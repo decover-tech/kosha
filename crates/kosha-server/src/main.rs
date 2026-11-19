@@ -1483,6 +1483,7 @@ impl AppState {
                 operator: None,
                 no_cache: None,
                 collapse: None,
+                limit_per: None,
                 source_includes: None,
                 source_excludes: None,
                 rank: None,
@@ -4966,6 +4967,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
         source_includes: None,
         source_excludes: None,
         rank: None,
@@ -7132,6 +7134,69 @@ mod tests {
     }
 
     #[test]
+    fn limit_per_diversifies_over_http() {
+        // Issue #211: one author holds 20 of 26 matches and all the best
+        // ones; `limit_per` keeps the page full with at most 2 of them,
+        // and is part of the result-cache key.
+        let state = test_state();
+        let ns = NamespaceId("limitns".into());
+        let mut docs = Vec::new();
+        for i in 0..20 {
+            docs.push(Document {
+                id: DocumentId(format!("dom-{i:02}")),
+                fields: vec![
+                    Field::text("text", "breach breach"),
+                    Field::keyword("author", "dom"),
+                ],
+            });
+        }
+        for i in 0..6 {
+            docs.push(Document {
+                id: DocumentId(format!("other-{i}")),
+                fields: vec![
+                    Field::text("text", "breach of a much longer contract text"),
+                    Field::keyword("author", format!("author{i}")),
+                ],
+            });
+        }
+        state.indexer.index_documents(ns.clone(), docs).unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |extra: &str| {
+            let body = format!(
+                r#"{{"namespace":"limitns","query_text":"breach","max_results":5{extra}}}"#
+            );
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let doms = |resp: &str| -> (usize, usize) {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let hits = v["results"].as_array().unwrap();
+            let dom = hits
+                .iter()
+                .filter(|h| h["doc_id"].as_str().unwrap().starts_with("dom-"))
+                .count();
+            assert_eq!(v["total_hits"], 26, "counted before the cap: {v}");
+            (hits.len(), dom)
+        };
+        // Uncapped first, so a cache keyed without limit_per would serve it.
+        assert_eq!(doms(&post("")), (5, 5));
+        let capped = r#","limit_per":{"field":"author","max":2}"#;
+        assert_eq!(doms(&post(capped)), (5, 2));
+        assert_eq!(doms(&post(capped)), (5, 2));
+        for bad in [
+            r#","limit_per":{"field":"author","max":0}"#,
+            r#","limit_per":{"field":"author"}"#,
+            r#","limit_per":{"field":"author","max":2},"collapse":{"field":"author"}"#,
+        ] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+    }
+
+    #[test]
     fn hybrid_search_fuses_with_rrf_over_http() {
         // Issue #228: `rank.rrf` over HTTP — fused score plus per-retriever
         // ranks in the response, vector-only hits kept (#250), parameters
@@ -8489,6 +8554,7 @@ mod tests {
             operator: None,
             no_cache: None,
             collapse: None,
+            limit_per: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
@@ -8630,6 +8696,7 @@ mod tests {
             operator: None,
             no_cache: None,
             collapse: None,
+            limit_per: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
@@ -9856,6 +9923,7 @@ mod tests {
             operator: None,
             no_cache: None,
             collapse: None,
+            limit_per: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
@@ -9914,6 +9982,24 @@ mod tests {
         moded.query_text = "breach".into();
         moded.mode = Some(kosha_core::RetrievalMode::Hybrid);
         assert_ne!(canonical_query_for_cache(&moded).unwrap(), default_rrf);
+
+        // `limit_per` changes the page (issue #211), on both key shapes.
+        let limited = |max: usize, vector: bool| {
+            let mut q = if vector {
+                with_vec(vec![0.1_f32; 1024], 10)
+            } else {
+                base.clone()
+            };
+            q.limit_per = Some(kosha_core::LimitPerSpec {
+                field: "author".into(),
+                max,
+            });
+            canonical_query_for_cache(&q).unwrap()
+        };
+        assert_ne!(limited(2, false), canonical_query_for_cache(&base).unwrap());
+        assert_ne!(limited(2, false), limited(3, false));
+        assert_ne!(limited(2, true), a, "limit_per must be part of the kNN key");
+        assert_ne!(limited(2, true), limited(3, true));
 
         // The whole point: no raw embedding in the key.
         assert!(

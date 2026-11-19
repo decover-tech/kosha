@@ -1540,6 +1540,24 @@ pub struct SearchQuery {
     /// `total_hits` still counts matching documents, not groups.
     #[serde(default)]
     pub collapse: Option<CollapseSpec>,
+    /// Result diversification (issue #211): at most `max` hits per distinct
+    /// value of `field`, applied while the result list is collected, so the
+    /// page is filled from the next-best groups rather than cut short.
+    /// `collapse` is the `max: 1` special case with one difference:
+    /// documents with no value for the field are never capped here.
+    ///
+    /// The cap is a function of the result order alone: a hit is kept when
+    /// fewer than `max` hits of its group rank above it. A `search_after`
+    /// cursor therefore needs no extra state: each page is the same capped
+    /// list resumed after the cursor, so a document appears at most once
+    /// and a group spent on earlier pages is never refilled.
+    ///
+    /// `total_hits` (and aggregations) count matching documents before the
+    /// cap, as with `collapse`. A pure kNN request is the exception it
+    /// already was: there `total_hits` is the size of the returned
+    /// neighbour set, which is the diversified one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_per: Option<LimitPerSpec>,
     /// Return only these stored fields with each hit (OpenSearch
     /// `_source.includes`). `None` returns every field.
     #[serde(default)]
@@ -1641,6 +1659,17 @@ pub struct CollapseSpec {
     pub field: String,
 }
 
+/// See `SearchQuery.limit_per`. JSON: `"limit_per": {"field": "author", "max": 2}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitPerSpec {
+    /// A keyword (or other filterable) field. Documents without a value
+    /// for it are not capped.
+    pub field: String,
+    /// Hits allowed per distinct value; must be >= 1.
+    pub max: usize,
+}
+
 impl SearchQuery {
     /// Request-level checks that do not need any segment: currently the
     /// BM25 parameter ranges. An `Err` is a client error (HTTP 400).
@@ -1665,6 +1694,26 @@ impl SearchQuery {
                         "match_phrase field {name:?}: boosts and field patterns are not supported"
                     )));
                 }
+            }
+        }
+        if let Some(ref limit) = self.limit_per {
+            if limit.max == 0 {
+                return Err(KoshaError::InvalidQuery(
+                    "limit_per.max must be >= 1".into(),
+                ));
+            }
+            let field = limit.field.trim();
+            if field.is_empty() || field == "_id" || field == "_score" {
+                return Err(KoshaError::InvalidQuery(format!(
+                    "limit_per.field must name a stored keyword field, not {:?}",
+                    limit.field
+                )));
+            }
+            if self.collapse.is_some() {
+                return Err(KoshaError::InvalidQuery(
+                    "collapse and limit_per cannot be combined; collapse is limit_per with max 1"
+                        .into(),
+                ));
             }
         }
         let has_lexical = self.has_lexical_query();
@@ -1809,10 +1858,12 @@ impl SearchQuery {
     }
 
     /// Whether answering needs a segment's filter columns (`filters.bin`):
-    /// any filter, any aggregation, a collapse, or a sort on a stored field.
+    /// any filter, any aggregation, a collapse or `limit_per`, or a sort on a
+    /// stored field.
     pub fn needs_filter_columns(&self) -> bool {
         self.filter.is_some()
             || self.collapse.is_some()
+            || self.limit_per.is_some()
             || self.knn.as_ref().is_some_and(|k| k.filter.is_some())
             || !self.aggs.is_empty()
             || self.sort.iter().any(|spec| {

@@ -574,6 +574,7 @@ fn build_search_query(
         operator: or.then_some(kosha_core::QueryOperator::Or),
         no_cache: None,
         collapse: None,
+        limit_per: None,
         source_includes: None,
         source_excludes: None,
         rank: None,

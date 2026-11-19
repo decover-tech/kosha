@@ -294,6 +294,17 @@ message SearchRequest {
   // ["title^2", "content"]. Scores sum boost x per-field BM25. Empty = the
   // combined index of every Text field; "_all" names it explicitly.
   repeated string fields = 16;
+
+  // At most `max` hits per distinct value of a keyword field, applied while
+  // collecting results (the page stays full). HTTP:
+  // "limit_per": {"field": "author", "max": 2}. total_hits counts matches
+  // before the cap.
+  optional LimitPer limit_per = 17;
+}
+
+message LimitPer {
+  string field = 1;
+  int32 max = 2;  // >= 1
 }
 
 enum RetrievalMode {

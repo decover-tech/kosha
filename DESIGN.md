@@ -412,6 +412,19 @@ true in practice since ES refresh intervals are already tuned up for indexing th
    `knn.filter` to the vector one only. `total_hits` and aggregations cover the lexical matches
    plus the vector window; `from`/`sort`/`collapse`/`search_after` apply within the fused list,
    which is at most `rank_window_size` long. Each hit carries its per-retriever ranks.
+   **Diversification** (`limit_per: {field, max}`, issue #211) caps hits per distinct value of a
+   keyword field. Whether a hit survives depends only on the result order — fewer than `max`
+   hits of its group rank above it — so it is decided while collecting, not by post-filtering a
+   page, and a `search_after` cursor needs no cap state of its own: every page recomputes the
+   same capped list and resumes it after the cursor. Each segment caps its own ordered hits
+   first (a hit in the namespace's capped list always survives its segment's cap, since no more
+   of its group can rank above it inside one segment than across all of them), cuts to
+   `from + max_results` when there is no cursor, and the reduce step caps the merged list again.
+   Under a cursor a segment does not drop hits before it: those are what use up a group's cap
+   namespace-wide. Hybrid requests diversify each retriever's list before its window cut, so the
+   fused list holds at least `rank_window_size` capped hits; kNN segments probe up to
+   `num_candidates` instead of `k` so the cap has neighbours to choose from. `total_hits` counts
+   matches before the cap, as with `collapse` (which is the `max: 1` case and the same code).
 6. **Rerank hook**: an optional, pluggable cross-encoder rerank stage (Cohere today) runs on the
    fused top-N before results return — same role as `ChunkGenerator.__re_rank`.
 7. **Cursor**: response includes per-mode (lexical/semantic) cursor state (last score + doc id) so

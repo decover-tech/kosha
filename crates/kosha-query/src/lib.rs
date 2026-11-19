@@ -2454,9 +2454,11 @@ impl Searcher {
                 // WAND keeps the best `k` by score and nothing else. Any
                 // other order (a stored field, `_id`, `_score` ascending)
                 // needs candidates WAND has already discarded, as does a
-                // collapse, which looks past the first `k` for new groups.
+                // collapse or limit_per, which look past the first `k` for
+                // new groups.
                 && sort_is_default_ranking(&query.sort)
                 && query.collapse.is_none()
+                && query.limit_per.is_none()
                 && query.aggs.is_empty()
                 // The leapfrog join's gallop is only correct on strictly
                 // ascending postings. Every current writer format
@@ -3411,7 +3413,17 @@ impl Searcher {
                 None
             };
             let nothing_passes = knn_filter_set.as_ref().is_some_and(|set| set.is_empty());
-            let fetch_k = knn.k;
+            // Under `limit_per` the nearest `k` of a segment can all be one
+            // group, so the probe hands back everything it scored (up to
+            // `num_candidates`) and the cap picks the nearest `k` across
+            // groups from those. Diversity is found within the probed
+            // candidates: a corpus where one group crowds out the rest
+            // needs a larger `num_candidates`, as filtered kNN does.
+            let fetch_k = if query.limit_per.is_some() {
+                knn.k.max(knn.num_candidates)
+            } else {
+                knn.k
+            };
             // `knn.num_candidates` is a WHOLE-QUERY probe budget, not a
             // per-segment one. When the query layer managed to compute a
             // global cutoff, probe only centroids inside it; the union
@@ -3526,7 +3538,7 @@ impl Searcher {
                 .into_iter()
                 // Filters and tombstones were applied inside the probe.
                 .filter(|(doc_seq, _)| reader.doc_meta(*doc_seq).is_some())
-                .take(knn.k);
+                .take(fetch_k);
             if rrf.is_some() {
                 // Hybrid: fused by rank across the namespace, never here.
                 // Merging per segment is what issue #250 was about: a
@@ -3576,10 +3588,15 @@ impl Searcher {
             None => query.from.saturating_add(query.max_results),
         };
         let has_cursor = query.search_after.as_ref().is_some_and(|a| !a.is_empty());
+        let group_cap = GroupCap::for_query(query, sort_value_fields);
         // The page is ordered by score alone (ties by `_id`), with no
         // cursor to locate and no grouping: the cheap cut below applies.
         let score_ranked = rrf.is_some()
-            || (sort_is_default_ranking(&query.sort) && !has_cursor && query.collapse.is_none());
+            || (sort_is_default_ranking(&query.sort) && !has_cursor && group_cap.is_none());
+        // Hybrid under `limit_per`: each retriever's list is diversified
+        // before it is cut to the window, so the cut needs the group values
+        // and moves below, after the candidates carry them.
+        let diversified_rrf = rrf.is_some() && query.limit_per.is_some();
 
         // Hybrid: which vector hits also matched lexically (and so are
         // already counted in `total_hits` and the aggregations).
@@ -3588,7 +3605,7 @@ impl Searcher {
             .map(|(doc_seq, score)| (doc_seq, score, seg_hits.contains_key(&doc_seq)))
             .collect();
         let mut ranked: Vec<(f64, u32)> = seg_hits.into_iter().map(|(d, s)| (s, d)).collect();
-        if score_ranked {
+        if score_ranked && !diversified_rrf {
             // Cut to this segment's top `effective_k` by score *before*
             // paying the `DocumentId` allocation — the same discipline
             // `BoundedTopK` applies on the WAND paths.
@@ -3672,7 +3689,24 @@ impl Searcher {
             ));
         }
 
-        // ── Cut under a custom order, a cursor or a collapse ──
+        // ── Hybrid under limit_per: diversified per-retriever windows ──
+        // The same cut as the score-ranked one above, taken after the
+        // group cap: this segment's best `rank_window_size` lexical hits
+        // and nearest `min(k, window)` vector hits with at most `max` per
+        // group. A hit in the namespace's diversified window is always in
+        // its own segment's (fewer of its group can rank above it within
+        // one segment than across all of them).
+        if let (Some(params), Some(cap), true) = (rrf, group_cap, diversified_rrf) {
+            candidates.sort_by(by_score_then_id);
+            cap.apply(&mut candidates, |c| c);
+            candidates.truncate(params.rank_window_size);
+            let knn_k = query.knn.as_ref().map_or(0, |knn| knn.k);
+            vector_candidates.sort_by(|a, b| by_score_then_id(&a.0, &b.0));
+            cap.apply(&mut vector_candidates, |(c, _)| c);
+            vector_candidates.truncate(params.rank_window_size.min(knn_k));
+        }
+
+        // ── Cut under a custom order, a cursor or a group cap ──
         // The page is the first `effective_k` documents (or groups) under
         // one total order, and anything in the overall first `k` is also
         // in the first `k` of the segment it came from. So each segment
@@ -3683,19 +3717,29 @@ impl Searcher {
             let rank = |a: &HitCandidate, b: &HitCandidate| {
                 compare_candidates(a, b, &query.sort, sort_value_fields)
             };
+            // The group cap first, over everything this segment matched:
+            // whether a hit survives depends on the hits of its group that
+            // rank above it, including ones before a cursor. A hit in the
+            // namespace's capped list always survives its own segment's cap.
+            if let Some(cap) = group_cap {
+                candidates.sort_by(rank);
+                cap.apply(&mut candidates, |c| c);
+            }
             // A cursor over an explicit sort: nothing at or before it can
             // be on the page. (The legacy cursor under default ranking is
             // positional, so that case is left whole for the reduce step.)
-            let cursor_filtered = has_cursor && !query.sort.is_empty();
+            //
+            // Not under a group cap: a hit of this segment can survive the
+            // segment's cap and still be dropped by the namespace's, when
+            // other segments hold better hits of its group before the
+            // cursor. Those are what the reduce step counts against the
+            // cap, so the segment hands back its whole capped list.
+            let cursor_filtered = has_cursor && !query.sort.is_empty() && group_cap.is_none();
             if cursor_filtered {
                 let after = query.search_after.as_deref().unwrap_or_default();
                 candidates.retain(|cand| {
                     candidate_is_strictly_after_cursor(cand, after, &query.sort, sort_value_fields)
                 });
-            }
-            if let Some(ref collapse) = query.collapse {
-                candidates.sort_by(rank);
-                keep_first_of_each_group(&mut candidates, &collapse.field, sort_value_fields);
             }
             // After the cursor, `from` no longer applies (OpenSearch
             // semantics): only `max_results` documents can be returned.
@@ -3876,13 +3920,19 @@ impl Searcher {
         // not total hit count. Each candidate carries its own `Arc<SegmentReader>`
         // clone so the page can materialize after the segment loop finishes.
         // Stored fields whose values candidates must carry: the sort keys,
-        // plus the collapse field so hits can be grouped by it.
+        // plus the collapse / limit_per field so hits can be grouped by it.
         let mut sort_value_fields = sort_fields_needing_values(&query.sort);
-        if let Some(ref collapse) = query.collapse {
-            if !sort_value_fields.contains(&collapse.field) {
-                sort_value_fields.push(collapse.field.clone());
+        let group_field = query
+            .collapse
+            .as_ref()
+            .map(|c| &c.field)
+            .or(query.limit_per.as_ref().map(|l| &l.field));
+        if let Some(field) = group_field {
+            if !sort_value_fields.contains(field) {
+                sort_value_fields.push(field.clone());
             }
         }
+        let group_cap = GroupCap::for_query(query, &sort_value_fields);
 
         // Segments are independent until this reduce step, and opening
         // (I/O + parse) plus BM25/kNN scoring is what dominates wall-clock
@@ -4050,6 +4100,7 @@ impl Searcher {
                 vector_candidates,
                 params,
                 knn_k,
+                group_cap.filter(|_| query.limit_per.is_some()),
             );
             candidates = fused.candidates;
             // A hit is a document matching the lexical query, or one in the
@@ -4071,14 +4122,18 @@ impl Searcher {
         // to `k` per segment: keep the nearest `k` overall and report that
         // many. The sum of the per-segment counts (`k` times the number of
         // segments) said nothing about the query.
+        //
+        // Under `limit_per` that is the nearest `k` with at most `max` per
+        // group: segments probed deeper than `k` for this (see
+        // `score_segment`), and the cap is taken before the cut so the set
+        // stays `k` long when the probe found enough groups.
         if let Some(knn) = query.knn.as_ref().filter(|_| query.is_pure_knn()) {
+            if let Some(cap) = group_cap.filter(|_| query.limit_per.is_some()) {
+                candidates.sort_by(by_score_then_id);
+                cap.apply(&mut candidates, |c| c);
+            }
             if candidates.len() > knn.k {
-                candidates.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
-                });
+                candidates.sort_by(by_score_then_id);
                 candidates.truncate(knn.k);
             }
             total_hits = candidates.len();
@@ -4089,13 +4144,16 @@ impl Searcher {
             compare_candidates(a, b, &query.sort, &sort_value_fields)
         };
 
-        // ── collapse: the best hit of each group ──
-        // Each segment already kept one hit per group; the same group can
-        // still arrive from several segments, so order everything and keep
-        // the first of each again.
-        let collapsed = if let Some(ref collapse) = query.collapse {
+        // ── collapse / limit_per: at most `max` hits per group ──
+        // Each segment already capped its own hits; the same group can
+        // still arrive from several segments, so order everything and cap
+        // again. This runs before the cursor is located, over the same
+        // candidates on every page, so the capped list a `search_after`
+        // cursor resumes is the one the earlier pages were cut from: no
+        // document repeats and a spent group is never refilled.
+        let collapsed = if let Some(cap) = group_cap {
             candidates.sort_by(sort_cmp);
-            keep_first_of_each_group(&mut candidates, &collapse.field, &sort_value_fields);
+            cap.apply(&mut candidates, |c| c);
             true
         } else {
             false
@@ -4844,22 +4902,31 @@ struct FusedLists {
 /// to its window before ranks are assigned. The vector window is
 /// `min(k, rank_window_size)`: `knn.k` is how many neighbours the vector
 /// retriever returns, as in Elasticsearch.
+///
+/// Under `limit_per` (`group_cap`) each list is diversified before its cut:
+/// the lexical window is the best `rank_window_size` hits with at most
+/// `max` per group, and ranks are positions in those diversified lists.
+/// The fused list then holds at least as many hits per group as the
+/// lexical window does, so capping it again cannot leave it shorter than
+/// that window.
 fn rrf_fuse(
     mut lexical: Vec<HitCandidate>,
     mut vector: Vec<(HitCandidate, bool)>,
     params: RrfParams,
     knn_k: usize,
+    group_cap: Option<GroupCap>,
 ) -> FusedLists {
-    let by_score = |a: &HitCandidate, b: &HitCandidate| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
-    };
+    let by_score = by_score_then_id;
     let window = params.rank_window_size;
     lexical.sort_by(by_score);
+    if let Some(cap) = group_cap {
+        cap.apply(&mut lexical, |c| c);
+    }
     lexical.truncate(window);
     vector.sort_by(|a, b| by_score(&a.0, &b.0));
+    if let Some(cap) = group_cap {
+        cap.apply(&mut vector, |(c, _)| c);
+    }
     vector.truncate(window.min(knn_k));
 
     let constant = f64::from(params.rank_constant);
@@ -5099,6 +5166,15 @@ fn sort_is_default_ranking(sort: &[SortSpec]) -> bool {
     )
 }
 
+/// Score descending, `_id` ascending: default ranking, and the order each
+/// retriever's list is ranked in before fusion.
+fn by_score_then_id(a: &HitCandidate, b: &HitCandidate) -> std::cmp::Ordering {
+    b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
+}
+
 /// The order of the result list: the request's sort keys, or score
 /// descending when there are none, with `_id` ascending as the final
 /// tie-break either way. One function for every place that ranks
@@ -5119,25 +5195,62 @@ fn compare_candidates(
     }
 }
 
-/// Keep the first candidate of each distinct `field` value. `candidates`
-/// must already be in result order, so "first" is "best". Documents with no
-/// value for the field form one group, as in OpenSearch.
-fn keep_first_of_each_group(
-    candidates: &mut Vec<HitCandidate>,
-    field: &str,
-    sort_value_fields: &[String],
-) {
-    let Some(index) = sort_value_fields.iter().position(|f| f == field) else {
-        return;
-    };
-    let mut seen_text: HashSet<String> = HashSet::new();
-    let mut seen_number: HashSet<u64> = HashSet::new();
-    let mut seen_missing = false;
-    candidates.retain(|cand| match cand.sort_values.get(index) {
-        Some(SortValue::Text(value)) => seen_text.insert(value.clone()),
-        Some(SortValue::Number(value)) => seen_number.insert(value.to_bits()),
-        Some(SortValue::Missing) | None => !std::mem::replace(&mut seen_missing, true),
-    });
+/// A per-group cap on the result list: `collapse` (one hit per group) or
+/// `limit_per` (`max` hits per group). Both are decided by result order
+/// alone — a hit survives when fewer than `max` hits of its group rank
+/// above it — so the capped list is a pure function of the ordered
+/// candidates, and a `search_after` cursor can resume it without carrying
+/// any per-group state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroupCap {
+    /// Index of the group field in the candidates' `sort_values`.
+    index: usize,
+    max: usize,
+    /// Whether documents with no value for the field form one capped group
+    /// (`collapse`, as in OpenSearch) or are left uncapped (`limit_per`:
+    /// "at most `max` per value", and a missing value is no value).
+    cap_missing: bool,
+}
+
+impl GroupCap {
+    /// The request's cap, if any. `sort_value_fields` must already include
+    /// the group field (see `search_inner`).
+    fn for_query(query: &SearchQuery, sort_value_fields: &[String]) -> Option<Self> {
+        let (field, max, cap_missing) = match (&query.collapse, &query.limit_per) {
+            (Some(collapse), _) => (collapse.field.as_str(), 1, true),
+            (None, Some(limit)) => (limit.field.as_str(), limit.max.max(1), false),
+            (None, None) => return None,
+        };
+        let index = sort_value_fields.iter().position(|f| f == field)?;
+        Some(Self {
+            index,
+            max,
+            cap_missing,
+        })
+    }
+
+    /// Drop every item that has `max` items of its group ahead of it.
+    /// `items` must already be in result order.
+    fn apply<T>(&self, items: &mut Vec<T>, candidate: impl Fn(&T) -> &HitCandidate) {
+        #[derive(PartialEq, Eq, Hash)]
+        enum Group {
+            Text(String),
+            Number(u64),
+            Missing,
+        }
+        let mut seen: HashMap<Group, usize> = HashMap::new();
+        items.retain(|item| {
+            let group = match candidate(item).sort_values.get(self.index) {
+                Some(SortValue::Text(value)) => Group::Text(value.clone()),
+                Some(SortValue::Number(value)) => Group::Number(value.to_bits()),
+                Some(SortValue::Missing) | None if !self.cap_missing => return true,
+                Some(SortValue::Missing) | None => Group::Missing,
+            };
+            let count = seen.entry(group).or_insert(0);
+            *count += 1;
+            *count <= self.max
+        });
+    }
 }
 
 // ─── Aggregation functions ──────────────────────────────────────────────────
@@ -5635,6 +5748,7 @@ mod tests {
             operator: None,
             no_cache: None,
             collapse: None,
+            limit_per: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
@@ -7709,6 +7823,7 @@ mod tests {
             operator: None,
             no_cache: None,
             collapse: None,
+            limit_per: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
@@ -10294,6 +10409,7 @@ mod tests {
                     operator: None,
                     no_cache: None,
                     collapse: None,
+                    limit_per: None,
                     source_includes: None,
                     source_excludes: None,
                     rank: None,
@@ -10403,6 +10519,7 @@ mod tests {
                     operator: None,
                     no_cache: None,
                     collapse: None,
+                    limit_per: None,
                     source_includes: None,
                     source_excludes: None,
                     rank: None,
@@ -10487,6 +10604,7 @@ mod tests {
                     operator: None,
                     no_cache: None,
                     collapse: None,
+                    limit_per: None,
                     source_includes: None,
                     source_excludes: None,
                     rank: None,
@@ -10522,6 +10640,7 @@ mod tests {
                     operator: None,
                     no_cache: None,
                     collapse: None,
+                    limit_per: None,
                     source_includes: None,
                     source_excludes: None,
                     rank: None,
@@ -10809,6 +10928,7 @@ mod tests {
             operator: None,
             no_cache: None,
             collapse: None,
+            limit_per: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
@@ -10902,6 +11022,7 @@ mod tests {
             operator: None,
             no_cache: None,
             collapse: None,
+            limit_per: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
@@ -10986,6 +11107,7 @@ mod tests {
             operator: None,
             no_cache: None,
             collapse: None,
+            limit_per: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
@@ -13428,5 +13550,479 @@ mod field_tests {
         )
         .unwrap();
         assert!(q.match_phrase.unwrap().restricted_fields().is_none());
+    }
+}
+
+/// Result diversification (`limit_per`, issue #211).
+#[cfg(test)]
+mod limit_per_tests {
+    use super::*;
+    use kosha_core::{DocumentId, Field, KnnQuery, LimitPerSpec, ManifestEntry, SegmentId};
+    use kosha_segment::SegmentWriter;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    /// Documents per dominant author.
+    const DOMINANT: usize = 100;
+
+    struct Doc {
+        id: String,
+        text: String,
+        author: Option<String>,
+        rank: i64,
+        angle: f32,
+    }
+
+    fn unit(angle: f32) -> Vec<f32> {
+        vec![angle.cos(), angle.sin(), 0.0, 0.0]
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-limit-per-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn ns() -> NamespaceId {
+        NamespaceId("ns".into())
+    }
+
+    /// One author ("dom") holds `DOMINANT` matches that outscore everything
+    /// else, on the lexical side (short, term-dense) and the vector side
+    /// (nearest the query vector). Thirty other authors hold three weaker
+    /// matches each, and five matches have no author at all. Documents are
+    /// dealt round-robin into three segments so every group spans segments.
+    fn corpus() -> Vec<Doc> {
+        let mut docs = Vec::new();
+        for i in 0..DOMINANT {
+            docs.push(Doc {
+                id: format!("dom-{i:03}"),
+                text: "breach breach breach".into(),
+                author: Some("dom".into()),
+                rank: i as i64,
+                angle: 0.001 * i as f32,
+            });
+        }
+        for a in 0..30 {
+            for j in 0..3 {
+                docs.push(Doc {
+                    id: format!("a{a:02}-{j}"),
+                    text: format!("breach {}", "padding ".repeat(2 + a + j)),
+                    author: Some(format!("author{a:02}")),
+                    rank: 1000 + (a * 3 + j) as i64,
+                    angle: 0.3 + 0.01 * (a * 3 + j) as f32,
+                });
+            }
+        }
+        for j in 0..5 {
+            docs.push(Doc {
+                id: format!("anon-{j}"),
+                text: format!("breach {}", "padding ".repeat(3 + j)),
+                author: None,
+                rank: 2000 + j as i64,
+                angle: 0.25 + 0.001 * j as f32,
+            });
+        }
+        docs
+    }
+
+    /// Writes `docs` round-robin into `segments` segments. Returns the
+    /// manifest and each doc's `(segment, doc_seq)` for tombstones.
+    fn write(
+        dir: &Path,
+        docs: &[Doc],
+        segments: usize,
+    ) -> (Manifest, HashMap<String, (SegmentId, u32)>) {
+        let mut manifest = Manifest {
+            version: 1,
+            segments: Vec::new(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+        };
+        let mut locations = HashMap::new();
+        for s in 0..segments {
+            let id = SegmentId(format!("seg-{s}"));
+            let mut w = SegmentWriter::new(id.clone(), dir.join("ns").join(&id.0));
+            let mut count = 0u32;
+            for d in docs.iter().skip(s).step_by(segments) {
+                let mut fields = vec![
+                    Field::text("content", d.text.clone()),
+                    Field::integer("rank", d.rank),
+                    Field::vector("emb", unit(d.angle)),
+                ];
+                if let Some(ref author) = d.author {
+                    fields.push(Field::keyword("author", author.clone()));
+                }
+                w.add_document(DocumentId(d.id.clone()), fields);
+                locations.insert(d.id.clone(), (id.clone(), count));
+                count += 1;
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id: id,
+                doc_count: count,
+            });
+        }
+        (manifest, locations)
+    }
+
+    fn query(json: serde_json::Value) -> SearchQuery {
+        let mut q: SearchQuery = serde_json::from_value(json).unwrap();
+        q.exact_total_hits = Some(true);
+        q
+    }
+
+    fn limit(max: usize) -> Option<LimitPerSpec> {
+        Some(LimitPerSpec {
+            field: "author".into(),
+            max,
+        })
+    }
+
+    fn knn(k: usize) -> Option<KnnQuery> {
+        Some(KnnQuery {
+            field: "emb".into(),
+            vector: unit(0.0),
+            k,
+            // Exhaustive probe: the tests compare diversification, not
+            // ANN recall.
+            num_candidates: 100_000,
+            filter: None,
+        })
+    }
+
+    fn author(d: &ScoredDocument) -> Option<&str> {
+        d.fields
+            .iter()
+            .find(|f| f.name == "author")
+            .map(|f| f.value.as_str())
+    }
+
+    fn ids(r: &SearchResult) -> Vec<String> {
+        r.results.iter().map(|d| d.doc_id.0.clone()).collect()
+    }
+
+    fn count_author(r: &[ScoredDocument], name: &str) -> usize {
+        r.iter().filter(|d| author(d) == Some(name)).count()
+    }
+
+    /// The reference: take the uncapped list in result order and keep a
+    /// hit while fewer than `max` of its author rank above it.
+    fn reference_cap(all: &[ScoredDocument], max: usize) -> Vec<String> {
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        all.iter()
+            .filter(|d| match author(d) {
+                None => true,
+                Some(a) => {
+                    let n = seen.entry(a).or_insert(0);
+                    *n += 1;
+                    *n <= max
+                }
+            })
+            .map(|d| d.doc_id.0.clone())
+            .collect()
+    }
+
+    /// Walk every page of `q` with `search_after` on its sort keys.
+    fn walk_pages(
+        searcher: &Searcher,
+        manifest: &Manifest,
+        q: &SearchQuery,
+    ) -> Vec<ScoredDocument> {
+        let mut out = Vec::new();
+        let mut page = q.clone();
+        for _ in 0..1000 {
+            let r = searcher.search(&ns(), manifest, &page, None).unwrap();
+            if r.results.is_empty() {
+                return out;
+            }
+            let last = r.results.last().unwrap();
+            let mut cursor = Vec::new();
+            for spec in &q.sort {
+                for field in spec.fields.keys() {
+                    cursor.push(match field.as_str() {
+                        "_score" => last.score.to_string(),
+                        "_id" => last.doc_id.0.clone(),
+                        other => last
+                            .fields
+                            .iter()
+                            .find(|f| f.name == other)
+                            .map(|f| f.value.clone())
+                            .unwrap(),
+                    });
+                }
+            }
+            page.search_after = Some(cursor);
+            out.extend(r.results);
+        }
+        panic!("pagination did not terminate");
+    }
+
+    #[test]
+    fn bm25_page_is_full_with_at_most_max_per_value() {
+        let dir = scratch("bm25");
+        let (manifest, _) = write(&dir, &corpus(), 3);
+        let searcher = Searcher::new(dir.clone());
+
+        let plain = query(serde_json::json!({"query_text": "breach", "max_results": 10}));
+        let uncapped = searcher.search(&ns(), &manifest, &plain, None).unwrap();
+        assert_eq!(
+            count_author(&uncapped.results, "dom"),
+            10,
+            "fixture: dom dominates"
+        );
+
+        let mut capped = plain.clone();
+        capped.limit_per = limit(2);
+        let r = searcher.search(&ns(), &manifest, &capped, None).unwrap();
+        assert_eq!(r.results.len(), 10, "the page stays full: {:?}", ids(&r));
+        assert_eq!(count_author(&r.results, "dom"), 2, "{:?}", ids(&r));
+        for d in &r.results {
+            if let Some(a) = author(d) {
+                assert!(count_author(&r.results, a) <= 2, "{a}: {:?}", ids(&r));
+            }
+        }
+        // total_hits counts matching documents, before diversification.
+        assert_eq!(r.total_hits, uncapped.total_hits);
+        assert_eq!(r.total_hits, DOMINANT + 90 + 5);
+
+        // The page is exactly the capped full ranking's first ten.
+        let mut all = plain.clone();
+        all.max_results = 1000;
+        let all = searcher.search(&ns(), &manifest, &all, None).unwrap();
+        let expected = reference_cap(&all.results, 2);
+        assert_eq!(ids(&r), expected[..10]);
+
+        // `from` pages through the same capped list.
+        let mut second = capped.clone();
+        second.from = 10;
+        let r2 = searcher.search(&ns(), &manifest, &second, None).unwrap();
+        assert_eq!(ids(&r2), expected[10..20]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_after_never_repeats_a_document_or_refills_a_spent_group() {
+        let dir = scratch("cursor");
+        let (manifest, _) = write(&dir, &corpus(), 3);
+        let searcher = Searcher::new(dir.clone());
+        for sort in [
+            serde_json::json!([{"_score": {"order": "desc"}}, {"_id": {"order": "asc"}}]),
+            // A stored-field order: the per-segment cut takes the cursor
+            // path that is not positional.
+            serde_json::json!([{"rank": {"order": "asc"}}, {"_id": {"order": "asc"}}]),
+        ] {
+            let base = query(serde_json::json!({
+                "query_text": "breach",
+                "max_results": 1000,
+                "sort": sort,
+            }));
+            let all = searcher.search(&ns(), &manifest, &base, None).unwrap();
+            let expected = reference_cap(&all.results, 2);
+
+            let mut q = base.clone();
+            q.max_results = 7;
+            q.limit_per = limit(2);
+            let pages = walk_pages(&searcher, &manifest, &q);
+            let got: Vec<String> = pages.iter().map(|d| d.doc_id.0.clone()).collect();
+            let unique: HashSet<&String> = got.iter().collect();
+            assert_eq!(unique.len(), got.len(), "a document repeated: {got:?}");
+            assert_eq!(count_author(&pages, "dom"), 2, "dom refilled: {got:?}");
+            for a in 0..30 {
+                assert!(count_author(&pages, &format!("author{a:02}")) <= 2);
+            }
+            assert_eq!(got, expected, "sort {sort}");
+            // Every author group, the documents with no author included.
+            assert_eq!(got.len(), 2 + 30 * 2 + 5);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn documents_without_the_field_are_not_capped() {
+        let dir = scratch("missing");
+        let (manifest, _) = write(&dir, &corpus(), 2);
+        let searcher = Searcher::new(dir.clone());
+        let mut q = query(serde_json::json!({"query_text": "breach", "max_results": 1000}));
+        q.limit_per = limit(1);
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        let anon = r.results.iter().filter(|d| author(d).is_none()).count();
+        assert_eq!(anon, 5, "{:?}", ids(&r));
+        assert_eq!(r.results.len(), 1 + 30 + 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_documents_do_not_use_up_a_group() {
+        let dir = scratch("deleted");
+        let (manifest, locations) = write(&dir, &corpus(), 3);
+        let searcher = Searcher::new(dir.clone());
+        let mut q = query(serde_json::json!({"query_text": "breach", "max_results": 10}));
+        q.limit_per = limit(2);
+        let before = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        let first_dom = before
+            .results
+            .iter()
+            .find(|d| author(d) == Some("dom"))
+            .unwrap()
+            .doc_id
+            .0
+            .clone();
+        let (segment, seq) = locations[&first_dom].clone();
+        let tombstones = HashMap::from([(segment, HashSet::from([seq]))]);
+        let after = searcher
+            .search(&ns(), &manifest, &q, Some(&tombstones))
+            .unwrap();
+        assert_eq!(after.results.len(), 10);
+        assert_eq!(count_author(&after.results, "dom"), 2, "{:?}", ids(&after));
+        assert!(!ids(&after).contains(&first_dom));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn knn_set_is_k_long_and_diversified() {
+        let dir = scratch("knn");
+        let (manifest, _) = write(&dir, &corpus(), 3);
+        let searcher = Searcher::new(dir.clone());
+        let mut q = query(serde_json::json!({"query_text": "", "max_results": 10}));
+        q.knn = knn(10);
+        let uncapped = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert_eq!(count_author(&uncapped.results, "dom"), 10, "fixture");
+
+        q.limit_per = limit(2);
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert_eq!(r.results.len(), 10, "{:?}", ids(&r));
+        assert_eq!(count_author(&r.results, "dom"), 2, "{:?}", ids(&r));
+        // The two nearest dom vectors, then the nearest of everything else.
+        assert_eq!(&ids(&r)[..2], ["dom-000", "dom-001"]);
+        // A pure kNN request reports the size of its neighbour set.
+        assert_eq!(r.total_hits, 10);
+
+        // The capped set is the reference cap over the exhaustive ranking.
+        let mut all = q.clone();
+        all.limit_per = None;
+        all.max_results = 1000;
+        all.knn = knn(1000);
+        let all = searcher.search(&ns(), &manifest, &all, None).unwrap();
+        assert_eq!(ids(&r), reference_cap(&all.results, 2)[..10]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hybrid_fused_page_is_full_and_pages_with_search_after() {
+        let dir = scratch("hybrid");
+        let (manifest, _) = write(&dir, &corpus(), 3);
+        let searcher = Searcher::new(dir.clone());
+        let mut q = query(serde_json::json!({
+            "query_text": "breach",
+            "max_results": 10,
+            "rank": {"rrf": {"rank_window_size": 40}},
+        }));
+        q.knn = knn(40);
+        let uncapped = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert_eq!(count_author(&uncapped.results, "dom"), 10, "fixture");
+
+        q.limit_per = limit(2);
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert_eq!(r.results.len(), 10, "{:?}", ids(&r));
+        assert_eq!(count_author(&r.results, "dom"), 2, "{:?}", ids(&r));
+        // dom tops both retrievers, so its two hits are the fused top two,
+        // each ranked first or second by both lists.
+        for d in &r.results[..2] {
+            assert_eq!(author(d), Some("dom"));
+            let details = d.rank_details.as_ref().unwrap();
+            assert!(details.lexical_rank.unwrap() <= 2 && details.knn_rank.unwrap() <= 2);
+        }
+        // Ranks are positions in the diversified lists: no rank is beyond
+        // the window, and the lexical list held 40 distinct-enough hits.
+        let lexical_ranks: HashSet<u32> = r
+            .results
+            .iter()
+            .filter_map(|d| d.rank_details.as_ref()?.lexical_rank)
+            .collect();
+        assert!(lexical_ranks.iter().all(|&rank| rank <= 40));
+
+        // search_after over the fused order walks the whole capped window.
+        let mut paged = q.clone();
+        paged.max_results = 6;
+        paged.sort = serde_json::from_value(
+            serde_json::json!([{"_score": {"order": "desc"}}, {"_id": {"order": "asc"}}]),
+        )
+        .unwrap();
+        let pages = walk_pages(&searcher, &manifest, &paged);
+        let got: Vec<String> = pages.iter().map(|d| d.doc_id.0.clone()).collect();
+        let unique: HashSet<&String> = got.iter().collect();
+        assert_eq!(unique.len(), got.len(), "{got:?}");
+        assert_eq!(count_author(&pages, "dom"), 2, "{got:?}");
+        assert!(got.len() >= 40, "the window is filled: {}", got.len());
+        let mut whole = q.clone();
+        whole.max_results = 40;
+        let whole = searcher.search(&ns(), &manifest, &whole, None).unwrap();
+        assert_eq!(got[..40], ids(&whole)[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collapse_search_after_does_not_refill_a_group() {
+        let dir = scratch("collapse-cursor");
+        let (manifest, _) = write(&dir, &corpus(), 3);
+        let searcher = Searcher::new(dir.clone());
+        let mut q = query(serde_json::json!({
+            "query_text": "breach",
+            "max_results": 4,
+            "sort": [{"rank": {"order": "asc"}}, {"_id": {"order": "asc"}}],
+            "collapse": {"field": "author"},
+        }));
+        let pages = walk_pages(&searcher, &manifest, &q);
+        assert_eq!(count_author(&pages, "dom"), 1);
+        for a in 0..30 {
+            assert_eq!(count_author(&pages, &format!("author{a:02}")), 1);
+        }
+        // Collapse groups documents with no value into one.
+        assert_eq!(pages.len(), 1 + 30 + 1);
+        q.max_results = 1000;
+        let whole = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert_eq!(
+            pages.iter().map(|d| &d.doc_id).collect::<Vec<_>>(),
+            whole.results.iter().map(|d| &d.doc_id).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requests_are_validated() {
+        let bad = |json: serde_json::Value| {
+            let q: SearchQuery = serde_json::from_value(json).unwrap();
+            q.validate().unwrap_err().to_string()
+        };
+        assert!(bad(serde_json::json!({
+            "query_text": "x", "limit_per": {"field": "author", "max": 0}
+        }))
+        .contains("max"));
+        assert!(bad(serde_json::json!({
+            "query_text": "x", "limit_per": {"field": "_id", "max": 2}
+        }))
+        .contains("field"));
+        assert!(bad(serde_json::json!({
+            "query_text": "x",
+            "limit_per": {"field": "author", "max": 2},
+            "collapse": {"field": "author"}
+        }))
+        .contains("collapse"));
+        let unknown: Result<SearchQuery, _> = serde_json::from_value(serde_json::json!({
+            "query_text": "x", "limit_per": {"field": "author", "max": 2, "per": 1}
+        }));
+        assert!(unknown.is_err());
+        // Older requests (and cached keys) without the field still parse.
+        let q: SearchQuery =
+            serde_json::from_value(serde_json::json!({"query_text": "x"})).unwrap();
+        assert!(q.limit_per.is_none());
+        assert!(!serde_json::to_string(&q).unwrap().contains("limit_per"));
     }
 }
