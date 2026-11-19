@@ -1,3 +1,5 @@
+pub mod span_cache;
+
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -2090,6 +2092,14 @@ impl Drop for SegmentWriter {
 
 /// File name of the doc-vectors sidecar.
 pub const DOC_VECTORS_FILE: &str = "doc_vectors.bin";
+/// File name of the document store.
+pub const DOC_STORE_FILE: &str = "doc_store.bin";
+
+/// Whether a local file is present, non-empty and at least `complete_len`
+/// bytes long — the "whole file, not a torn write" check.
+fn file_is_complete(path: &Path, complete_len: u64) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.len() > 0 && m.len() >= complete_len)
+}
 /// Magic prefix of `doc_vectors.bin` ("KDV1", little-endian u32).
 pub const DOC_VECTORS_MAGIC: u32 = u32::from_le_bytes(*b"KDV1");
 
@@ -2125,101 +2135,225 @@ impl VectorStoreMode {
     }
 }
 
+/// How many bytes of `doc_vectors.bin` a header read asks for first. The
+/// header is 12 bytes per entry plus the field names; one probe of this
+/// size covers ~5k entries, and a larger header costs one more read of
+/// exactly the missing bytes (see [`doc_vectors_header_len`]).
+pub const DOC_VECTORS_HEADER_PROBE: u64 = 64 * 1024;
+
+/// Header of `doc_vectors.bin` parsed from a prefix of the file.
+struct DocVectorsHeader {
+    fields: Vec<String>,
+    entries: Vec<(u32, u32, u32)>,
+    offsets: Vec<u64>,
+    /// File length the header implies (end of the last vector).
+    file_len: u64,
+}
+
+/// Outcome of parsing a `doc_vectors.bin` prefix.
+enum HeaderParse {
+    /// The prefix ends inside the header; at least this many bytes are
+    /// needed.
+    Need(u64),
+    Done(DocVectorsHeader),
+}
+
+fn parse_doc_vectors_header(prefix: &[u8], what: &Path) -> Result<HeaderParse, KoshaError> {
+    let corrupt = |why: &str| KoshaError::CorruptSegment(format!("{}: {why}", what.display()));
+    let u32_at = |at: u64| -> Option<u32> {
+        let at = at as usize;
+        prefix
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let Some(magic) = u32_at(0) else {
+        return Ok(HeaderParse::Need(8));
+    };
+    if magic != DOC_VECTORS_MAGIC {
+        return Err(corrupt("bad magic"));
+    }
+    let Some(field_count) = u32_at(4) else {
+        return Ok(HeaderParse::Need(8));
+    };
+    let mut at: u64 = 8;
+    let mut fields = Vec::with_capacity((field_count as usize).min(1024));
+    for _ in 0..field_count {
+        let Some(len) = u32_at(at) else {
+            return Ok(HeaderParse::Need(at + 4));
+        };
+        let start = at + 4;
+        let end = start + len as u64;
+        let Some(name) = prefix.get(start as usize..end as usize) else {
+            return Ok(HeaderParse::Need(end));
+        };
+        fields.push(String::from_utf8_lossy(name).into_owned());
+        at = end;
+    }
+    let Some(entry_count) = u32_at(at) else {
+        return Ok(HeaderParse::Need(at + 4));
+    };
+    at += 4;
+    let header_len = at + entry_count as u64 * 12;
+    if (prefix.len() as u64) < header_len {
+        return Ok(HeaderParse::Need(header_len));
+    }
+    let mut entries = Vec::with_capacity(entry_count as usize);
+    let mut offsets = Vec::with_capacity(entry_count as usize);
+    let mut next = header_len;
+    let mut last_seq = 0u32;
+    for i in 0..entry_count as u64 {
+        let base = at + i * 12;
+        let (doc_seq, field_idx, dim) = (
+            u32_at(base).unwrap(),
+            u32_at(base + 4).unwrap(),
+            u32_at(base + 8).unwrap(),
+        );
+        if field_idx as usize >= fields.len() {
+            return Err(corrupt("entry names an unknown field"));
+        }
+        if doc_seq < last_seq {
+            return Err(corrupt("entries not sorted by doc_seq"));
+        }
+        last_seq = doc_seq;
+        entries.push((doc_seq, field_idx, dim));
+        offsets.push(next);
+        next += dim as u64 * 4;
+    }
+    Ok(HeaderParse::Done(DocVectorsHeader {
+        fields,
+        entries,
+        offsets,
+        file_len: next,
+    }))
+}
+
+/// How many leading bytes of `doc_vectors.bin` hold its header, given a
+/// prefix of the file: `Ok(Ok(len))` once the prefix contains the whole
+/// header (`len` may be shorter than the prefix), `Ok(Err(need))` when at
+/// least `need` bytes are required to find out. A remote reader fetches
+/// [`DOC_VECTORS_HEADER_PROBE`] bytes, then the rest if asked to.
+pub fn doc_vectors_header_len(prefix: &[u8]) -> Result<Result<u64, u64>, KoshaError> {
+    match parse_doc_vectors_header(prefix, Path::new(DOC_VECTORS_FILE))? {
+        HeaderParse::Need(n) => Ok(Err(n)),
+        HeaderParse::Done(h) => Ok(Ok(h.offsets.first().copied().unwrap_or(h.file_len))),
+    }
+}
+
 /// Parsed `doc_vectors.bin` header: field names, entries and where each
 /// entry's vector starts in the file. Vectors themselves are read on
-/// demand.
+/// demand, from the local file when it is whole, otherwise from the sparse
+/// span cache (#245, see [`span_cache`]).
 #[derive(Debug)]
 pub struct DocVectors {
-    path: PathBuf,
+    segment_dir: PathBuf,
     fields: Vec<String>,
     /// `(doc_seq, field_idx, dim)`, sorted by doc_seq.
     entries: Vec<(u32, u32, u32)>,
     /// Absolute byte offset of each entry's vector.
     offsets: Vec<u64>,
+    /// Length of the complete file.
+    file_len: u64,
 }
 
 impl DocVectors {
+    /// Open a whole local `doc_vectors.bin`, checking its length against
+    /// the header.
     pub fn open(path: PathBuf) -> Result<Self, KoshaError> {
         let corrupt = |why: &str| KoshaError::CorruptSegment(format!("{}: {why}", path.display()));
         let file_len = fs::metadata(&path)?.len();
-        let mut reader = std::io::BufReader::new(fs::File::open(&path)?);
-        let mut u32_buf = [0u8; 4];
-        let mut next_u32 = |r: &mut std::io::BufReader<fs::File>| -> Result<u32, KoshaError> {
-            r.read_exact(&mut u32_buf)
-                .map_err(|e| KoshaError::CorruptSegment(format!("truncated header: {e}")))?;
-            Ok(u32::from_le_bytes(u32_buf))
+        let mut file = fs::File::open(&path)?;
+        let mut prefix = Vec::new();
+        let mut want = DOC_VECTORS_HEADER_PROBE.min(file_len);
+        let header = loop {
+            if want > prefix.len() as u64 {
+                let mut more = vec![0u8; (want - prefix.len() as u64) as usize];
+                file.read_exact(&mut more)
+                    .map_err(|e| KoshaError::CorruptSegment(format!("truncated header: {e}")))?;
+                prefix.extend_from_slice(&more);
+            }
+            match parse_doc_vectors_header(&prefix, &path)? {
+                HeaderParse::Done(header) => break header,
+                HeaderParse::Need(n) if n > file_len || n <= prefix.len() as u64 => {
+                    return Err(corrupt("truncated header"));
+                }
+                HeaderParse::Need(n) => want = n,
+            }
         };
-        if next_u32(&mut reader)? != DOC_VECTORS_MAGIC {
-            return Err(corrupt("bad magic"));
-        }
-        let field_count = next_u32(&mut reader)? as usize;
-        let mut header_len: u64 = 8;
-        let mut fields = Vec::with_capacity(field_count.min(1024));
-        for _ in 0..field_count {
-            let len = next_u32(&mut reader)? as u64;
-            if len > file_len {
-                return Err(corrupt("field name length past end of file"));
-            }
-            let mut name = vec![0u8; len as usize];
-            reader
-                .read_exact(&mut name)
-                .map_err(|_| corrupt("truncated field name"))?;
-            fields.push(String::from_utf8_lossy(&name).into_owned());
-            header_len += 4 + len;
-        }
-        let entry_count = next_u32(&mut reader)? as u64;
-        header_len += 4;
-        if header_len + entry_count * 12 > file_len {
-            return Err(corrupt("entry table past end of file"));
-        }
-        let mut entries = Vec::with_capacity(entry_count as usize);
-        let mut offsets = Vec::with_capacity(entry_count as usize);
-        let mut next = header_len + entry_count * 12;
-        let mut last_seq = 0u32;
-        for _ in 0..entry_count {
-            let doc_seq = next_u32(&mut reader)?;
-            let field_idx = next_u32(&mut reader)?;
-            let dim = next_u32(&mut reader)?;
-            if field_idx as usize >= fields.len() {
-                return Err(corrupt("entry names an unknown field"));
-            }
-            if doc_seq < last_seq {
-                return Err(corrupt("entries not sorted by doc_seq"));
-            }
-            last_seq = doc_seq;
-            entries.push((doc_seq, field_idx, dim));
-            offsets.push(next);
-            next += dim as u64 * 4;
-        }
-        if next != file_len {
+        if header.file_len != file_len {
+            let header_len = header.offsets.first().copied().unwrap_or(header.file_len);
             return Err(corrupt(&format!(
                 "vector data is {} bytes, header says {}",
-                file_len.saturating_sub(header_len + entry_count * 12),
-                next - header_len - entry_count * 12
+                file_len.saturating_sub(header_len),
+                header.file_len - header_len
             )));
         }
-        Ok(Self {
-            path,
-            fields,
-            entries,
-            offsets,
+        let segment_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        Ok(Self::from_header(segment_dir, header))
+    }
+
+    /// Build from a cached prefix of the file (the sparse span cache's
+    /// header span). `Ok(None)` when the prefix ends inside the header.
+    pub fn from_prefix(segment_dir: PathBuf, prefix: &[u8]) -> Result<Option<Self>, KoshaError> {
+        match parse_doc_vectors_header(prefix, &segment_dir.join(DOC_VECTORS_FILE))? {
+            HeaderParse::Need(_) => Ok(None),
+            HeaderParse::Done(header) => Ok(Some(Self::from_header(segment_dir, header))),
+        }
+    }
+
+    fn from_header(segment_dir: PathBuf, header: DocVectorsHeader) -> Self {
+        Self {
+            segment_dir,
+            fields: header.fields,
+            entries: header.entries,
+            offsets: header.offsets,
+            file_len: header.file_len,
+        }
+    }
+
+    /// Length of the complete file, as the header describes it.
+    pub fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    fn entry_range(&self, doc_seq: u32) -> (usize, usize) {
+        let start = self.entries.partition_point(|e| e.0 < doc_seq);
+        let end = self.entries.partition_point(|e| e.0 <= doc_seq);
+        (start, end)
+    }
+
+    /// The `[start, end)` byte range of `doc_seq`'s vectors in the file;
+    /// `None` when the document has none.
+    pub fn doc_span(&self, doc_seq: u32) -> Option<(u64, u64)> {
+        let (start, end) = self.entry_range(doc_seq);
+        (start < end).then(|| {
+            (
+                self.offsets[start],
+                self.offsets[end - 1] + self.entries[end - 1].2 as u64 * 4,
+            )
         })
     }
 
     /// `(field name, vector)` for every vector stored for `doc_seq`, in the
-    /// document's field order. One seek+read.
+    /// document's field order. One local read.
     pub fn vectors_for(&self, doc_seq: u32) -> Result<Vec<(&str, Vec<f32>)>, KoshaError> {
-        let start = self.entries.partition_point(|e| e.0 < doc_seq);
-        let end = self.entries.partition_point(|e| e.0 <= doc_seq);
-        if start == end {
+        let (start, end) = self.entry_range(doc_seq);
+        let Some((span_start, span_end)) = self.doc_span(doc_seq) else {
             return Ok(Vec::new());
-        }
-        let span_start = self.offsets[start];
-        let span_end = self.offsets[end - 1] + self.entries[end - 1].2 as u64 * 4;
-        let mut buf = vec![0u8; (span_end - span_start) as usize];
-        let mut file = fs::File::open(&self.path)?;
-        file.seek(SeekFrom::Start(span_start))?;
-        file.read_exact(&mut buf)?;
+        };
+        let buf = span_cache::read_local_range(
+            &self.segment_dir,
+            DOC_VECTORS_FILE,
+            self.file_len,
+            span_start,
+            span_end - span_start,
+        )
+        .ok_or_else(|| {
+            KoshaError::NotFound(format!(
+                "{DOC_VECTORS_FILE} bytes {span_start}..{span_end} for doc_seq {doc_seq} are not \
+                 local in segment {:?}",
+                self.segment_dir
+            ))
+        })?;
         let mut out = Vec::with_capacity(end - start);
         for i in start..end {
             let (_, field_idx, dim) = self.entries[i];
@@ -3657,6 +3791,14 @@ struct DocIndex {
 }
 
 impl DocIndex {
+    /// The length `doc_store.bin` has when complete: the last record's end.
+    fn complete_len(&self) -> u64 {
+        self.entries
+            .last()
+            .map(|e| e.offset + e.length as u64)
+            .unwrap_or(0)
+    }
+
     fn id(&self, doc_seq: usize) -> Option<&str> {
         let e = self.entries.get(doc_seq)?;
         self.ids_pool
@@ -3938,18 +4080,38 @@ impl SegmentReader {
             return Ok(Arc::clone(dv));
         }
         let path = self.segment_dir.join(DOC_VECTORS_FILE);
-        let dv = Arc::new(DocVectors::open(path).map_err(|e| match e {
-            KoshaError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
-                KoshaError::NotFound(format!(
-                    "{DOC_VECTORS_FILE} missing from segment {:?}, whose footer says vectors \
-                     are stored there",
-                    self.segment_dir
-                ))
+        let missing = || {
+            KoshaError::NotFound(format!(
+                "{DOC_VECTORS_FILE} missing from segment {:?}, whose footer says vectors \
+                 are stored there",
+                self.segment_dir
+            ))
+        };
+        let dv = match DocVectors::open(path) {
+            Ok(dv) => dv,
+            // No whole file: the header may be in the sparse span cache
+            // (#245), fetched by a ranged read for page materialization.
+            Err(KoshaError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
+                let prefix = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE)
+                    .read_prefix()
+                    .ok_or_else(missing)?;
+                DocVectors::from_prefix(self.segment_dir.clone(), &prefix)?.ok_or_else(missing)?
             }
-            other => other,
-        })?);
+            Err(other) => return Err(other),
+        };
+        let dv = Arc::new(dv);
         *cached = Some(Arc::clone(&dv));
         Ok(dv)
+    }
+
+    /// The sidecar header if it is available locally (whole file or cached
+    /// header span), without failing when it is not. `None` for segments
+    /// that store vectors inline.
+    fn local_doc_vectors(&self) -> Option<Arc<DocVectors>> {
+        if !self.footer.doc_vectors {
+            return None;
+        }
+        self.doc_vectors().ok()
     }
 
     /// Put sidecar vectors back into the placeholder (empty-valued)
@@ -4542,6 +4704,19 @@ impl SegmentReader {
                 let Some(entry) = index.entries.get(doc_seq as usize) else {
                     return Ok(None);
                 };
+                // The whole file when it is complete, else the sparse span
+                // cache (#245). Neither → the plain read below, which fails
+                // with the same IO error as before spans existed.
+                if let Some(buf) = span_cache::read_local_range(
+                    &self.segment_dir,
+                    DOC_STORE_FILE,
+                    index.complete_len(),
+                    entry.offset,
+                    entry.length as u64,
+                ) {
+                    let mut cursor = &buf[..];
+                    return Ok(Some(parse_one_doc_record(&mut cursor, doc_seq)));
+                }
                 let mut file = fs::File::open(doc_store_path)?;
                 file.seek(SeekFrom::Start(entry.offset))?;
                 let mut buf = vec![0u8; entry.length as usize];
@@ -4592,16 +4767,84 @@ impl SegmentReader {
                 // ("failed to fill whole buffer") forever. The offsets
                 // sidecar knows the exact expected file size — the last
                 // record's end — so validate against it.
-                let expected = index
-                    .entries
-                    .last()
-                    .map(|e| e.offset + e.length as u64)
-                    .unwrap_or(0);
+                let expected = index.complete_len();
                 std::fs::metadata(doc_store_path)
                     .map(|m| m.len() >= expected && m.len() > 0)
                     .unwrap_or(false)
             }
         }
+    }
+
+    /// Whether `doc_record_full(doc_seq)` can be served from local disk —
+    /// the whole doc store (see [`Self::has_local_doc_store`]), or this
+    /// document's spans in the sparse span cache (#245): its record bytes
+    /// and, for a sidecar segment, the vectors header plus its vector
+    /// bytes. Out-of-range `doc_seq`s are "local" (there is nothing to
+    /// fetch; `doc_record_full` returns `None`).
+    pub fn doc_is_local(&self, doc_seq: u32) -> bool {
+        if self.has_local_doc_store() {
+            return true;
+        }
+        let DocStoreAccess::Lazy { index, .. } = &self.doc_store else {
+            // Eager record, but a sidecar whose file is absent.
+            return false;
+        };
+        let Some(entry) = index.entries.get(doc_seq as usize) else {
+            return true;
+        };
+        let record_local =
+            file_is_complete(&self.segment_dir.join(DOC_STORE_FILE), index.complete_len())
+                || span_cache::SpanIndex::load(&self.segment_dir, DOC_STORE_FILE)
+                    .covers(entry.offset, entry.offset + entry.length as u64);
+        if !record_local {
+            return false;
+        }
+        if !self.footer.doc_vectors {
+            return true;
+        }
+        let Some(dv) = self.local_doc_vectors() else {
+            return false;
+        };
+        match dv.doc_span(doc_seq) {
+            None => true,
+            Some((start, end)) => {
+                file_is_complete(&self.segment_dir.join(DOC_VECTORS_FILE), dv.file_len())
+                    || span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE)
+                        .covers(start, end)
+            }
+        }
+    }
+
+    /// Length `doc_store.bin` has when complete, from the offsets sidecar;
+    /// `None` for `Eager` (legacy) segments.
+    pub fn doc_store_len(&self) -> Option<u64> {
+        match &self.doc_store {
+            DocStoreAccess::Eager(_) => None,
+            DocStoreAccess::Lazy { index, .. } => Some(index.complete_len()),
+        }
+    }
+
+    /// Whether this segment keeps vectors in `doc_vectors.bin` (#243).
+    pub fn uses_doc_vectors(&self) -> bool {
+        self.footer.doc_vectors
+    }
+
+    /// The sidecar vectors' `[start, end)` byte range for `doc_seq` in
+    /// `doc_vectors.bin`, read from a locally available header (whole file
+    /// or cached header span). `Ok(None)`: the document has no sidecar
+    /// vectors. `Err`: the header is not local (fetch
+    /// `[0, doc_vectors_header_len)` first) or is corrupt.
+    pub fn doc_vectors_span(&self, doc_seq: u32) -> Result<Option<(u64, u64)>, KoshaError> {
+        if !self.footer.doc_vectors {
+            return Ok(None);
+        }
+        Ok(self.doc_vectors()?.doc_span(doc_seq))
+    }
+
+    /// Whether the sidecar header is readable locally. Always `true` for
+    /// segments without a sidecar.
+    pub fn has_local_doc_vectors_header(&self) -> bool {
+        !self.footer.doc_vectors || self.local_doc_vectors().is_some()
     }
 
     /// Parse one document's full record from bytes fetched elsewhere — the
@@ -7538,6 +7781,106 @@ mod doc_vectors_tests {
         assert!(reader.has_local_doc_store());
         let rec = reader.doc_record_full(0).unwrap().unwrap();
         assert_eq!(parsed(&rec.fields[0].value), vec![1.0, 2.0]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #245: with neither whole file local, a reader serves documents from
+    /// the sparse span cache — records from `doc_store.bin.spans`, vectors
+    /// via a header span plus the doc's vector span — and `doc_is_local`
+    /// reports exactly which documents are covered.
+    #[test]
+    fn documents_are_served_from_the_span_cache() {
+        let dir = scratch("spans");
+        write(
+            &dir,
+            VectorStoreMode::Sidecar,
+            (0..5)
+                .map(|i| {
+                    (
+                        ["d0", "d1", "d2", "d3", "d4"][i],
+                        vec![
+                            Field::text("t", format!("text {i}")),
+                            vector_field("emb", &[i as f32, 0.5]),
+                        ],
+                    )
+                })
+                .collect(),
+        );
+        let ds = fs::read(dir.join(DOC_STORE_FILE)).unwrap();
+        let dv = fs::read(dir.join(DOC_VECTORS_FILE)).unwrap();
+        fs::remove_file(dir.join(DOC_STORE_FILE)).unwrap();
+        fs::remove_file(dir.join(DOC_VECTORS_FILE)).unwrap();
+        let reader = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(!reader.has_local_doc_store());
+        assert!(!reader.doc_is_local(2));
+        assert!(!reader.has_local_doc_vectors_header());
+        assert!(reader.doc_vectors_span(2).is_err());
+        assert!(reader.doc_record_full(2).is_err());
+
+        let put = |file: &str, s: u64, e: u64, src: &[u8]| {
+            let d = span_cache::spans_dir(&dir, file);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                d.join(span_cache::span_file_name(s, e)),
+                &src[s as usize..e as usize],
+            )
+            .unwrap();
+        };
+        // The header length is discoverable from a short prefix.
+        let header_len = match doc_vectors_header_len(&dv[..10]).unwrap() {
+            Err(need) => {
+                assert!(need > 10);
+                doc_vectors_header_len(&dv).unwrap().unwrap()
+            }
+            Ok(len) => len,
+        };
+        assert_eq!(header_len, 8 + 4 + 3 + 4 + 5 * 12);
+        put(DOC_VECTORS_FILE, 0, header_len, &dv);
+        assert!(reader.has_local_doc_vectors_header());
+        let (vs, ve) = reader.doc_vectors_span(2).unwrap().unwrap();
+        assert_eq!(ve - vs, 8);
+        let (off, len) = reader.doc_span(2).unwrap();
+        put(DOC_STORE_FILE, off, off + len as u64, &ds);
+        assert!(!reader.doc_is_local(2), "vector span still missing");
+        put(DOC_VECTORS_FILE, vs, ve, &dv);
+        assert!(reader.doc_is_local(2));
+        assert!(!reader.doc_is_local(3));
+
+        let rec = reader.doc_record_full(2).unwrap().unwrap();
+        assert_eq!(rec.fields[0].value, "text 2");
+        let v: Vec<f32> = serde_json::from_str(&rec.fields[1].value).unwrap();
+        assert_eq!(v, vec![2.0, 0.5]);
+        assert!(reader.doc_record_full(3).is_err());
+
+        // Whole files win once they land, spans or not.
+        fs::write(dir.join(DOC_STORE_FILE), &ds).unwrap();
+        fs::write(dir.join(DOC_VECTORS_FILE), &dv).unwrap();
+        assert!(reader.doc_is_local(3));
+        let rec = reader.doc_record_full(3).unwrap().unwrap();
+        assert_eq!(rec.fields[0].value, "text 3");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_parse_from_prefix_matches_open() {
+        let dir = scratch("prefix");
+        write(
+            &dir,
+            VectorStoreMode::Sidecar,
+            vec![("d0", vec![vector_field("emb", &[1.0, 2.0, 3.0])])],
+        );
+        let bytes = fs::read(dir.join(DOC_VECTORS_FILE)).unwrap();
+        let whole = DocVectors::open(dir.join(DOC_VECTORS_FILE)).unwrap();
+        let from_prefix = DocVectors::from_prefix(dir.clone(), &bytes[..32])
+            .unwrap()
+            .unwrap();
+        assert_eq!(whole.doc_span(0), from_prefix.doc_span(0));
+        assert_eq!(whole.file_len(), bytes.len() as u64);
+        assert_eq!(from_prefix.file_len(), bytes.len() as u64);
+        assert!(DocVectors::from_prefix(dir.clone(), &bytes[..9])
+            .unwrap()
+            .is_none());
+        assert!(DocVectors::from_prefix(dir.clone(), b"XXXXXXXXXXXX").is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

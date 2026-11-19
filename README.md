@@ -60,7 +60,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 - S3 as the source of truth; any S3-compatible endpoint works (MinIO locally, path-style supported).
 - Local NVMe read-through cache, size-bounded with LRU eviction.
-- Lazy segment loading — the doc store, filter columns, and postings are read on demand, with ranged GETs for doc-store pages instead of whole-blob fetches.
+- Lazy segment loading — the doc store, filter columns, and postings are read on demand. A cold query fetches only its result page's documents from S3: ranged GETs for those documents' byte spans in `doc_store.bin` (and `doc_vectors.bin`), with nearby spans coalesced into one GET (`KOSHA_DOC_SPAN_COALESCE_GAP_BYTES`, default 64 KiB). Fetched spans are kept in a per-segment sparse span cache that counts toward the cache budget, so a warm repeat makes no S3 request. A segment that has served `KOSHA_DOC_SPAN_PROMOTE_GETS` ranged GETs (default 64) or `KOSHA_DOC_SPAN_PROMOTE_BYTES` (default 16 MiB) is hydrated whole in the background and its spans are dropped. `KOSHA_DOC_STORE_READ_MODE=whole` restores whole-file fetches per page segment. The `search timing:` log line reports `page_gets`, `page_ranged_kb`, `page_whole_files` and `page_whole_mb`; `GET /stats` reports the totals under `doc_store_reads`. Postings and vector postings are still fetched as whole files (#245).
 - In-memory parsed-segment cache governed by a live-bytes ledger and an admission gate, with a per-request hydration byte budget and bounded hydration concurrency.
 - Posting-blob presence cache, postings cache, and vector-postings cache.
 - Whole-response result cache for `POST /search` (bypassable per query with `no_cache`).

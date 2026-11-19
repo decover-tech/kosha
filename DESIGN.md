@@ -416,6 +416,15 @@ The SSD layer is a **read-through, write-behind cache**, never authoritative:
   hashing over namespace id) so repeated queries for the same namespace land on query nodes likely
   to already have it cached, without requiring hard node ownership — a node with a cold cache for
   a namespace simply falls back to S3 and warms up, no rebalancing operation required.
+- **Page documents by byte range** (#245): a query reads the scoring set (footers, postings,
+  filters, `doc_store.offsets`) whole, but materializes its result page from ranged GETs of just
+  those documents' spans in `doc_store.bin` / `doc_vectors.bin`, coalescing spans closer than
+  64 KiB into one GET. Fetched spans persist in a sparse span cache,
+  `{segment}/{file}.spans/{start:016x}-{end:016x}`, one file per fetched range, counted and
+  LRU-evicted like any other cached file. A partial file is never written at the real file path,
+  because existence there means complete. A segment that keeps taking ranged reads is promoted:
+  its whole files are hydrated in the background and its spans dropped. A whole local file always
+  wins over spans. `KOSHA_DOC_STORE_READ_MODE=whole` reverts to whole-file page hydration.
 - **Failure mode**: losing a query node's local disk (or the whole node) loses nothing but cache
   warmth. Traffic reroutes (consistent hashing + health checks) and the replacement node rebuilds
   its cache from S3 traffic as queries land.

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -16,30 +16,42 @@ use kosha_segment::{
     tokenize, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
 };
 
-/// Optional callback the searcher invokes to ensure `doc_store.bin` is
-/// present locally for the segments holding the materialize page — the
-/// on-demand half of scoring-set-only hydration (Option A: fetch the whole
-/// `doc_store.bin` per page-segment on first miss, persist it via the disk
-/// cache, then serve page reads from local disk on every subsequent warm
-/// query). See [`Searcher::search_with_doc_store_hydrator`].
+/// One segment of a materialize page, as handed to a [`DocStoreHydrator`]:
+/// the documents of the page that live in this segment and are not yet
+/// readable from local disk ([`SegmentReader::doc_is_local`]).
+pub struct PageSegment<'a> {
+    /// `{data_dir}/{namespace}/{segment_id}`.
+    pub segment_dir: &'a Path,
+    /// The open segment, for byte spans: [`SegmentReader::doc_span`] for
+    /// `doc_store.bin`, [`SegmentReader::doc_vectors_span`] for
+    /// `doc_vectors.bin`.
+    pub reader: &'a SegmentReader,
+    /// The page's documents in this segment that still need bytes, in page
+    /// order, deduplicated.
+    pub doc_seqs: Vec<u32>,
+}
+
+/// Optional callback the searcher invokes, after ranking and before field
+/// materialization, so the page's documents become readable locally.
+/// See [`Searcher::search_with_doc_store_hydrator`].
 ///
-/// Each element of the input slice is a segment directory path
-/// (`{data_dir}/{namespace}/{segment_id}`) whose `doc_store.bin` is absent
-/// or partial on local disk; the implementor fetches and persists the whole
-/// file for each, idempotently (already-local segments are no-ops). Pass
-/// `None` to materialize straight from disk — the warm / local-dev path
-/// where `doc_store.bin` is already present.
+/// It receives one [`PageSegment`] per segment holding page hits that are
+/// not local yet. After it returns, each listed document should be readable
+/// by `doc_record_full`, from either source the reader understands:
+///   * the whole `doc_store.bin` (+ `doc_vectors.bin`) — the pre-#245
+///     "Option A" (`KOSHA_DOC_STORE_READ_MODE=whole`);
+///   * the sparse span cache ([`kosha_segment::span_cache`]) holding just
+///     the documents' byte ranges — "Option B" (#245, the default), fetched
+///     with ranged GETs.
 ///
-/// Why whole-file per-segment instead of per-doc ranged GETs: a ranged GET
-/// per page document means *every* warm query re-pays N S3 round-trips
-/// (~350 ms p50 at 8 QPS / topk=10 against 1M docs), because span bytes are
-/// never persisted (a partial `doc_store.bin` would mis-read as complete to
-/// the hydration existence check). Fetching the whole file once per
-/// page-segment turns that into one round-trip per segment on the *first*
-/// warm query, then zero round-trips thereafter — warm falls to the local
-/// seek cost (~ms). Per-doc span reads remain available as a future Option B
-/// refinement (a per-segment sparse span cache), but are not the warm path.
-pub type DocStoreHydrator<'a> = Option<&'a dyn Fn(&[PathBuf])>;
+/// Either way the bytes are persisted, which is what makes a warm repeat
+/// free: the searcher only calls the hydrator for documents that are not
+/// already local, so a second identical query never reaches it. (PR #84
+/// replaced an earlier ranged path that did *not* persist spans, so every
+/// warm query re-paid the S3 round trips.)
+///
+/// Pass `None` to materialize straight from disk — the local-dev path.
+pub type DocStoreHydrator<'a> = Option<&'a dyn Fn(&[PageSegment<'_>])>;
 
 /// Default number of parsed segments kept resident in memory (see
 /// [`SegmentCache`]). Segments are immutable once written (DESIGN.md §6.2),
@@ -3006,39 +3018,48 @@ impl Searcher {
             }
         }
 
-        // On-demand `doc_store.bin` for the materialize page (Option A): a cold
-        // search hydrated just the offsets sidecar for Lazy segments, so
-        // `doc_store.bin` is absent until now. Collect the *distinct segment
-        // directories* among the page hits whose local `doc_store.bin` is
-        // missing, ask the hydrator to fetch & persist the whole file for
-        // each once, then materialize the page via the standard local
-        // seek+read path (`doc_record_full`). After this first warm query
-        // per page-segment, the file is on disk and `has_local_doc_store`
-        // short-circuits the callback on every subsequent warm query —
-        // warm page reads become sub-millisecond local seeks instead of
-        // N per-doc S3 ranged GETs every time.
+        // On-demand page bytes: a cold search hydrated just the offsets
+        // sidecar for Lazy segments, so the page's records are not local
+        // yet. Group the page's non-local documents by segment and ask the
+        // hydrator for them once (ranged spans or whole files — its call,
+        // see `DocStoreHydrator`). Whatever it fetched is persisted, so a
+        // warm repeat finds every document local and never gets here.
         if let Some(ensure_doc_store) = doc_store_hydrator {
-            let mut page_seg_paths: Vec<PathBuf> = Vec::new();
+            let mut page_segs: Vec<(&Arc<TrackedSegment>, Vec<u32>)> = Vec::new();
             for cand in &candidates[from..to] {
-                if cand.reader.has_local_doc_store() {
+                if cand.reader.doc_is_local(cand.doc_seq) {
                     continue;
                 }
-                let p = cand.reader.segment_dir().to_path_buf();
-                if !page_seg_paths.contains(&p) {
-                    page_seg_paths.push(p);
+                match page_segs
+                    .iter_mut()
+                    .find(|(reader, _)| Arc::ptr_eq(reader, &cand.reader))
+                {
+                    Some((_, seqs)) => {
+                        if !seqs.contains(&cand.doc_seq) {
+                            seqs.push(cand.doc_seq);
+                        }
+                    }
+                    None => page_segs.push((&cand.reader, vec![cand.doc_seq])),
                 }
             }
-            if !page_seg_paths.is_empty() {
-                ensure_doc_store(&page_seg_paths);
+            if !page_segs.is_empty() {
+                let request: Vec<PageSegment<'_>> = page_segs
+                    .into_iter()
+                    .map(|(reader, doc_seqs)| PageSegment {
+                        segment_dir: reader.segment_dir(),
+                        reader,
+                        doc_seqs,
+                    })
+                    .collect();
+                ensure_doc_store(&request);
             }
         }
 
         // Materialize fields / highlights only for the returned page — the
         // only place a `Lazy` segment's full field content is ever read
         // from disk (one seek+read per document, not the whole segment).
-        // `doc_store.bin` is now guaranteed local for every page-segment
-        // (either it pre-existed, or the hydrator just persisted it above),
-        // so `doc_record_full` succeeds without any further S3 round-trip.
+        // Every page document is now local — whole file or cached span —
+        // so `doc_record_full` needs no further S3 round trip.
         let mut page = Vec::with_capacity(to - from);
         for cand in &candidates[from..to] {
             let Some(doc_rec) = cand.reader.doc_record_full(cand.doc_seq)? else {
@@ -7175,9 +7196,10 @@ mod tests {
         // restore the backed-up file to its on-disk path so the segment's
         // local `doc_record_full` seek+read succeeds, exactly as it would
         // after the real hydrator's `ensure_files_local` lands the file.
-        let ensure_doc_store = move |segs: &[PathBuf]| {
+        let ensure_doc_store = move |segs: &[PageSegment<'_>]| {
             for seg in segs {
-                requested_clone.lock().unwrap().push(seg.clone());
+                let seg = seg.segment_dir;
+                requested_clone.lock().unwrap().push(seg.to_path_buf());
                 let _ = std::fs::copy(seg.join("doc_store.bin.bak"), seg.join("doc_store.bin"));
             }
         };
@@ -7244,6 +7266,93 @@ mod tests {
             "warm query must NOT re-invoke the hydrator — doc_store.bin is now local"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hydrator_gets_page_doc_spans_and_span_cache_serves_warm_repeat() {
+        // #245 Option B contract: the hydrator is told exactly which page
+        // documents are missing, per segment; it persists only their byte
+        // spans into the sparse span cache (never a partial file at the
+        // real `doc_store.bin` path), the searcher materializes from those
+        // spans, and a warm repeat finds every document local and never
+        // calls the hydrator again.
+        use kosha_segment::span_cache;
+        let dir = std::env::temp_dir().join("kosha-test-doc-store-spans");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        for i in 0..200 {
+            let text = if i % 50 == 7 {
+                "needle hay"
+            } else {
+                "hay only"
+            };
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![Field::text("t", format!("{text} filler {i}"))],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let full = std::fs::read(seg_dir.join("doc_store.bin")).unwrap();
+        std::fs::remove_file(seg_dir.join("doc_store.bin")).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 200,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let calls: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_in = Arc::clone(&calls);
+        let ensure = move |segs: &[PageSegment<'_>]| {
+            for seg in segs {
+                calls_in.lock().unwrap().push(seg.doc_seqs.clone());
+                for &seq in &seg.doc_seqs {
+                    let (off, len) = seg.reader.doc_span(seq).unwrap();
+                    let (s, e) = (off as usize, off as usize + len as usize);
+                    let spans = span_cache::spans_dir(seg.segment_dir, "doc_store.bin");
+                    std::fs::create_dir_all(&spans).unwrap();
+                    std::fs::write(
+                        spans.join(span_cache::span_file_name(s as u64, e as u64)),
+                        &full[s..e],
+                    )
+                    .unwrap();
+                }
+            }
+        };
+        let q = mk_query("needle", 10);
+        let (r, _) = searcher
+            .search_with_doc_store_hydrator(&ns, &manifest, &q, None, Some(&ensure))
+            .unwrap();
+        assert_eq!(r.results.len(), 4);
+        for doc in &r.results {
+            let i: usize = doc.doc_id.0[1..].parse().unwrap();
+            assert_eq!(doc.fields[0].value, format!("needle hay filler {i}"));
+        }
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "one hydrator call per query");
+            let mut seqs = calls[0].clone();
+            seqs.sort_unstable();
+            assert_eq!(seqs, vec![7, 57, 107, 157], "exactly the page's docs");
+        }
+        assert!(!seg_dir.join("doc_store.bin").exists());
+
+        let (r2, _) = searcher
+            .search_with_doc_store_hydrator(&ns, &manifest, &q, None, Some(&ensure))
+            .unwrap();
+        assert_eq!(r2.results.len(), 4);
+        assert_eq!(calls.lock().unwrap().len(), 1, "warm repeat must not fetch");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,14 +1,14 @@
-//! Warm page-materialize microbenchmark — measures the Option A fix
-//! (persist `doc_store.bin` per page-segment, then local seeks) against the
-//! per-doc ranged-GET behavior it replaces.
+//! Warm page-materialize microbenchmark — the persisted page-hydration
+//! paths against the per-doc ranged-GET behavior PR #84 replaced.
 //!
 //! Local Rust benches can't reproduce the *real* cost this changes (S3
 //! round-trip latency — ~35 ms/GET in-region), so this harness simulates it
-//! with a sleep-injecting hydrator and reports:
-//!   - hydrator call count per warm query (the structural change: N per-doc
-//!     → 1 per-segment on first warm, 0 on subsequent warm), and
-//!   - end-to-end materialize wall-clock with that simulated S3 latency
-//!     injected per hydrator call.
+//! with a sleep-injecting hydrator and reports, per query:
+//!   - simulated GETs (the structural number) and bytes fetched, and
+//!   - end-to-end wall-clock with one simulated round trip per hydrator
+//!     call (the server issues a call's GETs concurrently). The latency
+//!     does not model transfer time, which is what Option A's whole-file
+//!     bytes cost on a real network.
 //!
 //! Run:
 //! ```text
@@ -18,21 +18,20 @@
 //!   cargo bench -p kosha-query --bench warm_materialize
 //! ```
 //!
-//! What the numbers mean:
-//!   - **Option A** (this PR): `ensure_doc_store([PathBuf])` — one call per
-//!     distinct page-hit segment on the first warm query, zero thereafter
-//!     (the file is on disk → `has_local_doc_store` short-circuits). A
-//!     10-hit page over ≤10 segments costs ≤10 simulated GETs once, then 0.
-//!   - **Before (per-doc spans)**: simulates the previous hydrator shape
-//!     (`Fn(&[DocSpan]) -> ...`) — one call per page *document*, every warm
-//!     query, because span bytes are never persisted. A 10-hit page costs 10
-//!     simulated GETs on every warm query.
+//! What the rows mean:
+//!   - **Before (per-doc spans, never persisted)**: one GET per page
+//!     document on every query — the pre-#84 shape.
+//!   - **Option A (whole file, persisted)**: one whole `doc_store.bin` GET
+//!     per page segment on the cold query, zero after
+//!     (`KOSHA_DOC_STORE_READ_MODE=whole`).
+//!   - **Option B (ranged spans, persisted — #245 default)**: the page's
+//!     document spans, coalesced per segment, fetched as ranged GETs and
+//!     persisted into the sparse span cache; zero GETs after. Same round
+//!     trips as Option A, a small fraction of the bytes.
 //!
-//! The structural delta is the cargo of this PR: warm p50 ~350 ms → ~ms,
-//! matching the observed 1M-doc / 8 QPS / topk=10 benchmark where warm p50
-//! was dominated by per-doc ranged GETs against S3.
+//! The regression guard for #84: every persisted mode must show `gets = 0`
+//! on warm #2+.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,8 +39,8 @@ use std::time::{Duration, Instant};
 use kosha_core::{
     Bm25Params, DocumentId, Field, Manifest, ManifestEntry, NamespaceId, SearchQuery, SegmentId,
 };
-use kosha_query::Searcher;
-use kosha_segment::SegmentWriter;
+use kosha_query::{PageSegment, Searcher};
+use kosha_segment::{span_cache, SegmentWriter};
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -145,11 +144,18 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
     }
 }
 
-/// One test row: how many hydrator calls a warm query made + its wall-clock.
+/// One test row: simulated GETs and bytes a query made + its wall-clock.
 struct Row {
     label: &'static str,
     calls: usize,
+    bytes: usize,
     wall_ms: f64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Whole,
+    Ranged,
 }
 
 fn main() {
@@ -186,99 +192,133 @@ fn main() {
          simulated S3 latency = {s3_ms} ms/GET, warm iters = {warm_iters}, samples = {samples}\n"
     );
 
-    // ── After (this PR: Option A — per-segment ensure, persisted) ─────────
-    let mut after_rows: Vec<Row> = Vec::new();
+    let run_persisted = |mode: Mode| -> Vec<Row> {
+        let mut rows: Vec<Row> = Vec::new();
+        for _ in 0..samples {
+            // Fresh cold state for each sample: drop doc_store.bin and any
+            // cached spans so the first query of the sample pays for them.
+            for entry in &manifest.segments {
+                let seg_dir = work.join(&ns.0).join(&entry.segment_id.0);
+                let _ = std::fs::remove_file(seg_dir.join("doc_store.bin"));
+                let _ = std::fs::remove_dir_all(span_cache::spans_dir(&seg_dir, "doc_store.bin"));
+            }
+            let searcher = Searcher::new(work.clone());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let (calls_in, bytes_in) = (Arc::clone(&calls), Arc::clone(&bytes));
+            let ensure = move |segs: &[PageSegment<'_>]| {
+                // The server issues one call's GETs concurrently: one round
+                // trip of simulated latency per call, not per GET.
+                std::thread::sleep(s3_latency);
+                for seg in segs {
+                    let dir = seg.segment_dir;
+                    let full = std::fs::read(dir.join("doc_store.bin.bak")).unwrap();
+                    match mode {
+                        // Stand-in for the real S3 fetch+persist of the
+                        // whole file.
+                        Mode::Whole => {
+                            calls_in.fetch_add(1, Ordering::SeqCst);
+                            bytes_in.fetch_add(full.len(), Ordering::SeqCst);
+                            std::fs::write(dir.join("doc_store.bin"), &full).unwrap();
+                        }
+                        // Coalesced ranged GETs persisted as spans.
+                        Mode::Ranged => {
+                            let spans: Vec<(u64, u64)> = seg
+                                .doc_seqs
+                                .iter()
+                                .filter_map(|&d| seg.reader.doc_span(d))
+                                .map(|(o, l)| (o, o + l as u64))
+                                .collect();
+                            let out = span_cache::spans_dir(dir, "doc_store.bin");
+                            std::fs::create_dir_all(&out).unwrap();
+                            for (s, e) in span_cache::coalesce(spans, 64 * 1024) {
+                                calls_in.fetch_add(1, Ordering::SeqCst);
+                                bytes_in.fetch_add((e - s) as usize, Ordering::SeqCst);
+                                std::fs::write(
+                                    out.join(span_cache::span_file_name(s, e)),
+                                    &full[s as usize..e as usize],
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
+                }
+            };
+            for iter in 0..warm_iters {
+                let calls_before = calls.load(Ordering::SeqCst);
+                let bytes_before = bytes.load(Ordering::SeqCst);
+                let t = Instant::now();
+                let (result, _) = searcher
+                    .search_with_doc_store_hydrator(&ns, &manifest, &query, None, Some(&ensure))
+                    .expect("page must materialize");
+                assert_eq!(result.results.len(), topk.min(result.total_hits));
+                let wall_ms = t.elapsed().as_secs_f64() * 1e3;
+                let delta_calls = calls.load(Ordering::SeqCst) - calls_before;
+                if iter > 0 {
+                    assert_eq!(delta_calls, 0, "warm repeat must make zero GETs (#84)");
+                }
+                rows.push(Row {
+                    label: if iter == 0 {
+                        "cold page"
+                    } else {
+                        "warm repeat"
+                    },
+                    calls: delta_calls,
+                    bytes: bytes.load(Ordering::SeqCst) - bytes_before,
+                    wall_ms,
+                });
+            }
+        }
+        rows
+    };
+    let whole_rows = run_persisted(Mode::Whole);
+    let ranged_rows = run_persisted(Mode::Ranged);
+
+    // ── Before (per-doc ranged GET every query, never persisted) ─────────
+    // A hydrator that pays one simulated GET per page *document* and keeps
+    // nothing, so every query is cold again. Materialization then fails
+    // for want of bytes (ignored): only the fetch cost is being modelled.
+    let mut before_rows: Vec<Row> = Vec::new();
     for _ in 0..samples {
-        // Fresh cold state for each sample: drop doc_store.bin again so
-        // the first warm query of the sample actually pays for hydration.
         for entry in &manifest.segments {
             let seg_dir = work.join(&ns.0).join(&entry.segment_id.0);
             let _ = std::fs::remove_file(seg_dir.join("doc_store.bin"));
+            let _ = std::fs::remove_dir_all(span_cache::spans_dir(&seg_dir, "doc_store.bin"));
         }
         let searcher = Searcher::new(work.clone());
         let calls = Arc::new(AtomicUsize::new(0));
-        let s3 = s3_latency;
-        let calls_clone = Arc::clone(&calls);
-        let ensure = move |segs: &[PathBuf]| {
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let (calls_in, bytes_in) = (Arc::clone(&calls), Arc::clone(&bytes));
+        let per_doc = move |segs: &[PageSegment<'_>]| {
+            std::thread::sleep(s3_latency);
             for seg in segs {
-                calls_clone.fetch_add(1, Ordering::SeqCst);
-                std::thread::sleep(s3);
-                // Stand-in for the real S3 fetch+persist: restore the backed-
-                // up `doc_store.bin` so the segment's local seek+read
-                // succeeds on this query and every subsequent warm query
-                // (which is the whole point — `has_local_doc_store` then
-                // short-circuits the hydrator on warm #2+).
-                let _ = std::fs::copy(seg.join("doc_store.bin.bak"), seg.join("doc_store.bin"));
+                for &d in &seg.doc_seqs {
+                    calls_in.fetch_add(1, Ordering::SeqCst);
+                    let len = seg.reader.doc_span(d).map_or(0, |(_, l)| l as usize);
+                    bytes_in.fetch_add(len, Ordering::SeqCst);
+                }
             }
         };
         for iter in 0..warm_iters {
             let calls_before = calls.load(Ordering::SeqCst);
+            let bytes_before = bytes.load(Ordering::SeqCst);
             let t = Instant::now();
             let _ = searcher.search_with_doc_store_hydrator(
                 &ns,
                 &manifest,
                 &query,
                 None,
-                Some(&ensure),
+                Some(&per_doc),
             );
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
-            let delta_calls = calls.load(Ordering::SeqCst) - calls_before;
-            after_rows.push(Row {
-                label: if iter == 0 {
-                    "warm #1 (post-cold)"
-                } else {
-                    "warm #2+"
-                },
-                calls: delta_calls,
-                wall_ms,
-            });
-        }
-    }
-
-    // ── Before (per-doc ranged GET every warm query, never persisted) ─────
-    // Simulated by a hydrator that sleeps once per *page document* — the
-    // shape of the previous `Fn(&[DocSpan])` callback — and never persists
-    // anything. Same N=simulated-GETs cost on every warm query.
-    let mut before_rows: Vec<Row> = Vec::new();
-    for _ in 0..samples {
-        for entry in &manifest.segments {
-            let bin = work
-                .join(&ns.0)
-                .join(&entry.segment_id.0)
-                .join("doc_store.bin");
-            let _ = std::fs::remove_file(&bin);
-        }
-        let searcher = Searcher::new(work.clone());
-        let calls = Arc::new(AtomicUsize::new(0));
-        let s3 = s3_latency;
-        // We can't pass the old `Fn(&[DocSpan])` shape to the *new* API —
-        // the type changed. Instead we simulate the previous behavior by
-        // calling the hydrator topk times from the outside, once per page
-        // document, for every warm query (since the old code never
-        // persisted). The materialize path itself is identical; only the
-        // hydrator's per-doc cost differs.
-        for iter in 0..warm_iters {
-            let calls_before = calls.load(Ordering::SeqCst);
-            let t = Instant::now();
-            // Force a no-op hydrator (we're accounting the per-doc sleeps
-            // separately below to simulate the old behavior faithfully),
-            // then add topk simulated GETs on top.
-            let no_op = |_: &[PathBuf]| {};
-            let _ =
-                searcher.search_with_doc_store_hydrator(&ns, &manifest, &query, None, Some(&no_op));
-            for _ in 0..topk {
-                calls.fetch_add(1, Ordering::SeqCst);
-                std::thread::sleep(s3);
-            }
-            let wall_ms = t.elapsed().as_secs_f64() * 1e3;
-            let delta_calls = calls.load(Ordering::SeqCst) - calls_before;
             before_rows.push(Row {
                 label: if iter == 0 {
-                    "warm #1 (post-cold)"
+                    "cold page"
                 } else {
-                    "warm #2+"
+                    "warm repeat"
                 },
-                calls: delta_calls,
+                calls: calls.load(Ordering::SeqCst) - calls_before,
+                bytes: bytes.load(Ordering::SeqCst) - bytes_before,
                 wall_ms,
             });
         }
@@ -286,41 +326,34 @@ fn main() {
 
     // ── Report ───────────────────────────────────────────────────────────
     fn report(label: &str, rows: &[Row]) {
-        let by_phase: std::collections::HashMap<&str, Vec<&Row>> =
-            rows.iter().fold(Default::default(), |mut acc, r| {
-                acc.entry(r.label).or_default().push(r);
-                acc
-            });
         println!("  {label}");
-        for phase in ["warm #1 (post-cold)", "warm #2+"] {
-            if let Some(rs) = by_phase.get(phase) {
-                let med_calls = {
-                    let mut v: Vec<usize> = rs.iter().map(|r| r.calls).collect();
-                    v.sort();
-                    v[v.len() / 2]
-                };
-                let med_ms = {
-                    let mut v: Vec<f64> = rs.iter().map(|r| r.wall_ms).collect();
-                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    v[v.len() / 2]
-                };
-                println!(
-                    "    {:<22} calls/query = {:>3} | wall = {:>8.1} ms",
-                    phase, med_calls, med_ms
-                );
+        for phase in ["cold page", "warm repeat"] {
+            let rs: Vec<&Row> = rows.iter().filter(|r| r.label == phase).collect();
+            if rs.is_empty() {
+                continue;
             }
+            let median = |mut v: Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            println!(
+                "    {:<12} gets/query = {:>3} | bytes/query = {:>10} | wall = {:>8.1} ms",
+                phase,
+                median(rs.iter().map(|r| r.calls as f64).collect()) as usize,
+                median(rs.iter().map(|r| r.bytes as f64).collect()) as usize,
+                median(rs.iter().map(|r| r.wall_ms).collect()),
+            );
         }
     }
 
     report(
-        "Before (per-doc ranged GET, never persisted):",
+        "Before   (per-doc ranged GET, never persisted):",
         &before_rows,
     );
     println!();
-    report(
-        "After  (Option A: per-segment ensure, persisted):",
-        &after_rows,
-    );
+    report("Option A (whole doc_store.bin, persisted):", &whole_rows);
+    println!();
+    report("Option B (coalesced spans, persisted; #245):", &ranged_rows);
 
     let _ = std::fs::remove_dir_all(&work);
 }

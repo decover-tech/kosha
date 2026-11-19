@@ -24,6 +24,7 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 
 mod auth;
 mod compaction_sched;
+mod doc_spans;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 #[cfg(feature = "migrate")]
@@ -42,6 +43,8 @@ use kosha_core::StorageBackend;
 use kosha_core::{segment_may_contain_terms, TermBloomMode};
 use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::DocStoreHydrator;
+#[cfg(feature = "s3")]
+use kosha_query::PageSegment;
 use kosha_query::Searcher;
 #[cfg(feature = "s3")]
 use kosha_segment::tokenize;
@@ -137,6 +140,19 @@ struct AppState {
     /// `KOSHA_MAX_CONCURRENT_HYDRATIONS`, default 4.
     #[cfg(feature = "s3")]
     hydration_semaphore: Semaphore,
+    /// How page documents are fetched from S3: ranged spans into the
+    /// sparse span cache (default) or whole files
+    /// (`KOSHA_DOC_STORE_READ_MODE`, #245). See [`doc_spans`].
+    doc_read_mode: doc_spans::ReadMode,
+    /// Ranged page-document fetcher + promotion bookkeeping (#245).
+    #[cfg(feature = "s3")]
+    span_hydrator: doc_spans::SpanHydrator,
+    /// Segments hot enough on the ranged path to hydrate whole, drained by
+    /// the `kosha-doc-promote` thread (`spawn_doc_store_promoter`).
+    #[cfg(feature = "s3")]
+    doc_store_promotions: doc_spans::PromotionQueue,
+    /// Process totals of page-document bytes fetched, for `GET /stats`.
+    doc_store_reads: doc_spans::DocStoreReadCounters,
     /// Ceiling on concurrent `/search` executions
     /// (`KOSHA_MAX_CONCURRENT_SEARCHES`, default 8). Complements the
     /// searcher's own live-bytes admission gate (`kosha_query::MemoryLedger`):
@@ -517,6 +533,9 @@ struct HydrationOutcome {
     /// broken when the server merely declined to pull multiple GB inside
     /// one request.
     shed: bool,
+    /// Bytes the page's documents pulled from S3 after scoring (#245):
+    /// ranged spans or whole files. Filled in after the search runs.
+    page: doc_spans::PageFetchStats,
 }
 
 /// Cached verdict for `completed_hydrations`: NOT a single "namespace is
@@ -1227,6 +1246,9 @@ impl AppState {
             .and_then(|v| v.parse().ok())
             .filter(|n| *n > 0)
             .unwrap_or(1024 * 1024 * 1024);
+        #[cfg(feature = "s3")]
+        let span_hydrator =
+            doc_spans::SpanHydrator::new(data_dir.clone(), doc_spans::SpanConfig::from_env());
 
         Self {
             controller: Mutex::new(control_store),
@@ -1295,6 +1317,12 @@ impl AppState {
                     .filter(|n| *n > 0)
                     .unwrap_or(4),
             ),
+            doc_read_mode: doc_spans::ReadMode::from_env(),
+            #[cfg(feature = "s3")]
+            span_hydrator,
+            #[cfg(feature = "s3")]
+            doc_store_promotions: doc_spans::PromotionQueue::default(),
+            doc_store_reads: doc_spans::DocStoreReadCounters::default(),
             search_semaphore: {
                 let permits = std::env::var("KOSHA_MAX_CONCURRENT_SEARCHES")
                     .ok()
@@ -1629,9 +1657,12 @@ impl AppState {
                     );
                 }
 
-                // Phase 3 — doc stores. Page materialization (Option A, see
-                // `ensure_doc_store` in `handle_search_post`) asks for the
-                // WHOLE `doc_store.bin` of every page-hit segment, so on a
+                // Phase 3 — doc stores. Kept in both read modes: a
+                // namespace named for warmup is meant to be fully local,
+                // and a whole local file makes the ranged path (#245, see
+                // `hydrate_page_docs`) a no-op. History: page
+                // materialization used to ask for the WHOLE
+                // `doc_store.bin` of every page-hit segment, so on a
                 // cold pod the first queries pay full-file S3 fetches — for
                 // large compacted segments that is a multi-GB in-memory GET
                 // on the query path (the round-7 incident: a 10.6GB merged
@@ -2352,6 +2383,116 @@ impl AppState {
             bytes += b;
         }
         (files, bytes)
+    }
+
+    /// Make the page documents a search is about to materialize readable
+    /// locally (the [`DocStoreHydrator`] the search handlers pass down).
+    ///
+    /// `ranged` (default, #245): fetch just the documents' spans with
+    /// coalesced ranged GETs into the sparse span cache, under the
+    /// hydration semaphore and the request's byte accountant; segments the
+    /// ranged path cannot serve (legacy, or a failed range) and every
+    /// segment in `whole` mode get the whole files instead, as before #245.
+    /// Segments hot enough on the ranged path are queued for background
+    /// whole-file promotion.
+    #[cfg(feature = "s3")]
+    fn hydrate_page_docs(
+        &self,
+        pages: &[PageSegment<'_>],
+        request: &Arc<RequestHydration>,
+    ) -> doc_spans::PageFetchStats {
+        let mut stats = doc_spans::PageFetchStats::default();
+        let whole: Vec<PathBuf> = match (self.doc_read_mode, &self.s3_storage) {
+            (_, None) => return stats,
+            (doc_spans::ReadMode::Whole, Some(_)) => {
+                pages.iter().map(|p| p.segment_dir.to_path_buf()).collect()
+            }
+            (doc_spans::ReadMode::Ranged, Some(s3)) => {
+                let fetcher = doc_spans::S3RangeFetcher {
+                    s3,
+                    concurrency: self.scoring_hydrate_concurrency,
+                    budget: &self.hydration_budget,
+                    request,
+                };
+                let outcome = {
+                    let _permit = self.hydration_semaphore.acquire();
+                    self.span_hydrator.hydrate(pages, &fetcher, &self.cache)
+                };
+                stats.ranged_gets = outcome.gets;
+                stats.ranged_bytes = outcome.bytes;
+                for seg in outcome.promote {
+                    self.doc_store_reads.promotion_queued();
+                    self.doc_store_promotions.push(seg);
+                }
+                outcome.whole_fallback
+            }
+        };
+        if !whole.is_empty() {
+            let (files, bytes) = self.ensure_doc_store_local(&whole, request);
+            stats.whole_files = files as u64;
+            stats.whole_bytes = bytes;
+        }
+        self.doc_store_reads.record(&stats);
+        stats
+    }
+
+    /// Start the thread that promotes hot segments from ranged reads to a
+    /// whole local `doc_store.bin` (+ `doc_vectors.bin`), then drops their
+    /// now-redundant spans (#245). One segment at a time, each under a
+    /// hydration permit, so promotions queue behind live queries' fetches
+    /// instead of competing with them.
+    fn spawn_doc_store_promoter(self: &Arc<Self>) {
+        #[cfg(feature = "s3")]
+        {
+            if self.s3_storage.is_none() || self.doc_read_mode != doc_spans::ReadMode::Ranged {
+                return;
+            }
+            // `Weak`, re-upgraded per wait: the thread must not keep the
+            // state alive on its own.
+            let weak = Arc::downgrade(self);
+            std::thread::Builder::new()
+                .name("kosha-doc-promote".into())
+                .spawn(move || loop {
+                    let Some(state) = weak.upgrade() else { return };
+                    if let Some(seg) = state
+                        .doc_store_promotions
+                        .pop_timeout(Duration::from_secs(1))
+                    {
+                        state.promote_doc_store(&seg);
+                    }
+                })
+                .expect("failed to spawn doc-store promotion thread");
+        }
+    }
+
+    /// Hydrate one segment's whole doc store for promotion and drop its
+    /// spans once it is in place.
+    #[cfg(feature = "s3")]
+    fn promote_doc_store(&self, seg: &Path) {
+        let t = Instant::now();
+        let (files, bytes) = {
+            let _permit = self.hydration_semaphore.acquire();
+            self.ensure_doc_store_local(&[seg.to_path_buf()], &RequestHydration::unlimited())
+        };
+        let landed = file_present_nonempty(&seg.join(kosha_segment::DOC_STORE_FILE))
+            && (!kosha_segment::segment_uses_doc_vectors(seg)
+                || file_present_nonempty(&seg.join(kosha_segment::DOC_VECTORS_FILE)));
+        self.span_hydrator
+            .finish_promotion(&self.cache, seg, landed);
+        if landed {
+            self.doc_store_reads.promotion_done();
+            self.doc_store_reads.record(&doc_spans::PageFetchStats {
+                whole_files: files as u64,
+                whole_bytes: bytes,
+                ..Default::default()
+            });
+        }
+        println!(
+            "doc store promote: seg={} landed={landed} fetched {files} file(s) ({:.1} MB) in {:.0} ms",
+            seg.display(),
+            bytes as f64 / (1024.0 * 1024.0),
+            t.elapsed().as_secs_f64() * 1e3,
+        );
     }
 
     #[cfg(feature = "s3")]
@@ -3499,6 +3640,7 @@ fn main() {
     // `/readyz` keeps HPA/kube endpoints from sending traffic while it
     // runs (Tier 1 O2). Liveness (`/healthz`) is unaffected.
     state.spawn_warmup();
+    state.spawn_doc_store_promoter();
     state.spawn_idle_flush_timer();
     state.spawn_compaction_scheduler();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
@@ -4590,6 +4732,7 @@ fn handle_stats(state: &AppState) -> String {
         "segment_checksum_failures": segment_checksum_failures,
         "s3_bucket": s3_bucket,
         "s3_prefix": s3_prefix,
+        "doc_store_reads": state.doc_store_reads.to_json(state.doc_read_mode),
     }))
 }
 
@@ -4763,26 +4906,20 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     };
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
 
-    // On-demand `doc_store.bin` for page materialization (Option A): scoring
-    // hydrated only the offsets sidecar for Lazy segments, so the searcher
-    // asks back for the whole `doc_store.bin` once per distinct page-hit
-    // segment — fetched via the existing `ensure_files_local` and
-    // **persisted to the disk cache**, so every subsequent warm query
-    // against the same segment serves the page from local seeks (sub-ms)
-    // instead of re-paying N per-doc S3 ranged GETs every time.
+    // On-demand page documents: scoring hydrated only the offsets sidecar
+    // for Lazy segments, so the searcher asks back for the page's
+    // documents that are not local yet. `hydrate_page_docs` fetches their
+    // spans with ranged GETs (or whole files, `KOSHA_DOC_STORE_READ_MODE=
+    // whole`) and **persists** them, so a warm repeat is served from local
+    // disk with no S3 request (#245; the PR #84 property).
     #[cfg(feature = "s3")]
-    let ensure_doc_store = |segs: &[std::path::PathBuf]| {
-        // Same accountant as the scoring-set fetch above: the page's doc
-        // stores are hundreds of MB per segment and were previously outside
-        // every byte gate — the request pays for them, so the request's
-        // ceiling has to cover them.
-        let (files, bytes) = state.ensure_doc_store_local(segs, &hydration_request);
-        if files > 0 {
-            println!(
-                "page hydrate: fetched {files} doc store(s) ({:.1} MB)",
-                bytes as f64 / (1024.0 * 1024.0),
-            );
-        }
+    let page_fetch = Mutex::new(doc_spans::PageFetchStats::default());
+    #[cfg(feature = "s3")]
+    let ensure_doc_store = |pages: &[PageSegment<'_>]| {
+        // Same accountant as the scoring-set fetch above: the request pays
+        // for its page's bytes, so the request's ceiling has to cover them.
+        let stats = state.hydrate_page_docs(pages, &hydration_request);
+        page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
     let doc_store_hydrator: DocStoreHydrator<'_> = Some(&ensure_doc_store);
@@ -4797,6 +4934,11 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         doc_store_hydrator,
     ) {
         Ok((result, phases)) => {
+            #[cfg(feature = "s3")]
+            let hydration = HydrationOutcome {
+                page: *page_fetch.lock().unwrap(),
+                ..hydration
+            };
             log_search_timing(
                 &ns,
                 &hydration,
@@ -5136,22 +5278,16 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     };
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
 
-    // On-demand `doc_store.bin` page materialization — see
-    // `handle_search_post` for the rationale (Option A: persist the whole
-    // `doc_store.bin` per page-segment on first miss, then local seeks).
+    // On-demand page documents — see `handle_search_post` and
+    // `hydrate_page_docs`.
     #[cfg(feature = "s3")]
-    let ensure_doc_store = |segs: &[std::path::PathBuf]| {
-        // Same accountant as the scoring-set fetch above: the page's doc
-        // stores are hundreds of MB per segment and were previously outside
-        // every byte gate — the request pays for them, so the request's
-        // ceiling has to cover them.
-        let (files, bytes) = state.ensure_doc_store_local(segs, &hydration_request);
-        if files > 0 {
-            println!(
-                "page hydrate: fetched {files} doc store(s) ({:.1} MB)",
-                bytes as f64 / (1024.0 * 1024.0),
-            );
-        }
+    let page_fetch = Mutex::new(doc_spans::PageFetchStats::default());
+    #[cfg(feature = "s3")]
+    let ensure_doc_store = |pages: &[PageSegment<'_>]| {
+        // Same accountant as the scoring-set fetch above: the request pays
+        // for its page's bytes, so the request's ceiling has to cover them.
+        let stats = state.hydrate_page_docs(pages, &hydration_request);
+        page_fetch.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
     let doc_store_hydrator: DocStoreHydrator<'_> = Some(&ensure_doc_store);
@@ -5166,6 +5302,11 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         doc_store_hydrator,
     ) {
         Ok((result, phases)) => {
+            #[cfg(feature = "s3")]
+            let hydration = HydrationOutcome {
+                page: *page_fetch.lock().unwrap(),
+                ..hydration
+            };
             log_search_timing(
                 &ns,
                 &hydration,
@@ -6547,7 +6688,8 @@ fn log_search_timing(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} score_ms={:.1} \
          materialize_ms={:.1} opens_cold={} opens_cached={} open_total_ms={:.1} \
-         knn_postings={} knn_degraded={} hits={}",
+         knn_postings={} knn_degraded={} hits={} page_gets={} page_ranged_kb={:.1} \
+         page_whole_files={} page_whole_mb={:.1}",
         ns.0,
         total_ms,
         hydrate_ms,
@@ -6563,6 +6705,10 @@ fn log_search_timing(
         phases.knn_postings_probed,
         knn_degraded_segments.unwrap_or(0),
         total_hits,
+        hydration.page.ranged_gets,
+        hydration.page.ranged_bytes as f64 / 1024.0,
+        hydration.page.whole_files,
+        hydration.page.whole_bytes as f64 / (1024.0 * 1024.0),
     );
 }
 
