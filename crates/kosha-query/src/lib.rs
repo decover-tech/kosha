@@ -812,31 +812,51 @@ pub struct QueryAnalysis {
     /// `stop` filter removes matches nothing instead of turning into a
     /// filter-only "match everything" in some segments.
     has_text: bool,
+    /// The legacy `standard@1` reading, analyzed up front: it is what every
+    /// segment without a footer `analysis` (nearly all of them) uses, so
+    /// those segments skip the per-chain map, its lock and its hashing on
+    /// the per-segment hot path.
+    legacy: Arc<AnalyzedQuery>,
     by_chain: Mutex<HashMap<AnalyzerSpec, Arc<AnalyzedQuery>>>,
 }
 
 impl QueryAnalysis {
     pub fn new(query: &SearchQuery) -> Self {
+        let text = query.query_text.clone();
+        let phrase = query.match_phrase.as_ref().map(|mp| mp.phrase.clone());
+        let legacy = Arc::new(Self::analyze(
+            &Analyzer::new(&AnalyzerSpec::legacy()),
+            &text,
+            phrase.as_deref(),
+        ));
         Self {
-            has_text: !tokenize(&query.query_text).is_empty(),
-            text: query.query_text.clone(),
-            phrase: query.match_phrase.as_ref().map(|mp| mp.phrase.clone()),
+            has_text: !legacy.terms.is_empty(),
+            text,
+            phrase,
+            legacy,
             by_chain: Mutex::new(HashMap::new()),
         }
     }
 
+    fn analyze(analyzer: &Analyzer, text: &str, phrase: Option<&str>) -> AnalyzedQuery {
+        AnalyzedQuery {
+            terms: analyzer.analyze(text),
+            phrase: phrase.map(|phrase| analyzer.analyze_with_positions(phrase)),
+        }
+    }
+
     pub fn for_chain(&self, spec: &AnalyzerSpec) -> Arc<AnalyzedQuery> {
+        if spec.is_legacy() {
+            return Arc::clone(&self.legacy);
+        }
         if let Some(found) = self.by_chain.lock().unwrap().get(spec) {
             return Arc::clone(found);
         }
-        let analyzer = Analyzer::new(spec);
-        let analyzed = Arc::new(AnalyzedQuery {
-            terms: analyzer.analyze(&self.text),
-            phrase: self
-                .phrase
-                .as_ref()
-                .map(|phrase| analyzer.analyze_with_positions(phrase)),
-        });
+        let analyzed = Arc::new(Self::analyze(
+            &Analyzer::new(spec),
+            &self.text,
+            self.phrase.as_deref(),
+        ));
         Arc::clone(
             self.by_chain
                 .lock()
@@ -850,6 +870,10 @@ impl QueryAnalysis {
     /// holds `analysis`. Never empty. Readings with no terms are dropped
     /// unless every reading is empty.
     pub fn for_segment(&self, analysis: Option<&SegmentAnalysis>) -> Vec<Arc<AnalyzedQuery>> {
+        let Some(analysis) = analysis else {
+            return vec![Arc::clone(&self.legacy)];
+        };
+        let analysis = Some(analysis);
         let mut readings: Vec<Arc<AnalyzedQuery>> = Vec::new();
         for chain in kosha_core::analysis::segment_query_chains(analysis) {
             let reading = self.for_chain(&chain);

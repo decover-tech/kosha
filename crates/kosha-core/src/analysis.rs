@@ -100,7 +100,11 @@ impl AnalyzerSpec {
     }
 
     pub fn is_legacy(&self) -> bool {
-        *self == Self::legacy()
+        // Field by field rather than `== Self::legacy()`: no allocation, and
+        // it runs per segment on the query hot path.
+        self.tokenizer == TokenizerKind::Standard
+            && self.version == STANDARD_TOKENIZER_V1
+            && self.filters == [TokenFilterSpec::Lowercase]
     }
 
     /// Resolve a schema `analyzer` list: the first name picks the analyzer
