@@ -288,6 +288,12 @@ Indexer
   the pre-compact snapshot; concurrent mutations that remove a merge input cause publish to abort
   (or retry) rather than corrupt the manifest.
 - There is **no** process-wide `Mutex<Indexer>` on the request path.
+- Across processes, the manifest CAS is the only coordination. A writer whose CAS loses
+  (`ManifestConflict`) rebases its unpublished delta onto the committed manifest
+  (`Indexer::rebase_onto`) and retries a bounded number of times. A compaction rebases only if
+  its inputs are still listed remotely with no new remote deletes. A remote compaction is accepted
+  only if it removed no segment with unpublished local deletes. Otherwise the publish fails with
+  409, and nothing is published that references a segment the remote manifest removed.
 
 **Merge selection (size-tiered lite)**
 

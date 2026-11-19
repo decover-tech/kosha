@@ -194,9 +194,11 @@ impl Cache {
         let Some(max) = self.max_bytes else {
             return;
         };
+        let before = self.total_bytes.load(Ordering::Relaxed);
+        let mut files = 0u32;
         loop {
             if self.total_bytes.load(Ordering::Relaxed) <= max {
-                return;
+                break;
             }
             let victim = {
                 let recency = self.recency.lock().unwrap();
@@ -207,9 +209,19 @@ impl Cache {
                     .cloned()
             };
             let Some(key) = victim else {
-                return;
+                break;
             };
             let _ = self.evict(&key);
+            files += 1;
+        }
+        if files > 0 {
+            let now = self.total_bytes.load(Ordering::Relaxed);
+            println!(
+                "disk cache evicted: files={files} freed_mb={:.1} size_mb={:.1} max_mb={:.1}",
+                before.saturating_sub(now) as f64 / 1048576.0,
+                now as f64 / 1048576.0,
+                max as f64 / 1048576.0
+            );
         }
     }
 
