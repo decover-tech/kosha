@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use kosha_core::{
     Bm25Params, Document, DocumentId, FilterClause, FilterStore, KoshaError, Manifest,
-    ManifestEntry, NamespaceId, RangeBound, SegmentId,
+    ManifestEntry, NamespaceId, SegmentId,
 };
 use kosha_segment::SegmentWriter;
 
@@ -44,6 +44,38 @@ struct NamespaceState {
     recovered: Vec<(u64, kosha_core::WalRecord)>,
     recovered_deletes: HashSet<DocumentId>,
     replay_required: bool,
+    /// The manifest as last handed to a search, with what it was built
+    /// from — see [`Indexer::manifest_shared`].
+    shared_manifest: Option<(ManifestStamp, Arc<Manifest>)>,
+}
+
+/// What a shared manifest snapshot was built from. Two equal stamps mean
+/// the snapshot is still what `publication_snapshot` would build.
+///
+/// The version covers every publish (flush, rewrite, compaction, restore
+/// of a newer manifest). Deletes add tombstones between publishes, which
+/// the tombstone counts cover: within one version tombstones only grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManifestStamp {
+    version: u64,
+    segments: usize,
+    footers: usize,
+    tombstoned_segments: usize,
+    tombstones: usize,
+    deletion_vectors: usize,
+}
+
+impl ManifestStamp {
+    fn of(state: &NamespaceState) -> Self {
+        Self {
+            version: state.manifest.version,
+            segments: state.manifest.segments.len(),
+            footers: state.manifest.segment_footers.len(),
+            tombstoned_segments: state.tombstones.len(),
+            tombstones: state.tombstones.values().map(HashSet::len).sum(),
+            deletion_vectors: state.manifest.deletion_vectors.len(),
+        }
+    }
 }
 
 impl NamespaceState {
@@ -68,6 +100,7 @@ impl NamespaceState {
             recovered: Vec::new(),
             recovered_deletes: HashSet::new(),
             replay_required: false,
+            shared_manifest: None,
         }
     }
 }
@@ -1539,6 +1572,7 @@ impl Indexer {
         state.tombstones = manifest.tombstones.clone();
         state.published_version = manifest.version;
         state.manifest = manifest;
+        state.shared_manifest = None;
         state.known = true;
     }
 
@@ -1549,6 +1583,79 @@ impl Indexer {
     pub fn manifest_cloned(&self, namespace: &NamespaceId) -> Option<Manifest> {
         self.publication_snapshot(namespace)
             .map(|(_, manifest)| manifest)
+    }
+
+    /// The namespace's manifest version, without cloning the manifest.
+    pub fn manifest_version(&self, namespace: &NamespaceId) -> Option<u64> {
+        let map = self.namespaces.lock().unwrap();
+        let handle = map.get(namespace)?;
+        let state = handle.state.lock().unwrap();
+        state.known.then_some(state.manifest.version)
+    }
+
+    /// Replace the footers the manifest carries for segments it still
+    /// references, and bump the version if any were replaced.
+    ///
+    /// The manifest's copy of a footer is the one searches prune with, so a
+    /// footer rewritten on disk (new blooms) changes nothing until it is
+    /// installed here. Returns how many were installed.
+    pub fn replace_segment_footers(
+        &self,
+        namespace: &NamespaceId,
+        footers: Vec<kosha_core::Footer>,
+    ) -> usize {
+        let handle = self.ns_handle(namespace);
+        let mut state = handle.state.lock().unwrap();
+        let mut replaced = 0;
+        for footer in footers {
+            let referenced = state
+                .manifest
+                .segments
+                .iter()
+                .any(|entry| entry.segment_id == footer.segment_id);
+            if referenced {
+                state.manifest.remember_segment_footer(footer);
+                replaced += 1;
+            }
+        }
+        if replaced > 0 {
+            state.manifest.version += 1;
+        }
+        replaced
+    }
+
+    /// The manifest for a search (tombstones included), shared rather than
+    /// copied: the same value [`Indexer::manifest_cloned`] returns.
+    ///
+    /// A manifest carries a footer for every segment, each with its term
+    /// and filter blooms, so copying it is megabytes of allocation for a
+    /// namespace of a few hundred segments, and every search made that copy
+    /// before doing any work. This hands out one shared copy and rebuilds
+    /// it only when the namespace changes (see [`ManifestStamp`]).
+    pub fn manifest_shared(&self, namespace: &NamespaceId) -> Option<Arc<Manifest>> {
+        let map = self.namespaces.lock().unwrap();
+        let handle = map.get(namespace)?;
+        let mut state = handle.state.lock().unwrap();
+        if !state.known {
+            return None;
+        }
+        let stamp = ManifestStamp::of(&state);
+        if let Some((cached, manifest)) = state.shared_manifest.as_ref() {
+            if *cached == stamp {
+                return Some(Arc::clone(manifest));
+            }
+        }
+        let mut manifest = state.manifest.clone();
+        manifest.tombstones = state.tombstones.clone();
+        manifest.deletion_vectors.retain(|segment, _| {
+            manifest
+                .segments
+                .iter()
+                .any(|entry| &entry.segment_id == segment)
+        });
+        let manifest = Arc::new(manifest);
+        state.shared_manifest = Some((stamp, Arc::clone(&manifest)));
+        Some(manifest)
     }
 
     /// Capture the CAS anchor and candidate under one namespace lock. The
@@ -1746,185 +1853,16 @@ pub fn apply_filter_delete(
     store: &FilterStore,
     candidates: &HashSet<u32>,
 ) -> Result<HashSet<u32>, KoshaError> {
-    match filter {
-        FilterClause::Term { term } => {
-            let mut result = HashSet::new();
-            for (field, value) in term {
-                if let Some(entries) = store.string_fields.get(field) {
-                    for &(ds, ref v) in entries {
-                        if candidates.contains(&ds) && v == value {
-                            result.insert(ds);
-                        }
-                    }
-                }
-            }
-            Ok(result)
-        }
-        FilterClause::Terms { terms } => {
-            let mut result = HashSet::new();
-            for (field, values) in terms {
-                let vs: HashSet<&str> = values.iter().map(|s| s.as_str()).collect();
-                if let Some(entries) = store.string_fields.get(field) {
-                    for &(ds, ref v) in entries {
-                        if candidates.contains(&ds) && vs.contains(v.as_str()) {
-                            result.insert(ds);
-                        }
-                    }
-                }
-            }
-            Ok(result)
-        }
-        FilterClause::Range { range } => {
-            let mut result = HashSet::new();
-            for (field, bound) in range {
-                if let Some(entries) = store.integer_fields.get(field) {
-                    for &(ds, val) in entries {
-                        if candidates.contains(&ds) && range_check_i64(val, bound) {
-                            result.insert(ds);
-                        }
-                    }
-                } else if let Some(entries) = store.float_fields.get(field) {
-                    for &(ds, val) in entries {
-                        if candidates.contains(&ds) && range_check_f64(val, bound) {
-                            result.insert(ds);
-                        }
-                    }
-                } else if let Some(entries) = store.string_fields.get(field) {
-                    for &(ds, ref v) in entries {
-                        if candidates.contains(&ds) && range_check_str(v, bound) {
-                            result.insert(ds);
-                        }
-                    }
-                }
-            }
-            Ok(result)
-        }
-        FilterClause::Bool { bool: b } => {
-            let mut working: Option<HashSet<u32>> = None;
-            if !b.must.is_empty() {
-                let mut acc = candidates.clone();
-                for c in &b.must {
-                    acc = apply_filter_delete(c, store, &acc)?;
-                }
-                working = Some(acc);
-            }
-            if !b.must_not.is_empty() {
-                let base = working.take().unwrap_or_else(|| candidates.clone());
-                let mut excluded = HashSet::new();
-                for c in &b.must_not {
-                    excluded.extend(apply_filter_delete(c, store, &base)?);
-                }
-                working = Some(base.difference(&excluded).copied().collect());
-            }
-            if !b.should.is_empty() {
-                let base = working.take().unwrap_or_else(|| candidates.clone());
-                let mut scores: HashMap<u32, usize> = HashMap::new();
-                for c in &b.should {
-                    for ds in apply_filter_delete(c, store, &base)? {
-                        *scores.entry(ds).or_default() += 1;
-                    }
-                }
-                let passed: HashSet<u32> = scores
-                    .into_iter()
-                    .filter(|(_, c)| *c >= b.minimum_should_match)
-                    .map(|(d, _)| d)
-                    .collect();
-                working = Some(if base.is_empty() {
-                    passed
-                } else {
-                    base.intersection(&passed).copied().collect()
-                });
-            }
-            Ok(working.unwrap_or_else(|| candidates.clone()))
-        }
-        FilterClause::MatchAll { .. } => Ok(candidates.clone()),
-    }
-}
-
-fn range_check_i64(val: i64, bound: &RangeBound) -> bool {
-    if let Some(ref gte) = bound.gte {
-        if let Ok(b) = gte.parse::<i64>() {
-            if val < b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref gt) = bound.gt {
-        if let Ok(b) = gt.parse::<i64>() {
-            if val <= b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lte) = bound.lte {
-        if let Ok(b) = lte.parse::<i64>() {
-            if val > b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lt) = bound.lt {
-        if let Ok(b) = lt.parse::<i64>() {
-            if val >= b {
-                return false;
-            }
-        }
-    }
-    true
-}
-fn range_check_f64(val: f64, bound: &RangeBound) -> bool {
-    if let Some(ref gte) = bound.gte {
-        if let Ok(b) = gte.parse::<f64>() {
-            if val < b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref gt) = bound.gt {
-        if let Ok(b) = gt.parse::<f64>() {
-            if val <= b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lte) = bound.lte {
-        if let Ok(b) = lte.parse::<f64>() {
-            if val > b {
-                return false;
-            }
-        }
-    }
-    if let Some(ref lt) = bound.lt {
-        if let Ok(b) = lt.parse::<f64>() {
-            if val >= b {
-                return false;
-            }
-        }
-    }
-    true
-}
-fn range_check_str(val: &str, bound: &RangeBound) -> bool {
-    if let Some(ref gte) = bound.gte {
-        if val < gte.as_str() {
-            return false;
-        }
-    }
-    if let Some(ref gt) = bound.gt {
-        if val <= gt.as_str() {
-            return false;
-        }
-    }
-    if let Some(ref lte) = bound.lte {
-        if val > lte.as_str() {
-            return false;
-        }
-    }
-    if let Some(ref lt) = bound.lt {
-        if val >= lt.as_str() {
-            return false;
-        }
-    }
-    true
+    // The one filter implementation, shared with search (kosha-core's
+    // `docset`), so a delete matches exactly the documents a search with
+    // the same filter returns.
+    let doc_count = candidates.iter().max().map_or(0, |max| max + 1);
+    let passing = kosha_core::evaluate_filter(filter, store, doc_count);
+    Ok(candidates
+        .iter()
+        .copied()
+        .filter(|doc_seq| passing.contains(*doc_seq))
+        .collect())
 }
 
 #[cfg(test)]

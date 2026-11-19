@@ -573,6 +573,9 @@ fn build_search_query(
         total_hits_cap: None,
         operator: or.then_some(kosha_core::QueryOperator::Or),
         no_cache: None,
+        collapse: None,
+        source_includes: None,
+        source_excludes: None,
     }
 }
 

@@ -138,6 +138,9 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         total_hits_cap: None,
         operator: None,
         no_cache: None,
+        collapse: None,
+        source_includes: None,
+        source_excludes: None,
     }
 }
 

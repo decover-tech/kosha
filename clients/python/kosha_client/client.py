@@ -169,122 +169,607 @@ class KoshaClient:
     def search(
         self, index: str | None = None, body: dict | None = None, **params: Any
     ) -> dict:
+        """Run an OpenSearch search body against Kosha.
+
+        The body is translated to Kosha's native query (see
+        ``_translate_search``). A clause Kosha cannot express raises
+        ``KoshaRequestError(400)`` naming it. It is never dropped: dropping
+        a filter silently returns documents the caller excluded.
+        """
         ns = self._resolve_ns(index)
+        body = body or {}
+        kosha_body, context = self._translate_search(body, params)
+        kosha_body["namespace"] = ns
 
-        query_text = self._extract_query_text(body) if body else ""
-        size = body.get("size", 10) if body else 10
-        from_ = body.get("from", 0) if body else 0
-        filter_clause = self._extract_filter(body)
-        aggs = self._extract_aggs(body)
-        wildcard = self._extract_wildcard(body)
-        match_phrase = self._extract_match_phrase(body)
-        knn = self._extract_knn(body)
-        sort = self._extract_sort(body)
-        search_after = body.get("search_after") if body else None
-        if search_after is not None:
-            search_after = [str(v) for v in search_after]
-
-        # Determine if we need POST (agg/wildcard/phrase/filter/knn/sort/cursor).
-        needs_post = bool(
-            filter_clause
-            or aggs
-            or wildcard
-            or match_phrase
-            or knn
-            or sort
-            or search_after
-        )
-
-        if not needs_post:
-            bm25_params = {}
-            q = body and (body.get("query") or {})
-            if q:
-                bm25_params = self._extract_bm25_params(q)
-            query_params = {"ns": ns, "q": query_text, "max_results": str(size + from_)}
-            if bm25_params:
-                query_params.update(bm25_params)
-            url = f"{self._kosha_url}/search?{urllib.parse.urlencode(query_params)}"
-            try:
-                req = urllib.request.Request(url)
-                if self._transport.api_key:
-                    req.add_header("Authorization", f"Bearer {self._transport.api_key}")
-                elif self._auth:
-                    import base64
-
-                    user, pwd = self._auth
-                    token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
-                    req.add_header("Authorization", f"Basic {token}")
-                start = time.monotonic()
-                resp = urllib.request.urlopen(req, timeout=self._timeout)
-                took_ms = int((time.monotonic() - start) * 1000)
-                result = json.loads(resp.read().decode())
-            except urllib.error.HTTPError as e:
-                took_ms = 0
-                if e.code == 404:
-                    return self._build_search_response([], from_, size, took_ms)
-                body_bytes = e.read()
-                try:
-                    err = json.loads(body_bytes.decode())
-                except json.JSONDecodeError:
-                    err = {"error": body_bytes.decode()}
-                raise KoshaRequestError(e.code, err.get("error", str(e)), err) from e
-            kosha_hits = result.get("results", [])
-            total = result.get("total_hits", 0)
-            return self._build_search_response(kosha_hits, from_, size, took_ms, total)
-
-        # search_after replaces from (OpenSearch semantics).
-        kosha_body = {
-            "namespace": ns,
-            "query_text": query_text,
-            "max_results": size if search_after else size + from_,
-            "from": 0 if search_after else from_,
-        }
-        if filter_clause:
-            kosha_body["filter"] = filter_clause
-        if aggs:
-            kosha_body["aggs"] = aggs
-        if wildcard:
-            kosha_body["wildcard"] = wildcard
-        if match_phrase:
-            kosha_body["match_phrase"] = match_phrase
-        if knn:
-            kosha_body["knn"] = knn
-        if sort:
-            kosha_body["sort"] = sort
-        if search_after:
-            kosha_body["search_after"] = search_after
-
+        start = time.monotonic()
         try:
             result = self._request("POST", "search", body=kosha_body)
         except KoshaRequestError as e:
             if e.status_code == 404:
-                return self._build_search_response([], 0, size, 0)
-            raise
-        kosha_hits = result.get("results", [])
-        total = result.get("total_hits", 0)
-        kosha_aggs = result.get("aggregations")
+                # An index nothing has been written to yet: no hits.
+                result = {"results": [], "total_hits": 0}
+            else:
+                raise
+        took_ms = int((time.monotonic() - start) * 1000)
+        return self._build_search_response(result, took_ms, context)
 
-        # Server already applied from/search_after/size — do not re-slice.
-        response = self._build_search_response(
-            kosha_hits, 0, len(kosha_hits) or size, 0, total
+    # ── Query translation ──────────────────────────────────────────────────
+
+    # Options that change how a clause scores or parses but not which
+    # documents it matches, so they can be ignored without changing results.
+    _IGNORED_RANGE_KEYS = frozenset({"format", "time_zone", "boost", "relation"})
+    _BOUND_KEYS = ("gte", "gt", "lte", "lt")
+
+    @staticmethod
+    def _unsupported(what: str) -> KoshaRequestError:
+        message = (
+            f"unsupported by Kosha: {what}. The clause was not sent; "
+            "dropping it would change which documents match"
         )
-        if kosha_aggs:
-            response["aggregations"] = kosha_aggs
-        return response
+        return KoshaRequestError(400, message, {"error": message})
+
+    @staticmethod
+    def _as_list(value: Any) -> list:
+        if value is None:
+            return []
+        return list(value) if isinstance(value, (list, tuple)) else [value]
+
+    @staticmethod
+    def _scalar(value: Any) -> str:
+        """A filter value as Kosha compares it: always a string.
+
+        Booleans are stored as ``"true"``/``"false"`` (see
+        ``_source_to_fields``), so ``True`` must not become ``"True"``.
+        """
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if value is None:
+            raise KoshaClient._unsupported("a null filter value")
+        if isinstance(value, (dict, list, tuple)):
+            raise KoshaClient._unsupported(f"a non-scalar filter value {value!r}")
+        return str(value)
+
+    @classmethod
+    def _to_filter(cls, clause: Any) -> dict:
+        """Translate an OpenSearch filter clause into a Kosha filter.
+
+        Handles ``term``, ``terms``, ``range``, ``exists``, ``match_all``
+        and ``bool`` at any depth. Anything else raises.
+
+        ``bool`` follows OpenSearch's rules for ``should``: with no
+        ``minimum_should_match``, the clauses are required (at least one)
+        when the bool has no ``must``/``filter``, and optional when it has.
+        Optional clauses cannot change which documents a filter matches, so
+        they are left out. Kosha's own rule is that a non-empty ``should``
+        is always required, so the difference has to be resolved here.
+        """
+        if not isinstance(clause, dict) or len(clause) != 1:
+            raise cls._unsupported(f"filter clause {clause!r}")
+        kind, spec = next(iter(clause.items()))
+
+        if kind == "match_all":
+            return {"match_all": {}}
+
+        if kind == "term":
+            out = {}
+            for field, value in (spec or {}).items():
+                if field == "boost":
+                    continue
+                if field == "_id":
+                    raise cls._unsupported("a term filter on _id")
+                if isinstance(value, dict):
+                    value = value.get("value")
+                out[field] = cls._scalar(value)
+            if not out:
+                raise cls._unsupported(f"empty term clause {clause!r}")
+            return {"term": out}
+
+        if kind == "terms":
+            out = {}
+            for field, values in (spec or {}).items():
+                if field == "boost":
+                    continue
+                if field == "_id":
+                    raise cls._unsupported("a terms filter on _id")
+                out[field] = [cls._scalar(v) for v in cls._as_list(values)]
+            if not out:
+                raise cls._unsupported(f"empty terms clause {clause!r}")
+            return {"terms": out}
+
+        if kind == "range":
+            out = {}
+            for field, bounds in (spec or {}).items():
+                if not isinstance(bounds, dict):
+                    raise cls._unsupported(f"range clause {clause!r}")
+                unknown = set(bounds) - set(cls._BOUND_KEYS) - cls._IGNORED_RANGE_KEYS
+                if unknown:
+                    raise cls._unsupported(f"range option(s) {sorted(unknown)}")
+                out[field] = {
+                    k: cls._scalar(v)
+                    for k, v in bounds.items()
+                    if k in cls._BOUND_KEYS and v is not None
+                }
+            return {"range": out}
+
+        if kind == "exists":
+            field = (spec or {}).get("field")
+            if not field:
+                raise cls._unsupported(f"exists clause {clause!r}")
+            return {"exists": {"field": field}}
+
+        if kind == "bool":
+            spec = spec or {}
+            unknown = set(spec) - {
+                "must", "filter", "must_not", "should", "minimum_should_match", "boost",
+            }
+            if unknown:
+                raise cls._unsupported(f"bool option(s) {sorted(unknown)}")
+            must = [
+                cls._to_filter(c)
+                for key in ("must", "filter")
+                for c in cls._as_list(spec.get(key))
+            ]
+            must_not = [cls._to_filter(c) for c in cls._as_list(spec.get("must_not"))]
+            should_raw = cls._as_list(spec.get("should"))
+            need = cls._should_need(spec, has_required=bool(must))
+            out: dict = {}
+            if must:
+                out["must"] = must
+            if must_not:
+                out["must_not"] = must_not
+            if should_raw and need > 0:
+                out["should"] = [cls._to_filter(c) for c in should_raw]
+                out["minimum_should_match"] = need
+            if not out:
+                return {"match_all": {}}
+            return {"bool": out}
+
+        raise cls._unsupported(f"'{kind}' as a filter")
+
+    @classmethod
+    def _should_need(cls, bool_spec: dict, has_required: bool) -> int:
+        """How many ``should`` clauses must match (OpenSearch's default)."""
+        raw = bool_spec.get("minimum_should_match")
+        if raw is None:
+            return 0 if has_required else 1
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            raise cls._unsupported(f"minimum_should_match={raw!r}") from None
+
+    @classmethod
+    def _is_filter(cls, clause: Any) -> bool:
+        try:
+            cls._to_filter(clause)
+            return True
+        except KoshaRequestError:
+            return False
+
+    @classmethod
+    def _text_leaf(cls, clause: dict) -> tuple[str, Any] | None:
+        """``("text"|"phrase"|"wildcard", payload)`` for a full-text leaf.
+
+        Kosha has one text index covering every text field of a document,
+        so the field a clause names selects nothing: ``match`` on ``title``
+        and on ``content`` are the same query.
+        """
+        if not isinstance(clause, dict) or len(clause) != 1:
+            return None
+        kind, spec = next(iter(clause.items()))
+        if kind == "match":
+            for _field, value in (spec or {}).items():
+                if isinstance(value, dict):
+                    extra = set(value) - {"query", "operator", "boost"}
+                    if extra:
+                        raise cls._unsupported(f"match option(s) {sorted(extra)}")
+                    text = str(value.get("query", ""))
+                    operator = str(value.get("operator", "or")).lower()
+                else:
+                    text, operator = str(value), "or"
+                return "text", (text, operator)
+            return None
+        if kind == "multi_match":
+            spec = spec or {}
+            kind_of = spec.get("type", "best_fields")
+            if kind_of not in ("best_fields", "most_fields", "cross_fields"):
+                raise cls._unsupported(f"multi_match type {kind_of!r}")
+            return "text", (
+                str(spec.get("query", "")),
+                str(spec.get("operator", "or")).lower(),
+            )
+        if kind == "match_phrase":
+            for field, value in (spec or {}).items():
+                if isinstance(value, dict):
+                    return "phrase", {
+                        "field": field,
+                        "phrase": str(value.get("query", "")),
+                        "slop": int(value.get("slop", 0) or 0),
+                    }
+                return "phrase", {"field": field, "phrase": str(value), "slop": 0}
+            return None
+        if kind == "wildcard":
+            for field, value in (spec or {}).items():
+                if isinstance(value, dict):
+                    return "wildcard", {
+                        "field": field,
+                        "pattern": value.get("value", value.get("wildcard", "")),
+                        "case_insensitive": bool(value.get("case_insensitive", True)),
+                    }
+                return "wildcard", {
+                    "field": field, "pattern": value, "case_insensitive": True,
+                }
+            return None
+        return None
+
+    @classmethod
+    def _plan_query(cls, query: dict | None) -> dict:
+        """Split an OpenSearch query into the parts Kosha's query has.
+
+        Kosha's query is one of each: a text query (terms joined by a single
+        AND or OR), a phrase, a wildcard, a vector search, and a filter
+        tree. This walks the OpenSearch query and assigns each clause to one
+        of those, raising when the query needs something that shape cannot
+        hold (two different phrases, text OR-ed with a filter, a clause
+        type Kosha does not have).
+        """
+        plan: dict = {
+            "required_text": [],   # [(text, operator)] every one must match
+            "any_text": [],        # [(text, operator)] at least one must match
+            "phrase": None,
+            "wildcard": None,
+            "knn": None,
+            "must": [],
+            "must_not": [],
+        }
+        cls._absorb(query or {}, plan, required=True)
+        return plan
+
+    @classmethod
+    def _set_once(cls, plan: dict, key: str, value: dict) -> None:
+        if plan[key] is not None and plan[key] != value:
+            raise cls._unsupported(f"more than one {key} clause in a query")
+        plan[key] = value
+
+    @classmethod
+    def _absorb(cls, clause: dict, plan: dict, required: bool) -> None:
+        """Place one clause that has to match (``required``) into ``plan``."""
+        if not clause or "match_all" in clause:
+            return
+        if not isinstance(clause, dict) or len(clause) != 1:
+            raise cls._unsupported(f"query clause {clause!r}")
+        kind, spec = next(iter(clause.items()))
+
+        if kind == "function_score":
+            cls._absorb((spec or {}).get("query") or {}, plan, required)
+            return
+
+        if kind == "knn":
+            cls._set_once(plan, "knn", cls._knn(spec))
+            return
+
+        leaf = cls._text_leaf(clause)
+        if leaf is not None:
+            what, payload = leaf
+            if what == "text":
+                if payload[0].strip():
+                    plan["required_text"].append(payload)
+            else:
+                cls._set_once(plan, what, payload)
+            return
+
+        if kind == "bool":
+            cls._absorb_bool(spec or {}, plan)
+            return
+
+        # Everything else is either a filter or not expressible.
+        plan["must"].append(cls._to_filter(clause))
+
+    @classmethod
+    def _absorb_bool(cls, spec: dict, plan: dict) -> None:
+        if cls._is_filter({"bool": spec}):
+            translated = cls._to_filter({"bool": spec})
+            if translated != {"match_all": {}}:
+                plan["must"].append(translated)
+            return
+
+        unknown = set(spec) - {
+            "must", "filter", "must_not", "should", "minimum_should_match", "boost",
+        }
+        if unknown:
+            raise cls._unsupported(f"bool option(s) {sorted(unknown)}")
+
+        required = cls._as_list(spec.get("must")) + cls._as_list(spec.get("filter"))
+        for child in required:
+            cls._absorb(child, plan, required=True)
+        for child in cls._as_list(spec.get("must_not")):
+            # Only a filter can be negated: Kosha has no "text must not
+            # match".
+            plan["must_not"].append(cls._to_filter(child))
+
+        should = cls._as_list(spec.get("should"))
+        if not should:
+            return
+        need = cls._should_need(spec, has_required=bool(required))
+        if need == 0:
+            # Optional clauses only adjust the score of documents that
+            # already match. Kosha cannot apply the boost; the set of
+            # matching documents is unchanged.
+            return
+        if need > 1:
+            raise cls._unsupported("minimum_should_match > 1 over text clauses")
+
+        if all(cls._is_filter(c) for c in should):
+            plan["must"].append(
+                {
+                    "bool": {
+                        "should": [cls._to_filter(c) for c in should],
+                        "minimum_should_match": 1,
+                    }
+                }
+            )
+            return
+
+        # At least one of several text clauses. The keyword compiler emits
+        # this shape for one term searched across several fields: the same
+        # clause repeated per field, which is a single clause here.
+        leaves = []
+        for child in should:
+            leaf = cls._text_leaf(child)
+            if leaf is None:
+                raise cls._unsupported(
+                    "a should group mixing text with filters or nested queries"
+                )
+            leaves.append(leaf)
+        kinds = {what for what, _ in leaves}
+        if len(kinds) > 1:
+            raise cls._unsupported("a should group mixing text, phrase and wildcard")
+        what = kinds.pop()
+        if what == "text":
+            distinct = list(dict.fromkeys(payload for _, payload in leaves))
+            if len(distinct) == 1:
+                plan["required_text"].append(distinct[0])
+            else:
+                plan["any_text"].extend(distinct)
+        else:
+            same = {
+                (p.get("phrase", p.get("pattern")), p.get("slop", 0)) for _, p in leaves
+            }
+            if len(same) > 1:
+                raise cls._unsupported(f"a should group of different {what} clauses")
+            cls._set_once(plan, what, leaves[0][1])
+
+    @classmethod
+    def _knn(cls, spec: dict) -> dict:
+        """``{"knn": {field: {vector, k, filter}}}`` → Kosha's kNN.
+
+        The filter is carried into the vector search itself. It used to be
+        dropped here, so a matter-scoped semantic search returned the
+        nearest chunks of every matter in the index.
+        """
+        for field, options in (spec or {}).items():
+            if not isinstance(options, dict):
+                continue
+            unknown = set(options) - {
+                "vector", "k", "filter", "num_candidates", "boost",
+            }
+            if unknown:
+                raise cls._unsupported(f"knn option(s) {sorted(unknown)}")
+            k = int(options.get("k", 10))
+            knn = {
+                "field": field,
+                "vector": options.get("vector", []),
+                "k": k,
+                "num_candidates": int(options.get("num_candidates", max(100, k))),
+            }
+            if options.get("filter"):
+                translated = cls._to_filter(options["filter"])
+                if translated != {"match_all": {}}:
+                    knn["filter"] = translated
+            return knn
+        raise cls._unsupported(f"knn clause {spec!r}")
+
+    @classmethod
+    def _resolve_text(cls, plan: dict) -> tuple[str, str | None]:
+        """The plan's text clauses as one ``(query_text, operator)``."""
+        required = list(dict.fromkeys(plan["required_text"]))
+        any_of = list(dict.fromkeys(plan["any_text"]))
+        if required and any_of:
+            raise cls._unsupported("text that must match combined with an OR group of text")
+        if any_of:
+            if any(op == "and" and len(text.split()) > 1 for text, op in any_of):
+                raise cls._unsupported("an OR group of multi-word AND clauses")
+            return " ".join(text for text, _ in any_of), "or"
+        if not required:
+            return "", None
+        if len(required) == 1:
+            text, operator = required[0]
+            return text, operator
+        # Several clauses, all required: every term of every clause, which
+        # is only the same thing if no clause is itself an OR of words.
+        if any(op != "and" and len(text.split()) > 1 for text, op in required):
+            raise cls._unsupported(
+                "several required text clauses where one is a multi-word OR"
+            )
+        return " ".join(text for text, _ in required), "and"
+
+    @classmethod
+    def _translate_search(cls, body: dict, params: dict | None = None) -> tuple[dict, dict]:
+        """OpenSearch search body → ``(kosha request, response context)``."""
+        params = params or {}
+        size = int(body.get("size", params.get("size", 10)))
+        from_ = int(body.get("from", params.get("from_", 0)) or 0)
+
+        query = body.get("query") or {}
+        plan = cls._plan_query(query)
+        if body.get("knn"):
+            # Legacy top-level form: {"knn": {field: {...}}}.
+            cls._set_once(plan, "knn", cls._knn(body["knn"]))
+        if body.get("post_filter"):
+            plan["must"].append(cls._to_filter(body["post_filter"]))
+
+        text, operator = cls._resolve_text(plan)
+        if plan["phrase"] and text:
+            raise cls._unsupported("a phrase and separate query text in one query")
+
+        search_after = body.get("search_after")
+        kosha: dict = {
+            "query_text": text,
+            "max_results": size,
+            "from": 0 if search_after else from_,
+        }
+        if operator and text:
+            kosha["operator"] = operator
+
+        must, must_not = plan["must"], plan["must_not"]
+        if must_not or len(must) > 1:
+            node: dict = {}
+            if must:
+                node["must"] = must
+            if must_not:
+                node["must_not"] = must_not
+            kosha["filter"] = {"bool": node}
+        elif must:
+            kosha["filter"] = must[0]
+
+        if plan["phrase"]:
+            kosha["match_phrase"] = plan["phrase"]
+        if plan["wildcard"]:
+            kosha["wildcard"] = plan["wildcard"]
+        if plan["knn"]:
+            kosha["knn"] = plan["knn"]
+
+        aggs = cls._extract_aggs(body)
+        if aggs:
+            kosha["aggs"] = aggs
+        sort = cls._extract_sort(body)
+        if sort:
+            kosha["sort"] = sort
+        if search_after:
+            kosha["search_after"] = [
+                "" if v is None else cls._scalar(v) for v in search_after
+            ]
+
+        track = body.get("track_total_hits", params.get("track_total_hits"))
+        if track is True:
+            kosha["exact_total_hits"] = True
+        elif isinstance(track, int) and not isinstance(track, bool) and track > 0:
+            kosha["total_hits_cap"] = track
+
+        collapse = body.get("collapse")
+        if collapse:
+            unknown = set(collapse) - {"field"}
+            if unknown:
+                raise cls._unsupported(f"collapse option(s) {sorted(unknown)}")
+            kosha["collapse"] = {"field": collapse["field"]}
+
+        source = body.get("_source", params.get("_source"))
+        if source is False:
+            kosha["source_includes"] = []
+        elif isinstance(source, (list, tuple)):
+            kosha["source_includes"] = list(source)
+        elif isinstance(source, str):
+            kosha["source_includes"] = [source]
+        elif isinstance(source, dict):
+            includes = cls._as_list(source.get("includes", source.get("include")))
+            excludes = cls._as_list(source.get("excludes", source.get("exclude")))
+            if includes:
+                kosha["source_includes"] = includes
+            if excludes:
+                kosha["source_excludes"] = excludes
+
+        highlight_field = None
+        highlight = body.get("highlight")
+        if highlight and isinstance(highlight.get("fields"), dict):
+            highlight_field, options = next(iter(highlight["fields"].items()))
+            options = options or {}
+            spec = {"field": highlight_field}
+            for key in ("pre_tags", "post_tags"):
+                tags = options.get(key, highlight.get(key))
+                if tags:
+                    spec[key] = cls._as_list(tags)
+            kosha["highlight"] = spec
+
+        context = {
+            "size": size,
+            "sort": sort or [],
+            "collapse_field": (collapse or {}).get("field"),
+            "highlight_field": highlight_field,
+        }
+        return kosha, context
+
+    # Aggregation types Kosha computes. A sub-aggregation is refused rather
+    # than ignored: the caller would read buckets that are not there.
+    _AGG_TYPES = ("terms", "cardinality", "composite")
+
+    @classmethod
+    def _extract_aggs(cls, body: dict | None) -> dict | None:
+        """Validate and pass through the aggregations of a search body."""
+        if not body:
+            return None
+        aggs = body.get("aggs") or body.get("aggregations")
+        if not aggs:
+            return None
+        out = {}
+        for name, spec in aggs.items():
+            if not isinstance(spec, dict):
+                raise cls._unsupported(f"aggregation {name!r}: {spec!r}")
+            if "aggs" in spec or "aggregations" in spec:
+                raise cls._unsupported(f"sub-aggregations (in {name!r})")
+            kinds = [k for k in spec if k != "meta"]
+            if len(kinds) != 1 or kinds[0] not in cls._AGG_TYPES:
+                raise cls._unsupported(f"aggregation type(s) {kinds} (in {name!r})")
+            out[name] = {kinds[0]: spec[kinds[0]]}
+        return out
+
+    @staticmethod
+    def _extract_sort(body: dict | None) -> list[dict] | None:
+        """Translate OpenSearch ``sort`` into Kosha ``SortSpec`` objects.
+
+        Accepts ``"field"``, ``{"field": "asc"}`` and
+        ``{"field": {"order": "asc", ...}}`` entries. ``_doc`` (index
+        order, used to walk a result set) becomes ``_id`` ascending, which
+        is equally stable. Other per-field options (``missing``, ``mode``,
+        ``unmapped_type``) are not applied: a document without the field
+        sorts first.
+        """
+        if not body:
+            return None
+        raw = body.get("sort")
+        if not raw:
+            return None
+        if isinstance(raw, (str, dict)):
+            raw = [raw]
+        out: list[dict] = []
+        for entry in raw:
+            if isinstance(entry, str):
+                entry = {entry: "asc"}
+            if not isinstance(entry, dict):
+                continue
+            spec: dict[str, dict[str, str]] = {}
+            for field, val in entry.items():
+                if field == "_doc":
+                    field = "_id"
+                if isinstance(val, str):
+                    spec[field] = {"order": val}
+                elif isinstance(val, dict):
+                    spec[field] = {"order": str(val.get("order", "asc"))}
+                else:
+                    spec[field] = {"order": "asc"}
+            if spec:
+                out.append(spec)
+        return out or None
 
     def _build_search_response(
-        self,
-        kosha_hits: list[dict],
-        from_: int,
-        size: int,
-        took_ms: int,
-        total: int | None = None,
+        self, result: dict, took_ms: int = 0, context: dict | None = None
     ) -> dict:
-        if total is None:
-            total = len(kosha_hits)
+        """Kosha search result → OpenSearch response dict."""
+        context = context or {}
+        sort = context.get("sort") or []
+        collapse_field = context.get("collapse_field")
+        highlight_field = context.get("highlight_field")
 
         hits = []
-        for k_hit in kosha_hits:
+        for k_hit in result.get("results", []):
             doc_id = k_hit.get("doc_id", "")
             score = k_hit.get("score", 0.0)
             source = {}
@@ -295,101 +780,69 @@ class KoshaClient:
                 # Store field type for filter-aware operations.
                 if field.get("field_type") not in ("Text", None):
                     source[f"__type__{field['name']}"] = field["field_type"]
-            hits.append(
-                {
-                    "_index": self._namespace,
-                    "_id": doc_id,
-                    "_score": score,
-                    "_source": source,
-                }
-            )
+            hit = {
+                "_index": self._namespace,
+                "_id": doc_id,
+                "_score": score,
+                "_source": source,
+            }
+            if highlight_field and k_hit.get("highlights"):
+                hit["highlight"] = {highlight_field: k_hit["highlights"]}
+            if sort:
+                # The values this hit sorted by, in sort-key order: what a
+                # caller passes back as ``search_after`` for the next page.
+                values = []
+                for spec in sort:
+                    for field in spec:
+                        if field == "_id":
+                            values.append(doc_id)
+                        elif field == "_score":
+                            values.append(score)
+                        else:
+                            values.append(source.get(field))
+                hit["sort"] = values
+            if collapse_field:
+                base = collapse_field
+                for suffix in (".keyword", ".raw"):
+                    if base not in source and base.endswith(suffix):
+                        base = base[: -len(suffix)]
+                hit["fields"] = {collapse_field: [source.get(base)]}
+            hits.append(hit)
 
-        # Apply offset/pagination in Python (Kosha returns flat top-N).
-        page = hits[from_ : from_ + size]
-
-        return {
+        response = {
             "took": took_ms,
             "timed_out": False,
             "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
             "hits": {
-                "total": {"value": total, "relation": "eq"},
-                "max_score": max((h["_score"] for h in page), default=0.0),
-                "hits": page,
+                "total": {
+                    "value": result.get("total_hits", len(hits)),
+                    # "gte" when the count stopped at the cap: the true
+                    # total is at least this. Always reported as "eq"
+                    # before, which presented a lower bound as exact.
+                    "relation": result.get("total_hits_relation", "eq"),
+                },
+                "max_score": max((h["_score"] for h in hits), default=0.0),
+                "hits": hits,
             },
         }
+        if result.get("aggregations") is not None:
+            response["aggregations"] = result["aggregations"]
+        return response
 
-    @staticmethod
-    def _extract_query_text(body: dict | None) -> str:
-        """Extract the user's query text from an OpenSearch query body."""
+    # ── Older helper names, kept for callers and tests that use them ──────
+
+    @classmethod
+    def _extract_query_text(cls, body: dict | None) -> str:
+        """The query text Kosha will search for, given a search body."""
+        return cls._resolve_text(cls._plan_query((body or {}).get("query") or {}))[0]
+
+    @classmethod
+    def _extract_filter(cls, body: dict | None) -> dict | None:
+        """The Kosha filter for a search body, or ``None`` if it has none."""
         if not body:
-            return ""
-        query = body.get("query") or {}
-        return KoshaClient._extract_from_query_dsl(query)
-
-    @staticmethod
-    def _extract_from_query_dsl(query: dict) -> str:
-        """Recursively extract search terms from query DSL."""
-        if not query:
-            return ""
-
-        # match: {"match": {"field": "text"}} or {"match": {"field": {"query": "text"}}}
-        match = query.get("match")
-        if match is not None:
-            for field, val in match.items():
-                if isinstance(val, str):
-                    return val
-                if isinstance(val, dict) and "query" in val:
-                    return val["query"]
-            return ""
-
-        # multi_match: {"multi_match": {"query": "text", "fields": [...]}}
-        multi_match = query.get("multi_match")
-        if multi_match is not None:
-            return multi_match.get("query", "")
-
-        # bool: {"bool": {"must": [...], "should": [...], "filter": [...]}}
-        # Only extract text from must/should (full-text clauses).
-        # Filter clauses (term, terms, range) are not query text.
-        bool_q = query.get("bool")
-        if bool_q is not None:
-            texts = []
-            for clause_key in ("must", "should"):
-                for clause in bool_q.get(clause_key, []):
-                    if not KoshaClient._is_filter_only_clause(clause):
-                        t = KoshaClient._extract_from_query_dsl(clause)
-                        if t:
-                            texts.append(t)
-            return " ".join(texts)
-
-        # term: {"term": {"field": "value"}} — exact match, not full-text.
-        # We return empty because Kosha does BM25, not term queries (Phase 1).
-        #
-        # A bare top-level `{"query": {"term": {...}}}` reaches this branch
-        # directly (unlike a `term` nested in `bool.must`/`should`, which
-        # `_is_filter_only_clause` already screens out above before this
-        # function is even called on it). Previously this loop returned the
-        # term's own VALUE as query text whenever it happened to be a
-        # string — e.g. a bare `{"term": {"matter_id": "<uuid>"}}` filter
-        # query turned into a BM25 search for the literal matter_id text,
-        # which almost never appears in any document's indexed free text,
-        # silently collapsing an otherwise-correct filter-only query to
-        # zero hits. `_extract_filter` already carries this clause through
-        # to Kosha's native `filter` field unchanged — query text must stay
-        # empty here so the request takes Kosha's filter-only path instead
-        # of an unintended (and bogus) BM25 leg.
-        if query.get("term") is not None:
-            return ""
-
-        # match_all
-        if query.get("match_all") is not None:
-            return ""
-
-        # function_score: {"function_score": {"query": {...}, ...}}
-        fn_score = query.get("function_score")
-        if fn_score is not None:
-            return KoshaClient._extract_from_query_dsl(fn_score.get("query", {}))
-
-        return ""
+            return None
+        kosha, _ = cls._translate_search(body)
+        return kosha.get("filter")
 
     @staticmethod
     def _extract_bm25_params(query: dict) -> dict:
@@ -409,243 +862,7 @@ class KoshaClient:
                 params["b"] = str(b)
         return params
 
-    @staticmethod
-    def _extract_filter(body: dict | None) -> dict | None:
-        """Extract a filter clause from an OpenSearch query body.
-
-        Handles:
-        - ``body["query"]["bool"]["filter"]`` — ES bool filter clauses
-        - ``body["post_filter"]`` — ES post_filter
-        - ``body["query"]["bool"]["must_not"]`` — ES bool must_not
-        """
-        if not body:
-            return None
-
-        # Collect filter clauses from various locations.
-        must_clauses: list = []
-        must_not_clauses: list = []
-        should_clauses: list = []
-        has_clauses = False
-
-        query = body.get("query") or {}
-
-        # A filter-only clause may be the query itself, as in
-        # {"query": {"terms": {"documentId": [...]}}}.
-        if KoshaClient._is_filter_only_clause(query):
-            translated = KoshaClient._translate_es_clause(query)
-            if translated:
-                return translated
-
-        # bool.filter clauses
-        bool_q = query.get("bool")
-        if bool_q:
-            for clause in bool_q.get("filter", []):
-                translated = KoshaClient._translate_es_clause(clause)
-                if translated:
-                    must_clauses.append(translated)
-                    has_clauses = True
-            for clause in bool_q.get("must_not", []):
-                translated = KoshaClient._translate_es_clause(clause)
-                if translated:
-                    must_not_clauses.append(translated)
-                    has_clauses = True
-            for clause in bool_q.get("must", []):
-                # Only translate term/terms/range in must clauses
-                # (match clauses are handled by _extract_query_text).
-                translated = KoshaClient._translate_es_clause(clause)
-                if translated and KoshaClient._is_filter_only_clause(clause):
-                    must_clauses.append(translated)
-                    has_clauses = True
-            for clause in bool_q.get("should", []):
-                translated = KoshaClient._translate_es_clause(clause)
-                if translated and KoshaClient._is_filter_only_clause(clause):
-                    must_clauses.append(translated)
-                    has_clauses = True
-
-        # post_filter
-        post_filter = body.get("post_filter")
-        if post_filter:
-            translated = KoshaClient._translate_es_clause(post_filter)
-            if translated:
-                must_clauses.append(translated)
-                has_clauses = True
-
-        if not has_clauses:
-            return None
-
-        result: dict = {}
-        if must_clauses:
-            result["bool"] = result.get("bool", {})
-            result["bool"]["must"] = must_clauses
-        if must_not_clauses:
-            result["bool"] = result.get("bool", {})
-            result["bool"]["must_not"] = must_not_clauses
-
-        return result if result else None
-
-    @staticmethod
-    def _is_filter_only_clause(clause: dict) -> bool:
-        """Check if a clause is a filter-only clause (not a match query)."""
-        if not clause:
-            return False
-        if "term" in clause or "terms" in clause or "range" in clause:
-            return True
-        if "exists" in clause or "prefix" in clause or "wildcard" in clause:
-            return True
-        if "match_all" in clause:
-            return True
-        return False
-
-    @staticmethod
-    def _translate_es_clause(clause: dict) -> dict | None:
-        """Translate a single ES filter clause to Kosha format."""
-        if not clause:
-            return None
-
-        # term: {"term": {"matterId": "value"}}
-        if "term" in clause:
-            return clause  # Kosha accepts the same format
-
-        # terms: {"terms": {"documentId": ["v1", "v2"]}}
-        if "terms" in clause:
-            return clause  # Kosha accepts the same format
-
-        # range: {"range": {"sentAt": {"gte": "...", "lte": "..."}}}
-        if "range" in clause:
-            # Normalize range values to strings for Kosha.
-            bounds = {}
-            for field, val in clause["range"].items():
-                if isinstance(val, dict):
-                    bounds[field] = {k: str(v) for k, v in val.items()}
-                else:
-                    bounds[field] = val
-            return {"range": bounds}
-
-        # bool: nested bool (recursive)
-        if "bool" in clause:
-            return clause  # Kosha accepts the same format
-
-        # match_all: {"match_all": {}}
-        if "match_all" in clause:
-            return clause
-
-        # exists: {"exists": {"field": "..."}}
-        if "exists" in clause:
-            # Phase 1: skip exists (not supported yet).
-            return None
-
-        return None
-
     # ── Index ──────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _extract_aggs(body: dict | None) -> dict | None:
-        """Extract aggregations from an ES query body."""
-        if not body:
-            return None
-        aggs = body.get("aggs") or body.get("aggregations")
-        if aggs:
-            return aggs  # Kosha accepts the same format as ES
-        return None
-
-    @staticmethod
-    def _extract_wildcard(body: dict | None) -> dict | None:
-        """Extract wildcard query from an ES query body.
-        Converts ES format to Kosha format.
-        """
-        if not body:
-            return None
-        query = body.get("query") or {}
-        wc = query.get("wildcard")
-        if not wc:
-            return None
-        # ES: {"wildcard": {"field": {"value": "*Smith*", "case_insensitive": true}}}
-        for field, spec in wc.items():
-            if isinstance(spec, dict):
-                return {
-                    "field": field,
-                    "pattern": spec.get("value", spec.get("wildcard", "")),
-                    "case_insensitive": spec.get("case_insensitive", True),
-                }
-            return {
-                "field": field,
-                "pattern": spec,
-                "case_insensitive": True,
-            }
-        return None
-
-    @staticmethod
-    def _extract_match_phrase(body: dict | None) -> dict | None:
-        """Extract match_phrase query from an ES query body.
-        Converts ES format to Kosha format.
-        """
-        if not body:
-            return None
-        query = body.get("query") or {}
-        mp = query.get("match_phrase")
-        if not mp:
-            return None
-        # ES: {"match_phrase": {"field": {"query": "phrase text", "slop": 2}}}
-        for field, spec in mp.items():
-            if isinstance(spec, dict):
-                return {
-                    "field": field,
-                    "phrase": spec.get("query", ""),
-                    "slop": spec.get("slop", 0),
-                }
-            return {
-                "field": field,
-                "phrase": spec,
-                "slop": 0,
-            }
-        return None
-
-    @staticmethod
-    def _extract_sort(body: dict | None) -> list[dict] | None:
-        """Translate OpenSearch ``sort`` into Kosha ``SortSpec`` objects.
-
-        Accepts ``[{"_id": "asc"}]`` or ``[{"_id": {"order": "asc"}}]``.
-        """
-        if not body:
-            return None
-        raw = body.get("sort")
-        if not raw:
-            return None
-        out: list[dict] = []
-        for entry in raw:
-            if not isinstance(entry, dict):
-                continue
-            spec: dict[str, dict[str, str]] = {}
-            for field, val in entry.items():
-                if isinstance(val, str):
-                    spec[field] = {"order": val}
-                elif isinstance(val, dict):
-                    spec[field] = {"order": str(val.get("order", "asc"))}
-                else:
-                    spec[field] = {"order": "asc"}
-            if spec:
-                out.append(spec)
-        return out or None
-
-    @staticmethod
-    def _extract_knn(body: dict | None) -> dict | None:
-        """Extract kNN query from an ES query body."""
-        if not body:
-            return None
-        # ES: {"knn": {"field": {"vector": [...], "k": N}}}
-        # or embedded: {"query": {"knn": {...}}}
-        knn = body.get("knn") or (body.get("query") or {}).get("knn")
-        if not knn:
-            return None
-        for field, spec in knn.items():
-            if isinstance(spec, dict):
-                return {
-                    "field": field,
-                    "vector": spec.get("vector", []),
-                    "k": spec.get("k", 10),
-                    "num_candidates": spec.get("num_candidates", 100),
-                }
-        return None
 
     @staticmethod
     def _field_to_kosha(name: str, value: str, field_type: str = "Text") -> dict:
@@ -895,21 +1112,20 @@ class KoshaClient:
     def count(
         self, index: str | None = None, body: dict | None = None, **params: Any
     ) -> dict:
-        """Return document count from a broad search.
+        """Count the documents matching ``body["query"]`` (all, if none).
 
-        Kosha does not have a dedicated count API, so we search with a
-        non-empty placeholder (``*`` rendered as ``match``) and report the
-        total_hits.
+        A search for no hits with an exact total. The query in ``body`` was
+        ignored before, so every count was of the whole index, and capped.
         """
         ns = self._resolve_ns(index)
-        try:
-            result = self.search(
-                index=ns, body={"query": {"match": {"_all": "*"}}, "size": 0}
-            )
-            count = result["hits"]["total"]["value"]
-        except KoshaRequestError:
-            count = 0
-        return {"count": count, "_shards": {"total": 1, "successful": 1, "failed": 0}}
+        query = (body or {}).get("query") or {"match_all": {}}
+        result = self.search(
+            index=ns, body={"query": query, "size": 0, "track_total_hits": True}
+        )
+        return {
+            "count": result["hits"]["total"]["value"],
+            "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+        }
 
     # ── Update ─────────────────────────────────────────────────────────────
 
@@ -940,7 +1156,12 @@ class KoshaClient:
         """Delete documents matching a filter query."""
         ns = self._resolve_ns(index)
         query = body.get("query", {}) if body else {}
-        filter_clause = self._extract_filter(body) or query
+        if not query:
+            raise self._unsupported("delete_by_query without a query")
+        # The whole query has to translate as a filter. A clause that cannot
+        # be expressed raises: leaving it out would delete documents the
+        # caller meant to keep.
+        filter_clause = self._to_filter(query)
         kosha_body = {"namespace": ns, "filter": filter_clause}
         result = self._request("POST", "delete", body=kosha_body)
         deleted = result.get("deleted", 0)

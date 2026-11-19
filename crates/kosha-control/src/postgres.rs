@@ -298,6 +298,20 @@ impl ControlStore for PgStore {
         None
     }
 
+    /// One integer off the primary key, not the `segments_json` text.
+    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
+        let id_str = id.0.clone();
+        self.rt.block_on(async {
+            let row: Option<(i64,)> =
+                sqlx::query_as("SELECT version FROM kosha.manifests WHERE namespace_id = $1")
+                    .bind(&id_str)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .ok()?;
+            row.map(|(version,)| version as u64)
+        })
+    }
+
     fn manifest_cloned(&self, id: &NamespaceId) -> Option<Manifest> {
         let id_str = id.0.clone();
         self.rt.block_on(async {

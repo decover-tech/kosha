@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 
 // ─── Control store trait (in-memory or Postgres) ──────────────────────────
 
+pub mod docset;
+pub use docset::{evaluate_filter, DocSet};
+
 /// Pluggable namespace registry and manifest store.
 ///
 /// In-memory (`kosha_control::Controller`) is the default.
@@ -23,6 +26,17 @@ pub trait ControlStore: Send + Sync {
     /// a borrowed reference (e.g. Postgres) override this to read through.
     fn manifest_cloned(&self, id: &NamespaceId) -> Option<Manifest> {
         self.manifest(id).cloned()
+    }
+
+    /// The stored manifest's version, without its segment list.
+    ///
+    /// A query replica asks this before every search to learn whether the
+    /// ingest node has published since it last looked, so it has to be
+    /// cheap: the manifest itself carries a footer for every segment and
+    /// runs to megabytes for a few hundred segments. The default reads the
+    /// whole manifest; stores that can do better override it.
+    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
+        self.manifest_cloned(id).map(|manifest| manifest.version)
     }
 
     /// Persist a manifest for a namespace (upsert, last-write-wins).
@@ -176,10 +190,21 @@ pub enum FilterClause {
     MatchAll {
         match_all: Option<serde_json::Value>,
     },
+    /// The document has a value for the field.
+    Exists {
+        exists: ExistsFilter,
+    },
+}
+
+/// Body of an `exists` clause.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExistsFilter {
+    pub field: String,
 }
 
 /// Clause keys `FilterClause` accepts, as reported in parse errors.
-const FILTER_CLAUSE_KEYS: [&str; 5] = ["term", "terms", "range", "bool", "match_all"];
+const FILTER_CLAUSE_KEYS: [&str; 6] = ["term", "terms", "range", "bool", "match_all", "exists"];
 
 /// Deserialized by dispatching on the clause's single key rather than with
 /// `#[serde(untagged)]`.
@@ -246,17 +271,16 @@ impl<'de> Deserialize<'de> for FilterClause {
             "match_all" => Ok(FilterClause::MatchAll {
                 match_all: Some(inner),
             }),
+            "exists" => Ok(FilterClause::Exists {
+                exists: body(inner)?,
+            }),
             other => {
                 let hint = match other {
-                    "filter" => {
-                        " — Kosha's native filter has no `filter` clause; \
-                         OpenSearch's `bool.filter` is spelled `bool.must` here"
-                    }
-                    "must" | "must_not" | "should" | "minimum_should_match" => {
+                    "filter" | "must" | "must_not" | "should" | "minimum_should_match" => {
                         " — these belong inside a `bool` clause, e.g. \
                          {\"bool\": {\"must\": [...]}}"
                     }
-                    "match" | "match_phrase" | "wildcard" | "exists" | "prefix" => {
+                    "match" | "match_phrase" | "wildcard" | "prefix" => {
                         " — full-text and wildcard matching is not part of the \
                          filter language; use the query text instead"
                     }
@@ -283,12 +307,20 @@ pub struct RangeBound {
     pub lt: Option<String>,
 }
 
-/// `deny_unknown_fields` so OpenSearch's `bool.filter` is rejected with a
-/// clear error instead of deserializing to an all-empty `BoolFilter`, which
-/// matches every document (issue #170). Kosha's native equivalent of
-/// `bool.filter` is `bool.must`.
+/// A boolean combination of filter clauses.
+///
+/// Parsed through [`BoolFilterWire`], which is `deny_unknown_fields`: an
+/// unrecognized key is rejected rather than deserializing to an all-empty
+/// `BoolFilter`, which matches every document (issue #170).
+///
+/// OpenSearch's `bool.filter` is accepted and folded into `must`. Inside a
+/// filter nothing is scored, so `filter` and `must` mean exactly the same
+/// thing: every clause has to match. Folding at parse time keeps a single
+/// representation, so the three consumers (`FilterApplier::apply_bool`, the
+/// delete-by-query applier in kosha-write, and `segment_may_match`) cannot
+/// drift apart on it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "BoolFilterWire")]
 pub struct BoolFilter {
     #[serde(default)]
     pub must: Vec<FilterClause>,
@@ -298,6 +330,36 @@ pub struct BoolFilter {
     pub should: Vec<FilterClause>,
     #[serde(default = "default_minimum_should_match")]
     pub minimum_should_match: usize,
+}
+
+/// The on-the-wire shape of [`BoolFilter`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoolFilterWire {
+    #[serde(default)]
+    must: Vec<FilterClause>,
+    /// OpenSearch spelling of `must` in filter context.
+    #[serde(default)]
+    filter: Vec<FilterClause>,
+    #[serde(default)]
+    must_not: Vec<FilterClause>,
+    #[serde(default)]
+    should: Vec<FilterClause>,
+    #[serde(default = "default_minimum_should_match")]
+    minimum_should_match: usize,
+}
+
+impl From<BoolFilterWire> for BoolFilter {
+    fn from(wire: BoolFilterWire) -> Self {
+        let mut must = wire.must;
+        must.extend(wire.filter);
+        Self {
+            must,
+            must_not: wire.must_not,
+            should: wire.should,
+            minimum_should_match: wire.minimum_should_match,
+        }
+    }
 }
 fn default_minimum_should_match() -> usize {
     1
@@ -712,19 +774,29 @@ impl BloomFilter {
         filter
     }
 
+    /// Whether `value` may be in the set (`false` is definite).
+    ///
+    /// Reads the `k` bits it needs straight out of the base64 text, one
+    /// 4-character group each. It used to decode the whole filter into a
+    /// fresh buffer on every call, and a search asks this of every
+    /// segment's term bloom for every query term, twice (when choosing what
+    /// to fetch and again when scoring).
+    ///
+    /// A filter that cannot be read (empty, or a bit that falls outside the
+    /// text) cannot prune: the answer is `true`.
     pub fn may_contain(&self, value: &str) -> bool {
-        let bits = match decode_base64(&self.bits_b64) {
-            Some(b) if !b.is_empty() && self.num_bits > 0 => b,
-            _ => return true, // corrupt/empty → cannot prune
-        };
+        if self.num_bits == 0 || self.bits_b64.is_empty() {
+            return true;
+        }
+        let text = self.bits_b64.as_bytes();
         let m = self.num_bits as u64;
         let (h1, h2) = bloom_hashes(value);
         for i in 0..self.k {
             let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) % m;
-            let idx = (bit / 8) as usize;
-            let mask = 1u8 << (bit % 8);
-            if idx >= bits.len() || bits[idx] & mask == 0 {
-                return false;
+            match base64_byte(text, (bit / 8) as usize) {
+                Some(byte) if byte & (1u8 << (bit % 8)) == 0 => return false,
+                Some(_) => {}
+                None => return true,
             }
         }
         true
@@ -744,7 +816,42 @@ impl BloomFilter {
     }
 }
 
+/// The elements of a stored value that holds a list, or `None` when the
+/// value is a plain scalar.
+///
+/// A list-valued field (tags, recipients, custodians) reaches Kosha from the
+/// OpenSearch-compatible client as one field whose value is the list's JSON
+/// text: `["urgent","sealed"]`. As a filter value that string equals nothing
+/// a caller ever asks for, so `term: {tags: "urgent"}` never matched. Filter
+/// evaluation, blooms and aggregations therefore treat such a value as its
+/// elements. Strings are taken as they are; numbers and booleans by their
+/// JSON text. Nested arrays and objects are not list elements and are
+/// skipped.
+pub fn list_elements(value: &str) -> Option<Vec<String>> {
+    let trimmed = value.trim();
+    if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        return None;
+    }
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(trimmed).ok()?;
+    Some(
+        parsed
+            .into_iter()
+            .filter_map(|element| match element {
+                serde_json::Value::String(s) => Some(s),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                serde_json::Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
 /// Build per-field blooms from columnar string filter entries.
+///
+/// A list value contributes its elements as well as its whole text (see
+/// [`list_elements`]), so a segment is not pruned for a `term` on one
+/// element. Segments written before this was the case have blooms without
+/// the elements; `rebuild-filter-blooms` brings them up to date.
 pub fn build_filter_blooms(
     string_fields: &HashMap<String, Vec<(u32, String)>>,
 ) -> HashMap<String, BloomFilter> {
@@ -753,7 +860,17 @@ pub fn build_filter_blooms(
         if entries.is_empty() {
             continue;
         }
-        let bloom = BloomFilter::build(entries.iter().map(|(_, v)| v.as_str()));
+        let elements: Vec<String> = entries
+            .iter()
+            .filter_map(|(_, v)| list_elements(v))
+            .flatten()
+            .collect();
+        let bloom = BloomFilter::build(
+            entries
+                .iter()
+                .map(|(_, v)| v.as_str())
+                .chain(elements.iter().map(String::as_str)),
+        );
         out.insert(field.clone(), bloom);
     }
     out
@@ -854,40 +971,33 @@ fn encode_base64(data: &[u8]) -> String {
     out
 }
 
-fn decode_base64(s: &str) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u8> {
+/// Byte `index` of the data a base64 string encodes, decoding only the
+/// 4-character group that byte sits in. `None` if the group is missing,
+/// malformed, or padded at that position.
+fn base64_byte(text: &[u8], index: usize) -> Option<u8> {
+    fn val(c: u8) -> Option<u32> {
         match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
             b'+' => Some(62),
             b'/' => Some(63),
             b'=' => Some(0),
             _ => None,
         }
     }
-    let bytes = s.as_bytes();
-    if !bytes.len().is_multiple_of(4) {
+    let start = index / 3 * 4;
+    let group = text.get(start..start + 4)?;
+    let position = index % 3;
+    // Byte 1 of a group is absent when its third character is padding, and
+    // byte 2 when its fourth is.
+    if position > 0 && group[position + 1] == b'=' {
         return None;
     }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
-        let (a, b, c, d) = (
-            val(chunk[0])?,
-            val(chunk[1])?,
-            val(chunk[2])?,
-            val(chunk[3])?,
-        );
-        let n = (u32::from(a) << 18) | (u32::from(b) << 12) | (u32::from(c) << 6) | u32::from(d);
-        out.push(((n >> 16) & 0xff) as u8);
-        if chunk[2] != b'=' {
-            out.push(((n >> 8) & 0xff) as u8);
-        }
-        if chunk[3] != b'=' {
-            out.push((n & 0xff) as u8);
-        }
-    }
-    Some(out)
+    let n = group
+        .iter()
+        .try_fold(0u32, |n, &c| Some((n << 6) | val(c)?))?;
+    Some((n >> (16 - 8 * position)) as u8)
 }
 
 /// Whether a segment with the given footer blooms might satisfy `filter`.
@@ -895,6 +1005,45 @@ fn decode_base64(s: &str) -> Option<Vec<u8>> {
 /// Returns `true` when the segment must be opened (possible match, or not
 /// enough bloom metadata to decide). Returns `false` only when blooms prove
 /// no document in the segment can match.
+/// The stored name behind an OpenSearch sub-field reference.
+///
+/// OpenSearch mappings give a text field an exact-match twin, addressed as
+/// `<field>.keyword` (or `.raw`). Kosha stores one filterable value per
+/// field and has no sub-fields, so `tags.keyword` and `tags` are the same
+/// column. Callers look a field up by its exact name first and fall back to
+/// this, so a field that really is named `a.keyword` still wins.
+pub fn base_field_name(field: &str) -> &str {
+    field
+        .strip_suffix(".keyword")
+        .or_else(|| field.strip_suffix(".raw"))
+        .unwrap_or(field)
+}
+
+/// `map[field]`, or `map[base_field_name(field)]` when the exact name is
+/// absent. See [`base_field_name`].
+pub fn lookup_field<'a, V>(map: &'a HashMap<String, V>, field: &str) -> Option<&'a V> {
+    map.get(field).or_else(|| {
+        let base = base_field_name(field);
+        if base.len() == field.len() {
+            None
+        } else {
+            map.get(base)
+        }
+    })
+}
+
+/// Whether a segment with no bloom for a field could still hold `value`.
+///
+/// Blooms are only built for string columns (`build_filter_blooms`), so a
+/// missing bloom means one of two things: the segment has no such field, or
+/// the field is numeric. A numeric column can only ever equal a value that
+/// parses as a number, so only such a value keeps the segment in play;
+/// anything else is safe to prune on. Pruning unconditionally here is what
+/// made a term filter on an Integer or Float field match nothing.
+fn unbloomed_field_may_match(value: &str) -> bool {
+    value.trim().parse::<f64>().is_ok()
+}
+
 pub fn segment_may_match(
     filter: &FilterClause,
     blooms: Option<&HashMap<String, BloomFilter>>,
@@ -903,21 +1052,25 @@ pub fn segment_may_match(
         return true; // legacy footer — cannot prune
     };
     match filter {
-        // Term/Terms field maps are OR'd by FilterApplier — skip only if every
-        // alternative is impossible.
+        // Term/Terms field maps are OR'd by the filter evaluator — skip only
+        // if every alternative is impossible.
         FilterClause::Term { term } => {
             term.is_empty()
-                || term.iter().any(|(field, value)| match blooms.get(field) {
-                    Some(bloom) => bloom.may_contain(value),
-                    None => false,
-                })
+                || term
+                    .iter()
+                    .any(|(field, value)| match lookup_field(blooms, field) {
+                        Some(bloom) => bloom.may_contain(value),
+                        None => unbloomed_field_may_match(value),
+                    })
         }
         FilterClause::Terms { terms } => {
             terms.is_empty()
-                || terms.iter().any(|(field, values)| match blooms.get(field) {
-                    Some(bloom) => values.iter().any(|v| bloom.may_contain(v)),
-                    None => false,
-                })
+                || terms
+                    .iter()
+                    .any(|(field, values)| match lookup_field(blooms, field) {
+                        Some(bloom) => values.iter().any(|v| bloom.may_contain(v)),
+                        None => values.iter().any(|v| unbloomed_field_may_match(v)),
+                    })
         }
         FilterClause::Bool { bool: b } => {
             for child in &b.must {
@@ -939,7 +1092,11 @@ pub fn segment_may_match(
             // must_not cannot prove a segment has no matches via bloom.
             true
         }
-        FilterClause::Range { .. } | FilterClause::MatchAll { .. } => true,
+        // A field with no bloom may still be a numeric column, so the
+        // absence of a bloom cannot prove the field is absent.
+        FilterClause::Range { .. }
+        | FilterClause::MatchAll { .. }
+        | FilterClause::Exists { .. } => true,
     }
 }
 
@@ -995,6 +1152,25 @@ impl Manifest {
 
     pub fn segment_footer(&self, segment_id: &SegmentId) -> Option<&Footer> {
         self.segment_footers.get(segment_id)
+    }
+
+    /// The segment's footer for pruning: the manifest's own copy, borrowed,
+    /// or `read()` (from the segment's `footer.json`) when the manifest
+    /// carries none.
+    ///
+    /// Borrowed on purpose. A footer holds the segment's term bloom and a
+    /// bloom per filter field, and every search looks at every segment's
+    /// footer; cloning it per segment per search copied megabytes to read a
+    /// few bits.
+    pub fn footer_or_read<'a>(
+        &'a self,
+        segment_id: &SegmentId,
+        read: impl FnOnce() -> Option<Footer>,
+    ) -> Option<std::borrow::Cow<'a, Footer>> {
+        match self.segment_footer(segment_id) {
+            Some(footer) => Some(std::borrow::Cow::Borrowed(footer)),
+            None => read().map(std::borrow::Cow::Owned),
+        }
     }
 
     pub fn remember_segment_footer(&mut self, footer: Footer) {
@@ -1096,6 +1272,97 @@ pub struct SearchQuery {
     /// caching (when the engine has it enabled).
     #[serde(default)]
     pub no_cache: Option<bool>,
+    /// Keep only the best hit for each distinct value of a field
+    /// (OpenSearch `collapse`). "Best" is by the request's own ordering.
+    /// `total_hits` still counts matching documents, not groups.
+    #[serde(default)]
+    pub collapse: Option<CollapseSpec>,
+    /// Return only these stored fields with each hit (OpenSearch
+    /// `_source.includes`). `None` returns every field.
+    #[serde(default)]
+    pub source_includes: Option<Vec<String>>,
+    /// Leave these stored fields out of each hit (OpenSearch
+    /// `_source.excludes`). The common use is dropping the embedding, which
+    /// is by far the largest field and almost never read back.
+    #[serde(default)]
+    pub source_excludes: Option<Vec<String>>,
+}
+
+/// See `SearchQuery.collapse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollapseSpec {
+    pub field: String,
+}
+
+impl SearchQuery {
+    /// True when the vector leg is the only thing that can produce a hit:
+    /// no query text, wildcard, phrase or top-level filter.
+    pub fn is_pure_knn(&self) -> bool {
+        self.knn.is_some()
+            && self.query_text.trim().is_empty()
+            && self.wildcard.is_none()
+            && self.match_phrase.is_none()
+            && self.filter.is_none()
+    }
+
+    /// Whether a segment with these filter blooms could contribute a hit.
+    ///
+    /// The top-level filter always applies. `knn.filter` only rules a
+    /// segment out when the vector leg is the sole source of hits; next to
+    /// a text query, a segment can still contribute text hits whatever the
+    /// kNN filter says.
+    ///
+    /// Segment pruning is decided twice per request, once when choosing
+    /// what to fetch from S3 and once when scoring. Both ask this, so they
+    /// cannot disagree about which segments are in play.
+    pub fn segment_may_match_filters(&self, blooms: Option<&HashMap<String, BloomFilter>>) -> bool {
+        if let Some(ref filter) = self.filter {
+            if !segment_may_match(filter, blooms) {
+                return false;
+            }
+        }
+        if self.is_pure_knn() {
+            if let Some(filter) = self.knn.as_ref().and_then(|knn| knn.filter.as_ref()) {
+                if !segment_may_match(filter, blooms) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// True when any filter is present that [`Self::segment_may_match_filters`]
+    /// can prune on.
+    pub fn has_prunable_filter(&self) -> bool {
+        self.filter.is_some()
+            || (self.is_pure_knn() && self.knn.as_ref().is_some_and(|k| k.filter.is_some()))
+    }
+
+    /// Whether answering needs a segment's filter columns (`filters.bin`):
+    /// any filter, any aggregation, a collapse, or a sort on a stored field.
+    pub fn needs_filter_columns(&self) -> bool {
+        self.filter.is_some()
+            || self.collapse.is_some()
+            || self.knn.as_ref().is_some_and(|k| k.filter.is_some())
+            || !self.aggs.is_empty()
+            || self.sort.iter().any(|spec| {
+                spec.fields
+                    .keys()
+                    .any(|field| field != "_score" && field != "_id")
+            })
+    }
+
+    /// Whether `field` should be returned with a hit, per
+    /// `source_includes` / `source_excludes`.
+    pub fn returns_field(&self, field: &str) -> bool {
+        self.source_includes
+            .as_ref()
+            .is_none_or(|wanted| wanted.iter().any(|f| f == field))
+            && !self
+                .source_excludes
+                .as_ref()
+                .is_some_and(|unwanted| unwanted.iter().any(|f| f == field))
+    }
 }
 
 /// See `SearchQuery.operator`.
@@ -1246,18 +1513,49 @@ mod filter_clause_parsing {
     }
 
     #[test]
-    fn opensearch_bool_filter_key_is_rejected() {
-        // The reported case: `bool.filter` is OpenSearch's spelling; Kosha's
-        // native equivalent is `bool.must`. This used to deserialize into an
-        // all-empty BoolFilter that matched everything.
-        let err = parse(r#"{"bool": {"filter": [{"term": {"a": "b"}}]}}"#)
-            .expect_err("bool.filter must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("unknown field `filter`"), "{msg}");
-        assert!(
-            msg.contains("must"),
-            "error should name the native key: {msg}"
-        );
+    fn opensearch_bool_filter_key_means_must() {
+        // `bool.filter` is OpenSearch's spelling of `bool.must` in filter
+        // context. It once deserialized into an all-empty BoolFilter that
+        // matched everything (issue #170), then was rejected outright. It
+        // now folds into `must`, so the clause is enforced.
+        match parse(r#"{"bool": {"filter": [{"term": {"a": "b"}}]}}"#).unwrap() {
+            FilterClause::Bool { bool } => {
+                assert_eq!(bool.must.len(), 1, "filter clause must be kept");
+                assert!(matches!(bool.must[0], FilterClause::Term { .. }));
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bool_filter_and_must_are_combined_and_nest() {
+        // The backend's matter clause sits two levels down:
+        // bool.filter -> bool.filter -> bool.should.
+        let nested = parse(
+            r#"{"bool": {"must": [{"term": {"a": "b"}}],
+                        "filter": [{"bool": {"filter": [
+                            {"bool": {"should": [{"term": {"m": "1"}}, {"term": {"n": "1"}}]}}
+                        ]}}]}}"#,
+        )
+        .unwrap();
+        let FilterClause::Bool { bool: outer } = nested else {
+            panic!("expected Bool");
+        };
+        assert_eq!(outer.must.len(), 2, "must and filter are both kept");
+        let FilterClause::Bool { bool: mid } = &outer.must[1] else {
+            panic!("expected nested Bool");
+        };
+        let FilterClause::Bool { bool: inner } = &mid.must[0] else {
+            panic!("expected innermost Bool");
+        };
+        assert_eq!(inner.should.len(), 2);
+    }
+
+    #[test]
+    fn unknown_bool_key_is_still_rejected() {
+        let err = parse(r#"{"bool": {"bogus": [{"term": {"a": "b"}}]}}"#)
+            .expect_err("unknown bool key must be rejected");
+        assert!(err.to_string().contains("unknown field `bogus`"), "{err}");
     }
 
     #[test]
@@ -1380,6 +1678,53 @@ mod filter_clause_parsing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_byte_reads_any_byte_without_decoding_the_rest() {
+        // Lengths 1..=8 cover every padding shape; 300 spans many groups.
+        for len in (1..=8).chain([300]) {
+            let data: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let text = encode_base64(&data);
+            for (i, byte) in data.iter().enumerate() {
+                assert_eq!(
+                    base64_byte(text.as_bytes(), i),
+                    Some(*byte),
+                    "len {len} byte {i}"
+                );
+            }
+            assert_eq!(
+                base64_byte(text.as_bytes(), len),
+                None,
+                "one past the end, len {len}"
+            );
+        }
+        assert_eq!(base64_byte(b"!!!!", 0), None, "malformed group");
+    }
+
+    #[test]
+    fn bloom_answers_are_unchanged_by_reading_bits_in_place() {
+        let values: Vec<String> = (0..500).map(|i| format!("term{i}")).collect();
+        let bloom = BloomFilter::build(values.iter().map(String::as_str));
+        assert!(
+            values.iter().all(|v| bloom.may_contain(v)),
+            "no false negatives"
+        );
+        let false_positives = (0..2000)
+            .filter(|i| bloom.may_contain(&format!("absent{i}")))
+            .count();
+        assert!(false_positives < 200, "{false_positives} of 2000");
+        // Unreadable filters cannot prune.
+        let empty = BloomFilter {
+            bits_b64: String::new(),
+            ..bloom.clone()
+        };
+        assert!(empty.may_contain("anything"));
+        let truncated = BloomFilter {
+            bits_b64: bloom.bits_b64[..8].to_string(),
+            ..bloom
+        };
+        assert!(values.iter().all(|v| truncated.may_contain(v)));
+    }
 
     #[test]
     fn ids_wrap_strings() {
