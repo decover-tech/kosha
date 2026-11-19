@@ -603,27 +603,48 @@ struct HydrationOutcome {
 /// trivially covered regardless of the flags (`covers(false, false)` is
 /// always `true`) — the common warm-baseline-search case keeps today's
 /// single-`HashMap`-lookup fast path.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+///
+/// Columnar filter segments (#244) make the filter class finer still: a
+/// pass hydrates `filters.toc` plus only the columns *its* query names, so
+/// the verdict records which column names were verified. A later query is
+/// covered only if every column it names was (`filters.bin` segments are
+/// verified whole by any filter pass, so the field set is what decides).
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 struct HydrationVerdict {
+    /// A filter-needing pass verified every segment's `filters.bin` or
+    /// `filters.toc`.
     filters_verified: bool,
+    /// Filter column names verified local in every columnar segment.
+    filter_fields_verified: std::collections::BTreeSet<String>,
     vectors_verified: bool,
 }
 
 impl HydrationVerdict {
     /// Whether this verdict can be trusted to skip a full
     /// `hydrate_segments_for_search` pass for a query with these needs.
-    fn covers(&self, needs_filters: bool, needs_vectors: bool) -> bool {
-        (!needs_filters || self.filters_verified) && (!needs_vectors || self.vectors_verified)
+    /// `needs_filters` is the query's filter column names, `None` when it
+    /// needs no filter files at all.
+    fn covers(&self, needs_filters: Option<&FilterFields>, needs_vectors: bool) -> bool {
+        let filters_ok = needs_filters.is_none_or(|fields| {
+            self.filters_verified && fields.is_subset(&self.filter_fields_verified)
+        });
+        filters_ok && (!needs_vectors || self.vectors_verified)
     }
 
     /// Record what a successful, non-bloom-pruned pass for a query with
     /// these needs actually verified, merging with (not replacing) whatever
     /// was already known for this manifest version.
-    fn merge(&mut self, needs_filters: bool, needs_vectors: bool) {
-        self.filters_verified |= needs_filters;
+    fn merge(&mut self, needs_filters: Option<&FilterFields>, needs_vectors: bool) {
+        if let Some(fields) = needs_filters {
+            self.filters_verified = true;
+            self.filter_fields_verified.extend(fields.iter().cloned());
+        }
         self.vectors_verified |= needs_vectors;
     }
 }
+
+/// Filter column names a query reads (`SearchQuery::filter_column_fields`).
+type FilterFields = std::collections::BTreeSet<String>;
 
 /// Segments this caller must fetch itself, paired with the completion
 /// signal it must flip via `complete_owned` once done.
@@ -805,6 +826,19 @@ fn publication_error(context: &str, error: &KoshaError) -> String {
 /// Free function (not an `AppState` method) so both `AppState::sync_to_s3`
 /// and the boot-time reconciliation sweep in `AppState::new`, which runs
 /// before `self` exists, can share it.
+/// Whether a local segment has its whole filter index (#244):
+/// `filters.bin`, or `filters.toc` plus every column its footer lists.
+/// The footer decides the format. A footer that does not parse is held to
+/// the pre-#244 rule (`filters.bin` present); opening such a segment fails
+/// on the footer anyway.
+#[cfg(feature = "s3")]
+fn filter_index_complete(seg_dir: &Path) -> bool {
+    match SegmentReader::read_footer(seg_dir) {
+        Ok(footer) => kosha_segment::filter_columns::filter_files_present(seg_dir, &footer),
+        Err(_) => seg_dir.join(kosha_core::FILTERS_BIN_FILE).is_file(),
+    }
+}
+
 #[cfg(feature = "s3")]
 fn sync_segment_dir_to_s3(
     s3: &s3_storage::S3Storage,
@@ -825,6 +859,11 @@ fn sync_segment_dir_to_s3(
                 "segment {rel} is missing required file {req} locally"
             ));
         }
+    }
+    if !filter_index_complete(seg_dir) {
+        return Err(format!(
+            "segment {rel} is missing filter index files locally"
+        ));
     }
     s3.sync_segment_dir(Path::new(&rel))
         .map_err(|e| format!("S3 upload of segment {rel} failed: {e}"))
@@ -1822,13 +1861,14 @@ impl AppState {
 
     /// See [`segment_commit::REQUIRED_SEGMENT_FILES`].
     #[cfg(feature = "s3")]
-    const REQUIRED_SEGMENT_FILES: [&'static str; 4] = segment_commit::REQUIRED_SEGMENT_FILES;
+    const REQUIRED_SEGMENT_FILES: [&'static str; 3] = segment_commit::REQUIRED_SEGMENT_FILES;
 
     #[cfg(feature = "s3")]
     fn segment_is_complete(seg_path: &Path) -> bool {
         Self::REQUIRED_SEGMENT_FILES
             .iter()
             .all(|f| seg_path.join(f).is_file())
+            && filter_index_complete(seg_path)
     }
 
     /// Ensure every listed segment directory is available locally, fanning
@@ -2515,7 +2555,7 @@ impl AppState {
         let term_prune = term_bloom_prune_for_query(query);
         let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
         let needs_vectors = query.knn.is_some();
-        let needs_filters = query_needs_filter_store(query);
+        let filter_fields = query_filter_fields(query);
         let posting_files = posting_blob_files_for_query(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
@@ -2621,10 +2661,25 @@ impl AppState {
             }
             to_hydrate.push(seg_path);
         }
+        // The filter files each segment needs for this query (#244): its
+        // whole `filters.bin`, or `filters.toc` plus only the columns the
+        // query names, as its footer says. Footers are all known by now:
+        // cached on the manifest or read from `footer.json` above.
+        let mut filter_files: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        if let Some(fields) = &filter_fields {
+            for entry in &manifest.segments {
+                let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                let footer = manifest
+                    .segment_footer(&entry.segment_id)
+                    .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
+                let files = segment_filter_files(footer, &seg_path, fields);
+                filter_files.insert(seg_path, files);
+            }
+        }
         let mut outcome = self.ensure_scoring_files_local(
             &to_hydrate,
             needs_vectors,
-            needs_filters,
+            &filter_files,
             &paths_with_manifest_footer,
             request,
         );
@@ -2672,11 +2727,16 @@ impl AppState {
         needs_filters: bool,
         has_manifest_footer: bool,
     ) -> bool {
+        let filter_files: Vec<String> = if needs_filters {
+            vec![kosha_core::FILTERS_BIN_FILE.to_string()]
+        } else {
+            Vec::new()
+        };
         Self::scoring_complete(
             seg_path,
             needs_vectors,
             false,
-            needs_filters,
+            &filter_files,
             has_manifest_footer,
         )
     }
@@ -2685,11 +2745,16 @@ impl AppState {
     /// postings are read by range (#245), so a clustered segment needs only
     /// its `vector.offsets` locally, not the whole `vector.idx`.
     #[cfg(feature = "s3")]
+    ///
+    /// `filter_files` is what this query needs of the segment's filter
+    /// index (#244): empty for a query that reads no filter columns,
+    /// `filters.bin` for a legacy segment, `filters.toc` plus the query's
+    /// columns for a columnar one.
     fn scoring_complete(
         seg_path: &Path,
         needs_vectors: bool,
         vectors_ranged: bool,
-        needs_filters: bool,
+        filter_files: &[String],
         has_manifest_footer: bool,
     ) -> bool {
         if !has_manifest_footer && !file_present_nonempty(&seg_path.join("footer.json")) {
@@ -2698,7 +2763,10 @@ impl AppState {
         if !file_present_nonempty(&seg_path.join("inverted.idx")) {
             return false;
         }
-        if needs_filters && !file_present_nonempty(&seg_path.join("filters.bin")) {
+        if !filter_files
+            .iter()
+            .all(|f| file_present_nonempty(&seg_path.join(f)))
+        {
             return false;
         }
         let doc_access_ok = file_present_nonempty(&seg_path.join("doc_store.offsets"))
@@ -2747,7 +2815,7 @@ impl AppState {
         &self,
         seg_paths: &[PathBuf],
         needs_vectors: bool,
-        needs_filters: bool,
+        filter_files: &HashMap<PathBuf, Vec<String>>,
         paths_with_manifest_footer: &std::collections::HashSet<PathBuf>,
         request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
@@ -2756,13 +2824,14 @@ impl AppState {
         };
 
         let vectors_ranged = self.posting_read_mode == doc_spans::ReadMode::Ranged;
+        let filters_of = |p: &Path| filter_files.get(p).map(Vec::as_slice).unwrap_or(&[]);
         let mut outcome = HydrationOutcome::default();
         let (owned, waiting) = partition_for_hydration(&self.in_flight_segments, seg_paths, |p| {
             Self::scoring_complete(
                 p,
                 needs_vectors,
                 vectors_ranged,
-                needs_filters,
+                filters_of(p),
                 paths_with_manifest_footer.contains(p),
             )
         });
@@ -2800,8 +2869,13 @@ impl AppState {
                 if !file_present_nonempty(&seg_path.join("inverted.idx")) {
                     logical_paths.push((format!("{s3_prefix}/inverted.idx"), 0));
                 }
-                if needs_filters && !file_present_nonempty(&seg_path.join("filters.bin")) {
-                    logical_paths.push((format!("{s3_prefix}/filters.bin"), 0));
+                // Only the filter files this query reads: a columnar
+                // segment's TOC plus the columns the query names (#244),
+                // in the same round as the other scoring files.
+                for file in filters_of(seg_path) {
+                    if !file_present_nonempty(&seg_path.join(file)) {
+                        logical_paths.push((format!("{s3_prefix}/{file}"), 0));
+                    }
                 }
 
                 // doc_store: Lazy segments need only the offsets sidecar;
@@ -2927,7 +3001,7 @@ impl AppState {
                     p,
                     needs_vectors,
                     vectors_ranged,
-                    needs_filters,
+                    filters_of(p),
                     paths_with_manifest_footer.contains(*p),
                 )
             })
@@ -4968,14 +5042,14 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         // or warmup's own probe) must not be trusted by a query that does
         // need one of them; `covers` enforces that per-file-class check
         // instead of trusting a flat "namespace hydrated" bool.
-        let needs_filters = query_needs_filter_store(&query);
+        let needs_filters = query_filter_fields(&query);
         let needs_vectors = query.knn.is_some();
         let cached_covers = state
             .completed_hydrations
             .lock()
             .unwrap()
             .get(&verdict_key)
-            .is_some_and(|v| v.covers(needs_filters, needs_vectors));
+            .is_some_and(|v| v.covers(needs_filters.as_ref(), needs_vectors));
         let outcome = if cached_covers {
             // The cached verdict can only ever cover the *static* scoring
             // set (footers/TOCs/offsets/filters). Posting blobs are fetched
@@ -5019,7 +5093,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                     .unwrap()
                     .entry(verdict_key)
                     .or_default()
-                    .merge(needs_filters, needs_vectors);
+                    .merge(needs_filters.as_ref(), needs_vectors);
             }
             outcome
         };
@@ -5383,14 +5457,14 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         // `HydrationVerdict` for why this is per-file-class, not a flat
         // bool.
         let verdict_key = (ns.0.clone(), manifest.version);
-        let needs_filters = query_needs_filter_store(&query);
+        let needs_filters = query_filter_fields(&query);
         let needs_vectors = query.knn.is_some();
         let cached_covers = state
             .completed_hydrations
             .lock()
             .unwrap()
             .get(&verdict_key)
-            .is_some_and(|v| v.covers(needs_filters, needs_vectors));
+            .is_some_and(|v| v.covers(needs_filters.as_ref(), needs_vectors));
         let outcome = if cached_covers {
             // Posting blobs are per-query and outside the cached verdict —
             // see `handle_search_post` for the full rationale.
@@ -5407,7 +5481,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
                     .unwrap()
                     .entry(verdict_key)
                     .or_default()
-                    .merge(needs_filters, needs_vectors);
+                    .merge(needs_filters.as_ref(), needs_vectors);
             }
             outcome
         };
@@ -6701,6 +6775,34 @@ fn term_bloom_prune_for_query(query: &SearchQuery) -> Option<(Vec<String>, TermB
 #[cfg(feature = "s3")]
 fn query_needs_filter_store(query: &SearchQuery) -> bool {
     query.needs_filter_columns()
+}
+
+/// The filter files a query reading `fields` needs from one segment
+/// (#244): `filters.bin`, or `filters.toc` plus the named columns, as the
+/// segment's footer says. `footer` is the cached copy when there is one;
+/// otherwise the local `footer.json` decides. With no footer at all the
+/// segment cannot be scored anyway (`footer.json` is itself missing), so
+/// the legacy name is as good as any.
+#[cfg(feature = "s3")]
+fn segment_filter_files(
+    footer: Option<&kosha_core::Footer>,
+    seg_path: &Path,
+    fields: &FilterFields,
+) -> Vec<String> {
+    match footer {
+        Some(footer) => footer.filter_files_for(Some(fields)),
+        None => SegmentReader::read_footer(seg_path)
+            .map(|f| f.filter_files_for(Some(fields)))
+            .unwrap_or_else(|_| vec![kosha_core::FILTERS_BIN_FILE.to_string()]),
+    }
+}
+
+/// The filter column names a query reads, or `None` when it needs no
+/// filter files (#244). A legacy segment needs its whole `filters.bin`
+/// either way; a columnar one needs `filters.toc` plus these columns.
+#[cfg(feature = "s3")]
+fn query_filter_fields(query: &SearchQuery) -> Option<FilterFields> {
+    query_needs_filter_store(query).then(|| query.filter_column_fields())
 }
 
 /// The tokens whose postings a query reads: the same terms
@@ -8150,6 +8252,45 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #244: a columnar segment has no `filters.bin`; it is complete once
+    /// `filters.toc` and every column its footer lists are local.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn columnar_segment_is_complete_with_toc_and_every_column() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-columnar-complete-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut w =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("c".into()), dir.clone())
+                .with_filters_write_version(2);
+        w.add_document(
+            kosha_core::DocumentId("d".into()),
+            vec![
+                kosha_core::Field::keyword("a", "x"),
+                kosha_core::Field::integer("b", 1),
+            ],
+        );
+        let footer = w.finalize(kosha_core::Bm25Params::default()).unwrap();
+        assert!(!dir.join("filters.bin").exists());
+        assert!(AppState::segment_is_complete(&dir));
+        let col = footer.filter_columns.as_ref().unwrap()[1].file_name();
+        let stash = dir.join("col.stash");
+        fs::rename(dir.join(&col), &stash).unwrap();
+        assert!(
+            !AppState::segment_is_complete(&dir),
+            "a missing column makes a columnar segment incomplete"
+        );
+        fs::rename(&stash, dir.join(&col)).unwrap();
+        fs::remove_file(dir.join("filters.toc")).unwrap();
+        assert!(
+            !AppState::segment_is_complete(&dir),
+            "so does a missing TOC"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Regression for the S3 durability gap this fixes: 174 of 376
     /// segments in a real benchmark run were never uploaded because
     /// `publish_namespace` used to sync only `manifest.segments.last()` —
@@ -8198,6 +8339,16 @@ mod tests {
             vec!["seg-1", "seg-3"],
             "must find every unsynced segment (including non-'last' seg-1), not just the newest"
         );
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn hydration_wants_file_fetches_every_columnar_filter_file() {
+        // Full-segment hydration (index/compact/admin) needs every column
+        // (#244); only the search path narrows to the query's columns.
+        for f in ["filters.toc", "filters-000.col", "filters-123.col"] {
+            assert!(hydration_wants_file(f, false), "{f}");
+        }
     }
 
     #[cfg(feature = "s3")]
@@ -8991,37 +9142,214 @@ mod tests {
 
     #[test]
     fn hydration_verdict_covers_only_what_was_actually_verified() {
+        let fields =
+            |names: &[&str]| -> FilterFields { names.iter().map(|s| s.to_string()).collect() };
+        let none = fields(&[]);
         let mut v = HydrationVerdict::default();
         assert!(
-            v.covers(false, false),
+            v.covers(None, false),
             "a query needing neither file class is trivially covered by any verdict"
         );
         assert!(
-            !v.covers(true, false),
+            !v.covers(Some(&none), false),
             "an unverified verdict must not cover a query that needs filters.bin"
         );
         assert!(
-            !v.covers(false, true),
+            !v.covers(None, true),
             "an unverified verdict must not cover a query that needs vector.idx"
         );
 
-        // A pass that itself needed only filters.bin verifies only that.
-        v.merge(true, false);
-        assert!(v.covers(false, false));
-        assert!(v.covers(true, false));
+        // A pass that itself needed only filters verifies only that.
+        v.merge(Some(&none), false);
+        assert!(v.covers(None, false));
+        assert!(v.covers(Some(&none), false));
         assert!(
-            !v.covers(false, true),
+            !v.covers(None, true),
             "verifying filters.bin must not also mark vector.idx as verified"
         );
-        assert!(!v.covers(true, true));
+        assert!(!v.covers(Some(&none), true));
 
         // A later pass needing vector.idx merges in, not overwrites.
-        v.merge(false, true);
+        v.merge(None, true);
         assert!(
-            v.covers(true, true),
+            v.covers(Some(&none), true),
             "flags accumulate across passes — filters_verified from an earlier pass must \
              survive a later pass that only verified vectors"
         );
+    }
+
+    /// #244: columnar segments hydrate only the columns a query names, so a
+    /// verdict earned by a `matterId` filter must not cover a later query
+    /// on `documentId` — its column may never have been fetched.
+    #[test]
+    fn hydration_verdict_tracks_which_filter_columns_were_verified() {
+        let fields =
+            |names: &[&str]| -> FilterFields { names.iter().map(|s| s.to_string()).collect() };
+        let mut v = HydrationVerdict::default();
+        v.merge(Some(&fields(&["matterId"])), false);
+        assert!(v.covers(Some(&fields(&["matterId"])), false));
+        assert!(
+            v.covers(Some(&fields(&[])), false),
+            "TOC-only needs are covered"
+        );
+        assert!(
+            !v.covers(Some(&fields(&["documentId"])), false),
+            "a column no pass fetched must not be assumed local"
+        );
+        assert!(!v.covers(Some(&fields(&["matterId", "documentId"])), false));
+        v.merge(Some(&fields(&["documentId"])), false);
+        assert!(
+            v.covers(Some(&fields(&["matterId", "documentId"])), false),
+            "verified columns accumulate across passes"
+        );
+    }
+
+    /// #244 acceptance: a filter on one keyword field of a columnar
+    /// segment hydrates only `filters.toc` and that field's column, and
+    /// the query answers exactly as from the whole segment. "S3" is a fully
+    /// written segment directory; the query node's directory gets only the
+    /// scoring files plus what `segment_filter_files` asks for.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn columnar_filter_query_hydrates_only_the_toc_and_its_column() {
+        let root = std::env::temp_dir().join(format!("kosha-244-hydration-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let remote = root.join("remote/ns/seg");
+        let local_root = root.join("local");
+        let local = local_root.join("ns/seg");
+        let mut w =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("seg".into()), remote.clone())
+                .with_filters_write_version(2);
+        for d in 0..2000u32 {
+            w.add_document(
+                kosha_core::DocumentId(format!("d{d}")),
+                vec![
+                    kosha_core::Field::text("t", format!("contract clause {d}")),
+                    kosha_core::Field::keyword("matterId", format!("m{}", d % 5)),
+                    kosha_core::Field::text("documentId", format!("doc-{d}")),
+                    kosha_core::Field::text("path", format!("/matters/m{}/f{d}.pdf", d % 5)),
+                    kosha_core::Field::integer("page", (d % 300) as i64),
+                    kosha_core::Field::float_val("confidence", d as f64 / 2000.0),
+                ],
+            );
+        }
+        let footer = w.finalize(kosha_core::Bm25Params::default()).unwrap();
+        assert!(footer.filter_columns.is_some());
+
+        let mut query: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "contract",
+            "max_results": 5,
+            "filter": {"term": {"matterId.keyword": "m3"}}
+        }))
+        .unwrap();
+        query.exact_total_hits = Some(true);
+        let fields = query_filter_fields(&query).expect("a filtered query needs filter columns");
+        let wanted = segment_filter_files(Some(&footer), &local, &fields);
+        let matter = footer
+            .filter_columns
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|c| c.name == "matterId")
+            .unwrap();
+        assert_eq!(
+            wanted,
+            vec![kosha_core::FILTERS_TOC_FILE.to_string(), matter.file_name()],
+            "only the TOC and the one column"
+        );
+
+        // Hydrate: scoring files + the wanted filter files, nothing else.
+        std::fs::create_dir_all(&local).unwrap();
+        for f in [
+            "footer.json",
+            "inverted.idx",
+            "doc_store.offsets",
+            "doc_store.bin",
+        ] {
+            std::fs::copy(remote.join(f), local.join(f)).unwrap();
+        }
+        for entry in std::fs::read_dir(&remote).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("postings-") {
+                std::fs::copy(entry.path(), local.join(&name)).unwrap();
+            }
+        }
+        assert!(
+            !AppState::scoring_complete(&local, false, false, &wanted, true),
+            "not scorable before its filter files land"
+        );
+        let mut hydrated = 0u64;
+        for f in &wanted {
+            hydrated += std::fs::copy(remote.join(f), local.join(f)).unwrap();
+        }
+        assert!(AppState::scoring_complete(
+            &local, false, false, &wanted, true
+        ));
+        let all_filter_bytes: u64 = footer
+            .filter_files_for(None)
+            .iter()
+            .map(|f| std::fs::metadata(remote.join(f)).unwrap().len())
+            .sum();
+        println!(
+            "columnar hydration: {hydrated} of {all_filter_bytes} filter bytes for a one-column filter"
+        );
+        assert!(
+            hydrated * 4 < all_filter_bytes,
+            "one column of five must be a small share: {hydrated} of {all_filter_bytes}"
+        );
+        for c in footer.filter_columns.as_ref().unwrap() {
+            if c.id != matter.id {
+                assert!(!local.join(c.file_name()).exists());
+            }
+        }
+
+        // Same answer as against the whole segment.
+        let manifest = kosha_core::Manifest {
+            version: 1,
+            segments: vec![kosha_core::ManifestEntry {
+                segment_id: kosha_core::SegmentId("seg".into()),
+                doc_count: 2000,
+            }],
+            segment_footers: HashMap::new(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        };
+        let ns = NamespaceId("ns".into());
+        let partial = kosha_query::Searcher::new(local_root.clone())
+            .search(&ns, &manifest, &query, None)
+            .unwrap();
+        let full = kosha_query::Searcher::new(root.join("remote"))
+            .search(&ns, &manifest, &query, None)
+            .unwrap();
+        assert_eq!(partial.total_hits, 400);
+        assert_eq!(partial.total_hits, full.total_hits);
+        let ids = |r: &kosha_core::SearchResult| {
+            r.results
+                .iter()
+                .map(|d| d.doc_id.0.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&partial), ids(&full));
+
+        // A later query on another column is not covered by what landed.
+        let mut other = query.clone();
+        other.filter = Some(
+            serde_json::from_value(serde_json::json!({"range": {"page": {"gte": "10"}}})).unwrap(),
+        );
+        let other_files =
+            segment_filter_files(Some(&footer), &local, &query_filter_fields(&other).unwrap());
+        assert!(!AppState::scoring_complete(
+            &local,
+            false,
+            false,
+            &other_files,
+            true
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(feature = "s3")]
@@ -9069,10 +9397,10 @@ mod tests {
         // warmup's own probe query shape — succeeds and (per the existing
         // `!bloom_pruned` gate) is eligible to merge into the cache.
         let warmup_like = base_query.clone();
-        let needs_filters_1 = query_needs_filter_store(&warmup_like);
+        let needs_filters_1 = query_filter_fields(&warmup_like);
         let needs_vectors_1 = warmup_like.knn.is_some();
         assert!(
-            !needs_filters_1 && !needs_vectors_1,
+            needs_filters_1.is_none() && !needs_vectors_1,
             "warmup's probe query must not need filters.bin/vector.idx — this is exactly \
              what makes its success unable to prove either file is local"
         );
@@ -9089,7 +9417,7 @@ mod tests {
             .unwrap()
             .entry(verdict_key.clone())
             .or_default()
-            .merge(needs_filters_1, needs_vectors_1);
+            .merge(needs_filters_1.as_ref(), needs_vectors_1);
 
         // Step 2: a documentId-filtered, sorted, search_after-paginated
         // chunk-visibility query — the shape `post_index_processing`
@@ -9107,10 +9435,10 @@ mod tests {
             )]),
         }];
         chunk_lookup.search_after = Some(vec!["0".to_string()]);
-        let needs_filters_2 = query_needs_filter_store(&chunk_lookup);
+        let needs_filters_2 = query_filter_fields(&chunk_lookup);
         let needs_vectors_2 = chunk_lookup.knn.is_some();
         assert!(
-            needs_filters_2,
+            needs_filters_2.is_some(),
             "a documentId term filter needs filters.bin"
         );
 
@@ -9119,8 +9447,9 @@ mod tests {
             .lock()
             .unwrap()
             .get(&verdict_key)
-            .copied();
-        let cached_covers = cached.is_some_and(|v| v.covers(needs_filters_2, needs_vectors_2));
+            .cloned();
+        let cached_covers =
+            cached.is_some_and(|v| v.covers(needs_filters_2.as_ref(), needs_vectors_2));
         assert!(
             !cached_covers,
             "an unfiltered pass that never checked filters.bin must not let a later, \
@@ -9142,9 +9471,12 @@ mod tests {
                 },
             )]),
         }];
-        let needs_filters_3 = query_needs_filter_store(&sorted_unfiltered);
+        let needs_filters_3 = query_filter_fields(&sorted_unfiltered);
         let needs_vectors_3 = sorted_unfiltered.knn.is_some();
-        assert!(needs_filters_3, "sorting by a real field needs filters.bin");
+        assert!(
+            needs_filters_3.is_some(),
+            "sorting by a real field needs filters.bin"
+        );
         let outcome3 = state.hydrate_segments_for_search(
             &ns,
             &manifest,
@@ -9162,16 +9494,16 @@ mod tests {
             .unwrap()
             .entry(verdict_key.clone())
             .or_default()
-            .merge(needs_filters_3, needs_vectors_3);
+            .merge(needs_filters_3.as_ref(), needs_vectors_3);
 
         let cached_after = state
             .completed_hydrations
             .lock()
             .unwrap()
             .get(&verdict_key)
-            .copied();
+            .cloned();
         assert!(
-            cached_after.is_some_and(|v| v.covers(true, false)),
+            cached_after.is_some_and(|v| v.covers(needs_filters_3.as_ref(), false)),
             "a pass that itself verified filters.bin must let a later query needing only \
              filters.bin take the fast path"
         );
@@ -10561,6 +10893,7 @@ mod tests {
             text_filter_ignore_above: None,
             doc_vectors: false,
             posting_blobs_raw: false,
+            filter_columns: None,
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.

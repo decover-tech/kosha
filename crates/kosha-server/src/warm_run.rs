@@ -606,7 +606,7 @@ impl AppState {
                     .unwrap()
                     .entry((ns_name.clone(), manifest.version))
                     .or_default()
-                    .merge(false, false);
+                    .merge(None, false);
             }
         }
 

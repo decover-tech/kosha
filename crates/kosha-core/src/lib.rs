@@ -266,6 +266,24 @@ pub enum FilterClause {
     },
 }
 
+impl FilterClause {
+    /// Call `f` with every field name this clause (recursively) reads.
+    pub fn for_each_field(&self, f: &mut impl FnMut(&str)) {
+        match self {
+            Self::Term { term } => term.keys().for_each(|k| f(k)),
+            Self::Terms { terms } => terms.keys().for_each(|k| f(k)),
+            Self::Range { range } => range.keys().for_each(|k| f(k)),
+            Self::Exists { exists } => f(&exists.field),
+            Self::MatchAll { .. } => {}
+            Self::Bool { bool } => {
+                for clause in bool.must.iter().chain(&bool.must_not).chain(&bool.should) {
+                    clause.for_each_field(f);
+                }
+            }
+        }
+    }
+}
+
 /// Body of an `exists` clause.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -803,6 +821,142 @@ pub struct Footer {
     /// optional), so a rollback still reads these segments.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub posting_blobs_raw: bool,
+    /// The columnar filter index directory (#244): one entry per filter
+    /// column, naming the `filters-NNN.col` file that holds it, plus its
+    /// per-segment stats. `Some` means the segment's filter values live in
+    /// `filters.toc` + those column files and it has **no** `filters.bin`;
+    /// `None` (the default, and every segment written before #244 or with
+    /// `KOSHA_FILTERS_WRITE_VERSION=1`) means they live in `filters.bin`.
+    /// This field is how readers and the hydration planner pick the
+    /// format: they never guess from which files happen to be local. It
+    /// is also what lets a query node fetch only the columns a query
+    /// touches without first fetching `filters.toc` to learn file names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_columns: Option<Vec<FilterColumnMeta>>,
+}
+
+/// Value type of one filter column (#244). A field name can appear with
+/// more than one kind in one segment (documents disagree on its type), so
+/// a column is keyed by `(name, kind)`, exactly like [`FilterStore`]'s
+/// three maps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FilterColumnKind {
+    /// Keyword, Boolean, Date and (capped) Text values.
+    String,
+    Integer,
+    Float,
+}
+
+/// A min/max bound in [`FilterColumnStats`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FilterStatValue {
+    Integer(i64),
+    Float(f64),
+    String(String),
+}
+
+/// Per-segment statistics of one filter column (#244), recorded so later
+/// work can skip segments by range the way `filter_blooms` skips them by
+/// term. Every field is optional on the wire; `None` means "unknown", and
+/// a reader must then not skip on it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FilterColumnStats {
+    /// Number of `(doc, value)` entries.
+    #[serde(default)]
+    pub values: u64,
+    /// Number of distinct documents holding at least one value.
+    #[serde(default)]
+    pub docs: u64,
+    /// Number of distinct values. Exact (the dictionary size) for string
+    /// columns; exact for numeric ones too (`f64` by bit pattern).
+    #[serde(default)]
+    pub distinct: u64,
+    /// Smallest value. For floats only finite values count, and the bound
+    /// is omitted if the column holds none. For strings it is omitted when
+    /// longer than [`FILTER_STAT_MAX_STRING_BYTES`] (a truncated minimum
+    /// would still be a bound, but a truncated maximum would not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<FilterStatValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<FilterStatValue>,
+    /// `true` when a float column holds a NaN or infinite value, which
+    /// `min`/`max` do not describe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub non_finite: bool,
+}
+
+/// Longest string min/max kept in [`FilterColumnStats`].
+pub const FILTER_STAT_MAX_STRING_BYTES: usize = 64;
+
+/// One entry of the columnar filter directory (#244). See
+/// `Footer::filter_columns`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilterColumnMeta {
+    pub name: String,
+    pub kind: FilterColumnKind,
+    /// Column file id: the data lives in `filters-{id:03}.col`. Files are
+    /// numbered rather than named after the field because field names are
+    /// arbitrary strings (`/`, `..`, very long, non-ASCII).
+    pub id: u32,
+    /// Size of the column file in bytes.
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub stats: FilterColumnStats,
+}
+
+impl FilterColumnMeta {
+    /// Basename of this column's file inside the segment directory.
+    pub fn file_name(&self) -> String {
+        filter_column_file_name(self.id)
+    }
+}
+
+/// Name of the columnar filter directory file (#244).
+pub const FILTERS_TOC_FILE: &str = "filters.toc";
+/// Name of the legacy row-oriented filter file.
+pub const FILTERS_BIN_FILE: &str = "filters.bin";
+
+/// Basename of filter column file `id` (#244): `filters-007.col`.
+pub fn filter_column_file_name(id: u32) -> String {
+    format!("filters-{id:03}.col")
+}
+
+/// Whether `name` is a columnar filter file (`filters.toc` or a
+/// `filters-NNN.col`).
+pub fn is_filter_column_file(name: &str) -> bool {
+    name == FILTERS_TOC_FILE
+        || name.strip_prefix("filters-").is_some_and(|rest| {
+            rest.strip_suffix(".col")
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
+impl Footer {
+    /// The filter files a query touching `fields` needs locally (#244):
+    /// `filters.bin` for a legacy segment, otherwise `filters.toc` plus
+    /// the column of every `(name, kind)` whose name is in `fields`.
+    /// `fields == None` means every column (admin paths, compaction).
+    pub fn filter_files_for(
+        &self,
+        fields: Option<&std::collections::BTreeSet<String>>,
+    ) -> Vec<String> {
+        match &self.filter_columns {
+            None => vec![FILTERS_BIN_FILE.to_string()],
+            Some(columns) => {
+                let mut files = vec![FILTERS_TOC_FILE.to_string()];
+                files.extend(
+                    columns
+                        .iter()
+                        .filter(|c| fields.is_none_or(|f| f.contains(&c.name)))
+                        .map(FilterColumnMeta::file_name),
+                );
+                files
+            }
+        }
+    }
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -1519,6 +1673,54 @@ impl SearchQuery {
             })
     }
 
+    /// The filter-column names answering this query can read (#244): every
+    /// field named by the filter, the kNN filter, a field sort, the
+    /// collapse and the aggregations. Each `x.keyword`/`x.raw` name also
+    /// adds its base `x`, because lookups fall back to it (see
+    /// [`lookup_field`]). Empty when [`Self::needs_filter_columns`] is
+    /// false. The query node hydrates only these columns of a columnar
+    /// segment.
+    pub fn filter_column_fields(&self) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut add = |field: &str| {
+            out.insert(field.to_string());
+            let base = base_field_name(field);
+            if base.len() != field.len() {
+                out.insert(base.to_string());
+            }
+        };
+        if let Some(filter) = &self.filter {
+            filter.for_each_field(&mut add);
+        }
+        if let Some(filter) = self.knn.as_ref().and_then(|k| k.filter.as_ref()) {
+            filter.for_each_field(&mut add);
+        }
+        if let Some(collapse) = &self.collapse {
+            add(&collapse.field);
+        }
+        for spec in &self.sort {
+            for field in spec.fields.keys() {
+                if field != "_score" && field != "_id" {
+                    add(field);
+                }
+            }
+        }
+        for agg in self.aggs.values() {
+            match agg {
+                Aggregation::Terms { terms } => add(&terms.field),
+                Aggregation::Cardinality { cardinality } => add(&cardinality.field),
+                Aggregation::Composite { composite } => {
+                    for source in &composite.sources {
+                        for terms in source.source.values() {
+                            add(&terms.terms.field);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Whether `field` should be returned with a hit, per
     /// `source_includes` / `source_excludes`.
     pub fn returns_field(&self, field: &str) -> bool {
@@ -1985,6 +2187,7 @@ mod tests {
             text_filter_ignore_above: Some(256),
             doc_vectors: false,
             posting_blobs_raw: false,
+            filter_columns: None,
         }
     }
 
@@ -2334,5 +2537,70 @@ mod bm25_overrides {
         }
         let q = query(r#"{"query_text": "x", "bm25_params": {"b": 2}}"#);
         assert!(matches!(q.validate(), Err(KoshaError::InvalidQuery(_))));
+    }
+}
+
+#[cfg(test)]
+mod filter_column_field_tests {
+    //! #244: which filter columns a query reads decides which column files
+    //! a query node hydrates, so a field it misses would be filtered
+    //! against a column that was never fetched.
+    use super::*;
+
+    #[test]
+    fn filter_column_fields_covers_every_clause_that_reads_columns() {
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "x",
+            "filter": {"bool": {
+                "must": [{"term": {"a.keyword": "1"}}],
+                "must_not": [{"range": {"b": {"gte": "2"}}}],
+                "should": [{"exists": {"field": "c"}}, {"terms": {"d": ["e"]}}]}},
+            "knn": {"field": "v", "vector": [1.0], "filter": {"term": {"k": "1"}}},
+            "sort": [{"s": {"order": "asc"}}, {"_score": {"order": "desc"}}, {"_id": {"order": "asc"}}],
+            "collapse": {"field": "g"},
+            "aggs": {
+                "t": {"terms": {"field": "h"}},
+                "c": {"cardinality": {"field": "i"}},
+                "p": {"composite": {"size": 10, "sources": [{"x": {"terms": {"field": "j"}}}]}}
+            }
+        }))
+        .unwrap();
+        let got: Vec<String> = q.filter_column_fields().into_iter().collect();
+        assert_eq!(
+            got,
+            [
+                "a",
+                "a.keyword",
+                "b",
+                "c",
+                "d",
+                "g",
+                "h",
+                "i",
+                "j",
+                "k",
+                "s"
+            ]
+        );
+        let plain: SearchQuery =
+            serde_json::from_value(serde_json::json!({"query_text": "x"})).unwrap();
+        assert!(plain.filter_column_fields().is_empty());
+    }
+
+    #[test]
+    fn column_file_names() {
+        assert_eq!(filter_column_file_name(7), "filters-007.col");
+        assert_eq!(filter_column_file_name(1234), "filters-1234.col");
+        for yes in ["filters.toc", "filters-000.col", "filters-1234.col"] {
+            assert!(is_filter_column_file(yes), "{yes}");
+        }
+        for no in [
+            "filters.bin",
+            "filters-.col",
+            "filters-a1.col",
+            "filters-001.col.tmp",
+        ] {
+            assert!(!is_filter_column_file(no), "{no}");
+        }
     }
 }

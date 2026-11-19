@@ -303,16 +303,24 @@ impl TrackedSegment {
     ///
     /// `key` is the clause's canonical JSON, computed once per request by
     /// the caller rather than once per segment here.
-    fn filter_set(&self, key: &str, clause: &FilterClause) -> Arc<DocSet> {
+    ///
+    /// Reads only the filter columns `clause` names (#244); a damaged
+    /// column fails the request instead of matching nothing.
+    fn filter_set(&self, key: &str, clause: &FilterClause) -> Result<Arc<DocSet>, KoshaError> {
         if let Some(set) = self.filter_sets.lock().unwrap().get(key) {
-            return Arc::clone(set);
+            return Ok(Arc::clone(set));
         }
+        let mut fields = std::collections::BTreeSet::new();
+        clause.for_each_field(&mut |f| {
+            fields.insert(f.to_string());
+            fields.insert(kosha_core::base_field_name(f).to_string());
+        });
         // Evaluated outside the lock: two requests racing on a new filter
         // both compute it, and one result is dropped. That is cheaper than
         // making every other request for this segment wait behind a scan.
         let set = Arc::new(kosha_core::evaluate_filter(
             clause,
-            &self.reader.filter_store(),
+            &*self.reader.filter_store_for(&fields)?,
             self.reader.doc_count(),
         ));
         let mut cache = self.filter_sets.lock().unwrap();
@@ -320,7 +328,7 @@ impl TrackedSegment {
             cache.clear();
         }
         cache.insert(key.to_string(), Arc::clone(&set));
-        set
+        Ok(set)
     }
 }
 
@@ -556,7 +564,7 @@ impl SegmentCache {
 ///
 /// Under-counting is the dangerous direction (this ledger exists because of
 /// a staging OOM), so anything that *can* become resident is still charged
-/// up front. That's why `filters.bin` is counted in full despite being
+/// up front. That's why `filters.bin` (or every local filter column) is counted in full despite being
 /// `LazyFilters`: it sits behind a `OnceLock` that the first filtered query
 /// populates and every later query keeps alive. Transient per-read buffers
 /// (lazy doc-store reads) hold nothing after the read, and decoded postings
@@ -586,6 +594,20 @@ pub fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u6
 
     // Becomes resident on the first filtered query and stays — see above.
     total = total.saturating_add(size("filters.bin"));
+    // Columnar segments (#244): the TOC plus whichever columns are local.
+    // A query node hydrates only the columns its queries touch, and only
+    // those can become resident.
+    if let Ok(entries) = std::fs::read_dir(seg_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(kosha_core::is_filter_column_file)
+            {
+                total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+            }
+        }
+    }
 
     if load_vectors {
         // Resident: centroids + ranges (v2 lazy) or the whole parsed
@@ -1405,7 +1427,7 @@ impl Searcher {
         // query could not take the block-max WAND path and paid to score
         // every match in the segment first.
         let filter_set: Option<Arc<DocSet>> = match (&query.filter, &filter_keys.query) {
-            (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)),
+            (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)?),
             _ => None,
         };
         if filter_set.as_ref().is_some_and(|set| set.is_empty()) {
@@ -1431,7 +1453,9 @@ impl Searcher {
 
         let needs_filter_store = !sort_value_fields.is_empty() || !query.aggs.is_empty();
         let filter_store = if needs_filter_store {
-            Some(reader.filter_store())
+            // Only the columns this query names (#244). A damaged column
+            // fails the request closed.
+            Some(reader.filter_store_for(&query.filter_column_fields())?)
         } else {
             None
         };
@@ -2393,7 +2417,7 @@ impl Searcher {
             // top `k` by closer vectors from other matters and then thrown
             // away by the filter.
             let knn_filter_set: Option<Arc<DocSet>> = match (&knn.filter, &filter_keys.knn) {
-                (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)),
+                (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)?),
                 _ => None,
             };
             let knn_accept = |doc_seq: u32| -> bool {
@@ -5174,7 +5198,12 @@ mod tests {
             let mut t = on_disk(d, "footer.json")
                 + on_disk(d, "inverted.idx")
                 + on_disk(d, "doc_store.offsets")
-                + on_disk(d, "filters.bin");
+                + SegmentReader::read_footer(d)
+                    .unwrap()
+                    .filter_files_for(None)
+                    .iter()
+                    .map(|f| on_disk(d, f))
+                    .sum::<u64>();
             if load_vectors {
                 t += on_disk(d, "vector.offsets");
             }
@@ -6261,15 +6290,15 @@ mod tests {
         w2.finalize(Bm25Params::default()).unwrap();
 
         let seg_size = |dir: &std::path::Path| -> u64 {
-            [
-                "doc_store.bin",
-                "inverted.idx",
-                "filters.bin",
-                "footer.json",
-            ]
-            .iter()
-            .map(|f| std::fs::metadata(dir.join(f)).unwrap().len())
-            .sum()
+            let filters = SegmentReader::read_footer(dir)
+                .unwrap()
+                .filter_files_for(None);
+            ["doc_store.bin", "inverted.idx", "footer.json"]
+                .iter()
+                .map(|f| f.to_string())
+                .chain(filters)
+                .map(|f| std::fs::metadata(dir.join(f)).unwrap().len())
+                .sum()
         };
         let seg1_bytes = seg_size(&seg1_dir);
         let seg2_bytes = seg_size(&seg2_dir);
@@ -9751,5 +9780,147 @@ mod tests {
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// #244: queries over columnar filter segments answer exactly as over
+/// `filters.bin` ones — filters, sorts, collapse and aggregations all go
+/// through the compatibility `FilterStore` — and a damaged column fails
+/// the query instead of matching nothing.
+#[cfg(test)]
+mod columnar_filter_tests {
+    use super::*;
+    use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
+    use kosha_segment::SegmentWriter;
+
+    fn build(root: &std::path::Path, version: u32) -> Manifest {
+        let mut entries = Vec::new();
+        for s in 0..2u32 {
+            let id = SegmentId(format!("s{s}"));
+            let mut w = SegmentWriter::new(id.clone(), root.join("ns").join(&id.0))
+                .with_filters_write_version(version);
+            for d in 0..300u32 {
+                let mut fields = vec![
+                    Field::text("t", format!("clause number {d}")),
+                    Field::keyword("matterId", format!("m{}", d % 4)),
+                    Field::integer("page", ((d * 7 + s) % 50) as i64),
+                    Field::float_val("score", (d % 13) as f64 / 3.0),
+                    Field::boolean("inScope", d % 3 == 0),
+                ];
+                if d % 10 == 0 {
+                    fields.push(Field::keyword("tag", "rare"));
+                }
+                w.add_document(DocumentId(format!("s{s}-d{d}")), fields);
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: id,
+                doc_count: 300,
+            });
+        }
+        Manifest {
+            version: 1,
+            segments: entries,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        }
+    }
+
+    fn queries() -> Vec<SearchQuery> {
+        [
+            serde_json::json!({"query_text": "clause", "max_results": 7,
+                "filter": {"bool": {"must": [{"term": {"matterId": "m1"}}],
+                                    "must_not": [{"term": {"inScope": "true"}}]}},
+                "sort": [{"page": {"order": "desc"}}, {"_id": {"order": "asc"}}],
+                "exact_total_hits": true}),
+            serde_json::json!({"query_text": "clause", "max_results": 5,
+                "filter": {"range": {"score": {"gte": "1.5", "lt": "3"}}},
+                "aggs": {"m": {"terms": {"field": "matterId"}},
+                         "c": {"cardinality": {"field": "page"}}},
+                "exact_total_hits": true}),
+            serde_json::json!({"query_text": "", "max_results": 10,
+                "filter": {"exists": {"field": "tag"}},
+                "collapse": {"field": "matterId"},
+                "exact_total_hits": true}),
+        ]
+        .into_iter()
+        .map(|q| serde_json::from_value(q).unwrap())
+        .collect()
+    }
+
+    fn summary(r: &SearchResult) -> String {
+        let ids: Vec<&str> = r.results.iter().map(|d| d.doc_id.0.as_str()).collect();
+        let aggs = r
+            .aggregations
+            .as_ref()
+            .map(|a| {
+                let v = serde_json::to_value(a).unwrap();
+                let sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                    serde_json::from_value(v).unwrap();
+                serde_json::to_string(&sorted).unwrap()
+            })
+            .unwrap_or_default();
+        format!("{} {ids:?} {aggs}", r.total_hits)
+    }
+
+    #[test]
+    fn columnar_segments_answer_like_filters_bin() {
+        let root = std::env::temp_dir().join(format!("kosha-q-244-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let m1 = build(&root.join("v1"), 1);
+        let m2 = build(&root.join("v2"), 2);
+        let s1 = Searcher::new(root.join("v1"));
+        let s2 = Searcher::new(root.join("v2"));
+        for q in queries() {
+            let a = s1.search(&ns, &m1, &q, None).unwrap();
+            let b = s2.search(&ns, &m2, &q, None).unwrap();
+            assert!(a.total_hits > 0);
+            assert_eq!(summary(&a), summary(&b), "query {q:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn damaged_column_fails_the_query_closed() {
+        let root = std::env::temp_dir().join(format!("kosha-q-244-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let m = build(&root, 2);
+        let seg = root.join("ns/s0");
+        let footer = SegmentReader::read_footer(&seg).unwrap();
+        let col = footer
+            .filter_columns
+            .unwrap()
+            .into_iter()
+            .find(|c| c.name == "matterId")
+            .unwrap();
+        let bytes = std::fs::read(seg.join(col.file_name())).unwrap();
+        std::fs::write(seg.join(col.file_name()), &bytes[..bytes.len() - 5]).unwrap();
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "clause", "filter": {"term": {"matterId": "m1"}}}))
+        .unwrap();
+        let err = Searcher::new(root.clone()).search(&ns, &m, &q, None);
+        assert!(
+            matches!(err, Err(KoshaError::CorruptSegment(_))),
+            "a truncated column must fail the query, got {:?}",
+            err.map(|r| r.total_hits)
+        );
+        // A query that never reads that column is unaffected.
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "clause", "filter": {"term": {"inScope": "true"}}}))
+        .unwrap();
+        assert!(
+            Searcher::new(root.clone())
+                .search(&ns, &m, &q, None)
+                .unwrap()
+                .total_hits
+                > 0
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

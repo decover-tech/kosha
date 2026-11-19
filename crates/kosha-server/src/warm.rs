@@ -35,7 +35,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[serde(rename_all = "snake_case")]
 pub enum FileClass {
     /// What every search needs before it can score a segment:
-    /// `footer.json`, `inverted.idx`, `doc_store.offsets`, `filters.bin`.
+    /// `footer.json`, `inverted.idx`, `doc_store.offsets`, `filters.bin`
+    /// (or `filters.toc` + `filters-NNN.col`, #244).
     Scoring,
     /// Posting shards, `postings-XX.bin`: read per query term.
     Postings,
@@ -70,6 +71,8 @@ impl FileClass {
             "footer.json" | "inverted.idx" | "doc_store.offsets" | "filters.bin" => {
                 Some(Self::Scoring)
             }
+            // Columnar filter index (#244): the TOC and its column files.
+            n if kosha_core::is_filter_column_file(n) => Some(Self::Scoring),
             "doc_store.bin" | "doc_vectors.bin" => Some(Self::DocStore),
             "vector.idx" | "vector.offsets" => Some(Self::Vectors),
             n if n.starts_with("postings-") && n.ends_with(".bin") => Some(Self::Postings),

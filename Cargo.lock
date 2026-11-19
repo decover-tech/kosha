@@ -2051,9 +2051,11 @@ name = "kosha-segment"
 version = "0.1.0"
 dependencies = [
  "cap",
+ "crc32fast",
  "instant-distance",
  "kosha-core",
  "kosha-vector-spfresh",
+ "roaring",
  "serde",
  "serde_json",
  "zstd",

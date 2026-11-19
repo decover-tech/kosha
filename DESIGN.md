@@ -199,9 +199,41 @@ s3://kosha-{env}/{namespace_id}/segments/{segment_id}/
     doc_store.bin       # document payloads (content, metadata), compressed, block-addressed
     inverted.idx         # term → postings list (docId, freq, positions) for lexical search
     vector.idx           # ANN index (HNSW graph or IVF-PQ codebook + posting lists) — Phase 2, not written in Phase 1
-    filters.bin          # columnar filter fields (dates, ids, tags) for fast predicate eval
+    filters.bin          # filter fields (dates, ids, tags), row-oriented — or, with the columnar format:
+    filters.toc          #   column directory + per-column stats (#244)
+    filters-NNN.col      #   one file per (field, type) column, numbered by id
     footer.json          # offsets, counts, schema version, checksum (reserves a vector.idx slot even in Phase 1)
 ```
+
+**Filter index formats (#244).** A segment stores its filter values in one of two formats, and
+`footer.json` says which (`filter_columns` present = columnar); readers never infer it from the
+files that happen to be on local disk.
+
+- `filters.bin` (v1): every field's `(doc_seq, value)` pairs in one row-oriented blob. Any filter,
+  sort or aggregation on one field needs the whole file.
+- Columnar (v2): `filters.toc` plus one `filters-NNN.col` per `(field, type)` column. Files are
+  numbered, not named after fields, because field names are arbitrary strings. String columns
+  (keyword, bool, date, capped text) hold a sorted dictionary, a roaring bitmap of documents per
+  term, and a per-entry dictionary ordinal for sorts and aggregations. Integer and float columns
+  hold values in doc order with min/max zone maps per 4096 entries. Every column has a presence
+  bitmap and a CRC over its header and body; a damaged or truncated column fails the query
+  rather than matching nothing. The footer also carries the column directory and per-column
+  stats (value count, document count, distinct count, min, max), so a query node can plan
+  which columns to fetch without an extra round trip, and later work can skip segments by
+  range.
+
+A query node fetches only `filters.toc` and the columns the query names (filter, kNN filter,
+field sorts, collapse and aggregations; `x.keyword` also fetches `x`). In this release the
+reader rebuilds the legacy in-memory `FilterStore` from those columns, so filter evaluation,
+sorting and aggregations are unchanged; bitmap-based evaluation is follow-up work.
+
+`KOSHA_FILTERS_WRITE_VERSION` picks the format writers (flush and compaction) emit: `1`
+(default) writes `filters.bin`, `2` writes columns. Every reader in this release reads both.
+Rollout: keep the gate at `1` until every query and write node runs a release that reads v2,
+then set it to `2`; compaction converts segments as it merges them. Rollback: set it back to `1`
+and compaction rewrites columnar segments as `filters.bin`, but a binary older than #244 cannot
+read columnar segments (their filters match nothing), so do not downgrade past this release
+while any remain.
 
 Segments are sized to a target (e.g. 128–512MB) so that a full segment fetch/cache-fill is a
 bounded, predictable operation. Small/continuous writes are buffered (§7) and flushed as a segment

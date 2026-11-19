@@ -1,3 +1,4 @@
+pub mod filter_columns;
 pub mod span_cache;
 
 use std::collections::{HashMap, VecDeque};
@@ -88,6 +89,12 @@ pub struct SegmentWriter {
     filter_string: HashMap<String, Vec<(u32, String)>>,
     filter_integer: HashMap<String, Vec<(u32, i64)>>,
     filter_float: HashMap<String, Vec<(u32, f64)>>,
+    /// Filter index format `finalize` writes: `1` = `filters.bin`, `2` =
+    /// columnar (#244). See [`filter_columns::filters_write_version`].
+    filters_write_version: u32,
+    /// The column directory `write_filters` produced in columnar mode,
+    /// recorded as `Footer::filter_columns`.
+    filter_columns_meta: Option<Vec<kosha_core::FilterColumnMeta>>,
     vectors: Vec<(u32, Vec<f32>)>,
     /// See [`text_filter_ignore_above`]. Captured per writer so tests can
     /// override it without touching the process-wide env.
@@ -134,6 +141,8 @@ impl SegmentWriter {
             filter_string: HashMap::new(),
             filter_integer: HashMap::new(),
             filter_float: HashMap::new(),
+            filters_write_version: filter_columns::filters_write_version(),
+            filter_columns_meta: None,
             vectors: Vec::new(),
             text_filter_ignore_above: text_filter_ignore_above(),
             vector_store_mode: VectorStoreMode::from_env(),
@@ -162,6 +171,15 @@ impl SegmentWriter {
     /// writers use `KOSHA_POSTINGS_RAW_BLOBS`; see [`posting_blobs_raw`].
     pub fn with_raw_posting_blobs(mut self, raw: bool) -> Self {
         self.posting_blobs_raw = raw;
+        self
+    }
+
+    /// Override the filter index format (#244): `1` writes `filters.bin`,
+    /// `2` the columnar `filters.toc` + `filters-NNN.col`. Production
+    /// writers use `KOSHA_FILTERS_WRITE_VERSION`; see
+    /// [`filter_columns::filters_write_version`].
+    pub fn with_filters_write_version(mut self, version: u32) -> Self {
+        self.filters_write_version = version;
         self
     }
 
@@ -601,7 +619,10 @@ impl SegmentWriter {
         Ok(())
     }
 
-    fn write_filters(&self) -> Result<(), KoshaError> {
+    fn write_filters(&mut self) -> Result<(), KoshaError> {
+        if self.filters_write_version >= 2 {
+            return self.write_filter_columns();
+        }
         let mut buf = Vec::new();
         let total_fields =
             self.filter_string.len() + self.filter_integer.len() + self.filter_float.len();
@@ -655,6 +676,31 @@ impl SegmentWriter {
         }
 
         self.backend.write("filters.bin", &buf)?;
+        Ok(())
+    }
+
+    /// Columnar filter index (#244): one `filters-NNN.col` per `(field,
+    /// kind)` and `filters.toc`, written last so a TOC on disk implies its
+    /// columns are. See [`filter_columns`] for the layout. Always writes the
+    /// TOC, even with zero columns, so "TOC absent" only ever means "not
+    /// hydrated yet".
+    fn write_filter_columns(&mut self) -> Result<(), KoshaError> {
+        let doc_count = self.field_lengths.len() as u32;
+        let backend = &self.backend;
+        let metas = filter_columns::build_columns(
+            doc_count,
+            &self.filter_string,
+            &self.filter_integer,
+            &self.filter_float,
+            |meta, bytes| backend.write(&meta.file_name(), bytes),
+        )?;
+        let toc = filter_columns::FiltersToc {
+            doc_count,
+            columns: metas,
+        };
+        self.backend
+            .write(kosha_core::FILTERS_TOC_FILE, &toc.encode())?;
+        self.filter_columns_meta = Some(toc.columns);
         Ok(())
     }
 
@@ -786,6 +832,7 @@ impl SegmentWriter {
             text_filter_ignore_above: self.text_filter_ignore_above,
             doc_vectors: !self.doc_vector_entries.is_empty(),
             posting_blobs_raw: self.posting_blobs_raw,
+            filter_columns: self.filter_columns_meta.clone(),
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -4012,9 +4059,35 @@ pub struct DocMetaRef<'a> {
 /// later hydration landed the real file (see `get()`'s doc comment for the
 /// incident this caused in production: a cached reader silently matched
 /// zero documents forever, on a file later confirmed byte-correct on disk).
+///
+/// Columnar segments (#244, `Footer::filter_columns` is `Some`) follow the
+/// same rule per file: `filters.toc` and each `filters-NNN.col` is cached
+/// only once a read found it present. A query node hydrates only the
+/// columns its queries touch, so [`Self::store_for`] adds columns to the
+/// cached compatibility [`FilterStore`] as they land, and a column that
+/// is still missing is simply retried on the next call.
 struct LazyFilters {
     segment_dir: PathBuf,
-    state: Mutex<Option<Arc<FilterStore>>>,
+    doc_count: u32,
+    /// `Footer::filter_columns.is_some()`: the format comes from the
+    /// footer, never from which files are on disk.
+    columnar: bool,
+    state: Mutex<FilterState>,
+}
+
+#[derive(Default)]
+struct FilterState {
+    /// Legacy: parsed `filters.bin`, once seen present.
+    legacy: Option<Arc<FilterStore>>,
+    /// Columnar: parsed `filters.toc`, once seen present.
+    toc: Option<Arc<filter_columns::FiltersToc>>,
+    /// Columnar: the compatibility store built from the columns loaded so
+    /// far, and their ids.
+    merged: Arc<FilterStore>,
+    merged_ids: std::collections::BTreeSet<u32>,
+    /// `filter_column` cache, by column id (columnar) or `(name, kind)`
+    /// position in the legacy store.
+    columns: HashMap<(String, kosha_core::FilterColumnKind), Arc<filter_columns::FilterColumn>>,
 }
 
 impl LazyFilters {
@@ -4040,9 +4113,8 @@ impl LazyFilters {
     /// non-empty (just a zero-entry header) and caches normally on first
     /// read, so this retry loop only ever runs during the brief hydration
     /// race, not on every query against a filter-less segment.
-    fn get(&self) -> Arc<FilterStore> {
-        let mut guard = self.state.lock().unwrap();
-        if let Some(store) = guard.as_ref() {
+    fn legacy(&self, state: &mut FilterState) -> Arc<FilterStore> {
+        if let Some(store) = state.legacy.as_ref() {
             return Arc::clone(store);
         }
         let raw = SegmentReader::read_filters_raw(&self.segment_dir);
@@ -4051,14 +4123,161 @@ impl LazyFilters {
                 "WARN: filters.bin missing/empty at first use for {} — filtered queries against this segment will match nothing until it hydrates; retrying on next use",
                 self.segment_dir.display()
             );
-            // Deliberately not cached — leave `guard` as `None` so the
-            // next call re-reads instead of trusting this premature empty
-            // parse forever.
+            // Deliberately not cached — leave `state.legacy` as `None` so
+            // the next call re-reads instead of trusting this premature
+            // empty parse forever.
             return Arc::new(SegmentReader::parse_filters(&raw));
         }
         let store = Arc::new(SegmentReader::parse_filters(&raw));
-        *guard = Some(Arc::clone(&store));
+        state.legacy = Some(Arc::clone(&store));
         store
+    }
+
+    /// `filters.toc`, or `None` while it is not local (not cached).
+    fn toc(
+        &self,
+        state: &mut FilterState,
+    ) -> Result<Option<Arc<filter_columns::FiltersToc>>, KoshaError> {
+        if let Some(toc) = state.toc.as_ref() {
+            return Ok(Some(Arc::clone(toc)));
+        }
+        let path = self.segment_dir.join(kosha_core::FILTERS_TOC_FILE);
+        let Some(bytes) = filter_columns::read_present(&path)? else {
+            eprintln!(
+                "WARN: filters.toc missing/empty at first use for {} — filtered queries against this segment will match nothing until it hydrates; retrying on next use",
+                self.segment_dir.display()
+            );
+            return Ok(None);
+        };
+        let toc = filter_columns::FiltersToc::decode(&bytes).map_err(|e| {
+            KoshaError::CorruptSegment(format!("{}: {e}", self.segment_dir.display()))
+        })?;
+        if toc.doc_count != self.doc_count {
+            return Err(KoshaError::CorruptSegment(format!(
+                "{}: filters.toc is for {} documents, footer says {}",
+                self.segment_dir.display(),
+                toc.doc_count,
+                self.doc_count
+            )));
+        }
+        let toc = Arc::new(toc);
+        state.toc = Some(Arc::clone(&toc));
+        Ok(Some(toc))
+    }
+
+    /// Read and decode one column file; `Ok(None)` while it is not local.
+    /// A present but damaged file is an error: it fails the query rather
+    /// than quietly matching nothing.
+    fn read_column(
+        &self,
+        meta: &kosha_core::FilterColumnMeta,
+    ) -> Result<Option<filter_columns::FilterColumn>, KoshaError> {
+        let file = meta.file_name();
+        let Some(bytes) = filter_columns::read_present(&self.segment_dir.join(&file))? else {
+            return Ok(None);
+        };
+        let what = format!("{}/{file} ({:?})", self.segment_dir.display(), meta.name);
+        filter_columns::decode_column(&bytes, meta.kind, self.doc_count, &what).map(Some)
+    }
+
+    /// The compatibility [`FilterStore`] holding at least every column
+    /// named in `fields` (all columns for `None`) that is local. Legacy
+    /// segments ignore `fields`: `filters.bin` holds every column.
+    fn store_for(
+        &self,
+        fields: Option<&std::collections::BTreeSet<String>>,
+    ) -> Result<Arc<FilterStore>, KoshaError> {
+        let mut state = self.state.lock().unwrap();
+        if !self.columnar {
+            return Ok(self.legacy(&mut state));
+        }
+        let Some(toc) = self.toc(&mut state)? else {
+            return Ok(Arc::new(FilterStore::default()));
+        };
+        let wanted: Vec<&kosha_core::FilterColumnMeta> = toc
+            .columns
+            .iter()
+            .filter(|c| !state.merged_ids.contains(&c.id))
+            .filter(|c| fields.is_none_or(|f| f.contains(&c.name)))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(Arc::clone(&state.merged));
+        }
+        let mut loaded = Vec::new();
+        for meta in wanted {
+            match self.read_column(meta)? {
+                Some(column) => loaded.push((meta, column)),
+                None => eprintln!(
+                    "WARN: filter column {} ({:?}) missing at use for {} — filters on it match nothing until it hydrates; retrying on next use",
+                    meta.file_name(),
+                    meta.name,
+                    self.segment_dir.display()
+                ),
+            }
+        }
+        if loaded.is_empty() {
+            return Ok(Arc::clone(&state.merged));
+        }
+        // Copy-on-grow: readers holding the previous Arc keep it. Rare —
+        // only when a query touches a column this segment has not loaded.
+        let mut store = (*state.merged).clone();
+        for (meta, column) in loaded {
+            column.append_to(&meta.name, &mut store);
+            state.merged_ids.insert(meta.id);
+        }
+        state.merged = Arc::new(store);
+        Ok(Arc::clone(&state.merged))
+    }
+
+    /// One column, decoded and cached. `Ok(None)` when the segment has no
+    /// such column, or (columnar) its file is not local yet — not cached.
+    fn column(
+        &self,
+        name: &str,
+        kind: kosha_core::FilterColumnKind,
+    ) -> Result<Option<Arc<filter_columns::FilterColumn>>, KoshaError> {
+        use filter_columns::{FilterColumn, NumericColumn, StringColumn};
+        let key = (name.to_string(), kind);
+        let mut state = self.state.lock().unwrap();
+        if let Some(column) = state.columns.get(&key) {
+            return Ok(Some(Arc::clone(column)));
+        }
+        let column = if self.columnar {
+            let Some(toc) = self.toc(&mut state)? else {
+                return Ok(None);
+            };
+            let Some(meta) = toc.find(name, kind) else {
+                return Ok(None);
+            };
+            match self.read_column(meta)? {
+                Some(column) => column,
+                None => return Ok(None),
+            }
+        } else {
+            let store = self.legacy(&mut state);
+            let column = match kind {
+                kosha_core::FilterColumnKind::String => store
+                    .string_fields
+                    .get(name)
+                    .map(|e| StringColumn::from_entries(e).map(FilterColumn::String))
+                    .transpose()?,
+                kosha_core::FilterColumnKind::Integer => store
+                    .integer_fields
+                    .get(name)
+                    .map(|e| FilterColumn::Integer(NumericColumn::from_entries(e))),
+                kosha_core::FilterColumnKind::Float => store
+                    .float_fields
+                    .get(name)
+                    .map(|e| FilterColumn::Float(NumericColumn::from_entries(e))),
+            };
+            match column {
+                Some(column) if state.legacy.is_some() => column,
+                _ => return Ok(None),
+            }
+        };
+        let column = Arc::new(column);
+        state.columns.insert(key, Arc::clone(&column));
+        Ok(Some(column))
     }
 }
 
@@ -4213,6 +4432,12 @@ impl SegmentReader {
             None => Self::read_footer(&segment_dir)?,
         };
         let posting_spans = footer.posting_blobs_raw;
+        let filters = LazyFilters {
+            segment_dir: segment_dir.clone(),
+            doc_count: footer.doc_count,
+            columnar: footer.filter_columns.is_some(),
+            state: Mutex::new(FilterState::default()),
+        };
         let doc_store = match try_read_doc_index(&segment_dir, footer.doc_count) {
             Some(index) => DocStoreAccess::Lazy {
                 doc_store_path: segment_dir.join("doc_store.bin"),
@@ -4225,10 +4450,7 @@ impl SegmentReader {
             footer,
             doc_store,
             inverted: Self::read_inverted(&segment_dir, postings_account, posting_spans)?,
-            filters: LazyFilters {
-                segment_dir: segment_dir.clone(),
-                state: Mutex::new(None),
-            },
+            filters,
             vector_store: vs,
             hnsw_map: hm,
             vector_index,
@@ -4873,7 +5095,50 @@ impl SegmentReader {
     /// [`LazyFilters`]). Queries without filters/aggregations/field sorts
     /// never call this, and never pay the parse.
     pub fn filter_store(&self) -> Arc<FilterStore> {
-        self.filters.get()
+        self.try_filter_store().unwrap_or_else(|e| {
+            eprintln!(
+                "ERROR: filter columns of {} unreadable: {e}",
+                self.segment_dir.display()
+            );
+            Arc::new(FilterStore::default())
+        })
+    }
+
+    /// [`Self::filter_store`] that reports a damaged columnar filter file
+    /// (#244) as an error instead of an empty store. Callers that filter,
+    /// sort or aggregate use this so corruption fails the request closed.
+    pub fn try_filter_store(&self) -> Result<Arc<FilterStore>, KoshaError> {
+        self.filters.store_for(None)
+    }
+
+    /// The compatibility store with at least the columns named in
+    /// `fields` (#244) — see `SearchQuery::filter_column_fields`. On a
+    /// columnar segment this reads only those columns, which is all a
+    /// query node hydrated for the query; a legacy segment returns all of
+    /// `filters.bin`. Columns loaded by earlier calls stay in the store.
+    pub fn filter_store_for(
+        &self,
+        fields: &std::collections::BTreeSet<String>,
+    ) -> Result<Arc<FilterStore>, KoshaError> {
+        self.filters.store_for(Some(fields))
+    }
+
+    /// One filter column, decoded on first use and cached (#244). Works on
+    /// both formats: a legacy segment builds it from `filters.bin`.
+    /// `Ok(None)` when the segment has no such column or its file is not
+    /// local yet (a missing file is never cached, so a later call sees it
+    /// once hydrated). `Err` when the file is present but damaged.
+    pub fn filter_column(
+        &self,
+        field: &str,
+        kind: kosha_core::FilterColumnKind,
+    ) -> Result<Option<Arc<filter_columns::FilterColumn>>, KoshaError> {
+        self.filters.column(field, kind)
+    }
+
+    /// Whether this segment stores filter values in the columnar format.
+    pub fn has_filter_columns(&self) -> bool {
+        self.footer.filter_columns.is_some()
     }
 
     pub fn footer(&self) -> &Footer {
@@ -5262,7 +5527,7 @@ impl SegmentReader {
     /// Used to unlock segment pruning on segments written before blooms existed.
     pub fn rewrite_filter_blooms(segment_dir: &Path) -> Result<Footer, KoshaError> {
         let mut footer = Self::read_footer(segment_dir)?;
-        let store = Self::read_filters(segment_dir)?;
+        let store = Self::read_filters_any(segment_dir, &footer)?;
         footer.filter_blooms = Some(build_filter_blooms(&store.string_fields));
         let json = serde_json::to_string_pretty(&footer)?;
         atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
@@ -5449,10 +5714,28 @@ impl SegmentReader {
         fs::read(segment_dir.join("filters.bin")).unwrap_or_default()
     }
 
-    /// Eagerly read + parse `filters.bin` — the pre-lazy behavior, kept for
-    /// the bloom-rewrite admin path which always needs the parsed form.
-    fn read_filters(segment_dir: &Path) -> Result<FilterStore, KoshaError> {
-        Ok(Self::parse_filters(&Self::read_filters_raw(segment_dir)))
+    /// Eagerly read every filter column, in whichever format `footer`
+    /// says the segment uses — for the bloom-rewrite admin path, which
+    /// always needs the parsed form. A columnar segment must have its TOC
+    /// and every column local; a missing one is an error here (a rebuilt
+    /// bloom must not silently drop a field).
+    fn read_filters_any(segment_dir: &Path, footer: &Footer) -> Result<FilterStore, KoshaError> {
+        if footer.filter_columns.is_none() {
+            return Ok(Self::parse_filters(&Self::read_filters_raw(segment_dir)));
+        }
+        let filters = LazyFilters {
+            segment_dir: segment_dir.to_path_buf(),
+            doc_count: footer.doc_count,
+            columnar: true,
+            state: Mutex::new(FilterState::default()),
+        };
+        if !filter_columns::filter_files_present(segment_dir, footer) {
+            return Err(KoshaError::NotFound(format!(
+                "{}: columnar filter files not all local",
+                segment_dir.display()
+            )));
+        }
+        Ok((*filters.store_for(None)?).clone())
     }
 
     /// Parse filter columns from raw `filters.bin` bytes. Empty/short input
@@ -6495,7 +6778,10 @@ mod tests {
         // eager parse was ~529ms/segment on the worst staging namespace).
         let dir = std::env::temp_dir().join("kosha-test-lazy-filters");
         let _ = fs::remove_dir_all(&dir);
-        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        // The legacy `filters.bin` path; columnar segments have their own
+        // tests in `filter_column_format_tests`.
+        let mut w =
+            SegmentWriter::new(SegmentId("s1".into()), dir.clone()).with_filters_write_version(1);
         w.add_document(
             DocumentId("d1".into()),
             vec![
@@ -6507,13 +6793,13 @@ mod tests {
 
         let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
         assert!(
-            r.filters.state.lock().unwrap().is_none(),
+            r.filters.state.lock().unwrap().legacy.is_none(),
             "open must not have parsed filters.bin"
         );
         let store = r.filter_store();
         assert!(store.string_fields.contains_key("tag"));
         assert!(
-            r.filters.state.lock().unwrap().is_some(),
+            r.filters.state.lock().unwrap().legacy.is_some(),
             "first filter_store() call materializes the parse"
         );
 
@@ -6530,7 +6816,10 @@ mod tests {
         // nothing. The reader must read the file at first *use* instead.
         let dir = std::env::temp_dir().join("kosha-test-filters-hydrated-late");
         let _ = fs::remove_dir_all(&dir);
-        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        // The legacy `filters.bin` path; columnar segments have their own
+        // tests in `filter_column_format_tests`.
+        let mut w =
+            SegmentWriter::new(SegmentId("s1".into()), dir.clone()).with_filters_write_version(1);
         w.add_document(
             DocumentId("d1".into()),
             vec![
@@ -6544,7 +6833,7 @@ mod tests {
         let stash = dir.join("filters.bin.stash");
         fs::rename(dir.join("filters.bin"), &stash).unwrap();
         let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
-        assert!(r.filters.state.lock().unwrap().is_none());
+        assert!(r.filters.state.lock().unwrap().legacy.is_none());
 
         // "Hydrate" the file, then use the SAME (cached) reader.
         fs::rename(&stash, dir.join("filters.bin")).unwrap();
@@ -6573,7 +6862,10 @@ mod tests {
         // reader's query still returned zero hits.
         let dir = std::env::temp_dir().join("kosha-test-filters-first-use-races-hydration");
         let _ = fs::remove_dir_all(&dir);
-        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        // The legacy `filters.bin` path; columnar segments have their own
+        // tests in `filter_column_format_tests`.
+        let mut w =
+            SegmentWriter::new(SegmentId("s1".into()), dir.clone()).with_filters_write_version(1);
         w.add_document(
             DocumentId("d1".into()),
             vec![
@@ -6594,7 +6886,7 @@ mod tests {
             "first use before hydration sees an empty store, as expected"
         );
         assert!(
-            r.filters.state.lock().unwrap().is_none(),
+            r.filters.state.lock().unwrap().legacy.is_none(),
             "an empty read caused by a missing file must not be cached — \
              only a confirmed-present read commits to the cache"
         );
@@ -8990,6 +9282,415 @@ mod posting_span_tests {
         let reader = SegmentReader::open_with_options(dir.clone(), false).unwrap();
         assert_eq!(reader.postings("alpha").unwrap().len(), 3000);
         assert!(!reader.take_blob_read_failure());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// #244: the columnar filter format (`filters.toc` + `filters-NNN.col`).
+#[cfg(test)]
+mod filter_column_format_tests {
+    use super::*;
+    use kosha_core::{FilterColumnKind, FILTERS_TOC_FILE};
+    use std::collections::BTreeSet;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-fcol-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Documents covering every filterable field type, a field holding two
+    /// kinds, a multi-valued field, a field only some documents have, a
+    /// long Text value over the cap and a Vector (never a filter column).
+    fn docs() -> Vec<(DocumentId, Vec<Field>)> {
+        let long = "prose ".repeat(100);
+        let mut out = Vec::new();
+        for i in 0..20u32 {
+            let mut fields = vec![
+                Field::text("body", format!("hello world {i}")),
+                Field::text(
+                    "content",
+                    if i == 3 {
+                        long.clone()
+                    } else {
+                        format!("short {i}")
+                    },
+                ),
+                Field::keyword("matterId", format!("m{}", i % 3)),
+                Field::boolean("inScope", i % 2 == 0),
+                Field::date_val("createdAt", format!("2024-01-{:02}", i + 1)),
+                Field::integer("pages", i as i64 * 10 - 50),
+                Field::float_val("score", i as f64 / 4.0),
+                Field::vector("emb", vec![i as f32, 1.0]),
+            ];
+            if i % 5 == 0 {
+                fields.push(Field::keyword("sparse", "rare"));
+                fields.push(Field::keyword("matterId", "extra"));
+            }
+            if i == 7 {
+                fields.push(Field::integer("mixed", 7));
+            } else {
+                fields.push(Field::keyword("mixed", format!("k{i}")));
+            }
+            out.push((DocumentId(format!("d{i}")), fields));
+        }
+        out
+    }
+
+    fn write(dir: &Path, version: u32, docs: &[(DocumentId, Vec<Field>)]) -> Footer {
+        let mut w = SegmentWriter::new(SegmentId("s".into()), dir.to_path_buf())
+            .with_filters_write_version(version)
+            .with_text_filter_ignore_above(Some(256));
+        for (id, fields) in docs {
+            w.add_document(id.clone(), fields.clone());
+        }
+        w.finalize(Bm25Params::default()).unwrap()
+    }
+
+    fn sorted(store: &FilterStore) -> String {
+        let mut s: Vec<String> = store
+            .string_fields
+            .iter()
+            .map(|(k, v)| format!("s {k} {v:?}"))
+            .chain(
+                store
+                    .integer_fields
+                    .iter()
+                    .map(|(k, v)| format!("i {k} {v:?}")),
+            )
+            .chain(
+                store
+                    .float_fields
+                    .iter()
+                    .map(|(k, v)| format!("f {k} {v:?}")),
+            )
+            .collect();
+        s.sort();
+        s.join("\n")
+    }
+
+    fn blooms(footer: &Footer) -> String {
+        let sorted: std::collections::BTreeMap<_, _> =
+            footer.filter_blooms.as_ref().unwrap().iter().collect();
+        serde_json::to_string(&sorted).unwrap()
+    }
+
+    fn fields(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn columnar_round_trip_matches_filters_bin_for_every_field_type() {
+        let docs = docs();
+        let v1 = temp_dir("v1");
+        let v2 = temp_dir("v2");
+        let f1 = write(&v1, 1, &docs);
+        let f2 = write(&v2, 2, &docs);
+
+        assert!(f1.filter_columns.is_none());
+        assert!(v1.join("filters.bin").is_file());
+        assert!(!v1.join(FILTERS_TOC_FILE).exists());
+        let metas = f2.filter_columns.clone().expect("v2 footer lists columns");
+        assert!(!v2.join("filters.bin").exists(), "v2 writes no filters.bin");
+        assert!(v2.join(FILTERS_TOC_FILE).is_file());
+        for m in &metas {
+            assert_eq!(fs::metadata(v2.join(m.file_name())).unwrap().len(), m.bytes);
+        }
+        // Same blooms either way: pruning does not depend on the format.
+        assert_eq!(blooms(&f1), blooms(&f2));
+
+        let r1 = SegmentReader::open(v1.clone()).unwrap();
+        let r2 = SegmentReader::open(v2.clone()).unwrap();
+        assert!(r2.has_filter_columns() && !r1.has_filter_columns());
+        let s1 = r1.try_filter_store().unwrap();
+        let s2 = r2.try_filter_store().unwrap();
+        assert_eq!(
+            sorted(&s1),
+            sorted(&s2),
+            "adapter rebuilds filters.bin's store exactly"
+        );
+
+        // Every kind is present, the two-kind field is two columns, the
+        // long Text value is capped out (#243) and vectors never appear.
+        assert!(s2.string_fields.contains_key("inScope"));
+        assert!(s2.string_fields.contains_key("createdAt"));
+        assert_eq!(s2.integer_fields["pages"].len(), 20);
+        assert_eq!(s2.float_fields["score"].len(), 20);
+        assert_eq!(s2.integer_fields["mixed"], vec![(7, 7)]);
+        assert_eq!(s2.string_fields["mixed"].len(), 19);
+        assert_eq!(s2.string_fields["sparse"].len(), 4);
+        assert_eq!(s2.string_fields["content"].len(), 19);
+        assert!(!s2.string_fields["content"].iter().any(|(d, _)| *d == 3));
+        assert!(!s2.string_fields.contains_key("emb"));
+        assert_eq!(
+            metas.iter().filter(|m| m.name == "mixed").count(),
+            2,
+            "a field holding two kinds is two columns"
+        );
+
+        // Per-column API, both formats, same answer.
+        for r in [&r1, &r2] {
+            let col = r
+                .filter_column("matterId", FilterColumnKind::String)
+                .unwrap()
+                .unwrap();
+            let filter_columns::FilterColumn::String(s) = &*col else {
+                panic!()
+            };
+            assert_eq!(s.term_count(), 4);
+            assert_eq!(
+                s.term_bitmap("extra").unwrap().iter().collect::<Vec<_>>(),
+                vec![0, 5, 10, 15]
+            );
+            let col = r
+                .filter_column("pages", FilterColumnKind::Integer)
+                .unwrap()
+                .unwrap();
+            assert_eq!(col.len(), 20);
+            assert!(r
+                .filter_column("pages", FilterColumnKind::Float)
+                .unwrap()
+                .is_none());
+            assert!(r
+                .filter_column("nope", FilterColumnKind::String)
+                .unwrap()
+                .is_none());
+        }
+
+        // Stats in the footer and TOC.
+        let pages = metas.iter().find(|m| m.name == "pages").unwrap();
+        assert_eq!(
+            pages.stats.min,
+            Some(kosha_core::FilterStatValue::Integer(-50))
+        );
+        assert_eq!(
+            pages.stats.max,
+            Some(kosha_core::FilterStatValue::Integer(140))
+        );
+        assert_eq!(
+            (pages.stats.values, pages.stats.docs, pages.stats.distinct),
+            (20, 20, 20)
+        );
+        let matter = metas.iter().find(|m| m.name == "matterId").unwrap();
+        assert_eq!(
+            (
+                matter.stats.values,
+                matter.stats.docs,
+                matter.stats.distinct
+            ),
+            (24, 20, 4)
+        );
+        let toc = filter_columns::FiltersToc::decode(&fs::read(v2.join(FILTERS_TOC_FILE)).unwrap())
+            .unwrap();
+        assert_eq!(toc.columns, metas);
+
+        let _ = fs::remove_dir_all(&v1);
+        let _ = fs::remove_dir_all(&v2);
+    }
+
+    #[test]
+    fn segment_with_no_filter_fields_and_empty_segment() {
+        for (name, docs) in [
+            (
+                "nofields",
+                vec![(
+                    DocumentId("a".into()),
+                    vec![Field::text("body", "x ".repeat(300))],
+                )],
+            ),
+            ("nodocs", Vec::new()),
+        ] {
+            let dir = temp_dir(name);
+            let footer = write(&dir, 2, &docs);
+            assert_eq!(footer.filter_columns, Some(Vec::new()));
+            assert!(
+                dir.join(FILTERS_TOC_FILE).is_file(),
+                "the TOC is always written"
+            );
+            let r = SegmentReader::open(dir.clone()).unwrap();
+            let store = r.try_filter_store().unwrap();
+            assert!(store.string_fields.is_empty() && store.integer_fields.is_empty());
+            assert!(
+                r.filters.state.lock().unwrap().toc.is_some(),
+                "a present TOC is cached"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn filter_store_for_reads_only_the_named_columns() {
+        let dir = temp_dir("subset");
+        let footer = write(&dir, 2, &docs());
+        let metas = footer.filter_columns.unwrap();
+        let matter = metas.iter().find(|m| m.name == "matterId").unwrap();
+        // A query node hydrated only the TOC and the matterId column.
+        for m in &metas {
+            if m.id != matter.id {
+                fs::remove_file(dir.join(m.file_name())).unwrap();
+            }
+        }
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let store = r.filter_store_for(&fields(&["matterId"])).unwrap();
+        assert_eq!(store.string_fields["matterId"].len(), 24);
+        assert_eq!(store.string_fields.len(), 1);
+        assert!(store.integer_fields.is_empty());
+
+        // A later query touches `pages`, whose column lands afterwards: the
+        // missing read is not cached, and the store grows once it is local.
+        let missing = r.filter_store_for(&fields(&["matterId", "pages"])).unwrap();
+        assert!(!missing.integer_fields.contains_key("pages"));
+        assert!(r
+            .filter_column("pages", FilterColumnKind::Integer)
+            .unwrap()
+            .is_none());
+        let v2 = temp_dir("subset-src");
+        write(&v2, 2, &docs());
+        let pages = metas.iter().find(|m| m.name == "pages").unwrap();
+        fs::copy(v2.join(pages.file_name()), dir.join(pages.file_name())).unwrap();
+        let grown = r.filter_store_for(&fields(&["pages"])).unwrap();
+        assert_eq!(grown.integer_fields["pages"].len(), 20);
+        assert!(
+            grown.string_fields.contains_key("matterId"),
+            "earlier columns stay"
+        );
+        assert!(r
+            .filter_column("pages", FilterColumnKind::Integer)
+            .unwrap()
+            .is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&v2);
+    }
+
+    #[test]
+    fn missing_toc_is_retried_not_cached() {
+        let dir = temp_dir("late-toc");
+        write(&dir, 2, &docs());
+        let stash = dir.join("toc.stash");
+        fs::rename(dir.join(FILTERS_TOC_FILE), &stash).unwrap();
+        let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        let store = r.try_filter_store().unwrap();
+        assert!(store.string_fields.is_empty());
+        assert!(r.filters.state.lock().unwrap().toc.is_none());
+        fs::rename(&stash, dir.join(FILTERS_TOC_FILE)).unwrap();
+        let store = r.try_filter_store().unwrap();
+        assert!(store.string_fields.contains_key("matterId"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_or_truncated_column_fails_closed() {
+        let dir = temp_dir("corrupt");
+        let footer = write(&dir, 2, &docs());
+        let metas = footer.filter_columns.unwrap();
+        let matter = metas.iter().find(|m| m.name == "matterId").unwrap();
+        let path = dir.join(matter.file_name());
+        let good = fs::read(&path).unwrap();
+
+        // Truncated.
+        fs::write(&path, &good[..good.len() / 2]).unwrap();
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(matches!(
+            r.try_filter_store(),
+            Err(KoshaError::CorruptSegment(_))
+        ));
+        assert!(r.filter_store_for(&fields(&["matterId"])).is_err());
+        assert!(r
+            .filter_column("matterId", FilterColumnKind::String)
+            .is_err());
+        // Columns the query does not touch still load.
+        assert!(r.filter_store_for(&fields(&["pages"])).is_ok());
+
+        // A flipped byte in the body.
+        let mut bad = good.clone();
+        let mid = bad.len() - 3;
+        bad[mid] ^= 0xFF;
+        fs::write(&path, &bad).unwrap();
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(r.filter_store_for(&fields(&["matterId"])).is_err());
+
+        // Corrupt TOC.
+        fs::write(&path, &good).unwrap();
+        let toc_path = dir.join(FILTERS_TOC_FILE);
+        let mut toc = fs::read(&toc_path).unwrap();
+        toc.truncate(toc.len() - 1);
+        fs::write(&toc_path, &toc).unwrap();
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(r.try_filter_store().is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bloom_rewrite_reads_columnar_segments() {
+        let dir = temp_dir("bloom-rewrite");
+        let footer = write(&dir, 2, &docs());
+        let mut stripped = footer.clone();
+        stripped.filter_blooms = None;
+        fs::write(
+            dir.join("footer.json"),
+            serde_json::to_string(&stripped).unwrap(),
+        )
+        .unwrap();
+        let rebuilt = SegmentReader::rewrite_filter_blooms(&dir).unwrap();
+        assert_eq!(blooms(&rebuilt), blooms(&footer));
+        assert_eq!(rebuilt.filter_columns, footer.filter_columns);
+        // A column that is not local fails the rebuild instead of dropping
+        // that field's bloom.
+        let any = &footer.filter_columns.as_ref().unwrap()[0];
+        fs::remove_file(dir.join(any.file_name())).unwrap();
+        assert!(SegmentReader::rewrite_filter_blooms(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Compaction re-adds every stored document to a fresh writer, so
+    /// its output format is whatever the writer gate says, whatever the
+    /// inputs were: v1 inputs become columnar under `=2`, and columnar
+    /// inputs go back to `filters.bin` on a rollback to `=1`.
+    #[test]
+    fn rewriting_a_segment_follows_the_writer_gate_both_ways() {
+        let src_v1 = temp_dir("merge-src-v1");
+        let src_v2 = temp_dir("merge-src-v2");
+        write(&src_v1, 1, &docs());
+        write(&src_v2, 2, &docs());
+        let expected = sorted(
+            &SegmentReader::open(src_v1.clone())
+                .unwrap()
+                .try_filter_store()
+                .unwrap(),
+        );
+        for (src, target) in [(&src_v1, 2u32), (&src_v2, 1u32)] {
+            let out = temp_dir(&format!("merge-out-{target}"));
+            let reader = SegmentReader::open(src.clone()).unwrap();
+            let mut w = SegmentWriter::new(SegmentId("m".into()), out.clone())
+                .with_filters_write_version(target)
+                .with_text_filter_ignore_above(Some(256));
+            for raw in reader.iter_doc_records_raw() {
+                let raw = raw.unwrap();
+                w.add_document_with_vectors(raw.record.doc_id, raw.record.fields, raw.vectors);
+            }
+            let footer = w.finalize(Bm25Params::default()).unwrap();
+            assert_eq!(footer.filter_columns.is_some(), target == 2);
+            assert_eq!(out.join("filters.bin").exists(), target == 1);
+            let merged = SegmentReader::open(out.clone()).unwrap();
+            assert_eq!(sorted(&merged.try_filter_store().unwrap()), expected);
+            let _ = fs::remove_dir_all(&out);
+        }
+        let _ = fs::remove_dir_all(&src_v1);
+        let _ = fs::remove_dir_all(&src_v2);
+    }
+
+    #[test]
+    fn footer_without_filter_columns_parses_as_legacy() {
+        // A footer.json from before #244 has no `filter_columns` key.
+        let dir = temp_dir("legacy-footer");
+        let footer = write(&dir, 1, &docs());
+        let json = serde_json::to_string(&footer).unwrap();
+        assert!(!json.contains("filter_columns"));
+        let back: Footer = serde_json::from_str(&json).unwrap();
+        assert!(back.filter_columns.is_none());
+        assert_eq!(back.filter_files_for(None), vec!["filters.bin".to_string()]);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -485,7 +485,7 @@ impl Indexer {
         for entry in &state.manifest.segments {
             let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
             let reader = kosha_segment::SegmentReader::open(seg_dir)?;
-            let store = reader.filter_store();
+            let store = reader.try_filter_store()?;
             let all: HashSet<u32> = (0..reader.doc_count())
                 .filter(|seq| {
                     !state
