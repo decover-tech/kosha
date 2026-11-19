@@ -38,6 +38,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
 | Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
 | Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `bool` (`must` / `must_not` / `should` / `minimum_should_match`), `match_all` |
+| Late-interaction (ColBERT-style) vectors | A `Vector` field whose value is a bag of token vectors (`[[f32; dim]; n]`) is indexed for MaxSim: `"knn": {"field": "tokens", "vectors": [[...], [...]], "k": 10}` scores `Σ over query tokens of max cosine over the document's tokens`. See [Late interaction](#late-interaction) |
 | kNN-scoped filters | `knn.filter` restricts only the vector list; the top-level `filter` restricts both the lexical and the vector list |
 | Sorting | Multi-field `sort` over stored fields, plus `_id` |
 | Pagination | `from` / `max_results`, and an OpenSearch-style `search_after` cursor |
@@ -149,6 +150,47 @@ Throughput on the repository's Markdown (16 MB, ~2 KB documents; `cargo bench -p
 `standard@2` + `stop` + `stem` 41 MB/s; whole segment build 61 / 50 / 28 MB/s (`standard@2`
 costs 0.82x of a legacy build; the Snowball stemmer is most of the rest). All-ASCII words take a
 hand-written UAX #29 fast path checked against `unicode-segmentation` by a differential test.
+
+## Late interaction
+
+ColBERT-style multi-vector retrieval (issue #205). Send a document's token embeddings as a
+`Vector` field whose value is a JSON array of equal-length arrays, and query them with a bag of
+query token embeddings:
+
+```json
+{"id": "p1", "fields": [{"name": "tokens", "field_type": "Vector",
+                         "value": "[[0.12, -0.03, ...], [0.08, 0.41, ...], ...]"}]}
+
+{"query_text": "", "max_results": 10,
+ "knn": {"field": "tokens", "vectors": [[0.2, ...], [0.1, ...]], "k": 10, "num_candidates": 100}}
+```
+
+The score is `MaxSim(Q, D) = Σ_q max_d cosine(q, d)` (so it ranges up to the number of query
+tokens). `vectors` implies `"scoring": "late_interaction"`; setting that with a single `vector`
+searches with a one-token bag. `knn.filter`, the top-level `filter`, deletes and hybrid RRF work
+as for single-vector kNN. A query whose tokens differ in dimension from the field's is a 400.
+
+**How it runs.** Each segment keeps, per late-interaction field, `multivec.{i}.bags` (every
+token, unit-normalized f32, with a per-document offsets table so one bag is one ranged read) and
+`multivec.{i}.ivf` (the tokens clustered with the same balanced k-means as the single-vector
+index; each posting holds its tokens' doc ids and int8 codes). For every query token the
+`KOSHA_LATE_INTERACTION_NPROBE` (default 16) nearest postings are scored from the int8 codes,
+the best `num_candidates` documents by that approximate MaxSim are re-scored exactly from their
+bags, and the top `k` are kept. With enough probes and candidates the result is exact MaxSim
+(tested against a brute-force reference). The source JSON stays in the doc store, so documents
+read back as sent and compaction rebuilds the files from it; a binary older than this change
+reads these segments normally, just without late-interaction hits, and its compactions drop the
+`multivec` files until a newer binary compacts again.
+
+**Cost** (`cargo bench -p kosha-query --bench late_interaction`, synthetic clustered corpus,
+Apple M5). Per document, relative to its raw f32 tokens: `.bags` 1.00x, `.ivf` 0.28x, and the
+source JSON in the doc store 2.55x, so about 4.8x the raw token bytes in all. With 128-dim
+tokens, 64 per document, that is 32 KB raw, ~124 KB stored, against ~0.5 KB for one 128-dim
+vector; the index build is k-means over every token (7.6 s for 8,000 such documents, 512k
+tokens). Queries: 8,000 documents x 64 tokens, 32 query tokens: warm p50 15.3 ms, recall@10
+against brute-force MaxSim 1.000 (single-vector kNN over mean-pooled tokens: 1.1 ms, but only
+0.40 of the MaxSim top 10). 4,000 x 32 tokens at 64 dim, 16 query tokens: 1.9 ms. Single-vector
+kNN is unchanged when the feature is unused (`knn_open_search` p50s identical to main).
 
 ## Authorization and durability
 

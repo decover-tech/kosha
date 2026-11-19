@@ -174,6 +174,8 @@ fn mk_knn(dim: usize, k: usize) -> KnnQuery {
         k,
         num_candidates: 10 * k,
         filter: None,
+        vectors: None,
+        scoring: None,
     }
 }
 

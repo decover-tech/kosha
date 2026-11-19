@@ -2880,7 +2880,7 @@ impl AppState {
             .filter(|t| !t.is_empty());
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         let mut stats_only: Vec<PathBuf> = Vec::new();
-        for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
+        for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths.iter().cloned()) {
             // Borrowed, never cloned: footers hold every bloom. A segment
             // with no cached footer was already read (once) into
             // `fetched_footers` above.
@@ -2914,6 +2914,34 @@ impl AppState {
         outcome.files_fetched += postings_outcome.files_fetched;
         outcome.bytes_fetched += postings_outcome.bytes_fetched;
         outcome.missing.extend(postings_outcome.missing);
+        // Late interaction (#205) reads the queried field's bag store and
+        // token index, which only some segments have (their footers say
+        // which); single-vector kNN never fetches them.
+        if let Some(knn) = query.knn.as_ref().filter(|k| k.is_late_interaction()) {
+            let scoring: std::collections::HashSet<&PathBuf> = to_hydrate.iter().collect();
+            let mut by_file: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
+            for (entry, seg_path) in manifest.segments.iter().zip(&all_seg_paths) {
+                if !scoring.contains(seg_path) {
+                    continue;
+                }
+                let Some(i) = segment_footer(entry)
+                    .and_then(|f| f.multi_vectors.iter().position(|m| m.name == knn.field))
+                else {
+                    continue;
+                };
+                for file in [
+                    kosha_segment::multivec::bags_file(i),
+                    kosha_segment::multivec::ivf_file(i),
+                ] {
+                    by_file.entry(file).or_default().push(seg_path.clone());
+                }
+            }
+            for (file, paths) in by_file {
+                let (files, bytes) = self.ensure_files_local(&paths, &file, request);
+                outcome.files_fetched += files;
+                outcome.bytes_fetched += bytes;
+            }
+        }
         if !stats_only.is_empty() {
             // Best effort: whatever is still missing afterwards doesn't fail
             // the search. The searcher then can't read that segment's `df`
@@ -5177,15 +5205,28 @@ fn canonical_query_for_cache(query: &SearchQuery) -> Option<String> {
     for &v in &knn.vector {
         v.to_bits().hash(&mut h2);
     }
+    // Late interaction (#205): every token vector, with its boundaries, so
+    // two bags with the same flattened floats never share a key.
+    let bag = knn.vectors.as_deref().unwrap_or_default();
+    for token in bag {
+        (0x5a5a_a5a5_u64, token.len() as u64).hash(&mut h1);
+        (0x5a5a_a5a5_u64, token.len() as u64).hash(&mut h2);
+        for &v in token {
+            v.to_bits().hash(&mut h1);
+            v.to_bits().hash(&mut h2);
+        }
+    }
     let digest = format!(
-        "dim{}:{:016x}{:016x}",
+        "dim{}:bag{}:{:016x}{:016x}",
         knn.vector.len(),
+        bag.len(),
         h1.finish(),
         h2.finish()
     );
     let mut stripped = query.clone();
     if let Some(ref mut k) = stripped.knn {
         k.vector = Vec::new();
+        k.vectors = k.vectors.as_ref().map(|_| Vec::new());
     }
     serde_json::to_string(&stripped)
         .ok()
@@ -8055,6 +8096,7 @@ mod tests {
             text_filter_ignore_above: None,
             doc_vectors: false,
             analysis: None,
+            multi_vectors: Vec::new(),
         };
         let mut query: SearchQuery = serde_json::from_str(
             r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
@@ -10757,6 +10799,8 @@ mod tests {
                 k,
                 num_candidates: 100,
                 filter: None,
+                vectors: None,
+                scoring: None,
             });
             q
         };
@@ -10776,6 +10820,27 @@ mod tests {
         v[517] = f32::from_bits(v[517].to_bits() ^ 1);
         let b = canonical_query_for_cache(&with_vec(v, 10)).unwrap();
         assert_ne!(a, b, "different vectors must produce different keys");
+
+        // Late interaction (#205): the bag is digested with its token
+        // boundaries, never inlined, and a single `vector` with the same
+        // floats is a different query.
+        let with_bag = |bag: Vec<Vec<f32>>| {
+            let mut q = with_vec(Vec::new(), 10);
+            q.knn.as_mut().unwrap().vectors = Some(bag);
+            canonical_query_for_cache(&q).unwrap()
+        };
+        let bag = with_bag(vec![vec![0.25, 0.5], vec![0.75, 1.0]]);
+        assert_eq!(bag, with_bag(vec![vec![0.25, 0.5], vec![0.75, 1.0]]));
+        assert_ne!(bag, with_bag(vec![vec![0.25], vec![0.5, 0.75, 1.0]]));
+        assert_ne!(bag, with_bag(vec![vec![0.25, 0.5], vec![0.75, 0.5]]));
+        assert_ne!(
+            bag,
+            canonical_query_for_cache(&with_vec(vec![0.25, 0.5, 0.75, 1.0], 10)).unwrap()
+        );
+        assert!(
+            !bag.contains("0.75"),
+            "no raw token vector in the key: {bag}"
+        );
 
         // Non-vector knn params still flow through the canonical JSON.
         let c = canonical_query_for_cache(&with_vec(vec![0.1_f32; 1024], 20)).unwrap();
@@ -10825,6 +10890,7 @@ mod tests {
             text_filter_ignore_above: None,
             doc_vectors: false,
             analysis: None,
+            multi_vectors: Vec::new(),
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.

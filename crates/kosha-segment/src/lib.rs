@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod multivec;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -15,6 +16,7 @@ use kosha_core::{
 use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 
 pub use analysis::Analyzer;
+pub use multivec::{LateInteractionHits, LateInteractionParams};
 
 /// A point in HNSW space using cosine distance.
 #[derive(Clone)]
@@ -104,6 +106,8 @@ pub struct SegmentWriter {
     analyzed_fields: BTreeMap<String, AnalyzerSpec>,
     /// Whether any `Text` value went through `default_analyzer`.
     default_analyzer_used: bool,
+    /// Late-interaction bags (#205), written to `multivec.*` at finalize.
+    multi_vectors: multivec::MultiVectorBuilder,
 }
 
 impl SegmentWriter {
@@ -145,6 +149,7 @@ impl SegmentWriter {
             field_analyzers: HashMap::new(),
             analyzed_fields: BTreeMap::new(),
             default_analyzer_used: false,
+            multi_vectors: multivec::MultiVectorBuilder::default(),
         }
     }
 
@@ -311,6 +316,19 @@ impl SegmentWriter {
                             moved_to_sidecar.push(index);
                         }
                         self.vectors.push((doc_seq, vec));
+                    } else if let Some(bag) = multivec::parse_bag(&field.value) {
+                        // A bag of token vectors (#205): indexed for late
+                        // interaction, and kept inline in the doc store.
+                        if !self.multi_vectors.add(doc_seq, &field.name, &bag) {
+                            eprintln!(
+                                "WARN: late-interaction field '{}' of {:?}: token dimension {} \
+                                 differs from earlier documents in this segment — stored, \
+                                 not indexed",
+                                field.name,
+                                doc_id.0,
+                                bag[0].len()
+                            );
+                        }
                     }
                     // Unparseable values stay inline as given: nothing
                     // indexes them, but the stored document is lossless.
@@ -407,7 +425,8 @@ impl SegmentWriter {
             1 => self.write_vectors()?,
             _ => self.write_vectors_v2()?,
         }
-        let footer = self.write_footer(bm25_params)?;
+        let multi_vectors = self.multi_vectors.write(&*self.backend)?;
+        let footer = self.write_footer(bm25_params, multi_vectors)?;
         let _ = fs::remove_dir_all(self.build_dir());
         self.finalized = true;
         Ok(footer)
@@ -744,7 +763,11 @@ impl SegmentWriter {
         Ok(())
     }
 
-    fn write_footer(&self, bm25_params: Bm25Params) -> Result<Footer, KoshaError> {
+    fn write_footer(
+        &self,
+        bm25_params: Bm25Params,
+        multi_vectors: Vec<kosha_core::MultiVectorField>,
+    ) -> Result<Footer, KoshaError> {
         let doc_count = self.field_lengths.len() as u32;
         let avg = if doc_count > 0 {
             self.total_field_length as f64 / doc_count as f64
@@ -768,6 +791,7 @@ impl SegmentWriter {
             text_filter_ignore_above: self.text_filter_ignore_above,
             doc_vectors: !self.doc_vector_entries.is_empty(),
             analysis: self.segment_analysis(),
+            multi_vectors,
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -1295,7 +1319,9 @@ mod vector_index_v2_tests {
         writer.write_inverted_index().unwrap();
         writer.write_filters().unwrap();
         writer.write_vectors_v2().unwrap();
-        writer.write_footer(Bm25Params::default()).unwrap();
+        writer
+            .write_footer(Bm25Params::default(), Vec::new())
+            .unwrap();
 
         // On disk: header says unit-norm, and every stored vector and
         // centroid actually is unit-L2.
@@ -3558,6 +3584,9 @@ pub struct SegmentReader {
     /// segment whose footer sets `doc_vectors` (#243). Only success is
     /// cached: the file may be hydrated after the segment was opened.
     doc_vectors: Mutex<Option<Arc<DocVectors>>>,
+    /// Late-interaction fields (#205) opened so far, by footer index. Only
+    /// success is cached, as for `doc_vectors`.
+    multi_vectors: Mutex<HashMap<usize, Arc<multivec::MultiVectorIndex>>>,
 }
 
 impl SegmentReader {
@@ -3627,7 +3656,66 @@ impl SegmentReader {
             vector_index,
             vector_index_degraded,
             doc_vectors: Mutex::new(None),
+            multi_vectors: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Whether this segment has late-interaction data for `field` (#205).
+    pub fn has_multi_vector_field(&self, field: &str) -> bool {
+        self.footer.multi_vectors.iter().any(|f| f.name == field)
+    }
+
+    /// Late-interaction (MaxSim) top `k` over `field` (#205). See
+    /// [`multivec`] for the files and the algorithm. A segment without
+    /// late-interaction data for `field` returns no hits; query tokens of a
+    /// different dimension than the field's are an `InvalidQuery`.
+    pub fn late_interaction_search(
+        &self,
+        field: &str,
+        query: &[&[f32]],
+        k: usize,
+        params: LateInteractionParams,
+        accept: Option<&dyn Fn(u32) -> bool>,
+    ) -> Result<LateInteractionHits, KoshaError> {
+        let Some(i) = self
+            .footer
+            .multi_vectors
+            .iter()
+            .position(|f| f.name == field)
+        else {
+            return Ok(LateInteractionHits::default());
+        };
+        let index = {
+            let mut cached = self.multi_vectors.lock().unwrap();
+            match cached.get(&i) {
+                Some(index) => Arc::clone(index),
+                None => {
+                    let index = Arc::new(multivec::MultiVectorIndex::open(
+                        &self.segment_dir,
+                        i,
+                        &self.footer.multi_vectors[i],
+                    )?);
+                    cached.insert(i, Arc::clone(&index));
+                    index
+                }
+            }
+        };
+        if let Some(bad) = query.iter().find(|q| q.len() != index.dim()) {
+            return Err(KoshaError::InvalidQuery(format!(
+                "knn field '{field}' holds {}-dimensional token vectors; a query vector has {}",
+                index.dim(),
+                bad.len()
+            )));
+        }
+        let normalized: Vec<Vec<f32>> = query
+            .iter()
+            .map(|q| {
+                let mut q = q.to_vec();
+                kosha_vector_spfresh::normalize_in_place(&mut q);
+                q
+            })
+            .collect();
+        index.search(&normalized, k, params, accept)
     }
 
     fn doc_vectors(&self) -> Result<Arc<DocVectors>, KoshaError> {
@@ -6060,7 +6148,7 @@ mod tests {
         w.write_inverted_index().unwrap();
         w.write_filters().unwrap();
         w.write_vectors_v2().unwrap();
-        w.write_footer(Bm25Params::default()).unwrap();
+        w.write_footer(Bm25Params::default(), Vec::new()).unwrap();
         seg_id
     }
 

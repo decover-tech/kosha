@@ -1175,6 +1175,28 @@ fn knn_global_budget_enabled() -> bool {
     })
 }
 
+/// Centroids probed per query token by late-interaction search (#205)
+/// before candidates are re-scored exactly. `KOSHA_LATE_INTERACTION_NPROBE`,
+/// default 16. Widened automatically in a segment where it turns up fewer
+/// than `k` acceptable documents.
+fn late_interaction_nprobe() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KOSHA_LATE_INTERACTION_NPROBE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(16)
+    })
+}
+
+fn late_interaction_params(knn: &kosha_core::KnnQuery) -> kosha_segment::LateInteractionParams {
+    kosha_segment::LateInteractionParams {
+        nprobe: late_interaction_nprobe(),
+        num_candidates: knn.num_candidates.max(knn.k),
+    }
+}
+
 /// Fraction of a namespace's total centroid count that [`effective_knn_budget`]
 /// floors the probe budget to. `num_candidates` selects *centroids/clusters*
 /// to probe, not documents — a fixed default that doesn't scale with corpus
@@ -3048,6 +3070,27 @@ impl Searcher {
             // probe depth scales with segment count.
             let probe = if nothing_passes {
                 Some(Ok(Vec::new()))
+            } else if knn.is_late_interaction() {
+                // ColBERT-style MaxSim over the field's token bags (#205).
+                // A segment without bags for the field has no hits (never
+                // the single-vector fallback below); a query of the wrong
+                // dimension is the client's error, not a degraded segment.
+                match reader.late_interaction_search(
+                    &knn.field,
+                    &knn.query_tokens(),
+                    fetch_k,
+                    late_interaction_params(knn),
+                    knn_accept_dyn,
+                ) {
+                    Ok(found) => {
+                        open_stats
+                            .knn_postings
+                            .fetch_add(found.postings_probed, Ordering::Relaxed);
+                        Some(Ok(found.hits))
+                    }
+                    Err(e @ KoshaError::InvalidQuery(_)) => return Err(e),
+                    Err(e) => Some(Err(e)),
+                }
             } else {
                 match knn_cutoff {
                     Some((cutoff, effective_budget)) => reader
@@ -3544,7 +3587,9 @@ impl Searcher {
         // that admits ~`num_candidates` postings ACROSS the whole query,
         // then let each segment probe only inside it.
         let knn_cutoff = match query.knn {
-            Some(ref knn) if knn_global_budget_enabled() => {
+            // Late interaction (#205) probes its own per-field token index;
+            // the single-vector centroid budget does not apply to it.
+            Some(ref knn) if knn_global_budget_enabled() && !knn.is_late_interaction() => {
                 self.global_probe_cutoff(namespace, manifest, query, knn, &permit, &open_stats)
             }
             _ => None,
@@ -5900,6 +5945,8 @@ mod tests {
             k: 10,
             num_candidates: 8,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
 
         let (r, stats) = searcher
@@ -5944,6 +5991,8 @@ mod tests {
             k: 5,
             num_candidates: 32,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.results.len(), 5);
@@ -6205,6 +6254,8 @@ mod tests {
             k: 10,
             num_candidates: 40,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
 
         // A kNN query now walks the segments TWICE: once in the zero-I/O
@@ -6437,6 +6488,8 @@ mod tests {
             k: 10,
             num_candidates: N,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let bm25_q = mk_query("alpha", 10);
 
@@ -6741,6 +6794,8 @@ mod tests {
             k: 3,
             num_candidates: 100,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &query, None).unwrap();
         assert_eq!(r.results.len(), 3);
@@ -7227,6 +7282,8 @@ mod tests {
             k: 1,
             num_candidates: 10,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let (result, stats) = searcher
             .search_with_stats(&ns, &manifest, &q, None)
@@ -7361,6 +7418,8 @@ mod tests {
             k: 1,
             num_candidates: 10,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
@@ -7418,6 +7477,8 @@ mod tests {
             k: 5,
             num_candidates: 40, // probe ~everything, this test is about recall not nprobe tuning
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.results.len(), 5);
@@ -7589,6 +7650,8 @@ mod tests {
                 k: 1,
                 num_candidates,
                 filter: None,
+                vectors: None,
+                scoring: None,
             });
             q
         };
@@ -7716,6 +7779,8 @@ mod tests {
             k: 1,
             num_candidates: 15, // thin: well under the 51-segment corpus
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -7788,6 +7853,8 @@ mod tests {
             k: 5,
             num_candidates: 10,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -7855,6 +7922,8 @@ mod tests {
             k: 5,
             num_candidates: 10,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
 
         // First call: vector.idx is present, opens and hydrates normally,
@@ -7930,6 +7999,8 @@ mod tests {
             k,
             num_candidates: 40,
             filter,
+            vectors: None,
+            scoring: None,
         });
         q
     }
@@ -11363,6 +11434,8 @@ mod rrf_tests {
             // compare fusion, not ANN recall.
             num_candidates: 100_000,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         q.rank = rank.map(|rrf| RankSpec { rrf: Some(rrf) });
         q
@@ -11944,6 +12017,8 @@ mod rrf_tests {
             k,
             num_candidates: 100,
             filter: None,
+            vectors: None,
+            scoring: None,
         };
         println!(
             "{} docs in {SEGMENTS} segments, {QUERIES} queries, 10 relevant each",
