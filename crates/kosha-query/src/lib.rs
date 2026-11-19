@@ -505,6 +505,14 @@ impl SegmentCache {
         for key in pinned.into_iter().rev() {
             recency.push_front(key);
         }
+        if freed > 0 {
+            println!(
+                "segment cache evicted: freed_mb={:.1} segments_left={} size_mb={:.1}",
+                freed as f64 / 1048576.0,
+                entries.len(),
+                self.total_bytes.load(Ordering::Relaxed) as f64 / 1048576.0
+            );
+        }
         freed
     }
 }

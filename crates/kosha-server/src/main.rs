@@ -1802,6 +1802,12 @@ impl AppState {
                     }
                     Ok(std::fs::read(self.data_dir.join(path))?)
                 })?;
+                println!(
+                    "manifest refreshed: ns={} version={} segments={}",
+                    ns.0,
+                    manifest.version,
+                    manifest.segments.len()
+                );
                 self.indexer.restore_manifest(ns.clone(), manifest);
             }
         }
@@ -1908,6 +1914,7 @@ impl AppState {
             let Some((expected_version, manifest)) = self.indexer.prepare_publication(ns)? else {
                 return Ok(());
             };
+            let started = Instant::now();
             upload(&manifest)?;
             let committed = self.controller.lock().unwrap().compare_and_swap_manifest(
                 ns,
@@ -1917,6 +1924,13 @@ impl AppState {
             match committed {
                 Ok(()) => {
                     self.indexer.acknowledge_manifest(ns, &manifest)?;
+                    println!(
+                        "manifest published: ns={} version={} segments={} ms={:.1}",
+                        ns.0,
+                        manifest.version,
+                        manifest.segments.len(),
+                        started.elapsed().as_secs_f64() * 1e3
+                    );
                     return Ok(());
                 }
                 Err(conflict @ KoshaError::ManifestConflict { .. })
@@ -2765,17 +2779,19 @@ impl AppState {
         if !doc_access_ok {
             return false;
         }
-        // Deliberately does NOT also require vector.offsets: it's an
-        // optional sidecar (legacy v1 segments never have one; the reader
-        // falls back to an eager parse of vector.idx alone when it's
-        // absent — same tolerance doc_access_ok above gives
-        // doc_store.offsets vs. doc_store.bin). `ensure_scoring_files_local`
-        // still proactively *attempts* to fetch it when present on S3 (see
-        // its comment) — this predicate just doesn't block "can we score"
-        // on that attempt having succeeded, since scoring is correct
-        // either way.
-        if needs_vectors && !file_present_nonempty(&seg_path.join("vector.idx")) {
-            return false;
+        // `vector.offsets` is required only where it exists: legacy flat
+        // segments never have one. A clustered segment without it is served
+        // by exact scan of every vector (seconds on a large segment), so it
+        // is not complete until the sidecar has been fetched.
+        if needs_vectors {
+            if !file_present_nonempty(&seg_path.join("vector.idx")) {
+                return false;
+            }
+            if !file_present_nonempty(&seg_path.join("vector.offsets"))
+                && kosha_segment::vector_index_needs_offsets(seg_path)
+            {
+                return false;
+            }
         }
         true
     }
@@ -3518,6 +3534,7 @@ fn serve(listener: TcpListener, state: Arc<AppState>, io_timeout: Duration) {
 // ─── Request handling ───────────────────────────────────────────────────────
 
 fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
+    let started = Instant::now();
     let mut reader = BufReader::new(
         stream
             .try_clone()
@@ -3619,28 +3636,56 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
     } else {
         authenticate(&headers)
     };
-    let tenant = match authentication {
-        Ok(t) => t,
-        Err(resp) => {
-            stream.write_all(resp.as_bytes()).ok();
-            return Ok(());
-        }
-    };
-
     // ── Query/ingest role routing ────────────────────────────────────────
     // A query-role pod (KOSHA_INGEST_HOST set) forwards write-path requests
     // to the single ingest pod instead of executing them locally — see
     // is_write_path/forward_to_ingest. Every other request (all reads, and
     // everything on the ingest pod itself, which never forwards) is handled
     // locally exactly as before this existed.
-    let response = match (&state.ingest_host, &state.write_http_client) {
-        (Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
+    let response = match (
+        &authentication,
+        &state.ingest_host,
+        &state.write_http_client,
+    ) {
+        (Err(resp), _, _) => resp.clone(),
+        (Ok(_), Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
             forward_to_ingest(client, ingest_host, &request_line, &headers, &body)
         }
-        _ => route(&request_line, &headers, &body, &tenant, state),
+        (Ok(tenant), _, _) => route(&request_line, &headers, &body, tenant, state),
     };
+    log_request(
+        &request_line,
+        authentication.as_deref().unwrap_or("-"),
+        body.len(),
+        &response,
+        started,
+    );
     stream.write_all(response.as_bytes()).ok();
     Ok(())
+}
+
+/// One line per API request: who asked for what, the status returned and how
+/// long it took. A successful search is skipped because it already prints
+/// the more detailed `search timing:` line; probes never reach here.
+fn log_request(
+    request_line: &str,
+    tenant: &str,
+    body_bytes: usize,
+    response: &str,
+    started: Instant,
+) {
+    let status = response.get(9..12).unwrap_or("???");
+    let mut parts = request_line.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or("-"), parts.next().unwrap_or("-"));
+    let path = target.split('?').next().unwrap_or(target);
+    if status == "200" && path.ends_with("/search") {
+        return;
+    }
+    println!(
+        "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}",
+        started.elapsed().as_secs_f64() * 1e3,
+        response.len()
+    );
 }
 
 /// Extract and validate the API key from request headers.
@@ -6312,6 +6357,8 @@ fn json_accepted<T: serde::Serialize>(value: &T) -> String {
 }
 
 fn json_error(status_code: u16, message: &str) -> String {
+    // The reason for an error response; `request:` carries the rest.
+    eprintln!("WARN: request failed: status={status_code} {message}");
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",
