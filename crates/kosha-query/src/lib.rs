@@ -8103,6 +8103,116 @@ mod tests {
     }
 
     #[test]
+    fn namespace_mixing_f32_and_i8_segments_ranks_like_f32_brute_force() {
+        // #210: an i8-quantized segment written next to f32 segments (a
+        // namespace mid-migration) must rank as if every vector were f32:
+        // the i8 segment rescores its shortlist from `doc_vectors.bin`, so
+        // scores from both formats are the same exact cosine and merge
+        // into one correct order.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-knn-mixed-quantization-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        const DIM: usize = 32;
+        let vector = |seed: u64| -> Vec<f32> {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            (0..DIM)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+                })
+                .collect()
+        };
+        let cosine = |a: &[f32], b: &[f32]| -> f64 {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (na * nb)
+        };
+
+        let mut entries = Vec::new();
+        let mut corpus: Vec<(String, Vec<f32>)> = Vec::new();
+        for (seg_idx, quantization) in [
+            kosha_core::VectorQuantization::F32,
+            kosha_core::VectorQuantization::I8,
+            kosha_core::VectorQuantization::F32,
+            kosha_core::VectorQuantization::I8,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seg = format!("seg{seg_idx}-{}", quantization.as_str());
+            let mut w = SegmentWriter::new(SegmentId(seg.clone()), dir.join(&ns.0).join(&seg))
+                .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                    quantization,
+                ));
+            for i in 0..300u64 {
+                let id = format!("{seg}-{i}");
+                let v = vector(seg_idx as u64 * 1000 + i);
+                corpus.push((id.clone(), v.clone()));
+                w.add_document(DocumentId(id), vec![Field::vector("emb", v)]);
+            }
+            let footer = w.finalize(Bm25Params::default()).unwrap();
+            assert_eq!(
+                footer.vector_fields.as_ref().unwrap()[0].quantization,
+                quantization
+            );
+            entries.push(ManifestEntry {
+                segment_id: SegmentId(seg),
+                doc_count: 300,
+            });
+        }
+        let manifest = Manifest {
+            version: 1,
+            segments: entries,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+        };
+        let searcher = Searcher::new(dir.clone());
+        let (mut hits_from_i8, mut total_recall) = (0usize, 0.0f64);
+        let queries = 10u64;
+        for q_seed in 0..queries {
+            let query = vector(900_000 + q_seed);
+            let mut q = mk_query("", 10);
+            q.knn = Some(kosha_core::KnnQuery {
+                field: "emb".into(),
+                vector: query.clone(),
+                k: 10,
+                // Every posting of every segment: only quantization, not
+                // the probe budget, could cost recall here.
+                num_candidates: 10_000,
+                filter: None,
+            });
+            let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+            let got: Vec<String> = r.results.iter().map(|h| h.doc_id.0.clone()).collect();
+            let mut exact: Vec<(String, f64)> = corpus
+                .iter()
+                .map(|(id, v)| (id.clone(), cosine(&query, v)))
+                .collect();
+            exact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let want: Vec<String> = exact.into_iter().take(10).map(|(id, _)| id).collect();
+            assert_eq!(got.len(), 10);
+            hits_from_i8 += got.iter().filter(|id| id.contains("-i8-")).count();
+            total_recall += got.iter().filter(|id| want.contains(id)).count() as f64 / 10.0;
+            // Scores are ordered and both formats speak the same units.
+            assert!(r.results.windows(2).all(|w| w[0].score >= w[1].score));
+        }
+        assert!(hits_from_i8 > 0, "i8 segments contribute hits");
+        let recall = total_recall / queries as f64;
+        assert!(recall >= 0.99, "mixed-format recall@10 {recall}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn radius_aware_ranking_finds_the_diluted_neighbour_without_widening_the_budget() {
         // The structural fix for the exact scenario proved above: instead
         // of needing a budget wide enough to include every segment (the

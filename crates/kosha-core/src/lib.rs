@@ -900,6 +900,47 @@ pub struct VectorFieldMeta {
     /// `KOSHA_VECTOR_WRITE_VERSION=1` flat format).
     #[serde(default)]
     pub offsets: bool,
+    /// How the column's posting entries are stored (#210). Omitted from
+    /// the JSON for `f32`, so a segment written without quantization has
+    /// exactly the footer it always had, and every footer written before
+    /// #210 reads as `f32`.
+    #[serde(default, skip_serializing_if = "VectorQuantization::is_f32")]
+    pub quantization: VectorQuantization,
+}
+
+/// Storage of a vector column's ANN posting entries (#210). Centroids and
+/// `doc_vectors.bin` stay `f32` either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorQuantization {
+    /// Full-precision `f32` entries.
+    #[default]
+    F32,
+    /// Scalar-quantized entries: one `f32` scale per vector and `dim`
+    /// signed bytes, ~4x smaller than `f32`.
+    I8,
+}
+
+impl VectorQuantization {
+    pub fn is_f32(&self) -> bool {
+        *self == VectorQuantization::F32
+    }
+
+    /// Parses `f32` / `i8` (case-insensitive); `None` for anything else.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "f32" => Some(Self::F32),
+            "i8" | "int8" => Some(Self::I8),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::I8 => "i8",
+        }
+    }
 }
 
 impl VectorFieldMeta {

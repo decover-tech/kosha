@@ -140,6 +140,7 @@ fn single_column_segment_is_byte_identical_to_the_pre_columns_writer() {
                 count: 24,
                 slot: 0,
                 offsets: true,
+                quantization: Default::default(),
             }])
         );
         let expected = files(&fixture(name));
