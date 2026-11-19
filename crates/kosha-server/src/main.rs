@@ -5569,16 +5569,21 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
 ///                "max_segment_bytes": 5368709120,   // optional; 0 = uncapped
 ///                "async": true}                     // optional (#242)
 ///
-/// Merged output size is capped (default 5GiB, Lucene-style): `full` under a
-/// cap merges one greedy smallest-first group per pass — loop the endpoint
-/// until `segments_after` stops dropping to converge on
-/// ~ceil(total_bytes/cap) segments. `max_segment_bytes: 0` restores the
-/// legacy all-to-one merge.
+/// Merged output size is capped (default 5GiB, Lucene-style). Each group is
+/// planned from S3 object sizes before anything is hydrated, and only that
+/// group is downloaded, merged, published and then evicted from local disk
+/// (#242), so a pass needs about `2 x cap` of local disk, not the whole
+/// namespace. `full` loops greedy smallest-first groups inside the one
+/// pass until none fits under the cap (~ceil(total_bytes/cap) segments);
+/// looping the endpoint until `segments_after` stops dropping still works
+/// and is now a no-op after the first call. `max_segment_bytes: 0` restores
+/// the legacy all-to-one merge, which hydrates everything.
 ///
 /// `"async": true` answers `202` with a `job_id` at once and runs the pass
-/// on a background thread; poll `GET /v1/admin/compaction-jobs/{job_id}`. A
-/// `full` pass hydrates every segment first and can run for hours on a big
-/// namespace, far past the query→ingest proxy and HTTP timeouts. Without
+/// on a background thread; poll `GET /v1/admin/compaction-jobs/{job_id}`,
+/// whose `progress` reports groups, segments merged and bytes hydrated and
+/// evicted after every group. A `full` pass over a big namespace can run
+/// for hours, far past the query→ingest proxy and HTTP timeouts. Without
 /// `async` the call blocks as before. Either way the pass is registered with
 /// the compaction scheduler: a second pass on the same namespace gets `409`
 /// with the running job's id.
@@ -5687,6 +5692,11 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
             "segments_merged": outcome.segments_merged,
             "max_segment_bytes": outcome.max_segment_bytes,
             "not_hydrated": outcome.not_hydrated,
+            "groups": outcome.groups,
+            "bytes_hydrated": outcome.bytes_hydrated,
+            "bytes_evicted": outcome.bytes_evicted,
+            "peak_local_bytes": outcome.peak_local_bytes,
+            "not_evicted": outcome.not_evicted,
         })),
         Err(error) => json_error(500, &error),
     }
@@ -5767,19 +5777,25 @@ fn run_compaction_job(
 ) -> Result<compaction_sched::PassOutcome, String> {
     let started = Instant::now();
     let mode = compact_mode_name(opts.mode);
-    let outcome = compaction_pass(state, ns, opts);
+    let outcome = compaction_pass(state, ns, opts, job_id);
     let version = state.indexer.manifest_version(ns).unwrap_or(0);
     let elapsed_ms = started.elapsed().as_millis();
     match &outcome {
         Ok(o) => println!(
             "compaction: job={job_id} ns={} mode={mode} merged={} segments {}→{} \
-             (merged {}) not_hydrated={} in {elapsed_ms} ms",
+             (merged {} in {} group(s)) hydrated={}B evicted={}B peak_local={}B \
+             not_hydrated={} not_evicted={} in {elapsed_ms} ms",
             ns.0,
             o.merged,
             o.segments_before,
             o.segments_after,
             o.segments_merged,
+            o.groups,
+            o.bytes_hydrated,
+            o.bytes_evicted,
+            o.peak_local_bytes,
             o.not_hydrated.len(),
+            o.not_evicted.len(),
         ),
         Err(e) => eprintln!(
             "compaction: job={job_id} ns={} mode={mode} failed after {elapsed_ms} ms: {e}",
@@ -5792,88 +5808,302 @@ fn run_compaction_job(
     outcome
 }
 
-/// One compaction pass plus publication: hydrate what the pass may read,
-/// merge, publish.
+/// Where a compaction pass learns segment sizes, hydrates its inputs and
+/// whether it may evict them afterwards. `AppState` is the real one (S3
+/// when configured, local disk otherwise); tests swap in a fake object
+/// store so the plan/hydrate/evict sequence runs without S3.
+trait CompactionStorage {
+    /// Bytes each manifest segment would occupy once hydrated (with
+    /// vectors), learned without downloading it. A segment missing from
+    /// the map has an unknown size and never joins a capped group.
+    fn segment_sizes(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> HashMap<kosha_core::SegmentId, u64>;
+    /// Make these segment directories local, vectors included.
+    fn hydrate(&self, seg_paths: &[PathBuf]);
+    /// Whether superseded inputs live on in object storage, so their local
+    /// copies are only a cache and may be removed after the merge
+    /// publishes. Local-only mode returns `false`: there the directory is
+    /// the only copy, and deleting it is segment GC, not cache eviction.
+    fn evicts_superseded(&self) -> bool;
+}
+
+impl CompactionStorage for AppState {
+    fn segment_sizes(
+        &self,
+        ns: &NamespaceId,
+        manifest: &kosha_core::Manifest,
+    ) -> HashMap<kosha_core::SegmentId, u64> {
+        #[cfg_attr(not(feature = "s3"), allow(unused_mut))]
+        let mut remote: HashMap<String, u64> = HashMap::new();
+        #[cfg(feature = "s3")]
+        if let Some(ref s3) = self.s3_storage {
+            // Compaction rewrites segments, so it hydrates (and must size)
+            // vectors too.
+            match s3.segment_sizes(&ns.0, |file| hydration_wants_file(file, true)) {
+                Ok(sizes) => remote = sizes,
+                Err(e) => eprintln!(
+                    "WARN: compaction: S3 size listing failed for {}: {e}; \
+                     only local segments can be planned",
+                    ns.0
+                ),
+            }
+        }
+        let ns_dir = self.data_dir.join(&ns.0);
+        manifest
+            .segments
+            .iter()
+            .filter_map(|entry| {
+                let id = &entry.segment_id;
+                // S3 is authoritative: a local copy may be partial (a
+                // lexical search hydrates without vector.idx). Local size
+                // only for segments S3 doesn't list, i.e. local-only mode
+                // or a flush not yet published.
+                let bytes = remote
+                    .get(&id.0)
+                    .copied()
+                    .filter(|b| *b > 0)
+                    .or_else(|| local_dir_bytes(&ns_dir.join(&id.0)))?;
+                Some((id.clone(), bytes))
+            })
+            .collect()
+    }
+
+    fn hydrate(&self, seg_paths: &[PathBuf]) {
+        #[cfg(feature = "s3")]
+        self.ensure_segments_local(seg_paths, true);
+        let _ = seg_paths;
+    }
+
+    fn evicts_superseded(&self) -> bool {
+        #[cfg(feature = "s3")]
+        {
+            self.s3_storage.is_some()
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            false
+        }
+    }
+}
+
+/// Total bytes of the files under a local directory (recursively); `None`
+/// when it does not exist.
+fn local_dir_bytes(dir: &std::path::Path) -> Option<u64> {
+    fn walk(dir: &std::path::Path, total: &mut u64) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                walk(&entry.path(), total);
+            } else {
+                *total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut total = 0;
+    walk(dir, &mut total);
+    Some(total)
+}
+
+/// One compaction pass plus publication.
 ///
-/// A `full` pass hydrates every segment (it may merge any of them). A
-/// `tiered` pass hydrates only its possible inputs, the segments under
-/// `max_mergeable_docs`, so the scheduler never pulls a whole namespace
-/// (22 GiB on staging) to merge a few small segments. Segments still not
-/// local afterwards are skipped by the merge, left unmerged, and reported
-/// in `not_hydrated`.
+/// Plan, then hydrate (#242): each merge group is chosen from segment
+/// sizes in object storage (`CompactionStorage::segment_sizes`) before
+/// anything is downloaded, only that group is hydrated, merged and
+/// published, and then the inputs, now superseded, leave local disk. Peak
+/// local disk for a group is its inputs plus its output, about
+/// `2 x max_segment_bytes`, however big the namespace is. The old `full`
+/// pass hydrated every segment first (22 GiB on staging).
+///
+/// A `tiered` pass merges at most one group. A `full` pass loops group by
+/// group until no group fits under the cap; every group is published on
+/// its own, so a pass that fails halfway keeps the groups it finished.
+/// `max_segment_bytes: 0` (uncapped) is the legacy all-to-one merge and
+/// still hydrates every segment. Planned inputs that fail to hydrate are
+/// left out of the merge and reported in `not_hydrated`.
 fn compaction_pass(
     state: &AppState,
     ns: &NamespaceId,
     opts: kosha_write::CompactOptions,
+    job_id: &str,
 ) -> Result<compaction_sched::PassOutcome, String> {
-    let manifest = state
+    compaction_pass_with(state, state, ns, opts, |progress| {
+        state.compaction.progress(job_id, progress);
+    })
+}
+
+fn compaction_pass_with(
+    state: &AppState,
+    storage: &dyn CompactionStorage,
+    ns: &NamespaceId,
+    opts: kosha_write::CompactOptions,
+    mut on_group: impl FnMut(&compaction_sched::PassOutcome),
+) -> Result<compaction_sched::PassOutcome, String> {
+    let segments_before = state
         .indexer
         .manifest_cloned(ns)
-        .ok_or_else(|| format!("namespace '{}' not found", ns.0))?;
-    let segments_before = manifest.segments.len();
-    let candidate_paths: Vec<PathBuf> = compaction_hydration_set(&manifest, &opts)
-        .into_iter()
-        .map(|id| state.data_dir.join(&ns.0).join(&id.0))
-        .collect();
-    drop(manifest);
-    // Hydrate every candidate in one fanned-out batch rather than one
-    // ensure_segment_local round trip per segment — see handle_index.
-    // Sequential round trips were the bottleneck behind the old synchronous
-    // endpoint's timeouts: 441 of them before compaction could start.
-    #[cfg(feature = "s3")]
-    // Compaction rewrites segments, so it must preserve vectors.
-    state.ensure_segments_local(&candidate_paths, true);
-    let not_hydrated: Vec<String> = candidate_paths
-        .iter()
-        .filter(|p| !p.exists())
-        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .collect();
+        .ok_or_else(|| format!("namespace '{}' not found", ns.0))?
+        .segments
+        .len();
+    let ns_dir = state.data_dir.join(&ns.0);
+    let mut outcome = compaction_sched::PassOutcome {
+        merged: false,
+        segments_before,
+        segments_after: segments_before,
+        segments_merged: 0,
+        max_segment_bytes: opts.policy.max_merged_segment_bytes,
+        not_hydrated: Vec::new(),
+        groups: 0,
+        bytes_hydrated: 0,
+        bytes_evicted: 0,
+        peak_local_bytes: 0,
+        not_evicted: Vec::new(),
+    };
+    let group_bytes = |ids: &[kosha_core::SegmentId]| -> u64 {
+        ids.iter()
+            .filter_map(|id| local_dir_bytes(&ns_dir.join(&id.0)))
+            .sum()
+    };
 
-    let max_segment_bytes = opts.policy.max_merged_segment_bytes;
-    let result = state
-        .indexer
-        .compact_namespace_with_options(ns, opts)
-        .map_err(|e| format!("compaction error: {e}"))?;
+    loop {
+        let Some(manifest) = state.indexer.manifest_cloned(ns) else {
+            break;
+        };
+        let sizes = storage.segment_sizes(ns, &manifest);
+        let Some(plan) =
+            kosha_write::plan_merge_group(&manifest, &opts, |id| sizes.get(id).copied())
+        else {
+            break;
+        };
+        drop(manifest);
+        let ids = plan.input_ids();
 
-    // Persist the merged manifest and upload the new segment to S3, the
-    // same path a normal flush uses.
-    if result.merged {
+        // Hydrate only this group, in one fanned-out batch (see
+        // `ensure_segments_local`). Compaction rewrites segments, so it
+        // must preserve vectors.
+        let local_before = group_bytes(&ids);
+        let paths: Vec<PathBuf> = ids.iter().map(|id| ns_dir.join(&id.0)).collect();
+        storage.hydrate(&paths);
+        let local_inputs = group_bytes(&ids);
+        outcome.bytes_hydrated += local_inputs.saturating_sub(local_before);
+        for path in &paths {
+            if !path.exists() {
+                if let Some(name) = path.file_name() {
+                    let name = name.to_string_lossy().into_owned();
+                    if !outcome.not_hydrated.contains(&name) {
+                        outcome.not_hydrated.push(name);
+                    }
+                }
+            }
+        }
+
+        let result = state
+            .indexer
+            .compact_planned(ns, &plan)
+            .map_err(|e| format!("compaction error: {e}"))?;
+        if !result.merged {
+            // Hydration failed for all but one input, or a concurrent
+            // manifest change removed an input. Re-planning would pick the
+            // same group again.
+            break;
+        }
+
+        // Persist the merged manifest and upload the new segment to S3,
+        // the same path a normal flush uses.
         state
             .publish_namespace(ns)
             .map_err(|e| format!("publication failed: {e}"))?;
+
+        let output_bytes = result
+            .output
+            .as_ref()
+            .and_then(|id| local_dir_bytes(&ns_dir.join(&id.0)))
+            .unwrap_or(0);
+        outcome.peak_local_bytes = outcome
+            .peak_local_bytes
+            .max(local_inputs.saturating_add(output_bytes));
+        if storage.evicts_superseded() {
+            let (evicted, kept) = evict_superseded_inputs(state, ns, &result.merged_inputs);
+            outcome.bytes_evicted += evicted;
+            outcome.not_evicted.extend(kept);
+        }
+
+        outcome.merged = true;
+        outcome.groups += 1;
+        outcome.segments_merged += result.segments_merged;
+        outcome.segments_after = state
+            .indexer
+            .manifest_cloned(ns)
+            .map(|m| m.segments.len())
+            .unwrap_or(0);
+        on_group(&outcome);
+
+        if opts.mode != kosha_write::CompactMode::Full || opts.policy.max_merged_segment_bytes == 0
+        {
+            break;
+        }
     }
 
-    let segments_after = state
+    outcome.segments_after = state
         .indexer
         .manifest_cloned(ns)
         .map(|m| m.segments.len())
         .unwrap_or(0);
-    Ok(compaction_sched::PassOutcome {
-        merged: result.merged,
-        segments_before,
-        segments_after,
-        segments_merged: result.segments_merged,
-        max_segment_bytes,
-        not_hydrated,
-    })
+    Ok(outcome)
 }
 
-/// Segments a pass may read, so must be local: all of them for `full`,
-/// only those under `max_mergeable_docs` (possible tiered inputs) for
-/// `tiered`. Same eligibility rule as `select_merge_inputs`.
-fn compaction_hydration_set(
-    manifest: &kosha_core::Manifest,
-    opts: &kosha_write::CompactOptions,
-) -> Vec<kosha_core::SegmentId> {
-    manifest
-        .segments
-        .iter()
-        .filter(|entry| {
-            opts.mode == kosha_write::CompactMode::Full
-                || entry.doc_count < opts.policy.max_mergeable_docs
-        })
-        .map(|entry| entry.segment_id.clone())
-        .collect()
+/// Remove the local copies of merge inputs a published merge superseded.
+/// Returns the bytes freed and the segments kept: one the manifest still
+/// references (never evicted), or one with a file pinned by an in-flight
+/// hydration or warmup (`Cache::evict_dir_unless_pinned`). A kept copy is
+/// harmless; it is just cache that ordinary LRU eviction will reclaim.
+///
+/// A search still running against the pre-merge manifest that needs an
+/// evicted segment re-hydrates it from S3: removal here only drops cache,
+/// and the S3 objects are untouched.
+fn evict_superseded_inputs(
+    state: &AppState,
+    ns: &NamespaceId,
+    inputs: &[kosha_core::SegmentId],
+) -> (u64, Vec<String>) {
+    let live: std::collections::HashSet<kosha_core::SegmentId> = state
+        .indexer
+        .manifest_cloned(ns)
+        .map(|m| m.segments.into_iter().map(|e| e.segment_id).collect())
+        .unwrap_or_default();
+    let mut freed = 0u64;
+    let mut kept = Vec::new();
+    for id in inputs {
+        if live.contains(id) {
+            kept.push(id.0.clone());
+            continue;
+        }
+        match state
+            .cache
+            .evict_dir_unless_pinned(&format!("{}/{}", ns.0, id.0))
+        {
+            Ok(Some(bytes)) => freed += bytes,
+            Ok(None) => kept.push(id.0.clone()),
+            Err(e) => {
+                eprintln!(
+                    "WARN: compaction: could not evict superseded segment {}/{}: {e}",
+                    ns.0, id.0
+                );
+                kept.push(id.0.clone());
+            }
+        }
+    }
+    (freed, kept)
 }
 
 /// One scheduler tick: find namespaces `needs_compaction` flags, let the
@@ -9137,45 +9367,358 @@ mod tests {
         }
     }
 
-    /// The tiered pass a scheduler runs must not hydrate segments it can
-    /// never merge (doc_count >= max_mergeable_docs): those are the large
-    /// ones, and pulling them is what made the old endpoint hydrate 22 GiB.
-    #[test]
-    fn tiered_pass_hydrates_only_mergeable_segments() {
-        let entry = |id: &str, docs: u32| kosha_core::ManifestEntry {
-            segment_id: kosha_core::SegmentId(id.into()),
-            doc_count: docs,
-        };
-        let manifest = kosha_core::Manifest {
-            version: 3,
-            segments: vec![
-                entry("small", 1_000),
-                entry("big", 2_000_000),
-                entry("edge", 50_000),
-            ],
-            segment_footers: Default::default(),
-            footer_crc32: Default::default(),
-            wal_checkpoint: 0,
-            wal_origin: None,
-            tombstones: Default::default(),
-            deletion_vectors: Default::default(),
-        };
-        let policy = kosha_write::CompactionPolicy::default();
-        assert_eq!(policy.max_mergeable_docs, 50_000);
-        let ids = |opts: &kosha_write::CompactOptions| -> Vec<String> {
-            compaction_hydration_set(&manifest, opts)
-                .into_iter()
-                .map(|id| id.0)
+    /// In-process stand-in for S3 in the #242 tests: a "remote" directory
+    /// with the same `<ns>/<segment>/<file>` layout as the bucket. Sizes come
+    /// from the remote copies (falling back to local, as `AppState` does for
+    /// a segment not yet listed in S3), hydration copies whole segment
+    /// directories down, and every hydrate call records which segments were
+    /// on local disk right after it.
+    /// (requested segment ids, segment dirs local afterwards, local bytes of
+    /// the requested group afterwards).
+    type HydrateCall = (Vec<String>, Vec<String>, u64);
+
+    struct FakeObjectStore {
+        remote: PathBuf,
+        data_dir: PathBuf,
+        /// Segments whose size S3 "can't report": they must never join a
+        /// capped group, so never be hydrated by compaction.
+        unknown_size: std::collections::HashSet<String>,
+        /// Per hydrate call: (requested segment ids, segment dirs local
+        /// afterwards, local bytes of the requested group afterwards).
+        calls: Mutex<Vec<HydrateCall>>,
+    }
+
+    impl FakeObjectStore {
+        fn local_segments(&self, ns: &NamespaceId) -> Vec<String> {
+            let mut out: Vec<String> = fs::read_dir(self.data_dir.join(&ns.0))
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.path().is_dir())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| !n.starts_with('_') && !n.starts_with('.'))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.sort();
+            out
+        }
+    }
+
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap().flatten() {
+            let dest = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_tree(&entry.path(), &dest);
+            } else {
+                fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+
+    impl CompactionStorage for FakeObjectStore {
+        fn segment_sizes(
+            &self,
+            ns: &NamespaceId,
+            manifest: &kosha_core::Manifest,
+        ) -> HashMap<kosha_core::SegmentId, u64> {
+            manifest
+                .segments
+                .iter()
+                .filter(|e| !self.unknown_size.contains(&e.segment_id.0))
+                .filter_map(|e| {
+                    let rel = std::path::Path::new(&ns.0).join(&e.segment_id.0);
+                    let bytes = local_dir_bytes(&self.remote.join(&rel))
+                        .or_else(|| local_dir_bytes(&self.data_dir.join(&rel)))?;
+                    Some((e.segment_id.clone(), bytes))
+                })
                 .collect()
+        }
+
+        fn hydrate(&self, seg_paths: &[PathBuf]) {
+            let mut requested = Vec::new();
+            let mut ns = None;
+            let mut group_bytes = 0;
+            for path in seg_paths {
+                let rel = path.strip_prefix(&self.data_dir).unwrap();
+                let remote = self.remote.join(rel);
+                if !path.exists() && remote.is_dir() {
+                    copy_tree(&remote, path);
+                }
+                group_bytes += local_dir_bytes(path).unwrap_or(0);
+                requested.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                ns = rel
+                    .parent()
+                    .map(|p| NamespaceId(p.to_string_lossy().into_owned()));
+            }
+            let local = ns.map(|ns| self.local_segments(&ns)).unwrap_or_default();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((requested, local, group_bytes));
+        }
+
+        fn evicts_superseded(&self) -> bool {
+            true
+        }
+    }
+
+    /// #242 acceptance: on a cold writer (nothing local, every segment only
+    /// in object storage) a `full` pass over a namespace several times the
+    /// cap must plan from remote sizes, hydrate one capped group at a time,
+    /// evict each group's inputs once its merge is published, keep peak
+    /// local disk at about `2 x cap`, never touch a segment whose size is
+    /// unknown, and lose no document.
+    #[test]
+    fn full_pass_hydrates_one_capped_group_at_a_time_and_evicts_inputs() {
+        let state = test_state();
+        let n = 10;
+        let ns = seed_segments(&state, "bounded-disk", n);
+        let manifest = state.indexer.manifest_cloned(&ns).unwrap();
+        let originals: Vec<String> = manifest
+            .segments
+            .iter()
+            .map(|e| e.segment_id.0.clone())
+            .collect();
+
+        // Move every segment to the fake bucket: the writer starts cold.
+        let remote = state.data_dir.with_extension("remote");
+        let _ = fs::remove_dir_all(&remote);
+        let mut sizes = HashMap::new();
+        for id in &originals {
+            let local = state.data_dir.join(&ns.0).join(id);
+            sizes.insert(id.clone(), local_dir_bytes(&local).unwrap());
+            copy_tree(&local, &remote.join(&ns.0).join(id));
+            fs::remove_dir_all(&local).unwrap();
+        }
+        let unknown = originals[4].clone();
+        let store = FakeObjectStore {
+            remote: remote.clone(),
+            data_dir: state.data_dir.clone(),
+            unknown_size: [unknown.clone()].into_iter().collect(),
+            calls: Mutex::new(Vec::new()),
         };
-        assert_eq!(
-            ids(&kosha_write::CompactOptions::tiered(policy)),
-            vec!["small"]
+        assert!(store.local_segments(&ns).is_empty(), "cold start");
+
+        // A cap that fits about three of these segments, so the namespace
+        // (10 segments) is several caps big.
+        let largest = *sizes.values().max().unwrap();
+        let total: u64 = sizes.values().sum();
+        let cap = largest * 7 / 2;
+        assert!(
+            total > 2 * cap,
+            "namespace must exceed the cap: {total} vs {cap}"
         );
-        assert_eq!(
-            ids(&kosha_write::CompactOptions::full()),
-            vec!["small", "big", "edge"]
+        let mut opts = compact_options(&state, kosha_write::CompactMode::Full, Some(cap));
+        opts.policy.max_merged_segment_bytes = cap;
+
+        let mut progress = Vec::new();
+        let outcome = compaction_pass_with(&state, &store, &ns, opts, |p| {
+            progress.push((p.groups, store.local_segments(&ns)));
+        })
+        .unwrap();
+
+        let calls = store.calls.lock().unwrap().clone();
+        eprintln!(
+            "bounded-disk: {n} segments, total {total} B, cap {cap} B, groups {}, \
+             hydrated {} B, evicted {} B, peak local {} B ({:.2} x cap)",
+            outcome.groups,
+            outcome.bytes_hydrated,
+            outcome.bytes_evicted,
+            outcome.peak_local_bytes,
+            outcome.peak_local_bytes as f64 / cap as f64
         );
+        assert!(calls.len() >= 2, "several groups: {calls:?}");
+        assert_eq!(outcome.groups, calls.len(), "{outcome:?}");
+        for (requested, local_after, group_bytes) in &calls {
+            // Only the planned group's original segments are ever local:
+            // nothing outside the group was downloaded, and every earlier
+            // group's inputs are gone already.
+            let originals_local: Vec<&String> = local_after
+                .iter()
+                .filter(|s| originals.contains(s))
+                .collect();
+            for seg in &originals_local {
+                assert!(
+                    requested.contains(seg),
+                    "{seg} is local but not in the planned group {requested:?}"
+                );
+            }
+            assert!(!requested.contains(&unknown), "unknown size hydrated");
+            assert!(
+                *group_bytes <= cap,
+                "group {requested:?} = {group_bytes} > cap {cap}"
+            );
+        }
+        // After each published group, its inputs have left local disk.
+        for (_, local) in &progress {
+            assert!(
+                local.iter().all(|s| !originals.contains(s)),
+                "superseded inputs still local after a group: {local:?}"
+            );
+        }
+
+        let after = state.indexer.manifest_cloned(&ns).unwrap();
+        let after_ids: Vec<String> = after
+            .segments
+            .iter()
+            .map(|e| e.segment_id.0.clone())
+            .collect();
+        assert!(after_ids.contains(&unknown), "unknown size never merges");
+        assert!(after.segments.len() < n, "{after_ids:?}");
+        assert_eq!(outcome.segments_after, after.segments.len());
+        assert_eq!(outcome.segments_before, n);
+        assert!(outcome.merged);
+        assert!(outcome.not_hydrated.is_empty(), "{outcome:?}");
+        assert!(outcome.not_evicted.is_empty(), "{outcome:?}");
+        // Merged originals were downloaded once and evicted once.
+        let merged_original_bytes: u64 = originals
+            .iter()
+            .filter(|s| !after_ids.contains(s))
+            .map(|s| sizes[s])
+            .sum();
+        assert_eq!(outcome.bytes_hydrated, merged_original_bytes, "{outcome:?}");
+        assert!(
+            outcome.bytes_evicted >= merged_original_bytes,
+            "{outcome:?}"
+        );
+        assert!(
+            outcome.peak_local_bytes > 0 && outcome.peak_local_bytes <= 2 * cap + cap / 4,
+            "peak {} vs 2 x cap {}",
+            outcome.peak_local_bytes,
+            2 * cap
+        );
+        // Local disk now holds only merged outputs, never the namespace.
+        for seg in store.local_segments(&ns) {
+            assert!(!originals.contains(&seg), "{seg} still local");
+        }
+
+        // Every doc is still searchable once the query side hydrates what
+        // it needs (the unmerged unknown-size segment is still remote).
+        let paths: Vec<PathBuf> = after_ids
+            .iter()
+            .map(|id| state.data_dir.join(&ns.0).join(id))
+            .collect();
+        store.hydrate(&paths);
+        for i in 0..n {
+            let search = route(
+                &format!("GET /search?ns=bounded-disk&q=segment+number+{i} HTTP/1.1\r\n"),
+                &HashMap::new(),
+                b"",
+                "test",
+                &state,
+            );
+            assert!(
+                search.contains(&format!("\"doc{i}\"")),
+                "doc{i} lost: {search}"
+            );
+        }
+
+        // Converged: a second pass finds nothing that fits and hydrates
+        // nothing.
+        let before_calls = store.calls.lock().unwrap().len();
+        let again =
+            compaction_pass_with(&state, &store, &ns, opts_for(&state, cap), |_| {}).unwrap();
+        assert!(!again.merged, "{again:?}");
+        assert_eq!(store.calls.lock().unwrap().len(), before_calls);
+        let _ = fs::remove_dir_all(&remote);
+    }
+
+    fn opts_for(state: &AppState, cap: u64) -> kosha_write::CompactOptions {
+        compact_options(state, kosha_write::CompactMode::Full, Some(cap))
+    }
+
+    /// A `tiered` pass plans the same way and merges at most one group; it
+    /// never hydrates a segment it can't merge.
+    #[test]
+    fn tiered_pass_hydrates_only_its_planned_group() {
+        let state = test_state();
+        let ns = seed_segments(&state, "tiered-disk", 6);
+        let ids: Vec<String> = state
+            .indexer
+            .manifest_cloned(&ns)
+            .unwrap()
+            .segments
+            .iter()
+            .map(|e| e.segment_id.0.clone())
+            .collect();
+        let remote = state.data_dir.with_extension("remote");
+        let _ = fs::remove_dir_all(&remote);
+        for id in &ids {
+            let local = state.data_dir.join(&ns.0).join(id);
+            copy_tree(&local, &remote.join(&ns.0).join(id));
+            fs::remove_dir_all(&local).unwrap();
+        }
+        let store = FakeObjectStore {
+            remote: remote.clone(),
+            data_dir: state.data_dir.clone(),
+            unknown_size: Default::default(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut opts = compact_options(&state, kosha_write::CompactMode::Tiered, None);
+        opts.policy.max_segments_per_merge = 3;
+        let outcome = compaction_pass_with(&state, &store, &ns, opts, |_| {}).unwrap();
+        assert!(outcome.merged);
+        assert_eq!(outcome.groups, 1);
+        assert_eq!(outcome.segments_merged, 3);
+        let calls = store.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.len(), 3, "{calls:?}");
+        assert_eq!(
+            store
+                .local_segments(&ns)
+                .iter()
+                .filter(|s| ids.contains(s))
+                .count(),
+            0,
+            "inputs evicted, nothing else hydrated"
+        );
+        let _ = fs::remove_dir_all(&remote);
+    }
+
+    /// Eviction never removes a segment the manifest still references or
+    /// one with a pinned file (an in-flight hydration or warmup).
+    #[test]
+    fn eviction_skips_live_and_pinned_segments() {
+        let state = test_state();
+        let ns = seed_segments(&state, "evict-guard", 3);
+        let ids: Vec<kosha_core::SegmentId> = state
+            .indexer
+            .manifest_cloned(&ns)
+            .unwrap()
+            .segments
+            .iter()
+            .map(|e| e.segment_id.clone())
+            .collect();
+        // Still in the manifest: kept.
+        let (freed, kept) = evict_superseded_inputs(&state, &ns, &ids[..1]);
+        assert_eq!(freed, 0);
+        assert_eq!(kept, vec![ids[0].0.clone()]);
+        assert!(state.data_dir.join(&ns.0).join(&ids[0].0).exists());
+
+        // Merge all three, then pin a file of one superseded input.
+        let plan = kosha_write::MergePlan {
+            inputs: state.indexer.manifest_cloned(&ns).unwrap().segments,
+        };
+        assert!(state.indexer.compact_planned(&ns, &plan).unwrap().merged);
+        let pinned_key = format!("{}/{}/doc_store.bin", ns.0, ids[1].0);
+        state.cache.pin(&pinned_key);
+        let (freed, kept) = evict_superseded_inputs(&state, &ns, &ids);
+        assert!(freed > 0);
+        assert_eq!(kept, vec![ids[1].0.clone()]);
+        assert!(!state.data_dir.join(&ns.0).join(&ids[0].0).exists());
+        assert!(state.data_dir.join(&ns.0).join(&ids[1].0).exists());
+        assert!(!state.data_dir.join(&ns.0).join(&ids[2].0).exists());
+        state.cache.unpin(&pinned_key);
+    }
+
+    /// Local-only mode (no object storage): the local directory is the only
+    /// copy, so a pass must never delete superseded inputs. That is GC's
+    /// job, not cache eviction's.
+    #[test]
+    fn local_only_mode_does_not_evict() {
+        let state = test_state();
+        assert!(!CompactionStorage::evicts_superseded(&state));
     }
 
     #[test]

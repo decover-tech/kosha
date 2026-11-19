@@ -2,7 +2,8 @@ pub mod compaction;
 pub mod wal;
 
 pub use compaction::{
-    needs_compaction, CompactMode, CompactOptions, CompactResult, CompactionPolicy, MergePlan,
+    needs_compaction, plan_merge_group, CompactMode, CompactOptions, CompactResult,
+    CompactionPolicy, MergePlan,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -1371,36 +1372,72 @@ impl Indexer {
         opts: CompactOptions,
         after_plan: impl FnOnce(),
     ) -> Result<CompactResult, KoshaError> {
+        self.compact_with_selector(
+            namespace,
+            |manifest, ns_dir| {
+                select_merge_inputs(
+                    manifest,
+                    &opts,
+                    |seg_id| ns_dir.join(&seg_id.0).exists(),
+                    |seg_id| segment_dir_bytes(&ns_dir.join(&seg_id.0)),
+                )
+            },
+            after_plan,
+        )
+    }
+
+    /// Merge exactly the segments of a plan made beforehand with
+    /// [`plan_merge_group`] (#242): the caller planned from remote sizes,
+    /// hydrated only these inputs, and now merges them. Re-planning here
+    /// from whatever happens to be on local disk could pick a different
+    /// group (fresh flushes are local too), so the plan is honored as
+    /// given, minus any input that has since left the manifest or is not
+    /// on local disk (hydration failed). Fewer than two left is a no-op.
+    pub fn compact_planned(
+        &self,
+        namespace: &NamespaceId,
+        plan: &MergePlan,
+    ) -> Result<CompactResult, KoshaError> {
+        self.compact_with_selector(
+            namespace,
+            |manifest, ns_dir| {
+                let inputs: Vec<ManifestEntry> = plan
+                    .inputs
+                    .iter()
+                    .filter_map(|planned| {
+                        manifest
+                            .segments
+                            .iter()
+                            .find(|e| e.segment_id == planned.segment_id)
+                    })
+                    .filter(|e| ns_dir.join(&e.segment_id.0).exists())
+                    .cloned()
+                    .collect();
+                (inputs.len() >= 2).then_some(MergePlan { inputs })
+            },
+            || {},
+        )
+    }
+
+    fn compact_with_selector(
+        &self,
+        namespace: &NamespaceId,
+        select: impl FnOnce(&Manifest, &Path) -> Option<MergePlan>,
+        after_plan: impl FnOnce(),
+    ) -> Result<CompactResult, KoshaError> {
         let handle = self.ns_handle(namespace);
         let _compact_guard = handle.compact.lock().unwrap();
 
         let (plan, tombstones, bm25_params, segments_before) = {
             let mut state = handle.state.lock().unwrap();
             if !state.known {
-                return Ok(CompactResult {
-                    merged: false,
-                    segments_before: 0,
-                    segments_after: 0,
-                    segments_merged: 0,
-                });
+                return Ok(CompactResult::unchanged(0));
             }
             let segments_before = state.manifest.segments.len();
             let ns_dir = self.data_dir.join(&namespace.0);
-            let plan = match select_merge_inputs(
-                &state.manifest,
-                &opts,
-                |seg_id| ns_dir.join(&seg_id.0).exists(),
-                |seg_id| segment_dir_bytes(&ns_dir.join(&seg_id.0)),
-            ) {
+            let plan = match select(&state.manifest, &ns_dir) {
                 Some(p) => p,
-                None => {
-                    return Ok(CompactResult {
-                        merged: false,
-                        segments_before,
-                        segments_after: segments_before,
-                        segments_merged: 0,
-                    });
-                }
+                None => return Ok(CompactResult::unchanged(segments_before)),
             };
             let mut tombstones = HashMap::new();
             for entry in &plan.inputs {
@@ -1470,15 +1507,11 @@ impl Indexer {
 
         if !any_docs {
             let _ = std::fs::remove_dir_all(ns_dir.join(&seg_id.0));
-            return Ok(CompactResult {
-                merged: false,
-                segments_before,
-                segments_after: segments_before,
-                segments_merged: 0,
-            });
+            return Ok(CompactResult::unchanged(segments_before));
         }
 
         let footer = writer.finalize(bm25_params)?;
+        let output_segment_id = seg_id.clone();
 
         // ── CAS publish under state lock ─────────────────────────────────
         {
@@ -1491,10 +1524,8 @@ impl Indexer {
                 // merge output rather than publishing a conflicting manifest.
                 let _ = std::fs::remove_dir_all(ns_dir.join(&seg_id.0));
                 return Ok(CompactResult {
-                    merged: false,
                     segments_before,
-                    segments_after: state.manifest.segments.len(),
-                    segments_merged: 0,
+                    ..CompactResult::unchanged(state.manifest.segments.len())
                 });
             }
 
@@ -1559,6 +1590,8 @@ impl Indexer {
             segments_before,
             segments_after,
             segments_merged: old_segment_ids.len(),
+            merged_inputs: old_segment_ids,
+            output: Some(output_segment_id),
         })
     }
 
@@ -3288,6 +3321,66 @@ mod tests {
         // Old segment directories should be deleted.
         assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 1);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #242: `compact_planned` merges exactly the planned group, even when
+    /// other segments are also on local disk (re-planning from local disk
+    /// would grab them too), skips a planned input that is not local, and
+    /// reports the consumed inputs and the output for eviction.
+    #[test]
+    fn compact_planned_merges_only_the_planned_group() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-compact-planned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let idx = Indexer::new(dir.clone()).with_flush_threshold(1);
+        for i in 0..5 {
+            idx.index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId(format!("d{i}")),
+                    fields: vec![Field::text("title", format!("doc number {i}"))],
+                }],
+            )
+            .unwrap();
+        }
+        let before = idx.manifest_cloned(&ns).unwrap();
+        assert_eq!(before.segments.len(), 5);
+        let ids: Vec<SegmentId> = before
+            .segments
+            .iter()
+            .map(|e| e.segment_id.clone())
+            .collect();
+        // Plan s0, s1, s2; s2 is "not hydrated" (its dir is gone).
+        std::fs::remove_dir_all(dir.join("test").join(&ids[2].0)).unwrap();
+        let plan = MergePlan {
+            inputs: before.segments[..3].to_vec(),
+        };
+        let result = idx.compact_planned(&ns, &plan).unwrap();
+        assert!(result.merged);
+        assert_eq!(result.merged_inputs, vec![ids[0].clone(), ids[1].clone()]);
+        let output = result.output.clone().expect("output id");
+        let after = idx.manifest_cloned(&ns).unwrap();
+        let after_ids: Vec<&SegmentId> = after.segments.iter().map(|e| &e.segment_id).collect();
+        assert_eq!(after.segments.len(), 4);
+        for kept in [&ids[2], &ids[3], &ids[4], &output] {
+            assert!(after_ids.contains(&kept), "{kept:?} missing: {after_ids:?}");
+        }
+
+        // A plan with one usable input is a no-op.
+        let lone = MergePlan {
+            inputs: vec![after
+                .segments
+                .iter()
+                .find(|e| e.segment_id == ids[3])
+                .unwrap()
+                .clone()],
+        };
+        let noop = idx.compact_planned(&ns, &lone).unwrap();
+        assert!(!noop.merged);
+        assert!(noop.merged_inputs.is_empty());
+        assert_eq!(idx.manifest_cloned(&ns).unwrap().segments.len(), 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

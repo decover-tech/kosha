@@ -320,6 +320,15 @@ calls.
   when the node is under query load.
 - The `POST /v1/admin/compact-namespace` route remains the emergency lever; default body mode is
   `tiered`. Pass `"mode": "full"` only for deliberate one-shot remediation.
+- **Bounded local disk (#242).** A pass plans each merge group from object sizes in S3 (one
+  paginated ListObjectsV2 over the namespace prefix) before hydrating anything, hydrates only that
+  group's inputs (vectors included), merges and publishes it, then evicts the superseded inputs'
+  local directories (never one the manifest still references or with a file pinned by an in-flight
+  hydration or warmup; local-only mode never evicts, since there the directory is the only copy).
+  Peak local disk for a group is its inputs plus its output, about `2 x max_merged_segment_bytes`.
+  `full` loops capped groups inside one pass until none fits; a segment whose size S3 cannot report
+  never joins a capped group. `max_segment_bytes: 0` (uncapped, all-to-one) still hydrates
+  everything.
 
 **What this deliberately leaves to the compaction node role (§5)**
 

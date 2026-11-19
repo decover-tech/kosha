@@ -572,6 +572,55 @@ impl S3Storage {
         })
     }
 
+    /// Total object bytes per segment under a namespace path, from one
+    /// paginated ListObjectsV2 over the whole namespace prefix (no
+    /// delimiter): about one request per 1,000 objects, instead of one LIST
+    /// per segment or a `_COMMIT` GET each. Compaction plans merge groups
+    /// from these sizes before hydrating anything (#242). `wants(file)`
+    /// filters which files count (the files hydration would fetch).
+    ///
+    /// Keys deeper than `<segment>/<file>` are counted against their
+    /// segment too. A segment with no listed objects is absent from the map.
+    pub fn segment_sizes(
+        &self,
+        ns_path: &str,
+        wants: impl Fn(&str) -> bool,
+    ) -> Result<std::collections::HashMap<String, u64>, KoshaError> {
+        let mut prefix = self.s3_key(ns_path);
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let objects: Vec<(String, u64)> = self.rt.block_on(async move {
+            let mut out = Vec::new();
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                if let Some(token) = continuation.take() {
+                    req = req.continuation_token(token);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                for obj in resp.contents() {
+                    if let Some(key) = obj.key() {
+                        let relative = key.strip_prefix(&prefix).unwrap_or(key);
+                        let size = obj.size().unwrap_or(0).max(0) as u64;
+                        out.push((relative.trim_start_matches('/').to_string(), size));
+                    }
+                }
+                match resp.next_continuation_token() {
+                    Some(t) => continuation = Some(t.to_string()),
+                    None => break,
+                }
+            }
+            Ok::<_, KoshaError>(out)
+        })?;
+        Ok(sum_segment_sizes(objects, wants))
+    }
+
     /// Ground-truth durability check for one segment prefix, unlike
     /// `StorageBackend::exists` (local disk only) or `list_with_sizes`/`list`
     /// (which fall back to local on an empty S3 listing, so they can't tell
@@ -1242,9 +1291,54 @@ fn local_list_with_zero_sizes(
         .collect())
 }
 
+/// Group `(<segment>/<file>, size)` listing rows into bytes per segment,
+/// counting only files `wants` accepts (by basename). Rows with no segment
+/// component (stray objects at the namespace root) are ignored. A segment
+/// whose files are all filtered out still appears, with `0` bytes.
+pub(crate) fn sum_segment_sizes(
+    objects: Vec<(String, u64)>,
+    wants: impl Fn(&str) -> bool,
+) -> std::collections::HashMap<String, u64> {
+    let mut sizes = std::collections::HashMap::new();
+    for (relative, size) in objects {
+        let Some((segment, rest)) = relative.split_once('/') else {
+            continue;
+        };
+        if segment.is_empty() || rest.is_empty() {
+            continue;
+        }
+        let file = rest.rsplit('/').next().unwrap_or(rest);
+        let entry = sizes.entry(segment.to_string()).or_insert(0u64);
+        if wants(file) {
+            *entry = entry.saturating_add(size);
+        }
+    }
+    sizes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sum_segment_sizes_groups_by_segment_and_filters_files() {
+        let rows = vec![
+            ("seg-a/doc_store.bin".to_string(), 100),
+            ("seg-a/vector.idx".to_string(), 1_000),
+            ("seg-a/_COMMIT".to_string(), 5),
+            ("seg-b/inverted.idx".to_string(), 7),
+            ("seg-c/vector.idx".to_string(), 9),
+            ("stray.json".to_string(), 50),
+            ("seg-d/".to_string(), 0),
+        ];
+        let sizes = sum_segment_sizes(rows.clone(), |_| true);
+        assert_eq!(sizes["seg-a"], 1_105);
+        assert_eq!(sizes["seg-b"], 7);
+        assert_eq!(sizes.len(), 3, "stray root object and empty key ignored");
+        let lexical = sum_segment_sizes(rows, |f| f != "vector.idx");
+        assert_eq!(lexical["seg-a"], 105);
+        assert_eq!(lexical["seg-c"], 0);
+    }
 
     /// Regression for the BM25 benchmark re-run's bug #4
     /// (`scripts/bench/bm25_scale/RESULTS.md`): "hydration S3 GETs have no

@@ -316,6 +316,68 @@ impl Cache {
         Ok(())
     }
 
+    /// Remove a whole directory (a superseded segment) and every file under
+    /// it, unless any key at or under `key` is pinned. Returns
+    /// `Ok(None)` when a pin blocked the eviction (nothing was removed), or
+    /// `Ok(Some(bytes))` with the bytes actually freed on disk (`0` when the
+    /// directory was already gone).
+    ///
+    /// Unlike `evict` on a directory key, this keeps the LRU list and the
+    /// running total exact: every file key under the directory leaves the
+    /// recency list, and the total drops only by the files the cache was
+    /// tracking (files written straight to disk by the indexer were never
+    /// counted, so subtracting them would wrap the counter).
+    ///
+    /// The recency and pin locks are held, in `enforce_limit`'s order,
+    /// across the check and the removal, so a hydration batch cannot pin a
+    /// file in between and then lose it.
+    pub fn evict_dir_unless_pinned(&self, key: &str) -> Result<Option<u64>, KoshaError> {
+        let path = self.path_for(key)?;
+        let key = key
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string();
+        let prefix = format!("{key}/");
+        let mut recency = self.recency.lock().unwrap();
+        let pinned = self.pinned.lock().unwrap();
+        if pinned.keys().any(|k| {
+            k.trim_start_matches('/') == key || k.trim_start_matches('/').starts_with(&prefix)
+        }) {
+            return Ok(None);
+        }
+        if !path.is_dir() {
+            return Ok(Some(0));
+        }
+        let mut files = Vec::new();
+        collect_files(&path, &mut files);
+        let on_disk: u64 = files.iter().map(|(_, len)| len).sum();
+        std::fs::remove_dir_all(&path)?;
+        let mut tracked = 0u64;
+        for (file, len) in &files {
+            let Ok(rel) = file.strip_prefix(&self.cache_dir) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if let Some(pos) = recency.iter().position(|k| *k == rel) {
+                recency.remove(pos);
+                tracked += len;
+            }
+        }
+        drop(pinned);
+        drop(recency);
+        let mut current = self.total_bytes.load(Ordering::Relaxed);
+        while let Err(actual) = self.total_bytes.compare_exchange_weak(
+            current,
+            current.saturating_sub(tracked),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            current = actual;
+        }
+        self.eviction_generation.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(on_disk))
+    }
+
     /// Monotonic counter bumped once per file/dir this cache has actually
     /// removed (LRU `enforce_limit` or an explicit `evict` call) — never on
     /// a no-op `evict` of an already-absent key. Callers that cache their
@@ -347,6 +409,22 @@ impl Cache {
     /// incrementally rather than walked on every call.
     pub fn total_size(&self) -> u64 {
         self.total_bytes.load(Ordering::Relaxed)
+    }
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<(PathBuf, u64)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            collect_files(&entry.path(), out);
+        } else {
+            out.push((entry.path(), meta.len()));
+        }
     }
 }
 
@@ -556,6 +634,57 @@ mod tests {
             "unpinning must restore normal LRU eligibility"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #242: compaction evicts a superseded segment directory. A pin on any
+    /// file under it must block the eviction; otherwise the directory goes,
+    /// its file keys leave the LRU list, and the running total drops only
+    /// by the bytes the cache was tracking (an untracked file written by the
+    /// indexer must not wrap the counter).
+    #[test]
+    fn evict_dir_unless_pinned_respects_pins_and_keeps_accounting_exact() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-cache-evict-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
+        cache
+            .put_bytes("ns/seg-a/doc_store.bin", &[0u8; 40])
+            .unwrap();
+        cache
+            .put_bytes("ns/seg-a/inverted.idx", &[0u8; 10])
+            .unwrap();
+        cache
+            .put_bytes("ns/seg-a2/doc_store.bin", &[0u8; 7])
+            .unwrap();
+        // Written straight to disk, never accounted (an indexer flush).
+        fs::write(dir.join("ns/seg-a/filters.bin"), [0u8; 5]).unwrap();
+        assert_eq!(cache.total_size(), 57);
+
+        cache.pin("ns/seg-a/inverted.idx");
+        assert_eq!(cache.evict_dir_unless_pinned("ns/seg-a").unwrap(), None);
+        assert!(dir.join("ns/seg-a/doc_store.bin").exists(), "pinned: kept");
+        cache.unpin("ns/seg-a/inverted.idx");
+
+        let gen = cache.eviction_generation();
+        assert_eq!(
+            cache.evict_dir_unless_pinned("ns/seg-a").unwrap(),
+            Some(55),
+            "all bytes on disk, tracked or not"
+        );
+        assert!(!dir.join("ns/seg-a").exists());
+        assert_eq!(cache.total_size(), 7, "only tracked bytes subtracted");
+        assert!(cache.eviction_generation() > gen);
+        assert!(!cache
+            .recency
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|k| k.starts_with("ns/seg-a/")));
+        // A sibling whose name shares the prefix is untouched, and an
+        // already-gone directory is a no-op.
+        assert!(cache.get("ns/seg-a2/doc_store.bin").is_some());
+        assert_eq!(cache.evict_dir_unless_pinned("ns/seg-a").unwrap(), Some(0));
         let _ = fs::remove_dir_all(&dir);
     }
 
