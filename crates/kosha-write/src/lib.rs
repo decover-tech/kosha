@@ -2225,6 +2225,66 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// #243: compaction reads every input doc through `iter_doc_records`,
+    /// which must put sidecar vectors back, or the merged segment would
+    /// lose them. The merged segment stores them in a sidecar again.
+    #[test]
+    fn compaction_preserves_sidecar_vectors() {
+        let dir = std::env::temp_dir().join(format!("kosha-compact-docvec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("v".into());
+        let vector = |i: usize| -> Vec<f32> { vec![i as f32 + 0.1, -(i as f32), 0.5, 1.0e-3] };
+        for i in 0..3 {
+            idx.index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId(format!("d{i}")),
+                    fields: vec![
+                        Field::text("text", format!("doc {i}")),
+                        Field {
+                            name: "emb".into(),
+                            field_type: kosha_core::FieldType::Vector,
+                            value: serde_json::to_string(&vector(i)).unwrap(),
+                        },
+                    ],
+                }],
+            )
+            .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+        }
+        let before = idx.manifest(&ns).unwrap();
+        assert_eq!(before.segments.len(), 3);
+        assert!(before
+            .segments
+            .iter()
+            .all(|e| before.segment_footer(&e.segment_id).unwrap().doc_vectors));
+
+        let result = idx
+            .compact_namespace_with_options(&ns, CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
+        let after = idx.manifest(&ns).unwrap();
+        assert_eq!(after.segments.len(), 1);
+        let seg_dir = dir.join(&ns.0).join(&after.segments[0].segment_id.0);
+        let reader = kosha_segment::SegmentReader::open(seg_dir).unwrap();
+        assert!(
+            reader.footer().doc_vectors,
+            "merged segment uses the sidecar"
+        );
+        let mut seen = 0;
+        for record in reader.iter_doc_records() {
+            let record = record.unwrap();
+            let i: usize = record.doc_id.0[1..].parse().unwrap();
+            let emb = record.fields.iter().find(|f| f.name == "emb").unwrap();
+            let got: Vec<f32> = serde_json::from_str(&emb.value).unwrap();
+            assert_eq!(got, vector(i), "doc {i}");
+            seen += 1;
+        }
+        assert_eq!(seen, 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn regression_fresh_disk_advances_wal_past_remote_checkpoint() {
         let dir = std::env::temp_dir().join("kosha-regression-fresh-wal");

@@ -1582,8 +1582,7 @@ impl AppState {
                 let mut ds_bytes = 0u64;
                 let warmup_request = RequestHydration::unlimited();
                 for chunk in seg_paths.chunks(2) {
-                    let (files, bytes) =
-                        self.ensure_files_local(chunk, "doc_store.bin", &warmup_request);
+                    let (files, bytes) = self.ensure_doc_store_local(chunk, &warmup_request);
                     ds_files += files;
                     ds_bytes += bytes;
                 }
@@ -2149,6 +2148,33 @@ impl AppState {
     #[cfg(feature = "s3")]
     /// Returns `(files_fetched, bytes_fetched)` — already-local files cost
     /// nothing and aren't counted.
+    /// Fetch what materializing documents from these segments needs:
+    /// `doc_store.bin`, plus `doc_vectors.bin` for segments whose footer
+    /// says vectors were moved there (#243). Only those segments are asked
+    /// for the sidecar, so older segments never trigger a GET for a file
+    /// they don't have.
+    #[cfg(feature = "s3")]
+    fn ensure_doc_store_local(
+        &self,
+        seg_paths: &[PathBuf],
+        request: &Arc<RequestHydration>,
+    ) -> (usize, u64) {
+        let (mut files, mut bytes) = self.ensure_files_local(seg_paths, "doc_store.bin", request);
+        let with_sidecar: Vec<PathBuf> = seg_paths
+            .iter()
+            .filter(|p| kosha_segment::segment_uses_doc_vectors(p))
+            .cloned()
+            .collect();
+        if !with_sidecar.is_empty() {
+            let (f, b) =
+                self.ensure_files_local(&with_sidecar, kosha_segment::DOC_VECTORS_FILE, request);
+            files += f;
+            bytes += b;
+        }
+        (files, bytes)
+    }
+
+    #[cfg(feature = "s3")]
     fn ensure_files_local(
         &self,
         seg_paths: &[PathBuf],
@@ -4519,7 +4545,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         // stores are hundreds of MB per segment and were previously outside
         // every byte gate — the request pays for them, so the request's
         // ceiling has to cover them.
-        let (files, bytes) = state.ensure_files_local(segs, "doc_store.bin", &hydration_request);
+        let (files, bytes) = state.ensure_doc_store_local(segs, &hydration_request);
         if files > 0 {
             println!(
                 "page hydrate: fetched {files} doc store(s) ({:.1} MB)",
@@ -4871,7 +4897,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         // stores are hundreds of MB per segment and were previously outside
         // every byte gate — the request pays for them, so the request's
         // ceiling has to cover them.
-        let (files, bytes) = state.ensure_files_local(segs, "doc_store.bin", &hydration_request);
+        let (files, bytes) = state.ensure_doc_store_local(segs, &hydration_request);
         if files > 0 {
             println!(
                 "page hydrate: fetched {files} doc store(s) ({:.1} MB)",
@@ -8690,6 +8716,7 @@ mod tests {
             term_bloom: None,
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: None,
+            doc_vectors: false,
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.

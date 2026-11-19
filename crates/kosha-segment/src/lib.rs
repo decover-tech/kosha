@@ -61,6 +61,14 @@ pub struct SegmentWriter {
     /// See [`text_filter_ignore_above`]. Captured per writer so tests can
     /// override it without touching the process-wide env.
     text_filter_ignore_above: Option<u32>,
+    /// Where parsed `Vector` field values are stored (#243). See
+    /// [`VectorStoreMode`].
+    vector_store_mode: VectorStoreMode,
+    /// `doc_vectors.bin` field-name table (sidecar mode only).
+    doc_vector_fields: Vec<String>,
+    /// `(doc_seq, field_idx, index into self.vectors)` for each vector moved
+    /// to the sidecar, in doc_seq then field order.
+    doc_vector_entries: Vec<(u32, u32, u32)>,
 }
 
 impl SegmentWriter {
@@ -87,7 +95,17 @@ impl SegmentWriter {
             filter_float: HashMap::new(),
             vectors: Vec::new(),
             text_filter_ignore_above: text_filter_ignore_above(),
+            vector_store_mode: VectorStoreMode::from_env(),
+            doc_vector_fields: Vec::new(),
+            doc_vector_entries: Vec::new(),
         }
+    }
+
+    /// Override where this writer stores parsed vector values (#243).
+    /// Production writers use `KOSHA_VECTOR_STORE`; see [`VectorStoreMode`].
+    pub fn with_vector_store_mode(mut self, mode: VectorStoreMode) -> Self {
+        self.vector_store_mode = mode;
+        self
     }
 
     /// Override the `Text` → filter-column cap for this writer (`None`
@@ -99,11 +117,14 @@ impl SegmentWriter {
         self
     }
 
-    pub fn add_document(&mut self, doc_id: DocumentId, fields: Vec<Field>) {
+    pub fn add_document(&mut self, doc_id: DocumentId, mut fields: Vec<Field>) {
         let doc_seq = self.doc_records.len() as u32;
         let mut field_length: u32 = 0;
+        // Vector fields whose value moves to `doc_vectors.bin` (#243); their
+        // doc-store value is blanked after the loop below.
+        let mut moved_to_sidecar: Vec<usize> = Vec::new();
 
-        for field in &fields {
+        for (index, field) in fields.iter().enumerate() {
             if field.field_type == FieldType::Text {
                 let tokens = tokenize_with_positions(&field.value);
                 field_length += tokens.len() as u32;
@@ -162,10 +183,37 @@ impl SegmentWriter {
                 }
                 FieldType::Vector => {
                     if let Ok(vec) = serde_json::from_str::<Vec<f32>>(&field.value) {
+                        // An empty value is the sidecar placeholder; a
+                        // literal `[]` would be indistinguishable from it
+                        // once blanked, so it stays inline.
+                        if self.vector_store_mode == VectorStoreMode::Sidecar && !vec.is_empty() {
+                            let field_idx = match self
+                                .doc_vector_fields
+                                .iter()
+                                .position(|name| name == &field.name)
+                            {
+                                Some(i) => i,
+                                None => {
+                                    self.doc_vector_fields.push(field.name.clone());
+                                    self.doc_vector_fields.len() - 1
+                                }
+                            };
+                            self.doc_vector_entries.push((
+                                doc_seq,
+                                field_idx as u32,
+                                self.vectors.len() as u32,
+                            ));
+                            moved_to_sidecar.push(index);
+                        }
                         self.vectors.push((doc_seq, vec));
                     }
+                    // Unparseable values stay inline as given: nothing
+                    // indexes them, but the stored document is lossless.
                 }
             }
+        }
+        for index in moved_to_sidecar {
+            fields[index].value.clear();
         }
 
         self.total_field_length += field_length as u64;
@@ -180,6 +228,7 @@ impl SegmentWriter {
     pub fn finalize(self, bm25_params: Bm25Params) -> Result<Footer, KoshaError> {
         self.backend.create_dir_all("")?;
         self.write_doc_store()?;
+        self.write_doc_vectors()?;
         self.write_inverted_index()?;
         self.write_filters()?;
         match vector_write_version() {
@@ -230,6 +279,38 @@ impl SegmentWriter {
         self.backend.write("doc_store.bin", &buf)?;
         self.backend.write("doc_store.offsets", &offsets_buf)?;
         Ok(())
+    }
+
+    /// Write `doc_vectors.bin` (#243) when any vector was moved out of the
+    /// doc store. See [`DocVectors`] for the layout.
+    fn write_doc_vectors(&self) -> Result<(), KoshaError> {
+        if self.doc_vector_entries.is_empty() {
+            return Ok(());
+        }
+        let data_len: usize = self
+            .doc_vector_entries
+            .iter()
+            .map(|&(_, _, v)| self.vectors[v as usize].1.len() * 4)
+            .sum();
+        let mut buf = Vec::with_capacity(16 + self.doc_vector_entries.len() * 12 + data_len);
+        buf.extend_from_slice(&DOC_VECTORS_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&(self.doc_vector_fields.len() as u32).to_le_bytes());
+        for name in &self.doc_vector_fields {
+            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+        }
+        buf.extend_from_slice(&(self.doc_vector_entries.len() as u32).to_le_bytes());
+        for &(doc_seq, field_idx, v) in &self.doc_vector_entries {
+            buf.extend_from_slice(&doc_seq.to_le_bytes());
+            buf.extend_from_slice(&field_idx.to_le_bytes());
+            buf.extend_from_slice(&(self.vectors[v as usize].1.len() as u32).to_le_bytes());
+        }
+        for &(_, _, v) in &self.doc_vector_entries {
+            for x in &self.vectors[v as usize].1 {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        self.backend.write(DOC_VECTORS_FILE, &buf)
     }
 
     /// Write `inverted.idx` in the v3 table-of-contents layout (see
@@ -483,6 +564,7 @@ impl SegmentWriter {
             )),
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: self.text_filter_ignore_above,
+            doc_vectors: !self.doc_vector_entries.is_empty(),
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -1145,6 +1227,185 @@ fn text_value_within_cap(value: &str, cap: Option<u32>) -> bool {
     let Some(cap) = cap else { return true };
     let cap = cap as usize;
     value.len() <= cap || value.chars().count() <= cap
+}
+
+// ─── Doc vectors sidecar (#243) ─────────────────────────────────────────────
+//
+// `doc_vectors.bin` holds every parsed `Vector` field value as raw f32 LE,
+// so `doc_store.bin` no longer carries each embedding as JSON text (~14 KB
+// for 1024 dims, vs 4 KB binary). `vector.idx` can't serve as the stored
+// copy: from format v3 it holds unit-normalized vectors only, so the
+// original magnitudes would be lost.
+//
+// Layout:
+//   [magic "KDV1"][field_count:u32] then per field [len:u32][utf8 name]
+//   [entry_count:u32] then per entry [doc_seq:u32][field_idx:u32][dim:u32]
+//   then every entry's vector, f32 LE x dim, in entry order.
+// Entries are sorted by doc_seq (ties keep the doc's field order), so one
+// document's vectors are a binary-searchable run and one contiguous span.
+// The header is 12 bytes/entry and stays resident; vectors are read with
+// one seek+read per document, the way doc-store records are.
+
+/// File name of the doc-vectors sidecar.
+pub const DOC_VECTORS_FILE: &str = "doc_vectors.bin";
+/// Magic prefix of `doc_vectors.bin` ("KDV1", little-endian u32).
+pub const DOC_VECTORS_MAGIC: u32 = u32::from_le_bytes(*b"KDV1");
+
+/// Where a writer stores parsed `Vector` field values (#243).
+/// `KOSHA_VECTOR_STORE=sidecar` (the default) moves them to
+/// `doc_vectors.bin`; `inline` keeps the pre-#243 JSON in `doc_store.bin`.
+///
+/// Rollout note: binaries older than #243 don't know the sidecar. They
+/// would read a sidecar segment's vector fields as empty strings, and an
+/// old binary *compacting* one would drop those vectors from its output.
+/// Set `inline` before rolling back past #243.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorStoreMode {
+    Sidecar,
+    Inline,
+}
+
+impl VectorStoreMode {
+    fn from_env() -> Self {
+        static MODE: OnceLock<VectorStoreMode> = OnceLock::new();
+        *MODE.get_or_init(|| Self::parse(std::env::var("KOSHA_VECTOR_STORE").ok().as_deref()))
+    }
+
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("sidecar") => Self::Sidecar,
+            Some("inline") => Self::Inline,
+            Some(other) => {
+                eprintln!("WARN: KOSHA_VECTOR_STORE={other} not sidecar|inline — using sidecar");
+                Self::Sidecar
+            }
+        }
+    }
+}
+
+/// Parsed `doc_vectors.bin` header: field names, entries and where each
+/// entry's vector starts in the file. Vectors themselves are read on
+/// demand.
+#[derive(Debug)]
+pub struct DocVectors {
+    path: PathBuf,
+    fields: Vec<String>,
+    /// `(doc_seq, field_idx, dim)`, sorted by doc_seq.
+    entries: Vec<(u32, u32, u32)>,
+    /// Absolute byte offset of each entry's vector.
+    offsets: Vec<u64>,
+}
+
+impl DocVectors {
+    pub fn open(path: PathBuf) -> Result<Self, KoshaError> {
+        let corrupt = |why: &str| KoshaError::CorruptSegment(format!("{}: {why}", path.display()));
+        let file_len = fs::metadata(&path)?.len();
+        let mut reader = std::io::BufReader::new(fs::File::open(&path)?);
+        let mut u32_buf = [0u8; 4];
+        let mut next_u32 = |r: &mut std::io::BufReader<fs::File>| -> Result<u32, KoshaError> {
+            r.read_exact(&mut u32_buf)
+                .map_err(|e| KoshaError::CorruptSegment(format!("truncated header: {e}")))?;
+            Ok(u32::from_le_bytes(u32_buf))
+        };
+        if next_u32(&mut reader)? != DOC_VECTORS_MAGIC {
+            return Err(corrupt("bad magic"));
+        }
+        let field_count = next_u32(&mut reader)? as usize;
+        let mut header_len: u64 = 8;
+        let mut fields = Vec::with_capacity(field_count.min(1024));
+        for _ in 0..field_count {
+            let len = next_u32(&mut reader)? as u64;
+            if len > file_len {
+                return Err(corrupt("field name length past end of file"));
+            }
+            let mut name = vec![0u8; len as usize];
+            reader
+                .read_exact(&mut name)
+                .map_err(|_| corrupt("truncated field name"))?;
+            fields.push(String::from_utf8_lossy(&name).into_owned());
+            header_len += 4 + len;
+        }
+        let entry_count = next_u32(&mut reader)? as u64;
+        header_len += 4;
+        if header_len + entry_count * 12 > file_len {
+            return Err(corrupt("entry table past end of file"));
+        }
+        let mut entries = Vec::with_capacity(entry_count as usize);
+        let mut offsets = Vec::with_capacity(entry_count as usize);
+        let mut next = header_len + entry_count * 12;
+        let mut last_seq = 0u32;
+        for _ in 0..entry_count {
+            let doc_seq = next_u32(&mut reader)?;
+            let field_idx = next_u32(&mut reader)?;
+            let dim = next_u32(&mut reader)?;
+            if field_idx as usize >= fields.len() {
+                return Err(corrupt("entry names an unknown field"));
+            }
+            if doc_seq < last_seq {
+                return Err(corrupt("entries not sorted by doc_seq"));
+            }
+            last_seq = doc_seq;
+            entries.push((doc_seq, field_idx, dim));
+            offsets.push(next);
+            next += dim as u64 * 4;
+        }
+        if next != file_len {
+            return Err(corrupt(&format!(
+                "vector data is {} bytes, header says {}",
+                file_len.saturating_sub(header_len + entry_count * 12),
+                next - header_len - entry_count * 12
+            )));
+        }
+        Ok(Self {
+            path,
+            fields,
+            entries,
+            offsets,
+        })
+    }
+
+    /// `(field name, vector)` for every vector stored for `doc_seq`, in the
+    /// document's field order. One seek+read.
+    pub fn vectors_for(&self, doc_seq: u32) -> Result<Vec<(&str, Vec<f32>)>, KoshaError> {
+        let start = self.entries.partition_point(|e| e.0 < doc_seq);
+        let end = self.entries.partition_point(|e| e.0 <= doc_seq);
+        if start == end {
+            return Ok(Vec::new());
+        }
+        let span_start = self.offsets[start];
+        let span_end = self.offsets[end - 1] + self.entries[end - 1].2 as u64 * 4;
+        let mut buf = vec![0u8; (span_end - span_start) as usize];
+        let mut file = fs::File::open(&self.path)?;
+        file.seek(SeekFrom::Start(span_start))?;
+        file.read_exact(&mut buf)?;
+        let mut out = Vec::with_capacity(end - start);
+        for i in start..end {
+            let (_, field_idx, dim) = self.entries[i];
+            let at = (self.offsets[i] - span_start) as usize;
+            let vector = buf[at..at + dim as usize * 4]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            out.push((self.fields[field_idx as usize].as_str(), vector));
+        }
+        Ok(out)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Whether `segment_dir`'s footer says vectors live in `doc_vectors.bin`.
+/// Reads the local `footer.json`; `false` if it can't be read.
+pub fn segment_uses_doc_vectors(segment_dir: &Path) -> bool {
+    SegmentReader::read_footer(segment_dir).is_ok_and(|footer| footer.doc_vectors)
 }
 
 /// The vector-index version `finalize` writes — `KOSHA_VECTOR_WRITE_VERSION`,
@@ -2738,6 +2999,10 @@ pub struct SegmentReader {
     /// `SearchResult::knn_degraded_segments` instead. See
     /// `load_vector_index`'s corrupt-body branch.
     vector_index_degraded: bool,
+    /// Parsed `doc_vectors.bin` header, loaded on first doc-record read of a
+    /// segment whose footer sets `doc_vectors` (#243). Only success is
+    /// cached: the file may be hydrated after the segment was opened.
+    doc_vectors: Mutex<Option<Arc<DocVectors>>>,
 }
 
 impl SegmentReader {
@@ -2806,7 +3071,64 @@ impl SegmentReader {
             hnsw_map: hm,
             vector_index,
             vector_index_degraded,
+            doc_vectors: Mutex::new(None),
         })
+    }
+
+    fn doc_vectors(&self) -> Result<Arc<DocVectors>, KoshaError> {
+        let mut cached = self.doc_vectors.lock().unwrap();
+        if let Some(dv) = cached.as_ref() {
+            return Ok(Arc::clone(dv));
+        }
+        let path = self.segment_dir.join(DOC_VECTORS_FILE);
+        let dv = Arc::new(DocVectors::open(path).map_err(|e| match e {
+            KoshaError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                KoshaError::NotFound(format!(
+                    "{DOC_VECTORS_FILE} missing from segment {:?}, whose footer says vectors \
+                     are stored there",
+                    self.segment_dir
+                ))
+            }
+            other => other,
+        })?);
+        *cached = Some(Arc::clone(&dv));
+        Ok(dv)
+    }
+
+    /// Put sidecar vectors back into the placeholder (empty-valued)
+    /// `Vector` fields of `record` (#243). No-op for segments that store
+    /// vectors inline. A placeholder with no matching sidecar entry is
+    /// corruption and fails loudly: returning the empty value would let a
+    /// compaction write the document out without its vector.
+    fn fill_doc_vectors(&self, record: &mut DocRecord) -> Result<(), KoshaError> {
+        if !self.footer.doc_vectors
+            || !record
+                .fields
+                .iter()
+                .any(|f| f.field_type == FieldType::Vector && f.value.is_empty())
+        {
+            return Ok(());
+        }
+        let dv = self.doc_vectors()?;
+        let mut stored = dv.vectors_for(record.doc_seq)?.into_iter();
+        for field in record
+            .fields
+            .iter_mut()
+            .filter(|f| f.field_type == FieldType::Vector && f.value.is_empty())
+        {
+            match stored.next() {
+                Some((name, vector)) if name == field.name => {
+                    field.value = serde_json::to_string(&vector)?;
+                }
+                _ => {
+                    return Err(KoshaError::CorruptSegment(format!(
+                        "{DOC_VECTORS_FILE} in {:?} has no vector for doc_seq {} field '{}'",
+                        self.segment_dir, record.doc_seq, field.name
+                    )))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Loads this segment's vectors, dispatching on `vector.idx`'s format —
@@ -3346,6 +3668,15 @@ impl SegmentReader {
     /// disk for `Lazy` segments — use only for documents actually being
     /// materialized into a response, not during scoring.
     pub fn doc_record_full(&self, doc_seq: u32) -> Result<Option<DocRecord>, KoshaError> {
+        let mut record = self.doc_record_stored(doc_seq)?;
+        if let Some(record) = record.as_mut() {
+            self.fill_doc_vectors(record)?;
+        }
+        Ok(record)
+    }
+
+    /// The record as stored in `doc_store.bin`, vector placeholders and all.
+    fn doc_record_stored(&self, doc_seq: u32) -> Result<Option<DocRecord>, KoshaError> {
         match &self.doc_store {
             DocStoreAccess::Eager(records) => Ok(records.get(doc_seq as usize).cloned()),
             DocStoreAccess::Lazy {
@@ -3384,6 +3715,14 @@ impl SegmentReader {
     /// `Eager` segments hold every record in memory; `Lazy` segments need
     /// `doc_store.bin` present on local disk.
     pub fn has_local_doc_store(&self) -> bool {
+        // A sidecar segment also needs `doc_vectors.bin` to produce complete
+        // records (#243).
+        if self.footer.doc_vectors
+            && !std::fs::metadata(self.segment_dir.join(DOC_VECTORS_FILE))
+                .is_ok_and(|m| m.len() > 0)
+        {
+            return false;
+        }
         match &self.doc_store {
             DocStoreAccess::Eager(_) => true,
             DocStoreAccess::Lazy {
@@ -3430,7 +3769,9 @@ impl SegmentReader {
             )));
         }
         let mut cursor = bytes;
-        Ok(Some(parse_one_doc_record(&mut cursor, doc_seq)))
+        let mut record = parse_one_doc_record(&mut cursor, doc_seq);
+        self.fill_doc_vectors(&mut record)?;
+        Ok(Some(record))
     }
 
     /// Iterate every document's zero-I/O metadata (`doc_id`/`field_length`)
@@ -6077,5 +6418,307 @@ mod tests {
             assert_eq!(flat, expected_flat, "scoring stream mismatch for {term}");
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod doc_vectors_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-docvec-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn vector_field(name: &str, values: &[f32]) -> Field {
+        Field {
+            name: name.into(),
+            field_type: FieldType::Vector,
+            value: serde_json::to_string(values).unwrap(),
+        }
+    }
+
+    fn write(dir: &Path, mode: VectorStoreMode, docs: Vec<(&str, Vec<Field>)>) -> Footer {
+        let mut writer = SegmentWriter::new(SegmentId("s".into()), dir.to_path_buf())
+            .with_vector_store_mode(mode);
+        for (id, fields) in docs {
+            writer.add_document(DocumentId(id.into()), fields);
+        }
+        writer.finalize(Bm25Params::default()).unwrap()
+    }
+
+    fn parsed(value: &str) -> Vec<f32> {
+        serde_json::from_str(value).unwrap()
+    }
+
+    #[test]
+    fn sidecar_round_trips_vectors_and_keeps_field_order() {
+        let dir = scratch("roundtrip");
+        // Not representable exactly in decimal: the f32 must survive.
+        let a = vec![0.1f32, -1.25, 3.0e-7, f32::MAX];
+        let b = vec![2.5f32, 0.0, -0.333_333_34, 1.0];
+        let footer = write(
+            &dir,
+            VectorStoreMode::Sidecar,
+            vec![
+                // One vector field per doc: several per doc don't build a
+                // vector.idx today in either mode (#204).
+                (
+                    "d0",
+                    vec![
+                        Field::text("title", "first doc"),
+                        vector_field("emb", &a),
+                        Field::keyword("tag", "x"),
+                    ],
+                ),
+                ("d1", vec![Field::text("title", "no vectors here")]),
+                (
+                    "d2",
+                    vec![vector_field("emb", &b), Field::text("title", "third")],
+                ),
+            ],
+        );
+        assert!(footer.doc_vectors);
+        assert!(dir.join(DOC_VECTORS_FILE).exists());
+        let stored = fs::read_to_string(dir.join("footer.json")).unwrap();
+        assert!(stored.contains("\"doc_vectors\": true"), "{stored}");
+
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let d0 = reader.doc_record_full(0).unwrap().unwrap();
+        let names: Vec<&str> = d0.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["title", "emb", "tag"], "field order preserved");
+        assert_eq!(parsed(&d0.fields[1].value), a);
+        assert_eq!(d0.fields[1].field_type, FieldType::Vector);
+
+        let d1 = reader.doc_record_full(1).unwrap().unwrap();
+        assert_eq!(d1.fields.len(), 1);
+        let d2 = reader.doc_record_full(2).unwrap().unwrap();
+        assert_eq!(parsed(&d2.fields[0].value), b);
+
+        // Every path that reads records sees full vectors, compaction's
+        // `iter_doc_records` included.
+        let all: Vec<DocRecord> = reader.iter_doc_records().map(|r| r.unwrap()).collect();
+        assert_eq!(parsed(&all[2].fields[0].value), b);
+
+        // The ranged-read path parses raw doc-store bytes.
+        let (offset, len) = reader.doc_span(0).unwrap();
+        let raw = fs::read(dir.join("doc_store.bin")).unwrap();
+        let from_bytes = reader
+            .doc_record_from_bytes(0, &raw[offset as usize..offset as usize + len as usize])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed(&from_bytes.fields[1].value), a);
+
+        // And kNN still works: vector.idx is built from the same vectors.
+        let hits = reader
+            .knn_search(&b, 3, 8)
+            .expect("segment has vectors")
+            .unwrap();
+        assert!(hits.iter().any(|&(seq, _)| seq == 2), "{hits:?}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn doc_store_holds_placeholders_not_vector_json() {
+        let dir = scratch("placeholder");
+        write(
+            &dir,
+            VectorStoreMode::Sidecar,
+            vec![("d0", vec![vector_field("emb", &[0.123_456_79, 9.5])])],
+        );
+        let raw = fs::read(dir.join("doc_store.bin")).unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            !text.contains("0.12345679"),
+            "vector JSON left in doc store"
+        );
+        let mut cursor = &raw[4..];
+        let rec = parse_one_doc_record(&mut cursor, 0);
+        assert_eq!(rec.fields[0].name, "emb");
+        assert_eq!(rec.fields[0].value, "", "placeholder");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inline_mode_keeps_pre_243_layout() {
+        let dir = scratch("inline");
+        let json = "[0.5,1.5]";
+        let footer = write(
+            &dir,
+            VectorStoreMode::Inline,
+            vec![(
+                "d0",
+                vec![Field {
+                    name: "emb".into(),
+                    field_type: FieldType::Vector,
+                    value: json.into(),
+                }],
+            )],
+        );
+        assert!(!footer.doc_vectors);
+        assert!(!dir.join(DOC_VECTORS_FILE).exists());
+        assert!(!fs::read_to_string(dir.join("footer.json"))
+            .unwrap()
+            .contains("doc_vectors"));
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        assert_eq!(
+            reader.doc_record_full(0).unwrap().unwrap().fields[0].value,
+            json
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Unparseable vector JSON is never indexed, but stays inline verbatim
+    /// so the stored document is lossless, next to moved vectors.
+    #[test]
+    fn unparseable_vectors_stay_inline() {
+        let dir = scratch("odd");
+        let bad = Field {
+            name: "emb".into(),
+            field_type: FieldType::Vector,
+            value: "not a vector".into(),
+        };
+        let footer = write(
+            &dir,
+            VectorStoreMode::Sidecar,
+            vec![
+                ("bad", vec![bad]),
+                ("good", vec![vector_field("emb", &[1.0, 2.0])]),
+            ],
+        );
+        assert!(footer.doc_vectors);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        assert_eq!(
+            reader.doc_record_full(0).unwrap().unwrap().fields[0].value,
+            "not a vector"
+        );
+        assert_eq!(
+            parsed(&reader.doc_record_full(1).unwrap().unwrap().fields[0].value),
+            vec![1.0, 2.0]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A sidecar segment without its sidecar must fail loudly, never hand
+    /// out empty vector values a compaction would then write back out.
+    #[test]
+    fn missing_sidecar_is_an_error_and_not_local() {
+        let dir = scratch("missing");
+        write(
+            &dir,
+            VectorStoreMode::Sidecar,
+            vec![("d0", vec![vector_field("emb", &[1.0, 2.0])])],
+        );
+        let sidecar = fs::read(dir.join(DOC_VECTORS_FILE)).unwrap();
+        fs::remove_file(dir.join(DOC_VECTORS_FILE)).unwrap();
+        let reader = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(!reader.has_local_doc_store());
+        let err = reader.doc_record_full(0).unwrap_err().to_string();
+        assert!(err.contains(DOC_VECTORS_FILE), "{err}");
+        assert!(reader.iter_doc_records().next().unwrap().is_err());
+
+        // Hydrated later (the server fetches it on demand): now it works,
+        // with no reopen.
+        fs::write(dir.join(DOC_VECTORS_FILE), &sidecar).unwrap();
+        assert!(reader.has_local_doc_store());
+        let rec = reader.doc_record_full(0).unwrap().unwrap();
+        assert_eq!(parsed(&rec.fields[0].value), vec![1.0, 2.0]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn truncated_or_garbled_sidecar_is_rejected() {
+        let dir = scratch("corrupt");
+        write(
+            &dir,
+            VectorStoreMode::Sidecar,
+            vec![("d0", vec![vector_field("emb", &[1.0, 2.0, 3.0])])],
+        );
+        let path = dir.join(DOC_VECTORS_FILE);
+        let good = fs::read(&path).unwrap();
+        for bad in [
+            good[..good.len() - 1].to_vec(),
+            good[..6].to_vec(),
+            [b"XXXX".as_slice(), &good[4..]].concat(),
+        ] {
+            fs::write(&path, &bad).unwrap();
+            assert!(DocVectors::open(path.clone()).is_err());
+            let reader = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+            assert!(reader.doc_record_full(0).is_err());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn parse_vector_store_mode() {
+        assert_eq!(VectorStoreMode::parse(None), VectorStoreMode::Sidecar);
+        assert_eq!(VectorStoreMode::parse(Some("")), VectorStoreMode::Sidecar);
+        assert_eq!(
+            VectorStoreMode::parse(Some("INLINE")),
+            VectorStoreMode::Inline
+        );
+        assert_eq!(
+            VectorStoreMode::parse(Some(" sidecar ")),
+            VectorStoreMode::Sidecar
+        );
+        assert_eq!(
+            VectorStoreMode::parse(Some("bogus")),
+            VectorStoreMode::Sidecar
+        );
+    }
+
+    /// Acceptance criterion from #243: the doc store shrinks by the vector
+    /// JSON share. 1024-dim embeddings plus a short text field.
+    #[test]
+    fn sidecar_removes_the_vector_json_share_of_the_doc_store() {
+        let docs = |n: usize| -> Vec<(String, Vec<Field>)> {
+            (0..n)
+                .map(|i| {
+                    let v: Vec<f32> = (0..1024)
+                        .map(|d| ((i * 1024 + d) as f32 * 0.618_034).sin() * 0.05)
+                        .collect();
+                    (
+                        format!("doc{i}"),
+                        vec![
+                            Field::text("title", format!("paragraph {i} about something")),
+                            vector_field("embedding", &v),
+                        ],
+                    )
+                })
+                .collect()
+        };
+        let size = |mode: VectorStoreMode| -> (u64, u64) {
+            let dir = scratch("size");
+            let d = docs(200);
+            write(
+                &dir,
+                mode,
+                d.iter().map(|(id, f)| (id.as_str(), f.clone())).collect(),
+            );
+            let ds = fs::metadata(dir.join("doc_store.bin")).unwrap().len();
+            let dv = fs::metadata(dir.join(DOC_VECTORS_FILE)).map_or(0, |m| m.len());
+            fs::remove_dir_all(dir).unwrap();
+            (ds, dv)
+        };
+        let (inline_ds, _) = size(VectorStoreMode::Inline);
+        let (sidecar_ds, sidecar_dv) = size(VectorStoreMode::Sidecar);
+        eprintln!(
+            "doc_store.bin inline={inline_ds} sidecar={sidecar_ds} doc_vectors.bin={sidecar_dv}"
+        );
+        assert!(
+            sidecar_ds * 20 < inline_ds,
+            "doc store should drop by >95%: {inline_ds} -> {sidecar_ds}"
+        );
+        assert!(
+            sidecar_ds + sidecar_dv < inline_ds / 2,
+            "binary vectors are smaller than their JSON: {inline_ds} -> {}",
+            sidecar_ds + sidecar_dv
+        );
     }
 }
