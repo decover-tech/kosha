@@ -231,7 +231,11 @@ Iceberg/Delta Lake use for tables, applied to a search index.
    `IndexDocuments` call.
 2. **Buffer**: the ingest node appends to an in-memory + local-SSD write buffer for that namespace,
    and synchronously appends to a WAL object in S3 (small, cheap PUTs) so the write survives node
-   loss before it's part of a segment.
+   loss before it's part of a segment. *Implemented today:* the WAL is on local disk behind a
+   `WalStore` trait (an S3 implementation is #236). Concurrent appends are group-committed: one
+   WAL file (one fsync) holds the records of every namespace that arrived during the previous
+   commit, each record carries its own LSN, and a file is deleted only once every namespace in it
+   has a published manifest checkpoint at or past its records there.
 3. **Flush**: when the buffer crosses a size/time threshold (default: 512MB or 60s, whichever
    first), the ingest node builds inverted + vector + filter indices for the buffered documents,
    writes a new segment to S3, and publishes an updated manifest that adds the new segment.
@@ -288,6 +292,12 @@ Indexer
   the pre-compact snapshot; concurrent mutations that remove a merge input cause publish to abort
   (or retry) rather than corrupt the manifest.
 - There is **no** process-wide `Mutex<Indexer>` on the request path.
+- Across processes, the manifest CAS is the only coordination. A writer whose CAS loses
+  (`ManifestConflict`) rebases its unpublished delta onto the committed manifest
+  (`Indexer::rebase_onto`) and retries a bounded number of times. A compaction rebases only if
+  its inputs are still listed remotely with no new remote deletes. A remote compaction is accepted
+  only if it removed no segment with unpublished local deletes. Otherwise the publish fails with
+  409, and nothing is published that references a segment the remote manifest removed.
 
 **Merge selection (size-tiered lite)**
 
@@ -355,7 +365,7 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      the cross-segment merge compares like with like; the block-max ceilings take their `df`
      from the same scorer. Deleted documents still count until compaction drops them, as they do
      in Lucene. If any segment's footer or a term's postings can't be read locally, the search
-     falls back to per-segment statistics as a whole (reported as `segment_fallback`) rather than
+     falls back to per-segment statistics as a whole (reported as `segment_fallback`, and not result-cached) rather than
      score with a partial `df`; the server therefore also hydrates the inverted index and posting
      blob of segments the query's filter prunes but whose term bloom admits a query term.
      `bm25_params.stats: "segment"` (or `KOSHA_BM25_STATS=segment` engine-wide) restores

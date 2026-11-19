@@ -715,6 +715,33 @@ fn segments_needing_sync<'a>(
         .collect()
 }
 
+/// How many times one publish rebases onto a newer remote manifest before
+/// giving up with `ManifestConflict` (HTTP 409).
+const MANIFEST_REBASE_ATTEMPTS: u32 = 3;
+
+/// Pause before rebase attempt `attempt` (2..): a few milliseconds, growing,
+/// with jitter so two writers that keep colliding fall out of step.
+fn rebase_backoff(attempt: u32) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let base_ms = 5u64 << attempt.min(6);
+    Duration::from_millis(base_ms + u64::from(nanos) % base_ms)
+}
+
+/// HTTP response for a failed manifest publication: a conflict another
+/// writer caused (and a rebase could not resolve) is a 409 the client can
+/// retry; anything else is a server error.
+fn publication_error(context: &str, error: &KoshaError) -> String {
+    let status = if matches!(error, KoshaError::ManifestConflict { .. }) {
+        409
+    } else {
+        500
+    };
+    json_error(status, &format!("{context}: {error}"))
+}
+
 /// Upload a segment directory to S3 and commit it: every data file first,
 /// in a fixed (sorted) order, then the `_COMMIT` marker last, listing each
 /// file's size and CRC32 (#231). Only a segment whose `_COMMIT` landed
@@ -1777,20 +1804,82 @@ impl AppState {
                     }
                     Ok(std::fs::read(self.data_dir.join(path))?)
                 })?;
+                println!(
+                    "manifest refreshed: ns={} version={} segments={}",
+                    ns.0,
+                    manifest.version,
+                    manifest.segments.len()
+                );
                 self.indexer.restore_manifest(ns.clone(), manifest);
             }
         }
         Ok(())
     }
 
-    fn persist_manifest(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
-        if let Some(manifest) = self.indexer.manifest_cloned(ns) {
-            self.controller
-                .lock()
-                .unwrap()
-                .save_manifest(ns, &manifest)?;
+    /// Read the namespace's committed manifest with its deletion vectors
+    /// resolved, the way a query replica installs one.
+    fn hydrated_remote_manifest(
+        &self,
+        ns: &NamespaceId,
+    ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
+        let Some(mut manifest) = self.controller.lock().unwrap().manifest_cloned(ns) else {
+            return Ok(None);
+        };
+        kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
+            let path = vector.path(ns, segment)?;
+            #[cfg(feature = "s3")]
+            if let Some(ref s3) = self.s3_storage {
+                return s3.read(&path);
+            }
+            Ok(std::fs::read(self.data_dir.join(path))?)
+        })?;
+        Ok(Some(manifest))
+    }
+
+    /// Install a manifest built outside the write path (admin import) by
+    /// CAS against the version the control store holds right now. Never
+    /// rebases: a concurrent publish wins and this fails with
+    /// `ManifestConflict`, leaving both the store and the indexer alone.
+    fn import_manifest(
+        &self,
+        ns: &NamespaceId,
+        mut manifest: kosha_core::Manifest,
+    ) -> Result<(), KoshaError> {
+        let lock = self.publication_lock(ns);
+        let _guard = lock.lock().unwrap();
+        let expected = self
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_version(ns)
+            .unwrap_or(0);
+        let local = self.indexer.manifest_version(ns).unwrap_or(0);
+        manifest.version = manifest.version.max(expected.max(local) + 1);
+        self.controller.lock().unwrap().compare_and_swap_manifest(
+            ns,
+            expected,
+            manifest.clone(),
+        )?;
+        #[cfg(feature = "s3")]
+        {
+            // Imported segments are read from S3; there is nothing local to
+            // upload for them.
+            let mut synced = self.synced_segments.lock().unwrap();
+            for entry in &manifest.segments {
+                synced.insert((ns.clone(), entry.segment_id.clone()));
+            }
         }
+        self.indexer.restore_manifest(ns.clone(), manifest);
         Ok(())
+    }
+
+    fn publication_lock(&self, ns: &NamespaceId) -> Arc<Mutex<()>> {
+        self.publication_locks
+            .lock()
+            .unwrap()
+            .entry(ns.clone())
+            .or_default()
+            .clone()
     }
 
     fn publish_namespace(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
@@ -1807,30 +1896,78 @@ impl AppState {
     /// Serialize publications per namespace and use the same immutable
     /// snapshot for object upload and manifest commit. Failed uploads never
     /// expose a manifest; failed commits remain retryable.
+    ///
+    /// A `ManifestConflict` means another writer committed since this
+    /// writer's last publish. The remote manifest is read back, this
+    /// writer's unpublished delta is rebased onto it
+    /// ([`Indexer::rebase_onto`]), and the CAS is retried, up to
+    /// [`MANIFEST_REBASE_ATTEMPTS`] times with a short jittered pause. A
+    /// conflict the rebase cannot resolve (see `rebase_onto`) is returned
+    /// as `ManifestConflict`, which the HTTP layer maps to 409.
     fn publish_namespace_with(
         &self,
         ns: &NamespaceId,
-        upload: impl FnOnce(&kosha_core::Manifest) -> Result<(), KoshaError>,
+        upload: impl Fn(&kosha_core::Manifest) -> Result<(), KoshaError>,
     ) -> Result<(), KoshaError> {
-        let lock = self
-            .publication_locks
-            .lock()
-            .unwrap()
-            .entry(ns.clone())
-            .or_default()
-            .clone();
+        let lock = self.publication_lock(ns);
         let _guard = lock.lock().unwrap();
-        let Some((expected_version, manifest)) = self.indexer.prepare_publication(ns)? else {
-            return Ok(());
-        };
-        upload(&manifest)?;
-        self.controller.lock().unwrap().compare_and_swap_manifest(
-            ns,
-            expected_version,
-            manifest.clone(),
-        )?;
-        self.indexer.acknowledge_manifest(ns, &manifest)?;
-        Ok(())
+        let mut rebases = 0;
+        loop {
+            let Some((expected_version, manifest)) = self.indexer.prepare_publication(ns)? else {
+                return Ok(());
+            };
+            let started = Instant::now();
+            upload(&manifest)?;
+            let committed = self.controller.lock().unwrap().compare_and_swap_manifest(
+                ns,
+                expected_version,
+                manifest.clone(),
+            );
+            match committed {
+                Ok(()) => {
+                    self.indexer.acknowledge_manifest(ns, &manifest)?;
+                    println!(
+                        "manifest published: ns={} version={} segments={} ms={:.1}",
+                        ns.0,
+                        manifest.version,
+                        manifest.segments.len(),
+                        started.elapsed().as_secs_f64() * 1e3
+                    );
+                    return Ok(());
+                }
+                Err(conflict @ KoshaError::ManifestConflict { .. })
+                    if rebases < MANIFEST_REBASE_ATTEMPTS =>
+                {
+                    rebases += 1;
+                    let Some(remote) = self.hydrated_remote_manifest(ns)? else {
+                        return Err(conflict);
+                    };
+                    eprintln!(
+                        "manifest conflict on namespace {} (expected version {expected_version}, \
+                         found {}): rebasing, attempt {rebases}/{MANIFEST_REBASE_ATTEMPTS}",
+                        ns.0, remote.version
+                    );
+                    #[cfg(feature = "s3")]
+                    {
+                        // The committed manifest's segments are durable by
+                        // the publish protocol; the other writer uploaded
+                        // them and this node has nothing local to send.
+                        let mut synced = self.synced_segments.lock().unwrap();
+                        for entry in &remote.segments {
+                            synced.insert((ns.clone(), entry.segment_id.clone()));
+                        }
+                    }
+                    if self.indexer.rebase_onto(ns, remote)? == kosha_write::RebaseOutcome::Adopted
+                    {
+                        return Ok(());
+                    }
+                    if rebases > 1 {
+                        std::thread::sleep(rebase_backoff(rebases));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Upload every segment in `ns`'s current manifest that this process
@@ -2667,17 +2804,19 @@ impl AppState {
         if !doc_access_ok {
             return false;
         }
-        // Deliberately does NOT also require vector.offsets: it's an
-        // optional sidecar (legacy v1 segments never have one; the reader
-        // falls back to an eager parse of vector.idx alone when it's
-        // absent — same tolerance doc_access_ok above gives
-        // doc_store.offsets vs. doc_store.bin). `ensure_scoring_files_local`
-        // still proactively *attempts* to fetch it when present on S3 (see
-        // its comment) — this predicate just doesn't block "can we score"
-        // on that attempt having succeeded, since scoring is correct
-        // either way.
-        if needs_vectors && !file_present_nonempty(&seg_path.join("vector.idx")) {
-            return false;
+        // `vector.offsets` is required only where it exists: legacy flat
+        // segments never have one. A clustered segment without it is served
+        // by exact scan of every vector (seconds on a large segment), so it
+        // is not complete until the sidecar has been fetched.
+        if needs_vectors {
+            if !file_present_nonempty(&seg_path.join("vector.idx")) {
+                return false;
+            }
+            if !file_present_nonempty(&seg_path.join("vector.offsets"))
+                && kosha_segment::vector_index_needs_offsets(seg_path)
+            {
+                return false;
+            }
         }
         true
     }
@@ -3420,6 +3559,7 @@ fn serve(listener: TcpListener, state: Arc<AppState>, io_timeout: Duration) {
 // ─── Request handling ───────────────────────────────────────────────────────
 
 fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
+    let started = Instant::now();
     let mut reader = BufReader::new(
         stream
             .try_clone()
@@ -3521,28 +3661,56 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
     } else {
         authenticate(&headers)
     };
-    let tenant = match authentication {
-        Ok(t) => t,
-        Err(resp) => {
-            stream.write_all(resp.as_bytes()).ok();
-            return Ok(());
-        }
-    };
-
     // ── Query/ingest role routing ────────────────────────────────────────
     // A query-role pod (KOSHA_INGEST_HOST set) forwards write-path requests
     // to the single ingest pod instead of executing them locally — see
     // is_write_path/forward_to_ingest. Every other request (all reads, and
     // everything on the ingest pod itself, which never forwards) is handled
     // locally exactly as before this existed.
-    let response = match (&state.ingest_host, &state.write_http_client) {
-        (Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
+    let response = match (
+        &authentication,
+        &state.ingest_host,
+        &state.write_http_client,
+    ) {
+        (Err(resp), _, _) => resp.clone(),
+        (Ok(_), Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
             forward_to_ingest(client, ingest_host, &request_line, &headers, &body)
         }
-        _ => route(&request_line, &headers, &body, &tenant, state),
+        (Ok(tenant), _, _) => route(&request_line, &headers, &body, tenant, state),
     };
+    log_request(
+        &request_line,
+        authentication.as_deref().unwrap_or("-"),
+        body.len(),
+        &response,
+        started,
+    );
     stream.write_all(response.as_bytes()).ok();
     Ok(())
+}
+
+/// One line per API request: who asked for what, the status returned and how
+/// long it took. A successful search is skipped because it already prints
+/// the more detailed `search timing:` line; probes never reach here.
+fn log_request(
+    request_line: &str,
+    tenant: &str,
+    body_bytes: usize,
+    response: &str,
+    started: Instant,
+) {
+    let status = response.get(9..12).unwrap_or("???");
+    let mut parts = request_line.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or("-"), parts.next().unwrap_or("-"));
+    let path = target.split('?').next().unwrap_or(target);
+    if status == "200" && path.ends_with("/search") {
+        return;
+    }
+    println!(
+        "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}",
+        started.elapsed().as_secs_f64() * 1e3,
+        response.len()
+    );
 }
 
 /// Extract and validate the API key from request headers.
@@ -4041,7 +4209,7 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     // write survives restarts (explicit flushes go through publish_namespace too).
     if manifest_changed || state.indexer.manifest_cloned(&ns).is_some() {
         if let Err(e) = state.publish_namespace(&ns) {
-            return json_error(500, &format!("publication failed: {e}"));
+            return publication_error("publication failed", &e);
         }
     }
 
@@ -4174,7 +4342,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
         controller.ensure_namespace(namespace.clone());
     }
     if let Err(e) = state.publish_namespace(&namespace) {
-        return json_error(500, &format!("publication failed: {e}"));
+        return publication_error("publication failed", &e);
     }
 
     json_ok(&IndexResponse {
@@ -4212,7 +4380,7 @@ fn flush_and_publish_namespace(state: &AppState, namespace: &NamespaceId) -> Res
         .map_err(|e| json_error(500, &format!("flush error: {e}")))?;
     state
         .publish_namespace(namespace)
-        .map_err(|e| json_error(500, &format!("publication failed: {e}")))
+        .map_err(|e| publication_error("publication failed", &e))
 }
 
 fn handle_flush(body: &[u8], state: &AppState) -> String {
@@ -4251,7 +4419,7 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
     // Publish manifest(s) to the control store and upload segments to S3.
     for ns_id in &state.indexer.namespaces() {
         if let Err(e) = state.publish_namespace(ns_id) {
-            return json_error(500, &format!("publication failed: {e}"));
+            return publication_error("publication failed", &e);
         }
     }
 
@@ -4377,7 +4545,7 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
     };
 
     if let Err(e) = state.publish_namespace(&ns) {
-        return json_error(500, &format!("deletion publication failed: {e}"));
+        return publication_error("deletion publication failed", &e);
     }
 
     json_ok(&serde_json::json!({
@@ -4665,8 +4833,14 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             );
             let resp = json_ok(&result);
             // Only successful responses enter the cache, after the search
-            // proved every needed file readable.
-            if let Some(key) = cache_key {
+            // proved every needed file readable. A search that fell back to
+            // per-segment BM25 statistics (issue #246) because some
+            // segment's footer or postings weren't local isn't cached
+            // either: the miss is usually transient (best-effort stats
+            // hydration), and caching it would pin the degraded scores for
+            // the rest of this manifest version.
+            let cacheable = phases.bm25_stats != kosha_query::Bm25StatsUsed::SegmentFallback;
+            if let Some(key) = cache_key.filter(|_| cacheable) {
                 state.result_cache.lock().unwrap().insert(key, &resp);
             }
             resp
@@ -5862,7 +6036,8 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
         let ns = NamespaceId(ns_raw.to_string());
 
         if !overwrite {
-            if let Some(m) = state.indexer.manifest_cloned(&ns) {
+            let published = state.controller.lock().unwrap().manifest_cloned(&ns);
+            if let Some(m) = published.or_else(|| state.indexer.manifest_cloned(&ns)) {
                 if !m.segments.is_empty() {
                     return json_error(
                         409,
@@ -5932,13 +6107,12 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
         let manifest = manifest_from_footers(footers);
         let segments = manifest.segments.len();
         let documents: u64 = manifest.segments.iter().map(|e| e.doc_count as u64).sum();
-        state.indexer.restore_manifest(ns.clone(), manifest);
         {
             let mut ctrl = state.controller.lock().unwrap();
             ctrl.ensure_namespace(ns.clone());
         }
-        if let Err(e) = state.persist_manifest(&ns) {
-            return json_error(500, &format!("publication failed: {e}"));
+        if let Err(e) = state.import_manifest(&ns, manifest) {
+            return publication_error("publication failed", &e);
         }
 
         json_ok(&serde_json::json!({
@@ -6281,6 +6455,8 @@ fn json_accepted<T: serde::Serialize>(value: &T) -> String {
 }
 
 fn json_error(status_code: u16, message: &str) -> String {
+    // The reason for an error response; `request:` carries the rest.
+    eprintln!("WARN: request failed: status={status_code} {message}");
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",
@@ -6382,6 +6558,9 @@ mod tests {
     struct SharedManifestStore {
         inner: Arc<Mutex<kosha_control::Controller>>,
         lose_next_commit_reply: Arc<std::sync::atomic::AtomicBool>,
+        /// Commit this manifest (over the stored version) right after the
+        /// next `manifest_version` read: a writer racing the reader.
+        commit_on_next_version_read: Arc<Mutex<Option<kosha_core::Manifest>>>,
     }
     impl ControlStore for SharedManifestStore {
         fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
@@ -6401,6 +6580,16 @@ mod tests {
         }
         fn manifest_cloned(&self, id: &NamespaceId) -> Option<kosha_core::Manifest> {
             self.inner.lock().unwrap().manifest(id).cloned()
+        }
+        fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
+            let mut inner = self.inner.lock().unwrap();
+            let version = inner.manifest(id).map(|manifest| manifest.version);
+            if let Some(racing) = self.commit_on_next_version_read.lock().unwrap().take() {
+                inner
+                    .compare_and_swap_manifest(id, version.unwrap_or(0), racing)
+                    .unwrap();
+            }
+            version
         }
         fn save_manifest(
             &mut self,
@@ -6567,10 +6756,10 @@ mod tests {
 
     #[test]
     fn lost_commit_reply_is_retryable_without_losing_the_next_flush() {
-        let shared = SharedManifestStore {
-            inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
-            lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
+        let shared = shared_store();
+        shared
+            .lose_next_commit_reply
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let state = test_state();
         *state.controller.lock().unwrap() = Box::new(shared.clone());
         let ns = NamespaceId("retry".into());
@@ -6608,89 +6797,227 @@ mod tests {
         );
     }
 
-    #[test]
-    fn competing_writers_cannot_overwrite_a_published_manifest() {
-        let shared = SharedManifestStore {
+    fn shared_store() -> SharedManifestStore {
+        SharedManifestStore {
             inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
             lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
+            commit_on_next_version_read: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn write_and_flush(state: &AppState, ns: &NamespaceId, id: &str) {
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId(id.into()),
+                    fields: vec![Field::keyword("id", id)],
+                }],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(ns).unwrap();
+    }
+
+    fn wal_is_empty(state: &AppState) -> bool {
+        kosha_write::wal::WalWriter::recover(&state.data_dir.join("_wal"))
+            .unwrap()
+            .is_empty()
+    }
+
+    fn segment_set(manifest: &kosha_core::Manifest) -> std::collections::HashSet<String> {
+        manifest
+            .segments
+            .iter()
+            .map(|entry| entry.segment_id.0.clone())
+            .collect()
+    }
+
+    /// #230: two independent writers publish to one namespace at the same
+    /// time. The loser of the CAS rebases onto the winner's manifest and
+    /// publishes too — no restart, no lost segment, and each writer's WAL
+    /// is reclaimed through its own checkpoint.
+    #[test]
+    fn competing_writers_both_publish_by_rebasing_without_losing_segments() {
+        let shared = shared_store();
         let ns = NamespaceId("competing".into());
         shared.inner.lock().unwrap().ensure_namespace(ns.clone());
         let first = test_state();
         let second = test_state();
         for (state, id) in [(&first, "first"), (&second, "second")] {
             *state.controller.lock().unwrap() = Box::new(shared.clone());
-            state
-                .indexer
-                .index_documents(
-                    ns.clone(),
-                    vec![Document {
-                        id: DocumentId(id.into()),
-                        fields: vec![Field::text("text", id)],
-                    }],
-                )
-                .unwrap();
-            state.indexer.flush_namespace(&ns).unwrap();
+            write_and_flush(state, &ns, id);
         }
+        let flushed: std::collections::HashSet<String> = [&first, &second]
+            .iter()
+            .flat_map(|state| segment_set(&state.indexer.manifest(&ns).unwrap()))
+            .collect();
+        // Both writers prepare against version 0 before either commits.
         let barrier = std::sync::Barrier::new(2);
+        let publish = |state: &AppState| {
+            let first_upload = std::sync::atomic::AtomicBool::new(true);
+            state.publish_namespace_with(&ns, |_| {
+                if first_upload.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    barrier.wait();
+                }
+                Ok(())
+            })
+        };
         let outcomes = std::thread::scope(|scope| {
-            let a = scope.spawn(|| {
-                first.publish_namespace_with(&ns, |_| {
-                    barrier.wait();
-                    Ok(())
-                })
-            });
-            let b = scope.spawn(|| {
-                second.publish_namespace_with(&ns, |_| {
-                    barrier.wait();
-                    Ok(())
-                })
-            });
+            let a = scope.spawn(|| publish(&first));
+            let b = scope.spawn(|| publish(&second));
             (a.join().unwrap(), b.join().unwrap())
         });
-        assert_eq!(
-            usize::from(outcomes.0.is_ok()) + usize::from(outcomes.1.is_ok()),
-            1,
-            "exactly one independent writer may publish the initial version"
-        );
-        let (winner, loser) = if outcomes.0.is_ok() {
-            (&first, &second)
-        } else {
-            (&second, &first)
-        };
+        outcomes.0.unwrap();
+        outcomes.1.unwrap();
+
         let committed = shared.manifest_cloned(&ns).unwrap();
-        assert_eq!(
-            committed.segments[0].segment_id,
-            winner.indexer.manifest(&ns).unwrap().segments[0].segment_id
-        );
-        let rejected_doc = if outcomes.0.is_ok() {
-            "second"
-        } else {
-            "first"
+        assert_eq!(segment_set(&committed), flushed, "no segment may be lost");
+        assert_eq!(committed.version, 2);
+        assert!(wal_is_empty(&first) && wal_is_empty(&second));
+
+        // Whichever writer is now stale keeps publishing without a restart.
+        // (Writes need every listed segment local; S3 hydration would fetch
+        // the other writer's, here a copy stands in for it.)
+        let share_segments = || {
+            for (from, to) in [(&first, &second), (&second, &first)] {
+                copy_dir(&from.data_dir.join(&ns.0), &to.data_dir.join(&ns.0));
+            }
         };
-        let restarted_loser = Indexer::new(loser.data_dir.clone());
-        restarted_loser.restore_manifest(ns.clone(), committed.clone());
-        assert!(
-            restarted_loser
-                .existing_ids(&ns, &[DocumentId(rejected_doc.into())])
-                .unwrap()
-                .contains(&DocumentId(rejected_doc.into())),
-            "the winner's WAL checkpoint must not discard the loser's unrelated recovery records"
+        for (round, state) in [&first, &second, &first].into_iter().enumerate() {
+            share_segments();
+            write_and_flush(state, &ns, &format!("later-{round}"));
+            let response = handle_flush(br#"{"namespace":"competing"}"#, state);
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(wal_is_empty(state));
+        }
+        let committed = shared.manifest_cloned(&ns).unwrap();
+        assert_eq!(committed.segments.len(), 5);
+        assert!(flushed.is_subset(&segment_set(&committed)));
+        for state in [&first, &second] {
+            assert!(segment_set(&state.indexer.manifest(&ns).unwrap())
+                .is_subset(&segment_set(&committed)));
+        }
+
+        // A restart replays nothing that is already published.
+        let restarted = Indexer::new(first.data_dir.clone());
+        restarted.restore_manifest(ns.clone(), committed);
+        assert_eq!(restarted.pending_doc_count(&ns), 0);
+    }
+
+    /// #230: a remote compaction removed the segment a local, unpublished
+    /// delete targets. The rebase must abort (publishing the delete against
+    /// a segment that no longer exists would drop it), surface as 409, and
+    /// keep the delete in the WAL.
+    #[test]
+    fn remote_compaction_of_a_locally_deleted_segment_aborts_the_rebase_with_409() {
+        let shared = shared_store();
+        let ns = NamespaceId("compacted".into());
+        let compactor = test_state();
+        let deleter = test_state();
+        for state in [&compactor, &deleter] {
+            *state.controller.lock().unwrap() = Box::new(shared.clone());
+        }
+        write_and_flush(&compactor, &ns, "a");
+        write_and_flush(&compactor, &ns, "b");
+        compactor.publish_namespace(&ns).unwrap();
+        let v1 = shared.manifest_cloned(&ns).unwrap();
+
+        // The deleter starts from v1, with v1's segments local (as if
+        // hydrated from S3).
+        copy_dir(
+            &compactor.data_dir.join(&ns.0),
+            &deleter.data_dir.join(&ns.0),
         );
-        let retry = handle_flush(br#"{"namespace":"competing"}"#, loser);
+        deleter.indexer.restore_manifest(ns.clone(), v1.clone());
+
         assert!(
-            retry.starts_with("HTTP/1.1 500"),
-            "stale writer must still fail: {retry}"
+            compactor
+                .indexer
+                .compact_namespace_with_options(&ns, kosha_write::CompactOptions::full())
+                .unwrap()
+                .merged
+        );
+        compactor.publish_namespace(&ns).unwrap();
+        let v2 = shared.manifest_cloned(&ns).unwrap();
+        assert_ne!(segment_set(&v1), segment_set(&v2));
+
+        let response = handle_delete(
+            br#"{"namespace":"compacted","filter":{"term":{"id":"a"}}}"#,
+            &deleter,
+        );
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(
+            shared.manifest_cloned(&ns).unwrap().same_contents(&v2),
+            "an aborted rebase must not publish"
         );
         assert!(
-            !kosha_write::wal::WalWriter::recover(&loser.data_dir.join("_wal"))
+            kosha_write::wal::WalWriter::recover(&deleter.data_dir.join("_wal"))
                 .unwrap()
-                .is_empty()
+                .iter()
+                .any(|record| !record.deleted_ids.is_empty()),
+            "the delete stays durable for a later recovery"
+        );
+        let flush = handle_flush(br#"{"namespace":"compacted"}"#, &deleter);
+        assert!(flush.starts_with("HTTP/1.1 409"), "{flush}");
+    }
+
+    /// #230: admin import CASes against the version it read and never
+    /// overwrites a manifest another writer committed in between.
+    #[test]
+    fn import_refuses_to_clobber_a_concurrently_published_manifest() {
+        let shared = shared_store();
+        let ns = NamespaceId("imported".into());
+        let state = test_state();
+        *state.controller.lock().unwrap() = Box::new(shared.clone());
+        let manifest = |version: u64, segment: &str| kosha_core::Manifest {
+            version,
+            segments: vec![kosha_core::ManifestEntry {
+                segment_id: kosha_core::SegmentId(segment.into()),
+                doc_count: 1,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        };
+        state.import_manifest(&ns, manifest(1, "seed")).unwrap();
+        assert_eq!(shared.manifest_cloned(&ns).unwrap().version, 1);
+
+        // Another writer commits v2 right after the import reads v1.
+        *shared.commit_on_next_version_read.lock().unwrap() = Some(manifest(2, "ingest"));
+        let err = state
+            .import_manifest(&ns, manifest(1, "imported"))
+            .unwrap_err();
+        assert!(matches!(err, KoshaError::ManifestConflict { .. }), "{err}");
+        let stored = shared.manifest_cloned(&ns).unwrap();
+        assert_eq!(
+            (stored.version, stored.segments[0].segment_id.0.as_str()),
+            (2, "ingest")
         );
         assert_eq!(
-            shared.manifest_cloned(&ns).unwrap().segments[0].segment_id,
-            committed.segments[0].segment_id
+            state.indexer.manifest(&ns).unwrap().segments[0]
+                .segment_id
+                .0,
+            "seed",
+            "a refused import must not change the indexer either"
         );
+        assert!(publication_error("publication failed", &err).starts_with("HTTP/1.1 409"));
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
     }
 
     struct FailingManifestStore(kosha_control::Controller);
@@ -7096,6 +7423,74 @@ mod tests {
             decide(&query, &same_matter_one_term),
             SegmentHydration::Skip
         );
+    }
+
+    #[test]
+    fn segment_fallback_bm25_results_are_not_result_cached() {
+        // Issue #246: when a segment the query's filter prunes can't be read
+        // for `df`, the search scores with per-segment statistics. That
+        // degraded answer must not be result-cached, or it would outlive
+        // the (usually transient) miss for the whole manifest version.
+        let state = test_state();
+        let ns = NamespaceId("fallbackns".into());
+        let doc = |id: &str, text: &str, matter: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text), Field::keyword("matter", matter)],
+        };
+        state
+            .indexer
+            .index_documents(ns.clone(), vec![doc("r", "rare common", "m1")])
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                (0..9)
+                    .map(|i| doc(&format!("c{i}"), "rare filler", "m2"))
+                    .collect(),
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        // The m2 segment: pruned by the filter, but holds `rare`.
+        let pruned = fs::read_dir(state.data_dir.join(&ns.0))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                SegmentReader::read_footer(p).is_ok_and(|f| {
+                    f.filter_blooms
+                        .as_ref()
+                        .and_then(|b| b.get("matter"))
+                        .is_some_and(|b| b.may_contain("m2"))
+                })
+            })
+            .expect("m2 segment");
+        let inverted = pruned.join("inverted.idx");
+        let hidden = pruned.join("inverted.idx.hidden");
+
+        let search = || {
+            let resp = handle_search_post(
+                br#"{"namespace":"fallbackns","query_text":"rare","filter":{"term":{"matter":"m1"}}}"#,
+                &state,
+            );
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(v["results"][0]["doc_id"], "r");
+            v["results"][0]["score"].as_f64().unwrap()
+        };
+        // dl = 2. Namespace: N = 10, df = 10, avgdl = 2. Segment: N = 1, df = 1.
+        let namespace_expected = (1.0f64 + 0.5 / 10.5).ln();
+        let segment_expected = (1.0f64 + 0.5 / 1.5).ln();
+
+        fs::rename(&inverted, &hidden).unwrap();
+        assert!((search() - segment_expected).abs() < 1e-9);
+        fs::rename(&hidden, &inverted).unwrap();
+        assert!((search() - namespace_expected).abs() < 1e-9);
+        // The namespace-stats answer is cached as usual.
+        assert!((search() - namespace_expected).abs() < 1e-9);
     }
 
     #[test]

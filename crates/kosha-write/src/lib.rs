@@ -31,6 +31,16 @@ struct NamespaceState {
     buffer: Option<NamespaceBuffer>,
     manifest: Manifest,
     published_version: u64,
+    /// What the control store held at `published_version`, as far as this
+    /// writer knows: the base [`Indexer::rebase_onto`] diffs the local
+    /// manifest against to find this writer's unpublished delta.
+    published_base: PublishedBase,
+    /// The bases the snapshots most recently handed out by
+    /// [`Indexer::prepare_publication`] would become once committed, keyed
+    /// by snapshot version (newest last, a few kept). Promoted by
+    /// `acknowledge_manifest`; also how a rebase recognizes a commit of its
+    /// own whose reply was lost.
+    pending_bases: Vec<(u64, PublishedBase)>,
     /// Tombstoned docs: segment_id → set of doc_seqs
     tombstones: HashMap<SegmentId, HashSet<u32>>,
     /// Lazy map of doc_id → flushed (segment, seq) locations.
@@ -47,6 +57,60 @@ struct NamespaceState {
     /// The manifest as last handed to a search, with what it was built
     /// from — see [`Indexer::manifest_shared`].
     shared_manifest: Option<(ManifestStamp, Arc<Manifest>)>,
+}
+
+/// How many prepared-but-unacknowledged publication bases a namespace keeps.
+const MAX_PENDING_BASES: usize = 4;
+
+/// Segment set and deletes of a published manifest version.
+#[derive(Clone, Default)]
+struct PublishedBase {
+    segments: HashSet<SegmentId>,
+    tombstones: HashMap<SegmentId, HashSet<u32>>,
+}
+
+impl PublishedBase {
+    fn of(manifest: &Manifest, tombstones: &HashMap<SegmentId, HashSet<u32>>) -> Self {
+        let segments: HashSet<SegmentId> = manifest
+            .segments
+            .iter()
+            .map(|entry| entry.segment_id.clone())
+            .collect();
+        let tombstones = tombstones
+            .iter()
+            .filter(|(segment, ids)| segments.contains(*segment) && !ids.is_empty())
+            .map(|(segment, ids)| (segment.clone(), ids.clone()))
+            .collect();
+        Self {
+            segments,
+            tombstones,
+        }
+    }
+
+    /// Deletes in `current` on `segment` that this base does not have.
+    fn new_deletes(
+        &self,
+        segment: &SegmentId,
+        current: &HashMap<SegmentId, HashSet<u32>>,
+    ) -> usize {
+        let base = self.tombstones.get(segment);
+        current.get(segment).map_or(0, |ids| {
+            ids.iter()
+                .filter(|seq| !base.is_some_and(|base| base.contains(seq)))
+                .count()
+        })
+    }
+}
+
+/// What [`Indexer::rebase_onto`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseOutcome {
+    /// This writer had nothing unpublished: the remote manifest was
+    /// installed as is, and there is nothing left to publish.
+    Adopted,
+    /// The writer's unpublished delta was replayed on top of the remote
+    /// manifest; publish the new snapshot against the remote version.
+    Rebased,
 }
 
 /// What a shared manifest snapshot was built from. Two equal stamps mean
@@ -93,6 +157,8 @@ impl NamespaceState {
                 deletion_vectors: Default::default(),
             },
             published_version: 0,
+            published_base: PublishedBase::default(),
+            pending_bases: Vec::new(),
             tombstones: HashMap::new(),
             id_index: None,
             known: false,
@@ -229,7 +295,7 @@ pub struct Indexer {
     flush_threshold: usize,
     bm25_params: Bm25Params,
     /// Write-Ahead Log for durability
-    wal: Mutex<crate::wal::WalWriter>,
+    wal: crate::wal::WalWriter,
     /// Whether WAL is enabled
     wal_enabled: bool,
     namespaces: Mutex<HashMap<NamespaceId, Arc<NamespaceHandle>>>,
@@ -250,14 +316,13 @@ impl Indexer {
     pub fn new(data_dir: PathBuf) -> Self {
         let wal_dir = data_dir.join("_wal");
         std::fs::create_dir_all(&wal_dir).ok();
-        let backend = Box::new(kosha_core::LocalStorage::new(wal_dir.clone()));
-        let wal = crate::wal::WalWriter::new(backend, wal_dir.clone());
+        let wal = crate::wal::WalWriter::new(wal_dir.clone());
 
         let idx = Self {
             data_dir,
             flush_threshold: 1000,
             bm25_params: Bm25Params::default(),
-            wal: Mutex::new(wal),
+            wal,
             wal_enabled: true,
             namespaces: Mutex::new(HashMap::new()),
             compaction_policy: CompactionPolicy::default(),
@@ -438,11 +503,12 @@ impl Indexer {
         }
         let total = changes.iter().map(|(_, ids)| ids.len()).sum();
         if total > 0 && self.wal_enabled {
-            let mut wal = self.wal.lock().unwrap();
-            wal.append_delete(namespace, deleted_ids.into_iter().collect())?;
-            state.wal_sequence = wal.last_sequence();
+            let lsn = self
+                .wal
+                .append_delete(namespace, deleted_ids.into_iter().collect())?;
+            state.wal_sequence = state.wal_sequence.max(lsn);
             state.manifest.wal_checkpoint = state.wal_sequence;
-            state.manifest.wal_origin = Some(wal.origin().to_owned());
+            state.manifest.wal_origin = Some(self.wal.origin().to_owned());
         }
         for (segment, matching) in changes {
             if !matching.is_empty() {
@@ -636,9 +702,8 @@ impl Indexer {
             }
 
             if self.wal_enabled {
-                let mut wal = self.wal.lock().unwrap();
-                wal.append(&namespace, &documents)?;
-                state.wal_sequence = wal.last_sequence();
+                let lsn = self.wal.append(&namespace, &documents)?;
+                state.wal_sequence = state.wal_sequence.max(lsn);
             }
 
             if let Some(buf) = state.buffer.as_mut() {
@@ -761,9 +826,7 @@ impl Indexer {
         // WAL fsync and segment I/O happen with state unlocked. The operation
         // lock orders writes; compaction cannot move the old doc locations.
         let sequence = if self.wal_enabled {
-            let mut wal = self.wal.lock().unwrap();
-            wal.append(&namespace, &replacements)?;
-            wal.last_sequence()
+            self.wal.append(&namespace, &replacements)?
         } else {
             snapshot.wal_sequence
         };
@@ -785,7 +848,7 @@ impl Indexer {
             .map(|b| b.bm25_params.clone())
             .unwrap_or_else(|| self.bm25_params.clone());
         let footer = writer.finalize(params)?;
-        let origin = self.wal.lock().unwrap().origin().to_owned();
+        let origin = self.wal.origin().to_owned();
         let mut state = handle.state.lock().unwrap();
         let ids: HashSet<_> = replacements.iter().map(|doc| &doc.id).collect();
         if let Some(buffer) = state.buffer.as_mut() {
@@ -802,7 +865,7 @@ impl Indexer {
         state.manifest.remember_segment_footer(footer);
         state.manifest.version += 1;
         state.manifest.tombstones = state.tombstones.clone();
-        state.wal_sequence = sequence;
+        state.wal_sequence = state.wal_sequence.max(sequence);
         // Other buffered records must remain recoverable after publication.
         if state.buffer.as_ref().is_none_or(|b| b.documents.is_empty()) {
             state.manifest.wal_checkpoint = sequence;
@@ -987,7 +1050,7 @@ impl Indexer {
         };
         let _mutation = handle.mutation.lock().unwrap();
         let recovery = self.prepare_recovery(namespace, handle)?;
-        let origin = self.wal.lock().unwrap().origin().to_owned();
+        let origin = self.wal.origin().to_owned();
         // Phase 1 (state locked, cheap): snapshot whatever's buffered and
         // split it into chunks, each with its own reserved SegmentId.
         // Released immediately after — concurrent index_documents calls for
@@ -1221,7 +1284,7 @@ impl Indexer {
         namespace: &NamespaceId,
         data_dir: &Path,
         wal_enabled: bool,
-        wal: &Mutex<crate::wal::WalWriter>,
+        wal: &crate::wal::WalWriter,
     ) -> Result<(), KoshaError> {
         let (docs, seg_id, bm25_params) = {
             let Some(buf) = state.buffer.as_mut() else {
@@ -1256,7 +1319,7 @@ impl Indexer {
         // WAL reclamation waits for durable manifest publication.
         let _ = (wal_enabled, wal);
         state.manifest.wal_checkpoint = state.wal_sequence;
-        state.manifest.wal_origin = Some(wal.lock().unwrap().origin().to_owned());
+        state.manifest.wal_origin = Some(wal.origin().to_owned());
 
         Self::remember_flushed_ids_in(state, &seg_id, &docs);
 
@@ -1535,11 +1598,14 @@ impl Indexer {
         let checkpoint_applies = manifest
             .wal_origin
             .as_deref()
-            .is_none_or(|origin| origin == self.wal.lock().unwrap().origin());
-        self.wal
-            .lock()
-            .unwrap()
-            .advance_past(manifest.wal_checkpoint);
+            .is_none_or(|origin| origin == self.wal.origin());
+        self.wal.advance_past(manifest.wal_checkpoint);
+        if checkpoint_applies {
+            // Lets a later reclamation of another namespace delete group
+            // files this namespace shares with it.
+            self.wal
+                .note_checkpoint(&namespace, manifest.wal_checkpoint);
+        }
         state.wal_sequence = state.wal_sequence.max(manifest.wal_checkpoint);
         let max_counter = manifest
             .segments
@@ -1578,6 +1644,8 @@ impl Indexer {
         }
         state.tombstones = manifest.tombstones.clone();
         state.published_version = manifest.version;
+        state.published_base = PublishedBase::of(&manifest, &manifest.tombstones);
+        state.pending_bases.clear();
         state.manifest = manifest;
         state.shared_manifest = None;
         state.known = true;
@@ -1757,6 +1825,18 @@ impl Indexer {
         let Some((expected, mut manifest)) = self.publication_snapshot(namespace) else {
             return Ok(None);
         };
+        {
+            let handle = self.ns_handle(namespace);
+            let mut state = handle.state.lock().unwrap();
+            let base = PublishedBase::of(&manifest, &manifest.tombstones);
+            state
+                .pending_bases
+                .retain(|(version, _)| *version != manifest.version);
+            if state.pending_bases.len() >= MAX_PENDING_BASES {
+                state.pending_bases.remove(0);
+            }
+            state.pending_bases.push((manifest.version, base));
+        }
         // A no-op retry must keep the exact published representation,
         // including legacy inline tombstones, without a same-version migration.
         if expected == manifest.version && manifest.deletion_vectors.is_empty() {
@@ -1801,22 +1881,252 @@ impl Indexer {
         // happened. A retry can then verify the same snapshot idempotently.
         let handle = self.ns_handle(namespace);
         let mut state = handle.state.lock().unwrap();
+        if manifest.version >= state.published_version {
+            // Without the snapshot's own deletes (the committed manifest
+            // only carries sidecar references), an empty delete set is the
+            // safe under-estimate: a later rebase then treats more deletes
+            // as unpublished, which can only make it abort, never drop one.
+            let pending = state
+                .pending_bases
+                .iter()
+                .position(|(version, _)| *version == manifest.version);
+            state.published_base = match pending {
+                Some(at) => state.pending_bases.remove(at).1,
+                None => PublishedBase::of(manifest, &HashMap::new()),
+            };
+            state
+                .pending_bases
+                .retain(|(version, _)| *version > manifest.version);
+        }
         state.published_version = state.published_version.max(manifest.version);
         if state.manifest.version == manifest.version {
             state.manifest.deletion_vectors = manifest.deletion_vectors.clone();
         }
         drop(state);
-        if self.wal_enabled {
-            let mut wal = self.wal.lock().unwrap();
-            if manifest
+        if self.wal_enabled
+            && manifest
                 .wal_origin
                 .as_deref()
-                .is_none_or(|origin| origin == wal.origin())
-            {
-                wal.clear_through(namespace, manifest.wal_checkpoint)?;
-            }
+                .is_none_or(|origin| origin == self.wal.origin())
+        {
+            self.wal.clear_through(namespace, manifest.wal_checkpoint)?;
         }
         Ok(())
+    }
+
+    /// Replay this writer's unpublished delta on top of `remote`, the
+    /// manifest another writer committed after this writer's
+    /// `published_version` (a `ManifestConflict` on publish).
+    ///
+    /// `remote` must have its deletion vectors hydrated into `tombstones`.
+    /// The delta is measured against the last version this writer published
+    /// or restored: segments it added (flushes, compaction outputs),
+    /// segments it removed (compaction inputs), and deletes. The result is
+    /// the remote segment list minus what this writer compacted away, plus
+    /// what it added, with deletes merged per segment (segments are
+    /// immutable, so a segment's deletes only ever grow and the union is
+    /// exact). The WAL checkpoint stays this writer's own when it has one,
+    /// so publishing the result clears exactly the WAL records it covers.
+    ///
+    /// Aborts with `ManifestConflict`, leaving local state untouched, when
+    /// the two histories cannot be merged without losing data:
+    /// - the remote removed a segment this writer compacted away (two
+    ///   compactions of one input would publish its documents twice);
+    /// - the remote added deletes to a segment this writer compacted away
+    ///   (its compaction output would resurrect those documents);
+    /// - the remote removed a segment that carries unpublished local
+    ///   deletes (they could no longer be applied).
+    ///
+    /// The caller then retries the CAS against `remote.version`. Waits for
+    /// an in-flight compaction or upsert on the namespace to finish.
+    pub fn rebase_onto(
+        &self,
+        namespace: &NamespaceId,
+        mut remote: Manifest,
+    ) -> Result<RebaseOutcome, KoshaError> {
+        let own_origin = self.wal.origin().to_owned();
+        let handle = self.ns_handle(namespace);
+        // Upserts and compactions hold `compact` across their I/O and
+        // commit doc locations / merge inputs read before it; swapping the
+        // segment list underneath them could strand their tombstones on a
+        // segment the rebase just dropped.
+        let _compact = handle.compact.lock().unwrap();
+        let mut state = handle.state.lock().unwrap();
+        let conflict = |state: &NamespaceState, reason: String| {
+            eprintln!(
+                "WARN: manifest rebase of namespace {} onto version {} aborted: {reason}",
+                namespace.0, remote.version
+            );
+            KoshaError::ManifestConflict {
+                namespace: namespace.clone(),
+                expected: state.published_version,
+                actual: Some(remote.version),
+            }
+        };
+        if state.known && remote.version < state.published_version {
+            let reason = format!(
+                "remote version is older than this writer's published version {}",
+                state.published_version
+            );
+            return Err(conflict(&state, reason));
+        }
+        let remote_tombstones = std::mem::take(&mut remote.tombstones);
+        let remote_ids: HashSet<SegmentId> = remote
+            .segments
+            .iter()
+            .map(|entry| entry.segment_id.clone())
+            .collect();
+        let local_ids: HashSet<SegmentId> = state
+            .manifest
+            .segments
+            .iter()
+            .map(|entry| entry.segment_id.clone())
+            .collect();
+        // A commit of this writer's whose reply was lost (the CAS landed,
+        // the caller saw an error) is this writer's own history: take it as
+        // the base rather than as a competing writer's change.
+        if remote.wal_origin.as_deref() == Some(own_origin.as_str()) {
+            let own = state.pending_bases.iter().position(|(version, base)| {
+                *version == remote.version && base.segments == remote_ids
+            });
+            if let Some(at) = own {
+                let (version, base) = state.pending_bases.remove(at);
+                state.published_version = version;
+                state.published_base = base;
+            }
+        }
+        let local_changed = state.known && state.manifest.version != state.published_version;
+
+        let (manifest, tombstones, outcome) = if local_changed {
+            let base = &state.published_base;
+            let mut removed = HashSet::new();
+            for id in base.segments.difference(&local_ids) {
+                if !remote_ids.contains(id) {
+                    let reason = format!(
+                        "segment {} was compacted away both locally and remotely",
+                        id.0
+                    );
+                    return Err(conflict(&state, reason));
+                }
+                if base.new_deletes(id, &remote_tombstones) > 0 {
+                    let reason = format!(
+                        "remote deleted documents in segment {}, which this writer compacted away",
+                        id.0
+                    );
+                    return Err(conflict(&state, reason));
+                }
+                removed.insert(id.clone());
+            }
+            for id in base.segments.intersection(&local_ids) {
+                if !remote_ids.contains(id) && base.new_deletes(id, &state.tombstones) > 0 {
+                    let reason = format!(
+                        "remote removed segment {}, which has unpublished local deletes",
+                        id.0
+                    );
+                    return Err(conflict(&state, reason));
+                }
+            }
+
+            let mut segments: Vec<ManifestEntry> = remote
+                .segments
+                .iter()
+                .filter(|entry| !removed.contains(&entry.segment_id))
+                .cloned()
+                .collect();
+            let added: Vec<ManifestEntry> = state
+                .manifest
+                .segments
+                .iter()
+                .filter(|entry| {
+                    !base.segments.contains(&entry.segment_id)
+                        && !remote_ids.contains(&entry.segment_id)
+                })
+                .cloned()
+                .collect();
+            segments.extend(added);
+
+            let mut tombstones: HashMap<SegmentId, HashSet<u32>> = HashMap::new();
+            let mut footer_crc32 = HashMap::new();
+            for entry in &segments {
+                let id = &entry.segment_id;
+                let mut ids = remote_tombstones.get(id).cloned().unwrap_or_default();
+                if let Some(local) = state.tombstones.get(id) {
+                    ids.extend(local.iter().copied());
+                }
+                if !ids.is_empty() {
+                    tombstones.insert(id.clone(), ids);
+                }
+                // A footer rewrite is an admin action on one writer; prefer
+                // the remote record for a segment both sides list.
+                if let Some(crc) = remote
+                    .footer_crc32
+                    .get(id)
+                    .or_else(|| state.manifest.footer_crc32.get(id))
+                {
+                    footer_crc32.insert(id.clone(), *crc);
+                }
+            }
+
+            let (wal_checkpoint, wal_origin) =
+                if state.manifest.wal_origin.as_deref() == Some(own_origin.as_str()) {
+                    let mut checkpoint = state.manifest.wal_checkpoint;
+                    if remote.wal_origin.as_deref() == Some(own_origin.as_str()) {
+                        checkpoint = checkpoint.max(remote.wal_checkpoint);
+                    }
+                    (checkpoint, Some(own_origin.clone()))
+                } else {
+                    (remote.wal_checkpoint, remote.wal_origin.clone())
+                };
+
+            let manifest = Manifest {
+                version: state.manifest.version.max(remote.version) + 1,
+                segments,
+                segment_footers: Default::default(),
+                footer_crc32,
+                wal_checkpoint,
+                wal_origin,
+                tombstones: tombstones.clone(),
+                // Rebuilt from `tombstones` by `prepare_publication`.
+                deletion_vectors: Default::default(),
+            };
+            (manifest, tombstones, RebaseOutcome::Rebased)
+        } else {
+            let mut manifest = remote.clone();
+            manifest.tombstones = remote_tombstones.clone();
+            (manifest, remote_tombstones.clone(), RebaseOutcome::Adopted)
+        };
+
+        let mut manifest = manifest;
+        manifest.carry_segment_footers_from(&state.manifest);
+        manifest.carry_segment_footers_from(&remote);
+        if remote.wal_origin.as_deref() == Some(own_origin.as_str()) {
+            self.wal.advance_past(remote.wal_checkpoint);
+            state.wal_sequence = state.wal_sequence.max(remote.wal_checkpoint);
+        }
+        let max_counter = manifest
+            .segments
+            .iter()
+            .filter_map(|e| segment_flush_counter(&e.segment_id))
+            .max();
+        if let Some(max) = max_counter {
+            let buf = Self::buffer_mut_in(
+                &mut state,
+                namespace.clone(),
+                &self.data_dir,
+                &self.bm25_params,
+            );
+            buf.segment_counter = buf.segment_counter.max(max + 1);
+        }
+        remote.tombstones = remote_tombstones;
+        state.published_base = PublishedBase::of(&remote, &remote.tombstones);
+        state.pending_bases.clear();
+        state.published_version = remote.version;
+        state.tombstones = tombstones;
+        state.manifest = manifest;
+        state.id_index = None;
+        state.shared_manifest = None;
+        state.known = true;
+        Ok(outcome)
     }
 
     pub fn namespaces(&self) -> Vec<NamespaceId> {
@@ -2156,7 +2466,7 @@ mod tests {
         let committed = idx.manifest(&ns).unwrap();
         idx.acknowledge_manifest(&ns, &committed).unwrap();
         // Crash after a new upsert's WAL append, before its segment commit.
-        idx.wal.lock().unwrap().append(&ns, &[doc("new")]).unwrap();
+        idx.wal.append(&ns, &[doc("new")]).unwrap();
         let restart = Indexer::new(dir.clone());
         restart.restore_manifest(ns.clone(), committed);
         restart.flush_namespace(&ns).unwrap();
@@ -2371,6 +2681,63 @@ mod tests {
         idx.flush_namespace(&NamespaceId("a".into())).unwrap();
         let recovered = wal::WalWriter::recover(&dir.join("_wal")).unwrap();
         assert!(recovered.iter().any(|r| r.namespace.0 == "b"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn flush_of_one_namespace_keeps_a_shared_group_file_until_both_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("kosha-wal-shared-{}", uuid::Uuid::new_v4()));
+        let (a, b) = (NamespaceId("a".into()), NamespaceId("b".into()));
+        let doc = |id: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", id)],
+        };
+        let wal_files = || {
+            std::fs::read_dir(dir.join("_wal"))
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|x| x == "wal")
+                })
+                .count()
+        };
+        // One group commit holding both namespaces' records, then a crash.
+        wal::WalWriter::new(dir.join("_wal"))
+            .append_records(&[
+                kosha_core::WalRecord::new(a.clone(), vec![doc("a1")]),
+                kosha_core::WalRecord::new(b.clone(), vec![doc("b1")]),
+            ])
+            .unwrap();
+        assert_eq!(wal_files(), 1);
+
+        let idx = Indexer::new(dir.clone());
+        idx.flush_namespace(&a).unwrap();
+        let published_a = idx.manifest(&a).unwrap();
+        idx.acknowledge_manifest(&a, &published_a).unwrap();
+        assert_eq!(wal_files(), 1, "B's record still needs the shared file");
+        drop(idx);
+
+        let restart = Indexer::new(dir.clone());
+        restart.restore_manifest(a.clone(), published_a);
+        restart.flush_namespace(&a).unwrap();
+        restart.flush_namespace(&b).unwrap();
+        let count = |ns: &NamespaceId| {
+            restart
+                .manifest(ns)
+                .unwrap()
+                .segments
+                .iter()
+                .map(|e| e.doc_count)
+                .sum::<u32>()
+        };
+        assert_eq!(count(&a), 1, "A's checkpointed record is not replayed");
+        assert_eq!(count(&b), 1, "B is recovered after A's flush");
+        let published_b = restart.manifest(&b).unwrap();
+        restart.acknowledge_manifest(&b, &published_b).unwrap();
+        assert_eq!(wal_files(), 0, "reclaimed once both namespaces checkpoint");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3498,5 +3865,286 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Manifest rebase (#230) ───────────────────────────────────────────
+
+    fn rebase_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-rebase-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn write_docs(idx: &Indexer, ns: &NamespaceId, ids: &[&str]) {
+        idx.index_documents(
+            ns.clone(),
+            ids.iter()
+                .map(|id| Document {
+                    id: DocumentId((*id).into()),
+                    fields: vec![Field::keyword("id", *id)],
+                })
+                .collect(),
+        )
+        .unwrap();
+        idx.flush_namespace(ns).unwrap();
+    }
+
+    /// Commit the current snapshot as if the control-store CAS succeeded,
+    /// and return the committed manifest with its deletes hydrated (what a
+    /// competing writer would read back from the control store).
+    fn commit(idx: &Indexer, ns: &NamespaceId) -> Manifest {
+        let (_, hydrated) = idx.publication_snapshot(ns).unwrap();
+        let (_, prepared) = idx.prepare_publication(ns).unwrap().unwrap();
+        idx.acknowledge_manifest(ns, &prepared).unwrap();
+        hydrated
+    }
+
+    fn delete_id(idx: &Indexer, ns: &NamespaceId, id: &str) {
+        let filter: FilterClause =
+            serde_json::from_value(serde_json::json!({"term": {"id": id}})).unwrap();
+        let manifest = idx.manifest(ns).unwrap();
+        assert_eq!(idx.delete_by_query(ns, &manifest, &filter).unwrap(), 1);
+    }
+
+    fn segment_ids(manifest: &Manifest) -> HashSet<SegmentId> {
+        manifest
+            .segments
+            .iter()
+            .map(|entry| entry.segment_id.clone())
+            .collect()
+    }
+
+    /// A segment another writer published: only its manifest entry matters
+    /// to a rebase, which never opens segments.
+    fn foreign(remote: &mut Manifest, id: &str, doc_count: u32) -> SegmentId {
+        let segment = SegmentId(id.into());
+        remote.segments.push(ManifestEntry {
+            segment_id: segment.clone(),
+            doc_count,
+        });
+        segment
+    }
+
+    #[test]
+    fn rebase_replays_unpublished_segments_and_deletes_onto_a_newer_remote() {
+        let dir = rebase_dir("replay");
+        let ns = NamespaceId("ns".into());
+        let idx = Indexer::new(dir.clone());
+        write_docs(&idx, &ns, &["a", "b"]);
+        let base = commit(&idx, &ns);
+        let s1 = base.segments[0].segment_id.clone();
+
+        // Unpublished local work: a new segment and a delete in s1.
+        write_docs(&idx, &ns, &["c"]);
+        delete_id(&idx, &ns, "a");
+        let local = idx.publication_snapshot(&ns).unwrap().1;
+        let a_seq = *local.tombstones[&s1].iter().next().unwrap();
+
+        // Meanwhile another writer published a segment and deleted "b".
+        let mut remote = base.clone();
+        remote.version = base.version + 1;
+        let other = foreign(&mut remote, "other-writer-000001", 3);
+        remote
+            .tombstones
+            .insert(s1.clone(), HashSet::from([1 - a_seq]));
+        remote.tombstones.insert(other.clone(), HashSet::from([2]));
+        remote.wal_origin = Some("other-writer".into());
+        remote.wal_checkpoint = 77;
+
+        assert_eq!(
+            idx.rebase_onto(&ns, remote.clone()).unwrap(),
+            RebaseOutcome::Rebased
+        );
+        let (expected, rebased) = idx.publication_snapshot(&ns).unwrap();
+        assert_eq!(
+            expected, remote.version,
+            "CAS must target the remote version"
+        );
+        assert!(rebased.version > remote.version);
+        assert_eq!(
+            segment_ids(&rebased),
+            segment_ids(&local)
+                .union(&HashSet::from([other.clone()]))
+                .cloned()
+                .collect()
+        );
+        assert_eq!(rebased.tombstones[&s1], HashSet::from([0, 1]));
+        assert_eq!(rebased.tombstones[&other], HashSet::from([2]));
+        assert_eq!(
+            rebased.wal_origin, local.wal_origin,
+            "checkpoint stays this writer's"
+        );
+        assert_eq!(rebased.wal_checkpoint, local.wal_checkpoint);
+
+        // Publishing the rebase makes it the base; nothing left to rebase.
+        commit(&idx, &ns);
+        let mut newer = idx.publication_snapshot(&ns).unwrap().1;
+        newer.version += 1;
+        assert_eq!(
+            idx.rebase_onto(&ns, newer.clone()).unwrap(),
+            RebaseOutcome::Adopted
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebase_without_local_changes_adopts_the_remote_manifest() {
+        let dir = rebase_dir("adopt");
+        let ns = NamespaceId("ns".into());
+        let idx = Indexer::new(dir.clone());
+        write_docs(&idx, &ns, &["a"]);
+        let mut remote = commit(&idx, &ns);
+        remote.version += 3;
+        foreign(&mut remote, "other-000001", 1);
+        assert_eq!(
+            idx.rebase_onto(&ns, remote.clone()).unwrap(),
+            RebaseOutcome::Adopted
+        );
+        let (expected, adopted) = idx.publication_snapshot(&ns).unwrap();
+        assert_eq!(
+            (expected, adopted.version),
+            (remote.version, remote.version)
+        );
+        assert_eq!(segment_ids(&adopted), segment_ids(&remote));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebase_aborts_when_a_remote_compaction_removed_a_locally_deleted_segment() {
+        let dir = rebase_dir("remote-compaction");
+        let ns = NamespaceId("ns".into());
+        let idx = Indexer::new(dir.clone());
+        write_docs(&idx, &ns, &["a", "b"]);
+        let base = commit(&idx, &ns);
+        delete_id(&idx, &ns, "a");
+        let before = idx.publication_snapshot(&ns).unwrap();
+
+        // The other writer compacted s1 away before seeing the delete.
+        let mut remote = base.clone();
+        remote.version += 1;
+        remote.segments.clear();
+        foreign(&mut remote, "ns-compact-remote", 2);
+
+        let err = idx.rebase_onto(&ns, remote).unwrap_err();
+        assert!(matches!(err, KoshaError::ManifestConflict { .. }), "{err}");
+        let after = idx.publication_snapshot(&ns).unwrap();
+        assert_eq!(after.0, before.0, "abort must leave the CAS anchor alone");
+        assert!(
+            after.1.same_contents(&before.1),
+            "abort must not touch local state"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebase_drops_a_segment_a_remote_compaction_subsumed_when_no_local_delete_targets_it() {
+        let dir = rebase_dir("subsumed");
+        let ns = NamespaceId("ns".into());
+        let idx = Indexer::new(dir.clone());
+        write_docs(&idx, &ns, &["a"]);
+        let base = commit(&idx, &ns);
+        write_docs(&idx, &ns, &["b"]);
+        let mut remote = base.clone();
+        remote.version += 1;
+        remote.segments.clear();
+        let merged = foreign(&mut remote, "ns-compact-remote", 1);
+        assert_eq!(
+            idx.rebase_onto(&ns, remote).unwrap(),
+            RebaseOutcome::Rebased
+        );
+        let rebased = idx.publication_snapshot(&ns).unwrap().1;
+        assert!(!segment_ids(&rebased).contains(&base.segments[0].segment_id));
+        assert!(segment_ids(&rebased).contains(&merged));
+        assert_eq!(rebased.segments.len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebase_keeps_a_local_compaction_only_while_its_inputs_are_untouched_remotely() {
+        let dir = rebase_dir("local-compaction");
+        let ns = NamespaceId("ns".into());
+        let idx = Indexer::new(dir.clone());
+        write_docs(&idx, &ns, &["a"]);
+        write_docs(&idx, &ns, &["b"]);
+        let base = commit(&idx, &ns);
+        assert!(
+            idx.compact_namespace_with_options(&ns, CompactOptions::full())
+                .unwrap()
+                .merged
+        );
+        let local = idx.publication_snapshot(&ns).unwrap();
+
+        // Remote compacted the same inputs: publishing both would double
+        // every document.
+        let mut conflicting = base.clone();
+        conflicting.version += 1;
+        conflicting.segments.clear();
+        foreign(&mut conflicting, "ns-compact-remote", 2);
+        assert!(matches!(
+            idx.rebase_onto(&ns, conflicting).unwrap_err(),
+            KoshaError::ManifestConflict { .. }
+        ));
+        // Remote deleted inside an input: the local output would resurrect it.
+        let mut deleted = base.clone();
+        deleted.version += 1;
+        deleted
+            .tombstones
+            .insert(base.segments[0].segment_id.clone(), HashSet::from([0]));
+        assert!(matches!(
+            idx.rebase_onto(&ns, deleted).unwrap_err(),
+            KoshaError::ManifestConflict { .. }
+        ));
+        assert!(idx
+            .publication_snapshot(&ns)
+            .unwrap()
+            .1
+            .same_contents(&local.1));
+
+        // Remote only added a segment: the compaction rebases cleanly.
+        let mut appended = base.clone();
+        appended.version += 1;
+        let other = foreign(&mut appended, "other-000001", 1);
+        assert_eq!(
+            idx.rebase_onto(&ns, appended).unwrap(),
+            RebaseOutcome::Rebased
+        );
+        let rebased = idx.publication_snapshot(&ns).unwrap().1;
+        assert_eq!(
+            segment_ids(&rebased),
+            segment_ids(&local.1)
+                .union(&HashSet::from([other]))
+                .cloned()
+                .collect()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebase_recognizes_its_own_commit_whose_reply_was_lost() {
+        let dir = rebase_dir("lost-reply");
+        let ns = NamespaceId("ns".into());
+        let idx = Indexer::new(dir.clone());
+        write_docs(&idx, &ns, &["a"]);
+        commit(&idx, &ns);
+        write_docs(&idx, &ns, &["b"]);
+        write_docs(&idx, &ns, &["c"]);
+        // The CAS of this compaction landed but its reply was lost.
+        idx.compact_namespace_with_options(&ns, CompactOptions::full())
+            .unwrap();
+        let (_, landed) = idx.publication_snapshot(&ns).unwrap();
+        idx.prepare_publication(&ns).unwrap();
+        write_docs(&idx, &ns, &["d"]);
+        assert_eq!(
+            idx.rebase_onto(&ns, landed.clone()).unwrap(),
+            RebaseOutcome::Rebased
+        );
+        let (expected, rebased) = idx.publication_snapshot(&ns).unwrap();
+        assert_eq!(expected, landed.version);
+        assert_eq!(rebased.segments.len(), landed.segments.len() + 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
