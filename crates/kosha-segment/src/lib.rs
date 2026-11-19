@@ -48,11 +48,33 @@ pub fn build_hnsw(vectors: &[(u32, Vec<f32>)]) -> Option<(HnswMap<CosinePoint, u
 
 pub struct SegmentWriter {
     segment_id: SegmentId,
-    #[allow(dead_code)]
     output_dir: PathBuf,
     backend: Box<dyn StorageBackend>,
-    doc_records: Vec<DocRecord>,
+    /// Per-document BM25 field length, indexed by doc_seq. All the writer
+    /// keeps per document: the stored record itself is streamed to disk as
+    /// it is added (#242), not held until `finalize`.
+    field_lengths: Vec<u32>,
+    /// Streams `doc_store.bin` as documents are added. Opened lazily.
+    doc_store: Option<DocStoreSink>,
     inverted_index: HashMap<String, Vec<Posting>>,
+    /// Approximate heap bytes held by `inverted_index`.
+    inverted_bytes: usize,
+    /// Highest `inverted_bytes` seen (for tests and diagnostics).
+    peak_inverted_bytes: usize,
+    /// Spill `inverted_index` to a sorted run once `inverted_bytes` passes
+    /// this. See [`segment_build_memory_bytes`].
+    build_memory_bytes: usize,
+    /// Sorted posting runs spilled so far, oldest (lowest doc_seq) first.
+    runs: Vec<PathBuf>,
+    /// First I/O error from streaming in `add_document`, which can't return
+    /// one; reported by `finalize`.
+    io_error: Option<KoshaError>,
+    /// Set once `finalize` succeeds; otherwise `Drop` removes the partial
+    /// build files.
+    finalized: bool,
+    /// Term bloom built by `write_inverted_index` from the merged vocabulary
+    /// (the in-memory index alone no longer holds every term).
+    term_bloom: Option<kosha_core::BloomFilter>,
     total_field_length: u64,
     filter_string: HashMap<String, Vec<(u32, String)>>,
     filter_integer: HashMap<String, Vec<(u32, i64)>>,
@@ -87,8 +109,16 @@ impl SegmentWriter {
             segment_id,
             output_dir,
             backend,
-            doc_records: Vec::new(),
+            field_lengths: Vec::new(),
+            doc_store: None,
             inverted_index: HashMap::new(),
+            inverted_bytes: 0,
+            peak_inverted_bytes: 0,
+            build_memory_bytes: segment_build_memory_bytes(),
+            runs: Vec::new(),
+            io_error: None,
+            finalized: false,
+            term_bloom: None,
             total_field_length: 0,
             filter_string: HashMap::new(),
             filter_integer: HashMap::new(),
@@ -99,6 +129,14 @@ impl SegmentWriter {
             doc_vector_fields: Vec::new(),
             doc_vector_entries: Vec::new(),
         }
+    }
+
+    /// Override the in-memory postings budget before a sorted run is spilled
+    /// to disk (#242). Production writers use
+    /// `KOSHA_SEGMENT_BUILD_MEMORY_BYTES`; see [`segment_build_memory_bytes`].
+    pub fn with_build_memory_bytes(mut self, bytes: usize) -> Self {
+        self.build_memory_bytes = bytes.max(1);
+        self
     }
 
     /// Override where this writer stores parsed vector values (#243).
@@ -118,7 +156,7 @@ impl SegmentWriter {
     }
 
     pub fn add_document(&mut self, doc_id: DocumentId, mut fields: Vec<Field>) {
-        let doc_seq = self.doc_records.len() as u32;
+        let doc_seq = self.field_lengths.len() as u32;
         let mut field_length: u32 = 0;
         // Vector fields whose value moves to `doc_vectors.bin` (#243); their
         // doc-store value is blanked after the loop below.
@@ -129,11 +167,18 @@ impl SegmentWriter {
                 let tokens = tokenize_with_positions(&field.value);
                 field_length += tokens.len() as u32;
                 for (token, pos) in tokens {
-                    let postings = self.inverted_index.entry(token).or_default();
+                    let postings = match self.inverted_index.get_mut(&token) {
+                        Some(postings) => postings,
+                        None => {
+                            self.inverted_bytes += TERM_ENTRY_OVERHEAD + token.len();
+                            self.inverted_index.entry(token).or_default()
+                        }
+                    };
                     if let Some(last) = postings.last_mut() {
                         if last.doc_id == doc_seq {
                             last.term_frequency += 1;
                             last.positions.push(pos);
+                            self.inverted_bytes += 4;
                             continue;
                         }
                     }
@@ -142,6 +187,7 @@ impl SegmentWriter {
                         term_frequency: 1,
                         positions: vec![pos],
                     });
+                    self.inverted_bytes += POSTING_OVERHEAD + 4;
                 }
             }
             match field.field_type {
@@ -217,15 +263,82 @@ impl SegmentWriter {
         }
 
         self.total_field_length += field_length as u64;
-        self.doc_records.push(DocRecord {
+        self.field_lengths.push(field_length);
+        self.peak_inverted_bytes = self.peak_inverted_bytes.max(self.inverted_bytes);
+        if self.io_error.is_some() {
+            return;
+        }
+        let record = DocRecord {
             doc_id,
             doc_seq,
             field_length,
             fields,
-        });
+        };
+        let streamed = self.doc_store_sink().and_then(|sink| sink.append(&record));
+        if let Err(e) = streamed {
+            self.io_error = Some(e);
+            return;
+        }
+        if self.inverted_bytes > self.build_memory_bytes {
+            if let Err(e) = self.spill_run() {
+                self.io_error = Some(e);
+            }
+        }
     }
 
-    pub fn finalize(self, bm25_params: Bm25Params) -> Result<Footer, KoshaError> {
+    /// Number of sorted posting runs spilled so far.
+    pub fn spilled_runs(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// Highest approximate in-memory postings size this writer reached.
+    pub fn peak_inverted_bytes(&self) -> usize {
+        self.peak_inverted_bytes
+    }
+
+    /// Scratch directory for this build's partial files, inside the output
+    /// directory so every rename into place stays on one filesystem.
+    fn build_dir(&self) -> PathBuf {
+        self.output_dir.join(BUILD_DIR)
+    }
+
+    fn doc_store_sink(&mut self) -> Result<&mut DocStoreSink, KoshaError> {
+        if self.doc_store.is_none() {
+            let dir = self.build_dir();
+            fs::create_dir_all(&dir)?;
+            self.doc_store = Some(DocStoreSink::create(dir.join("doc_store.bin"))?);
+        }
+        Ok(self.doc_store.as_mut().unwrap())
+    }
+
+    /// Write the in-memory postings to a sorted run file and free them.
+    /// Runs hold contiguous, increasing doc_seq ranges, so a term's
+    /// postings across runs are merged by concatenating in run order.
+    fn spill_run(&mut self) -> Result<(), KoshaError> {
+        if self.inverted_index.is_empty() {
+            return Ok(());
+        }
+        let dir = self.build_dir();
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("run-{:05}", self.runs.len()));
+        let mut terms: Vec<(String, Vec<Posting>)> = std::mem::take(&mut self.inverted_index)
+            .into_iter()
+            .collect();
+        terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut out = std::io::BufWriter::new(fs::File::create(&path)?);
+        for (term, postings) in &terms {
+            write_run_entry(&mut out, term, postings)?;
+        }
+        std::io::Write::flush(&mut out)?;
+        self.runs.push(path);
+        self.inverted_bytes = 0;
+        Ok(())
+    }
+
+    pub fn finalize(mut self, bm25_params: Bm25Params) -> Result<Footer, KoshaError> {
+        if let Some(e) = self.io_error.take() {
+            return Err(e);
+        }
         self.backend.create_dir_all("")?;
         self.write_doc_store()?;
         self.write_doc_vectors()?;
@@ -236,48 +349,33 @@ impl SegmentWriter {
             _ => self.write_vectors_v2()?,
         }
         let footer = self.write_footer(bm25_params)?;
+        let _ = fs::remove_dir_all(self.build_dir());
+        self.finalized = true;
         Ok(footer)
     }
 
-    /// Writes `doc_store.bin` (unchanged byte layout) and, alongside it,
+    /// Finishes `doc_store.bin` (unchanged byte layout) and writes
     /// `doc_store.offsets` — a sidecar sized to `doc_count`, not content
     /// size, that lets `SegmentReader` open a segment without parsing every
     /// document's full field content into memory (see `DocStoreAccess`).
-    /// Offsets are captured as a free byproduct of the same loop that
-    /// already builds `buf` in doc_seq order — no second pass.
-    fn write_doc_store(&self) -> Result<(), KoshaError> {
-        let mut buf = Vec::new();
-        let mut offsets_buf = Vec::new();
-        let doc_count = self.doc_records.len() as u32;
-        buf.extend_from_slice(&doc_count.to_le_bytes());
-        offsets_buf.extend_from_slice(&doc_count.to_le_bytes());
-        for rec in &self.doc_records {
-            let record_start = buf.len() as u64;
-            let id_bytes = rec.doc_id.0.as_bytes();
-            buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(id_bytes);
-            buf.extend_from_slice(&rec.field_length.to_le_bytes());
-            let field_count = rec.fields.len() as u32;
-            buf.extend_from_slice(&field_count.to_le_bytes());
-            for field in &rec.fields {
-                let name_bytes = field.name.as_bytes();
-                buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(name_bytes);
-                buf.push(field.field_type as u8);
-                let val_bytes = field.value.as_bytes();
-                buf.extend_from_slice(&(val_bytes.len() as u64).to_le_bytes());
-                buf.extend_from_slice(val_bytes);
+    /// Records were streamed to disk by `add_document` (#242); this patches
+    /// the leading doc count and moves the file into place.
+    fn write_doc_store(&mut self) -> Result<(), KoshaError> {
+        let doc_count = self.field_lengths.len() as u32;
+        let sink = match self.doc_store.take() {
+            Some(sink) => sink,
+            // No documents: the same 4-byte files as before.
+            None => {
+                self.backend
+                    .write("doc_store.bin", &doc_count.to_le_bytes())?;
+                self.backend
+                    .write("doc_store.offsets", &doc_count.to_le_bytes())?;
+                return Ok(());
             }
-            let record_len = (buf.len() as u64 - record_start) as u32;
-
-            offsets_buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
-            offsets_buf.extend_from_slice(id_bytes);
-            offsets_buf.extend_from_slice(&rec.field_length.to_le_bytes());
-            offsets_buf.extend_from_slice(&record_start.to_le_bytes());
-            offsets_buf.extend_from_slice(&record_len.to_le_bytes());
-        }
-        self.backend.write("doc_store.bin", &buf)?;
-        self.backend.write("doc_store.offsets", &offsets_buf)?;
+        };
+        let (path, offsets) = sink.finish(doc_count)?;
+        fs::rename(&path, self.output_dir.join("doc_store.bin"))?;
+        self.backend.write("doc_store.offsets", &offsets)?;
         Ok(())
     }
 
@@ -317,39 +415,75 @@ impl SegmentWriter {
     /// [`LazyInvertedIndex`] for the format and why it exists). The legacy
     /// v1 stream layout and inline v2 layout are still readable for
     /// segments already on disk/S3.
-    fn write_inverted_index(&self) -> Result<(), KoshaError> {
-        let mut terms: Vec<&String> = self.inverted_index.keys().collect();
-        // Sorted term order is load-bearing: the reader binary-searches the
-        // term table (see `LazyInvertedIndex::find`).
-        terms.sort();
+    fn write_inverted_index(&mut self) -> Result<(), KoshaError> {
+        // Every spilled run plus what's still in memory, merged in term
+        // order. Sorted term order is load-bearing: the reader
+        // binary-searches the term table (see `LazyInvertedIndex::find`).
+        // Memory: one term's postings at a time plus the term table, not the
+        // whole index (#242).
+        let mut sources: Vec<PostingSource> = Vec::with_capacity(self.runs.len() + 1);
+        for path in &self.runs {
+            sources.push(PostingSource::Run(RunReader::open(path)?));
+        }
+        let mut in_memory: Vec<(String, Vec<Posting>)> = std::mem::take(&mut self.inverted_index)
+            .into_iter()
+            .collect();
+        in_memory.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        sources.push(PostingSource::Memory(in_memory.into_iter()));
+        self.inverted_bytes = 0;
 
-        // Serialize the string pool and sharded postings blobs first,
-        // recording each term's spans. Query nodes can then hydrate just
-        // the TOC (`inverted.idx`) plus the query-term shard(s), not every
-        // term's postings in the segment.
+        // Postings go straight to one raw file per shard; query nodes can
+        // then hydrate just the TOC (`inverted.idx`) plus the query-term
+        // shard(s), not every term's postings in the segment.
+        let build_dir = self.build_dir();
+        fs::create_dir_all(&build_dir)?;
+        let mut blobs: Vec<Option<std::io::BufWriter<fs::File>>> =
+            (0..POSTING_BLOB_SHARDS).map(|_| None).collect();
+        let mut blob_lens: Vec<u64> = vec![0; POSTING_BLOB_SHARDS];
         let mut pool: Vec<u8> = Vec::new();
-        let mut posting_blobs: Vec<Vec<u8>> =
-            (0..POSTING_BLOB_SHARDS).map(|_| Vec::new()).collect();
         // (term_off_in_pool, term_len, blob_id, postings_off_in_blob, postings_len)
-        let mut entries: Vec<(u64, u32, u32, u64, u32)> = Vec::with_capacity(terms.len());
+        let mut entries: Vec<(u64, u32, u32, u64, u32)> = Vec::new();
         let write_version = postings_write_version();
-        for term_str in &terms {
-            let postings = &self.inverted_index[*term_str];
-            let term_off = pool.len() as u64;
-            pool.extend_from_slice(term_str.as_bytes());
-            let blob_id = posting_blob_id_for_term(term_str) as u32;
-            let blob = &mut posting_blobs[blob_id as usize];
-            let p_off = blob.len() as u64;
+        let mut encoded: Vec<u8> = Vec::new();
+
+        let mut merger = TermMerger::new(sources)?;
+        while let Some((term, postings)) = merger.next_term()? {
+            encoded.clear();
             if write_version == SPLIT_INVERTED_VERSION {
                 // Rollout/rollback compatibility mode — see
                 // `postings_write_version`.
-                write_postings_varint_delta(blob, postings);
+                write_postings_varint_delta(&mut encoded, &postings);
             } else {
-                write_postings_skip_split(blob, postings, &self.doc_records);
+                write_postings_skip_split(&mut encoded, &postings, &self.field_lengths);
             }
-            let p_len = (blob.len() as u64 - p_off) as u32;
-            entries.push((term_off, term_str.len() as u32, blob_id, p_off, p_len));
+            drop(postings);
+            let blob_id = posting_blob_id_for_term(&term);
+            let blob = match &mut blobs[blob_id] {
+                Some(blob) => blob,
+                slot => {
+                    let file = fs::File::create(build_dir.join(format!("blob-{blob_id}")))?;
+                    slot.insert(std::io::BufWriter::new(file))
+                }
+            };
+            std::io::Write::write_all(blob, &encoded)?;
+            let p_off = blob_lens[blob_id];
+            blob_lens[blob_id] += encoded.len() as u64;
+            let term_off = pool.len() as u64;
+            pool.extend_from_slice(term.as_bytes());
+            entries.push((
+                term_off,
+                term.len() as u32,
+                blob_id as u32,
+                p_off,
+                encoded.len() as u32,
+            ));
         }
+
+        // Every term is in `pool` exactly once, sorted (no duplicates).
+        self.term_bloom = Some(build_term_bloom(entries.iter().map(|&(off, len, ..)| {
+            std::str::from_utf8(&pool[off as usize..off as usize + len as usize])
+                .expect("pool holds UTF-8 terms")
+        })));
 
         let table_len = entries.len() as u64 * SPLIT_INVERTED_TABLE_ENTRY_LEN as u64;
         let pool_base = INVERTED_HEADER_LEN as u64 + table_len;
@@ -371,14 +505,21 @@ impl SegmentWriter {
         // TOC and every posting blob are wrapped independently (see
         // `maybe_compress_inverted`) so the lazy per-shard fetch/decode
         // semantics are unchanged — each artifact self-describes.
-        let encoded = maybe_compress_inverted(&buf);
-        self.backend.write("inverted.idx", &encoded)?;
-        for (blob_id, blob) in posting_blobs.into_iter().enumerate() {
-            if !blob.is_empty() {
-                let encoded = maybe_compress_inverted(&blob);
-                self.backend
-                    .write(&posting_blob_file_for_id(blob_id), &encoded)?;
-            }
+        let encoded_toc = maybe_compress_inverted(&buf);
+        drop(buf);
+        self.backend.write("inverted.idx", &encoded_toc)?;
+        for (blob_id, blob) in blobs.into_iter().enumerate() {
+            let Some(blob) = blob else { continue };
+            let file = blob
+                .into_inner()
+                .map_err(|e| KoshaError::Io(e.into_error()))?;
+            drop(file);
+            let raw = build_dir.join(format!("blob-{blob_id}"));
+            let final_path = self.output_dir.join(posting_blob_file_for_id(blob_id));
+            maybe_compress_inverted_file(&raw, &final_path, blob_lens[blob_id])?;
+        }
+        for run in self.runs.drain(..) {
+            let _ = fs::remove_file(run);
         }
         Ok(())
     }
@@ -545,7 +686,7 @@ impl SegmentWriter {
     }
 
     fn write_footer(&self, bm25_params: Bm25Params) -> Result<Footer, KoshaError> {
-        let doc_count = self.doc_records.len() as u32;
+        let doc_count = self.field_lengths.len() as u32;
         let avg = if doc_count > 0 {
             self.total_field_length as f64 / doc_count as f64
         } else {
@@ -559,9 +700,11 @@ impl SegmentWriter {
             bm25_params,
             created_at: chrono_like_now(),
             filter_blooms: Some(build_filter_blooms(&self.filter_string)),
-            term_bloom: Some(build_term_bloom(
-                self.inverted_index.keys().map(|s| s.as_str()),
-            )),
+            term_bloom: Some(
+                self.term_bloom
+                    .clone()
+                    .unwrap_or_else(|| build_term_bloom(std::iter::empty())),
+            ),
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: self.text_filter_ignore_above,
             doc_vectors: !self.doc_vector_entries.is_empty(),
@@ -1227,6 +1370,327 @@ fn text_value_within_cap(value: &str, cap: Option<u32>) -> bool {
     let Some(cap) = cap else { return true };
     let cap = cap as usize;
     value.len() <= cap || value.chars().count() <= cap
+}
+
+// ─── Bounded-memory segment build (#242) ────────────────────────────────────
+//
+// A writer used to hold everything until `finalize`: every document's full
+// field content, the whole positional inverted index, and every posting
+// blob. Compaction feeds every live document of its inputs through one
+// writer, so a merge's peak memory grew with the merged segment (the
+// 22 GiB staging namespace could not be merged on the ingest pod).
+//
+// Now:
+// - Stored records stream to `.build/doc_store.bin` as they are added;
+//   per document the writer keeps only its field length and offsets entry.
+// - Once the in-memory postings pass `KOSHA_SEGMENT_BUILD_MEMORY_BYTES`,
+//   they are written to a sorted run file and freed. `finalize` k-way
+//   merges the runs and what's left in memory by term, one term at a time,
+//   and streams each term's encoded postings to its shard file.
+// - Each posting shard is compressed file-to-file.
+//
+// Output bytes are unchanged; `.build/` is removed before `finalize`
+// returns, or by `Drop` if the build is abandoned.
+
+/// Scratch directory inside a segment's output directory.
+const BUILD_DIR: &str = ".build";
+/// Approximate heap cost of a new term in the in-memory index (hash-map
+/// slot, `String` and `Vec` headers, allocator slack), on top of its bytes.
+const TERM_ENTRY_OVERHEAD: usize = 80;
+/// Approximate heap cost of one `Posting` (struct plus its positions `Vec`
+/// allocation), on top of 4 bytes per position.
+const POSTING_OVERHEAD: usize = 48;
+/// Default for `KOSHA_SEGMENT_BUILD_MEMORY_BYTES`.
+pub const DEFAULT_SEGMENT_BUILD_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+
+/// In-memory postings budget per segment writer before a sorted run is
+/// spilled to disk (`KOSHA_SEGMENT_BUILD_MEMORY_BYTES`, default 256 MiB).
+/// Bounds the positional index part of a flush or merge; see the section
+/// comment above for what else a writer holds.
+pub fn segment_build_memory_bytes() -> usize {
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        parse_segment_build_memory_bytes(
+            std::env::var("KOSHA_SEGMENT_BUILD_MEMORY_BYTES")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_segment_build_memory_bytes(raw: Option<&str>) -> usize {
+    match raw.map(str::trim) {
+        None | Some("") => DEFAULT_SEGMENT_BUILD_MEMORY_BYTES,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!(
+                    "WARN: KOSHA_SEGMENT_BUILD_MEMORY_BYTES={v} must be a positive byte count — \
+                     using {DEFAULT_SEGMENT_BUILD_MEMORY_BYTES}"
+                );
+                DEFAULT_SEGMENT_BUILD_MEMORY_BYTES
+            }
+        },
+    }
+}
+
+/// `doc_store.bin` being written record by record, plus its offsets table.
+struct DocStoreSink {
+    path: PathBuf,
+    out: std::io::BufWriter<fs::File>,
+    written: u64,
+    offsets: Vec<u8>,
+    scratch: Vec<u8>,
+}
+
+impl DocStoreSink {
+    fn create(path: PathBuf) -> Result<Self, KoshaError> {
+        let mut out = std::io::BufWriter::new(fs::File::create(&path)?);
+        // Doc count placeholder, patched by `finish`.
+        std::io::Write::write_all(&mut out, &0u32.to_le_bytes())?;
+        Ok(Self {
+            path,
+            out,
+            written: 4,
+            offsets: 0u32.to_le_bytes().to_vec(),
+            scratch: Vec::new(),
+        })
+    }
+
+    /// Same record encoding `doc_store.bin` has always used.
+    fn append(&mut self, rec: &DocRecord) -> Result<(), KoshaError> {
+        let buf = &mut self.scratch;
+        buf.clear();
+        let id_bytes = rec.doc_id.0.as_bytes();
+        buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(id_bytes);
+        buf.extend_from_slice(&rec.field_length.to_le_bytes());
+        buf.extend_from_slice(&(rec.fields.len() as u32).to_le_bytes());
+        for field in &rec.fields {
+            let name_bytes = field.name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.push(field.field_type as u8);
+            let val_bytes = field.value.as_bytes();
+            buf.extend_from_slice(&(val_bytes.len() as u64).to_le_bytes());
+            buf.extend_from_slice(val_bytes);
+        }
+        std::io::Write::write_all(&mut self.out, buf)?;
+        self.offsets
+            .extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+        self.offsets.extend_from_slice(id_bytes);
+        self.offsets
+            .extend_from_slice(&rec.field_length.to_le_bytes());
+        self.offsets.extend_from_slice(&self.written.to_le_bytes());
+        self.offsets
+            .extend_from_slice(&(buf.len() as u32).to_le_bytes());
+        self.written += buf.len() as u64;
+        Ok(())
+    }
+
+    /// Patch the doc count into both files; returns the finished file's
+    /// path and the offsets bytes.
+    fn finish(mut self, doc_count: u32) -> Result<(PathBuf, Vec<u8>), KoshaError> {
+        let mut file = self
+            .out
+            .into_inner()
+            .map_err(|e| KoshaError::Io(e.into_error()))?;
+        file.seek(SeekFrom::Start(0))?;
+        std::io::Write::write_all(&mut file, &doc_count.to_le_bytes())?;
+        self.offsets[0..4].copy_from_slice(&doc_count.to_le_bytes());
+        Ok((self.path, self.offsets))
+    }
+}
+
+/// Run entry: `[term_len:u32][term][count:u32]` then per posting
+/// `[doc_id:u32][tf:u32][n_positions:u32][positions:u32 x n]`.
+fn write_run_entry(
+    out: &mut impl std::io::Write,
+    term: &str,
+    postings: &[Posting],
+) -> Result<(), KoshaError> {
+    out.write_all(&(term.len() as u32).to_le_bytes())?;
+    out.write_all(term.as_bytes())?;
+    out.write_all(&(postings.len() as u32).to_le_bytes())?;
+    for p in postings {
+        out.write_all(&p.doc_id.to_le_bytes())?;
+        out.write_all(&p.term_frequency.to_le_bytes())?;
+        out.write_all(&(p.positions.len() as u32).to_le_bytes())?;
+        for pos in &p.positions {
+            out.write_all(&pos.to_le_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+struct RunReader {
+    input: std::io::BufReader<fs::File>,
+}
+
+impl RunReader {
+    fn open(path: &Path) -> Result<Self, KoshaError> {
+        Ok(Self {
+            input: std::io::BufReader::new(fs::File::open(path)?),
+        })
+    }
+
+    fn read_u32(&mut self) -> Result<u32, KoshaError> {
+        let mut b = [0u8; 4];
+        self.input.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn next_entry(&mut self) -> Result<Option<(String, Vec<Posting>)>, KoshaError> {
+        let mut b = [0u8; 4];
+        match self.input.read_exact(&mut b) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let mut term = vec![0u8; u32::from_le_bytes(b) as usize];
+        self.input.read_exact(&mut term)?;
+        let term = String::from_utf8(term)
+            .map_err(|_| KoshaError::CorruptSegment("posting run: non-UTF-8 term".into()))?;
+        let count = self.read_u32()? as usize;
+        let mut postings = Vec::with_capacity(count);
+        for _ in 0..count {
+            let doc_id = self.read_u32()?;
+            let term_frequency = self.read_u32()?;
+            let n = self.read_u32()? as usize;
+            let mut positions = Vec::with_capacity(n);
+            for _ in 0..n {
+                positions.push(self.read_u32()?);
+            }
+            postings.push(Posting {
+                doc_id,
+                term_frequency,
+                positions,
+            });
+        }
+        Ok(Some((term, postings)))
+    }
+}
+
+enum PostingSource {
+    Run(RunReader),
+    Memory(std::vec::IntoIter<(String, Vec<Posting>)>),
+}
+
+impl PostingSource {
+    fn next_entry(&mut self) -> Result<Option<(String, Vec<Posting>)>, KoshaError> {
+        match self {
+            Self::Run(run) => run.next_entry(),
+            Self::Memory(it) => Ok(it.next()),
+        }
+    }
+}
+
+/// K-way merge of term-sorted sources. Sources are given in doc_seq order
+/// (each covers a later doc range than the one before), so one term's
+/// postings are the concatenation of its sources' postings in source order.
+struct TermMerger {
+    sources: Vec<PostingSource>,
+    heads: Vec<Option<Vec<Posting>>>,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(String, usize)>>,
+}
+
+impl TermMerger {
+    fn new(mut sources: Vec<PostingSource>) -> Result<Self, KoshaError> {
+        let mut heads = Vec::with_capacity(sources.len());
+        let mut heap = std::collections::BinaryHeap::new();
+        for (i, source) in sources.iter_mut().enumerate() {
+            match source.next_entry()? {
+                Some((term, postings)) => {
+                    heap.push(std::cmp::Reverse((term, i)));
+                    heads.push(Some(postings));
+                }
+                None => heads.push(None),
+            }
+        }
+        Ok(Self {
+            sources,
+            heads,
+            heap,
+        })
+    }
+
+    fn advance(&mut self, i: usize) -> Result<(), KoshaError> {
+        match self.sources[i].next_entry()? {
+            Some((term, postings)) => {
+                self.heap.push(std::cmp::Reverse((term, i)));
+                self.heads[i] = Some(postings);
+            }
+            None => self.heads[i] = None,
+        }
+        Ok(())
+    }
+
+    fn next_term(&mut self) -> Result<Option<(String, Vec<Posting>)>, KoshaError> {
+        let Some(std::cmp::Reverse((term, i))) = self.heap.pop() else {
+            return Ok(None);
+        };
+        let mut postings = self.heads[i].take().unwrap_or_default();
+        self.advance(i)?;
+        // Equal terms pop in ascending source index: doc_seq order.
+        while self
+            .heap
+            .peek()
+            .is_some_and(|std::cmp::Reverse((t, _))| *t == term)
+        {
+            let std::cmp::Reverse((_, j)) = self.heap.pop().unwrap();
+            postings.extend(self.heads[j].take().unwrap_or_default());
+            self.advance(j)?;
+        }
+        Ok(Some((term, postings)))
+    }
+}
+
+/// File-to-file version of [`maybe_compress_inverted`]: the same output
+/// bytes rules (small files and incompressible ones stay raw), streamed so
+/// a multi-GB posting shard is never held in memory. Moves the result to
+/// `dest` and removes `raw`.
+fn maybe_compress_inverted_file(raw: &Path, dest: &Path, raw_len: u64) -> Result<(), KoshaError> {
+    if raw_len < 4096 {
+        fs::rename(raw, dest)?;
+        return Ok(());
+    }
+    let compressed_path = raw.with_extension("zst");
+    {
+        let mut out = std::io::BufWriter::new(fs::File::create(&compressed_path)?);
+        std::io::Write::write_all(&mut out, &COMPRESSED_INVERTED_MAGIC.to_le_bytes())?;
+        std::io::Write::write_all(&mut out, &COMPRESSED_INVERTED_VERSION.to_le_bytes())?;
+        std::io::Write::write_all(&mut out, &raw_len.to_le_bytes())?;
+        let mut encoder = zstd::stream::Encoder::new(out, INVERTED_COMPRESSION_LEVEL)?;
+        // Record the size in the frame header, as `zstd::bulk` does.
+        encoder.set_pledged_src_size(Some(raw_len))?;
+        let mut input = std::io::BufReader::new(fs::File::open(raw)?);
+        std::io::copy(&mut input, &mut encoder)?;
+        let mut out = encoder.finish()?;
+        std::io::Write::flush(&mut out)?;
+    }
+    let compressed_len = fs::metadata(&compressed_path)?.len();
+    if compressed_len < raw_len {
+        fs::rename(&compressed_path, dest)?;
+        fs::remove_file(raw)?;
+    } else {
+        fs::remove_file(&compressed_path)?;
+        fs::rename(raw, dest)?;
+    }
+    Ok(())
+}
+
+impl Drop for SegmentWriter {
+    /// An abandoned build (an error mid-compaction, a writer dropped
+    /// without `finalize`) leaves no partial files behind, and removes the
+    /// output directory too if nothing else is in it.
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.doc_store = None;
+        let _ = fs::remove_dir_all(self.build_dir());
+        let _ = fs::remove_dir(&self.output_dir);
+    }
 }
 
 // ─── Doc vectors sidecar (#243) ─────────────────────────────────────────────
@@ -2191,7 +2655,7 @@ pub struct ScoringBlockSummary {
 /// positions bytes: per posting (same ordinal order), n_positions +
 ///                  position deltas — read only by the full-postings path
 /// ```
-fn write_postings_skip_split(out: &mut Vec<u8>, postings: &[Posting], doc_records: &[DocRecord]) {
+fn write_postings_skip_split(out: &mut Vec<u8>, postings: &[Posting], field_lengths: &[u32]) {
     put_var_u32(out, postings.len() as u32);
 
     let mut scoring: Vec<u8> = Vec::new();
@@ -2206,8 +2670,8 @@ fn write_postings_skip_split(out: &mut Vec<u8>, postings: &[Posting], doc_record
             prev_doc = posting.doc_id;
             put_var_u32(&mut scoring, posting.term_frequency);
             max_tf = max_tf.max(posting.term_frequency);
-            if let Some(record) = doc_records.get(posting.doc_id as usize) {
-                min_fl = min_fl.min(record.field_length);
+            if let Some(&field_length) = field_lengths.get(posting.doc_id as usize) {
+                min_fl = min_fl.min(field_length);
             }
         }
         let last = block.last().expect("chunks yields non-empty blocks").doc_id;
@@ -4754,7 +5218,14 @@ mod tests {
             })
             .collect();
         let mut span = Vec::new();
-        write_postings_skip_split(&mut span, &postings, &doc_records);
+        write_postings_skip_split(
+            &mut span,
+            &postings,
+            &doc_records
+                .iter()
+                .map(|r| r.field_length)
+                .collect::<Vec<_>>(),
+        );
 
         let clean = BlockedTermPostings::parse(Arc::new(span.clone())).unwrap();
         let mut buf = Vec::new();
@@ -4805,7 +5276,14 @@ mod tests {
             })
             .collect();
         let mut span = Vec::new();
-        write_postings_skip_split(&mut span, &postings, &doc_records);
+        write_postings_skip_split(
+            &mut span,
+            &postings,
+            &doc_records
+                .iter()
+                .map(|r| r.field_length)
+                .collect::<Vec<_>>(),
+        );
 
         let clean = BlockedTermPostings::parse(Arc::new(span.clone())).unwrap();
         let (decoded, _) = clean.decode_full().unwrap();
@@ -6271,7 +6749,14 @@ mod tests {
             })
             .collect();
         let mut span = Vec::new();
-        write_postings_skip_split(&mut span, &postings, &doc_records);
+        write_postings_skip_split(
+            &mut span,
+            &postings,
+            &doc_records
+                .iter()
+                .map(|r| r.field_length)
+                .collect::<Vec<_>>(),
+        );
         let parsed = BlockedTermPostings::parse(Arc::new(span)).expect("span must parse");
 
         assert_eq!(parsed.doc_count(), 300);
@@ -6332,7 +6817,14 @@ mod tests {
             })
             .collect();
         let mut span = Vec::new();
-        write_postings_skip_split(&mut span, &postings, &doc_records);
+        write_postings_skip_split(
+            &mut span,
+            &postings,
+            &doc_records
+                .iter()
+                .map(|r| r.field_length)
+                .collect::<Vec<_>>(),
+        );
 
         for cut in 0..span.len() {
             let Some(parsed) = BlockedTermPostings::parse(Arc::new(span[..cut].to_vec())) else {
@@ -6719,6 +7211,199 @@ mod doc_vectors_tests {
             sidecar_ds + sidecar_dv < inline_ds / 2,
             "binary vectors are smaller than their JSON: {inline_ds} -> {}",
             sidecar_ds + sidecar_dv
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounded_build_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-bounded-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A few thousand docs with a Zipf-ish vocabulary: shared stopwords
+    /// (long posting lists across every run), mid-frequency words and
+    /// per-doc unique terms, plus filters and a vector.
+    fn corpus(n: usize) -> Vec<(DocumentId, Vec<Field>)> {
+        (0..n)
+            .map(|i| {
+                let text = format!(
+                    "the quick brown fox number {i} jumps over the lazy dog topic{} \
+                     unique{i}term the end word{}",
+                    i % 37,
+                    (i * 7919) % 1013
+                );
+                (
+                    DocumentId(format!("doc-{i:05}")),
+                    vec![
+                        Field::text("body", text),
+                        Field::keyword("bucket", format!("b{}", i % 11)),
+                        Field {
+                            name: "rank".into(),
+                            field_type: FieldType::Integer,
+                            value: (i % 97).to_string(),
+                        },
+                        Field {
+                            name: "emb".into(),
+                            field_type: FieldType::Vector,
+                            value: serde_json::to_string(&[
+                                (i % 13) as f32,
+                                1.0,
+                                (i % 5) as f32 * 0.5,
+                            ])
+                            .unwrap(),
+                        },
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    fn build(
+        dir: &Path,
+        budget: usize,
+        docs: &[(DocumentId, Vec<Field>)],
+    ) -> (Footer, usize, usize) {
+        let mut w = SegmentWriter::new(SegmentId("seg".into()), dir.to_path_buf())
+            .with_build_memory_bytes(budget);
+        for (id, fields) in docs {
+            w.add_document(id.clone(), fields.clone());
+        }
+        let runs = w.spilled_runs();
+        let peak = w.peak_inverted_bytes();
+        (w.finalize(Bm25Params::default()).unwrap(), runs, peak)
+    }
+
+    fn files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().unwrap().is_file())
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                (name, fs::read(e.path()).unwrap())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The spill path must be invisible in the output: a segment built with
+    /// a tiny budget (dozens of runs) is byte-for-byte the segment built
+    /// fully in memory, footer aside from its timestamp.
+    #[test]
+    fn spilled_build_is_byte_identical_to_in_memory_build() {
+        let docs = corpus(3_000);
+        let (a_dir, b_dir) = (scratch("mem"), scratch("spill"));
+        let (fa, runs_a, _) = build(&a_dir, usize::MAX, &docs);
+        let (fb, runs_b, _) = build(&b_dir, 64 * 1024, &docs);
+        assert_eq!(runs_a, 0);
+        assert!(runs_b >= 10, "expected many runs, got {runs_b}");
+
+        let (a, b) = (files(&a_dir), files(&b_dir));
+        let names: Vec<&str> = a.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, b.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>());
+        assert!(names.iter().any(|n| n.starts_with("postings")), "{names:?}");
+        for ((name, x), (_, y)) in a.iter().zip(&b) {
+            if name == "footer.json" {
+                continue;
+            }
+            assert!(
+                x == y,
+                "{name} differs between in-memory and spilled builds"
+            );
+        }
+        let mut fa_json = serde_json::to_value(&fa).unwrap();
+        let mut fb_json = serde_json::to_value(&fb).unwrap();
+        fa_json["created_at"] = serde_json::Value::Null;
+        fb_json["created_at"] = serde_json::Value::Null;
+        assert_eq!(fa_json, fb_json);
+        assert!(!b_dir.join(BUILD_DIR).exists(), "scratch removed");
+
+        // And it reads back: postings, blooms and stored docs.
+        let r = SegmentReader::open(b_dir.clone()).unwrap();
+        assert_eq!(r.doc_count(), 3_000);
+        let the = r.postings("the").unwrap();
+        assert_eq!(the.len(), 3_000);
+        assert!(the.windows(2).all(|w| w[0].doc_id < w[1].doc_id));
+        assert_eq!(the[42].positions, vec![0, 8, 13]);
+        assert_eq!(r.postings("unique1234term").unwrap()[0].doc_id, 1234);
+        assert!(fb
+            .term_bloom
+            .as_ref()
+            .unwrap()
+            .may_contain("unique2999term"));
+        let rec = r.doc_record_full(2_999).unwrap().unwrap();
+        assert_eq!(rec.doc_id.0, "doc-02999");
+        fs::remove_dir_all(a_dir).unwrap();
+        fs::remove_dir_all(b_dir).unwrap();
+    }
+
+    /// The in-memory postings never exceed the budget by more than one
+    /// document's worth before a spill.
+    #[test]
+    fn in_memory_postings_stay_within_budget() {
+        let docs = corpus(2_000);
+        let dir = scratch("budget");
+        let budget = 32 * 1024;
+        let (_, runs, peak) = build(&dir, budget, &docs);
+        assert!(runs > 0);
+        assert!(peak <= budget + 4 * 1024, "peak {peak} vs budget {budget}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn abandoned_build_leaves_nothing_behind() {
+        let dir = scratch("abandon");
+        {
+            let mut w = SegmentWriter::new(SegmentId("seg".into()), dir.clone())
+                .with_build_memory_bytes(1024);
+            for (id, fields) in corpus(200) {
+                w.add_document(id, fields);
+            }
+            assert!(w.spilled_runs() > 0);
+            assert!(dir.join(BUILD_DIR).join("doc_store.bin").exists());
+        }
+        assert!(!dir.exists(), "partial build removed on drop");
+    }
+
+    #[test]
+    fn empty_segment_still_writes_empty_doc_store() {
+        let dir = scratch("empty");
+        let w = SegmentWriter::new(SegmentId("seg".into()), dir.clone());
+        let footer = w.finalize(Bm25Params::default()).unwrap();
+        assert_eq!(footer.doc_count, 0);
+        assert_eq!(
+            fs::read(dir.join("doc_store.bin")).unwrap(),
+            0u32.to_le_bytes()
+        );
+        assert!(!dir.join(BUILD_DIR).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn parse_build_memory_bytes() {
+        assert_eq!(
+            parse_segment_build_memory_bytes(None),
+            DEFAULT_SEGMENT_BUILD_MEMORY_BYTES
+        );
+        assert_eq!(parse_segment_build_memory_bytes(Some("1048576")), 1_048_576);
+        assert_eq!(
+            parse_segment_build_memory_bytes(Some("0")),
+            DEFAULT_SEGMENT_BUILD_MEMORY_BYTES
+        );
+        assert_eq!(
+            parse_segment_build_memory_bytes(Some("lots")),
+            DEFAULT_SEGMENT_BUILD_MEMORY_BYTES
         );
     }
 }
