@@ -59,13 +59,160 @@ selected profile → default `http://localhost:8080`.
 | `kosha health` | `GET /v1/healthz` |
 | `kosha stats [-n NS]` | Global or per-namespace stats |
 | `kosha index -n NS --file docs.jsonl` | Bulk index (JSONL or `--doc '{…}'`) |
-| `kosha search -n NS "query" [--max 10] [--filter '…']` | BM25 search |
+| `kosha search -n NS "query" [flags]` | BM25, kNN or hybrid search (see [Search](#search)) |
 | `kosha search -n NS --body @query.json` | Full `SearchQuery` JSON |
+| `kosha exists -n NS DOC_ID…` | `POST /v1/namespaces/{ns}/exists`; exit status 1 if any id is missing |
 | `kosha flush [-n NS]` | Flush buffer (omit ns = flush all via legacy `/flush`) |
 | `kosha delete -n NS --filter '{…}'` | Delete by filter |
+| `kosha compact -n TENANT/NS [--mode tiered\|full] [--wait]` | Start a compaction job (admin) |
+| `kosha compaction-status [--job ID]` | Scheduler overview, or one job (admin) |
+| `kosha import -n TENANT/NS --source s3 [--overwrite]` | Rebuild a manifest from S3 segment footers (admin) |
+| `kosha admin create-api-key --tenant T [--description D]` | Create a tenant API key (admin, Postgres only) |
+| `kosha rebuild-filter-blooms -n NS` | Rebuild segment filter blooms (admin) |
+| `kosha backfill-offset-tables -n NS` | Backfill `doc_store.offsets` (admin) |
 | `kosha curl METHOD PATH [--body @file]` | Raw REST escape hatch |
+| `kosha profile list\|show\|set-default` | Manage connection profiles |
 
-Add `--json` for machine-readable output.
+Add `--json` to any command for machine-readable output: it prints the
+server's response as is (for `compact --wait`, the finished job record).
+Usage mistakes — conflicting flags, a bad `--sort` order, a cursor that does
+not match the sort keys — are reported by the CLI with exit status 2 before
+any request is sent.
+
+### Search
+
+Every flag below except `--max` is an alternative to setting the same
+`SearchQuery` field in `--body`, so each one conflicts with `--body`. JSON
+flags accept inline JSON or `@file.json`, the convention `--body` uses.
+
+| Flag | `SearchQuery` field |
+|------|---------------------|
+| `--max N` (default 10) | `max_results` |
+| `--from N` | `from` (ignored by the server when `--search-after` is set) |
+| `--filter JSON` | `filter` |
+| `--exact` | `exact_total_hits: true` |
+| `--or` | `operator: "or"` |
+| `--sort FIELD[:asc\|:desc]` (repeatable) | `sort`, in flag order; a bare field sorts ascending; `_score` and `_id` work too |
+| `--search-after VALUE` (repeatable) | `search_after`; one value per `--sort`, or a single `_id` without `--sort` |
+| `--knn-field F --knn-vector JSON\|@FILE` | `knn.field`, `knn.vector` |
+| `--k N` | `knn.k` (default `--from` + `--max`) |
+| `--num-candidates N` | `knn.num_candidates` (default max(100, k)) |
+| `--knn-filter JSON` | `knn.filter` (applies to the kNN leg only) |
+| `--highlight FIELD [--pre-tag T] [--post-tag T]` | `highlight` (tags default to `<b>` / `</b>`) |
+| `--aggs JSON` | `aggs`, e.g. `'{"by_year":{"terms":{"field":"year"}}}'` |
+| `--no-cache` | `no_cache: true` (bypass the server's result cache) |
+
+A query string with no `--knn-*` flags is lexical (BM25); `--knn-*` with no
+query string is a pure vector search; both together is **hybrid** — the two
+result lists are fused with Reciprocal Rank Fusion.
+
+```bash
+# Vector search (examples/vectors.jsonl has a 4-dimensional `embedding` field)
+kosha index -n vec-demo --file crates/kosha-cli/examples/vectors.jsonl
+kosha flush -n vec-demo
+kosha search -n vec-demo --knn-field embedding --knn-vector '[0.85,0.15,0,0.05]' --max 3
+
+# Hybrid: BM25 on "contract" fused with kNN; the vector read from a file
+echo '[0.1,0.9,0.1,0]' > q.json
+kosha search -n vec-demo "contract" --knn-field embedding --knn-vector @q.json
+
+# Sorted pages with a cursor. Plain output ends with the flags for the next page:
+kosha search -n vec-demo "the" --or --sort year:desc --sort _id --max 2
+#   …
+#   next page: --search-after 2020 --search-after vec-3
+kosha search -n vec-demo "the" --or --sort year:desc --sort _id --max 2 \
+  --search-after 2020 --search-after vec-3
+
+# Highlighting and aggregations
+kosha search -n vec-demo "contract" --highlight content --pre-tag '[' --post-tag ']'
+kosha search -n vec-demo "the" --or --aggs '{"by_year":{"terms":{"field":"year"}}}'
+```
+
+The `next page:` line appears only for a sorted, full page; a score-ordered
+page has no stable cursor, so page it with `--from`.
+
+### Exists
+
+```bash
+kosha exists -n quickstart-demo doc-1           # prints "exists", exit 0
+kosha exists -n quickstart-demo doc-1 doc-404   # one line per id, exit 1
+kosha --json exists -n quickstart-demo doc-404  # {"existing":[],"missing":["doc-404"],…}, exit 1
+```
+
+### Admin commands
+
+`compact`, `compaction-status`, `import`, `admin create-api-key`,
+`rebuild-filter-blooms` and `backfill-offset-tables` call `/v1/admin/*`, which
+the server only accepts with its `KOSHA_ADMIN_API_KEY`. Pass that key the same
+way as any other (`--api-key`, `KOSHA_API_KEY`, or a profile — a separate
+`admin` profile works well). The local `docker compose` stack sets it to
+`sk-kosha-admin-dev`. A refused key, or a server without the backend a route
+needs (Postgres for API keys, S3 for import), is reported in plain words
+rather than as a bare status code.
+
+Admin requests do not run as the tenant that owns the data, so name the
+namespace as it is stored, with its tenant prefix: `default/my-ns` for a
+namespace created with the bootstrap `KOSHA_API_KEY`.
+
+```bash
+export KOSHA_API_KEY=sk-kosha-admin-dev
+
+# Compaction runs as a background job on the server
+kosha compact -n default/quickstart-demo                # prints the job id
+kosha compaction-status --job cj-1795125506152-1        # one job
+kosha compaction-status                                 # scheduler + every namespace
+kosha compact -n default/quickstart-demo --mode full --wait --timeout 1800
+
+# Disaster recovery: rebuild a manifest from the segment footers in S3
+kosha import -n default/quickstart-demo --source s3
+kosha import -n default/quickstart-demo --source s3 --overwrite   # replace a live manifest
+
+# Create a tenant key. The key alone goes to stdout (notes go to stderr),
+# and it is shown only this once:
+NEW_KEY=$(kosha admin create-api-key --tenant acme --description "staging")
+```
+
+`compact --wait` polls `GET /v1/admin/compaction-jobs/{id}` every
+`--poll-interval` seconds (default 2) and gives up after `--timeout` seconds
+(default 3600); the job itself keeps running on the server. It exits non-zero
+if the job failed. `import` waits up to `--timeout` seconds (default 600) for
+the server, since it fetches every segment footer first.
+
+`scripts/create_api_key.py` is now a thin wrapper around
+`kosha admin create-api-key`.
+
+## Shell completions
+
+`kosha completions <bash|zsh|fish|powershell|elvish>` prints a completion
+script to stdout (the command is hidden from `--help`).
+
+```bash
+# bash (needs bash-completion; or source it from ~/.bashrc)
+kosha completions bash > ~/.local/share/bash-completion/completions/kosha
+# zsh (any directory on $fpath, before compinit runs)
+kosha completions zsh > "${fpath[1]}/_kosha"
+# fish
+kosha completions fish > ~/.config/fish/completions/kosha.fish
+# PowerShell
+kosha completions powershell >> $PROFILE
+# elvish
+kosha completions elvish >> ~/.config/elvish/rc.elv
+```
+
+## Man page
+
+`kosha man` prints the `kosha(1)` page (roff) to stdout;
+`kosha man --out-dir DIR` writes it plus one `kosha-<command>(1)` page per
+subcommand, which is where each command's flags are documented.
+
+```bash
+man -l <(kosha man)                        # Linux (man-db)
+kosha man | mandoc -a                      # macOS / BSD
+kosha man --out-dir /usr/local/share/man/man1
+```
+
+`make cli-assets` builds the release binary and writes every completion
+script and man page into `target/cli-assets/`, for packaging.
 
 ### Document formats
 

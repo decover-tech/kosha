@@ -289,10 +289,16 @@ kosha index -n quickstart-demo --file crates/kosha-cli/examples/docs.jsonl
 kosha flush -n quickstart-demo
 kosha search -n quickstart-demo "breach"
 kosha stats -n quickstart-demo
+
+# Vector search (the example docs carry a 4-dimensional `embedding`)
+kosha index -n quickstart-demo --file crates/kosha-cli/examples/vectors.jsonl
+kosha flush -n quickstart-demo
+kosha search -n quickstart-demo --knn-field embedding --knn-vector '[0.85,0.15,0,0.05]'
 ```
 
 See [crates/kosha-cli/README.md](crates/kosha-cli/README.md) for profiles
-(`~/.kosha/config.toml`), `--json` output, and the `kosha curl` escape hatch.
+(`~/.kosha/config.toml`), `--json` output, hybrid search / sort / cursor
+flags, admin commands, shell completions, and the `kosha curl` escape hatch.
 
 The Python client ([`kosha-client` on PyPI](https://pypi.org/project/kosha-client/))
 still works the same way for application code:
