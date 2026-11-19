@@ -2400,13 +2400,36 @@ impl AppState {
         let (footer_files, footer_bytes) =
             self.ensure_files_local(&missing_manifest_footer_paths, "footer.json", request);
 
+        // Persisted manifests no longer carry footers (#241), so the
+        // fallback above is now the normal path for segments this pod has
+        // not seen yet. Parse each such footer once and cache it on the
+        // in-memory manifest: later queries (and later manifest versions,
+        // via `restore_manifest`'s carry-over) skip both the S3 fetch and
+        // the local parse for it.
+        let fetched_footers: HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>> = manifest
+            .segments
+            .iter()
+            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
+            .filter_map(|entry| {
+                let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                let footer = SegmentReader::read_footer(&seg_path).ok()?;
+                // A footer.json from a different segment id (a corrupt or
+                // misplaced file) must not be cached under this id.
+                (footer.segment_id == entry.segment_id)
+                    .then(|| (entry.segment_id.clone(), Arc::new(footer)))
+            })
+            .collect();
+        if !fetched_footers.is_empty() {
+            self.indexer
+                .remember_segment_footers(ns, fetched_footers.values().cloned());
+        }
+
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
             if needs_bloom_check {
                 let footer = manifest
                     .segment_footer(&entry.segment_id)
-                    .cloned()
-                    .or_else(|| SegmentReader::read_footer(&seg_path).ok());
+                    .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
                 if let Some(footer) = footer.as_ref() {
                     if let Some(ref filter) = query.filter {
                         if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
@@ -5274,7 +5297,7 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
             segment_id: footer.segment_id.clone(),
             doc_count: footer.doc_count,
         });
-        segment_footers.insert(footer.segment_id.clone(), footer);
+        segment_footers.insert(footer.segment_id.clone(), std::sync::Arc::new(footer));
     }
     kosha_core::Manifest {
         version: 1,
@@ -8489,8 +8512,8 @@ mod tests {
         assert_eq!(
             m.segment_footers.len(),
             3,
-            "every footer must ride along (manifest-carried footers skip \
-             the footer-first hydration phase on cold search)"
+            "every footer is cached in memory on the importing pod (not \
+             persisted — #241), so its first searches skip footer hydration"
         );
     }
 

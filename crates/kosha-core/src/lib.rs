@@ -1,5 +1,6 @@
 pub mod deletes;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -954,12 +955,24 @@ pub struct ManifestEntry {
 pub struct Manifest {
     pub version: u64,
     pub segments: Vec<ManifestEntry>,
-    /// Optional per-segment footer snapshot for search-time pruning/open.
+    /// In-memory cache of parsed per-segment footers for search-time
+    /// pruning/open. Readers fall back to `footer.json` when an entry is
+    /// missing.
     ///
-    /// Older persisted manifests do not contain this field; readers fall
-    /// back to `footer.json` when an entry is missing.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub segment_footers: HashMap<SegmentId, Footer>,
+    /// **Never persisted** (issue #241). Footers carry the filter and term
+    /// blooms (up to [`BLOOM_MAX_BYTES`] per field), so inlining them made
+    /// every publish rewrite O(segments × footer size) bytes into the
+    /// control store — a 12 MB row at 1,529 segments. `footer.json` in the
+    /// segment prefix is the source of truth; segments are immutable, so a
+    /// parsed footer stays valid for the life of its segment id and is
+    /// carried across manifest versions by
+    /// [`Manifest::carry_segment_footers_from`].
+    ///
+    /// Still *deserialized* so manifests written before #241 (which inline
+    /// footers) keep their warm-start benefit until the next publish.
+    /// Stored as `Arc` so cloning a manifest per request stays cheap.
+    #[serde(default, skip_serializing)]
+    pub segment_footers: HashMap<SegmentId, Arc<Footer>>,
     /// WAL records through this sequence are represented by this manifest.
     #[serde(default)]
     pub wal_checkpoint: u64,
@@ -994,12 +1007,50 @@ impl Manifest {
     }
 
     pub fn segment_footer(&self, segment_id: &SegmentId) -> Option<&Footer> {
-        self.segment_footers.get(segment_id)
+        self.segment_footers.get(segment_id).map(Arc::as_ref)
     }
 
-    pub fn remember_segment_footer(&mut self, footer: Footer) {
+    pub fn remember_segment_footer(&mut self, footer: impl Into<Arc<Footer>>) {
+        let footer = footer.into();
         self.segment_footers
             .insert(footer.segment_id.clone(), footer);
+    }
+
+    /// Cache a footer only if its segment is listed in this manifest and no
+    /// footer is cached for it yet. Returns whether it was inserted.
+    pub fn remember_listed_segment_footer(&mut self, footer: impl Into<Arc<Footer>>) -> bool {
+        let footer = footer.into();
+        if self.segment_footers.contains_key(&footer.segment_id)
+            || !self
+                .segments
+                .iter()
+                .any(|entry| entry.segment_id == footer.segment_id)
+        {
+            return false;
+        }
+        self.segment_footers
+            .insert(footer.segment_id.clone(), footer);
+        true
+    }
+
+    /// Reuse already-parsed footers from `previous` for every segment this
+    /// manifest still lists but has no footer for, and drop cached footers
+    /// for segments it no longer lists. Segments are immutable, so a footer
+    /// keyed by segment id never goes stale. Zero I/O.
+    pub fn carry_segment_footers_from(&mut self, previous: &Manifest) {
+        let listed: std::collections::HashSet<&SegmentId> = self
+            .segments
+            .iter()
+            .map(|entry| &entry.segment_id)
+            .collect();
+        self.segment_footers.retain(|id, _| listed.contains(id));
+        for id in listed {
+            if !self.segment_footers.contains_key(id) {
+                if let Some(footer) = previous.segment_footers.get(id) {
+                    self.segment_footers.insert(id.clone(), Arc::clone(footer));
+                }
+            }
+        }
     }
 }
 
@@ -1447,6 +1498,132 @@ mod tests {
         let back: BloomFilter = serde_json::from_str(&json).unwrap();
         assert!(back.may_contain("matter-a"));
         assert!(!back.may_contain("matter-absent"));
+    }
+
+    fn bloomy_footer(id: &str, docs: u32) -> Footer {
+        let values: Vec<String> = (0..1_000).map(|i| format!("{id}-value-{i}")).collect();
+        let mut filter_blooms = HashMap::new();
+        filter_blooms.insert(
+            "status".to_string(),
+            BloomFilter::build(values.iter().map(String::as_str)),
+        );
+        Footer {
+            segment_id: SegmentId(id.to_string()),
+            doc_count: docs,
+            total_field_length: 10,
+            avg_field_length: 1.0,
+            bm25_params: Bm25Params::default(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            filter_blooms: Some(filter_blooms),
+            term_bloom: Some(BloomFilter::build(values.iter().map(String::as_str))),
+            format_version: SEGMENT_FORMAT_VERSION,
+            text_filter_ignore_above: Some(256),
+        }
+    }
+
+    fn manifest_with(ids: &[&str]) -> Manifest {
+        Manifest {
+            version: 7,
+            segments: ids
+                .iter()
+                .map(|id| ManifestEntry {
+                    segment_id: SegmentId(id.to_string()),
+                    doc_count: 1_000,
+                })
+                .collect(),
+            segment_footers: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        }
+    }
+
+    /// #241: footers are an in-memory cache, never part of the persisted
+    /// manifest, so a publish costs O(segments × ~100 B), not
+    /// O(segments × footer size).
+    #[test]
+    fn persisted_manifest_excludes_segment_footers() {
+        let mut m = manifest_with(&["s1"]);
+        m.remember_segment_footer(bloomy_footer("s1", 1_000));
+        assert!(m.segment_footer(&SegmentId("s1".into())).is_some());
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("segment_footers"), "{json}");
+        assert!(!json.contains("bits_b64"), "no bloom bytes in the row");
+        let back: Manifest = serde_json::from_str(&json).unwrap();
+        assert!(back.segment_footers.is_empty());
+        assert!(
+            back.same_contents(&m),
+            "footers must not affect CAS idempotency checks"
+        );
+    }
+
+    /// Acceptance criterion from #241: a 1,500-segment manifest is < 200 KB,
+    /// even when every segment's footer (with blooms) is cached in memory.
+    #[test]
+    fn fifteen_hundred_segment_manifest_row_is_under_200kb() {
+        let ids: Vec<String> = (0..1_500)
+            .map(|i| format!("paragraph_index_hnsw-{i:06x}"))
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut m = manifest_with(&refs);
+        for id in &ids {
+            m.remember_segment_footer(bloomy_footer(id, 1_000));
+        }
+        let bytes = serde_json::to_vec(&m).unwrap().len();
+        assert!(bytes < 200 * 1024, "manifest row is {bytes} bytes");
+        assert!(
+            bytes / 1_500 < 100,
+            "~{} B per segment row, want < 100",
+            bytes / 1_500
+        );
+    }
+
+    /// Manifests written before #241 inline footers; they must still load,
+    /// and keep the footers as a warm cache until the next publish.
+    #[test]
+    fn legacy_manifest_with_inline_footers_still_deserializes() {
+        let legacy = serde_json::json!({
+            "version": 3,
+            "segments": [{"segment_id": "s1", "doc_count": 1000}],
+            "segment_footers": {"s1": bloomy_footer("s1", 1000)},
+        });
+        let m: Manifest = serde_json::from_value(legacy).unwrap();
+        let footer = m.segment_footer(&SegmentId("s1".into())).unwrap();
+        assert!(footer.filter_blooms.is_some());
+        assert!(!serde_json::to_string(&m).unwrap().contains("bits_b64"));
+    }
+
+    #[test]
+    fn carry_segment_footers_keeps_listed_and_drops_unlisted() {
+        let mut prev = manifest_with(&["s1", "s2"]);
+        prev.remember_segment_footer(bloomy_footer("s1", 1));
+        prev.remember_segment_footer(bloomy_footer("s2", 2));
+
+        // s2 compacted away into s3; s1 survives.
+        let mut next = manifest_with(&["s1", "s3"]);
+        next.remember_segment_footer(bloomy_footer("s2", 2)); // stale entry
+        next.carry_segment_footers_from(&prev);
+
+        let s1 = SegmentId("s1".into());
+        assert!(Arc::ptr_eq(
+            &next.segment_footers[&s1],
+            &prev.segment_footers[&s1]
+        ));
+        assert!(!next.segment_footers.contains_key(&SegmentId("s2".into())));
+        assert!(!next.segment_footers.contains_key(&SegmentId("s3".into())));
+    }
+
+    #[test]
+    fn remember_listed_segment_footer_ignores_unlisted_and_existing() {
+        let mut m = manifest_with(&["s1"]);
+        assert!(!m.remember_listed_segment_footer(bloomy_footer("other", 1)));
+        assert!(m.remember_listed_segment_footer(bloomy_footer("s1", 1)));
+        assert!(!m.remember_listed_segment_footer(bloomy_footer("s1", 99)));
+        assert_eq!(
+            m.segment_footer(&SegmentId("s1".into())).unwrap().doc_count,
+            1
+        );
     }
 
     #[test]
