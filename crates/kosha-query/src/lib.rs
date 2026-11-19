@@ -12144,6 +12144,13 @@ mod analyzer_tests {
         // A term only the Unicode tokenizer splits out reaches only the new
         // segment (the old one never indexed it) — and still hits there.
         assert_eq!(hits(&root, &manifest, &query("world")), ["n1"]);
+        // Phrases use the new tokenizer's positions: `hello,world` is two
+        // adjacent tokens in the Unicode segment, one token in the old one.
+        assert_eq!(hits(&root, &manifest, &phrase("hello world")), ["n1"]);
+        assert_eq!(hits(&root, &manifest, &phrase("hello,world again")), ["n1"]);
+        assert_eq!(hits(&root, &manifest, &phrase("world again")), ["n1"]);
+        assert!(hits(&root, &manifest, &phrase("again hello")).is_empty());
+        assert_eq!(hits(&root, &manifest, &phrase("hello,world from")), ["d1"]);
         // Segment-level statistics take the same per-segment path.
         let mut q = query("hello,world");
         q.bm25_params.stats = Some(Bm25StatsScope::Segment);
