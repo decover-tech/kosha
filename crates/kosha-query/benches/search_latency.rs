@@ -83,6 +83,7 @@ fn build_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        branch: None,
         schema: None,
     };
     (ns, manifest)
@@ -158,6 +159,7 @@ fn build_term_bloom_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         },
     )
@@ -209,6 +211,7 @@ fn build_broad_query_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         },
     )
@@ -474,6 +477,7 @@ fn build_many_segment_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         },
     )

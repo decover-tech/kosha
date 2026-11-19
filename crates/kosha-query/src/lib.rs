@@ -1658,9 +1658,8 @@ impl Searcher {
             .segments
             .iter()
             .filter(|entry| {
-                self.data_dir
-                    .join(&namespace.0)
-                    .join(&entry.segment_id.0)
+                manifest
+                    .segment_dir(&self.data_dir, namespace, &entry.segment_id)
                     .exists()
             })
             .collect();
@@ -1678,7 +1677,8 @@ impl Searcher {
                     already_cached += 1;
                     0
                 } else {
-                    let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                    let seg_dir =
+                        manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
                     approx_segment_bytes(&seg_dir, load_vectors)
                 }
             })
@@ -1705,7 +1705,7 @@ impl Searcher {
             // for this call's duration too, protecting it from concurrent
             // eviction by whatever else this same pass opens.
             let was_cached = self.segment_cache.contains(&key);
-            let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+            let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
             match self.open_segment(
                 &namespace.0,
                 &entry.segment_id.0,
@@ -1790,7 +1790,7 @@ impl Searcher {
             .segments
             .par_iter()
             .filter_map(|entry| {
-                let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
                 if !seg_dir.exists() {
                     return None;
                 }
@@ -1871,8 +1871,9 @@ impl Searcher {
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
     ) -> Option<Arc<CorpusStats>> {
-        let seg_dir =
-            |entry: &ManifestEntry| self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+        let seg_dir = |entry: &ManifestEntry| {
+            manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id)
+        };
         let key = (
             namespace.0.clone(),
             manifest.version,
@@ -2122,8 +2123,9 @@ impl Searcher {
         open_stats: &OpenStatsCollector,
         corpus: Option<&Arc<CorpusStats>>,
     ) -> Vec<f64> {
-        let seg_dir =
-            |entry: &ManifestEntry| self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+        let seg_dir = |entry: &ManifestEntry| {
+            manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id)
+        };
         let key = (
             namespace.0.clone(),
             manifest.version,
@@ -2339,7 +2341,10 @@ impl Searcher {
         tombstones: Option<
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
-        manifest_footer: Option<&kosha_core::Footer>,
+        // The manifest listing the segment: where its files live (a
+        // branch's inherited segment is in its parent's prefix, #208) and
+        // its cached footer.
+        manifest: &Manifest,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
         // `Some((cutoff, effective_budget))` = a global probe budget was
@@ -2361,7 +2366,8 @@ impl Searcher {
         // ceiling (issue #248); `None` prunes against the local floor only.
         shared_wand: Option<SharedWand<'_>>,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
-        let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+        let manifest_footer = manifest.segment_footer(&entry.segment_id);
+        let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
         if !seg_dir.exists() {
             return Ok(None);
         }
@@ -4017,7 +4023,7 @@ impl Searcher {
             .segments
             .iter()
             .map(|entry| {
-                let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
                 let key = (
                     namespace.0.clone(),
                     entry.segment_id.0.clone(),
@@ -4137,7 +4143,7 @@ impl Searcher {
                 term_prune,
                 &sort_value_fields,
                 tombstones,
-                manifest.segment_footer(&entry.segment_id),
+                manifest,
                 &permit,
                 &open_stats,
                 knn_cutoff,
@@ -6054,6 +6060,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         for (segment, docs) in [
@@ -6261,6 +6268,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -6396,6 +6404,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -6488,6 +6497,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -6659,6 +6669,7 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
                 schema: None,
             },
             all,
@@ -6921,6 +6932,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
 
@@ -7088,6 +7100,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let result = searcher.search(
@@ -7144,6 +7157,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -7217,6 +7231,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -7305,6 +7320,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let result = searcher
@@ -7390,6 +7406,7 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
                 schema: None,
             },
         )
@@ -7786,6 +7803,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -7866,6 +7884,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -7955,6 +7974,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
 
@@ -8075,6 +8095,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -8142,6 +8163,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -8197,6 +8219,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -8369,6 +8392,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -8497,6 +8521,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -8569,6 +8594,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -8636,6 +8662,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -8708,6 +8735,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         (dir, manifest)
@@ -8828,6 +8856,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         // Fresh searcher (no warm in-memory segment cache) so opening the
@@ -8909,6 +8938,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         // Fresh searcher so each segment is actually opened (Lazy), not
@@ -9030,6 +9060,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -9082,6 +9113,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -9142,6 +9174,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -9241,6 +9274,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -9287,6 +9321,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -9348,6 +9383,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         }
     }
@@ -9402,6 +9438,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         }
     }
@@ -9592,6 +9629,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -9725,6 +9763,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -9897,6 +9936,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -10058,6 +10098,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
 
@@ -10154,6 +10195,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -10209,6 +10251,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -10350,6 +10393,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -10415,6 +10459,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -10599,6 +10644,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -10650,6 +10696,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -10758,6 +10805,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -10840,6 +10888,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -10967,6 +11016,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -11039,6 +11089,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -11094,6 +11145,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -11172,6 +11224,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -11266,6 +11319,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -11347,6 +11401,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let searcher = Searcher::new(dir.clone());
@@ -11452,6 +11507,7 @@ mod corpus_stats_tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         }
     }
@@ -12540,6 +12596,7 @@ mod rrf_tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let mut locations = HashMap::new();
@@ -13139,6 +13196,7 @@ mod rrf_tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         for (g, docs) in groups.iter().enumerate() {
@@ -13296,6 +13354,7 @@ mod analyzer_tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         }
     }

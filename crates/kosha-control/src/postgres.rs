@@ -58,6 +58,7 @@ fn decode_manifest(version: u64, segments_json: &str) -> Option<Manifest> {
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        branch: None,
         schema: None,
     };
     for entry in entries {
@@ -392,6 +393,37 @@ impl ControlStore for PgStore {
             .map_err(|e| KoshaError::NotFound(e.to_string()))?;
 
             Ok(())
+        })
+    }
+
+    /// Both rows go in one transaction (the manifest row first: it holds
+    /// the foreign key), so a reader never sees a manifest without its
+    /// namespace or the reverse.
+    fn remove_namespace(&mut self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
+        let id_str = id.0.clone();
+        self.rt.block_on(async {
+            let mut tx = self.pool.begin().await.map_err(control_plane_error)?;
+            let row: Option<(i64, String)> = sqlx::query_as(
+                "DELETE FROM kosha.manifests WHERE namespace_id = $1 \
+                 RETURNING version, segments_json",
+            )
+            .bind(&id_str)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(control_plane_error)?;
+            let deleted = sqlx::query("DELETE FROM kosha.namespaces WHERE id = $1")
+                .bind(&id_str)
+                .execute(&mut *tx)
+                .await
+                .map_err(control_plane_error)?;
+            tx.commit().await.map_err(control_plane_error)?;
+            if deleted.rows_affected() == 0 && row.is_none() {
+                return Ok(None);
+            }
+            Ok(Some(
+                row.and_then(|(version, json)| decode_manifest(version as u64, &json))
+                    .unwrap_or_else(|| decode_manifest(0, "[]").expect("empty manifest")),
+            ))
         })
     }
 

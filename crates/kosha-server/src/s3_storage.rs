@@ -521,6 +521,26 @@ impl S3Storage {
         })
     }
 
+    /// Delete one object by logical path from S3 only (the local cache
+    /// copy, if any, is the caller's business). Unlike
+    /// `StorageBackend::delete`, a failure is reported: branch deletion
+    /// (#208) tells the caller which objects it could not reclaim.
+    pub fn delete_remote(&self, path: &str) -> Result<(), KoshaError> {
+        let key = self.s3_key(path);
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        self.rt.block_on(async move {
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| KoshaError::NotFound(format!("S3 delete_object {key}: {e}")))
+        })
+    }
+
     /// Immediate child "directories" under a logical path — the S3
     /// common-prefix listing (delimiter `/`), fully paginated. For a
     /// namespace path this returns its segment ids. `list_with_sizes`

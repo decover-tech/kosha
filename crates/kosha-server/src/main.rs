@@ -23,6 +23,7 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 }
 
 mod auth;
+mod branching;
 mod compaction_sched;
 #[cfg(feature = "s3")]
 mod hydration_budget;
@@ -54,6 +55,10 @@ struct AppState {
     admin_auth_key: Option<String>,
     internal_service_key: Option<String>,
     publication_locks: Mutex<HashMap<NamespaceId, Arc<Mutex<()>>>>,
+    /// Serializes namespace branch creation and deletion (#208), so a
+    /// deletion's reference set cannot miss a branch being created from
+    /// the namespace it deletes.
+    branch_lock: Mutex<()>,
     /// Hydrated segment files that failed their `_COMMIT` size/CRC check
     /// (#231), counting refetch failures again. Reported in `/stats`.
     #[cfg(feature = "s3")]
@@ -714,8 +719,22 @@ fn segments_needing_sync<'a>(
     manifest
         .segments
         .iter()
-        .filter(|e| !synced.contains(&(ns.clone(), e.segment_id.clone())))
+        // A branch's inherited segment is durable by construction: it was
+        // listed by a published parent manifest (#208).
+        .filter(|e| !manifest.is_inherited_segment(ns, &e.segment_id))
+        .filter(|e| !synced.contains(&synced_key(manifest, ns, &e.segment_id)))
         .collect()
+}
+
+/// `synced_segments` key: the segment's *home* namespace and id, so a
+/// branch and its parent share one durability record per object (#208).
+#[cfg(feature = "s3")]
+fn synced_key(
+    manifest: &kosha_core::Manifest,
+    ns: &NamespaceId,
+    segment: &kosha_core::SegmentId,
+) -> (NamespaceId, kosha_core::SegmentId) {
+    (manifest.segment_home(ns, segment).clone(), segment.clone())
 }
 
 /// How many times one publish rebases onto a newer remote manifest before
@@ -1046,17 +1065,20 @@ impl AppState {
                     if is_ingest_role {
                         if let Some(ref s3) = s3_storage {
                             for entry in &manifest.segments {
-                                let rel = format!("{}/{}", ns.0, entry.segment_id.0);
+                                // A branch's inherited segment is checked
+                                // (and keyed) where it lives (#208).
+                                let rel = manifest.segment_rel_dir(&ns, &entry.segment_id);
+                                let key = synced_key(&manifest, &ns, &entry.segment_id);
                                 let durability = s3.segment_durability(&rel);
                                 if durability.is_durable() {
-                                    synced_segments.insert((ns.clone(), entry.segment_id.clone()));
+                                    synced_segments.insert(key);
                                     continue;
                                 }
-                                let seg_path = data_dir.join(&ns.0).join(&entry.segment_id.0);
+                                let seg_path =
+                                    manifest.segment_dir(&data_dir, &ns, &entry.segment_id);
                                 match sync_segment_dir_to_s3(s3, &data_dir, &seg_path) {
                                     Ok(()) => {
-                                        synced_segments
-                                            .insert((ns.clone(), entry.segment_id.clone()));
+                                        synced_segments.insert(key);
                                         reconciled_missing += 1;
                                         println!(
                                             "reconciliation: re-uploaded segment not durable in \
@@ -1240,6 +1262,7 @@ impl AppState {
                 .ok()
                 .filter(|k| !k.is_empty()),
             publication_locks: Mutex::new(HashMap::new()),
+            branch_lock: Mutex::new(()),
             #[cfg(feature = "s3")]
             segment_checksum_failures: std::sync::atomic::AtomicU64::new(0),
             indexer,
@@ -1576,7 +1599,7 @@ impl AppState {
                 let seg_paths: Vec<PathBuf> = manifest
                     .segments
                     .iter()
-                    .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+                    .map(|entry| manifest.segment_dir(&self.data_dir, &ns, &entry.segment_id))
                     .collect();
                 let mut blob_files = 0usize;
                 let mut blob_bytes = 0u64;
@@ -1820,7 +1843,10 @@ impl AppState {
         let stored = self.controller.lock().unwrap().manifest_version(ns)?;
         match stored {
             Some(stored) => self.follow_stored_version(ns, stored, observed_at, warm),
-            None => Ok(()),
+            None => {
+                self.forget_deleted_branch(ns);
+                Ok(())
+            }
         }
     }
 
@@ -1963,6 +1989,14 @@ impl AppState {
             }
         };
         let mut control_plane_ok = true;
+        // A loaded branch missing from a successful poll was deleted (#208).
+        let listed: std::collections::HashSet<&NamespaceId> =
+            versions.iter().map(|(ns, _)| ns).collect();
+        for ns in self.indexer.namespaces() {
+            if !listed.contains(&ns) {
+                self.forget_deleted_branch(&ns);
+            }
+        }
         for (ns, stored) in versions {
             match self.follow_stored_version(&ns, stored, observed_at, true) {
                 Ok(()) => {}
@@ -1992,14 +2026,7 @@ impl AppState {
         let Some(mut manifest) = self.controller.lock().unwrap().manifest_cloned(ns) else {
             return Ok(None);
         };
-        kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
-            let path = vector.path(ns, segment)?;
-            #[cfg(feature = "s3")]
-            if let Some(ref s3) = self.s3_storage {
-                return s3.read(&path);
-            }
-            Ok(std::fs::read(self.data_dir.join(path))?)
-        })?;
+        self.hydrate_deletes(ns, &mut manifest)?;
         Ok(Some(manifest))
     }
 
@@ -2033,7 +2060,7 @@ impl AppState {
             // upload for them.
             let mut synced = self.synced_segments.lock().unwrap();
             for entry in &manifest.segments {
-                synced.insert((ns.clone(), entry.segment_id.clone()));
+                synced.insert(synced_key(&manifest, ns, &entry.segment_id));
             }
         }
         self.indexer.restore_manifest(ns.clone(), manifest);
@@ -2121,7 +2148,7 @@ impl AppState {
                         // them and this node has nothing local to send.
                         let mut synced = self.synced_segments.lock().unwrap();
                         for entry in &remote.segments {
-                            synced.insert((ns.clone(), entry.segment_id.clone()));
+                            synced.insert(synced_key(&remote, ns, &entry.segment_id));
                         }
                     }
                     if self.indexer.rebase_onto(ns, remote)? == kosha_write::RebaseOutcome::Adopted
@@ -2174,7 +2201,7 @@ impl AppState {
             return Ok(());
         };
         for segment_id in pending {
-            let seg_path = self.data_dir.join(&ns.0).join(&segment_id.0);
+            let seg_path = manifest.segment_dir(&self.data_dir, ns, &segment_id);
             // Only mark synced once the segment is committed (`_COMMIT`
             // written last, #231). A partial upload must be retried by a
             // future publish call, never treated as durable.
@@ -2182,10 +2209,15 @@ impl AppState {
             self.synced_segments
                 .lock()
                 .unwrap()
-                .insert((ns.clone(), segment_id));
+                .insert(synced_key(manifest, ns, &segment_id));
         }
         if let Some(ref s3) = self.s3_storage {
             for (segment, vector) in &manifest.deletion_vectors {
+                // Inherited from a branch parent (#208): already durable in
+                // the parent's prefix, and not this namespace's to write.
+                if vector.is_inherited(ns) {
+                    continue;
+                }
                 let path = vector.path(ns, segment)?;
                 let bytes = std::fs::read(self.data_dir.join(&path))?;
                 s3.write(&path, &bytes)?;
@@ -2785,20 +2817,20 @@ impl AppState {
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
         let paths_with_manifest_footer: std::collections::HashSet<PathBuf> = manifest
             .segments
             .iter()
             .filter(|entry| manifest.segment_footer(&entry.segment_id).is_some())
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
 
         let missing_manifest_footer_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
             .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
 
         // A footer rewritten after commit (bloom rebuild) is recorded by CRC
@@ -2811,10 +2843,8 @@ impl AppState {
             if manifest.segment_footer(&entry.segment_id).is_some() {
                 continue;
             }
-            let path = self
-                .data_dir
-                .join(&ns.0)
-                .join(&entry.segment_id.0)
+            let path = manifest
+                .segment_dir(&self.data_dir, ns, &entry.segment_id)
                 .join("footer.json");
             if let Ok(bytes) = std::fs::read(&path) {
                 if crc32fast::hash(&bytes) != expected {
@@ -2841,7 +2871,7 @@ impl AppState {
             .iter()
             .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
             .filter_map(|entry| {
-                let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
                 let bytes = std::fs::read(seg_path.join("footer.json")).ok()?;
                 // Still not the recorded rewrite (e.g. S3 fetch failed and
                 // left nothing usable): don't cache or prune with it.
@@ -3192,7 +3222,7 @@ impl AppState {
             .segments
             .iter()
             .map(|entry| {
-                let dir = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
                 manifest
                     .footer_or_read(&entry.segment_id, || {
                         kosha_segment::SegmentReader::read_footer(&dir).ok()
@@ -3211,7 +3241,7 @@ impl AppState {
         let seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
         self.ensure_posting_blobs_local(ns, manifest.version, &seg_paths, &posting_files, request)
     }
@@ -4007,6 +4037,12 @@ fn is_write_path(request_line: &str) -> bool {
     if extract_namespace(request_line, "POST /v1/namespaces/", "/schema").is_some() {
         return true;
     }
+    // Branch create/delete (#208) write manifests and reclaim objects.
+    if extract_namespace(request_line, "POST /v1/namespaces/", "/branch").is_some()
+        || extract_namespace(request_line, "DELETE /v1/namespaces/", "/branch").is_some()
+    {
+        return true;
+    }
     // v1 admin routes — all mutate segment/manifest state.
     if request_line.starts_with("POST /v1/admin/") {
         return true;
@@ -4269,6 +4305,19 @@ fn route_inner(
         return handle_get_schema_with_ns(&ns, tenant, state);
     }
 
+    // ── Namespace branching (#208) ─────────────────────────────────────────
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/branch") {
+        return branching::handle_branch_create(&ns, tenant, body, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/branches") {
+        return branching::handle_branch_list(&ns, tenant, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "DELETE /v1/namespaces/", "/branch") {
+        return branching::handle_branch_delete(&ns, tenant, state);
+    }
+
     if request_line.starts_with("GET /v1/stats") {
         return handle_stats(state);
     }
@@ -4413,7 +4462,7 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
             let paths: Vec<PathBuf> = manifest
                 .segments
                 .iter()
-                .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
+                .map(|entry| manifest.segment_dir(&state.data_dir, &ns, &entry.segment_id))
                 .collect();
             // Rewrite/lookup paths must see a segment's full fidelity,
             // including vectors — unlike the search path, there's no
@@ -4489,10 +4538,7 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
                 .segments
                 .iter()
                 .map(|entry| {
-                    state
-                        .data_dir
-                        .join(&request.namespace.0)
-                        .join(&entry.segment_id.0)
+                    manifest.segment_dir(&state.data_dir, &request.namespace, &entry.segment_id)
                 })
                 .collect();
             // Rewrite/lookup paths must see a segment's full fidelity,
@@ -4558,7 +4604,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
             let paths: Vec<PathBuf> = manifest
                 .segments
                 .iter()
-                .map(|entry| state.data_dir.join(&namespace.0).join(&entry.segment_id.0))
+                .map(|entry| manifest.segment_dir(&state.data_dir, &namespace, &entry.segment_id))
                 .collect();
             // Rewrite/lookup paths must see a segment's full fidelity,
             // including vectors — unlike the search path, there's no
@@ -4607,7 +4653,7 @@ fn flush_and_publish_namespace(state: &AppState, namespace: &NamespaceId) -> Res
             let paths: Vec<_> = manifest
                 .segments
                 .iter()
-                .map(|e| state.data_dir.join(&namespace.0).join(&e.segment_id.0))
+                .map(|e| manifest.segment_dir(&state.data_dir, namespace, &e.segment_id))
                 .collect();
             let outcome = state.ensure_segments_local(&paths, true);
             if let Some(error) = hydration_error_response(&outcome) {
@@ -4643,7 +4689,7 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
                 let paths: Vec<_> = manifest
                     .segments
                     .iter()
-                    .map(|e| state.data_dir.join(&namespace.0).join(&e.segment_id.0))
+                    .map(|e| manifest.segment_dir(&state.data_dir, &namespace, &e.segment_id))
                     .collect();
                 let outcome = state.ensure_segments_local(&paths, true);
                 if let Some(error) = hydration_error_response(&outcome) {
@@ -4764,7 +4810,7 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
         let paths: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .map(|e| state.data_dir.join(&ns.0).join(&e.segment_id.0))
+            .map(|e| manifest.segment_dir(&state.data_dir, &ns, &e.segment_id))
             .collect();
         let outcome = state.ensure_segments_local(&paths, false);
         if let Some(error) = hydration_error_response(&outcome) {
@@ -5674,6 +5720,20 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
         "version": manifest.version,
         "manifest_version": manifest.version,
     });
+    // A branch (#208) reports its lineage and how much it still shares.
+    if let Some(branch) = &manifest.branch {
+        let ns = NamespaceId(scoped_ns.clone());
+        let shared = manifest
+            .segments
+            .iter()
+            .filter(|entry| manifest.is_inherited_segment(&ns, &entry.segment_id))
+            .count();
+        body["branch"] = serde_json::json!({
+            "parent": branch.parent.0.split_once('/').map_or(branch.parent.0.as_str(), |(_, n)| n),
+            "parent_version": branch.parent_version,
+            "shared_segments": shared,
+        });
+    }
     if state.ingest_host.is_some() {
         add_manifest_follow_stats(state, &NamespaceId(scoped_ns), &mut body);
     }
@@ -5733,7 +5793,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
     let seg_paths: Vec<PathBuf> = manifest
         .segments
         .iter()
-        .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
+        .map(|entry| manifest.segment_dir(&state.data_dir, &ns, &entry.segment_id))
         .collect();
     #[cfg(feature = "s3")]
     // Admin routes rewrite or merge segments — must preserve vectors.
@@ -5741,8 +5801,15 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
 
     let mut new_footers = Vec::new();
     let mut rebuilt = 0usize;
+    let mut inherited = 0usize;
     let mut errors = Vec::new();
     for (entry, seg_path) in manifest.segments.iter().zip(seg_paths.iter()) {
+        // A branch never rewrites a file in its parent's prefix (#208):
+        // run the rebuild on the namespace that owns the segment.
+        if manifest.is_inherited_segment(&ns, &entry.segment_id) {
+            inherited += 1;
+            continue;
+        }
         if !seg_path.exists() {
             errors.push(format!("{}: segment not local", entry.segment_id.0));
             continue;
@@ -5787,6 +5854,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
         "namespace": ns.0,
         "segments": manifest.segments.len(),
         "rebuilt": rebuilt,
+        "skipped_inherited": inherited,
         "errors": errors,
     }))
 }
@@ -5861,7 +5929,12 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
         let mut skipped = 0usize;
         let mut failed = 0usize;
         for (i, entry) in manifest.segments.iter().enumerate() {
-            let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
+            let seg_path = manifest.segment_dir(&state.data_dir, &ns, &entry.segment_id);
+            // A branch never writes into its parent's prefix (#208).
+            if manifest.is_inherited_segment(&ns, &entry.segment_id) {
+                skipped += 1;
+                continue;
+            }
 
             // Resumable: a segment whose sidecar already reached S3 is done —
             // re-running after a crash/restart only pays for the remainder.
@@ -5870,7 +5943,7 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
                 .s3_storage
                 .as_ref()
                 .map(|s3| {
-                    let rel = format!("{}/{}", ns.0, entry.segment_id.0);
+                    let rel = manifest.segment_rel_dir(&ns, &entry.segment_id);
                     s3.list_with_sizes(&rel)
                         .map(|files| files.iter().any(|(n, _)| n == "doc_store.offsets"))
                         .unwrap_or(false)
@@ -6204,7 +6277,7 @@ fn compaction_pass(
     let segments_before = manifest.segments.len();
     let candidate_paths: Vec<PathBuf> = compaction_hydration_set(&manifest, &opts)
         .into_iter()
-        .map(|id| state.data_dir.join(&ns.0).join(&id.0))
+        .map(|id| manifest.segment_dir(&state.data_dir, ns, &id))
         .collect();
     drop(manifest);
     // Hydrate every candidate in one fanned-out batch rather than one
@@ -6341,6 +6414,7 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        branch: None,
         schema: None,
     }
 }
@@ -6967,6 +7041,12 @@ mod tests {
         fn namespace_count(&self) -> usize {
             self.inner.lock().unwrap().namespace_count()
         }
+        fn remove_namespace(
+            &mut self,
+            id: &NamespaceId,
+        ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
+            Ok(self.inner.lock().unwrap().remove_namespace(id))
+        }
     }
 
     #[cfg(feature = "s3")]
@@ -7223,6 +7303,13 @@ mod tests {
         fn namespace_count(&self) -> usize {
             self.inner.namespace_count()
         }
+        fn remove_namespace(
+            &mut self,
+            id: &NamespaceId,
+        ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
+            self.check()?;
+            self.inner.remove_namespace(id)
+        }
     }
 
     fn outage_store() -> OutageStore {
@@ -7327,6 +7414,42 @@ mod tests {
         assert_eq!(stats["manifest_refresh"]["interval_ms"], 20);
         // The ingest pod's stats carry no follower block.
         assert!(stats_json(&ingest)["manifest_refresh"].is_null());
+    }
+
+    /// #208: a query replica follows a branch like any namespace, and drops
+    /// it once the ingest pod deletes it, instead of serving a manifest
+    /// whose own objects were just reclaimed. The parent is unaffected.
+    #[test]
+    fn query_replica_follows_branches_and_forgets_deleted_ones() {
+        let store = outage_store();
+        let parent = NamespaceId("tenant/prod".into());
+        let child = NamespaceId("tenant/exp".into());
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_secs(3600)));
+        index_text_and_publish(&ingest, &parent, &["a", "b"]);
+        ingest.branch_namespace(&parent, &child).unwrap();
+        index_text_and_publish(&ingest, &child, &["c"]);
+        let search = |ns: &str| {
+            let body = format!(r#"{{"namespace":"{ns}","query_text":"hello"}}"#);
+            total_hits(&handle_search_post(body.as_bytes(), &query))
+        };
+        assert_eq!(search("tenant/exp"), 3);
+        assert_eq!(search("tenant/prod"), 2);
+        assert!(query
+            .indexer
+            .manifest_shared(&child)
+            .unwrap()
+            .branch
+            .is_some());
+
+        ingest.delete_branch(&child).unwrap();
+        query.run_manifest_refresh_tick();
+        assert!(query.indexer.manifest_version(&child).is_none());
+        assert_eq!(search("tenant/prod"), 2);
+        assert!(handle_search_post(
+            br#"{"namespace":"tenant/exp","query_text":"hello"}"#,
+            &query
+        )
+        .starts_with("HTTP/1.1 404"));
     }
 
     /// #232: `max_staleness_seconds` forces a synchronous refresh when the
@@ -7652,6 +7775,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         state.import_manifest(&ns, manifest(1, "seed")).unwrap();
@@ -8635,6 +8759,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         // Simulate: an earlier publish call already confirmed seg-2
@@ -9130,6 +9255,8 @@ mod tests {
             "POST /v1/namespaces/foo/flush HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/delete HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/schema HTTP/1.1\r\n",
+            "POST /v1/namespaces/foo/branch HTTP/1.1\r\n",
+            "DELETE /v1/namespaces/foo/branch HTTP/1.1\r\n",
             "POST /v1/admin/api-keys HTTP/1.1\r\n",
             "POST /v1/admin/rebuild-filter-blooms HTTP/1.1\r\n",
             "POST /v1/admin/backfill-offset-tables HTTP/1.1\r\n",
@@ -9155,6 +9282,7 @@ mod tests {
             "GET /v1/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/schema HTTP/1.1\r\n",
+            "GET /v1/namespaces/foo/branches HTTP/1.1\r\n",
             "GET /search?ns=foo&q=bar HTTP/1.1\r\n",
             "POST /search HTTP/1.1\r\n",
             "POST /exists HTTP/1.1\r\n",
@@ -9359,6 +9487,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let base_query = kosha_core::SearchQuery {
@@ -9499,6 +9628,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let base_query = kosha_core::SearchQuery {
@@ -10219,6 +10349,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         let policy = kosha_write::CompactionPolicy::default();

@@ -17,6 +17,7 @@ fn candidate(segment: &str, version: u64) -> Manifest {
         wal_checkpoint: 1,
         wal_origin: Some(segment.into()),
         deletion_vectors: Default::default(),
+        branch: None,
         schema: None,
         tombstones: [(SegmentId(segment.into()), (0..256).collect())]
             .into_iter()
@@ -105,4 +106,36 @@ fn postgres_manifest_versions_poll_and_missing_namespace() {
     assert_eq!(store.manifest_version(&missing).unwrap(), None);
     assert!(store.try_manifest_cloned(&missing).unwrap().is_none());
     assert_eq!(store.try_manifest_cloned(&ns).unwrap().unwrap().version, 3);
+}
+
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_branch_manifest_round_trips_and_remove_namespace() {
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let mut store = PgStore::new(&url).unwrap();
+    let parent = NamespaceId(format!("branch-parent-{}", uuid::Uuid::new_v4()));
+    let child = NamespaceId(format!("branch-child-{}", uuid::Uuid::new_v4()));
+    store
+        .compare_and_swap_manifest(&parent, 0, candidate("shared", 4))
+        .unwrap();
+    let branch = store
+        .try_manifest_cloned(&parent)
+        .unwrap()
+        .unwrap()
+        .branch_from(&parent, 1);
+    store
+        .compare_and_swap_manifest(&child, 0, branch.clone())
+        .unwrap();
+    let stored = store.try_manifest_cloned(&child).unwrap().unwrap();
+    assert!(stored.same_contents(&branch));
+    let shared = SegmentId("shared".into());
+    assert_eq!(stored.segment_home(&child, &shared), &parent);
+
+    let removed = store.remove_namespace(&child).unwrap().unwrap();
+    assert_eq!(removed.version, 1);
+    assert!(!store.has_namespace(&child));
+    assert!(store.try_manifest_cloned(&child).unwrap().is_none());
+    assert!(store.remove_namespace(&child).unwrap().is_none());
+    // The parent is untouched.
+    assert_eq!(store.manifest_version(&parent).unwrap(), Some(4));
 }

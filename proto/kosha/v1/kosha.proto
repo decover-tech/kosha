@@ -114,6 +114,30 @@ service KoshaService {
       delete: "/v1/namespaces/{namespace}"
     };
   }
+
+  // Branch a namespace (issue #208): a new namespace whose manifest lists
+  // the parent's segments in place (copy-on-write, no data copied).
+  rpc BranchNamespace(BranchNamespaceRequest) returns (BranchNamespaceResponse) {
+    option (google.api.http) = {
+      post: "/v1/namespaces/{namespace}/branch"
+      body: "*"
+    };
+  }
+
+  rpc ListBranches(ListBranchesRequest) returns (ListBranchesResponse) {
+    option (google.api.http) = {
+      get: "/v1/namespaces/{namespace}/branches"
+    };
+  }
+
+  // Delete a branch. Reclaims only objects in the branch's own prefix that
+  // no remaining manifest references. Fails (409) for a namespace that is
+  // not a branch.
+  rpc DeleteBranch(DeleteBranchRequest) returns (DeleteBranchResponse) {
+    option (google.api.http) = {
+      delete: "/v1/namespaces/{namespace}/branch"
+    };
+  }
 }
 
 // ─── Health ──────────────────────────────────────────────────────────────────
@@ -198,6 +222,61 @@ message DeleteNamespaceRequest {
 message DeleteNamespaceResponse {
   string namespace = 1;
   bool acknowledged = 2;
+}
+
+// ─── Branching (issue #208) ─────────────────────────────────────────────────
+
+message BranchNamespaceRequest {
+  string namespace = 1;  // the parent
+  string name = 2;       // the new branch
+}
+
+// The new branch (same fields as `NamespaceBranch`).
+message BranchNamespaceResponse {
+  string name = 1;
+  string parent = 2;
+  int64 parent_version = 3;
+  int64 version = 4;
+  int64 segments = 5;
+  int64 shared_segments = 6;
+  int64 documents = 7;
+}
+
+message NamespaceBranch {
+  string name = 1;
+  string parent = 2;
+  int64 parent_version = 3;  // parent manifest version the branch started from
+  int64 version = 4;
+  int64 segments = 5;
+  int64 shared_segments = 6;  // segments still read from the parent's prefix
+  int64 documents = 7;
+}
+
+message ListBranchesRequest {
+  string namespace = 1;
+}
+
+message ListBranchesResponse {
+  string namespace = 1;
+  repeated NamespaceBranch branches = 2;
+}
+
+message DeleteBranchRequest {
+  string namespace = 1;
+}
+
+message BranchReclaim {
+  int64 local_files = 1;
+  int64 remote_objects = 2;
+  int64 kept = 3;  // still referenced by another branch
+  repeated string errors = 4;
+}
+
+message DeleteBranchResponse {
+  string deleted = 1;
+  string parent = 2;
+  int64 version = 3;
+  BranchReclaim reclaimed = 4;
 }
 
 // ─── Document model ─────────────────────────────────────────────────────────

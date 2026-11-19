@@ -9,16 +9,32 @@ use std::collections::HashSet;
 pub struct DeletionVector {
     pub generation: String,
     pub count: u64,
+    /// Namespace whose storage prefix holds the bitmap, when it is not the
+    /// namespace whose manifest lists it: a branch (#208) inherits its
+    /// parent's bitmaps by reference instead of copying them. `None` (every
+    /// manifest written before branching existed) means the listing
+    /// namespace itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<NamespaceId>,
 }
 impl DeletionVector {
+    /// Logical storage path of this bitmap, for the manifest of `ns`.
     pub fn path(&self, ns: &NamespaceId, segment: &SegmentId) -> Result<String, KoshaError> {
         if self.generation.len() != 64 || !self.generation.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(invalid("invalid deletion generation"));
         }
+        let home = self.namespace.as_ref().unwrap_or(ns);
         Ok(format!(
             "{}/{}/deletes-{}.roaring",
-            ns.0, segment.0, self.generation
+            home.0, segment.0, self.generation
         ))
+    }
+
+    /// Whether the bitmap lives in another namespace's prefix (inherited
+    /// from a branch parent), so the listing namespace must not write,
+    /// upload or delete it.
+    pub fn is_inherited(&self, ns: &NamespaceId) -> bool {
+        self.namespace.as_ref().is_some_and(|home| home != ns)
     }
     pub fn encode(ids: &HashSet<u32>) -> Result<(Self, Vec<u8>), KoshaError> {
         let bitmap: RoaringBitmap = ids.iter().copied().collect();
@@ -28,6 +44,7 @@ impl DeletionVector {
             Self {
                 generation: format!("{:x}", Sha256::digest(&bytes)),
                 count: bitmap.len(),
+                namespace: None,
             },
             bytes,
         ))
@@ -88,5 +105,26 @@ mod tests {
         assert_eq!(old.decode(&bytes, 70000).unwrap(), ids);
         let (_, again) = DeletionVector::encode(&ids).unwrap();
         assert_eq!(bytes, again);
+    }
+
+    #[test]
+    fn inherited_bitmaps_resolve_to_their_home_prefix() {
+        let (mut vector, _) = DeletionVector::encode(&HashSet::from([3])).unwrap();
+        let parent = NamespaceId("t/prod".into());
+        let branch = NamespaceId("t/test".into());
+        let seg = SegmentId("t_prod-1".into());
+        let own = vector.path(&branch, &seg).unwrap();
+        assert!(own.starts_with("t/test/t_prod-1/deletes-"));
+        assert!(!vector.is_inherited(&branch));
+        // A pre-#208 manifest has no `namespace` key and serializes without one.
+        let json = serde_json::to_value(&vector).unwrap();
+        assert!(json.get("namespace").is_none());
+        vector.namespace = Some(parent.clone());
+        assert!(vector.is_inherited(&branch));
+        assert!(!vector.is_inherited(&parent));
+        assert!(vector
+            .path(&branch, &seg)
+            .unwrap()
+            .starts_with("t/prod/t_prod-1/deletes-"));
     }
 }

@@ -539,6 +539,7 @@ impl Publisher {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
                 // The rebuilt segments were analyzed with this schema.
                 schema: existing.schema.clone(),
             },
@@ -668,6 +669,7 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         });
         // Restore to advance segment IDs beyond an existing/partial run.
@@ -818,6 +820,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
         };
         commit_manifest(&mut store, &ns, 0, &manifest(1, "run-1")).unwrap();

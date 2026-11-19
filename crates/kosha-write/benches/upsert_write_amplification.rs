@@ -51,6 +51,7 @@ fn main() {
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        branch: None,
         schema: None,
     };
     manifest.remember_segment_footer(footer);
