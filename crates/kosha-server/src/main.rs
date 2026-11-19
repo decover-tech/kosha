@@ -1776,6 +1776,12 @@ impl AppState {
                     }
                     Ok(std::fs::read(self.data_dir.join(path))?)
                 })?;
+                println!(
+                    "manifest refreshed: ns={} version={} segments={}",
+                    ns.0,
+                    manifest.version,
+                    manifest.segments.len()
+                );
                 self.indexer.restore_manifest(ns.clone(), manifest);
             }
         }
@@ -1822,6 +1828,7 @@ impl AppState {
         let Some((expected_version, manifest)) = self.indexer.prepare_publication(ns)? else {
             return Ok(());
         };
+        let started = Instant::now();
         upload(&manifest)?;
         self.controller.lock().unwrap().compare_and_swap_manifest(
             ns,
@@ -1829,6 +1836,13 @@ impl AppState {
             manifest.clone(),
         )?;
         self.indexer.acknowledge_manifest(ns, &manifest)?;
+        println!(
+            "manifest published: ns={} version={} segments={} ms={:.1}",
+            ns.0,
+            manifest.version,
+            manifest.segments.len(),
+            started.elapsed().as_secs_f64() * 1e3
+        );
         Ok(())
     }
 
