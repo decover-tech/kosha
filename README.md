@@ -116,9 +116,17 @@ existing data automatically.
 A successful flush uploads its segment snapshot before publishing its manifest.
 Upload and manifest-store failures return errors and remain retryable. Buffered
 writes use a local, fsynced WAL; they are not S3-durable until a successful flush.
-WAL records are reclaimed only through the published namespace checkpoint,
-without removing later writes or another namespace's records. Partial parallel
-flush failures restore the entire snapshot for retry.
+Concurrent appends are group-committed: one WAL file and one fsync cover every
+record queued while the previous commit ran, and each caller is acknowledged
+only after the fsync covering its own record. Once the previous group held more
+than one record, the committer waits up to `KOSHA_WAL_GROUP_COMMIT_MS` (default
+2; `0` disables the wait) for more, and cuts a group at
+`KOSHA_WAL_GROUP_COMMIT_BYTES` (default 4 MiB). A lone writer never waits.
+Every record has its own log sequence number. WAL records are reclaimed only
+through the published namespace checkpoint: a file shared by several namespaces
+is deleted once each of them has a published checkpoint past its records there,
+so a flush never removes later writes or another namespace's records. Partial
+parallel flush failures restore the entire snapshot for retry.
 
 Publication uses compare-and-swap against the writer's last committed manifest
 version. Concurrent writers cannot replace each other's snapshots. A stale
@@ -148,8 +156,11 @@ its `origin` file, across restarts. Legacy checkpoints without an origin retain
 their previous recovery behavior; upgrade all writers before concurrent use.
 
 Deletes include buffered documents and WAL-log resolved document IDs before
-applying them. New WAL files use checksummed v2 frames; recovery discards an
-incomplete final file and rejects corrupt records. Legacy v1 files remain readable.
+applying them. New WAL files hold one or more checksummed v3 frames (the CRC
+covers the record's sequence number and payload); vectors are stored as binary
+f32 rather than JSON text. Recovery keeps every complete frame of a torn final
+file, discards only the incomplete tail, and rejects corrupt records. v1 and v2
+files remain readable.
 Deletes and writes replay in order, so reinserting a deleted ID remains valid.
 
 Deletion sets are immutable `deletes-{sha256}.roaring` sidecars referenced by the
@@ -171,8 +182,8 @@ object, including tombstones and checkpoints. New servers can read the old entry
 arrays. Old servers cannot read the new object format: upgrade ingest and query
 roles together before resuming writes, and do not roll back readers without a
 manifest-format migration. Servers predating deletion-vector support ignore
-those references, and older WAL readers cannot replay v2 frames: upgrade all
-roles together before accepting writes and preserve the WAL directory. Rolling
+those references, and older WAL readers cannot replay v2 or v3 frames: upgrade
+all roles together before accepting writes and preserve the WAL directory. Rolling
 back requires converting both formats. The SQL column needs no schema change.
 
 ## Repository layout
