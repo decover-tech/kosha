@@ -1,6 +1,6 @@
 """OpenSearch compatibility shim.
 
-``opensearchpy.helpers.bulk()`` (used by ParagraphRepository._bulk_insert_sources)
+``opensearchpy.helpers.bulk()`` (as used by typical bulk-indexing code)
 reaches into ``client.transport.serializer`` to JSON-encode and chunk
 actions by size, then calls ``client.bulk(body=ndjson)`` once per chunk.
 

@@ -43,3 +43,38 @@ npx @openapitools/openapi-generator-cli generate \
 Phase 1 ships with a lightweight hand-written client (`client.py`) that directly calls the
 Kosha HTTP API. As the API stabilises, the hand-written code will shrink to just `transport.py`
 + `compat.py` + the delegation layer in `client.py`.
+
+## Index introspection
+
+`client.indices.get_mapping(index=...)` returns the namespace's real schema, read from
+`GET /v1/namespaces/{ns}/schema` and translated to Elasticsearch types:
+
+| Kosha `FieldType` | ES mapping type |
+|-------------------|-----------------|
+| `FIELD_TYPE_TEXT` | `text` |
+| `FIELD_TYPE_KEYWORD` | `keyword` |
+| `FIELD_TYPE_INTEGER` | `long` |
+| `FIELD_TYPE_FLOAT` | `double` |
+| `FIELD_TYPE_DATE` | `date` |
+| `FIELD_TYPE_BOOLEAN` | `boolean` |
+| `FIELD_TYPE_VECTOR` | `knn_vector` |
+
+Kosha is schemaless, so a namespace with no registered schema, or a server that predates the
+schema route (404/405), returns `{"<index>": {"mappings": {"properties": {}}}}`. A field the
+schema lists without a type appears as `{}`; the client never guesses a type.
+
+`client.indices.get_settings(index=...)` reports only `{"index": {"provided_name": "<index>"}}`.
+Kosha has no shards, replicas or refresh interval per namespace, so none are reported.
+
+## Changelog
+
+### 0.2.14
+
+- **Behavior change:** `indices.get_mapping()` no longer returns a fixed, made-up set of
+  fields for every index. It returns the namespace's schema, or empty `properties` when there
+  is none. Code that read fields from the old placeholder mapping now gets no fields and should
+  handle an empty mapping. `indices.get()` reports the same mapping.
+- **Behavior change:** `indices.get_settings()` no longer reports `refresh_interval`,
+  `number_of_shards`, `number_of_replicas` or `knn`; it returns only `provided_name`.
+- `get_mapping` / `get_settings` / `get` accept a list or comma-separated string of indices.
+- Removed application-specific field names from examples, tests and docstrings.
