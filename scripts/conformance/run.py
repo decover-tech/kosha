@@ -31,9 +31,10 @@ Usage:
       --restart-cmd "scripts/conformance/compose_restart_cold.sh"
 
 The server must run with KOSHA_MAX_CONCURRENT_FLUSH_WRITERS=1, a large
-KOSHA_FLUSH_THRESHOLD and KOSHA_FLUSH_MAX_AGE_MS=0 (no idle-buffer flush
-timer) so segments come only from explicit flushes, one per flush; otherwise
-the per-segment score checks cannot be predicted (``--spawn`` sets all three).
+KOSHA_FLUSH_THRESHOLD, KOSHA_FLUSH_MAX_AGE_MS=0 (no idle-buffer flush timer)
+and KOSHA_COMPACTION_INTERVAL_MS=0 (no background compaction) so segments
+come only from explicit flushes, one per flush; otherwise the per-segment
+score checks cannot be predicted (``--spawn`` sets all four).
 
 Exit status: 0 when every check passed or failed only as listed in
 expected_failures.json; 1 on any unexpected failure. With --strict, an
@@ -175,6 +176,7 @@ class Spawned:
                 "KOSHA_FLUSH_THRESHOLD": "1000000",
                 "KOSHA_MAX_CONCURRENT_FLUSH_WRITERS": "1",
                 "KOSHA_FLUSH_MAX_AGE_MS": "0",
+                "KOSHA_COMPACTION_INTERVAL_MS": "0",
             }
         )
         if self.database_url:

@@ -23,6 +23,7 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 }
 
 mod auth;
+mod compaction_sched;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 #[cfg(feature = "migrate")]
@@ -180,6 +181,10 @@ struct AppState {
     /// Namespaces with an offsets-backfill job currently running — one job
     /// per namespace at a time.
     backfill_jobs: Mutex<std::collections::HashSet<String>>,
+    /// Compaction jobs and per-namespace scheduler state (#242): every pass,
+    /// scheduled or requested through the API, is registered here, so the
+    /// global concurrency budget and one-pass-per-namespace hold across both.
+    compaction: compaction_sched::CompactionRegistry,
     /// Namespace-level cached hydration verdict (Tier 1 O2). Keyed by
     /// `(namespace, manifest_version)`: every search request currently
     /// pays per-segment freshness/existence checks inside
@@ -1296,6 +1301,9 @@ impl AppState {
             internal_auth_key,
             self_ref: Weak::new(),
             backfill_jobs: Mutex::new(std::collections::HashSet::new()),
+            compaction: compaction_sched::CompactionRegistry::new(
+                compaction_sched::SchedulerConfig::from_env(),
+            ),
             completed_hydrations: Mutex::new(HashMap::new()),
             result_cache: Mutex::new(ResultCache::new(result_cache_budget())),
             posting_blob_presence: Mutex::new(HashMap::new()),
@@ -1391,6 +1399,41 @@ impl AppState {
                 }
             })
             .expect("failed to spawn idle-flush thread");
+    }
+
+    /// Start the background compaction scheduler (#242) on a pod that
+    /// accepts writes. Every `KOSHA_COMPACTION_INTERVAL_MS` (default 30 s,
+    /// `0` disables) it starts a tiered pass on each namespace that
+    /// `needs_compaction` flags, up to `KOSHA_COMPACTION_MAX_CONCURRENT`
+    /// passes at once (default 1, API jobs included). The idle-flush timer
+    /// cuts a segment per interval for slowly written namespaces; this is
+    /// what keeps their segment count bounded without anyone calling
+    /// `/v1/admin/compact-namespace`. Selection, fairness and backoff are in
+    /// `compaction_sched`. Query-role pods own no segments and never start it.
+    fn spawn_compaction_scheduler(self: &Arc<Self>) {
+        let forwards_writes = std::env::var("KOSHA_INGEST_HOST")
+            .ok()
+            .is_some_and(|h| !h.is_empty());
+        if forwards_writes {
+            return;
+        }
+        let Some(interval) = self.compaction.config().interval else {
+            println!("compaction scheduler disabled (KOSHA_COMPACTION_INTERVAL_MS=0)");
+            return;
+        };
+        println!(
+            "compaction scheduler: every {} ms, max {} concurrent pass(es)",
+            interval.as_millis(),
+            self.compaction.config().max_concurrent
+        );
+        let state = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("kosha-compaction-scheduler".into())
+            .spawn(move || loop {
+                std::thread::sleep(interval);
+                run_compaction_scheduler_tick(&state, Instant::now());
+            })
+            .expect("failed to spawn compaction scheduler thread");
     }
 
     /// Readiness-gate predicate used by the `/readyz` handler: true when no
@@ -3292,6 +3335,7 @@ fn main() {
     // runs (Tier 1 O2). Liveness (`/healthz`) is unaffected.
     state.spawn_warmup();
     state.spawn_idle_flush_timer();
+    state.spawn_compaction_scheduler();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     println!("kosha-server role={role} listening on {addr} data_dir={data_dir}");
 
@@ -3513,6 +3557,11 @@ fn is_write_path(request_line: &str) -> bool {
     }
     // v1 admin routes — all mutate segment/manifest state.
     if request_line.starts_with("POST /v1/admin/") {
+        return true;
+    }
+    // Compaction jobs and scheduler state live on the write pod that runs
+    // them; a query pod has none, so these reads are forwarded too.
+    if request_line.starts_with("GET /v1/admin/compaction-") {
         return true;
     }
     // Legacy (pre-v1) write routes.
@@ -3783,6 +3832,15 @@ fn route_inner(
 
     if request_line.starts_with("POST /v1/admin/compact-namespace") {
         return handle_compact_namespace(body, tenant, state);
+    }
+
+    if request_line.starts_with("GET /v1/admin/compaction-status") {
+        return handle_compaction_status(state);
+    }
+
+    if let Some(rest) = request_line.strip_prefix("GET /v1/admin/compaction-jobs/") {
+        let job_id = rest.split([' ', '?']).next().unwrap_or_default();
+        return handle_compaction_job(job_id, state);
     }
 
     if request_line.starts_with("POST /v1/admin/import-namespace") {
@@ -5292,7 +5350,8 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
 /// held for the duration.
 ///
 /// Request body: {"namespace": "paragraph_index_hnsw", "mode": "tiered"|"full",
-///                "max_segment_bytes": 5368709120}   // optional; 0 = uncapped
+///                "max_segment_bytes": 5368709120,   // optional; 0 = uncapped
+///                "async": true}                     // optional (#242)
 ///
 /// Merged output size is capped (default 5GiB, Lucene-style): `full` under a
 /// cap merges one greedy smallest-first group per pass — loop the endpoint
@@ -5300,9 +5359,13 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
 /// ~ceil(total_bytes/cap) segments. `max_segment_bytes: 0` restores the
 /// legacy all-to-one merge.
 ///
-/// Every existing segment should hydrate locally first (compaction reads each
-/// one via `SegmentReader::open`) — for a namespace with hundreds of segments
-/// this call can take a while.
+/// `"async": true` answers `202` with a `job_id` at once and runs the pass
+/// on a background thread; poll `GET /v1/admin/compaction-jobs/{job_id}`. A
+/// `full` pass hydrates every segment first and can run for hours on a big
+/// namespace, far past the query→ingest proxy and HTTP timeouts. Without
+/// `async` the call blocks as before. Either way the pass is registered with
+/// the compaction scheduler: a second pass on the same namespace gets `409`
+/// with the running job's id.
 fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> String {
     let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -5322,6 +5385,7 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
             );
         }
     };
+    let run_async = req.get("async").and_then(|v| v.as_bool()).unwrap_or(false);
     // Prefer the name as given (migration uses bare index names); fall back
     // to tenant-scoped lookup used by v1 routes.
     let ns = {
@@ -5346,87 +5410,303 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
             }
         }
     };
+    let opts = compact_options(
+        state,
+        mode,
+        req.get("max_segment_bytes").and_then(|v| v.as_u64()),
+    );
 
-    let (segments_before, not_hydrated) = {
-        let manifest = state
-            .indexer
-            .manifest_cloned(&ns)
-            .expect("namespace existence checked above");
-        // Hydrate every segment in one fanned-out batch rather than one
-        // ensure_segment_local round trip per segment — see handle_index.
-        // This was the actual bottleneck behind this endpoint's own
-        // timeouts: 441 sequential S3 round trips before compaction could
-        // even start reading anything.
-        let seg_paths: Vec<PathBuf> = manifest
-            .segments
-            .iter()
-            .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
-            .collect();
-        #[cfg(feature = "s3")]
-        // Admin routes rewrite or merge segments — must preserve vectors.
-        state.ensure_segments_local(&seg_paths, true);
-        // compact_namespace silently skips (and keeps unmerged) any segment
-        // that isn't present locally after this — safe, but worth surfacing
-        // so a caller knows compaction was partial.
-        let not_hydrated: Vec<String> = manifest
-            .segments
-            .iter()
-            .zip(seg_paths.iter())
-            .filter(|(_, p)| !p.exists())
-            .map(|(entry, _)| entry.segment_id.0.clone())
-            .collect();
-        (manifest.segments.len(), not_hydrated)
+    // Resolve the background handle before registering, so a refusal can't
+    // leave a job stuck in `running`.
+    let job_state = if run_async {
+        match state.self_ref.upgrade() {
+            Some(s) => Some(s),
+            None => return json_error(500, "server not initialized for background jobs"),
+        }
+    } else {
+        None
+    };
+    let job_id = match state.compaction.try_start(
+        &ns,
+        compact_mode_name(mode),
+        compaction_sched::Trigger::Api,
+        Instant::now(),
+    ) {
+        Ok(id) => id,
+        Err(running) => {
+            return json_error(
+                409,
+                &format!(
+                    "a compaction pass is already running on namespace '{}' (job {running}); \
+                     poll GET /v1/admin/compaction-jobs/{running}",
+                    ns.0
+                ),
+            );
+        }
     };
 
+    if let Some(job_state) = job_state {
+        let response = serde_json::json!({
+            "job_id": job_id,
+            "namespace": ns.0,
+            "mode": compact_mode_name(mode),
+            "state": "running",
+            "status_url": format!("/v1/admin/compaction-jobs/{job_id}"),
+        });
+        std::thread::Builder::new()
+            .name("kosha-compaction-job".into())
+            .spawn(move || run_compaction_job(&job_state, &ns, opts, &job_id))
+            .expect("failed to spawn compaction job thread");
+        return json_accepted(&response);
+    }
+
+    match run_compaction_job(state, &ns, opts, &job_id) {
+        Ok(outcome) => json_ok(&serde_json::json!({
+            "job_id": job_id,
+            "namespace": ns.0,
+            "mode": compact_mode_name(mode),
+            "merged": outcome.merged,
+            "segments_before": outcome.segments_before,
+            "segments_after": outcome.segments_after,
+            "segments_merged": outcome.segments_merged,
+            "max_segment_bytes": outcome.max_segment_bytes,
+            "not_hydrated": outcome.not_hydrated,
+        })),
+        Err(error) => json_error(500, &error),
+    }
+}
+
+/// GET /v1/admin/compaction-status — scheduler config and counters, every
+/// known namespace's segment count and `needs_compaction`, plus running and
+/// recent jobs. Served by the write pod (query pods forward it).
+fn handle_compaction_status(state: &AppState) -> String {
+    let live: Vec<(compaction_sched::Candidate, usize)> = state
+        .indexer
+        .namespaces()
+        .into_iter()
+        .filter_map(|ns| {
+            let manifest = state.indexer.manifest_cloned(&ns)?;
+            let needs = kosha_write::needs_compaction(&manifest, state.indexer.compaction_policy());
+            Some((
+                compaction_sched::Candidate {
+                    namespace: ns,
+                    manifest_version: manifest.version,
+                    needs_compaction: needs,
+                },
+                manifest.segments.len(),
+            ))
+        })
+        .collect();
+    let forwards_writes = state.ingest_host.is_some();
+    let enabled = !forwards_writes && state.compaction.config().interval.is_some();
+    json_ok(&state.compaction.status_json(enabled, &live))
+}
+
+/// GET /v1/admin/compaction-jobs/{job_id} — one job's state and result.
+/// Finished jobs are kept for the last `FINISHED_JOBS_RETAINED` passes.
+fn handle_compaction_job(job_id: &str, state: &AppState) -> String {
+    match state.compaction.job(job_id) {
+        Some(job) => json_ok(&job),
+        None => json_error(404, &format!("compaction job '{job_id}' not found")),
+    }
+}
+
+fn compact_mode_name(mode: kosha_write::CompactMode) -> &'static str {
+    match mode {
+        kosha_write::CompactMode::Tiered => "tiered",
+        kosha_write::CompactMode::Full => "full",
+    }
+}
+
+/// The indexer's policy with the merge-size cap resolved. Precedence:
+/// policy default (5 GiB) < `KOSHA_COMPACT_MAX_SEGMENT_BYTES` < request
+/// body. `0` disables the cap (the legacy all-to-one full merge, the
+/// 167→1 merge that put the 10M bench box into reclaim stalls; opt back in
+/// explicitly if that's really wanted).
+fn compact_options(
+    state: &AppState,
+    mode: kosha_write::CompactMode,
+    request_max_segment_bytes: Option<u64>,
+) -> kosha_write::CompactOptions {
     let mut policy = state.indexer.compaction_policy().clone();
-    // Merge-size cap precedence: policy default (5GiB) < env < request body.
-    // `0` disables the cap (legacy all-to-one full merge — the 167→1 merge
-    // that put the 10M bench box into reclaim stalls; opt back in explicitly
-    // if that's really wanted).
     if let Some(n) = std::env::var("KOSHA_COMPACT_MAX_SEGMENT_BYTES")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
         policy.max_merged_segment_bytes = n;
     }
-    if let Some(n) = req.get("max_segment_bytes").and_then(|v| v.as_u64()) {
+    if let Some(n) = request_max_segment_bytes {
         policy.max_merged_segment_bytes = n;
     }
-    let max_segment_bytes = policy.max_merged_segment_bytes;
-    let opts = kosha_write::CompactOptions { mode, policy };
-    let result = match state.indexer.compact_namespace_with_options(&ns, opts) {
-        Ok(r) => r,
-        Err(e) => return json_error(500, &format!("compaction error: {e}")),
-    };
+    kosha_write::CompactOptions { mode, policy }
+}
 
-    // Persist the merged manifest and upload the new segment to S3 — same
-    // path a normal flush uses (sync_latest_segment_to_s3 picks up the
-    // compacted segment because compact_namespace pushes it last).
+/// Run one registered compaction pass and record its outcome. The caller
+/// must already hold the job's slot from `CompactionRegistry::try_start`.
+fn run_compaction_job(
+    state: &AppState,
+    ns: &NamespaceId,
+    opts: kosha_write::CompactOptions,
+    job_id: &str,
+) -> Result<compaction_sched::PassOutcome, String> {
+    let started = Instant::now();
+    let mode = compact_mode_name(opts.mode);
+    let outcome = compaction_pass(state, ns, opts);
+    let version = state.indexer.manifest_version(ns).unwrap_or(0);
+    let elapsed_ms = started.elapsed().as_millis();
+    match &outcome {
+        Ok(o) => println!(
+            "compaction: job={job_id} ns={} mode={mode} merged={} segments {}→{} \
+             (merged {}) not_hydrated={} in {elapsed_ms} ms",
+            ns.0,
+            o.merged,
+            o.segments_before,
+            o.segments_after,
+            o.segments_merged,
+            o.not_hydrated.len(),
+        ),
+        Err(e) => eprintln!(
+            "compaction: job={job_id} ns={} mode={mode} failed after {elapsed_ms} ms: {e}",
+            ns.0
+        ),
+    }
+    state
+        .compaction
+        .finish(job_id, outcome.clone(), version, Instant::now());
+    outcome
+}
+
+/// One compaction pass plus publication: hydrate what the pass may read,
+/// merge, publish.
+///
+/// A `full` pass hydrates every segment (it may merge any of them). A
+/// `tiered` pass hydrates only its possible inputs, the segments under
+/// `max_mergeable_docs`, so the scheduler never pulls a whole namespace
+/// (22 GiB on staging) to merge a few small segments. Segments still not
+/// local afterwards are skipped by the merge, left unmerged, and reported
+/// in `not_hydrated`.
+fn compaction_pass(
+    state: &AppState,
+    ns: &NamespaceId,
+    opts: kosha_write::CompactOptions,
+) -> Result<compaction_sched::PassOutcome, String> {
+    let manifest = state
+        .indexer
+        .manifest_cloned(ns)
+        .ok_or_else(|| format!("namespace '{}' not found", ns.0))?;
+    let segments_before = manifest.segments.len();
+    let candidate_paths: Vec<PathBuf> = compaction_hydration_set(&manifest, &opts)
+        .into_iter()
+        .map(|id| state.data_dir.join(&ns.0).join(&id.0))
+        .collect();
+    drop(manifest);
+    // Hydrate every candidate in one fanned-out batch rather than one
+    // ensure_segment_local round trip per segment — see handle_index.
+    // Sequential round trips were the bottleneck behind the old synchronous
+    // endpoint's timeouts: 441 of them before compaction could start.
+    #[cfg(feature = "s3")]
+    // Compaction rewrites segments, so it must preserve vectors.
+    state.ensure_segments_local(&candidate_paths, true);
+    let not_hydrated: Vec<String> = candidate_paths
+        .iter()
+        .filter(|p| !p.exists())
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+
+    let max_segment_bytes = opts.policy.max_merged_segment_bytes;
+    let result = state
+        .indexer
+        .compact_namespace_with_options(ns, opts)
+        .map_err(|e| format!("compaction error: {e}"))?;
+
+    // Persist the merged manifest and upload the new segment to S3, the
+    // same path a normal flush uses.
     if result.merged {
-        if let Err(e) = state.publish_namespace(&ns) {
-            return json_error(500, &format!("publication failed: {e}"));
-        }
+        state
+            .publish_namespace(ns)
+            .map_err(|e| format!("publication failed: {e}"))?;
     }
 
     let segments_after = state
         .indexer
-        .manifest_cloned(&ns)
+        .manifest_cloned(ns)
         .map(|m| m.segments.len())
         .unwrap_or(0);
+    Ok(compaction_sched::PassOutcome {
+        merged: result.merged,
+        segments_before,
+        segments_after,
+        segments_merged: result.segments_merged,
+        max_segment_bytes,
+        not_hydrated,
+    })
+}
 
-    json_ok(&serde_json::json!({
-        "namespace": ns.0,
-        "mode": match mode {
-            kosha_write::CompactMode::Tiered => "tiered",
-            kosha_write::CompactMode::Full => "full",
-        },
-        "merged": result.merged,
-        "segments_before": segments_before,
-        "segments_after": segments_after,
-        "segments_merged": result.segments_merged,
-        "max_segment_bytes": max_segment_bytes,
-        "not_hydrated": not_hydrated,
-    }))
+/// Segments a pass may read, so must be local: all of them for `full`,
+/// only those under `max_mergeable_docs` (possible tiered inputs) for
+/// `tiered`. Same eligibility rule as `select_merge_inputs`.
+fn compaction_hydration_set(
+    manifest: &kosha_core::Manifest,
+    opts: &kosha_write::CompactOptions,
+) -> Vec<kosha_core::SegmentId> {
+    manifest
+        .segments
+        .iter()
+        .filter(|entry| {
+            opts.mode == kosha_write::CompactMode::Full
+                || entry.doc_count < opts.policy.max_mergeable_docs
+        })
+        .map(|entry| entry.segment_id.clone())
+        .collect()
+}
+
+/// One scheduler tick: find namespaces `needs_compaction` flags, let the
+/// registry pick the due ones under the global budget, and start a tiered
+/// pass on a background thread for each. Never blocks on a merge.
+fn run_compaction_scheduler_tick(state: &Arc<AppState>, now: Instant) -> Vec<NamespaceId> {
+    let policy = state.indexer.compaction_policy().clone();
+    let candidates: Vec<compaction_sched::Candidate> = state
+        .indexer
+        .namespaces()
+        .into_iter()
+        .filter_map(|ns| {
+            let manifest = state.indexer.manifest_cloned(&ns)?;
+            Some(compaction_sched::Candidate {
+                needs_compaction: kosha_write::needs_compaction(&manifest, &policy),
+                manifest_version: manifest.version,
+                namespace: ns,
+            })
+        })
+        .collect();
+    let mut started = Vec::new();
+    for ns in state.compaction.select_due(&candidates, now) {
+        let job_id = match state.compaction.try_start(
+            &ns,
+            "tiered",
+            compaction_sched::Trigger::Scheduler,
+            now,
+        ) {
+            Ok(id) => id,
+            Err(_) => continue, // an API job got there first
+        };
+        let opts = compact_options(state, kosha_write::CompactMode::Tiered, None);
+        let job_state = Arc::clone(state);
+        let job_ns = ns.clone();
+        let spawned = std::thread::Builder::new()
+            .name("kosha-compaction-job".into())
+            .spawn(move || {
+                let _ = run_compaction_job(&job_state, &job_ns, opts, &job_id);
+            });
+        if let Err(e) = spawned {
+            eprintln!(
+                "compaction scheduler: failed to spawn pass for {}: {e}",
+                ns.0
+            );
+            continue;
+        }
+        started.push(ns);
+    }
+    started
 }
 
 /// Build an import manifest from recovered segment footers: entries sorted
@@ -5848,6 +6128,15 @@ fn search_error_response(e: &KoshaError) -> String {
         KoshaError::Overloaded(_) => json_error(429, &format!("search overloaded: {e}")),
         _ => json_error(500, &format!("search error: {e}")),
     }
+}
+
+/// `202 Accepted` with a JSON body: a background job was started.
+fn json_accepted<T: serde::Serialize>(value: &T) -> String {
+    let body = serde_json::to_string(value).unwrap_or_else(|_| "{}".into());
+    format!(
+        "HTTP/1.1 202 Accepted\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 fn json_error(status_code: u16, message: &str) -> String {
@@ -7345,6 +7634,8 @@ mod tests {
             "POST /v1/admin/rebuild-filter-blooms HTTP/1.1\r\n",
             "POST /v1/admin/backfill-offset-tables HTTP/1.1\r\n",
             "POST /v1/admin/compact-namespace HTTP/1.1\r\n",
+            "GET /v1/admin/compaction-status HTTP/1.1\r\n",
+            "GET /v1/admin/compaction-jobs/cj-1-1 HTTP/1.1\r\n",
             "POST /index HTTP/1.1\r\n",
             "POST /replace HTTP/1.1\r\n",
             "POST /flush HTTP/1.1\r\n",
@@ -8219,6 +8510,225 @@ mod tests {
                 "doc{i} missing after compaction: {search}"
             );
         }
+    }
+
+    /// `test_state`, but behind the `Arc` `main` uses, so `self_ref`
+    /// resolves and background jobs (async compaction, scheduler passes)
+    /// can start.
+    fn test_shared_state() -> Arc<AppState> {
+        let dir = test_state().data_dir.clone();
+        AppState::new_shared(dir)
+    }
+
+    /// Index `n` single-doc segments into `test/<name>` via index+flush.
+    fn seed_segments(state: &AppState, name: &str, n: usize) -> NamespaceId {
+        for i in 0..n {
+            let req = IndexRequest {
+                namespace: NamespaceId(name.into()),
+                documents: vec![Document {
+                    id: DocumentId(format!("doc{i}")),
+                    fields: vec![Field::text("title", format!("segment number {i}"))],
+                }],
+            };
+            route(
+                "POST /index HTTP/1.1\r\n",
+                &HashMap::new(),
+                &serde_json::to_vec(&req).unwrap(),
+                "test",
+                state,
+            );
+            route(
+                "POST /flush HTTP/1.1\r\n",
+                &HashMap::new(),
+                format!(r#"{{"namespace":"{name}"}}"#).as_bytes(),
+                "test",
+                state,
+            );
+        }
+        let ns = NamespaceId(tenant_namespace("test", name));
+        assert_eq!(
+            state.indexer.manifest_cloned(&ns).unwrap().segments.len(),
+            n
+        );
+        ns
+    }
+
+    fn wait_for_job(state: &AppState, job_id: &str) -> compaction_sched::JobRecord {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let job = state.compaction.job(job_id).expect("job registered");
+            if job.state != compaction_sched::JobState::Running {
+                return job;
+            }
+            assert!(Instant::now() < deadline, "job {job_id} still running");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn json_body(response: &str) -> serde_json::Value {
+        let body = response.split("\r\n\r\n").nth(1).unwrap_or_default();
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {response}"))
+    }
+
+    /// #242: nothing used to call `needs_compaction`. A scheduler tick must
+    /// start a tiered pass on a namespace past the trigger, the pass must
+    /// keep every doc, and once the namespace no longer needs compaction the
+    /// next tick must leave it alone.
+    #[test]
+    fn scheduler_tick_compacts_namespaces_past_the_trigger() {
+        let state = test_shared_state();
+        let trigger = state.indexer.compaction_policy().trigger_mergeable_segments;
+        let busy = seed_segments(&state, "sched-busy", trigger);
+        let quiet = seed_segments(&state, "sched-quiet", 2);
+
+        let started = run_compaction_scheduler_tick(&state, Instant::now());
+        assert_eq!(
+            started,
+            vec![busy.clone()],
+            "only the namespace past the trigger"
+        );
+
+        let status = json_body(&handle_compaction_status(&state));
+        let job_id = status["running_jobs"][0]["job_id"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| {
+                status["recent_jobs"][0]["job_id"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .expect("scheduled job is listed");
+        let job = wait_for_job(&state, &job_id);
+        assert_eq!(job.state, compaction_sched::JobState::Succeeded, "{job:?}");
+        assert_eq!(job.trigger, compaction_sched::Trigger::Scheduler);
+        let result = job.result.unwrap();
+        assert!(result.merged);
+        assert_eq!(result.segments_before, trigger);
+        assert!(result.segments_after < trigger, "{result:?}");
+
+        for i in 0..trigger {
+            let search = route(
+                &format!("GET /search?ns=sched-busy&q=segment+number+{i} HTTP/1.1\r\n"),
+                &HashMap::new(),
+                b"",
+                "test",
+                &state,
+            );
+            assert!(
+                search.contains(&format!("\"doc{i}\"")),
+                "doc{i} lost: {search}"
+            );
+        }
+
+        assert!(
+            run_compaction_scheduler_tick(&state, Instant::now()).is_empty(),
+            "neither namespace needs compaction now"
+        );
+        let status = json_body(&handle_compaction_status(&state));
+        let rows = status["namespaces"].as_array().unwrap();
+        let row = |ns: &NamespaceId| {
+            rows.iter()
+                .find(|r| r["namespace"] == ns.0.as_str())
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row(&busy)["stats"]["merges"], 1);
+        assert_eq!(row(&busy)["needs_compaction"], false);
+        assert_eq!(row(&quiet)["stats"]["passes"], 0, "never selected");
+    }
+
+    #[test]
+    fn async_compaction_returns_202_and_the_job_reports_the_result() {
+        let state = test_shared_state();
+        seed_segments(&state, "async-ns", 3);
+        let response = handle_compact_namespace(
+            br#"{"namespace":"async-ns","mode":"full","async":true}"#,
+            "test",
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 202 Accepted"), "{response}");
+        let accepted = json_body(&response);
+        let job_id = accepted["job_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            accepted["status_url"],
+            format!("/v1/admin/compaction-jobs/{job_id}")
+        );
+
+        wait_for_job(&state, &job_id);
+        let polled = handle_compaction_job(&job_id, &state);
+        let job = json_body(&polled);
+        assert_eq!(job["state"], "succeeded", "{polled}");
+        assert_eq!(job["trigger"], "api");
+        assert_eq!(job["mode"], "full");
+        assert_eq!(job["result"]["segments_before"], 3);
+        assert_eq!(job["result"]["segments_after"], 1);
+
+        let missing = handle_compaction_job("nope", &state);
+        assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
+    }
+
+    #[test]
+    fn second_compaction_on_a_busy_namespace_gets_409_with_the_running_job() {
+        let state = test_shared_state();
+        let ns = seed_segments(&state, "busy-ns", 2);
+        let running = state
+            .compaction
+            .try_start(
+                &ns,
+                "tiered",
+                compaction_sched::Trigger::Scheduler,
+                Instant::now(),
+            )
+            .unwrap();
+        for body in [
+            br#"{"namespace":"busy-ns"}"#.as_slice(),
+            br#"{"namespace":"busy-ns","async":true}"#.as_slice(),
+        ] {
+            let response = handle_compact_namespace(body, "test", &state);
+            assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+            assert!(response.contains(&running), "{response}");
+        }
+    }
+
+    /// The tiered pass a scheduler runs must not hydrate segments it can
+    /// never merge (doc_count >= max_mergeable_docs): those are the large
+    /// ones, and pulling them is what made the old endpoint hydrate 22 GiB.
+    #[test]
+    fn tiered_pass_hydrates_only_mergeable_segments() {
+        let entry = |id: &str, docs: u32| kosha_core::ManifestEntry {
+            segment_id: kosha_core::SegmentId(id.into()),
+            doc_count: docs,
+        };
+        let manifest = kosha_core::Manifest {
+            version: 3,
+            segments: vec![
+                entry("small", 1_000),
+                entry("big", 2_000_000),
+                entry("edge", 50_000),
+            ],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        };
+        let policy = kosha_write::CompactionPolicy::default();
+        assert_eq!(policy.max_mergeable_docs, 50_000);
+        let ids = |opts: &kosha_write::CompactOptions| -> Vec<String> {
+            compaction_hydration_set(&manifest, opts)
+                .into_iter()
+                .map(|id| id.0)
+                .collect()
+        };
+        assert_eq!(
+            ids(&kosha_write::CompactOptions::tiered(policy)),
+            vec!["small"]
+        );
+        assert_eq!(
+            ids(&kosha_write::CompactOptions::full()),
+            vec!["small", "big", "edge"]
+        );
     }
 
     #[test]

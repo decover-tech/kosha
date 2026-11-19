@@ -1,5 +1,14 @@
 # Scheduled compaction for the staging paragraph namespace.
 #
+# Since #242 the ingest pod compacts on its own: a background scheduler runs
+# a tiered pass on every namespace past the segment trigger
+# (KOSHA_COMPACTION_INTERVAL_MS, default 30s), hydrating only the small
+# segments it may merge. This CronJob is no longer needed to keep segment
+# count bounded. It stays (suspended) only as a way to run a scheduled
+# `full` pass. If you enable it, send "async": true and poll
+# /v1/admin/compaction-jobs/{id} rather than holding a 3-hour request open.
+# The comments below predate the scheduler.
+#
 # There is no "compaction pod" to deploy, despite DESIGN.md §5 describing
 # three node types: `KOSHA_ROLE` is read once (main.rs:2921) and used only
 # in a log line (main.rs:2954). The behavioural split is `KOSHA_INGEST_HOST`
