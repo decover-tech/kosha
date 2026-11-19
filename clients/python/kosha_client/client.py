@@ -509,9 +509,10 @@ class KoshaClient:
             )
             return
 
-        # At least one of several text clauses. The keyword compiler emits
-        # this shape for one term searched across several fields: the same
-        # clause repeated per field, which is a single clause here.
+        # At least one of several text clauses. A typical keyword query
+        # builder emits this shape for one term searched across several
+        # fields: the same clause repeated per field, which is a single
+        # clause here.
         leaves = []
         for child in should:
             leaf = cls._text_leaf(child)
@@ -543,8 +544,8 @@ class KoshaClient:
         """``{"knn": {field: {vector, k, filter}}}`` → Kosha's kNN.
 
         The filter is carried into the vector search itself. It used to be
-        dropped here, so a matter-scoped semantic search returned the
-        nearest chunks of every matter in the index.
+        dropped here, so a project-scoped semantic search returned the
+        nearest chunks of every project in the index.
         """
         for field, options in (spec or {}).items():
             if not isinstance(options, dict):
@@ -887,7 +888,7 @@ class KoshaClient:
         Kosha always returns field values as strings on the wire
         (server-side ``Field.value: String``), regardless of field_type.
         Callers index straight into these (``hit.bottom_left[0]``,
-        ``if hit.isHot``), so they must come back as the original Python
+        ``if hit.isFeatured``), so they must come back as the original Python
         type, not the raw string. ``Keyword`` is used exclusively (by this
         client) for JSON-encoded lists that aren't Vector-worthy, so it
         decodes the same way as Vector.
@@ -943,7 +944,7 @@ class KoshaClient:
                 fields.append(cls._field_to_kosha(k, json.dumps(list(v)), "Vector"))
             elif isinstance(v, (list, tuple)):
                 # Everything else list-shaped: short numeric tuples (below
-                # _MIN_VECTOR_DIM), empty lists, string lists (recipients),
+                # _MIN_VECTOR_DIM), empty lists, string lists (labels),
                 # mixed content. JSON-encode as Keyword — stored verbatim
                 # and filterable by exact match, but never tokenized and
                 # never inserted into the shared Vector store. Decoded back
@@ -1420,41 +1421,128 @@ class IndexOps:
         self._client._flush(self._client._resolve_ns(index))
         return {"_shards": {"total": 1, "successful": 1, "failed": 0}}
 
-    def get(self, index: str, **params: Any) -> dict:
-        return {index: {"aliases": {}, "mappings": {}, "settings": {}}}
+    # Proto ``FieldType`` (proto/kosha/v1/kosha.proto) -> Elasticsearch
+    # mapping type. Keyed by the bare type name; ``_es_field_type`` also
+    # accepts the ``FIELD_TYPE_*`` enum spelling and the enum number.
+    _ES_FIELD_TYPES = {
+        "TEXT": "text",
+        "KEYWORD": "keyword",
+        "INTEGER": "long",
+        "FLOAT": "double",
+        "DATE": "date",
+        "BOOLEAN": "boolean",
+        "VECTOR": "knn_vector",
+    }
+    _FIELD_TYPE_NUMBERS = {
+        1: "TEXT",
+        2: "KEYWORD",
+        3: "INTEGER",
+        4: "FLOAT",
+        5: "DATE",
+        6: "BOOLEAN",
+        7: "VECTOR",
+    }
 
-    def get_mapping(self, index: str | None = None, **params: Any) -> dict:
-        idx = index or "default"
+    def _index_names(self, index: Any) -> list[str]:
+        """Expand an ES ``index`` argument (str, comma list, list) to names."""
+        if index is None or index == "" or index == []:
+            return [self._client._resolve_ns(None)]
+        if isinstance(index, (list, tuple)):
+            names = [str(i) for i in index]
+        else:
+            names = str(index).split(",")
+        names = [n.strip() for n in names if n and n.strip()]
+        return names or [self._client._resolve_ns(None)]
+
+    @classmethod
+    def _es_field_type(cls, field: dict) -> str | None:
+        """ES type for one ``FieldSchema``, or None when it has no type."""
+        raw = field.get("type", field.get("field_type"))
+        if isinstance(raw, bool):
+            raw = None
+        if isinstance(raw, int):
+            raw = cls._FIELD_TYPE_NUMBERS.get(raw)
+        if isinstance(raw, str):
+            name = raw.strip().upper()
+            if name.startswith("FIELD_TYPE_"):
+                name = name[len("FIELD_TYPE_") :]
+            if name in cls._ES_FIELD_TYPES:
+                return cls._ES_FIELD_TYPES[name]
+        # Only Text fields are analyzed, so a field that names an analyzer
+        # but no type is a text field.
+        if field.get("analyzer"):
+            return "text"
+        return None
+
+    def _namespace_schema(self, namespace: str) -> dict:
+        """The namespace's stored ``NamespaceSchema`` (``{}`` if none).
+
+        ``GET /v1/namespaces/{ns}/schema`` returns the schema bare or
+        wrapped as ``{"schema": ...}``. A server without that route, or a
+        namespace that does not exist yet, answers 404 (405 from a proxy
+        that knows the path but not the method): both mean "no schema",
+        not an error. Anything else (auth, 5xx, unreachable) is raised.
+        """
+        ns = urllib.parse.quote(namespace, safe="")
+        try:
+            body = self._client._v1_request("GET", ns, "schema")
+        except KoshaRequestError as e:
+            if e.status_code in (404, 405, 501) or "not found" in str(
+                e.error
+            ).lower():
+                return {}
+            raise
+        if not isinstance(body, dict):
+            return {}
+        schema = body.get("schema", body)
+        return schema if isinstance(schema, dict) else {}
+
+    def _properties(self, namespace: str) -> dict:
+        """ES ``properties`` for exactly the fields the schema declares."""
+        fields = self._namespace_schema(namespace).get("fields") or {}
+        properties: dict[str, dict] = {}
+        if not isinstance(fields, dict):
+            return properties
+        for name, field in fields.items():
+            es_type = self._es_field_type(field if isinstance(field, dict) else {})
+            properties[name] = {"type": es_type} if es_type else {}
+        return properties
+
+    def get(self, index: str, **params: Any) -> dict:
         return {
-            idx: {
-                "mappings": {
-                    "properties": {
-                        "documentId": {"type": "keyword"},
-                        "content": {"type": "text"},
-                        "title": {"type": "text"},
-                        "sender": {"type": "keyword"},
-                        "recipients": {"type": "keyword"},
-                        "sentAt": {"type": "date"},
-                        "matterId": {"type": "keyword"},
-                        "orgId": {"type": "keyword"},
-                    }
-                }
+            name: {
+                "aliases": {},
+                "mappings": {"properties": self._properties(name)},
+                "settings": self._settings(name),
             }
+            for name in self._index_names(index)
         }
 
-    def get_settings(self, index: str | None = None, **params: Any) -> dict:
-        idx = index or "default"
+    def get_mapping(self, index: str | None = None, **params: Any) -> dict:
+        """The namespace's real field mapping, in Elasticsearch shape.
+
+        Fields come from the namespace schema (``GET
+        /v1/namespaces/{ns}/schema``), with proto ``FieldType`` translated
+        to ES types. Kosha is schemaless, so a namespace without a schema,
+        or a server too old to serve one, has ``"properties": {}``. Fields
+        are never guessed.
+        """
         return {
-            idx: {
-                "settings": {
-                    "index": {
-                        "knn": "true",
-                        "refresh_interval": "-1",
-                        "number_of_shards": "1",
-                        "number_of_replicas": "0",
-                    }
-                }
-            }
+            name: {"mappings": {"properties": self._properties(name)}}
+            for name in self._index_names(index)
+        }
+
+    @staticmethod
+    def _settings(name: str) -> dict:
+        # Only what is actually known: Kosha has no shards, replicas or
+        # refresh interval to report per namespace.
+        return {"index": {"provided_name": name}}
+
+    def get_settings(self, index: str | None = None, **params: Any) -> dict:
+        """Index settings: only the index name. Nothing else is invented."""
+        return {
+            name: {"settings": self._settings(name)}
+            for name in self._index_names(index)
         }
 
     def flush(self, index: str | None = None, **params: Any) -> dict:
