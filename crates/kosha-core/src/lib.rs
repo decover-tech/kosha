@@ -714,6 +714,15 @@ pub struct Footer {
     /// readers need not consult it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_filter_ignore_above: Option<u32>,
+    /// `true` when the writer moved parsed `Vector` field values out of
+    /// `doc_store.bin` into the binary `doc_vectors.bin` sidecar (#243).
+    /// The doc store then keeps each such field with an **empty** value as
+    /// a placeholder (name, type and position preserved), and
+    /// `SegmentReader` fills it back in from the sidecar on every
+    /// doc-record read. `false` (the default, and every segment written
+    /// before #243) means vectors are inline JSON in the doc store.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub doc_vectors: bool,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -1880,6 +1889,7 @@ mod tests {
             term_bloom: Some(BloomFilter::build(values.iter().map(String::as_str))),
             format_version: SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: Some(256),
+            doc_vectors: false,
         }
     }
 
