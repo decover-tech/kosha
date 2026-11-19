@@ -423,6 +423,33 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      with; with AND, each query position must match in some listed field. It runs on an
      exhaustive per-field path (per-field block summaries carry no lengths yet, so no WAND).
      `match_phrase` with a `field` (or `fields`) is matched in that field's postings.
+     Block-max WAND prunes against a **namespace-wide top-k floor** (issue #248): segments of
+     one plain ranked lexical query (no kNN/hybrid, phrase, wildcard, `fields`, fuzzy, aggs,
+     collapse, `limit_per`, custom sort or `search_after`) share an `AtomicU64` holding the highest
+     k-th-best score any segment has reached (`k = from + max_results`, or the `rank_by` rescore
+     window when that is larger), and each prunes blocks and candidates strictly
+     below `max(local k-th-best, shared floor)`. A published value is the k-th score of `k` real,
+     accepted documents scored exactly as the merge ranks them, so the final page's k-th score
+     is at least that high and nothing that could reach the page is ever pruned; ties are still
+     scored. Before scoring, each segment's ceiling (Σ over query terms of its best block's
+     `block_max_score`) is computed and segments are handed out highest ceiling first from a
+     shared queue, so the strongest segments raise the floor early (the ceiling uses the terms
+     that segment's own analysis chains read the query as, #220; a mixed-analyzer segment gets an
+     infinite ceiling); a single-term segment whose
+     ceiling is already below the floor is skipped outright (its exact count is the term's
+     `df`). The ceiling inputs are cached per `(namespace, manifest version, segment-list
+     fingerprint, term)` like the `df` values: each segment's footer shape and the Pareto
+     frontier of the term's block `(max_tf, min_field_length)` skip summaries. BM25 rises with
+     tf and falls with length for every valid k1/b, so the best block under any request's
+     scorer lies on that frontier, and a warm query computes all ceilings from memory (~10 µs
+     for 200 segments); a new term costs one pass reading skip summaries, decoding no posting. Counts are unaffected:
+     exact counting still visits every match, and capped counting stops a segment only once its
+     own count reaches the cap. A legacy segment without stored summaries has an infinite
+     ceiling (visited first, never skipped). A segment that publishes and then abandons its WAND
+     walk for the general path (a corrupt block found mid-walk) poisons the floor and the search
+     is rescored with per-segment floors. Hybrid (RRF) requests are untouched: their lexical
+     list is a rank window, scored by the general path. `SearchPhaseStats` reports
+     `wand_docs_scored`, `wand_segments_skipped`, `wand_global_threshold` and `wand_bounds_ms`.
    - Semantic: ANN search over `vector.idx` (HNSW graph traversal or IVF-PQ probe), scored by
      cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
      query in `query_builder.py`.

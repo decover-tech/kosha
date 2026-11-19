@@ -11,9 +11,9 @@ use kosha_core::fuzzy::{ExpandStats, FuzzyQuery, MAX_FUZZY_EDITS};
 use kosha_core::{
     segment_may_contain_terms, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
     AggMetricResult, Aggregation, AggregationResults, Bm25Params, Bm25StatsScope, DocSet,
-    DocumentId, FieldType, FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry,
-    NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery, SearchResult, SortSpec,
-    TermBloomMode, TotalHitsRelation,
+    DocumentId, FieldType, FilterClause, FilterStore, HighlightConfig, KoshaError, Manifest,
+    ManifestEntry, NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery, SearchResult,
+    SortSpec, TermBloomMode, TotalHitsRelation,
 };
 use kosha_core::{AnalyzerSpec, FieldBoost, Footer, SegmentAnalysis};
 use kosha_segment::{
@@ -1227,6 +1227,100 @@ fn manifest_segments_fingerprint(manifest: &Manifest) -> u64 {
     hasher.finish()
 }
 
+// ─── Segment score ceilings (issue #248) ────────────────────────────────────
+
+/// The footer values a segment's scorer is built from (see
+/// [`shape_scorer`]).
+struct SegmentShape {
+    doc_count: u32,
+    avg_field_length: f64,
+    bm25_params: Bm25Params,
+    /// The footer's analysis chains (#220): which terms the query reads as
+    /// in this segment.
+    analysis: Option<kosha_core::analysis::SegmentAnalysis>,
+}
+
+/// One term's score-ceiling inputs in one segment.
+#[derive(Clone)]
+enum TermCeiling {
+    /// The segment does not contain the term: it contributes nothing.
+    Absent,
+    /// No cheap bound (legacy format without stored block summaries, or
+    /// postings that could not be read): the ceiling is `+∞`.
+    Unknown,
+    /// The term's posting count in the segment, and the Pareto frontier of
+    /// its blocks' `(max_tf, min_field_length)` summaries: every block not
+    /// on it has a no-larger `max_tf` and a no-smaller `min_field_length`
+    /// than one that is. BM25 grows with tf and shrinks with length for
+    /// every valid k1/b, so the best block ceiling under any scorer is on
+    /// the frontier — which is why it can be cached once and scored per
+    /// request.
+    Frontier { df: u32, pairs: Box<[(u32, u32)]> },
+}
+
+impl TermCeiling {
+    fn of(source: &ScoringBlocks<'_>) -> Self {
+        let mut summaries = Vec::with_capacity(source.block_count());
+        for block in 0..source.block_count() {
+            match source.stored_summary(block) {
+                Some(summary) => summaries.push(summary),
+                None => return Self::Unknown,
+            }
+        }
+        // Highest tf first, shortest field first among equal tf; keep a
+        // block only if it is shorter than every block kept before it.
+        summaries.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        for (max_tf, min_fl) in summaries {
+            if pairs.last().is_none_or(|&(_, kept_fl)| min_fl < kept_fl) {
+                pairs.push((max_tf, min_fl));
+            }
+        }
+        Self::Frontier {
+            df: u32::try_from(source.doc_count()).unwrap_or(u32::MAX),
+            pairs: pairs.into_boxed_slice(),
+        }
+    }
+}
+
+/// Per manifest version: each segment's [`SegmentShape`] (`None` when its
+/// footer could not be read) and, per query term seen at this version,
+/// every segment's [`TermCeiling`] in manifest order.
+struct CeilingEntry {
+    shapes: Vec<Option<SegmentShape>>,
+    terms: Mutex<HashMap<String, Arc<Vec<TermCeiling>>>>,
+}
+
+/// Most manifest versions with cached ceilings, across namespaces.
+const CEILING_CACHE_MAX_ENTRIES: usize = 64;
+/// Most cached terms per manifest version. Each costs a small frontier
+/// per segment, so this is much lower than the `df` cache's bound.
+const CEILING_CACHE_MAX_TERMS: usize = 4096;
+
+/// [`CeilingEntry`] per `(namespace, manifest version, segment-list
+/// fingerprint)` — the same key and lifecycle as [`CorpusStatsCache`].
+/// Segments are immutable under a fingerprint, so a cached frontier never
+/// goes stale.
+#[derive(Default)]
+struct CeilingCache {
+    entries: Mutex<HashMap<CorpusKey, Arc<CeilingEntry>>>,
+}
+
+impl CeilingCache {
+    fn get(&self, key: &CorpusKey) -> Option<Arc<CeilingEntry>> {
+        self.entries.lock().unwrap().get(key).cloned()
+    }
+
+    fn insert(&self, key: CorpusKey, entry: Arc<CeilingEntry>) -> Arc<CeilingEntry> {
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|k, _| k.0 != key.0 || k.1 > key.1);
+        if entries.len() >= CEILING_CACHE_MAX_ENTRIES {
+            entries.clear();
+        }
+        Arc::clone(entries.entry(key).or_insert(entry))
+    }
+}
+
 // ─── Wildcard matcher ───────────────────────────────────────────────────────
 
 pub fn wildcard_terms(terms: &[&str], pattern: &str, case_insensitive: bool) -> Vec<String> {
@@ -1668,6 +1762,45 @@ pub fn apply_highlight(
     result
 }
 
+/// Fills `doc`'s highlight output for `config`, marking up `query_terms`
+/// (the query's analyzed terms, shared by every field) in each requested
+/// field. A requested field the document lacks, or that is not a text
+/// field, is skipped silently, as OpenSearch does. A multi-valued field
+/// yields one fragment per value.
+///
+/// The legacy single-field request form fills `doc.highlights` (the flat
+/// list it always returned); the `fields` form fills the per-field
+/// `doc.highlight` map.
+pub fn apply_highlights(
+    doc: &mut ScoredDocument,
+    config: &HighlightConfig,
+    query_terms: &[String],
+) {
+    let mut by_field: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for requested in &config.fields {
+        let pre = config.pre_tag(requested);
+        let post = config.post_tag(requested);
+        let fragments: Vec<String> = doc
+            .fields
+            .iter()
+            .filter(|f| f.name == requested.name && f.field_type == FieldType::Text)
+            .map(|f| apply_highlight(&f.value, query_terms, pre, post))
+            .collect();
+        if !fragments.is_empty() {
+            by_field.insert(requested.name.clone(), fragments);
+        }
+    }
+    if by_field.is_empty() {
+        return;
+    }
+    if config.legacy_single_field {
+        doc.highlights = by_field.into_values().next();
+    } else {
+        doc.highlight = Some(by_field);
+    }
+}
+
 // ─── Searcher ───────────────────────────────────────────────────────────────
 
 // ─── Cosine similarity ─────────────────────────────────────────────────────
@@ -1834,6 +1967,23 @@ pub struct SearchPhaseStats {
     pub bm25_stats_ms: f64,
     /// Which statistics the lexical scores used — see [`Bm25StatsUsed`].
     pub bm25_stats: Bm25StatsUsed,
+    /// Documents the block-max WAND paths actually computed a BM25 score
+    /// for, summed over segments — the work pruning exists to avoid. A
+    /// query that took the general (exhaustive) path reports 0.
+    pub wand_docs_scored: usize,
+    /// Segments whose whole score ceiling was already below the
+    /// namespace-wide top-k floor, so no block of theirs was scored
+    /// (issue #248).
+    pub wand_segments_skipped: usize,
+    /// Whether segments shared one top-k floor and were visited in
+    /// descending order of their score ceiling (issue #248). Only plain
+    /// ranked lexical queries over more than one segment do.
+    pub wand_global_threshold: bool,
+    /// Wall time spent computing the per-segment score ceilings that
+    /// order segments under the shared floor (issue #248); part of
+    /// `score_wall_ms`. Microseconds once the query's terms are cached for
+    /// the manifest version; zero when the floor was not used.
+    pub wand_bounds_ms: f64,
 }
 
 /// Which BM25 collection statistics a search actually scored with.
@@ -1873,6 +2023,10 @@ struct OpenStatsCollector {
     /// Vector postings hydrated across segments (kNN only) — see
     /// [`SearchPhaseStats::knn_postings_probed`].
     knn_postings: AtomicUsize,
+    /// See [`SearchPhaseStats::wand_docs_scored`].
+    wand_docs_scored: AtomicUsize,
+    /// See [`SearchPhaseStats::wand_segments_skipped`].
+    wand_segments_skipped: AtomicUsize,
 }
 
 pub struct Searcher {
@@ -1881,6 +2035,12 @@ pub struct Searcher {
     ledger: Arc<MemoryLedger>,
     /// Namespace-level BM25 statistics per manifest version (issue #246).
     corpus_stats: CorpusStatsCache,
+    /// Share one block-max WAND floor across segments (issue #248). On by
+    /// default; only tests and benches turn it off, to compare against
+    /// per-segment pruning — see [`Searcher::set_global_wand_threshold`].
+    global_wand: std::sync::atomic::AtomicBool,
+    /// Per-segment score-ceiling inputs per manifest version (issue #248).
+    ceilings: CeilingCache,
 }
 
 /// Result of a [`Searcher::warm_segments`] pass — how many segments were
@@ -1939,7 +2099,18 @@ impl Searcher {
             segment_cache: SegmentCache::new(capacity, max_bytes),
             ledger: Arc::new(MemoryLedger::new(max_live_bytes, admission_timeout)),
             corpus_stats: CorpusStatsCache::default(),
+            global_wand: std::sync::atomic::AtomicBool::new(true),
+            ceilings: CeilingCache::default(),
         }
+    }
+
+    /// Turn the namespace-wide block-max WAND floor (issue #248) on or
+    /// off for this searcher. Results are identical either way — only how
+    /// much gets scored differs — so this is a test/bench hook for
+    /// measuring that, not a production knob.
+    #[doc(hidden)]
+    pub fn set_global_wand_threshold(&self, enabled: bool) {
+        self.global_wand.store(enabled, Ordering::Relaxed);
     }
 
     /// Return the cached parsed segment for `(namespace, segment_id,
@@ -2399,6 +2570,324 @@ impl Searcher {
         }))
     }
 
+    /// The scoring pass under a namespace-wide WAND floor (issue #248).
+    ///
+    /// First every segment's score ceiling is computed (see
+    /// [`Self::segment_score_ceilings`]: from memory when the query's terms
+    /// were seen before at this manifest version). Then segments are
+    /// handed out highest ceiling first from a shared queue, one at a time,
+    /// to one worker per rayon thread — a plain `par_iter` splits the list
+    /// into halves and starts in the middle of it, so it would not visit
+    /// the strongest segments first. Each segment prunes against the
+    /// shared `floor`, and a segment whose ceiling is already below it
+    /// skips scoring outright.
+    ///
+    /// Returns one entry per manifest segment, in manifest order, so the
+    /// merge that follows is as deterministic as the plain pass.
+    #[allow(clippy::too_many_arguments)]
+    fn score_segments_by_upper_bound<F>(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        // The query's lexical text; each segment's ceiling is computed for
+        // its own reading of it (#220).
+        analysis: &QueryAnalysis,
+        permit: &AdmissionPermit,
+        // Opens done by the ceiling pass, kept apart like the `df` pass's
+        // (see `search_inner`): the scoring pass then finds them cached.
+        bound_open_stats: &OpenStatsCollector,
+        corpus: Option<&Arc<CorpusStats>>,
+        floor: &GlobalWandFloor,
+        score_one: &F,
+    ) -> Result<(Vec<Option<SegmentOutput>>, f64), KoshaError>
+    where
+        F: Fn(&ManifestEntry, Option<SharedWand<'_>>) -> Result<Option<SegmentOutput>, KoshaError>
+            + Sync,
+    {
+        let segments = &manifest.segments;
+        let t_bounds = Instant::now();
+        let bounds = self.segment_score_ceilings(
+            namespace,
+            manifest,
+            query,
+            analysis,
+            permit,
+            bound_open_stats,
+            corpus,
+        );
+        let bounds_ms = t_bounds.elapsed().as_secs_f64() * 1e3;
+        // Highest ceiling first; manifest order among equals.
+        let mut order: Vec<(usize, f64)> = bounds.into_iter().enumerate().collect();
+        order.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        let next = AtomicUsize::new(0);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let workers = rayon::current_num_threads().clamp(1, order.len().max(1));
+        // Each worker's `(manifest index, output)` pairs.
+        type Scored = Vec<(usize, Option<SegmentOutput>)>;
+        let per_worker: Vec<Result<Scored, KoshaError>> = (0..workers)
+            .into_par_iter()
+            .map(|_| {
+                let mut done = Vec::new();
+                while !failed.load(Ordering::Relaxed) {
+                    let Some(&(index, segment_upper_bound)) =
+                        order.get(next.fetch_add(1, Ordering::Relaxed))
+                    else {
+                        break;
+                    };
+                    let shared = SharedWand {
+                        floor,
+                        segment_upper_bound,
+                    };
+                    match score_one(&segments[index], Some(shared)) {
+                        Ok(output) => done.push((index, output)),
+                        Err(err) => {
+                            failed.store(true, Ordering::Relaxed);
+                            return Err(err);
+                        }
+                    }
+                }
+                Ok(done)
+            })
+            .collect();
+        let mut outputs: Vec<Option<SegmentOutput>> = Vec::with_capacity(segments.len());
+        outputs.resize_with(segments.len(), || None);
+        for worker in per_worker {
+            for (index, output) in worker? {
+                outputs[index] = output;
+            }
+        }
+        Ok((outputs, bounds_ms))
+    }
+
+    /// An upper bound on the BM25 score any document of each manifest
+    /// segment can get for `query_terms` (issue #248), in manifest order:
+    /// for each term, the largest block ceiling in the segment's postings
+    /// (the same `block_max_score` the WAND paths prune with, from the
+    /// same scorer), summed over terms. It bounds AND and OR alike, since a
+    /// document scores at most every term's best block.
+    ///
+    /// The scorer-independent inputs — each segment's footer shape and,
+    /// per term, the Pareto frontier of its blocks' `(max_tf,
+    /// min_field_length)` summaries — are cached per manifest version (see
+    /// [`CeilingCache`]), so a warm query computes its ceilings from memory
+    /// without touching a segment. Only a term not seen yet at this version
+    /// costs a pass over the segments, which reads skip-table summaries and
+    /// decodes no posting. `+∞` for any segment without a cheap bound: a
+    /// legacy format without stored summaries, an unreadable footer or
+    /// postings blob, or a segment that failed to open (scoring then
+    /// surfaces the error). An infinite ceiling is visited first and never
+    /// skipped, which is always safe.
+    #[allow(clippy::too_many_arguments)]
+    fn segment_score_ceilings(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        analysis: &QueryAnalysis,
+        permit: &AdmissionPermit,
+        open_stats: &OpenStatsCollector,
+        corpus: Option<&Arc<CorpusStats>>,
+    ) -> Vec<f64> {
+        let seg_dir =
+            |entry: &ManifestEntry| self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+        let key = (
+            namespace.0.clone(),
+            manifest.version,
+            manifest_segments_fingerprint(manifest),
+        );
+        let ceilings = match self.ceilings.get(&key) {
+            Some(entry) => entry,
+            None => {
+                let shapes: Vec<Option<SegmentShape>> = manifest
+                    .segments
+                    .par_iter()
+                    .map(|entry| {
+                        let footer = manifest.footer_or_read(&entry.segment_id, || {
+                            SegmentReader::read_footer(&seg_dir(entry)).ok()
+                        })?;
+                        Some(SegmentShape {
+                            doc_count: footer.doc_count,
+                            avg_field_length: footer.avg_field_length,
+                            bm25_params: footer.bm25_params.clone(),
+                            analysis: footer.analysis.clone(),
+                        })
+                    })
+                    .collect();
+                let complete = shapes.iter().all(Option::is_some);
+                let entry = Arc::new(CeilingEntry {
+                    shapes,
+                    terms: Mutex::new(HashMap::new()),
+                });
+                // A footer that could not be read (not hydrated yet, say)
+                // is not cached as "no bound" for the manifest's lifetime:
+                // the next search tries again.
+                if complete {
+                    self.ceilings.insert(key, entry)
+                } else {
+                    entry
+                }
+            }
+        };
+
+        // Each segment's terms for the query, read with the analysis chains
+        // its footer names (#220) — the same reading `score_segment` scores
+        // it with. `None` when there is no single reading: an unreadable
+        // footer, or a mixed-analyzer segment, which never takes the WAND
+        // path (its ceiling is then `+∞`).
+        let segment_terms: Vec<Option<Vec<String>>> = ceilings
+            .shapes
+            .iter()
+            .map(|shape| {
+                let shape = shape.as_ref()?;
+                let readings = analysis.for_segment(shape.analysis.as_ref());
+                match readings.as_slice() {
+                    [reading] => Some(reading.terms.clone()),
+                    _ => None,
+                }
+            })
+            .collect();
+        let mut query_terms: Vec<String> =
+            segment_terms.iter().flatten().flatten().cloned().collect();
+        query_terms.sort();
+        query_terms.dedup();
+
+        let mut known: HashMap<&str, Arc<Vec<TermCeiling>>> = HashMap::new();
+        let mut missing: Vec<String> = Vec::new();
+        {
+            let cached = ceilings.terms.lock().unwrap();
+            for term in &query_terms {
+                match cached.get(term) {
+                    Some(per_segment) => {
+                        known.insert(term, Arc::clone(per_segment));
+                    }
+                    None if !missing.contains(term) => missing.push(term.clone()),
+                    None => {}
+                }
+            }
+        }
+        if !missing.is_empty() {
+            // One pass over the segments for every missing term: per
+            // segment, one `TermCeiling` per missing term, and whether any
+            // of them is unknown for a reason that may not last (a segment
+            // or postings blob that could not be read). Such a pass is used
+            // for this search but not cached.
+            let per_segment: Vec<(Vec<TermCeiling>, bool)> = manifest
+                .segments
+                .par_iter()
+                .map(|entry| {
+                    let unknown = || (vec![TermCeiling::Unknown; missing.len()], true);
+                    let dir = seg_dir(entry);
+                    let Some(footer) = manifest.footer_or_read(&entry.segment_id, || {
+                        SegmentReader::read_footer(&dir).ok()
+                    }) else {
+                        return unknown();
+                    };
+                    let mut out = vec![TermCeiling::Absent; missing.len()];
+                    // The term bloom has no false negatives: a term it
+                    // rules out is absent without opening the segment.
+                    let candidates: Vec<String> = missing
+                        .iter()
+                        .filter(|term| {
+                            footer
+                                .term_bloom
+                                .as_ref()
+                                .is_none_or(|bloom| bloom.may_contain(term))
+                        })
+                        .cloned()
+                        .collect();
+                    if candidates.is_empty() {
+                        return (out, false);
+                    }
+                    if !dir.exists() {
+                        return unknown();
+                    }
+                    let Ok(reader) = self.open_segment(
+                        &namespace.0,
+                        &entry.segment_id.0,
+                        dir,
+                        // Lexical only: the shared floor never runs for kNN.
+                        false,
+                        manifest.segment_footer(&entry.segment_id),
+                        Some(permit),
+                        Some(open_stats),
+                    ) else {
+                        return unknown();
+                    };
+                    let slot_of = |term: &str| missing.iter().position(|t| t == term);
+                    // A term the TOC has whose postings do not come back
+                    // was unreadable: its ceiling stays unknown. (The
+                    // failure flag is left for the scoring pass to drain;
+                    // it refetches and decides.)
+                    let mut present = 0;
+                    for term in candidates.iter().filter(|t| reader.contains_term(t)) {
+                        if let Some(slot) = slot_of(term) {
+                            out[slot] = TermCeiling::Unknown;
+                            present += 1;
+                        }
+                    }
+                    let mut fetched = 0;
+                    for (term, scoring) in reader.scoring_postings_for_terms(&candidates) {
+                        if let Some(slot) = slot_of(term) {
+                            out[slot] = TermCeiling::of(&ScoringBlocks::new(scoring));
+                            fetched += 1;
+                        }
+                    }
+                    (out, fetched < present)
+                })
+                .collect();
+            let transient = per_segment.iter().any(|(_, transient)| *transient);
+            let mut cached = ceilings.terms.lock().unwrap();
+            if cached.len() + missing.len() > CEILING_CACHE_MAX_TERMS {
+                cached.clear();
+            }
+            for (slot, term) in missing.iter().enumerate() {
+                let column: Vec<TermCeiling> = per_segment
+                    .iter()
+                    .map(|(segment, _)| segment[slot].clone())
+                    .collect();
+                let column = Arc::new(column);
+                if !transient {
+                    cached.insert(term.clone(), Arc::clone(&column));
+                }
+                known.insert(term.as_str(), column);
+            }
+        }
+
+        ceilings
+            .shapes
+            .iter()
+            .enumerate()
+            .map(|(index, shape)| {
+                let (Some(shape), Some(terms)) = (shape, &segment_terms[index]) else {
+                    return f64::INFINITY;
+                };
+                let scorer = shape_scorer(
+                    query,
+                    shape.doc_count,
+                    shape.avg_field_length,
+                    &shape.bm25_params,
+                    corpus,
+                );
+                terms
+                    .iter()
+                    .map(|term| match &known[term.as_str()][index] {
+                        TermCeiling::Absent => 0.0,
+                        TermCeiling::Unknown => f64::INFINITY,
+                        TermCeiling::Frontier { df, pairs } => {
+                            let df = scorer.doc_frequency(term, *df);
+                            pairs
+                                .iter()
+                                .map(|&(max_tf, min_fl)| scorer.block_max_score(max_tf, df, min_fl))
+                                .fold(0.0, f64::max)
+                        }
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn score_segment(
         &self,
@@ -2436,6 +2925,9 @@ impl Searcher {
         // Namespace-level BM25 statistics (issue #246); `None` scores this
         // segment with its own `N` / `df` / `avgdl`.
         corpus: Option<&Arc<CorpusStats>>,
+        // The namespace-wide block-max WAND floor and this segment's score
+        // ceiling (issue #248); `None` prunes against the local floor only.
+        shared_wand: Option<SharedWand<'_>>,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
         let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
         if !seg_dir.exists() {
@@ -2474,7 +2966,6 @@ impl Searcher {
             Some(permit),
             Some(open_stats),
         )?;
-        let total_docs = reader.doc_count();
 
         // ── Which documents of this segment may be a hit at all ──
         // The filter is resolved to a set up front (cached on the segment,
@@ -2530,10 +3021,7 @@ impl Searcher {
         // WAND ceilings go through `scorer.doc_frequency` too, so they are
         // computed with exactly the IDF the hits get.
         let params = query.bm25_params.resolve(reader.bm25_params());
-        let scorer = match corpus {
-            Some(corpus) => Bm25Scorer::with_corpus(Arc::clone(corpus), params.clone()),
-            None => Bm25Scorer::new(total_docs, reader.avg_field_length(), params.clone()),
-        };
+        let scorer = segment_scorer(query, &reader, corpus);
 
         // Hybrid requests keep their lexical and vector lists apart here and
         // fuse them by rank in `search_inner`, once both lists are known
@@ -2768,6 +3256,14 @@ impl Searcher {
                 // v4 corruption always had. Returning partial output here
                 // instead would truncate AND intersections or report an
                 // exact-looking total_hits with missing candidates.
+                // The namespace-wide floor (issue #248), and what this
+                // segment did with it: whether it published a value (see
+                // `GlobalWandFloor::poisoned`) and how many documents it
+                // actually scored (reported in `SearchPhaseStats`).
+                let global = shared_wand.map(|w| w.floor);
+                let published = std::cell::Cell::new(false);
+                let docs_scored = std::cell::Cell::new(0usize);
+                let count_scored = || docs_scored.set(docs_scored.get() + 1);
                 let wand_attempt = || -> Option<SegmentOutput> {
                     // Required AND terms were verified in the TOC above;
                     // absent optional OR terms can be omitted here.
@@ -2846,6 +3342,24 @@ impl Searcher {
                             });
                         }
 
+                        // The whole segment's ceiling is already below the
+                        // namespace-wide floor: none of its documents can
+                        // reach the page, so not one block is looked at.
+                        // `total_hits` above is still exact.
+                        if shared_wand.is_some_and(|w| w.segment_upper_bound < w.floor.get()) {
+                            open_stats
+                                .wand_segments_skipped
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Some(SegmentOutput {
+                                candidates: Vec::new(),
+                                vector_candidates: Vec::new(),
+                                aggs: HashMap::new(),
+                                total_hits,
+                                hits_capped: false,
+                                knn_segment_degraded: false,
+                            });
+                        }
+
                         let mut topk = BoundedTopK::new(effective_k);
                         let mut buf: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
                         for block in 0..source.block_count() {
@@ -2892,7 +3406,7 @@ impl Searcher {
                             // low-tf high-dl docs falls off fast for Zipfian
                             // terms. On v5 a skipped block was never decoded in
                             // the first place.
-                            if topk.is_full() && block_ub < topk.floor() {
+                            if block_ub < topk.threshold(global) {
                                 continue;
                             }
                             // v5: only a block that survived the pivot test is
@@ -2910,8 +3424,12 @@ impl Searcher {
                                 if let Some(meta) = reader.doc_meta(sp.doc_id) {
                                     let score =
                                         scorer.score_term(sp.term_frequency, df, meta.field_length);
+                                    count_scored();
                                     topk.insert(score, sp.doc_id, meta.doc_id);
                                 }
+                            }
+                            if topk.publish(global) {
+                                published.set(true);
                             }
                         }
 
@@ -3035,10 +3553,13 @@ impl Searcher {
                             // OR asking for more hits than the cap
                             // (`max_results` 1000, cap 10) used to index
                             // past the end and panic here.
-                            let can_skip =
-                                count_budget.is_some_and(|cap| total_hits >= cap) && topk.is_full();
+                            // The threshold may come from other segments
+                            // (issue #248) before this one's top-k fills.
+                            let threshold = topk.threshold(global);
+                            let can_skip = count_budget.is_some_and(|cap| total_hits >= cap)
+                                && threshold > f64::NEG_INFINITY;
                             let pivot_pos = if can_skip && !ranking_settled {
-                                let floor = topk.floor();
+                                let floor = threshold;
                                 let mut acc = 0.0;
                                 let mut found = None;
                                 for (pos, &i) in order.iter().enumerate() {
@@ -3105,14 +3626,15 @@ impl Searcher {
                                 // for bit (see the AND join's identical
                                 // note above): identical float rounding,
                                 // identical ties.
-                                let prune = topk.is_full() && {
+                                let threshold = topk.threshold(global);
+                                let prune = threshold > f64::NEG_INFINITY && {
                                     let mut ub = 0.0;
                                     for (i, cursor) in cursors.iter_mut().enumerate() {
                                         if cur[i] == Some(pivot_doc) {
                                             ub += cursor.block_upper_bound(&scorer, &reader);
                                         }
                                     }
-                                    ub < topk.floor()
+                                    ub < threshold
                                 };
                                 if !prune {
                                     let mut score = 0.0;
@@ -3126,7 +3648,11 @@ impl Searcher {
                                             );
                                         }
                                     }
+                                    count_scored();
                                     topk.insert(score, pivot_doc, meta.doc_id);
+                                    if topk.publish(global) {
+                                        published.set(true);
+                                    }
                                 }
                             }
 
@@ -3256,14 +3782,15 @@ impl Searcher {
                         total_hits += 1;
                         if effective_k > 0 {
                             if let Some(meta) = reader.doc_meta(candidate) {
-                                let prune = topk.is_full() && {
+                                let threshold = topk.threshold(global);
+                                let prune = threshold > f64::NEG_INFINITY && {
                                     let mut ub = 0.0;
                                     for cursor in cursors.iter_mut() {
                                         ub += cursor.block_upper_bound(&scorer, &reader);
                                     }
                                     // Strict: a doc whose ceiling ties the
                                     // floor can still win by doc_id tiebreak.
-                                    ub < topk.floor()
+                                    ub < threshold
                                 };
                                 if !prune {
                                     let mut score = 0.0;
@@ -3275,14 +3802,19 @@ impl Searcher {
                                             meta.field_length,
                                         );
                                     }
+                                    count_scored();
                                     topk.insert(score, candidate, meta.doc_id);
+                                    if topk.publish(global) {
+                                        published.set(true);
+                                    }
                                 }
                             }
                         }
 
+                        let threshold = topk.threshold(global);
                         if early_exit_enabled
                             && count_budget.is_some_and(|cap| total_hits >= cap)
-                            && topk.is_full()
+                            && threshold > f64::NEG_INFINITY
                         {
                             let mut bound = 0.0;
                             let mut have_bounds = true;
@@ -3299,7 +3831,7 @@ impl Searcher {
                                 // Legacy source in the join — no cheap
                                 // remaining bound; count exactly instead.
                                 early_exit_enabled = false;
-                            } else if bound < topk.floor() {
+                            } else if bound < threshold {
                                 // No future member can beat the page
                                 // (strict: a tie could still win by
                                 // doc_id). total_hits is now a lower
@@ -3333,8 +3865,20 @@ impl Searcher {
                         knn_segment_degraded: false,
                     })
                 };
-                if let Some(output) = wand_attempt() {
+                let attempt = wand_attempt();
+                open_stats
+                    .wand_docs_scored
+                    .fetch_add(docs_scored.get(), Ordering::Relaxed);
+                if let Some(output) = attempt {
                     return Ok(Some(output));
+                }
+                if published.get() {
+                    // This segment raised the shared floor from scores the
+                    // general path below may not reproduce; see
+                    // `GlobalWandFloor::poisoned`.
+                    if let Some(global) = global {
+                        global.poisoned.store(true, Ordering::Relaxed);
+                    }
                 }
                 // Corruption detected: fall through to the general path,
                 // whose full decode drops undecodable terms (fail-closed,
@@ -4319,41 +4863,101 @@ impl Searcher {
         phase_stats.bm25_stats_ms = t_stats.elapsed().as_secs_f64() * 1e3;
 
         let t_score = Instant::now();
-        let segment_outputs: Vec<SegmentOutput> = manifest
-            .segments
-            .par_iter()
-            .map(|entry| {
-                let manifest_footer = manifest.segment_footer(&entry.segment_id);
-                self.score_segment(
-                    namespace,
-                    entry,
-                    query,
-                    &query_analysis,
-                    count_budget,
-                    term_prune,
-                    &sort_value_fields,
-                    tombstones,
-                    manifest_footer,
-                    &permit,
-                    &open_stats,
-                    knn_cutoff,
-                    &filter_keys,
-                    corpus.as_ref(),
-                )
-            })
-            .collect::<Result<Vec<Option<SegmentOutput>>, KoshaError>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+        let score_one = |entry: &ManifestEntry, shared_wand: Option<SharedWand<'_>>| {
+            self.score_segment(
+                namespace,
+                entry,
+                query,
+                &query_analysis,
+                count_budget,
+                term_prune,
+                &sort_value_fields,
+                tombstones,
+                manifest.segment_footer(&entry.segment_id),
+                &permit,
+                &open_stats,
+                knn_cutoff,
+                &filter_keys,
+                corpus.as_ref(),
+                shared_wand,
+            )
+        };
+        // ── Namespace-wide block-max WAND floor (issue #248) ───────────
+        // A plain ranked lexical query over several segments shares one
+        // top-k floor between them and visits segments best-ceiling first,
+        // so the strongest segments raise the floor early and the rest
+        // prune against it from their first block. See `GlobalWandFloor`.
+        let global_wand = self.global_wand.load(Ordering::Relaxed)
+            && manifest.segments.len() > 1
+            && wand_eligible_query(query, query_analysis.has_text());
+        phase_stats.wand_global_threshold = global_wand;
+        let mut shared_outputs = None;
+        let bound_open_stats = OpenStatsCollector::default();
+        if global_wand {
+            let floor = GlobalWandFloor::new();
+            #[cfg(test)]
+            if FORCE_WAND_POISON.with(|force| force.get()) {
+                floor.poisoned.store(true, Ordering::Relaxed);
+            }
+            let (outputs, bounds_ms) = self.score_segments_by_upper_bound(
+                namespace,
+                manifest,
+                query,
+                &query_analysis,
+                &permit,
+                &bound_open_stats,
+                corpus.as_ref(),
+                &floor,
+                &score_one,
+            )?;
+            phase_stats.wand_bounds_ms = bounds_ms;
+            if floor.poisoned.load(Ordering::Relaxed) {
+                // A segment fell back to the general path after raising the
+                // floor; score everything again with per-segment floors
+                // only (a corrupt segment is rare, exactness is not
+                // negotiable). The rerun's opens are all repeats.
+                phase_stats.wand_global_threshold = false;
+                open_stats.wand_docs_scored.store(0, Ordering::Relaxed);
+                open_stats.wand_segments_skipped.store(0, Ordering::Relaxed);
+            } else {
+                shared_outputs = Some(outputs);
+            }
+        }
+        let cached_before_rerun = open_stats.cached.load(Ordering::Relaxed);
+        let rerun = global_wand && shared_outputs.is_none();
+        let segment_outputs: Vec<SegmentOutput> = match shared_outputs {
+            Some(outputs) => outputs,
+            None => manifest
+                .segments
+                .par_iter()
+                .map(|entry| score_one(entry, None))
+                .collect::<Result<Vec<Option<SegmentOutput>>, KoshaError>>()?,
+        }
+        .into_iter()
+        .flatten()
+        .collect();
+        if rerun {
+            open_stats
+                .cached
+                .store(cached_before_rerun, Ordering::Relaxed);
+        }
+        phase_stats.wand_docs_scored = open_stats.wand_docs_scored.load(Ordering::Relaxed);
+        phase_stats.wand_segments_skipped =
+            open_stats.wand_segments_skipped.load(Ordering::Relaxed);
         phase_stats.score_wall_ms = t_score.elapsed().as_secs_f64() * 1e3;
-        let stats_cold = stats_open_stats.cold.load(Ordering::Relaxed);
+        // A segment the `df` pass or the ceiling pass opened cold, and the
+        // scoring pass then found cached, is reported once, as cold; their
+        // own cached opens are repeats of the scoring pass's.
+        let stats_cold = stats_open_stats.cold.load(Ordering::Relaxed)
+            + bound_open_stats.cold.load(Ordering::Relaxed);
         phase_stats.open_cold = open_stats.cold.load(Ordering::Relaxed) + stats_cold;
         phase_stats.open_cached = open_stats
             .cached
             .load(Ordering::Relaxed)
             .saturating_sub(stats_cold);
         phase_stats.open_total_ms = (open_stats.open_nanos.load(Ordering::Relaxed)
-            + stats_open_stats.open_nanos.load(Ordering::Relaxed))
+            + stats_open_stats.open_nanos.load(Ordering::Relaxed)
+            + bound_open_stats.open_nanos.load(Ordering::Relaxed))
             as f64
             / 1e6;
         phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
@@ -4575,29 +5179,12 @@ impl Searcher {
                 score: cand.score,
                 fields: doc_rec.fields,
                 highlights: None,
+                highlight: None,
                 rank_details: cand.rank_details.clone(),
             };
             if let Some(ref highlight) = query.highlight {
                 if !query_terms.is_empty() {
-                    let pre = highlight
-                        .pre_tags
-                        .first()
-                        .map(|s| s.as_str())
-                        .unwrap_or("<b>");
-                    let post = highlight
-                        .post_tags
-                        .first()
-                        .map(|s| s.as_str())
-                        .unwrap_or("</b>");
-                    let mut highlights = Vec::new();
-                    for field in &doc.fields {
-                        if field.name == highlight.field && field.field_type == FieldType::Text {
-                            highlights.push(apply_highlight(&field.value, &query_terms, pre, post));
-                        }
-                    }
-                    if !highlights.is_empty() {
-                        doc.highlights = Some(highlights);
-                    }
+                    apply_highlights(&mut doc, highlight, &query_terms);
                 }
             }
             // After highlighting, which reads the field it marks up even
@@ -5056,6 +5643,87 @@ impl<'a> TermCursor<'a> {
     }
 }
 
+/// The block-max WAND threshold shared by every segment of one search
+/// (issue #248).
+///
+/// Each segment used to prune only against its own k-th-best score, so on
+/// a namespace of many segments every one of them had to fill its own
+/// top-k before pruning could start. This floor is the highest k-th-best
+/// score any segment has reached so far; a segment prunes a block or a
+/// candidate whose ceiling is strictly below `max(local floor, this)`.
+///
+/// Why that is exact: a published value is the k-th-best score among `k`
+/// real, accepted (not filtered, not deleted) documents of one segment,
+/// scored exactly as the cross-segment merge ranks them. So at least `k`
+/// documents of the namespace score at or above it, and the final page's
+/// k-th-best score can only be higher. A document whose ceiling is
+/// strictly below it can never reach the page. Ties stay safe for the same
+/// reason the local floor does: pruning is strictly below, and a tie is
+/// still scored and offered to the `(score desc, _id asc)` order.
+///
+/// The value is an `f64` stored as its bits in an `AtomicU64`, starting at
+/// negative infinity (nothing prunes until some segment fills its top-k),
+/// and only ever raised. Relaxed ordering is enough: a stale read is just
+/// an older, lower floor, which prunes less but never wrongly.
+struct GlobalWandFloor {
+    bits: AtomicU64,
+    /// Set when a segment published to the floor from a WAND attempt it
+    /// then abandoned for the general path (a corrupt block found
+    /// mid-walk). The general path may score that segment's documents
+    /// differently (it drops undecodable terms), so the published value is
+    /// no longer a proven lower bound; `search_inner` reruns the scoring
+    /// pass without the shared floor.
+    poisoned: std::sync::atomic::AtomicBool,
+}
+
+impl GlobalWandFloor {
+    fn new() -> Self {
+        Self {
+            bits: AtomicU64::new(f64::NEG_INFINITY.to_bits()),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn get(&self) -> f64 {
+        f64::from_bits(self.bits.load(Ordering::Relaxed))
+    }
+
+    /// Raise the floor to `score` if that is higher (an atomic max on the
+    /// float value; a NaN never raises it).
+    fn raise(&self, score: f64) {
+        let mut current = self.bits.load(Ordering::Relaxed);
+        while score > f64::from_bits(current) {
+            match self.bits.compare_exchange_weak(
+                current,
+                score.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: mark the shared floor poisoned so `search_inner` takes
+    /// its rerun path, which real corruption reaches too rarely to test.
+    /// Thread-local because `search_inner` checks it on the calling
+    /// thread, so concurrently running tests are unaffected.
+    static FORCE_WAND_POISON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One segment's view of the shared floor: the floor itself, and the
+/// segment's score ceiling computed before scoring (see
+/// `Searcher::segment_score_ceilings`).
+#[derive(Clone, Copy)]
+struct SharedWand<'a> {
+    floor: &'a GlobalWandFloor,
+    segment_upper_bound: f64,
+}
+
 /// Bounded top-k accumulator shared by the block-max WAND paths: unsorted
 /// pushes until `k` entries exist, one sort at the fill point, then O(k)
 /// bubble insertion per replacement — cheaper than a heap at page-sized k,
@@ -5088,6 +5756,34 @@ impl BoundedTopK {
     /// score can still enter via the doc_id tiebreak below.
     fn floor(&self) -> f64 {
         self.entries[self.k - 1].0
+    }
+
+    /// The score a block or candidate ceiling must reach (prune strictly
+    /// below it): the larger of this segment's k-th-best score, once full,
+    /// and the namespace-wide floor other segments have published (issue
+    /// #248). Negative infinity while neither exists, so nothing prunes.
+    fn threshold(&self, global: Option<&GlobalWandFloor>) -> f64 {
+        let local = if self.k > 0 && self.is_full() {
+            self.floor()
+        } else {
+            f64::NEG_INFINITY
+        };
+        match global {
+            Some(global) => local.max(global.get()),
+            None => local,
+        }
+    }
+
+    /// Offer this segment's k-th-best score to the shared floor, once the
+    /// top-k is full. Returns whether anything was published.
+    fn publish(&self, global: Option<&GlobalWandFloor>) -> bool {
+        match global {
+            Some(global) if self.k > 0 && self.is_full() => {
+                global.raise(self.floor());
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The total order the global merge ranks by for default (score)
@@ -5473,6 +6169,64 @@ fn candidate_sort_value<'a>(
         .position(|f| f == field)
         .and_then(|i| cand.sort_values.get(i))
         .unwrap_or(&SortValue::Missing)
+}
+
+/// The BM25 scorer one segment is scored with: the request's k1/b over the
+/// segment's build-time values (issue #247), and namespace-level
+/// statistics when `corpus` is given (issue #246). Shared by
+/// `score_segment` and the score-ceiling pass before it, so a segment's
+/// ceiling is computed with exactly the scorer its hits get.
+fn segment_scorer(
+    query: &SearchQuery,
+    reader: &kosha_segment::SegmentReader,
+    corpus: Option<&Arc<CorpusStats>>,
+) -> Bm25Scorer {
+    shape_scorer(
+        query,
+        reader.doc_count(),
+        reader.avg_field_length(),
+        reader.bm25_params(),
+        corpus,
+    )
+}
+
+/// [`segment_scorer`] from a segment's footer values, for the ceiling
+/// table (which scores without opening the segment).
+fn shape_scorer(
+    query: &SearchQuery,
+    doc_count: u32,
+    avg_field_length: f64,
+    build_params: &Bm25Params,
+    corpus: Option<&Arc<CorpusStats>>,
+) -> Bm25Scorer {
+    let params = query.bm25_params.resolve(build_params);
+    match corpus {
+        Some(corpus) => Bm25Scorer::with_corpus(Arc::clone(corpus), params),
+        None => Bm25Scorer::new(doc_count, avg_field_length, params),
+    }
+}
+
+/// The request-level half of `score_segment`'s `can_block_max_wand` gate:
+/// a plain ranked lexical query that wants at least one hit. Only such a
+/// query can use a namespace-wide top-k floor (issue #248); the rest of
+/// the gate is per segment (ordered postings, every required term present)
+/// and is still checked there.
+fn wand_eligible_query(query: &SearchQuery, has_text: bool) -> bool {
+    has_text
+        // `fields` (#249) and `fuzzy` (#201) score on exhaustive paths whose
+        // scores are not the combined-index BM25 the ceilings bound, and
+        // `limit_per` (#211) looks past the first `k` for new groups.
+        && query.fields.is_empty()
+        && query.fuzzy.is_none()
+        && query.limit_per.is_none()
+        && query.wildcard.is_none()
+        && query.match_phrase.is_none()
+        && query.knn.is_none()
+        && query.search_after.as_ref().is_none_or(|a| a.is_empty())
+        && sort_is_default_ranking(&query.sort)
+        && query.collapse.is_none()
+        && query.aggs.is_empty()
+        && query.from.saturating_add(query.max_results) > 0
 }
 
 /// True when the page is ordered by score alone, best first, ties by `_id`
@@ -6086,6 +6840,50 @@ mod tests {
     use super::*;
     use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId, SortOrder};
     use kosha_segment::SegmentWriter;
+
+    /// #195: each requested field is marked up with its own tags; a
+    /// multi-valued field gives one fragment per value; absent and
+    /// non-text fields are skipped; the legacy form fills `highlights`.
+    #[test]
+    fn apply_highlights_runs_per_field() {
+        let doc = || ScoredDocument {
+            doc_id: DocumentId("d".into()),
+            score: 1.0,
+            fields: vec![
+                Field::text("title", "Breach of contract"),
+                Field::text("body", "the contract was void"),
+                Field::text("body", "no breach here"),
+                Field::keyword("kind", "contract"),
+            ],
+            highlights: None,
+            highlight: None,
+            rank_details: None,
+        };
+        let terms = vec!["contract".to_string(), "breach".to_string()];
+        let config: HighlightConfig = serde_json::from_value(serde_json::json!({
+            "fields": {"title": {"pre_tags": ["["], "post_tags": ["]"]}, "body": {}, "kind": {}, "gone": {}}
+        }))
+        .unwrap();
+        let mut d = doc();
+        apply_highlights(&mut d, &config, &terms);
+        assert!(d.highlights.is_none());
+        let map = d.highlight.unwrap();
+        assert_eq!(map.len(), 2, "{map:?}");
+        assert_eq!(map["title"], ["[Breach] of [contract]"]);
+        assert_eq!(
+            map["body"],
+            ["the <b>contract</b> was void", "no <b>breach</b> here"]
+        );
+
+        let mut d = doc();
+        apply_highlights(&mut d, &HighlightConfig::single_field("title"), &terms);
+        assert!(d.highlight.is_none());
+        assert_eq!(d.highlights.unwrap(), ["<b>Breach</b> of <b>contract</b>"]);
+
+        let mut d = doc();
+        apply_highlights(&mut d, &HighlightConfig::for_fields(["kind"]), &terms);
+        assert!(d.highlight.is_none() && d.highlights.is_none());
+    }
 
     fn mk_query(text: &str, max: usize) -> SearchQuery {
         SearchQuery {
@@ -12170,6 +12968,452 @@ mod corpus_stats_tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── Namespace-wide block-max WAND floor (issue #248) ────────────────
+
+    #[test]
+    fn global_wand_floor_is_an_atomic_float_max() {
+        let floor = GlobalWandFloor::new();
+        assert_eq!(floor.get(), f64::NEG_INFINITY);
+        floor.raise(1.5);
+        floor.raise(0.5);
+        floor.raise(f64::NAN);
+        assert_eq!(floor.get(), 1.5);
+        floor.raise(-3.0);
+        assert_eq!(floor.get(), 1.5);
+        std::thread::scope(|scope| {
+            for t in 0..8 {
+                let floor = &floor;
+                scope.spawn(move || {
+                    for i in 0..1000 {
+                        floor.raise(f64::from(t * 1000 + i) / 100.0);
+                    }
+                });
+            }
+        });
+        assert_eq!(floor.get(), 7999.0 / 100.0);
+    }
+
+    /// Split `docs` across `k` segments: randomly, or (when `by_length`)
+    /// after sorting by length so segments differ widely in their best
+    /// possible score — the case the visiting order and segment skip are
+    /// for.
+    fn split_into(rng: &mut Rng, docs: &[Doc], k: usize, by_length: bool) -> Vec<Vec<Doc>> {
+        let mut docs = docs.to_vec();
+        if by_length {
+            docs.sort_by_key(|d| d.content.len());
+        } else {
+            for i in (1..docs.len()).rev() {
+                docs.swap(i, rng.below(i + 1));
+            }
+        }
+        let per = docs.len().div_ceil(k);
+        docs.chunks(per).map(|c| c.to_vec()).collect()
+    }
+
+    fn same_page_exactly(label: &str, a: &SearchResult, b: &SearchResult) {
+        assert_eq!(page_ids(a), page_ids(b), "{label}: page");
+        for (x, y) in a.results.iter().zip(&b.results) {
+            assert_eq!(x.score, y.score, "{label}: score of {}", x.doc_id.0);
+        }
+    }
+
+    /// Acceptance criterion 1 of #248: with segments sharing one top-k
+    /// floor, the page is the one the exhaustive path returns and the one
+    /// per-segment pruning returns — over many segments, single-term, AND
+    /// and OR, exact and capped counts, filters, deletes and deep pages.
+    #[test]
+    fn global_wand_floor_matches_exhaustive_across_many_segments() {
+        let ns = NamespaceId("ns".into());
+        for seed in 1..=6u64 {
+            let mut rng = Rng(0xA076_1D64_78BD_642F ^ seed.wrapping_mul(0xE703_7ED1_A0B4_28DB));
+            let n = 1500 + rng.below(1500);
+            let docs = random_corpus(&mut rng, n);
+            let k = 12 + rng.below(30);
+            let groups = split_into(&mut rng, &docs, k, seed % 2 == 0);
+            let deleted: HashSet<String> = docs
+                .iter()
+                .filter(|_| rng.below(20) == 0)
+                .map(|d| d.id.clone())
+                .collect();
+            let dir = scratch(&format!("global-wand-{seed}"));
+            let (manifest, locations) = write_segments(&dir, &ns.0, "s", &groups, 1);
+            let tombstones = tombstones_for(&deleted, &locations);
+            let shared = Searcher::new(dir.clone());
+            let local = Searcher::new(dir.clone());
+            local.set_global_wand_threshold(false);
+            // The ceiling table is cached per manifest version and reused
+            // across requests with different k1/b and statistics scopes,
+            // so every variant runs against the same searcher.
+            let params = [
+                Bm25Overrides::default(),
+                Bm25Overrides::new(2.0, 0.3),
+                Bm25Overrides::new(0.5, 1.0),
+                Bm25Overrides {
+                    stats: Some(Bm25StatsScope::Segment),
+                    ..Default::default()
+                },
+            ];
+
+            for text in [
+                "alpha",
+                "kappa",
+                "alpha beta",
+                "beta gamma delta",
+                "iota kappa",
+            ] {
+                for or in [false, true] {
+                    for capped in [false, true] {
+                        for filter in [None, matter_filter("m1")] {
+                            for (from, max) in [(0, 10), (15, 5), (0, 1)] {
+                                let bm25 = &params[rng.below(params.len())];
+                                let mut q = query(text, max);
+                                q.bm25_params = bm25.clone();
+                                q.from = from;
+                                q.filter = filter.clone();
+                                if or {
+                                    q.operator = Some(kosha_core::QueryOperator::Or);
+                                }
+                                if capped {
+                                    q.exact_total_hits = Some(false);
+                                    q.total_hits_cap = Some(40);
+                                }
+                                let label = format!(
+                                    "seed {seed} ({} segs) '{text}' or={or} capped={capped} \
+                                     filter={} from={from} max={max} bm25={bm25:?}",
+                                    groups.len(),
+                                    filter.is_some()
+                                );
+                                let (on, stats) = shared
+                                    .search_with_stats(&ns, &manifest, &q, Some(&tombstones))
+                                    .unwrap();
+                                assert!(stats.wand_global_threshold, "{label}: not shared");
+                                let off =
+                                    local.search(&ns, &manifest, &q, Some(&tombstones)).unwrap();
+                                same_page_exactly(&format!("{label} shared vs local"), &on, &off);
+                                if !capped {
+                                    assert_eq!(on.total_hits, off.total_hits, "{label}");
+                                    assert_eq!(
+                                        on.total_hits_relation, off.total_hits_relation,
+                                        "{label}"
+                                    );
+                                }
+
+                                // Exhaustive: the general path, every match
+                                // scored, sliced to the same page.
+                                let mut ex = q.clone();
+                                ex.search_after = force_legacy_search_after();
+                                ex.exact_total_hits = Some(true);
+                                ex.from = 0;
+                                ex.max_results = from + max;
+                                let mut exhaustive = shared
+                                    .search(&ns, &manifest, &ex, Some(&tombstones))
+                                    .unwrap();
+                                exhaustive.results = exhaustive
+                                    .results
+                                    .split_off(from.min(exhaustive.results.len()));
+                                let mut on_page = on.clone();
+                                if capped {
+                                    on_page.total_hits = exhaustive.total_hits;
+                                }
+                                assert_same_scores(
+                                    &format!("{label} shared vs exhaustive"),
+                                    &on_page,
+                                    &exhaustive,
+                                );
+                                for hit in &on.results {
+                                    assert!(!deleted.contains(&hit.doc_id.0), "{label}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Every segment's cached ceiling bounds every score in it, for any
+    /// k1/b and either statistics scope — the cache stores only
+    /// scorer-independent inputs and is filled by the first request.
+    #[test]
+    fn segment_ceilings_bound_every_score_under_any_params() {
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("global-wand-ceilings");
+        let mut rng = Rng(4242);
+        let docs = random_corpus(&mut rng, 2500);
+        let mut groups = split_into(&mut rng, &docs, 7, true);
+        // A segment where term frequency and length pull opposite ways:
+        // its highest-tf block (the first 128 postings) holds only long
+        // documents, the later blocks only one-word ones. Which block
+        // bounds the segment depends on k1/b, so a ceiling from any single
+        // block would be wrong for some.
+        groups.push(
+            (0..300)
+                .map(|i| Doc {
+                    id: format!("tradeoff-{i:03}"),
+                    content: if i < 128 {
+                        format!("{}{}", "alpha ".repeat(12), "pad ".repeat(150))
+                    } else {
+                        "alpha".to_string()
+                    },
+                    matter: "m0".into(),
+                })
+                .collect(),
+        );
+        let (manifest, locations) = write_segments(&dir, &ns.0, "s", &groups, 1);
+        let searcher = Searcher::new(dir.clone());
+        let permit = searcher.ledger.admit(0, |_| {}).unwrap();
+        let open_stats = OpenStatsCollector::default();
+        let mut checked = 0;
+        for params in [
+            Bm25Overrides::default(),
+            Bm25Overrides::new(2.0, 0.3),
+            Bm25Overrides::new(0.0, 0.0),
+            Bm25Overrides::new(3.0, 1.0),
+            Bm25Overrides {
+                stats: Some(Bm25StatsScope::Segment),
+                ..Default::default()
+            },
+        ] {
+            for text in ["alpha", "kappa", "beta gamma", "theta iota kappa"] {
+                let mut q = query(text, 100_000);
+                q.bm25_params = params.clone();
+                q.operator = Some(kosha_core::QueryOperator::Or);
+                let analysis = QueryAnalysis::new(&q);
+                let corpus = uses_namespace_stats(&q)
+                    .then(|| {
+                        searcher.namespace_corpus_stats(
+                            &ns,
+                            &manifest,
+                            &q,
+                            &analysis,
+                            &permit,
+                            &open_stats,
+                        )
+                    })
+                    .flatten();
+                let ceilings = searcher.segment_score_ceilings(
+                    &ns,
+                    &manifest,
+                    &q,
+                    &analysis,
+                    &permit,
+                    &open_stats,
+                    corpus.as_ref(),
+                );
+                assert_eq!(ceilings.len(), manifest.segments.len());
+                let mut exhaustive = q.clone();
+                exhaustive.search_after = force_legacy_search_after();
+                let all = searcher.search(&ns, &manifest, &exhaustive, None).unwrap();
+                assert!(!all.results.is_empty());
+                for hit in &all.results {
+                    let (segment, _) = &locations[&hit.doc_id.0];
+                    let index = manifest
+                        .segments
+                        .iter()
+                        .position(|e| &e.segment_id == segment)
+                        .unwrap();
+                    assert!(ceilings[index].is_finite(), "v5 segments have summaries");
+                    assert!(
+                        hit.score <= ceilings[index],
+                        "{params:?} '{text}': {} scored {} above its segment's ceiling {}",
+                        hit.doc_id.0,
+                        hit.score,
+                        ceilings[index]
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A legacy (fully decoded) postings list has no stored block
+    /// summaries, so its ceiling is unknown — `+∞`, never skipped.
+    #[test]
+    fn term_ceiling_without_stored_summaries_is_unknown() {
+        let postings = vec![kosha_core::Posting {
+            doc_id: 0,
+            term_frequency: 1,
+            positions: vec![0],
+        }];
+        let decoded = kosha_segment::PostingsRef::Borrowed(&postings);
+        assert!(matches!(
+            TermCeiling::of(&ScoringBlocks::Decoded(decoded)),
+            TermCeiling::Unknown
+        ));
+    }
+
+    /// One strong segment among many weak ones, placed mid-manifest. On a
+    /// single scoring thread the visiting order is deterministic: the
+    /// strong segment goes first (highest ceiling), raises the floor above
+    /// every weak segment's ceiling, and every weak segment is then
+    /// skipped (single term) or has every candidate pruned (AND / OR).
+    #[test]
+    fn global_wand_floor_visits_strong_segment_first_and_skips_the_rest() {
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("global-wand-skip");
+        let weak = |g: usize| -> Vec<Doc> {
+            (0..200)
+                .map(|i| Doc {
+                    id: format!("weak-{g:02}-{i:03}"),
+                    content: format!("alpha beta{}", " pad".repeat(30 + i % 7)),
+                    matter: "m0".into(),
+                })
+                .collect()
+        };
+        let mut groups: Vec<Vec<Doc>> = (0..20).map(weak).collect();
+        groups.push(
+            (0..50)
+                .map(|i| Doc {
+                    id: format!("strong-{i:03}"),
+                    content: format!("{}beta{}", "alpha ".repeat(5 + i % 3), " pad".repeat(i % 4)),
+                    matter: "m0".into(),
+                })
+                .collect(),
+        );
+        groups.extend((20..40).map(weak));
+        let (manifest, _) = write_segments(&dir, &ns.0, "s", &groups, 1);
+        let shared = Searcher::new(dir.clone());
+        let local = Searcher::new(dir.clone());
+        local.set_global_wand_threshold(false);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        for (text, or) in [
+            ("alpha", false),
+            ("alpha beta", false),
+            ("alpha beta", true),
+        ] {
+            let mut q = query(text, 10);
+            if or {
+                q.operator = Some(kosha_core::QueryOperator::Or);
+                q.exact_total_hits = Some(false);
+                q.total_hits_cap = Some(20);
+            }
+            let (on, on_stats) =
+                pool.install(|| shared.search_with_stats(&ns, &manifest, &q, None).unwrap());
+            let (off, off_stats) =
+                pool.install(|| local.search_with_stats(&ns, &manifest, &q, None).unwrap());
+            let label = format!("'{text}' or={or}");
+            same_page_exactly(&label, &on, &off);
+            assert!(
+                on.results.iter().all(|d| d.doc_id.0.starts_with("strong-")),
+                "{label}: the strong segment owns the page"
+            );
+            if !or {
+                assert_eq!(on.total_hits, 50 + 40 * 200, "{label}: counts stay exact");
+                assert_eq!(on.total_hits, off.total_hits, "{label}");
+            }
+            assert!(on_stats.wand_global_threshold && !off_stats.wand_global_threshold);
+            assert!(
+                on_stats.wand_docs_scored <= 50,
+                "{label}: only the strong segment is scored, got {}",
+                on_stats.wand_docs_scored
+            );
+            assert!(
+                off_stats.wand_docs_scored >= 40 * 10,
+                "{label}: per-segment floors fill every segment's top-k, got {}",
+                off_stats.wand_docs_scored
+            );
+            if text == "alpha" {
+                assert_eq!(on_stats.wand_segments_skipped, 40, "{label}");
+            }
+            assert_eq!(off_stats.wand_segments_skipped, 0, "{label}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A segment that falls back to the general path after publishing to
+    /// the shared floor poisons it, and the search is scored again with
+    /// per-segment floors. Same page either way.
+    #[test]
+    fn poisoned_global_wand_floor_rescores_without_it() {
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("global-wand-poison");
+        let mut rng = Rng(77);
+        let docs = random_corpus(&mut rng, 900);
+        let groups = split_into(&mut rng, &docs, 9, true);
+        let (manifest, _) = write_segments(&dir, &ns.0, "s", &groups, 1);
+        let searcher = Searcher::new(dir.clone());
+        let q = query("alpha beta", 10);
+        let (clean, clean_stats) = searcher
+            .search_with_stats(&ns, &manifest, &q, None)
+            .unwrap();
+        assert!(clean_stats.wand_global_threshold);
+        FORCE_WAND_POISON.with(|force| force.set(true));
+        let poisoned = searcher.search_with_stats(&ns, &manifest, &q, None);
+        FORCE_WAND_POISON.with(|force| force.set(false));
+        let (poisoned, poisoned_stats) = poisoned.unwrap();
+        assert!(
+            !poisoned_stats.wand_global_threshold,
+            "rerun without the floor"
+        );
+        assert_eq!(poisoned_stats.wand_segments_skipped, 0);
+        same_page_exactly("poisoned rerun", &clean, &poisoned);
+        assert_eq!(clean.total_hits, poisoned.total_hits);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Queries the shared floor does not apply to: one segment, or a
+    /// request the WAND gate rejects anyway.
+    #[test]
+    fn global_wand_floor_only_for_ranked_lexical_queries_over_many_segments() {
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("global-wand-gate");
+        let mut rng = Rng(91);
+        let docs = random_corpus(&mut rng, 400);
+        let (one, _) = write_segments(&dir, &ns.0, "one", std::slice::from_ref(&docs), 1);
+        let (many, _) = write_segments(
+            &dir,
+            &ns.0,
+            "many",
+            &split_into(&mut rng, &docs, 4, false),
+            1,
+        );
+        let searcher = Searcher::new(dir.clone());
+        let used = |manifest: &Manifest, q: &SearchQuery| {
+            searcher
+                .search_with_stats(&ns, manifest, q, None)
+                .unwrap()
+                .1
+                .wand_global_threshold
+        };
+        assert!(used(&many, &query("alpha", 10)));
+        assert!(!used(&one, &query("alpha", 10)), "single segment");
+        assert!(!used(&many, &query("alpha", 0)), "no page to rank");
+        let mut legacy = query("alpha", 10);
+        legacy.search_after = force_legacy_search_after();
+        assert!(!used(&many, &legacy), "search_after");
+        let mut phrase = query("", 10);
+        phrase.match_phrase = Some(kosha_core::MatchPhraseQuery {
+            field: "content".into(),
+            phrase: "alpha beta".into(),
+            slop: 0,
+            fields: Vec::new(),
+        });
+        assert!(!used(&many, &phrase), "phrase");
+        // The stacked features (#249, #201, #211) score off the WAND paths
+        // or look past the first `k`: none of them may share a floor.
+        let mut fields = query("alpha", 10);
+        fields.fields = vec!["content".into()];
+        assert!(!used(&many, &fields), "fields");
+        let fuzzy: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "", "max_results": 10, "fuzzy": {"value": "alpah"}
+        }))
+        .unwrap();
+        assert!(!used(&many, &fuzzy), "fuzzy");
+        let limited: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "alpha", "max_results": 10,
+            "limit_per": {"field": "matter", "max": 1}
+        }))
+        .unwrap();
+        assert!(!used(&many, &limited), "limit_per");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Hybrid retrieval: Reciprocal Rank Fusion of the lexical and vector
@@ -12454,6 +13698,48 @@ mod rrf_tests {
             }
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// The namespace-wide WAND floor (issue #248) must not touch hybrid
+    /// requests: their lexical list is a rank window fused later, not a
+    /// top-k by score, so it is never pruned against other segments. The
+    /// fused page is the same with the floor on or off, and the lexical
+    /// list of the same text, asked alone, is the WAND-pruned one.
+    #[test]
+    fn hybrid_fusion_is_unaffected_by_the_global_wand_floor() {
+        let mut rng = Rng(0x5eed_0248);
+        let dir = scratch("global-wand");
+        let docs = random_corpus(&mut rng, 400);
+        let mut groups = random_split(&mut rng, &docs);
+        while groups.len() < 4 {
+            groups = random_split(&mut rng, &docs);
+        }
+        let (many, _) = write(&dir, "many", &groups);
+        let (single, _) = write(&dir, "one", std::slice::from_ref(&docs));
+        let shared = Searcher::new(dir.clone());
+        let local = Searcher::new(dir.clone());
+        local.set_global_wand_threshold(false);
+        for (text, window, k) in [("gamma", 20, 15), ("alpha beta", 30, 40)] {
+            let q = hybrid(text, 10, k, rrf(Some(window), None));
+            let (a, stats) = shared.search_with_stats(&ns(), &many, &q, None).unwrap();
+            assert!(!stats.wand_global_threshold, "{text}: hybrid never shares");
+            let b = local.search(&ns(), &many, &q, None).unwrap();
+            let c = shared.search(&ns(), &single, &q, None).unwrap();
+            assert_same_fusion(&format!("{text} shared vs local"), &a, &b);
+            assert_same_fusion(&format!("{text} many vs one"), &a, &c);
+
+            let lexical: SearchQuery = serde_json::from_value(
+                serde_json::json!({"query_text": text, "max_results": 10, "exact_total_hits": true}),
+            )
+            .unwrap();
+            let (l, stats) = shared
+                .search_with_stats(&ns(), &many, &lexical, None)
+                .unwrap();
+            assert!(stats.wand_global_threshold, "{text}: lexical alone shares");
+            let l_one = shared.search(&ns(), &single, &lexical, None).unwrap();
+            assert_eq!(ids(&l), ids(&l_one), "{text}: lexical page");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -13099,6 +14385,72 @@ mod analyzer_tests {
             ["run", "running"]
         );
         assert_eq!(hits(&root, &manifest, &query("RUNS")), ["run", "running"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The namespace-wide WAND floor (#248) computes each segment's score
+    /// ceiling for the terms *that segment* reads the query as (#220). A
+    /// stemmed segment holds `run`, not `running`; judged by the legacy
+    /// reading it would get a ceiling of 0, be visited last and skipped
+    /// once the plain segments raised the floor — dropping the best hits.
+    #[test]
+    fn global_wand_ceiling_uses_each_segments_own_analysis() {
+        let root = temp_root("global-wand-analysis");
+        let mut manifest = empty_manifest();
+        let plain = schema(&["standard"], &[]).resolve().unwrap();
+        let stemmed = schema(&["standard", "stem"], &[]).resolve().unwrap();
+        let pad = " pad".repeat(40);
+        for s in 0..6 {
+            let docs: Vec<(String, String)> = (0..30)
+                .map(|i| (format!("plain-{s}-{i:02}"), format!("running{pad}")))
+                .collect();
+            add_segment(
+                &root,
+                &mut manifest,
+                &format!("plain-{s}"),
+                &plain,
+                docs.iter()
+                    .map(|(id, body)| (id.as_str(), vec![Field::text("body", body.as_str())]))
+                    .collect(),
+            );
+        }
+        add_segment(
+            &root,
+            &mut manifest,
+            "stemmed",
+            &stemmed,
+            (0..5)
+                .map(|i| {
+                    let id: &str = ["strong-0", "strong-1", "strong-2", "strong-3", "strong-4"][i];
+                    (id, vec![Field::text("body", "running runs run")])
+                })
+                .collect(),
+        );
+        let ns = NamespaceId("ns".into());
+        let shared = Searcher::new(root.clone());
+        let local = Searcher::new(root.clone());
+        local.set_global_wand_threshold(false);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let mut q = query("running");
+        q.max_results = 5;
+        let (on, on_stats) =
+            pool.install(|| shared.search_with_stats(&ns, &manifest, &q, None).unwrap());
+        let (off, _) = pool.install(|| local.search_with_stats(&ns, &manifest, &q, None).unwrap());
+        assert!(on_stats.wand_global_threshold);
+        let ids = |r: &SearchResult| -> Vec<String> {
+            r.results.iter().map(|d| d.doc_id.0.clone()).collect()
+        };
+        assert_eq!(ids(&on), ids(&off));
+        assert!(
+            ids(&on).iter().all(|id| id.starts_with("strong-")),
+            "the stemmed segment owns the page: {:?}",
+            ids(&on)
+        );
+        assert_eq!(on.total_hits, off.total_hits);
+        assert_eq!(on.total_hits, 6 * 30 + 5);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -14788,7 +16140,12 @@ mod rank_by_tests {
                     let (expected, total) =
                         reference(&searcher, &manifest, &lookup, text, window, None);
                     let q = blended(text, window, 10);
-                    let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+                    let (r, stats) = searcher
+                        .search_with_stats(&ns(), &manifest, &q, None)
+                        .unwrap();
+                    // Over several segments the namespace-wide WAND floor
+                    // (#248) is shared at the window depth, not the page's.
+                    assert_eq!(stats.wand_global_threshold, segments > 1);
                     let page = expected.len().min(10);
                     assert_matches(&r, &expected[..page]);
                     assert_eq!(r.total_hits, total, "total_hits counts every match");
