@@ -6166,6 +6166,10 @@ fn json_accepted<T: serde::Serialize>(value: &T) -> String {
 }
 
 fn json_error(status_code: u16, message: &str) -> String {
+    // Rejections and server faults were invisible in the pod log.
+    if status_code >= 429 {
+        eprintln!("WARN: request failed: status={status_code} {message}");
+    }
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",
