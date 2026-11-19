@@ -7,6 +7,7 @@ behaviour as clients are added, and every error by reason. Read-only.
 
 Usage: run_eval.py <evalset_dir> --mode quick|standard|full [--out DIR]
                    [--host URL] [--namespace NAME] [--baseline report.json]
+                   [--areas knn,phrase]
   quick     ~10 min  the quick tier; warm latency; 1 and 8 clients
   standard  ~30 min  every case; warm and cached latency; 1-16 clients
   full      ~60 min  standard, 1-32 clients, then a sustained mixed run
@@ -28,8 +29,8 @@ from kosha_client import KoshaClient
 
 MODES = {  # warm rounds, cached rounds, (clients, seconds each), sustained minutes
     "quick": dict(warm=5, cached=0, ramp=((1, 8), 60), sustained=0),
-    "standard": dict(warm=3, cached=1, ramp=((1, 4, 8, 16), 60), sustained=0),
-    "full": dict(warm=3, cached=1, ramp=((1, 4, 8, 16, 32), 90), sustained=20),
+    "standard": dict(warm=8, cached=1, ramp=((1, 4, 8, 16), 180), sustained=0),
+    "full": dict(warm=8, cached=1, ramp=((1, 4, 8, 16, 32), 180), sustained=20),
 }
 LOAD_AREAS = ("word", "phrase", "word_grouped", "word_per_document", "document", "knn")
 WALK_PAGE = 1000
@@ -41,6 +42,7 @@ ap.add_argument("--out", default="eval-out")
 ap.add_argument("--host", default=os.environ.get("KOSHA_HOST"))
 ap.add_argument("--namespace", default="paragraph_index_hnsw")
 ap.add_argument("--baseline")
+ap.add_argument("--areas", help="comma-separated areas to run, e.g. knn,phrase (default: all)")
 args = ap.parse_args()
 mode = MODES[args.mode]
 os.makedirs(args.out, exist_ok=True)
@@ -48,7 +50,8 @@ manifest = json.load(open(os.path.join(args.evalset, "manifest.json")))
 with gzip.open(os.path.join(args.evalset, "cases.jsonl.gz"), "rt") as fh:
     every_case = [json.loads(line) for line in fh]
 by_id = {c["id"]: c for c in every_case}
-cases = [c for c in every_case if args.mode != "quick" or c["tier"] == "quick"]
+areas = set(args.areas.split(",")) if args.areas else None
+cases = [c for c in every_case if (args.mode != "quick" or c["tier"] == "quick") and (not areas or c["area"] in areas)]
 client = KoshaClient(hosts=[args.host], namespace=args.namespace, timeout=120)
 samples = gzip.open(os.path.join(args.out, "samples.jsonl.gz"), "wt")
 samples_lock = threading.Lock()
@@ -152,9 +155,17 @@ def check(case, response):
 
 
 def recall(case, response):
-    exact = [i for i, _ in case["expect"]["neighbours"]]
+    """(recall@10, top hit right). A returned chunk counts when it is as
+    close as the 10th true neighbour, and the top hit when it is as close as
+    the best one: duplicate documents have identical vectors, so several
+    different answers are equally right."""
+    exact = case["expect"]["neighbours"]
+    closeness = dict(map(tuple, exact))
+    k = min(10, len(exact))
     got = hit_ids(response)[:10]
-    return len(set(got) & set(exact[:10])) / max(1, min(10, len(exact))), got[:1] == exact[:1]
+    as_close = [i for i in got if closeness.get(i, -2.0) >= exact[k - 1][1] - 1e-5]
+    top_right = bool(got) and closeness.get(got[0], -2.0) >= exact[0][1] - 1e-5
+    return min(len(as_close), k) / max(1, k), top_right
 
 
 def load(clients, seconds, phase):
