@@ -222,6 +222,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         }
     }
 

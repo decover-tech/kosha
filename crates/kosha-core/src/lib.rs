@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 // ─── Control store trait (in-memory or Postgres) ──────────────────────────
 
 pub mod docset;
+pub mod sharding;
 pub use analysis::{
     AnalysisConfig, AnalyzerSpec, FieldSchema, NamespaceSchema, SegmentAnalysis, TokenFilterSpec,
     TokenizerKind,
@@ -1318,6 +1319,13 @@ pub struct Manifest {
     /// searched. `None` = no schema: every field uses `standard`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<NamespaceSchema>,
+    /// Fixed shard count (#207), set once when the namespace is created
+    /// sharded. `Some(n)` with `n > 1` marks a *root* manifest: it lists no
+    /// segments itself; documents live in the shard namespaces
+    /// [`sharding::shard_namespace`] names. `None` (every manifest written
+    /// before sharding existed) is an ordinary, unsharded namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shards: Option<u32>,
 }
 
 impl Manifest {
@@ -2260,6 +2268,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         }
     }
 

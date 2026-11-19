@@ -74,6 +74,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 - Namespace registry and manifest store, in-memory by default or Postgres-backed (`postgres` feature + `DATABASE_URL`), with compare-and-swap manifest publishes.
 - Multi-tenancy: every API key maps to a tenant prefix that scopes all namespace access.
 - Read/write split: query pods forward every mutating route to `KOSHA_INGEST_HOST` and serve reads locally. A background refresher on each query pod polls every namespace's manifest version in one control-store query every `KOSHA_MANIFEST_REFRESH_MS` (default 500; `0` disables it and the pod checks before every search instead) and swaps in manifests that advanced; searches already running finish on the snapshot they started with, and namespaces in `KOSHA_WARMUP_NAMESPACES` have the new version's scoring set fetched before the swap. Searches don't touch the control store unless they pass `max_staleness_seconds` (body field or query parameter) and the namespace was last confirmed current longer ago than that. If the control store is unreachable, query pods keep serving their last-known-good manifests and only a namespace the pod never loaded fails (503). `GET /v1/stats` on a query pod reports per-namespace `manifest_version`, `stored_manifest_version`, `last_refresh_at` (Unix seconds) and `manifest_lag_seconds`, plus a `manifest_refresh` block with error counters and the maximum lag.
+- Namespace sharding with a fixed shard count set at creation (`POST /v1/namespaces/{ns}/shards`): documents route by id to N shard namespaces, each with its own manifest, segments, flushes and compaction; searches read all shards as one namespace. See [Namespace sharding](#namespace-sharding).
 - Backpressure controls: max concurrent searches, search queue depth and timeout, hydration concurrency, admission timeout.
 - `GET /healthz` (liveness), `GET /readyz` (readiness), `GET /v1/stats` and per-namespace stats.
 - Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, import a namespace.
@@ -149,6 +150,44 @@ Throughput on the repository's Markdown (16 MB, ~2 KB documents; `cargo bench -p
 `standard@2` + `stop` + `stem` 41 MB/s; whole segment build 61 / 50 / 28 MB/s (`standard@2`
 costs 0.82x of a legacy build; the Snowball stemmer is most of the rest). All-ASCII words take a
 hand-written UAX #29 fast path checked against `unicode-segmentation` by a differential test.
+
+## Namespace sharding
+
+A namespace can be split into a fixed number of shards when it is created (issue #207). Before
+writing any document, set the count:
+
+```sh
+curl -X POST "$KOSHA/v1/namespaces/contracts/shards" -H "x-api-key: $KEY" -d '{"shards": 8}'
+# {"namespace":"contracts","shards":8,"changed":true}
+```
+
+- `2 <= shards <= 256`. `1` means an ordinary namespace and changes nothing. Repeating the call
+  with the same count is a no-op; any other count, or any count on a namespace that already holds
+  documents, is a 400 — resharding is not supported yet.
+- Every write route (`documents`, `flush`, `delete`, `exists`, the legacy `/index`, `/replace`)
+  keeps its shape. Each document goes to shard `jump_hash(fnv1a64(id), N)`, a function of the id
+  bytes and N only, so an upsert or `replace` always finds the previous version in the same shard.
+  A batch spanning shards is applied one shard after another; if one fails, retry the batch (writes
+  are keyed by id, so the retry is idempotent).
+- Each shard is a namespace of its own, `{tenant}/{ns}/_shard-0000` … `_shard-{N-1}`, with its own
+  manifest row, segments in S3 under that prefix, WAL checkpoint, flushes and compaction. The root
+  `{tenant}/{ns}` manifest records `"shards": N` and lists no segments. Shard namespaces are created
+  in the control store when the count is set, inherit the namespace schema, and follow later
+  `schema` changes.
+- Searches read the shards as one namespace: one merged manifest over every shard's segments,
+  scored with namespace-wide BM25 statistics, one top-K, one `search_after` order and one capped
+  total-hit count, so results — scores, order, totals, aggregations, pagination — equal the same
+  corpus in one unsharded namespace. Query pods follow every shard's manifest like any other.
+- `GET /v1/namespaces/{ns}/stats` reports totals plus `shards` and per-shard `shard_stats`.
+  `POST /v1/admin/compact-namespace` on the root runs one pass per shard; the other admin routes
+  take a shard by its full name (`{tenant}/{ns}/_shard-0003`).
+
+**Today's limits.** Scatter-gather runs inside one pod: every query pod still serves all shards of
+a namespace, so sharding bounds per-manifest size, publish contention, flush and compaction units,
+but not one pod's working set. Fanning shards out across pods, manual resharding and automatic
+resharding are follow-ups. Namespaces created before this change carry no shard count and are
+unchanged. A binary older than this change ignores the count: it sees the root as an empty
+namespace, so don't roll back past it while sharded namespaces are in use.
 
 ## Authorization and durability
 

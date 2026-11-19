@@ -84,6 +84,7 @@ fn build_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        shards: None,
     };
     (ns, manifest)
 }
@@ -159,6 +160,7 @@ fn build_term_bloom_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         },
     )
 }
@@ -210,6 +212,7 @@ fn build_broad_query_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         },
     )
 }

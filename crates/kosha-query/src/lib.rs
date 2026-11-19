@@ -5264,6 +5264,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         for (segment, docs) in [
             (
@@ -5471,6 +5472,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5606,6 +5608,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5698,6 +5701,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5869,6 +5873,7 @@ mod tests {
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
                 schema: None,
+                shards: None,
             },
             all,
         )
@@ -6131,6 +6136,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
 
         // Reproduce the production regime exactly, independent of how this
@@ -6298,6 +6304,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let result = searcher.search(
             &NamespaceId("test".into()),
@@ -6354,6 +6361,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -6427,6 +6435,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -6515,6 +6524,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let result = searcher
             .search(
@@ -6600,6 +6610,7 @@ mod tests {
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
                 schema: None,
+                shards: None,
             },
         )
     }
@@ -6996,6 +7007,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut query = mk_query("", 10);
@@ -7076,6 +7088,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -7165,6 +7178,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
 
         // Generous entry-count cap (10) but a byte budget that fits s1 alone,
@@ -7285,6 +7299,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -7352,6 +7367,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
@@ -7407,6 +7423,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7579,6 +7596,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mk_knn_q = |num_candidates: usize| {
@@ -7707,6 +7725,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 1);
@@ -7779,6 +7798,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -7846,6 +7866,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -7918,6 +7939,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         (dir, manifest)
     }
@@ -8038,6 +8060,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         // Fresh searcher (no warm in-memory segment cache) so opening the
         // segment for these searches goes through the real `try_read_doc_index`
@@ -8119,6 +8142,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         // Fresh searcher so each segment is actually opened (Lazy), not
         // served from a warm cache populated by an earlier call here.
@@ -8240,6 +8264,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -8292,6 +8317,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -8352,6 +8378,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8451,6 +8478,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -8497,6 +8525,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -8558,6 +8587,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         }
     }
 
@@ -8612,6 +8642,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         }
     }
 
@@ -8802,6 +8833,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8935,6 +8967,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let run = |b: f64| {
@@ -9107,6 +9140,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let scores = |q: SearchQuery| -> Vec<(String, f64)> {
@@ -9268,6 +9302,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
 
         // Baseline (uncorrupted): "alpha beta" intersects, "beta" matches.
@@ -9364,6 +9399,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         // Open + warm the segment so the reader is cached, THEN evict
@@ -9419,6 +9455,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -9560,6 +9597,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -9625,6 +9663,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -9809,6 +9848,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -9860,6 +9900,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -9968,6 +10009,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -10050,6 +10092,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut id_sort = std::collections::HashMap::new();
@@ -10177,6 +10220,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -10249,6 +10293,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -10304,6 +10349,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -10382,6 +10428,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -10476,6 +10523,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -10557,6 +10605,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -10662,6 +10711,7 @@ mod corpus_stats_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         }
     }
 
@@ -11321,6 +11371,7 @@ mod rrf_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         let mut locations = HashMap::new();
         for (g, docs) in groups.iter().enumerate() {
@@ -11878,6 +11929,7 @@ mod rrf_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         };
         for (g, docs) in groups.iter().enumerate() {
             let id = SegmentId(format!("seg-{g:03}"));
@@ -12035,6 +12087,7 @@ mod analyzer_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            shards: None,
         }
     }
 

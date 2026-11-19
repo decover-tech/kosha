@@ -76,6 +76,7 @@ fn main() {
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        shards: None,
     };
     let searcher = Searcher::new(work);
 

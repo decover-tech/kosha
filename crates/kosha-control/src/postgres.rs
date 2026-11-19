@@ -59,6 +59,7 @@ fn decode_manifest(version: u64, segments_json: &str) -> Option<Manifest> {
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        shards: None,
     };
     for entry in entries {
         if let Some(footer) = entry.footer {

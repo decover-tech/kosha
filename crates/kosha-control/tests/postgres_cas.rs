@@ -18,6 +18,7 @@ fn candidate(segment: &str, version: u64) -> Manifest {
         wal_origin: Some(segment.into()),
         deletion_vectors: Default::default(),
         schema: None,
+        shards: None,
         tombstones: [(SegmentId(segment.into()), (0..256).collect())]
             .into_iter()
             .collect(),
