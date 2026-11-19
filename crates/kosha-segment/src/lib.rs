@@ -1,4 +1,5 @@
 pub mod filter_columns;
+pub mod filter_eval;
 pub mod span_cache;
 
 use std::collections::{HashMap, VecDeque};
@@ -10,8 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use instant_distance::{Builder, HnswMap, Point, Search};
 use kosha_core::{
     build_filter_blooms, build_term_bloom, AggBucket, AggBucketResult, AggMetricResult,
-    AggregationResults, Bm25Params, DocRecord, DocumentId, Field, FieldType, FilterStore, Footer,
-    KoshaError, LocalStorage, Posting, SegmentId, StorageBackend, VectorStore,
+    AggregationResults, Bm25Params, DocRecord, DocSet, DocumentId, Field, FieldType, FilterClause,
+    FilterStore, Footer, KoshaError, LocalStorage, Posting, SegmentId, StorageBackend, VectorStore,
 };
 
 /// A point in HNSW space using cosine distance.
@@ -5136,6 +5137,31 @@ impl SegmentReader {
         self.filters.column(field, kind)
     }
 
+    /// The documents of this segment that pass `clause` (#244).
+    ///
+    /// The one entry point for search and delete-by-query. A columnar
+    /// segment answers from its columns — dictionary lookups and term
+    /// bitmaps, zone-map-pruned numeric scans, presence bitmaps (see
+    /// [`filter_eval`]) — reading only the columns the clause names. A
+    /// legacy `filters.bin` segment keeps the row scan of
+    /// [`kosha_core::evaluate_filter`]. Both return the same set; a damaged
+    /// column fails the call instead of matching nothing.
+    pub fn evaluate_filter(&self, clause: &FilterClause) -> Result<DocSet, KoshaError> {
+        if self.has_filter_columns() {
+            return filter_eval::evaluate_filter_columns(clause, self, self.doc_count());
+        }
+        let mut fields = std::collections::BTreeSet::new();
+        clause.for_each_field(&mut |f| {
+            fields.insert(f.to_string());
+            fields.insert(kosha_core::base_field_name(f).to_string());
+        });
+        Ok(kosha_core::evaluate_filter(
+            clause,
+            &*self.filter_store_for(&fields)?,
+            self.doc_count(),
+        ))
+    }
+
     /// Whether this segment stores filter values in the columnar format.
     pub fn has_filter_columns(&self) -> bool {
         self.footer.filter_columns.is_some()
@@ -5783,6 +5809,16 @@ impl SegmentReader {
             }
         }
         store
+    }
+}
+
+impl filter_eval::ColumnSource for SegmentReader {
+    fn column(
+        &self,
+        name: &str,
+        kind: kosha_core::FilterColumnKind,
+    ) -> Result<Option<Arc<filter_columns::FilterColumn>>, KoshaError> {
+        self.filter_column(name, kind)
     }
 }
 

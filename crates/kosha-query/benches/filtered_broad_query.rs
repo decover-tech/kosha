@@ -16,6 +16,10 @@
 //! column. The columnar run deletes every other column file first, so it
 //! also proves nothing else is read.
 //!
+//! #244 part 2: also reports the filter's evaluation cost per format, the
+//! work a segment's filter-set cache does on a miss (the first request with
+//! a new filter): a row scan of `filters.bin` vs the columnar term bitmap.
+//!
 //! Run:
 //! ```text
 //! cargo bench -p kosha-query --bench filtered_broad_query --release
@@ -29,7 +33,7 @@ use kosha_core::{
     SegmentId,
 };
 use kosha_query::Searcher;
-use kosha_segment::SegmentWriter;
+use kosha_segment::{SegmentReader, SegmentWriter};
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -136,6 +140,31 @@ fn run(work: &std::path::Path, label: &str, version: u32, segs: usize, docs: usi
         "\n  [{label}] filter bytes hydrated for the query: {needed} of {all} ({:.1}%) across {segs} segments",
         needed as f64 * 100.0 / all.max(1) as f64
     );
+
+    // Uncached filter evaluation, summed over the segments: what each
+    // segment's filter-set cache pays on a miss.
+    let filter = query.filter.clone().unwrap();
+    let readers: Vec<SegmentReader> = manifest
+        .segments
+        .iter()
+        .map(|e| SegmentReader::open(work.join(&ns.0).join(&e.segment_id.0)).unwrap())
+        .collect();
+    for r in &readers {
+        black_box(r.evaluate_filter(&filter).unwrap()); // parse / decode once
+    }
+    let mut eval = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = Instant::now();
+        for r in &readers {
+            black_box(r.evaluate_filter(&filter).unwrap());
+        }
+        eval.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    println!(
+        "  uncached filter evaluation, all {segs} segments: median {:.3} ms",
+        median_ms(eval)
+    );
+    drop(readers);
 
     let searcher = Searcher::new(work.to_path_buf());
 

@@ -276,6 +276,11 @@ pub struct TrackedSegment {
     filter_sets: Mutex<HashMap<String, Arc<DocSet>>>,
 }
 
+/// A pre-filter with fewer than one passing document per this many is
+/// "sparse": the single-term WAND walk then checks each postings block's
+/// doc range against it and skips blocks with no passing document.
+const SPARSE_FILTER_RATIO: usize = 64;
+
 /// Filter sets kept per segment before the cache is cleared and refilled.
 /// One set is `doc_count / 8` bytes (a few KB), so this bounds the cache at
 /// well under a megabyte per segment however many distinct filters arrive.
@@ -305,24 +310,19 @@ impl TrackedSegment {
     /// the caller rather than once per segment here.
     ///
     /// Reads only the filter columns `clause` names (#244); a damaged
-    /// column fails the request instead of matching nothing.
+    /// column fails the request instead of matching nothing. The set is
+    /// also the segment's pre-filter for a filtered vector probe (#252):
+    /// [`DocSet::to_bitmap`] gives it as a roaring bitmap.
     fn filter_set(&self, key: &str, clause: &FilterClause) -> Result<Arc<DocSet>, KoshaError> {
         if let Some(set) = self.filter_sets.lock().unwrap().get(key) {
             return Ok(Arc::clone(set));
         }
-        let mut fields = std::collections::BTreeSet::new();
-        clause.for_each_field(&mut |f| {
-            fields.insert(f.to_string());
-            fields.insert(kosha_core::base_field_name(f).to_string());
-        });
         // Evaluated outside the lock: two requests racing on a new filter
         // both compute it, and one result is dropped. That is cheaper than
         // making every other request for this segment wait behind a scan.
-        let set = Arc::new(kosha_core::evaluate_filter(
-            clause,
-            &*self.reader.filter_store_for(&fields)?,
-            self.reader.doc_count(),
-        ));
+        // Columnar segments answer from term bitmaps and zone maps; legacy
+        // `filters.bin` segments scan rows (`SegmentReader::evaluate_filter`).
+        let set = Arc::new(self.reader.evaluate_filter(clause)?);
         let mut cache = self.filter_sets.lock().unwrap();
         if cache.len() >= MAX_FILTER_SETS_PER_SEGMENT {
             cache.clear();
@@ -1430,16 +1430,35 @@ impl Searcher {
             (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)?),
             _ => None,
         };
+        let segment_tombstones = tombstones
+            .and_then(|t| t.get(&entry.segment_id))
+            .filter(|seqs| !seqs.is_empty());
+        // The pre-filter: the filter's documents less this request's
+        // deleted ones, so a candidate costs one bit test either way. The
+        // cached set is shared, so the deletes go into a copy.
+        let filter_set = match (filter_set, segment_tombstones) {
+            (Some(set), Some(dead)) => {
+                let mut live = (*set).clone();
+                live.remove_all(dead);
+                Some(Arc::new(live))
+            }
+            (set, _) => set,
+        };
         if filter_set.as_ref().is_some_and(|set| set.is_empty()) {
             // The bloom said "maybe"; the real answer is no document here.
             return Ok(None);
         }
-        let segment_tombstones = tombstones
-            .and_then(|t| t.get(&entry.segment_id))
-            .filter(|seqs| !seqs.is_empty());
+        // A sparse pre-filter also lets the single-term walk skip whole
+        // postings blocks whose doc range holds no passing document.
+        let sparse_filter: Option<&DocSet> = filter_set.as_deref().filter(|set| {
+            set.count().saturating_mul(SPARSE_FILTER_RATIO) < set.universe() as usize
+        });
         let accept = |doc_seq: u32| -> bool {
-            filter_set.as_ref().is_none_or(|set| set.contains(doc_seq))
-                && !segment_tombstones.is_some_and(|seqs| seqs.contains(&doc_seq))
+            match filter_set.as_ref() {
+                // Deleted documents are already out of the pre-filter.
+                Some(set) => set.contains(doc_seq),
+                None => !segment_tombstones.is_some_and(|seqs| seqs.contains(&doc_seq)),
+            }
         };
         // The filter or a tombstone rules the document out. The scoring
         // loops below were written against tombstones alone; a filter is
@@ -1451,7 +1470,11 @@ impl Searcher {
         let restricted = filter_set.is_some() || segment_tombstones.is_some();
         let rejected = |doc_seq: u32| -> bool { restricted && !accept(doc_seq) };
 
-        let needs_filter_store = !sort_value_fields.is_empty() || !query.aggs.is_empty();
+        // Columnar segments (#244) aggregate and sort straight from their
+        // columns; only `filters.bin` segments need the row-shaped store.
+        let columnar_filters = reader.has_filter_columns();
+        let needs_filter_store =
+            !columnar_filters && (!sort_value_fields.is_empty() || !query.aggs.is_empty());
         let filter_store = if needs_filter_store {
             // Only the columns this query names (#244). A damaged column
             // fails the request closed.
@@ -1679,10 +1702,24 @@ impl Searcher {
                     if let [source] = sources.as_slice() {
                         // ── Single present term: block-by-block walk ──
                         let df = source.doc_count() as u32;
+                        // False when the sparse pre-filter has no document
+                        // in the block's doc range: nothing in it can pass.
+                        let block_may_pass = |block: usize| -> bool {
+                            sparse_filter.is_none_or(|set| {
+                                let first = match block {
+                                    0 => 0,
+                                    _ => source.last_doc(block - 1).saturating_add(1),
+                                };
+                                set.any_in_range(first, source.last_doc(block))
+                            })
+                        };
                         let total_hits = if segment_has_tombstones {
                             let mut count = 0;
                             let mut postings = Vec::new();
                             for block in 0..source.block_count() {
+                                if !block_may_pass(block) {
+                                    continue;
+                                }
                                 if !source.read_block(block, &mut postings) {
                                     return None;
                                 }
@@ -1706,6 +1743,9 @@ impl Searcher {
                         let mut topk = BoundedTopK::new(effective_k);
                         let mut buf: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
                         for block in 0..source.block_count() {
+                            if !block_may_pass(block) {
+                                continue;
+                            }
                             // The block's per-doc score ceiling. v5 reads it
                             // straight from the skip entry — no posting decode,
                             // no doc_meta pass. Legacy formats recompute it by
@@ -2382,11 +2422,8 @@ impl Searcher {
             if count_only_filter {
                 // Nothing will be returned or ranked from this segment's
                 // hits, so only their number is needed.
-                filter_only_count = Some(if segment_tombstones.is_some() {
-                    set.iter().filter(|doc_seq| accept(*doc_seq)).count()
-                } else {
-                    set.count()
-                });
+                // Deleted documents are already out of the set.
+                filter_only_count = Some(set.count());
             } else {
                 for doc_seq in set.iter() {
                     if !accept(doc_seq) {
@@ -2573,15 +2610,30 @@ impl Searcher {
         let aggs = if query.aggs.is_empty() {
             HashMap::new()
         } else {
-            let wanted: HashSet<u32> = seg_hits.keys().copied().collect();
-            let store = filter_store
-                .as_ref()
-                .expect("aggregations require filter store");
-            query
-                .aggs
-                .iter()
-                .map(|(name, agg)| (name.clone(), aggregate_matches(store, &wanted, agg)))
-                .collect()
+            if columnar_filters {
+                let mut wanted: Vec<u32> = seg_hits.keys().copied().collect();
+                wanted.sort_unstable();
+                query
+                    .aggs
+                    .iter()
+                    .map(|(name, agg)| {
+                        Ok((
+                            name.clone(),
+                            aggregate_matches_columnar(&reader, &wanted, agg)?,
+                        ))
+                    })
+                    .collect::<Result<_, KoshaError>>()?
+            } else {
+                let wanted: HashSet<u32> = seg_hits.keys().copied().collect();
+                let store = filter_store
+                    .as_ref()
+                    .expect("aggregations require filter store");
+                query
+                    .aggs
+                    .iter()
+                    .map(|(name, agg)| (name.clone(), aggregate_matches(store, &wanted, agg)))
+                    .collect()
+            }
         };
         let total_hits = filter_only_count.unwrap_or(seg_hits.len());
 
@@ -2623,13 +2675,17 @@ impl Searcher {
             HashMap::new()
         } else {
             let wanted: HashSet<u32> = ranked.iter().map(|(_, doc_seq)| *doc_seq).collect();
-            build_sort_value_maps(
-                filter_store
-                    .as_ref()
-                    .expect("custom sort requires filter_store"),
-                sort_value_fields,
-                &wanted,
-            )
+            if columnar_filters {
+                build_sort_value_maps_columnar(&reader, sort_value_fields, &wanted)?
+            } else {
+                build_sort_value_maps(
+                    filter_store
+                        .as_ref()
+                        .expect("custom sort requires filter_store"),
+                    sort_value_fields,
+                    &wanted,
+                )
+            }
         };
         let mut candidates = Vec::with_capacity(ranked.len());
         for (score, doc_seq) in ranked {
@@ -4097,6 +4153,262 @@ fn aggregate_matches(
         }
     }
     state
+}
+
+// ─── Columnar aggregations and sort values (#244) ──────────────────────────
+//
+// On a columnar segment, aggregations and field sorts read the filter
+// columns directly: the per-entry doc_seq array is walked against the
+// sorted candidate list (galloping, so a small candidate set touches few
+// entries), string values arrive as dictionary ordinals that are resolved
+// to text once per distinct ordinal, and numeric values come from the
+// value arrays. Nothing is copied into a row-shaped `FilterStore`.
+//
+// The results are the same as the `FilterStore` path's on a `filters.bin`
+// segment, rule for rule: field-name resolution (`x.keyword` -> `x`),
+// list values counted once per element, every column kind contributing to
+// an aggregation, and a sort reading the string column first, then the
+// integer column, then the float column.
+
+/// Call `f(wanted_index, entry_index)` for every entry of `docs` (a
+/// column's non-decreasing doc_seqs) whose doc_seq is in `wanted` (sorted,
+/// distinct). Gallops through `docs`, so the cost follows the candidate
+/// count, not the column length, when candidates are few.
+fn for_each_wanted_entry(docs: &[u32], wanted: &[u32], mut f: impl FnMut(usize, usize)) {
+    let mut p = 0usize;
+    for (wi, &doc) in wanted.iter().enumerate() {
+        if p >= docs.len() {
+            return;
+        }
+        if docs[p] < doc {
+            // Exponential probe, then binary search inside the bracket.
+            let mut step = 1usize;
+            let mut hi = p + 1;
+            while hi < docs.len() && docs[hi] < doc {
+                p = hi;
+                step *= 2;
+                hi = p + step;
+            }
+            let hi = hi.min(docs.len());
+            p += docs[p..hi].partition_point(|d| *d < doc);
+        }
+        while p < docs.len() && docs[p] == doc {
+            f(wi, p);
+            p += 1;
+        }
+    }
+}
+
+/// One aggregation source's values for each candidate, as interned key ids.
+struct ColumnarSourceValues {
+    /// Key id -> key text.
+    names: Vec<String>,
+    /// Parallel to the candidate list: sorted, distinct key ids.
+    per_doc: Vec<Vec<u32>>,
+}
+
+#[derive(Default)]
+struct KeyInterner {
+    names: Vec<String>,
+    ids: HashMap<String, u32>,
+}
+
+impl KeyInterner {
+    fn intern(&mut self, key: String) -> u32 {
+        if let Some(id) = self.ids.get(&key) {
+            return *id;
+        }
+        let id = self.names.len() as u32;
+        self.names.push(key.clone());
+        self.ids.insert(key, id);
+        id
+    }
+}
+
+fn columnar_source_values(
+    reader: &SegmentReader,
+    field: &str,
+    wanted: &[u32],
+) -> Result<ColumnarSourceValues, KoshaError> {
+    use kosha_core::FilterColumnKind;
+    use kosha_segment::filter_columns::FilterColumn;
+    use kosha_segment::filter_eval::resolve_column;
+    let mut keys = KeyInterner::default();
+    let mut per_doc: Vec<Vec<u32>> = vec![Vec::new(); wanted.len()];
+    for kind in [
+        FilterColumnKind::String,
+        FilterColumnKind::Integer,
+        FilterColumnKind::Float,
+    ] {
+        let Some(column) = resolve_column(reader, field, kind)? else {
+            continue;
+        };
+        match &*column {
+            FilterColumn::String(c) => {
+                // A list value counts once under each of its elements.
+                let mut ord_keys: HashMap<u32, Vec<u32>> = HashMap::new();
+                let ords = c.ords();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    let ord = ords[i];
+                    let ids = ord_keys.entry(ord).or_insert_with(|| {
+                        let term = c.term(ord);
+                        match term
+                            .starts_with('[')
+                            .then(|| kosha_core::list_elements(term))
+                            .flatten()
+                        {
+                            Some(elements) => {
+                                elements.into_iter().map(|e| keys.intern(e)).collect()
+                            }
+                            None => vec![keys.intern(term.to_string())],
+                        }
+                    });
+                    per_doc[wi].extend_from_slice(ids);
+                });
+            }
+            FilterColumn::Integer(c) => {
+                let mut cache: HashMap<i64, u32> = HashMap::new();
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    let v = values[i];
+                    let id = *cache.entry(v).or_insert_with(|| keys.intern(v.to_string()));
+                    per_doc[wi].push(id);
+                });
+            }
+            FilterColumn::Float(c) => {
+                let mut cache: HashMap<u64, u32> = HashMap::new();
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    let v = values[i];
+                    let id = *cache
+                        .entry(v.to_bits())
+                        .or_insert_with(|| keys.intern(v.to_string()));
+                    per_doc[wi].push(id);
+                });
+            }
+        }
+    }
+    for ids in &mut per_doc {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    Ok(ColumnarSourceValues {
+        names: keys.names,
+        per_doc,
+    })
+}
+
+/// [`aggregate_matches`] over a columnar segment's filter columns.
+/// `wanted` is the segment's matching doc_seqs, sorted and distinct.
+fn aggregate_matches_columnar(
+    reader: &SegmentReader,
+    wanted: &[u32],
+    agg: &Aggregation,
+) -> Result<AggregationState, KoshaError> {
+    let sources = aggregation_sources(agg);
+    let mut state = AggregationState::default();
+    if sources.is_empty() {
+        return Ok(state);
+    }
+    let values: Vec<ColumnarSourceValues> = sources
+        .iter()
+        .map(|(_, field)| columnar_source_values(reader, field, wanted))
+        .collect::<Result<_, _>>()?;
+    if let [only] = values.as_slice() {
+        // One source (`terms`, `cardinality`, a one-source `composite`):
+        // count per key id, and make each key's text once.
+        let mut counts = vec![0usize; only.names.len()];
+        for ids in &only.per_doc {
+            for id in ids {
+                counts[*id as usize] += 1;
+            }
+        }
+        for (id, count) in counts.into_iter().enumerate() {
+            if count > 0 {
+                state.buckets.insert(vec![only.names[id].clone()], count);
+            }
+        }
+        return Ok(state);
+    }
+    for wi in 0..wanted.len() {
+        // Every combination of the document's values across the sources;
+        // a source with no value leaves the document out.
+        let mut keys: Vec<Vec<String>> = vec![Vec::new()];
+        for source in &values {
+            let ids = &source.per_doc[wi];
+            if ids.is_empty() {
+                keys.clear();
+                break;
+            }
+            keys = keys
+                .into_iter()
+                .flat_map(|prefix| {
+                    ids.iter().map(move |id| {
+                        let mut key = prefix.clone();
+                        key.push(source.names[*id as usize].clone());
+                        key
+                    })
+                })
+                .collect();
+        }
+        for key in keys {
+            *state.buckets.entry(key).or_default() += 1;
+        }
+    }
+    Ok(state)
+}
+
+/// [`build_sort_value_maps`] over a columnar segment's filter columns.
+fn build_sort_value_maps_columnar(
+    reader: &SegmentReader,
+    fields: &[String],
+    wanted: &HashSet<u32>,
+) -> Result<HashMap<String, HashMap<u32, SortValue>>, KoshaError> {
+    use kosha_core::FilterColumnKind;
+    use kosha_segment::filter_columns::FilterColumn;
+    use kosha_segment::filter_eval::resolve_column;
+    let mut sorted: Vec<u32> = wanted.iter().copied().collect();
+    sorted.sort_unstable();
+    let mut out = HashMap::with_capacity(fields.len());
+    for field in fields {
+        let mut map: HashMap<u32, SortValue> = HashMap::new();
+        // The first kind the field has a column of, as on `filters.bin`.
+        // A document with several values keeps its last, as there.
+        let mut column = None;
+        for kind in [
+            FilterColumnKind::String,
+            FilterColumnKind::Integer,
+            FilterColumnKind::Float,
+        ] {
+            column = resolve_column(reader, field, kind)?;
+            if column.is_some() {
+                break;
+            }
+        }
+        match column.as_deref() {
+            Some(FilterColumn::String(c)) => {
+                let ords = c.ords();
+                for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
+                    map.insert(sorted[wi], SortValue::Text(c.term(ords[i]).to_string()));
+                });
+            }
+            Some(FilterColumn::Integer(c)) => {
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
+                    map.insert(sorted[wi], SortValue::Number(values[i] as f64));
+                });
+            }
+            Some(FilterColumn::Float(c)) => {
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
+                    map.insert(sorted[wi], SortValue::Number(values[i]));
+                });
+            }
+            None => {}
+        }
+        out.insert(field.clone(), map);
+    }
+    Ok(out)
 }
 
 fn finish_aggregations(
@@ -9922,5 +10234,291 @@ mod columnar_filter_tests {
                 > 0
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// #244 part 2: the same corpus as `filters.bin` segments, as columnar
+/// segments, and as a namespace mixing both must answer every query
+/// identically — hits, order, totals and aggregation buckets — now that
+/// columnar segments filter from bitmaps and aggregate/sort from columns.
+#[cfg(test)]
+mod columnar_eval_differential_tests {
+    use super::*;
+    use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
+    use kosha_segment::SegmentWriter;
+
+    const DOCS: u32 = 1500;
+
+    fn doc(s: u32, d: u32) -> Vec<Field> {
+        let n = s * DOCS + d;
+        let tags = [
+            r#"["urgent","sealed"]"#,
+            r#"["draft"]"#,
+            "[]",
+            "urgent",
+            r#"["a","urgent"]"#,
+        ];
+        let mut fields = vec![
+            Field::text(
+                "t",
+                if n.is_multiple_of(9) {
+                    format!("privileged contract clause {n}")
+                } else {
+                    format!("contract clause {n}")
+                },
+            ),
+            Field::keyword("matterId", format!("m{}", n % 5)),
+            Field::integer("page", ((n * 37) % 211) as i64 - 20),
+            Field::float_val("score", (n % 17) as f64 / 4.0),
+            Field::boolean("inScope", !n.is_multiple_of(3)),
+            Field::date_val("createdAt", format!("2024-{:02}-01", n % 12 + 1)),
+        ];
+        if n % 6 != 5 {
+            fields.push(Field::keyword("tags", tags[(n % 5) as usize]));
+        }
+        if n.is_multiple_of(4) {
+            // Multi-valued.
+            fields.push(Field::keyword("matterId", "shared"));
+            fields.push(Field::integer("page", 1000 + (n % 3) as i64));
+        }
+        if n.is_multiple_of(50) {
+            fields.push(Field::keyword("rare", "yes"));
+        }
+        if n % 150 == 7 {
+            // Sparse enough (10 per segment) for the WAND walk to skip
+            // postings blocks on the pre-filter.
+            fields.push(Field::keyword("rarer", "yes"));
+        }
+        fields
+    }
+
+    fn build(root: &std::path::Path, versions: &[u32]) -> Manifest {
+        let mut entries = Vec::new();
+        for (s, version) in versions.iter().enumerate() {
+            let s = s as u32;
+            let id = SegmentId(format!("s{s}"));
+            let mut w = SegmentWriter::new(id.clone(), root.join("ns").join(&id.0))
+                .with_filters_write_version(*version);
+            for d in 0..DOCS {
+                w.add_document(DocumentId(format!("s{s}-d{d:04}")), doc(s, d));
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: id,
+                doc_count: DOCS,
+            });
+        }
+        Manifest {
+            version: 1,
+            segments: entries,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        }
+    }
+
+    fn queries() -> Vec<serde_json::Value> {
+        use serde_json::json;
+        let aggs = json!({
+            "by_matter": {"terms": {"field": "matterId.keyword", "size": 50}},
+            "by_tag": {"terms": {"field": "tags", "size": 50}},
+            "by_page": {"terms": {"field": "page", "size": 5}},
+            "by_score": {"terms": {"field": "score", "size": 50}},
+            "pages": {"cardinality": {"field": "page"}},
+            "tag_count": {"cardinality": {"field": "tags.keyword"}},
+            "combo": {"composite": {"size": 40, "sources": [
+                {"m": {"terms": {"field": "matterId"}}},
+                {"t": {"terms": {"field": "tags.keyword"}}}]}},
+            "combo_after": {"composite": {"size": 10,
+                "after": {"m": "m2", "t": "draft"},
+                "sources": [{"m": {"terms": {"field": "matterId"}}},
+                            {"t": {"terms": {"field": "tags"}}}]}},
+            "one": {"composite": {"size": 100, "sources": [
+                {"s": {"terms": {"field": "inScope"}}}]}}
+        });
+        vec![
+            // Filters: term, terms, range, bool, exists, lists, .keyword.
+            json!({"query_text": "contract", "max_results": 10,
+                   "filter": {"term": {"matterId.keyword": "m1"}}, "exact_total_hits": true}),
+            json!({"query_text": "privileged", "max_results": 10,
+                   "filter": {"term": {"rare": "yes"}}, "exact_total_hits": true}),
+            json!({"query_text": "contract", "max_results": 5,
+                   "filter": {"term": {"rarer": "yes"}}, "exact_total_hits": true}),
+            json!({"query_text": "contract", "max_results": 0,
+                   "filter": {"term": {"rarer": "yes"}}, "exact_total_hits": true}),
+            json!({"query_text": "contract clause", "max_results": 10,
+                   "filter": {"terms": {"tags": ["urgent", "draft"]}}, "exact_total_hits": true}),
+            json!({"query_text": "contract", "max_results": 10, "operator": "or",
+                   "filter": {"range": {"page": {"gte": "10", "lt": "60"}}},
+                   "exact_total_hits": true}),
+            json!({"query_text": "", "max_results": 10,
+                   "filter": {"range": {"score": {"gt": "1.5", "lte": "3"}}},
+                   "exact_total_hits": true}),
+            json!({"query_text": "", "max_results": 0,
+                   "filter": {"bool": {"must": [{"exists": {"field": "tags"}}],
+                                       "must_not": [{"term": {"inScope": "true"}}]}},
+                   "exact_total_hits": true}),
+            json!({"query_text": "clause", "max_results": 10,
+                   "filter": {"bool": {"should": [{"term": {"matterId": "shared"}},
+                                                  {"range": {"createdAt": {"gte": "2024-11-01"}}},
+                                                  {"term": {"tags": "sealed"}}],
+                                       "minimum_should_match": 2}},
+                   "exact_total_hits": true}),
+            // Aggregations over the query's matches.
+            json!({"query_text": "contract", "max_results": 3, "aggs": aggs,
+                   "exact_total_hits": true}),
+            json!({"query_text": "privileged", "max_results": 3, "aggs": aggs,
+                   "filter": {"terms": {"matterId": ["m2", "m3"]}},
+                   "exact_total_hits": true}),
+            json!({"query_text": "", "max_results": 0, "aggs": aggs,
+                   "filter": {"exists": {"field": "rare"}}, "exact_total_hits": true}),
+            // Field sorts: numeric (multi-valued, negative), text, date,
+            // missing values, a cursor and collapse.
+            json!({"query_text": "contract", "max_results": 15,
+                   "sort": [{"page": {"order": "asc"}}, {"_id": {"order": "asc"}}],
+                   "exact_total_hits": true}),
+            json!({"query_text": "contract", "max_results": 15,
+                   "sort": [{"score": {"order": "desc"}}, {"_id": {"order": "desc"}}],
+                   "filter": {"range": {"page": {"lt": "100"}}}, "exact_total_hits": true}),
+            json!({"query_text": "clause", "max_results": 12,
+                   "sort": [{"tags.keyword": {"order": "asc"}}, {"_id": {"order": "asc"}}],
+                   "exact_total_hits": true}),
+            json!({"query_text": "clause", "max_results": 12,
+                   "sort": [{"page": {"order": "desc"}}, {"_id": {"order": "asc"}}],
+                   "search_after": ["150", "s0-d0000"], "exact_total_hits": true}),
+            json!({"query_text": "contract", "max_results": 10,
+                   "sort": [{"createdAt": {"order": "desc"}}, {"_id": {"order": "asc"}}],
+                   "collapse": {"field": "matterId"}, "exact_total_hits": true}),
+        ]
+    }
+
+    fn summary(r: &SearchResult) -> String {
+        let hits: Vec<String> = r
+            .results
+            .iter()
+            .map(|d| format!("{}:{:.6}", d.doc_id.0, d.score))
+            .collect();
+        let aggs = r
+            .aggregations
+            .as_ref()
+            .map(|a| {
+                let v = serde_json::to_value(a).unwrap();
+                let sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                    serde_json::from_value(v).unwrap();
+                serde_json::to_string(&sorted).unwrap()
+            })
+            .unwrap_or_default();
+        format!("{} {hits:?} {aggs}", r.total_hits)
+    }
+
+    #[test]
+    fn legacy_columnar_and_mixed_namespaces_answer_identically() {
+        let root = std::env::temp_dir().join(format!("kosha-q-244-eval-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let layouts: [(&str, [u32; 3]); 3] =
+            [("v1", [1, 1, 1]), ("v2", [2, 2, 2]), ("mixed", [2, 1, 2])];
+        let built: Vec<(Manifest, Searcher)> = layouts
+            .iter()
+            .map(|(name, versions)| {
+                let dir = root.join(name);
+                (build(&dir, versions), Searcher::new(dir))
+            })
+            .collect();
+        // Deleted documents must stay out of hits, totals and buckets.
+        let tombstones = HashMap::from([
+            (
+                SegmentId("s0".into()),
+                HashSet::from([0u32, 5, 10, 50, 100]),
+            ),
+            (
+                SegmentId("s2".into()),
+                (0..DOCS).step_by(7).collect::<HashSet<u32>>(),
+            ),
+        ]);
+        for json in queries() {
+            let q: SearchQuery = serde_json::from_value(json.clone()).unwrap();
+            for deletes in [None, Some(&tombstones)] {
+                let answers: Vec<String> = built
+                    .iter()
+                    .map(|(m, s)| summary(&s.search(&ns, m, &q, deletes).unwrap()))
+                    .collect();
+                assert!(!answers[0].starts_with("0 "), "vacuous query {json}");
+                if json.get("aggs").is_some() {
+                    assert!(answers[0].contains(r#""key":"urgent""#), "{}", answers[0]);
+                }
+                assert_eq!(
+                    answers[0],
+                    answers[1],
+                    "v1 vs v2, deletes={}: {json}",
+                    deletes.is_some()
+                );
+                assert_eq!(
+                    answers[0],
+                    answers[2],
+                    "v1 vs mixed, deletes={}: {json}",
+                    deletes.is_some()
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sparse_prefilter_block_skipping_keeps_exact_counts() {
+        // Independent of the differential above (both formats share the
+        // scoring loop): the WAND walk skips postings blocks on a sparse
+        // pre-filter, and must still count and return every passing doc.
+        let root = std::env::temp_dir().join(format!("kosha-q-244-sparse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let m = build(&root, &[2, 1, 2]);
+        let s = Searcher::new(root.clone());
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "contract", "max_results": 100,
+            "filter": {"term": {"rarer": "yes"}}, "exact_total_hits": true}))
+        .unwrap();
+        let r = s.search(&ns, &m, &q, None).unwrap();
+        assert_eq!(r.total_hits, 30);
+        assert_eq!(r.results.len(), 30);
+        // s2 loses d7 and d1057 (d % 150 == 7 and d % 7 == 0).
+        let tombstones = HashMap::from([(
+            SegmentId("s2".into()),
+            (0..DOCS).step_by(7).collect::<HashSet<u32>>(),
+        )]);
+        let r = s.search(&ns, &m, &q, Some(&tombstones)).unwrap();
+        assert_eq!(r.total_hits, 28);
+        assert!(r
+            .results
+            .iter()
+            .all(|d| d.doc_id.0 != "s2-d0007" && d.doc_id.0 != "s2-d1057"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn galloping_entry_walk_visits_exactly_the_wanted_entries() {
+        let docs: Vec<u32> = vec![0, 0, 1, 3, 3, 3, 4, 9, 10, 10, 200, 201, 5000];
+        for wanted in [
+            vec![],
+            vec![0],
+            vec![3, 10],
+            vec![2, 5, 6, 7, 8],
+            vec![0, 1, 3, 4, 9, 10, 200, 201, 5000],
+            vec![201, 4999, 5000, 6000],
+            (0..6000).collect::<Vec<u32>>(),
+        ] {
+            let mut got = Vec::new();
+            for_each_wanted_entry(&docs, &wanted, |wi, i| got.push((wanted[wi], i)));
+            let want: Vec<(u32, usize)> = docs
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| wanted.contains(d))
+                .map(|(i, d)| (*d, i))
+                .collect();
+            assert_eq!(got, want, "wanted {wanted:?}");
+        }
     }
 }

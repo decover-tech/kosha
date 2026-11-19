@@ -208,6 +208,43 @@ pub struct StringColumn {
     /// otherwise a serialized roaring bitmap (never 4 bytes long).
     bitmap_area: Vec<u8>,
     present: RoaringBitmap,
+    /// Element index over list-valued terms, built on first use (#244
+    /// filter evaluation). Not part of the on-disk format.
+    lists: LazyListIndex,
+}
+
+/// Which dictionary terms are JSON lists, and what they hold.
+///
+/// A list value is stored as its JSON text (one dictionary term), but a
+/// `term` filter or a terms aggregation treats it as one value per element
+/// (`kosha_core::list_elements`). This index answers "which list terms
+/// contain element `e`" and "which terms count as no value" without
+/// re-parsing JSON per query.
+#[derive(Debug, Default)]
+pub struct ListIndex {
+    /// Element -> ordinals of list terms (text starting with `[`) holding
+    /// it, ascending.
+    pub elements: HashMap<String, Vec<u32>>,
+    /// Ordinals of terms that parse as a list with no usable element
+    /// (`[]`, `[null]`, ` []`): `exists` treats them as no value.
+    pub empty: Vec<u32>,
+}
+
+/// A `OnceLock<ListIndex>` that is invisible to `Clone`/`PartialEq`: it is
+/// a cache of what the dictionary already says.
+#[derive(Debug, Default)]
+struct LazyListIndex(std::sync::OnceLock<ListIndex>);
+
+impl Clone for LazyListIndex {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for LazyListIndex {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 fn offset_u32(n: usize, what: &str) -> Result<u32, KoshaError> {
@@ -330,7 +367,91 @@ impl StringColumn {
             bitmap_offsets,
             bitmap_area,
             present,
+            lists: LazyListIndex::default(),
         })
+    }
+
+    /// The list-element index (see [`ListIndex`]), built on first call by
+    /// one pass over the dictionary.
+    pub fn list_index(&self) -> &ListIndex {
+        self.lists.0.get_or_init(|| {
+            let mut index = ListIndex::default();
+            for ord in 0..self.term_count() as u32 {
+                let term = self.term(ord);
+                if !term.trim_start().starts_with('[') {
+                    continue;
+                }
+                let Some(elements) = kosha_core::list_elements(term) else {
+                    continue;
+                };
+                if elements.is_empty() {
+                    index.empty.push(ord);
+                }
+                // Element matching only applies to text that starts with
+                // `[` itself, as in `kosha_core::evaluate_filter`.
+                if term.starts_with('[') {
+                    for element in elements {
+                        let ords = index.elements.entry(element).or_default();
+                        if ords.last() != Some(&ord) {
+                            ords.push(ord);
+                        }
+                    }
+                }
+            }
+            index
+        })
+    }
+
+    /// Dictionary ordinals of terms in `lo..hi` byte order (`None` bounds
+    /// are open): `lower_inclusive`/`upper_inclusive` pick `>=`/`>` and
+    /// `<=`/`<`.
+    pub fn ordinal_range(
+        &self,
+        lo: Option<(&str, bool)>,
+        hi: Option<(&str, bool)>,
+    ) -> std::ops::Range<u32> {
+        let n = self.term_count();
+        let point = |pred: &dyn Fn(&str) -> bool| -> usize {
+            let (mut a, mut b) = (0usize, n);
+            while a < b {
+                let mid = (a + b) / 2;
+                if pred(self.term(mid as u32)) {
+                    a = mid + 1;
+                } else {
+                    b = mid;
+                }
+            }
+            a
+        };
+        let start = match lo {
+            None => 0,
+            Some((bound, true)) => point(&|t| t < bound),
+            Some((bound, false)) => point(&|t| t <= bound),
+        };
+        let end = match hi {
+            None => n,
+            Some((bound, true)) => point(&|t| t <= bound),
+            Some((bound, false)) => point(&|t| t < bound),
+        };
+        start as u32..end.max(start) as u32
+    }
+
+    /// Visit the documents holding dictionary term `ord`, without building
+    /// a bitmap for single-document terms.
+    pub fn for_each_doc(&self, ord: u32, mut f: impl FnMut(u32)) {
+        let bytes = self.term_bytes(ord);
+        if let Ok(single) = <[u8; 4]>::try_from(bytes) {
+            f(u32::from_le_bytes(single));
+        } else {
+            for doc in self.bitmap(ord) {
+                f(doc);
+            }
+        }
+    }
+
+    /// Documents holding at least one value.
+    pub fn present(&self) -> &RoaringBitmap {
+        &self.present
     }
 
     fn stats(&self) -> FilterColumnStats {
@@ -793,6 +914,7 @@ fn decode_string(
         bitmap_offsets,
         bitmap_area,
         present,
+        lists: LazyListIndex::default(),
     };
     for i in 1..column.term_count() {
         if column.term(i as u32 - 1) >= column.term(i as u32) {
@@ -850,6 +972,15 @@ fn decode_numeric<T: ColumnValue>(
     let mut zones = Vec::with_capacity(zone_count);
     for _ in 0..zone_count {
         zones.push((T::from_le(c.b8()?), T::from_le(c.b8()?)));
+    }
+    // Filter evaluation trusts the zones to skip blocks and to take whole
+    // blocks without comparing values, so they must be exactly what the
+    // values say.
+    for ((lo, hi), block) in zones.iter().zip(values.chunks(ZONE_BLOCK)) {
+        let (want_lo, want_hi) = zone_of(block);
+        if lo.bits() != want_lo.bits() || hi.bits() != want_hi.bits() {
+            return Err(corrupt(what, "zone map disagrees with values"));
+        }
     }
     Ok(NumericColumn {
         docs,
@@ -984,6 +1115,26 @@ pub fn filter_files_present(segment_dir: &Path, footer: &kosha_core::Footer) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zone_maps_must_agree_with_values() {
+        let entries: Vec<(u32, i64)> = (0..5000).map(|i| (i, i as i64)).collect();
+        let encoded = encode_column(
+            &FilterColumn::Integer(NumericColumn::from_entries(&entries)),
+            5000,
+        );
+        assert!(decode_column(&encoded, FilterColumnKind::Integer, 5000, "ok").is_ok());
+        // The last zone's max is the body's last 8 bytes. Lower it and
+        // re-sign the CRC: the file is self-consistent but lies, which
+        // would make evaluation skip or wholesale-take the wrong blocks.
+        let mut bad = encoded.clone();
+        let n = bad.len();
+        bad[n - 8..].copy_from_slice(&100i64.to_le_bytes());
+        let crc = column_crc(&bad[..COLUMN_HEADER_LEN], &bad[COLUMN_HEADER_LEN..]);
+        bad[COLUMN_HEADER_LEN - 4..COLUMN_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+        let err = decode_column(&bad, FilterColumnKind::Integer, 5000, "bad").unwrap_err();
+        assert!(err.to_string().contains("zone map"), "{err}");
+    }
+
     use super::*;
 
     fn strings() -> Vec<(u32, String)> {

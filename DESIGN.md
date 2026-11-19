@@ -223,9 +223,31 @@ files that happen to be on local disk.
   range.
 
 A query node fetches only `filters.toc` and the columns the query names (filter, kNN filter,
-field sorts, collapse and aggregations; `x.keyword` also fetches `x`). In this release the
-reader rebuilds the legacy in-memory `FilterStore` from those columns, so filter evaluation,
-sorting and aggregations are unchanged; bitmap-based evaluation is follow-up work.
+field sorts, collapse and aggregations; `x.keyword` also fetches `x`). On a columnar segment
+the query evaluates straight from the columns (`kosha_segment::filter_eval`, entry point
+`SegmentReader::evaluate_filter`):
+
+- `term`/`terms` on a string column: a dictionary binary search, then that term's bitmap. A
+  list value (JSON text such as `["a","b"]`) also matches per element through a per-column
+  element index built once from the dictionary.
+- `term`/`terms`/`range` on a numeric column: zone maps skip blocks that cannot match; integer
+  blocks entirely inside a range are taken without comparing values; only the remaining blocks
+  are scanned. Zone maps are verified against the values at decode.
+- `range` on a string column: the dictionary's ordinal range, then those terms' bitmaps (or
+  one pass over the ordinals when the range spans many terms).
+- `exists`: the presence bitmap, less documents whose only values are empty lists.
+- `bool`: set algebra; `must_not` subtracts from the all-documents set.
+
+The result is the segment's dense `DocSet`, cached per segment and clause as before. Each
+request removes its deleted documents from a copy, which gives the scoring loops a single
+pre-filter: one bit test per candidate, and when it is sparse (under 1 in 64 documents) the
+single-term WAND walk skips postings blocks whose doc range holds no passing document.
+`DocSet::to_bitmap` hands the same set to a later filtered vector probe (#252). Aggregations
+(`terms`, `cardinality`, `composite`) and field sorts/collapse read the ordinal and value
+arrays for the matching documents instead of building row maps. `filters.bin` segments keep
+the row-scan evaluator and the `FilterStore` paths. Both formats give identical results; a
+namespace may mix them. On a 1M-document segment, columnar `term`/`terms`/`range` evaluation
+is 40x to several thousand times faster than the row scan (`filter_eval_1m` bench).
 
 `KOSHA_FILTERS_WRITE_VERSION` picks the format writers (flush and compaction) emit: `1`
 (default) writes `filters.bin`, `2` writes columns. Every reader in this release reads both.

@@ -485,16 +485,13 @@ impl Indexer {
         for entry in &state.manifest.segments {
             let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
             let reader = kosha_segment::SegmentReader::open(seg_dir)?;
-            let store = reader.try_filter_store()?;
-            let all: HashSet<u32> = (0..reader.doc_count())
-                .filter(|seq| {
-                    !state
-                        .tombstones
-                        .get(&entry.segment_id)
-                        .is_some_and(|set| set.contains(seq))
-                })
-                .collect();
-            let matching = crate::apply_filter_delete(filter, &store, &all)?;
+            // The search path's evaluator (columnar or `filters.bin`), so a
+            // delete matches exactly the documents a search would.
+            let mut matching_set = reader.evaluate_filter(filter)?;
+            if let Some(dead) = state.tombstones.get(&entry.segment_id) {
+                matching_set.remove_all(dead);
+            }
+            let matching: Vec<u32> = matching_set.iter().collect();
             for seq in &matching {
                 let meta = reader
                     .doc_meta(*seq)
