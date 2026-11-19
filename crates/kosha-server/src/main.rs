@@ -4538,6 +4538,9 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
         let old_manifest = manifest.clone();
         match indexer.delete_by_query(&ns, &old_manifest, &filter) {
             Ok(c) => (old_manifest, c),
+            // A filter the data cannot answer (e.g. `prefix` on a numeric
+            // field) is the client's mistake, not a server fault.
+            Err(e @ KoshaError::InvalidQuery(_)) => return json_error(400, &e.to_string()),
             Err(e) => return json_error(500, &format!("delete error: {e}")),
         }
     };
@@ -7127,6 +7130,100 @@ mod tests {
             &state,
         );
         assert!(repeated.contains("\"deleted\":0"), "{repeated}");
+    }
+
+    /// #199 / #217 with #170's rule: `prefix` through `/delete`. Every
+    /// malformed body is a 400 that deletes nothing (never a match-all), a
+    /// prefix on a numeric field is a 400 that deletes nothing, and a good
+    /// one deletes exactly the matching documents across segments.
+    #[test]
+    fn delete_by_prefix_parses_strictly_and_spans_segments() {
+        let state = test_state();
+        let ns = NamespaceId("prefix-delete".into());
+        for batch in [
+            [("a1", "/matters/2026/a"), ("a2", "/matters/2025/b")],
+            [("b1", "/matters/2026/c"), ("b2", "/MATTERS/2026/d")],
+        ] {
+            state
+                .indexer
+                .index_documents(
+                    ns.clone(),
+                    batch
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (id, path))| Document {
+                            id: DocumentId((*id).into()),
+                            fields: vec![
+                                Field::text("text", "hello"),
+                                Field::keyword("path", *path),
+                                Field::integer("page", i as i64),
+                            ],
+                        })
+                        .collect(),
+                )
+                .unwrap();
+            state.indexer.flush_namespace(&ns).unwrap();
+        }
+        assert_eq!(state.indexer.manifest(&ns).unwrap().segments.len(), 2);
+        let total = |state: &AppState| -> String {
+            handle_search_post(
+                br#"{"namespace":"prefix-delete","query_text":"hello","no_cache":true}"#,
+                state,
+            )
+        };
+        assert!(total(&state).contains("\"total_hits\":4"));
+        let found = handle_search_post(
+            br#"{"namespace":"prefix-delete","query_text":"hello",
+                 "filter":{"prefix":{"path":"/matters/2026/"}}}"#,
+            &state,
+        );
+        assert!(found.contains("\"total_hits\":2"), "{found}");
+        let numeric = handle_search_post(
+            br#"{"namespace":"prefix-delete","query_text":"hello",
+                 "filter":{"prefix":{"page":"1"}}}"#,
+            &state,
+        );
+        assert!(numeric.starts_with("HTTP/1.1 400"), "{numeric}");
+        assert!(numeric.contains("numeric field"), "{numeric}");
+
+        for filter in [
+            r#"{"prefix": {"path": 7}}"#,
+            r#"{"prefix": {"path": null}}"#,
+            r#"{"prefix": {"path": "/a", "other": "/b"}}"#,
+            r#"{"prefix": {}}"#,
+            r#"{"prefix": {"path": {"value": "/a", "boost": 1}}}"#,
+            r#"{"prefix": {"path": {"case_insensitive": true}}}"#,
+            r#"{"prefix": {"path": {"value": "/a", "case_insensitive": 1}}}"#,
+            r#"{"bool": {"must_not": [{"prefix": {"path": ["/a"]}}]}}"#,
+            // Numeric: parses, but the data cannot answer it.
+            r#"{"prefix": {"page": "1"}}"#,
+            r#"{"bool": {"must_not": [{"prefix": {"page": "1"}}]}}"#,
+        ] {
+            let body = format!(r#"{{"namespace":"prefix-delete","filter":{filter}}}"#);
+            let response = handle_delete(body.as_bytes(), &state);
+            assert!(response.starts_with("HTTP/1.1 400"), "{filter}: {response}");
+            assert!(
+                total(&state).contains("\"total_hits\":4"),
+                "{filter} deleted something"
+            );
+        }
+
+        let response = handle_delete(
+            br#"{"namespace":"prefix-delete","filter":{"prefix":{"path":"/matters/2026/"}}}"#,
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"deleted\":2"), "{response}");
+        // Case-insensitive takes the upper-case one too; "a2" survives.
+        let response = handle_delete(
+            br#"{"namespace":"prefix-delete","query":{"prefix":{"path":
+                {"value":"/matters/2026/","case_insensitive":true}}}}"#,
+            &state,
+        );
+        assert!(response.contains("\"deleted\":1"), "{response}");
+        let rest = total(&state);
+        assert!(rest.contains("\"total_hits\":1"), "{rest}");
+        assert!(rest.contains("\"a2\""), "{rest}");
     }
 
     #[test]

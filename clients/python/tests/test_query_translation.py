@@ -118,13 +118,60 @@ def test_exists_and_range_options():
     assert ranged == {"range": {"sentAt": {"gte": "2024-01-01", "lte": "2024-12-31"}}}
 
 
+def test_prefix_short_and_long_forms():
+    assert KoshaClient._to_filter({"prefix": {"path": "/matters/2026/"}}) == {
+        "prefix": {"path": "/matters/2026/"}
+    }
+    # Long form, default case: sent in the short form.
+    assert KoshaClient._to_filter(
+        {"prefix": {"path": {"value": "/a/", "boost": 2.0, "rewrite": "constant_score"}}}
+    ) == {"prefix": {"path": "/a/"}}
+    assert KoshaClient._to_filter(
+        {"prefix": {"sku": {"value": "ab", "case_insensitive": True}}}
+    ) == {"prefix": {"sku": {"value": "ab", "case_insensitive": True}}}
+    assert KoshaClient._to_filter(
+        {"prefix": {"sku": {"value": "ab", "case_insensitive": False}}}
+    ) == {"prefix": {"sku": "ab"}}
+
+
+def test_prefix_composes_in_bool_and_query_context():
+    kosha = translate(
+        {
+            "query": {
+                "bool": {
+                    "must": [{"match": {"content": "contract"}}],
+                    "filter": [
+                        {"prefix": {"status": "arch"}},
+                        {"range": {"createdAt": {"gte": "2026-01-01"}}},
+                    ],
+                    "must_not": [{"prefix": {"path": "/tmp/"}}],
+                }
+            }
+        }
+    )
+    assert kosha["query_text"] == "contract"
+    assert kosha["filter"] == {
+        "bool": {
+            "must": [
+                {"prefix": {"status": "arch"}},
+                {"range": {"createdAt": {"gte": "2026-01-01"}}},
+            ],
+            "must_not": [{"prefix": {"path": "/tmp/"}}],
+        }
+    }
+
+
 @pytest.mark.parametrize(
     "clause",
     [
         {"nested": {"path": "batesAssignments", "query": {"match_all": {}}}},
         {"term": {"_id": "abc"}},
         {"ids": {"values": ["a"]}},
-        {"prefix": {"title": "ab"}},
+        {"prefix": {"title": {"value": "ab", "fuzziness": 1}}},
+        {"prefix": {"title": 12}},
+        {"prefix": {"title": "ab", "path": "/a"}},
+        {"prefix": {"title": {"case_insensitive": True}}},
+        {"prefix": {"title": {"value": "ab", "case_insensitive": "yes"}}},
         {"bool": {"should": [{"term": {"a": "1"}}], "minimum_should_match": "75%"}},
     ],
 )

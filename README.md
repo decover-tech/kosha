@@ -36,7 +36,8 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | `wildcard` | Per-field pattern match, case-insensitive by default |
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
 | Hybrid retrieval | A `knn` clause and `query_text` in one request; vector and BM25 hits merged per segment |
-| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `bool` (`must` / `must_not` / `should` / `minimum_should_match`), `match_all` |
+| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `exists`, `prefix`, `bool` (`must` / `must_not` / `should` / `minimum_should_match`; OpenSearch's `filter` is accepted as `must`), `match_all`. Every clause composes inside `bool` and works in `filter`, `knn.filter` and `/delete`. An unknown or malformed clause is a 400, never a match-all |
+| `prefix` filter | `{"prefix": {"path": "/matters/2026/"}}`, or the long form `{"prefix": {"path": {"value": "/matters/2026/", "case_insensitive": true}}}`. Case-sensitive by default, like `term` (and unlike the `wildcard` query): `"ab"` matches `abc` and `ab`, not `a`, `xab` or `ABC`. A list value matches when any element does. The empty prefix matches exactly the documents `exists` matches. String fields only: a `prefix` on an `Integer`/`Float` field is a 400. Only `value` and `case_insensitive` are accepted in the long form. Evaluated by a linear scan of the segment's filter column, cached per segment; bloom filters cannot skip segments for it |
 | kNN-scoped filters | `knn.filter` restricts vector candidates; the top-level `filter` still governs the merged result set |
 | Sorting | Multi-field `sort` over stored fields, plus `_id` |
 | Pagination | `from` / `max_results`, and an OpenSearch-style `search_after` cursor |

@@ -2214,6 +2214,9 @@ pub fn apply_filter_delete(
     // The one filter implementation, shared with search (kosha-core's
     // `docset`), so a delete matches exactly the documents a search with
     // the same filter returns.
+    // A clause this segment cannot answer (a `prefix` on a numeric field)
+    // fails the whole delete before anything is tombstoned.
+    kosha_core::check_filter(filter, store).map_err(KoshaError::InvalidQuery)?;
     let doc_count = candidates.iter().max().map_or(0, |max| max + 1);
     let passing = kosha_core::evaluate_filter(filter, store, doc_count);
     Ok(candidates
