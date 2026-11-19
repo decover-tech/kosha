@@ -38,7 +38,7 @@ use kosha_cache::Cache;
 #[cfg(feature = "s3")]
 use kosha_core::StorageBackend;
 #[cfg(feature = "s3")]
-use kosha_core::{segment_may_contain_terms, segment_may_match, TermBloomMode};
+use kosha_core::{segment_may_contain_terms, TermBloomMode};
 use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::DocStoreHydrator;
 use kosha_query::Searcher;
@@ -1073,11 +1073,18 @@ impl AppState {
             println!("write-path requests will be forwarded to ingest at {h}");
             reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(
+                    // Matches the server's own request I/O timeout
+                    // (`KOSHA_HTTP_IO_TIMEOUT_SECS`). The previous default of 30 s
+                    // was shorter than a busy ingest node can take to answer a
+                    // write that waits for a flush: concurrent bulk writes queue
+                    // behind each other's flushes, and the ones that waited
+                    // longest came back as a 503 "forward to ingest failed"
+                    // although the ingest node then completed them.
                     std::env::var("KOSHA_INGEST_PROXY_TIMEOUT_SECS")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .filter(|n| *n > 0)
-                        .unwrap_or(30),
+                        .unwrap_or(300),
                 ))
                 .build()
                 .expect("failed to build ingest-forwarding HTTP client")
@@ -1434,6 +1441,9 @@ impl AppState {
                 total_hits_cap: None,
                 operator: None,
                 no_cache: None,
+                collapse: None,
+                source_includes: None,
+                source_excludes: None,
             };
             let needs_filters = query_needs_filter_store(&query);
             let needs_vectors = query.knn.is_some();
@@ -1684,6 +1694,26 @@ impl AppState {
     /// control store, so the segment list survives restarts.
     fn refresh_query_namespace(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
         if self.ingest_host.is_some() {
+            // Ask for the version first. This runs before every search on a
+            // query replica, and it used to read and parse the namespace's
+            // whole manifest row each time (megabytes for a few hundred
+            // segments) while holding the control-store lock every other
+            // search was waiting on, then clone the local manifest to
+            // compare one integer. The manifest is only fetched when the
+            // stored version is ahead.
+            let stored = self
+                .controller
+                .lock()
+                .unwrap()
+                .manifest_version(ns)
+                .ok_or_else(|| KoshaError::NamespaceNotFound(ns.clone()))?;
+            if self
+                .indexer
+                .manifest_version(ns)
+                .is_some_and(|local| local >= stored)
+            {
+                return Ok(());
+            }
             let mut manifest = self
                 .controller
                 .lock()
@@ -1692,8 +1722,8 @@ impl AppState {
                 .ok_or_else(|| KoshaError::NamespaceNotFound(ns.clone()))?;
             if self
                 .indexer
-                .manifest_cloned(ns)
-                .is_none_or(|local| local.version < manifest.version)
+                .manifest_version(ns)
+                .is_none_or(|local| local < manifest.version)
             {
                 kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
                     let path = vector.path(ns, segment)?;
@@ -2370,7 +2400,7 @@ impl AppState {
         request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
         let term_prune = term_bloom_prune_for_query(query);
-        let needs_bloom_check = query.filter.is_some() || term_prune.is_some();
+        let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
         let needs_vectors = query.knn.is_some();
         let needs_filters = query_needs_filter_store(query);
         let posting_files = posting_blob_files_for_query(query);
@@ -2393,6 +2423,28 @@ impl AppState {
             .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
             .collect();
 
+        // A footer rewritten after commit (bloom rebuild) is recorded by CRC
+        // in the manifest. A local copy that doesn't match is the old one:
+        // remove it so the hydration below fetches the current file.
+        for entry in &manifest.segments {
+            let Some(&expected) = manifest.footer_crc32.get(&entry.segment_id) else {
+                continue;
+            };
+            if manifest.segment_footer(&entry.segment_id).is_some() {
+                continue;
+            }
+            let path = self
+                .data_dir
+                .join(&ns.0)
+                .join(&entry.segment_id.0)
+                .join("footer.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if crc32fast::hash(&bytes) != expected {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+
         // New manifests carry the search footer metadata inline, so cold
         // search can skip the footer-first S3 phase entirely. Legacy
         // manifests fall back to hydrating footer.json for pruning and
@@ -2412,7 +2464,17 @@ impl AppState {
             .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
             .filter_map(|entry| {
                 let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
-                let footer = SegmentReader::read_footer(&seg_path).ok()?;
+                let bytes = std::fs::read(seg_path.join("footer.json")).ok()?;
+                // Still not the recorded rewrite (e.g. S3 fetch failed and
+                // left nothing usable): don't cache or prune with it.
+                if manifest
+                    .footer_crc32
+                    .get(&entry.segment_id)
+                    .is_some_and(|&expected| crc32fast::hash(&bytes) != expected)
+                {
+                    return None;
+                }
+                let footer: kosha_core::Footer = serde_json::from_slice(&bytes).ok()?;
                 // A footer.json from a different segment id (a corrupt or
                 // misplaced file) must not be cached under this id.
                 (footer.segment_id == entry.segment_id)
@@ -2427,14 +2489,15 @@ impl AppState {
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
             if needs_bloom_check {
+                // Borrowed, never cloned: footers hold every bloom. A
+                // segment with no cached footer was already read (once)
+                // into `fetched_footers` above.
                 let footer = manifest
                     .segment_footer(&entry.segment_id)
                     .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
-                if let Some(footer) = footer.as_ref() {
-                    if let Some(ref filter) = query.filter {
-                        if !segment_may_match(filter, footer.filter_blooms.as_ref()) {
-                            continue;
-                        }
+                if let Some(footer) = footer {
+                    if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
+                        continue;
                     }
                     if let Some((ref terms, mode)) = term_prune {
                         if !segment_may_contain_terms(terms, mode, footer.term_bloom.as_ref()) {
@@ -2804,6 +2867,59 @@ impl AppState {
             }
         }
 
+        // ── A shard that was never written is not a missing file ──
+        // The writer skips a posting shard no term hashed into, which is
+        // common in small segments. A query term that hashes to such a
+        // shard is simply absent from that segment, but the fetch above
+        // asked S3 for the file anyway, got a 404, and the whole search
+        // failed with a 503 "segment hydration failed".
+        //
+        // For each segment with a shard still missing, list what S3 holds
+        // for it. A shard that is not in the listing was never written:
+        // drop it from `missing` and remember it as resolved, so later
+        // queries do not ask again. A shard that IS listed but did not
+        // arrive is a real failure and stays in `missing`. So does
+        // everything for a segment whose listing fails.
+        //
+        // Dropping a shard here cannot hide lost data: the scorer checks
+        // every query term against the segment's term table and fails the
+        // search if a term the table contains has no readable shard.
+        if !outcome.missing.is_empty() {
+            let mut by_segment: HashMap<String, Vec<String>> = HashMap::new();
+            for rel in outcome.missing.drain(..) {
+                match rel.rsplit_once('/') {
+                    Some((seg_rel, file_name)) => by_segment
+                        .entry(seg_rel.to_string())
+                        .or_default()
+                        .push(file_name.to_string()),
+                    None => by_segment.entry(rel).or_default().push(String::new()),
+                }
+            }
+            for (seg_rel, files) in by_segment {
+                // S3 itself, not the local-fallback listing: only S3 can
+                // say a file was never uploaded. An empty listing means the
+                // whole segment is absent there, which is a failure, not
+                // 256 shards that happen to be empty.
+                let listed: Option<std::collections::HashSet<String>> = s3
+                    .list_remote_with_sizes(&seg_rel)
+                    .ok()
+                    .filter(|entries| !entries.is_empty())
+                    .map(|entries| entries.into_iter().map(|(name, _)| name).collect());
+                for file_name in files {
+                    let never_written = listed
+                        .as_ref()
+                        .is_some_and(|names| !file_name.is_empty() && !names.contains(&file_name));
+                    if never_written {
+                        newly_confirmed.push((seg_rel.clone(), file_name));
+                    } else if file_name.is_empty() {
+                        outcome.missing.push(seg_rel.clone());
+                    } else {
+                        outcome.missing.push(format!("{seg_rel}/{file_name}"));
+                    }
+                }
+            }
+        }
+
         // Fold every pair this call physically confirmed present — via
         // cache-miss stat or post-fetch verification — back into the
         // cache, one lock acquisition regardless of how many pairs were
@@ -2982,14 +3098,25 @@ fn plan_posting_blob_fetch(
     let mut newly_confirmed: Vec<(String, String)> = Vec::new();
 
     for seg_path in seg_paths {
-        if !is_split(seg_path) {
-            continue;
-        }
         let Ok(rel_path) = seg_path.strip_prefix(data_dir) else {
             continue;
         };
         let s3_prefix = rel_path.to_string_lossy().into_owned();
         let cached_shards = cached.get(&s3_prefix);
+        // Every shard this query needs is already confirmed for this
+        // segment: nothing to plan. Checked before `is_split`, which opens
+        // the segment's `inverted.idx` to read its format version. That
+        // probe ran for every candidate segment on every search, to learn
+        // something that cannot change: a segment with confirmed shards is
+        // a split segment. On staging the stage it belongs to took 33 ms of
+        // a 50 ms warm keyword search and 95 ms of a 117 ms phrase search,
+        // growing with the number of candidate segments.
+        if cached_shards.is_some_and(|set| posting_files.iter().all(|f| set.contains(f.as_str()))) {
+            continue;
+        }
+        if !is_split(seg_path) {
+            continue;
+        }
         for file_name in posting_files {
             if cached_shards.is_some_and(|set| set.contains(file_name.as_str())) {
                 continue; // already confirmed present this (version, eviction_generation)
@@ -4237,15 +4364,12 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         return search_error_response(&e);
     }
 
-    let (manifest, tombstones) = {
-        let indexer = &state.indexer;
-        let m = match indexer.manifest_cloned(&ns) {
-            Some(m) => m,
-            None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
-        };
-        let t = Some(m.tombstones.clone());
-        (m, t)
+    // Shared, not copied: see `Indexer::manifest_shared`.
+    let Some(snapshot) = state.indexer.manifest_shared(&ns) else {
+        return json_error(404, &format!("namespace '{}' not found", ns.0));
     };
+    let manifest: &kosha_core::Manifest = &snapshot;
+    let tombstones = Some(&manifest.tombstones);
 
     // ── Whole-response result cache ─────────────────────────────────────
     // Real query traffic is Zipfian in queries too; identical requests
@@ -4323,10 +4447,10 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             // shards as zero hits (non-deterministically per pod). It is
             // sub-ms when the shards are already local: one metadata stat
             // per term-shard per split segment.
-            state.ensure_query_posting_blobs(&ns, &manifest, &query, &hydration_request)
+            state.ensure_query_posting_blobs(&ns, manifest, &query, &hydration_request)
         } else {
             let outcome =
-                state.hydrate_segments_for_search(&ns, &manifest, &query, &hydration_request);
+                state.hydrate_segments_for_search(&ns, manifest, &query, &hydration_request);
             // Cache what this pass verified: the static scoring set is
             // local for this manifest version, so future warm queries with
             // matching-or-lesser needs skip the per-segment static checks
@@ -4410,9 +4534,9 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
 
     match state.searcher.search_with_doc_store_hydrator(
         &ns,
-        &manifest,
+        manifest,
         &query,
-        tombstones.as_ref(),
+        tombstones,
         doc_store_hydrator,
     ) {
         Ok((result, phases)) => {
@@ -4657,21 +4781,21 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         total_hits_cap: None,
         operator: None,
         no_cache: None,
+        collapse: None,
+        source_includes: None,
+        source_excludes: None,
     };
 
     if let Err(e) = state.refresh_query_namespace(&ns) {
         return search_error_response(&e);
     }
 
-    let (manifest, tombstones) = {
-        let indexer = &state.indexer;
-        let m = match indexer.manifest_cloned(&ns) {
-            Some(m) => m,
-            None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
-        };
-        let t = Some(m.tombstones.clone());
-        (m, t)
+    // Shared, not copied: see `Indexer::manifest_shared`.
+    let Some(snapshot) = state.indexer.manifest_shared(&ns) else {
+        return json_error(404, &format!("namespace '{}' not found", ns.0));
     };
+    let manifest: &kosha_core::Manifest = &snapshot;
+    let tombstones = Some(&manifest.tombstones);
 
     // One accountant for everything this request hydrates — footer prefetch,
     // scoring set, posting blobs, and the page's doc stores all share it, so
@@ -4699,10 +4823,10 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         let outcome = if cached_covers {
             // Posting blobs are per-query and outside the cached verdict —
             // see `handle_search_post` for the full rationale.
-            state.ensure_query_posting_blobs(&ns, &manifest, &query, &hydration_request)
+            state.ensure_query_posting_blobs(&ns, manifest, &query, &hydration_request)
         } else {
             let outcome =
-                state.hydrate_segments_for_search(&ns, &manifest, &query, &hydration_request);
+                state.hydrate_segments_for_search(&ns, manifest, &query, &hydration_request);
             // Only merge when unfiltered — see `HydrationOutcome::bloom_pruned`
             // and `handle_search_post` for the full rationale.
             if outcome.missing.is_empty() && !outcome.bloom_pruned {
@@ -4762,9 +4886,9 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
 
     match state.searcher.search_with_doc_store_hydrator(
         &ns,
-        &manifest,
+        manifest,
         &query,
-        tombstones.as_ref(),
+        tombstones,
         doc_store_hydrator,
     ) {
         Ok((result, phases)) => {
@@ -4950,6 +5074,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
     // Admin routes rewrite or merge segments — must preserve vectors.
     state.ensure_segments_local(&seg_paths, true);
 
+    let mut new_footers = Vec::new();
     let mut rebuilt = 0usize;
     let mut errors = Vec::new();
     for (entry, seg_path) in manifest.segments.iter().zip(seg_paths.iter()) {
@@ -4958,7 +5083,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
             continue;
         }
         match SegmentReader::rewrite_footer_blooms(seg_path) {
-            Ok(_) => {
+            Ok(footer) => {
                 rebuilt += 1;
                 #[cfg(feature = "s3")]
                 if let Err(e) = state.sync_files_to_s3(seg_path, &["footer.json"]) {
@@ -4966,9 +5091,30 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
                         "{}: rebuilt locally but S3 sync failed: {e}",
                         entry.segment_id.0
                     ));
+                    continue;
+                }
+                // The CRC of the rewritten file travels in the persisted
+                // manifest (footers themselves don't, #241) so replicas
+                // drop their cached footer and stale local footer.json.
+                match std::fs::read(seg_path.join("footer.json")) {
+                    Ok(bytes) => new_footers.push((footer, crc32fast::hash(&bytes))),
+                    Err(e) => errors.push(format!(
+                        "{}: rebuilt but footer.json unreadable: {e}",
+                        entry.segment_id.0
+                    )),
                 }
             }
             Err(e) => errors.push(format!("{}: {e}", entry.segment_id.0)),
+        }
+    }
+
+    // Searches prune with the footer copies inside the manifest, not the
+    // footer.json files just rewritten. Without installing the new footers
+    // and publishing, the rebuild changed files nothing reads: this node
+    // kept pruning with the old blooms, and so did every query replica.
+    if state.indexer.replace_segment_footers(&ns, new_footers) > 0 {
+        if let Err(e) = state.publish_namespace(&ns) {
+            errors.push(format!("blooms rebuilt but manifest publish failed: {e}"));
         }
     }
 
@@ -5303,6 +5449,7 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
         version: 1,
         segments,
         segment_footers,
+        footer_crc32: Default::default(),
         wal_checkpoint: 0,
         wal_origin: None,
         tombstones: Default::default(),
@@ -5515,13 +5662,7 @@ fn term_bloom_prune_for_query(query: &SearchQuery) -> Option<(Vec<String>, TermB
 /// doc metadata, and page doc stores.
 #[cfg(feature = "s3")]
 fn query_needs_filter_store(query: &SearchQuery) -> bool {
-    query.filter.is_some()
-        || !query.aggs.is_empty()
-        || query.sort.iter().any(|spec| {
-            spec.fields
-                .keys()
-                .any(|field| field != "_score" && field != "_id")
-        })
+    query.needs_filter_columns()
 }
 
 #[cfg(feature = "s3")]
@@ -6702,6 +6843,7 @@ mod tests {
                 },
             ],
             segment_footers: Default::default(),
+            footer_crc32: Default::default(),
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
@@ -6765,6 +6907,47 @@ mod tests {
     /// re-stated — the whole point is to turn an `fs::metadata` syscall
     /// into a `HashSet` lookup on a warm namespace.
     #[cfg(feature = "s3")]
+    #[test]
+    fn plan_posting_blob_fetch_skips_the_format_probe_when_all_shards_are_cached() {
+        use std::cell::Cell;
+
+        let seg = PathBuf::from("/data/ns/seg-1");
+        let posting_files = vec!["postings-00.bin".to_string(), "postings-01.bin".to_string()];
+        let mut cached = HashMap::new();
+        cached.insert(
+            "ns/seg-1".to_string(),
+            std::collections::HashSet::from([
+                "postings-00.bin".to_string(),
+                "postings-01.bin".to_string(),
+            ]),
+        );
+        let probes = Cell::new(0);
+        let plan = |files: &[String]| {
+            plan_posting_blob_fetch(
+                std::slice::from_ref(&seg),
+                files,
+                Path::new("/data"),
+                &cached,
+                |_| {
+                    probes.set(probes.get() + 1);
+                    true
+                },
+                |_| false,
+            )
+        };
+
+        // Both shards confirmed: the segment is skipped without opening it.
+        let (to_fetch, confirmed) = plan(&posting_files);
+        assert_eq!(probes.get(), 0);
+        assert!(to_fetch.is_empty() && confirmed.is_empty());
+
+        // A shard that is not confirmed still goes through the probe and is
+        // planned for fetching.
+        let (to_fetch, _) = plan(&["postings-02.bin".to_string()]);
+        assert_eq!(probes.get(), 1);
+        assert_eq!(to_fetch, vec![("ns/seg-1/postings-02.bin".to_string(), 0)]);
+    }
+
     #[test]
     fn plan_posting_blob_fetch_skips_stat_for_cached_pairs() {
         use std::cell::Cell;
@@ -7379,6 +7562,7 @@ mod tests {
                 doc_count: 10,
             }],
             segment_footers: HashMap::new(),
+            footer_crc32: Default::default(),
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
@@ -7401,6 +7585,9 @@ mod tests {
             total_hits_cap: None,
             operator: None,
             no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
         };
 
         let unfiltered = state.hydrate_segments_for_search(
@@ -7512,6 +7699,7 @@ mod tests {
                 doc_count: 10,
             }],
             segment_footers: HashMap::new(),
+            footer_crc32: Default::default(),
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
@@ -7534,6 +7722,9 @@ mod tests {
             total_hits_cap: None,
             operator: None,
             no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
         };
         let verdict_key = (ns.0.clone(), manifest.version);
 
@@ -8442,6 +8633,9 @@ mod tests {
             total_hits_cap: None,
             operator: None,
             no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
         };
         let with_vec = |v: Vec<f32>, k: usize| {
             let mut q = base.clone();

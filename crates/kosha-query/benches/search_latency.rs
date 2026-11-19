@@ -78,6 +78,7 @@ fn build_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             doc_count: HIT_COUNT as u32,
         }],
         segment_footers: Default::default(),
+        footer_crc32: Default::default(),
         wal_checkpoint: 0,
         wal_origin: None,
         tombstones: Default::default(),
@@ -107,6 +108,9 @@ fn mk_query(text: &str) -> SearchQuery {
         total_hits_cap: None,
         operator: None,
         no_cache: None,
+        collapse: None,
+        source_includes: None,
+        source_excludes: None,
     }
 }
 
@@ -146,6 +150,7 @@ fn build_term_bloom_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             version: 1,
             segments: entries,
             segment_footers: Default::default(),
+            footer_crc32: Default::default(),
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
@@ -195,6 +200,7 @@ fn build_broad_query_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             version: 1,
             segments: entries,
             segment_footers: Default::default(),
+            footer_crc32: Default::default(),
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),

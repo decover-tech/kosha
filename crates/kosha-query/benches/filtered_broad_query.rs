@@ -70,6 +70,7 @@ fn main() {
         version: 1,
         segments: entries,
         segment_footers: Default::default(),
+        footer_crc32: Default::default(),
         wal_checkpoint: 0,
         wal_origin: None,
         tombstones: Default::default(),
@@ -96,6 +97,9 @@ fn main() {
         total_hits_cap: None,
         operator: None,
         no_cache: None,
+        collapse: None,
+        source_includes: None,
+        source_excludes: None,
     };
 
     // Warm the segment cache.

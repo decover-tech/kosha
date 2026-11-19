@@ -2991,8 +2991,21 @@ impl SegmentReader {
         k: usize,
         nprobe: usize,
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
+        self.knn_search_filtered(query, k, nprobe, None)
+    }
+
+    /// [`Self::knn_search`] restricted to the documents `accept` lets
+    /// through. See [`Self::knn_search_within_filtered`] for how the
+    /// restriction is applied.
+    pub fn knn_search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
+    ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
         let vi = self.vector_index.as_ref()?;
-        Some(self.knn_search_lazy(vi, query, k, nprobe))
+        Some(self.knn_search_lazy(vi, query, k, nprobe, accept))
     }
 
     /// Triangle-inequality lower bound on `query`'s distance to *any*
@@ -3061,8 +3074,34 @@ impl SegmentReader {
         max_distance: f32,
         max_probes: usize,
     ) -> BudgetedKnnResult {
+        self.knn_search_within_filtered(query, k, max_distance, max_probes, None)
+    }
+
+    /// [`Self::knn_search_within`] restricted to the documents `accept`
+    /// lets through (a filter, deleted documents, or both).
+    ///
+    /// The restriction is applied while postings are scored, not to the
+    /// finished top `k`: a vector whose document is not accepted is never a
+    /// candidate, so the `k` returned are the nearest *accepted* documents
+    /// among the postings probed.
+    ///
+    /// The probe budget (`max_distance`, `max_probes`) was sized without
+    /// knowing how selective `accept` is. When it has been spent and fewer
+    /// than `k` accepted documents were found, probing continues outward,
+    /// nearest posting first, until `k` are found or the segment has been
+    /// read in full. A selective filter therefore costs more I/O in the
+    /// segments that hold its documents, and always returns them: the
+    /// alternative is an empty or short page for a filter that does match.
+    pub fn knn_search_within_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        max_distance: f32,
+        max_probes: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
+    ) -> BudgetedKnnResult {
         let vi = self.vector_index.as_ref()?;
-        Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes))
+        Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, accept))
     }
 
     fn knn_search_within_lazy(
@@ -3072,6 +3111,7 @@ impl SegmentReader {
         k: usize,
         max_distance: f32,
         max_probes: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
         // Rank this segment's qualifying postings nearest-first (by lower
         // bound, not raw centroid distance — see `centroid_lower_bound`),
@@ -3080,21 +3120,38 @@ impl SegmentReader {
         // from the same bound across all segments — see
         // `Searcher::global_probe_cutoff`), so both sides of this
         // comparison are in the same units.
-        let mut qualifying: Vec<(usize, f32)> = vi
+        let mut ranked: Vec<(usize, f32)> = vi
             .centroids
             .iter()
             .zip(&vi.radii)
             .enumerate()
             .map(|(i, (c, &r))| (i, Self::centroid_lower_bound(query, c, r)))
-            .filter(|(_, d)| *d <= max_distance)
             .collect();
-        qualifying.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        qualifying.truncate(max_probes);
+        ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Postings inside the budget: within the cutoff, capped at
+        // `max_probes`. `ranked` is nearest-first, so they are a prefix.
+        let budgeted = ranked
+            .iter()
+            .take_while(|(_, d)| *d <= max_distance)
+            .count()
+            .min(max_probes);
 
-        let probes = qualifying.len();
+        let mut probes = 0usize;
         let mut scored: Vec<(u32, f64)> = Vec::new();
-        for (range_idx, _) in qualifying {
-            for (id, v) in self.hydrate_posting(vi, range_idx)?.iter() {
+        for (position, (range_idx, _)) in ranked.iter().enumerate() {
+            if position >= budgeted {
+                // Past the budget. Without a restriction this is where the
+                // probe ends. With one, keep going only while the page is
+                // still short (see the doc comment on the public wrapper).
+                if accept.is_none() || scored.len() >= k {
+                    break;
+                }
+            }
+            probes += 1;
+            for (id, v) in self.hydrate_posting(vi, *range_idx)?.iter() {
+                if accept.is_some_and(|accept| !accept(*id)) {
+                    continue;
+                }
                 scored.push((
                     *id,
                     kosha_vector_spfresh::cosine_similarity(query, v) as f64,
@@ -3119,6 +3176,7 @@ impl SegmentReader {
         query: &[f32],
         k: usize,
         nprobe: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
     ) -> Result<Vec<(u32, f64)>, KoshaError> {
         // Unit-norm segments: normalize the query once, then every stored
         // comparison is a bare dot product — same cosine scores (clamped
@@ -3132,14 +3190,28 @@ impl SegmentReader {
         } else {
             query
         };
-        let candidates = if vi.unit_norm {
-            kosha_vector_spfresh::nearest_centroids_dot(&vi.centroids, query, nprobe)
+        // With a restriction, rank every posting so the probe can continue
+        // past `nprobe` while the page is still short, as the budgeted
+        // variant does.
+        let rank = if accept.is_some() {
+            vi.centroids.len()
         } else {
-            kosha_vector_spfresh::nearest_centroids(&vi.centroids, query, nprobe)
+            nprobe
+        };
+        let candidates = if vi.unit_norm {
+            kosha_vector_spfresh::nearest_centroids_dot(&vi.centroids, query, rank)
+        } else {
+            kosha_vector_spfresh::nearest_centroids(&vi.centroids, query, rank)
         };
         let mut scored: Vec<(u32, f64)> = Vec::new();
-        for range_idx in candidates {
+        for (position, range_idx) in candidates.into_iter().enumerate() {
+            if position >= nprobe && scored.len() >= k {
+                break;
+            }
             for (id, v) in self.hydrate_posting(vi, range_idx)?.iter() {
+                if accept.is_some_and(|accept| !accept(*id)) {
+                    continue;
+                }
                 let sim = if vi.unit_norm {
                     kosha_vector_spfresh::dot(query, v).clamp(-1.0, 1.0)
                 } else {

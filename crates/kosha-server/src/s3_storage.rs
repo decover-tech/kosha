@@ -204,14 +204,66 @@ impl S3Storage {
         }
         names.sort();
 
-        let mut files = Vec::with_capacity(names.len());
-        for name in &names {
-            let path = local_dir.join(name);
-            let data = std::fs::read(&path).map_err(KoshaError::Io)?;
-            let logical_path = logical_dir.join(name).to_string_lossy().into_owned();
-            files.push(segment_commit::SegmentCommit::entry(name, &data));
-            self.upload_bytes(data, &self.s3_key(&logical_path))?;
-        }
+        // The data files go up concurrently, at most `upload_concurrency`
+        // at a time; `_COMMIT` still goes last, alone, after every one of
+        // them has succeeded, so the marker's meaning is unchanged. A
+        // split-postings segment is a few large files plus up to 256 small
+        // posting shards: uploaded one after another, a flush spent nearly
+        // all of its time waiting on one S3 round trip per file with the
+        // CPU idle.
+        //
+        // Each task reads its own file, so at most `upload_concurrency`
+        // files are in memory at once, not the whole segment.
+        let limit = Arc::new(tokio::sync::Semaphore::new(upload_concurrency()));
+        let uploads: Vec<(String, PathBuf, String)> = names
+            .iter()
+            .map(|name| {
+                let logical_path = logical_dir.join(name).to_string_lossy().into_owned();
+                (
+                    name.clone(),
+                    local_dir.join(name),
+                    self.s3_key(&logical_path),
+                )
+            })
+            .collect();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let files = self.rt.block_on(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            for (name, path, key) in uploads {
+                let client = client.clone();
+                let bucket = bucket.clone();
+                let limit = Arc::clone(&limit);
+                tasks.spawn(async move {
+                    let _permit = limit.acquire_owned().await;
+                    let data = tokio::fs::read(&path).await.map_err(KoshaError::Io)?;
+                    let entry = segment_commit::SegmentCommit::entry(&name, &data);
+                    put_bytes(client, bucket, key, data).await?;
+                    Ok::<_, KoshaError>(entry)
+                });
+            }
+            // Every upload is attempted, so a retry has only the failed
+            // files left to do at the S3 end; the first error is reported.
+            let mut files = Vec::new();
+            let mut first_error: Option<KoshaError> = None;
+            while let Some(joined) = tasks.join_next().await {
+                match joined {
+                    Ok(Ok(entry)) => files.push(entry),
+                    Ok(Err(e)) => {
+                        first_error.get_or_insert(e);
+                    }
+                    Err(e) => {
+                        first_error.get_or_insert(KoshaError::NotFound(format!(
+                            "S3 upload task failed: {e}"
+                        )));
+                    }
+                }
+            }
+            match first_error {
+                Some(e) => Err(e),
+                None => Ok(files),
+            }
+        })?;
         let commit = segment_commit::SegmentCommit::new(files).to_bytes();
         let commit_path = logical_dir
             .join(segment_commit::COMMIT_FILE)
@@ -229,86 +281,11 @@ impl S3Storage {
 
     /// Upload bytes to S3. Uses multi-part upload for payloads > 5MB.
     fn upload_bytes(&self, data: Vec<u8>, s3_key: &str) -> Result<(), KoshaError> {
-        let size = data.len();
-
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key = s3_key.to_string();
-
-        self.rt.block_on(async move {
-            if size > 5 * 1024 * 1024 {
-                let mpu = client
-                    .create_multipart_upload()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        KoshaError::NotFound(format!("S3 create_multipart_upload: {e}"))
-                    })?;
-
-                let upload_id = mpu.upload_id().unwrap_or_default();
-                let mut parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
-                let part_size = 5 * 1024 * 1024;
-                let mut offset = 0;
-                let mut part_number = 1;
-
-                while offset < size {
-                    let end = std::cmp::min(offset + part_size, size);
-                    let part_data = &data[offset..end];
-
-                    let upload_part_res = client
-                        .upload_part()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .upload_id(upload_id)
-                        .part_number(part_number)
-                        .body(aws_sdk_s3::primitives::ByteStream::from(Vec::from(
-                            part_data,
-                        )))
-                        .send()
-                        .await
-                        .map_err(|e| KoshaError::NotFound(format!("S3 upload_part: {e}")))?;
-
-                    let etag = upload_part_res.e_tag().unwrap_or_default().to_string();
-                    parts.push(
-                        aws_sdk_s3::types::CompletedPart::builder()
-                            .e_tag(etag)
-                            .part_number(part_number)
-                            .build(),
-                    );
-
-                    offset = end;
-                    part_number += 1;
-                }
-
-                client
-                    .complete_multipart_upload()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .upload_id(upload_id)
-                    .multipart_upload(
-                        aws_sdk_s3::types::CompletedMultipartUpload::builder()
-                            .set_parts(Some(parts))
-                            .build(),
-                    )
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        KoshaError::NotFound(format!("S3 complete_multipart_upload: {e}"))
-                    })?;
-            } else {
-                client
-                    .put_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .body(aws_sdk_s3::primitives::ByteStream::from(data))
-                    .send()
-                    .await
-                    .map_err(|e| KoshaError::NotFound(format!("S3 put_object: {e}")))?;
-            }
-            Ok::<_, KoshaError>(())
-        })
+        self.rt
+            .block_on(async move { put_bytes(client, bucket, key, data).await })
     }
 
     /// Download multiple logical paths concurrently, bounded by
@@ -505,7 +482,10 @@ impl S3Storage {
     /// directory path directly from S3, no local fallback — see the public
     /// `list_with_sizes`, the only caller. Sizes are 0 if S3 didn't report
     /// one (`Object::size()` is optional per the SDK).
-    fn list_remote_with_sizes(&self, path: &str) -> Result<Vec<(String, u64)>, KoshaError> {
+    pub(crate) fn list_remote_with_sizes(
+        &self,
+        path: &str,
+    ) -> Result<Vec<(String, u64)>, KoshaError> {
         let mut prefix = self.s3_key(path);
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
@@ -1108,6 +1088,95 @@ async fn fetch_range_one(
         )));
     }
     Ok(bytes.to_vec())
+}
+
+/// Files of one segment uploaded at once (`KOSHA_UPLOAD_CONCURRENCY`,
+/// default 16 — the same default hydration uses for downloads).
+fn upload_concurrency() -> usize {
+    std::env::var("KOSHA_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(16)
+}
+
+/// Upload bytes to one S3 key. Multi-part for payloads > 5MB.
+async fn put_bytes(
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    key: String,
+    data: Vec<u8>,
+) -> Result<(), KoshaError> {
+    let size = data.len();
+
+    if size > 5 * 1024 * 1024 {
+        let mpu = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| KoshaError::NotFound(format!("S3 create_multipart_upload: {e}")))?;
+
+        let upload_id = mpu.upload_id().unwrap_or_default();
+        let mut parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
+        let part_size = 5 * 1024 * 1024;
+        let mut offset = 0;
+        let mut part_number = 1;
+
+        while offset < size {
+            let end = std::cmp::min(offset + part_size, size);
+            let part_data = &data[offset..end];
+
+            let upload_part_res = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(aws_sdk_s3::primitives::ByteStream::from(Vec::from(
+                    part_data,
+                )))
+                .send()
+                .await
+                .map_err(|e| KoshaError::NotFound(format!("S3 upload_part: {e}")))?;
+
+            let etag = upload_part_res.e_tag().unwrap_or_default().to_string();
+            parts.push(
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .e_tag(etag)
+                    .part_number(part_number)
+                    .build(),
+            );
+
+            offset = end;
+            part_number += 1;
+        }
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| KoshaError::NotFound(format!("S3 complete_multipart_upload: {e}")))?;
+    } else {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(&key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(data))
+            .send()
+            .await
+            .map_err(|e| KoshaError::NotFound(format!("S3 put_object: {e}")))?;
+    }
+    Ok::<_, KoshaError>(())
 }
 
 impl StorageBackend for S3Storage {

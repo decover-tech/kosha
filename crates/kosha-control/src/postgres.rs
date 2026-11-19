@@ -49,6 +49,7 @@ fn decode_manifest(version: u64, segments_json: &str) -> Option<Manifest> {
             })
             .collect(),
         segment_footers: Default::default(),
+        footer_crc32: Default::default(),
         wal_checkpoint: 0,
         wal_origin: None,
         tombstones: Default::default(),
@@ -296,6 +297,20 @@ impl ControlStore for PgStore {
     fn manifest_mut(&mut self, _id: &NamespaceId) -> Option<&mut Manifest> {
         // Same limitation as `manifest()` above.
         None
+    }
+
+    /// One integer off the primary key, not the `segments_json` text.
+    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
+        let id_str = id.0.clone();
+        self.rt.block_on(async {
+            let row: Option<(i64,)> =
+                sqlx::query_as("SELECT version FROM kosha.manifests WHERE namespace_id = $1")
+                    .bind(&id_str)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .ok()?;
+            row.map(|(version,)| version as u64)
+        })
     }
 
     fn manifest_cloned(&self, id: &NamespaceId) -> Option<Manifest> {

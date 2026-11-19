@@ -52,6 +52,7 @@ impl Controller {
                 version: 0,
                 segments: Vec::new(),
                 segment_footers: Default::default(),
+                footer_crc32: Default::default(),
                 wal_checkpoint: 0,
                 wal_origin: None,
                 tombstones: Default::default(),
@@ -71,6 +72,7 @@ impl Controller {
                     version: 0,
                     segments: Vec::new(),
                     segment_footers: Default::default(),
+                    footer_crc32: Default::default(),
                     wal_checkpoint: 0,
                     wal_origin: None,
                     tombstones: Default::default(),
@@ -178,6 +180,9 @@ impl ControlStore for Controller {
     fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut Manifest> {
         self.manifest_mut(id)
     }
+    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
+        self.manifest(id).map(|manifest| manifest.version)
+    }
     fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError> {
         self.save_manifest(id, manifest)
     }
@@ -210,6 +215,7 @@ mod tests {
             version: 3,
             segments: vec![],
             segment_footers: Default::default(),
+            footer_crc32: Default::default(),
             wal_checkpoint: 2,
             wal_origin: Some("writer-a".into()),
             tombstones: Default::default(),
@@ -272,6 +278,7 @@ mod tests {
                     doc_count: 7,
                 }],
                 segment_footers: Default::default(),
+                footer_crc32: Default::default(),
                 wal_checkpoint: 0,
                 wal_origin: None,
                 tombstones: Default::default(),
@@ -290,6 +297,7 @@ mod tests {
                 version: 4,
                 segments: vec![],
                 segment_footers: Default::default(),
+                footer_crc32: Default::default(),
                 wal_checkpoint: 0,
                 wal_origin: None,
                 tombstones: Default::default(),
@@ -317,6 +325,7 @@ mod tests {
                 doc_count: 10,
             }],
             segment_footers: Default::default(),
+            footer_crc32: Default::default(),
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
@@ -336,6 +345,7 @@ mod tests {
             version: 2,
             segments: vec![],
             segment_footers: Default::default(),
+            footer_crc32: Default::default(),
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),

@@ -101,27 +101,28 @@ def test_decode_field_value_restores_python_types():
 def test_build_search_response_decodes_short_list_and_vector_fields():
     client = KoshaClient(hosts=["http://localhost:9"], api_key="k")
     response = client._build_search_response(
-        kosha_hits=[
-            {
-                "doc_id": "d1",
-                "score": 1.5,
-                "fields": [
-                    {"name": "content", "field_type": "Text", "value": "hello"},
-                    {
-                        "name": "some_bbox_pair",
-                        "field_type": "Keyword",
-                        "value": "[12.5, 640.2]",
-                    },
-                    {
-                        "name": "contentEmbedding",
-                        "field_type": "Vector",
-                        "value": json.dumps(_EMBEDDING),
-                    },
-                ],
-            }
-        ],
-        from_=0,
-        size=10,
+        {
+            "total_hits": 1,
+            "results": [
+                {
+                    "doc_id": "d1",
+                    "score": 1.5,
+                    "fields": [
+                        {"name": "content", "field_type": "Text", "value": "hello"},
+                        {
+                            "name": "some_bbox_pair",
+                            "field_type": "Keyword",
+                            "value": "[12.5, 640.2]",
+                        },
+                        {
+                            "name": "contentEmbedding",
+                            "field_type": "Vector",
+                            "value": json.dumps(_EMBEDDING),
+                        },
+                    ],
+                }
+            ],
+        },
         took_ms=1,
     )
     hit = response["hits"]["hits"][0]["_source"]
