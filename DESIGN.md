@@ -288,6 +288,12 @@ Indexer
   the pre-compact snapshot; concurrent mutations that remove a merge input cause publish to abort
   (or retry) rather than corrupt the manifest.
 - There is **no** process-wide `Mutex<Indexer>` on the request path.
+- Across processes, the manifest CAS is the only coordination. A writer whose CAS loses
+  (`ManifestConflict`) rebases its unpublished delta onto the committed manifest
+  (`Indexer::rebase_onto`) and retries a bounded number of times. A compaction rebases only if
+  its inputs are still listed remotely with no new remote deletes. A remote compaction is accepted
+  only if it removed no segment with unpublished local deletes. Otherwise the publish fails with
+  409, and nothing is published that references a segment the remote manifest removed.
 
 **Merge selection (size-tiered lite)**
 
@@ -341,6 +347,11 @@ true in practice since ES refresh intervals are already tuned up for indexing th
 4. **Per-segment retrieval** (fanned out across the query node's worker pool, segments read
    through the SSD cache, see §9):
    - Lexical: postings-list intersection/union + BM25 scoring over `inverted.idx`.
+     BM25 `k1` / `b` come from the request (`SearchQuery.bm25_params`), each falling back to the
+     segment footer's build-time value when omitted, and are validated (`k1` ≥ 0, 0 ≤ `b` ≤ 1;
+     otherwise HTTP 400). Nothing on disk bakes them in: postings keep raw term frequencies and
+     block summaries keep `max_tf` / `min_field_length`, so block-max WAND ceilings are computed
+     at query time with the same scorer as the hits and pruning stays exact for any valid values.
    - Semantic: ANN search over `vector.idx` (HNSW graph traversal or IVF-PQ probe), scored by
      cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
      query in `query_builder.py`.

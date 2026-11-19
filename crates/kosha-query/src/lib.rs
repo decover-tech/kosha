@@ -1413,15 +1413,17 @@ impl Searcher {
         } else {
             None
         };
-        // Scored with the request's k1/b, as the API documents. The values
-        // stored in the segment were used here instead, so a request's
-        // parameters were silently ignored. Nothing on disk depends on
-        // them: block summaries store the raw term frequency and field
-        // length, and the score ceiling is computed from those here.
+        // Scored with the request's k1/b, as the API documents; a
+        // parameter the request leaves out falls back to the segment's
+        // build-time value (issue #247). Nothing on disk depends on them:
+        // block summaries store the raw term frequency and field length,
+        // and every score ceiling the WAND paths use is computed from
+        // those through this same scorer, so pruning bounds always match
+        // the parameters the hits are scored with.
         let scorer = Bm25Scorer::new(
             total_docs,
             reader.avg_field_length(),
-            query.bm25_params.clone(),
+            query.bm25_params.resolve(reader.bm25_params()),
         );
 
         let has_query =
@@ -2717,6 +2719,9 @@ impl Searcher {
         >,
         doc_store_hydrator: DocStoreHydrator<'_>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
+        // Out-of-range BM25 parameters are a client error, not something
+        // to clamp: every entry point funnels through here.
+        query.validate()?;
         let mut hydrated;
         let manifest = if manifest
             .deletion_vectors
@@ -4292,7 +4297,7 @@ mod tests {
             query_text: text.into(),
             max_results: max,
             from: 0,
-            bm25_params: Bm25Params::default(),
+            bm25_params: Default::default(),
             filter: None,
             sort: vec![],
             search_after: None,
@@ -6342,7 +6347,7 @@ mod tests {
             query_text: "".into(),
             max_results: 10,
             from: 0,
-            bm25_params: Bm25Params::default(),
+            bm25_params: Default::default(),
             filter: None,
             sort: vec![],
             search_after: None,
@@ -7893,6 +7898,329 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── Per-request BM25 parameters (issue #247) ────────────────────────
+
+    fn with_bm25(mut q: SearchQuery, k1: f64, b: f64) -> SearchQuery {
+        q.bm25_params = kosha_core::Bm25Overrides::new(k1, b);
+        q
+    }
+
+    fn assert_same_page(label: &str, wand: &SearchResult, legacy: &SearchResult) {
+        assert_eq!(
+            wand.total_hits, legacy.total_hits,
+            "{label}: pruned path must report the exact hit count"
+        );
+        assert_eq!(
+            page_ids(wand),
+            page_ids(legacy),
+            "{label}: page ranking must match the exhaustive path"
+        );
+        for (w, l) in wand.results.iter().zip(legacy.results.iter()) {
+            assert!(
+                (w.score - l.score).abs() < 1e-9,
+                "{label}: score mismatch on {}: {} vs {}",
+                w.doc_id.0,
+                w.score,
+                l.score
+            );
+        }
+    }
+
+    #[test]
+    fn bm25_b_zero_vs_one_changes_ranking_on_varied_lengths() {
+        // One long doc that repeats the term, one short doc that says it
+        // once. With b=0 length is ignored and the higher tf wins; with
+        // b=1 the long doc is fully length-normalized and the short doc
+        // wins. Before #247 both requests ranked identically because the
+        // request's parameters never reached the scorer.
+        let dir = std::env::temp_dir().join("kosha-test-bm25-b-ranking");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        w.add_document(
+            DocumentId("long".into()),
+            vec![Field::text(
+                "content",
+                format!("alpha alpha alpha{}", " filler".repeat(60)),
+            )],
+        );
+        w.add_document(
+            DocumentId("short".into()),
+            vec![Field::text("content", "alpha")],
+        );
+        for i in 0..8 {
+            w.add_document(
+                DocumentId(format!("other-{i}")),
+                vec![Field::text(
+                    "content",
+                    "unrelated words here ".repeat(i + 1),
+                )],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 10,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let run = |b: f64| {
+            searcher
+                .search(
+                    &ns,
+                    &manifest,
+                    &with_bm25(mk_query("alpha", 10), 1.2, b),
+                    None,
+                )
+                .unwrap()
+        };
+        let b0 = run(0.0);
+        let b1 = run(1.0);
+        assert_eq!(page_ids(&b0), vec!["long", "short"], "b=0 ignores length");
+        assert_eq!(page_ids(&b1), vec!["short", "long"], "b=1 penalizes length");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bm25_b_changes_ranking_on_wand_corpus() {
+        // Same property on the larger multi-block corpus the WAND tests
+        // use, through the pruned single-term and AND paths.
+        let dir = std::env::temp_dir().join("kosha-test-bm25-b-wand-corpus");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_wand_corpus(&dir, &ns.0, 600);
+        let searcher = Searcher::new(dir.clone());
+        for text in ["alpha", "alpha beta"] {
+            let b0 = searcher
+                .search(
+                    &ns,
+                    &manifest,
+                    &with_bm25(mk_query(text, 10), 1.2, 0.0),
+                    None,
+                )
+                .unwrap();
+            let b1 = searcher
+                .search(
+                    &ns,
+                    &manifest,
+                    &with_bm25(mk_query(text, 10), 1.2, 1.0),
+                    None,
+                )
+                .unwrap();
+            assert_ne!(page_ids(&b0), page_ids(&b1), "{text}: b must matter");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Non-default parameter sets for the parity tests, including every
+    /// boundary the validator accepts: k1=0 (tf saturates immediately,
+    /// every match scores idf), b=0 (no length normalization) and b=1
+    /// (full normalization).
+    const BM25_PARAM_GRID: [(f64, f64); 6] = [
+        (0.0, 0.0),
+        (0.0, 1.0),
+        (0.5, 0.3),
+        (2.0, 0.0),
+        (2.0, 1.0),
+        (3.5, 0.9),
+    ];
+
+    #[test]
+    fn wand_matches_exhaustive_path_under_non_default_bm25_params() {
+        // The block-max ceilings are computed from stored max_tf /
+        // min_field_length with the request's scorer, so pruning must stay
+        // exact for any valid k1/b: single term, AND join, OR join, and a
+        // deep page, each against the exhaustive (legacy) path.
+        let dir = std::env::temp_dir().join("kosha-test-bm25-params-wand-parity");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let and_manifest = mk_wand_corpus(&dir.join("and"), &ns.0, 600);
+        let or_manifest = mk_or_corpus(&dir.join("or"), &ns.0, 600);
+        let and_searcher = Searcher::new(dir.join("and"));
+        let or_searcher = Searcher::new(dir.join("or"));
+
+        let default_alpha = and_searcher
+            .search(&ns, &and_manifest, &mk_query("alpha", 10), None)
+            .unwrap();
+        for (k1, b) in BM25_PARAM_GRID {
+            for text in ["alpha", "alpha beta", "alpha beta gamma"] {
+                let label = format!("AND {text:?} k1={k1} b={b}");
+                let q = with_bm25(mk_query(text, 10), k1, b);
+                let wand = and_searcher.search(&ns, &and_manifest, &q, None).unwrap();
+                let legacy = and_searcher
+                    .search(&ns, &and_manifest, &force_legacy(q), None)
+                    .unwrap();
+                assert!(wand.total_hits > 0, "{label}: corpus must match");
+                assert_same_page(&label, &wand, &legacy);
+            }
+
+            // Deep page: from=20 must equal the slice of one big page.
+            let mut deep = with_bm25(mk_query("alpha beta", 10), k1, b);
+            deep.from = 20;
+            let deep = and_searcher
+                .search(&ns, &and_manifest, &deep, None)
+                .unwrap();
+            let full = and_searcher
+                .search(
+                    &ns,
+                    &and_manifest,
+                    &force_legacy(with_bm25(mk_query("alpha beta", 30), k1, b)),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                page_ids(&deep),
+                page_ids(&full)[20..30].to_vec(),
+                "deep page k1={k1} b={b}"
+            );
+
+            let label = format!("OR k1={k1} b={b}");
+            let q = with_bm25(mk_query_or("solar lunar", 10), k1, b);
+            let wand = or_searcher.search(&ns, &or_manifest, &q, None).unwrap();
+            let legacy = or_searcher
+                .search(&ns, &or_manifest, &force_legacy(q), None)
+                .unwrap();
+            assert_same_page(&label, &wand, &legacy);
+
+            // Guard against a vacuous pass: the request params must
+            // actually reach the scorer.
+            let alpha = and_searcher
+                .search(
+                    &ns,
+                    &and_manifest,
+                    &with_bm25(mk_query("alpha", 10), k1, b),
+                    None,
+                )
+                .unwrap();
+            assert!(
+                (alpha.results[0].score - default_alpha.results[0].score).abs() > 1e-9,
+                "k1={k1} b={b} must change scores vs. the defaults"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn omitted_bm25_params_fall_back_to_segment_build_params() {
+        // A segment built with non-default k1/b (kosha-build-segments
+        // --bm25-k1/--bm25-b) keeps scoring with them when the request
+        // says nothing, and a request that sets only one parameter takes
+        // the other from the segment.
+        let dir = std::env::temp_dir().join("kosha-test-bm25-segment-fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir);
+        for i in 0..50 {
+            w.add_document(
+                DocumentId(format!("doc-{i:02}")),
+                vec![Field::text(
+                    "content",
+                    format!("{}{}", "alpha ".repeat(i % 4 + 1), "pad ".repeat(i % 9)),
+                )],
+            );
+        }
+        w.finalize(Bm25Params { k1: 2.0, b: 0.2 }).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 50,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        };
+        let searcher = Searcher::new(dir.clone());
+        let scores = |q: SearchQuery| -> Vec<(String, f64)> {
+            searcher
+                .search(&ns, &manifest, &q, None)
+                .unwrap()
+                .results
+                .into_iter()
+                .map(|d| (d.doc_id.0, d.score))
+                .collect()
+        };
+        let close = |a: &[(String, f64)], b: &[(String, f64)]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| x.0 == y.0 && (x.1 - y.1).abs() < 1e-9)
+        };
+        let omitted = scores(mk_query("alpha", 20));
+        let explicit_segment = scores(with_bm25(mk_query("alpha", 20), 2.0, 0.2));
+        let explicit_default = scores(with_bm25(mk_query("alpha", 20), 1.2, 0.75));
+        assert!(close(&omitted, &explicit_segment), "omitted → segment k1/b");
+        assert!(
+            !close(&omitted, &explicit_default),
+            "not the global default"
+        );
+
+        let mut only_b = mk_query("alpha", 20);
+        only_b.bm25_params.b = Some(1.0);
+        assert!(
+            close(
+                &scores(only_b),
+                &scores(with_bm25(mk_query("alpha", 20), 2.0, 1.0))
+            ),
+            "b alone overrides b; k1 comes from the segment"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn out_of_range_bm25_params_are_rejected() {
+        let dir = std::env::temp_dir().join("kosha-test-bm25-validation");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let manifest = mk_wand_corpus(&dir, &ns.0, 20);
+        let searcher = Searcher::new(dir.clone());
+        for (k1, b) in [
+            (-0.1, 0.75),
+            (f64::NAN, 0.75),
+            (f64::INFINITY, 0.75),
+            (1.2, -0.01),
+            (1.2, 1.01),
+            (1.2, f64::NAN),
+        ] {
+            let err = searcher
+                .search(
+                    &ns,
+                    &manifest,
+                    &with_bm25(mk_query("alpha", 5), k1, b),
+                    None,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, KoshaError::InvalidQuery(_)),
+                "k1={k1} b={b}: expected InvalidQuery, got {err}"
+            );
+        }
+        for (k1, b) in [(0.0, 0.0), (0.0, 1.0), (100.0, 0.5)] {
+            searcher
+                .search(
+                    &ns,
+                    &manifest,
+                    &with_bm25(mk_query("alpha", 5), k1, b),
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("k1={k1} b={b} is valid: {e}"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn multi_term_wand_deep_page_matches_full_sort_slice() {
         // Same shape as `bounded_topk_selection_matches_full_sort_order`,
@@ -8577,7 +8905,7 @@ mod tests {
                     query_text: "shared".into(),
                     max_results: 2,
                     from: 0,
-                    bm25_params: Bm25Params::default(),
+                    bm25_params: Default::default(),
                     filter: None,
                     sort: vec![SortSpec {
                         fields: custodian_sort,
@@ -8682,7 +9010,7 @@ mod tests {
                     query_text: "shared".into(),
                     max_results: 10,
                     from: 0,
-                    bm25_params: Bm25Params::default(),
+                    bm25_params: Default::default(),
                     filter: None,
                     sort: vec![SortSpec {
                         fields: custodian_sort,
@@ -8762,7 +9090,7 @@ mod tests {
                     query_text: "shared".into(),
                     max_results: 2,
                     from: 0,
-                    bm25_params: Bm25Params::default(),
+                    bm25_params: Default::default(),
                     filter: None,
                     sort: vec![SortSpec {
                         fields: id_sort.clone(),
@@ -8796,7 +9124,7 @@ mod tests {
                     query_text: "shared".into(),
                     max_results: 2,
                     from: 0,
-                    bm25_params: Bm25Params::default(),
+                    bm25_params: Default::default(),
                     filter: None,
                     sort: vec![SortSpec { fields: id_sort }],
                     search_after: Some(vec![page1.results[1].doc_id.0.clone()]),
@@ -9074,7 +9402,7 @@ mod tests {
             query_text: "shared".into(),
             max_results: 10,
             from: 0,
-            bm25_params: Bm25Params::default(),
+            bm25_params: Default::default(),
             filter: Some(kosha_core::FilterClause::Term {
                 term: std::collections::HashMap::from([("matterId".into(), "m1".into())]),
             }),
@@ -9165,7 +9493,7 @@ mod tests {
             query_text: "contract".into(),
             max_results: 5,
             from: 0,
-            bm25_params: Bm25Params::default(),
+            bm25_params: Default::default(),
             filter: None,
             sort: vec![],
             search_after: None,
@@ -9243,7 +9571,7 @@ mod tests {
             query_text: "shared".into(),
             max_results: 10,
             from: 0,
-            bm25_params: Bm25Params::default(),
+            bm25_params: Default::default(),
             filter: Some(kosha_core::FilterClause::Term {
                 term: std::collections::HashMap::from([("matterId".into(), "m1".into())]),
             }),

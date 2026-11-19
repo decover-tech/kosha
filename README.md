@@ -29,7 +29,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 | Feature | Notes |
 | --- | --- |
-| BM25 lexical search | Tunable `k1` / `b` per request (defaults 1.2 / 0.75) |
+| BM25 lexical search | `k1` / `b` tunable per request: `bm25_params: {"k1": 2.0, "b": 0.3}` on `POST /search`, `k1=` / `b=` on `GET /search`. Either may be omitted and falls back to the segment's build-time value (1.2 / 0.75 unless built otherwise). `k1` must be ≥ 0 and `b` in [0, 1]; anything else (or non-numeric) is a 400. WAND pruning bounds are recomputed for the request's values, so results match exhaustive scoring. `k3` is not supported |
 | `operator: and` / `or` | AND (default) requires every query term; OR scores the union |
 | Block-max WAND | Skip-list postings, rarest-first probe ordering, leapfrog AND join |
 | `match_phrase` | Positional postings, configurable `slop` |
@@ -121,12 +121,25 @@ without removing later writes or another namespace's records. Partial parallel
 flush failures restore the entire snapshot for retry.
 
 Publication uses compare-and-swap against the writer's last committed manifest
-version. Concurrent writers cannot replace each other's snapshots: a stale
-writer returns an error and retains its WAL. Automatic conflict rebasing is not
-implemented; restart the stale writer with its existing data directory to load
-the published manifest and replay its pending writes. Retrying an identical
-committed snapshot is safe after a lost commit response. Segment object keys
-include a random writer identifier to avoid collisions before publication.
+version. Concurrent writers cannot replace each other's snapshots. A stale
+writer reads the newer manifest back (resolving its deletion sidecars), rebases
+its unpublished delta onto it and retries the CAS, up to 3 times with jittered
+backoff. The delta is the segments it added, the segments it compacted away and
+its new deletes; deletes on a segment both sides list are merged, and the
+published WAL checkpoint stays the rebasing writer's own. A writer with nothing
+unpublished just adopts the newer manifest. The rebase aborts, leaving local
+state and the WAL untouched, when merging would lose data: both writers
+compacted the same segment, the other writer deleted documents in a segment this
+writer compacted away, or the other writer compacted away a segment that carries
+this writer's unpublished deletes. An unresolved conflict returns HTTP 409.
+Restarting the writer with its existing data directory loads the published
+manifest and replays its pending writes from the WAL. Retrying an identical
+committed snapshot is safe after a lost commit response, and a rebase
+recognizes such a commit as its own. Segment object keys include a random
+writer identifier to avoid collisions before publication. Migration
+(`kosha-server migrate`) and `POST /v1/admin/import-namespace` also publish by
+CAS against the version they read. They never rebase, and they fail instead of
+overwriting a manifest another writer committed (409 for import).
 
 Each WAL directory has a persistent origin identifier. New manifest checkpoints
 apply only to that origin, so another writer's checkpoint cannot discard local

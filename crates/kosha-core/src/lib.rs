@@ -42,9 +42,9 @@ pub trait ControlStore: Send + Sync {
 
     /// Persist a manifest for a namespace (upsert, last-write-wins).
     ///
-    /// Used by the node to publish the current segment list after flush so
-    /// the state survives restarts. For multi-writer publish with optimistic
-    /// concurrency, use `compare_and_swap_manifest` instead.
+    /// Bootstrap and tests only: it can overwrite a concurrent writer's
+    /// commit, so no publish path (flush, compaction, migrate, admin
+    /// import) uses it. Publish with `compare_and_swap_manifest`.
     fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError>;
 
     /// Publish only over the writer's last committed version. An identical
@@ -168,6 +168,75 @@ pub struct Bm25Params {
 impl Default for Bm25Params {
     fn default() -> Self {
         Self { k1: 1.2, b: 0.75 }
+    }
+}
+
+/// Per-request BM25 overrides (`SearchQuery::bm25_params`).
+///
+/// Each parameter is optional. A parameter the request leaves out falls
+/// back to the value the segment was built with (`Footer::bm25_params`,
+/// 1.2 / 0.75 unless the namespace was built with other values), so a
+/// request that says nothing scores exactly as the segment's owner
+/// configured it, and `{"k1": 2.0}` changes `k1` alone.
+///
+/// Nothing on disk depends on these values: postings store raw term
+/// frequencies and block summaries store `max_tf` / `min_field_length`,
+/// so both the score and the block-max WAND ceiling are computed from the
+/// effective parameters at query time.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Bm25Overrides {
+    /// Term-frequency saturation. Must be finite and `>= 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k1: Option<f64>,
+    /// Length normalization. Must be finite and within `[0, 1]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b: Option<f64>,
+}
+
+impl Bm25Overrides {
+    /// Both parameters set explicitly.
+    pub fn new(k1: f64, b: f64) -> Self {
+        Self {
+            k1: Some(k1),
+            b: Some(b),
+        }
+    }
+
+    /// Reject values BM25 is not defined for. A negative `k1` or a `b`
+    /// outside `[0, 1]` can make the length-normalization denominator zero
+    /// or negative, producing infinite / negative scores, and breaks the
+    /// monotonicity the block-max WAND upper bound relies on — so these
+    /// are refused rather than clamped.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(k1) = self.k1 {
+            if !k1.is_finite() || k1 < 0.0 {
+                return Err(format!(
+                    "bm25_params.k1 must be a finite number >= 0, got {k1}"
+                ));
+            }
+        }
+        if let Some(b) = self.b {
+            if !b.is_finite() || !(0.0..=1.0).contains(&b) {
+                return Err(format!(
+                    "bm25_params.b must be a finite number between 0 and 1, got {b}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The effective parameters for a segment built with `base`.
+    pub fn resolve(&self, base: &Bm25Params) -> Bm25Params {
+        Bm25Params {
+            k1: self.k1.unwrap_or(base.k1),
+            b: self.b.unwrap_or(base.b),
+        }
+    }
+}
+
+impl From<Bm25Params> for Bm25Overrides {
+    fn from(p: Bm25Params) -> Self {
+        Self::new(p.k1, p.b)
     }
 }
 
@@ -1292,8 +1361,10 @@ pub struct SearchQuery {
     pub max_results: usize,
     #[serde(default)]
     pub from: usize,
+    /// Per-request BM25 `k1` / `b`; unset parameters use the segment's
+    /// build-time values. Checked by [`SearchQuery::validate`].
     #[serde(default)]
-    pub bm25_params: Bm25Params,
+    pub bm25_params: Bm25Overrides,
     #[serde(default)]
     pub filter: Option<FilterClause>,
     #[serde(default)]
@@ -1372,6 +1443,14 @@ pub struct CollapseSpec {
 }
 
 impl SearchQuery {
+    /// Request-level checks that do not need any segment: currently the
+    /// BM25 parameter ranges. An `Err` is a client error (HTTP 400).
+    pub fn validate(&self) -> Result<(), KoshaError> {
+        self.bm25_params
+            .validate()
+            .map_err(KoshaError::InvalidQuery)
+    }
+
     /// True when the vector leg is the only thing that can produce a hit:
     /// no query text, wildcard, phrase or top-level filter.
     pub fn is_pure_knn(&self) -> bool {
@@ -1537,6 +1616,9 @@ pub enum KoshaError {
     /// Transient by construction — callers should retry with backoff, which
     /// the Python `kosha_client` already does. Maps to HTTP 429.
     Overloaded(String),
+    /// The request itself is malformed or out of range (e.g. BM25 `b`
+    /// outside `[0, 1]`). A client error: maps to HTTP 400.
+    InvalidQuery(String),
 }
 
 impl std::fmt::Display for KoshaError {
@@ -1552,6 +1634,7 @@ impl std::fmt::Display for KoshaError {
             Self::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
             Self::CorruptSegment(msg) => write!(f, "corrupt segment data: {msg}"),
             Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
+            Self::InvalidQuery(msg) => write!(f, "invalid query: {msg}"),
         }
     }
 }
@@ -2175,5 +2258,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod bm25_overrides {
+    //! Issue #247: per-request BM25 parameters.
+    use super::*;
+
+    fn query(json: &str) -> SearchQuery {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn absent_params_defer_to_the_segment() {
+        let q = query(r#"{"query_text": "x"}"#);
+        assert_eq!(q.bm25_params, Bm25Overrides::default());
+        let seg = Bm25Params { k1: 2.0, b: 0.2 };
+        let p = q.bm25_params.resolve(&seg);
+        assert_eq!((p.k1, p.b), (2.0, 0.2));
+    }
+
+    #[test]
+    fn full_and_partial_params_parse() {
+        // The pre-#247 wire shape (both keys) still parses unchanged.
+        let q = query(r#"{"query_text": "x", "bm25_params": {"k1": 1.2, "b": 0.75}}"#);
+        assert_eq!(q.bm25_params, Bm25Overrides::new(1.2, 0.75));
+        let q = query(r#"{"query_text": "x", "bm25_params": {"b": 0.0}}"#);
+        let p = q.bm25_params.resolve(&Bm25Params::default());
+        assert_eq!((p.k1, p.b), (1.2, 0.0));
+    }
+
+    #[test]
+    fn default_overrides_serialize_empty() {
+        // Keeps result-cache keys and fan-out payloads small, and an older
+        // node reading this falls back to its own 1.2 / 0.75 default.
+        let v = serde_json::to_value(Bm25Overrides::default()).unwrap();
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn ranges_are_validated() {
+        for ok in [
+            Bm25Overrides::default(),
+            Bm25Overrides::new(0.0, 0.0),
+            Bm25Overrides::new(0.0, 1.0),
+            Bm25Overrides::new(1e6, 0.5),
+        ] {
+            assert!(ok.validate().is_ok(), "{ok:?}");
+        }
+        for bad in [
+            Bm25Overrides::new(-1.0, 0.5),
+            Bm25Overrides::new(f64::NAN, 0.5),
+            Bm25Overrides::new(f64::INFINITY, 0.5),
+            Bm25Overrides::new(1.2, -0.1),
+            Bm25Overrides::new(1.2, 1.5),
+            Bm25Overrides {
+                k1: None,
+                b: Some(f64::NAN),
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        let q = query(r#"{"query_text": "x", "bm25_params": {"b": 2}}"#);
+        assert!(matches!(q.validate(), Err(KoshaError::InvalidQuery(_))));
     }
 }
