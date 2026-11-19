@@ -12,6 +12,7 @@ use kosha_core::{
     FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry, NamespaceId, ScoredDocument,
     SearchQuery, SearchResult, SortSpec, TermBloomMode, TotalHitsRelation,
 };
+pub use kosha_segment::VectorSpanFetch;
 use kosha_segment::{
     tokenize, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
 };
@@ -1346,6 +1347,9 @@ impl Searcher {
         // Canonical JSON of `query.filter` and `query.knn.filter`, computed
         // once per request: the key into each segment's filter-set cache.
         filter_keys: &FilterKeys,
+        // Fetches the probed vector postings a segment does not hold
+        // locally (#245); see `Searcher::search_with_hydrators`.
+        vector_fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
         let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
         if !seg_dir.exists() {
@@ -2412,12 +2416,13 @@ impl Searcher {
             } else {
                 match knn_cutoff {
                     Some((cutoff, effective_budget)) => reader
-                        .knn_search_within_filtered(
+                        .knn_search_within_filtered_fetching(
                             &knn.vector,
                             fetch_k,
                             cutoff,
                             effective_budget,
                             knn_accept_dyn,
+                            vector_fetch,
                         )
                         .map(|r| {
                             r.map(|(results, probes)| {
@@ -2426,11 +2431,12 @@ impl Searcher {
                             })
                         }),
                     None => reader
-                        .knn_search_filtered(
+                        .knn_search_filtered_fetching(
                             &knn.vector,
                             fetch_k,
                             knn.num_candidates,
                             knn_accept_dyn,
+                            vector_fetch,
                         )
                         .map(|r| {
                             r.inspect(|_| {
@@ -2676,7 +2682,7 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
     ) -> Result<SearchResult, KoshaError> {
-        self.search_inner(namespace, manifest, query, tombstones, None)
+        self.search_inner(namespace, manifest, query, tombstones, None, None)
             .map(|(result, _stats)| result)
     }
 
@@ -2692,7 +2698,7 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
-        self.search_inner(namespace, manifest, query, tombstones, None)
+        self.search_inner(namespace, manifest, query, tombstones, None, None)
     }
 
     /// Like [`Searcher::search_with_stats`], but with an optional callback
@@ -2718,7 +2724,36 @@ impl Searcher {
         >,
         hydrator: DocStoreHydrator<'_>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
-        self.search_inner(namespace, manifest, query, tombstones, hydrator)
+        self.search_inner(namespace, manifest, query, tombstones, hydrator, None)
+    }
+
+    /// [`Searcher::search_with_doc_store_hydrator`] plus `vector_fetch`,
+    /// which each segment calls with the `vector.idx` ranges of the kNN
+    /// postings it is about to probe and does not hold locally (#245): a
+    /// query node then needs only `vector.offsets` up front and fetches the
+    /// probed postings by range instead of the whole `vector.idx`. Segments
+    /// probe in parallel, so their calls overlap (one round trip of wall
+    /// time); a restricted probe that runs past its budget calls again for
+    /// the next few postings.
+    pub fn search_with_hydrators(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
+        hydrator: DocStoreHydrator<'_>,
+        vector_fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
+        self.search_inner(
+            namespace,
+            manifest,
+            query,
+            tombstones,
+            hydrator,
+            vector_fetch,
+        )
     }
 
     fn search_inner(
@@ -2730,6 +2765,7 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
         doc_store_hydrator: DocStoreHydrator<'_>,
+        vector_fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
         // Out-of-range BM25 parameters are a client error, not something
         // to clamp: every entry point funnels through here.
@@ -2881,6 +2917,7 @@ impl Searcher {
                     &open_stats,
                     knn_cutoff,
                     &filter_keys,
+                    vector_fetch,
                 )
             })
             .collect::<Result<Vec<Option<SegmentOutput>>, KoshaError>>()?

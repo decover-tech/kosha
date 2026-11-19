@@ -792,6 +792,17 @@ pub struct Footer {
     /// before #243) means vectors are inline JSON in the doc store.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub doc_vectors: bool,
+    /// `true` when every `postings-*.bin` shard was written raw, never
+    /// zstd-wrapped (#245). A raw shard's bytes are exactly the logical
+    /// layout the `inverted.idx` TOC points into, so a query node can fetch
+    /// just its query terms' `(postings_off, postings_len)` spans with
+    /// ranged GETs instead of whole shards. `false` (the default, and every
+    /// segment written before #245) means a shard of 4 KiB or more may be
+    /// compressed as a whole file and must be fetched whole. Readers that
+    /// predate the flag read raw shards unchanged (the wrapper was always
+    /// optional), so a rollback still reads these segments.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub posting_blobs_raw: bool,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -1973,6 +1984,7 @@ mod tests {
             format_version: SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: Some(256),
             doc_vectors: false,
+            posting_blobs_raw: false,
         }
     }
 

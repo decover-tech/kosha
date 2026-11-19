@@ -59,17 +59,26 @@ pub enum ReadMode {
 
 impl ReadMode {
     pub fn from_env() -> Self {
-        Self::parse(std::env::var("KOSHA_DOC_STORE_READ_MODE").ok().as_deref())
+        Self::from_env_var("KOSHA_DOC_STORE_READ_MODE")
     }
 
-    fn parse(raw: Option<&str>) -> Self {
+    /// The same `whole|ranged` switch under another variable (postings use
+    /// `KOSHA_POSTINGS_READ_MODE`).
+    pub fn from_env_var(var: &str) -> Self {
+        Self::parse_var(var, std::env::var(var).ok().as_deref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse(raw: Option<&str>) -> Self {
+        Self::parse_var("KOSHA_DOC_STORE_READ_MODE", raw)
+    }
+
+    fn parse_var(var: &str, raw: Option<&str>) -> Self {
         match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
             None | Some("") | Some("ranged") => Self::Ranged,
             Some("whole") => Self::Whole,
             Some(other) => {
-                eprintln!(
-                    "WARN: KOSHA_DOC_STORE_READ_MODE={other} not whole|ranged — using ranged"
-                );
+                eprintln!("WARN: {var}={other} not whole|ranged — using ranged");
                 Self::Ranged
             }
         }
@@ -110,17 +119,22 @@ impl Default for SpanConfig {
 
 impl SpanConfig {
     pub fn from_env() -> Self {
+        Self::from_env_prefix("KOSHA_DOC_SPAN", Self::default())
+    }
+
+    /// `{prefix}_COALESCE_GAP_BYTES`, `{prefix}_PROMOTE_GETS` and
+    /// `{prefix}_PROMOTE_BYTES`, each falling back to `defaults`.
+    pub fn from_env_prefix(prefix: &str, defaults: Self) -> Self {
         let get = |key: &str, default: u64| {
-            std::env::var(key)
+            std::env::var(format!("{prefix}_{key}"))
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(default)
         };
-        let d = Self::default();
         Self {
-            coalesce_gap: get("KOSHA_DOC_SPAN_COALESCE_GAP_BYTES", d.coalesce_gap),
-            promote_after_gets: get("KOSHA_DOC_SPAN_PROMOTE_GETS", d.promote_after_gets),
-            promote_after_bytes: get("KOSHA_DOC_SPAN_PROMOTE_BYTES", d.promote_after_bytes),
+            coalesce_gap: get("COALESCE_GAP_BYTES", defaults.coalesce_gap),
+            promote_after_gets: get("PROMOTE_GETS", defaults.promote_after_gets),
+            promote_after_bytes: get("PROMOTE_BYTES", defaults.promote_after_bytes),
         }
     }
 }
@@ -136,6 +150,8 @@ pub trait RangeFetcher {
 /// line and summed into [`DocStoreReadCounters`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PageFetchStats {
+    /// Sequential S3 round trips (batches of concurrent GETs) the page cost.
+    pub rounds: u64,
     pub ranged_gets: u64,
     pub ranged_bytes: u64,
     pub whole_files: u64,
@@ -144,6 +160,7 @@ pub struct PageFetchStats {
 
 impl PageFetchStats {
     pub fn add(&mut self, other: &Self) {
+        self.rounds += other.rounds;
         self.ranged_gets += other.ranged_gets;
         self.ranged_bytes += other.ranged_bytes;
         self.whole_files += other.whole_files;
@@ -200,6 +217,8 @@ impl DocStoreReadCounters {
 /// Result of [`SpanHydrator::hydrate`].
 #[derive(Debug, Default)]
 pub struct SpanOutcome {
+    /// Sequential batches of ranged GETs (S3 round trips).
+    pub rounds: u64,
     /// Ranged GETs issued and bytes they returned.
     pub gets: u64,
     pub bytes: u64,
@@ -293,6 +312,7 @@ impl SpanHydrator {
                     (key, 0, DOC_VECTORS_HEADER_PROBE)
                 })
                 .collect();
+            out.rounds += 1;
             let results = fetcher.fetch(&probes);
             let mut rest: Vec<(usize, Vec<u8>, u64)> = Vec::new();
             for (&i, result) in header_segs.iter().zip(results) {
@@ -336,6 +356,7 @@ impl SpanHydrator {
                         (key, prefix.len() as u64, need - prefix.len() as u64)
                     })
                     .collect();
+                out.rounds += 1;
                 let results = fetcher.fetch(&reqs);
                 for ((i, mut prefix, need), result) in rest.into_iter().zip(results) {
                     out.gets += 1;
@@ -431,6 +452,7 @@ impl SpanHydrator {
             }
         }
         if !reqs.is_empty() {
+            out.rounds += 1;
             let results = fetcher.fetch(&reqs);
             for (p, result) in pending.into_iter().zip(results) {
                 out.gets += 1;
@@ -504,32 +526,8 @@ impl SpanHydrator {
         start: u64,
         bytes: &[u8],
     ) {
-        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-        let Some(rel) = rel else { return };
-        if bytes.is_empty() {
-            return;
-        }
-        let dir = span_cache::spans_dir(segment_dir, file);
-        let name = span_cache::span_file_name(start, start + bytes.len() as u64);
-        let dest = dir.join(&name);
-        if std::fs::metadata(&dest).is_ok_and(|m| m.len() == bytes.len() as u64) {
-            return;
-        }
-        let tmp = dir.join(format!(
-            ".tmp.{}.{}",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let written = std::fs::create_dir_all(&dir)
-            .and_then(|_| std::fs::write(&tmp, bytes))
-            .and_then(|_| std::fs::rename(&tmp, &dest));
-        match written {
-            Ok(()) => cache
-                .note_external_write(&format!("{rel}/{file}{}/{name}", span_cache::SPANS_SUFFIX)),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                eprintln!("WARN: failed to persist span {}: {e}", dest.display());
-            }
+        if let Some(rel) = rel {
+            persist_span(cache, segment_dir, rel, file, start, bytes);
         }
     }
 
@@ -552,6 +550,50 @@ impl SpanHydrator {
             if let Err(e) = cache.evict_dir_unless_pinned(&key) {
                 eprintln!("WARN: failed to drop span cache {key}: {e}");
             }
+        }
+    }
+}
+
+/// Write one fetched range `[start, start + bytes.len())` of
+/// `{segment_dir}/{file}` into the span cache and account it in the disk
+/// cache under `{rel}/{file}.spans/…`. Written to a temp name and renamed,
+/// so a reader never sees a partial span (it would ignore one anyway: the
+/// name carries the length). Failure to persist is logged, not fatal: the
+/// read that needed it then fails and the client retries, like any IO
+/// error.
+pub(crate) fn persist_span(
+    cache: &Cache,
+    segment_dir: &Path,
+    rel: &str,
+    file: &str,
+    start: u64,
+    bytes: &[u8],
+) {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    if bytes.is_empty() {
+        return;
+    }
+    let dir = span_cache::spans_dir(segment_dir, file);
+    let name = span_cache::span_file_name(start, start + bytes.len() as u64);
+    let dest = dir.join(&name);
+    if std::fs::metadata(&dest).is_ok_and(|m| m.len() == bytes.len() as u64) {
+        return;
+    }
+    let tmp = dir.join(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = std::fs::create_dir_all(&dir)
+        .and_then(|_| std::fs::write(&tmp, bytes))
+        .and_then(|_| std::fs::rename(&tmp, &dest));
+    match written {
+        Ok(()) => {
+            cache.note_external_write(&format!("{rel}/{file}{}/{name}", span_cache::SPANS_SUFFIX))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!("WARN: failed to persist span {}: {e}", dest.display());
         }
     }
 }

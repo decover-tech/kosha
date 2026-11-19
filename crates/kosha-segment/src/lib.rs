@@ -69,6 +69,10 @@ pub struct SegmentWriter {
     /// Inverted-index version `finalize` writes; see
     /// [`postings_write_version`].
     postings_write_version: u32,
+    /// Leave every `postings-*.bin` shard raw (no zstd wrapper) so query
+    /// nodes can range-read single terms (#245); recorded as
+    /// `Footer::posting_blobs_raw`. See [`posting_blobs_raw`].
+    posting_blobs_raw: bool,
     /// Sorted posting runs spilled so far, oldest (lowest doc_seq) first.
     runs: Vec<PathBuf>,
     /// First I/O error from streaming in `add_document`, which can't return
@@ -121,6 +125,7 @@ impl SegmentWriter {
             peak_inverted_bytes: 0,
             build_memory_bytes: segment_build_memory_bytes(),
             postings_write_version: postings_write_version(),
+            posting_blobs_raw: posting_blobs_raw(),
             runs: Vec::new(),
             io_error: None,
             finalized: false,
@@ -150,6 +155,13 @@ impl SegmentWriter {
     #[cfg(test)]
     fn with_postings_write_version(mut self, version: u32) -> Self {
         self.postings_write_version = version;
+        self
+    }
+
+    /// Override whether posting shards are written raw (#245). Production
+    /// writers use `KOSHA_POSTINGS_RAW_BLOBS`; see [`posting_blobs_raw`].
+    pub fn with_raw_posting_blobs(mut self, raw: bool) -> Self {
+        self.posting_blobs_raw = raw;
         self
     }
 
@@ -576,7 +588,12 @@ impl SegmentWriter {
             drop(file);
             let raw = build_dir.join(format!("blob-{blob_id}"));
             let final_path = self.output_dir.join(posting_blob_file_for_id(blob_id));
-            maybe_compress_inverted_file(&raw, &final_path, blob_lens[blob_id])?;
+            if self.posting_blobs_raw {
+                // Rangeable: the TOC's spans index these exact bytes.
+                fs::rename(&raw, &final_path)?;
+            } else {
+                maybe_compress_inverted_file(&raw, &final_path, blob_lens[blob_id])?;
+            }
         }
         for run in self.runs.drain(..) {
             let _ = fs::remove_file(run);
@@ -768,6 +785,7 @@ impl SegmentWriter {
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: self.text_filter_ignore_above,
             doc_vectors: !self.doc_vector_entries.is_empty(),
+            posting_blobs_raw: self.posting_blobs_raw,
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -810,6 +828,19 @@ impl SegmentWriter {
 
 /// Magic prefix of a v2 `vector.idx` ("KVE2", little-endian u32).
 pub const VECTOR_MAGIC: u32 = u32::from_le_bytes(*b"KVE2");
+/// File name of the clustered vector index.
+pub const VECTOR_IDX_FILE: &str = "vector.idx";
+
+/// Callback a reader calls with byte ranges of `{segment_dir}/vector.idx`
+/// it is about to read but does not hold locally (#245). After it returns,
+/// those ranges should be readable from the whole file or the span cache
+/// (`span_cache`); any still missing fail the search as an IO error.
+pub type VectorSpanFetch<'a> = &'a (dyn Fn(&Path, &[(u64, u64)]) + Sync);
+
+/// Postings fetched per call when a restricted kNN probe runs past its
+/// budget (see `knn_search_within_filtered`).
+const VECTOR_PREFETCH_CHUNK: usize = 8;
+
 /// Magic prefix of the `vector.offsets` sidecar ("KVOF", little-endian u32).
 pub const VECTOR_OFFSETS_MAGIC: u32 = u32::from_le_bytes(*b"KVOF");
 /// Version 1: vectors and centroids stored exactly as ingested (raw
@@ -1397,6 +1428,38 @@ fn postings_write_version() -> u32 {
                      (accepted: 4, 5) — writing v{SKIP_SPLIT_INVERTED_VERSION}"
                 );
                 SKIP_SPLIT_INVERTED_VERSION
+            }
+        }
+    })
+}
+
+/// Whether `SegmentWriter` leaves `postings-*.bin` shards raw —
+/// `KOSHA_POSTINGS_RAW_BLOBS`, `1`/`true` (default) or `0`/`false`.
+///
+/// Raw shards let a cold query fetch only its terms' posting spans with
+/// ranged GETs (#245) instead of whole shards, at the cost of skipping the
+/// whole-file zstd wrapper (`maybe_compress_inverted_file`). The postings
+/// are already varint/delta coded, so that wrapper saved little. No reader
+/// change is needed: the wrapper was always optional and every reader
+/// passes raw bytes through, so a rollback still reads raw segments. Set
+/// `0` to keep compressing shards; such segments are fetched whole as
+/// before. Compaction writes through `SegmentWriter`, so its output
+/// follows the same setting. Read once.
+fn posting_blobs_raw() -> bool {
+    static RAW: OnceLock<bool> = OnceLock::new();
+    *RAW.get_or_init(|| {
+        match std::env::var("KOSHA_POSTINGS_RAW_BLOBS")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("1") | Some("true") => true,
+            Some("0") | Some("false") => false,
+            Some(other) => {
+                eprintln!(
+                    "WARN: KOSHA_POSTINGS_RAW_BLOBS={other} not 0|1 — writing raw posting shards"
+                );
+                true
             }
         }
     })
@@ -2463,6 +2526,45 @@ pub fn posting_blob_inventory(
         .collect())
 }
 
+/// One query term's postings span in a split segment: bytes
+/// `[start, start + len)` of shard `file`, from the `inverted.idx` TOC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermSpan {
+    pub term: String,
+    pub file: String,
+    pub start: u64,
+    pub len: u64,
+}
+
+/// The TOC spans of each of `terms` this split segment contains, in
+/// `terms` order (terms it does not contain are left out, duplicates
+/// once). Reads only the local `inverted.idx`, never a shard. The spans
+/// index the shard's logical bytes, which are the stored bytes only when
+/// the segment's footer says `posting_blobs_raw` — a caller range-reading
+/// the stored file must check that first (#245).
+pub fn posting_term_spans(
+    segment_dir: &Path,
+    terms: &[String],
+) -> Result<Vec<TermSpan>, KoshaError> {
+    let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
+    let index = SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None)?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(terms
+        .iter()
+        .filter(|t| seen.insert(t.as_str()))
+        .filter_map(|term| {
+            let i = index.find(term)?;
+            let (_, _, blob_id, off, len) = index.raw_entry(i);
+            Some(TermSpan {
+                term: term.clone(),
+                file: posting_blob_file_for_id(blob_id),
+                start: off as u64,
+                len: len as u64,
+            })
+        })
+        .collect())
+}
+
 pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
     let Some(header) = read_inverted_header(&segment_dir.join("inverted.idx")) else {
         return false;
@@ -2561,6 +2663,34 @@ pub struct SplitInvertedIndex {
     /// [`SegmentReader::take_blob_read_failure`] and must surface an error
     /// instead of returning results that silently omit the term.
     blob_read_failure: std::sync::atomic::AtomicBool,
+    /// Shards are raw (`Footer::posting_blobs_raw`), so a term whose shard
+    /// is not local may be served from the sparse span cache
+    /// (`postings-XX.bin.spans/`, see [`span_cache`]) that a query node
+    /// fills with ranged GETs of just the query terms' spans (#245).
+    posting_spans: bool,
+}
+
+/// Where one shard's term spans are read from for a batch of terms.
+enum BlobSource {
+    /// The whole shard (logical, decompressed bytes).
+    Whole(Vec<u8>),
+    /// Only fetched spans of a raw shard are local.
+    Spans(span_cache::SpanIndex),
+}
+
+impl BlobSource {
+    /// The `[off, off + len)` bytes of the shard's logical layout. `None`
+    /// when they are not local: out of bounds for the whole shard (corrupt
+    /// TOC/shard) or not covered by any span (never fetched, or evicted).
+    fn term_bytes(&self, off: usize, len: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+        let end = off.checked_add(len)?;
+        match self {
+            Self::Whole(blob) => blob.get(off..end).map(std::borrow::Cow::Borrowed),
+            Self::Spans(index) => index
+                .read(off as u64, end as u64)
+                .map(std::borrow::Cow::Owned),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3441,6 +3571,7 @@ impl SplitInvertedIndex {
             cache: PostingsCache::new(postings_cache_max_bytes(), account.clone()),
             scoring_cache: PostingsCache::new(postings_cache_max_bytes(), account),
             blob_read_failure: std::sync::atomic::AtomicBool::new(false),
+            posting_spans: false,
         };
         for i in 0..term_count {
             let (term_off, term_len, blob_id, _, _) = index.raw_entry(i);
@@ -3543,28 +3674,18 @@ impl SplitInvertedIndex {
         }
 
         for (blob_id, spans) in by_blob {
-            let Some(blob) = self.read_posting_blob(blob_id) else {
+            let Some(blob) = self.open_posting_blob(blob_id) else {
                 // Every term queued on this shard was TOC-present; the
                 // shard itself is unreadable (evicted/corrupt).
                 self.note_blob_read_failure();
                 continue;
             };
             for (i, slot, term, p_off, p_len, admit) in spans {
-                let Some(p_end) = p_off.checked_add(p_len).filter(|&e| e <= blob.len()) else {
+                let Some(bytes) = self.term_bytes(&blob, blob_id, p_off, p_len) else {
                     self.note_blob_read_failure();
                     continue;
                 };
-                let decoded = match self.encoding {
-                    SplitPostingsEncoding::Fixed32 => decode_postings_bytes(&blob[p_off..p_end]),
-                    SplitPostingsEncoding::VarintDelta => {
-                        decode_postings_varint_delta_bytes(&blob[p_off..p_end])
-                    }
-                    SplitPostingsEncoding::SkipSplit => {
-                        BlockedTermPostings::parse(Arc::new(blob[p_off..p_end].to_vec()))
-                            .and_then(|b| b.decode_full())
-                    }
-                };
-                let Some((postings, approx_bytes)) = decoded else {
+                let Some((postings, approx_bytes)) = self.decode_term(&bytes) else {
                     self.note_blob_read_failure();
                     continue;
                 };
@@ -3593,16 +3714,18 @@ impl SplitInvertedIndex {
 
     fn decode_postings_inner(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
         let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
-        let blob = self.read_posting_blob(blob_id)?;
-        let p_end = p_off.checked_add(p_len).filter(|&e| e <= blob.len())?;
+        let blob = self.open_posting_blob(blob_id)?;
+        let bytes = self.term_bytes(&blob, blob_id, p_off, p_len)?;
+        self.decode_term(&bytes)
+    }
+
+    /// Full decode of one term's span, in this index's encoding.
+    fn decode_term(&self, bytes: &[u8]) -> Option<(Vec<Posting>, usize)> {
         match self.encoding {
-            SplitPostingsEncoding::Fixed32 => decode_postings_bytes(&blob[p_off..p_end]),
-            SplitPostingsEncoding::VarintDelta => {
-                decode_postings_varint_delta_bytes(&blob[p_off..p_end])
-            }
+            SplitPostingsEncoding::Fixed32 => decode_postings_bytes(bytes),
+            SplitPostingsEncoding::VarintDelta => decode_postings_varint_delta_bytes(bytes),
             SplitPostingsEncoding::SkipSplit => {
-                BlockedTermPostings::parse(Arc::new(blob[p_off..p_end].to_vec()))
-                    .and_then(|b| b.decode_full())
+                BlockedTermPostings::parse(Arc::new(bytes.to_vec())).and_then(|b| b.decode_full())
             }
         }
     }
@@ -3660,20 +3783,18 @@ impl SplitInvertedIndex {
         }
 
         for (blob_id, spans) in by_blob {
-            let Some(blob) = self.read_posting_blob(blob_id) else {
+            let Some(blob) = self.open_posting_blob(blob_id) else {
                 // Every term queued on this shard was TOC-present; the
                 // shard itself is unreadable (evicted/corrupt).
                 self.note_blob_read_failure();
                 continue;
             };
             for (i, slot, term, p_off, p_len, admit) in spans {
-                let Some(p_end) = p_off.checked_add(p_len).filter(|&e| e <= blob.len()) else {
+                let Some(bytes) = self.term_bytes(&blob, blob_id, p_off, p_len) else {
                     self.note_blob_read_failure();
                     continue;
                 };
-                let Some(parsed) =
-                    BlockedTermPostings::parse(Arc::new(blob[p_off..p_end].to_vec()))
-                else {
+                let Some(parsed) = BlockedTermPostings::parse(Arc::new(bytes.into_owned())) else {
                     self.note_blob_read_failure();
                     continue;
                 };
@@ -3693,6 +3814,47 @@ impl SplitInvertedIndex {
         // Spans in the TOC refer to the uncompressed shard layout.
         let raw = fs::read(self.segment_dir.join(posting_blob_file_for_id(blob_id))).ok()?;
         read_inverted_payload(raw).ok()
+    }
+
+    /// The shard as a [`BlobSource`]: the whole local file when there is
+    /// one (it always wins), otherwise — raw-shard segments only — the
+    /// spans cached for it. `None` when neither exists.
+    fn open_posting_blob(&self, blob_id: usize) -> Option<BlobSource> {
+        if let Some(blob) = self.read_posting_blob(blob_id) {
+            return Some(BlobSource::Whole(blob));
+        }
+        if !self.posting_spans {
+            return None;
+        }
+        let spans =
+            span_cache::SpanIndex::load(&self.segment_dir, &posting_blob_file_for_id(blob_id));
+        if spans.is_empty() {
+            // A promotion may have landed the whole shard and dropped the
+            // spans between the two looks.
+            return self.read_posting_blob(blob_id).map(BlobSource::Whole);
+        }
+        Some(BlobSource::Spans(spans))
+    }
+
+    /// One term's bytes from `blob`. On a span miss, looks for the whole
+    /// shard once more: a background promotion lands the whole file before
+    /// it drops the spans, so a span that vanished meanwhile is there.
+    fn term_bytes<'b>(
+        &self,
+        blob: &'b BlobSource,
+        blob_id: usize,
+        off: usize,
+        len: usize,
+    ) -> Option<std::borrow::Cow<'b, [u8]>> {
+        if let Some(bytes) = blob.term_bytes(off, len) {
+            return Some(bytes);
+        }
+        if !matches!(blob, BlobSource::Spans(_)) {
+            return None;
+        }
+        let whole = self.read_posting_blob(blob_id)?;
+        let end = off.checked_add(len).filter(|&e| e <= whole.len())?;
+        Some(std::borrow::Cow::Owned(whole[off..end].to_vec()))
     }
 }
 
@@ -4050,6 +4212,7 @@ impl SegmentReader {
             Some(footer) => footer,
             None => Self::read_footer(&segment_dir)?,
         };
+        let posting_spans = footer.posting_blobs_raw;
         let doc_store = match try_read_doc_index(&segment_dir, footer.doc_count) {
             Some(index) => DocStoreAccess::Lazy {
                 doc_store_path: segment_dir.join("doc_store.bin"),
@@ -4061,7 +4224,7 @@ impl SegmentReader {
             segment_dir: segment_dir.clone(),
             footer,
             doc_store,
-            inverted: Self::read_inverted(&segment_dir, postings_account)?,
+            inverted: Self::read_inverted(&segment_dir, postings_account, posting_spans)?,
             filters: LazyFilters {
                 segment_dir: segment_dir.clone(),
                 state: Mutex::new(None),
@@ -4176,7 +4339,16 @@ impl SegmentReader {
         // file. A missing file (open error) is not an error either — matches
         // `read_vectors`'s existing missing-file handling.
         let Some(header_buf) = read_vector_idx_header(&idx_path) else {
-            return Ok((VectorStore::default(), None, None, false));
+            // No local `vector.idx`. A query node reading postings by range
+            // (#245) only holds `vector.offsets`, whose header repeats the
+            // index's dim and version, plus whichever postings it fetched
+            // into the span cache.
+            return Ok(
+                Self::load_vector_index_from_offsets(segment_dir, postings_account)
+                    .map_or((VectorStore::default(), None, None, false), |vi| {
+                        (VectorStore::default(), None, Some(vi), false)
+                    }),
+            );
         };
 
         let Some((dim, _total_count, version)) = parse_vector_idx_header(&header_buf) else {
@@ -4271,6 +4443,40 @@ impl SegmentReader {
         }
     }
 
+    /// The lazy posting index from `vector.offsets` alone, for a segment
+    /// whose `vector.idx` is not local: postings are then read from the
+    /// sparse span cache (`vector.idx.spans/`) once fetched by range.
+    /// `None` without a valid sidecar.
+    fn load_vector_index_from_offsets(
+        segment_dir: &Path,
+        postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+    ) -> Option<LazyVectorIndex> {
+        let data = fs::read(segment_dir.join("vector.offsets")).ok()?;
+        if data.len() < VECTOR_OFFSETS_HEADER_LEN {
+            return None;
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().ok()?);
+        let dim = u32::from_le_bytes(data[8..12].try_into().ok()?);
+        let parsed = parse_vector_offsets(&data, dim, version)?;
+        let mut centroids = Vec::with_capacity(parsed.len());
+        let mut ranges = Vec::with_capacity(parsed.len());
+        let mut radii = Vec::with_capacity(parsed.len());
+        for p in parsed {
+            centroids.push(p.centroid);
+            ranges.push((p.offset, p.length));
+            radii.push(p.radius);
+        }
+        Some(LazyVectorIndex {
+            vector_idx_path: segment_dir.join("vector.idx"),
+            dim: dim as usize,
+            centroids,
+            ranges,
+            radii,
+            unit_norm: is_unit_norm_vector_index_version(version),
+            cache: PostingsCache::new(vector_postings_cache_max_bytes(), postings_account),
+        })
+    }
+
     /// `true` when this segment's vectors are served via the lazy v2
     /// posting index rather than the legacy `vector_store`/`hnsw_map`
     /// fields — callers branch on this to pick `knn_search` vs. the
@@ -4303,10 +4509,25 @@ impl SegmentReader {
             return Ok(hit);
         }
         let (offset, length) = vi.ranges[range_idx];
-        let mut file = fs::File::open(&vi.vector_idx_path)?;
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; length as usize];
-        file.read_exact(&mut buf)?;
+        // The whole local `vector.idx` when present, else the span cache a
+        // ranged cold query filled (#245). Neither: an IO error, which the
+        // query layer reports as a degraded segment, never as no matches.
+        let buf = span_cache::read_local_range(
+            &self.segment_dir,
+            VECTOR_IDX_FILE,
+            offset + length as u64,
+            offset,
+            length as u64,
+        )
+        .ok_or_else(|| {
+            KoshaError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "vector posting [{offset}, +{length}) of {} is not local",
+                    vi.vector_idx_path.display()
+                ),
+            ))
+        })?;
         let decoded = Arc::new(decode_posting_entries(&buf, vi.dim as u32));
         // Second-touch admission, same as text postings: one-shot probes
         // (a cold namespace scanned once) pass through without evicting a
@@ -4344,8 +4565,58 @@ impl SegmentReader {
         nprobe: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
+        self.knn_search_filtered_fetching(query, k, nprobe, accept, None)
+    }
+
+    /// [`Self::knn_search_filtered`] that first hands the postings it will
+    /// probe and does not hold locally to `fetch` (#245, ranged reads).
+    pub fn knn_search_filtered_fetching(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
         let vi = self.vector_index.as_ref()?;
-        Some(self.knn_search_lazy(vi, query, k, nprobe, accept))
+        Some(self.knn_search_lazy(vi, query, k, nprobe, accept, fetch))
+    }
+
+    /// Hand `fetch` the `vector.idx` ranges of the postings in `range_idxs`
+    /// that are neither decoded in memory nor readable locally, in one call.
+    fn prefetch_vector_postings(
+        &self,
+        vi: &LazyVectorIndex,
+        range_idxs: impl IntoIterator<Item = usize>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) {
+        let Some(fetch) = fetch else {
+            return;
+        };
+        let whole_len = fs::metadata(&vi.vector_idx_path)
+            .ok()
+            .filter(|m| m.is_file())
+            .map_or(0, |m| m.len());
+        let mut spans: Option<span_cache::SpanIndex> = None;
+        let mut missing = Vec::new();
+        for i in range_idxs {
+            let Some(&(offset, length)) = vi.ranges.get(i) else {
+                continue;
+            };
+            let end = offset + length as u64;
+            if length == 0 || whole_len >= end || vi.cache.get(i).is_some() {
+                continue;
+            }
+            let spans = spans.get_or_insert_with(|| {
+                span_cache::SpanIndex::load(&self.segment_dir, VECTOR_IDX_FILE)
+            });
+            if !spans.covers(offset, end) {
+                missing.push((offset, end));
+            }
+        }
+        if !missing.is_empty() {
+            fetch(&self.segment_dir, &missing);
+        }
     }
 
     /// Triangle-inequality lower bound on `query`'s distance to *any*
@@ -4440,10 +4711,28 @@ impl SegmentReader {
         max_probes: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
     ) -> BudgetedKnnResult {
-        let vi = self.vector_index.as_ref()?;
-        Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, accept))
+        self.knn_search_within_filtered_fetching(query, k, max_distance, max_probes, accept, None)
     }
 
+    /// [`Self::knn_search_within_filtered`] that first hands the postings
+    /// inside the budget it does not hold locally to `fetch`, in one call,
+    /// and fetches further postings in chunks of
+    /// [`VECTOR_PREFETCH_CHUNK`] if a restriction makes the probe run past
+    /// its budget (#245, ranged reads).
+    pub fn knn_search_within_filtered_fetching(
+        &self,
+        query: &[f32],
+        k: usize,
+        max_distance: f32,
+        max_probes: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> BudgetedKnnResult {
+        let vi = self.vector_index.as_ref()?;
+        Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn knn_search_within_lazy(
         &self,
         vi: &LazyVectorIndex,
@@ -4452,6 +4741,7 @@ impl SegmentReader {
         max_distance: f32,
         max_probes: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
         // Rank this segment's qualifying postings nearest-first (by lower
         // bound, not raw centroid distance — see `centroid_lower_bound`),
@@ -4475,6 +4765,7 @@ impl SegmentReader {
             .take_while(|(_, d)| *d <= max_distance)
             .count()
             .min(max_probes);
+        self.prefetch_vector_postings(vi, ranked[..budgeted].iter().map(|&(i, _)| i), fetch);
 
         let mut probes = 0usize;
         let mut scored: Vec<(u32, f64)> = Vec::new();
@@ -4485,6 +4776,11 @@ impl SegmentReader {
                 // still short (see the doc comment on the public wrapper).
                 if accept.is_none() || scored.len() >= k {
                     break;
+                }
+                if (position - budgeted) % VECTOR_PREFETCH_CHUNK == 0 {
+                    let chunk =
+                        &ranked[position..(position + VECTOR_PREFETCH_CHUNK).min(ranked.len())];
+                    self.prefetch_vector_postings(vi, chunk.iter().map(|&(i, _)| i), fetch);
                 }
             }
             probes += 1;
@@ -4517,6 +4813,7 @@ impl SegmentReader {
         k: usize,
         nprobe: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<Vec<(u32, f64)>, KoshaError> {
         // Unit-norm segments: normalize the query once, then every stored
         // comparison is a bare dot product — same cosine scores (clamped
@@ -4543,10 +4840,17 @@ impl SegmentReader {
         } else {
             kosha_vector_spfresh::nearest_centroids(&vi.centroids, query, rank)
         };
+        let budgeted = nprobe.min(candidates.len());
+        self.prefetch_vector_postings(vi, candidates[..budgeted].iter().copied(), fetch);
         let mut scored: Vec<(u32, f64)> = Vec::new();
-        for (position, range_idx) in candidates.into_iter().enumerate() {
+        for (position, &range_idx) in candidates.iter().enumerate() {
             if position >= nprobe && scored.len() >= k {
                 break;
+            }
+            if position >= budgeted && (position - budgeted) % VECTOR_PREFETCH_CHUNK == 0 {
+                let chunk =
+                    &candidates[position..(position + VECTOR_PREFETCH_CHUNK).min(candidates.len())];
+                self.prefetch_vector_postings(vi, chunk.iter().copied(), fetch);
             }
             for (id, v) in self.hydrate_posting(vi, range_idx)?.iter() {
                 if accept.is_some_and(|accept| !accept(*id)) {
@@ -4971,7 +5275,7 @@ impl SegmentReader {
     /// blooms existed.
     pub fn rewrite_term_bloom(segment_dir: &Path) -> Result<Footer, KoshaError> {
         let mut footer = Self::read_footer(segment_dir)?;
-        let inverted = Self::read_inverted(segment_dir, None)?;
+        let inverted = Self::read_inverted(segment_dir, None, false)?;
         footer.term_bloom = Some(build_term_bloom(inverted.all_terms()));
         let json = serde_json::to_string_pretty(&footer)?;
         atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
@@ -5050,17 +5354,22 @@ impl SegmentReader {
     /// table of contents) opens lazily with zero parsing; anything else is
     /// parsed eagerly via the legacy v1 stream layout — the exact cost every
     /// segment paid before v2 existed.
+    ///
+    /// `posting_spans` (the footer's `posting_blobs_raw`): a split index may
+    /// serve a term from the sparse span cache when its whole shard is not
+    /// local (#245). Off for segments whose shards may be compressed, where
+    /// a byte range of the stored file means nothing.
     fn read_inverted(
         segment_dir: &Path,
         account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+        posting_spans: bool,
     ) -> Result<InvertedAccess, KoshaError> {
         let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
         if SplitInvertedIndex::detect(&data) {
-            return Ok(InvertedAccess::Split(SplitInvertedIndex::from_bytes(
-                data,
-                segment_dir.to_path_buf(),
-                account,
-            )?));
+            let mut split =
+                SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), account)?;
+            split.posting_spans = posting_spans;
+            return Ok(InvertedAccess::Split(split));
         }
         if LazyInvertedIndex::detect(&data) {
             return Ok(InvertedAccess::Lazy(LazyInvertedIndex::from_bytes(
@@ -8463,5 +8772,224 @@ mod bounded_build_tests {
             parse_segment_build_memory_bytes(Some("lots")),
             DEFAULT_SEGMENT_BUILD_MEMORY_BYTES
         );
+    }
+}
+
+#[cfg(test)]
+mod posting_span_tests {
+    //! Raw posting shards and ranged term reads (#245, part 2).
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-postspan-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// 3,000 docs over a 400-word vocabulary: every shard a query term
+    /// lands in is well over the 4 KiB compression threshold.
+    fn build(dir: &Path, raw: bool) -> Footer {
+        let mut w = SegmentWriter::new(SegmentId("s".into()), dir.to_path_buf())
+            .with_raw_posting_blobs(raw);
+        for i in 0..3000u32 {
+            let words: Vec<String> = (0..12)
+                .map(|j| format!("w{}", (i * 7 + j * 13) % 400))
+                .collect();
+            let text = format!("alpha beta {} gamma", words.join(" "));
+            w.add_document(
+                kosha_core::DocumentId(format!("d{i}")),
+                vec![Field::text("t", text)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap()
+    }
+
+    fn shard_files(dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("postings-")
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn is_wrapped(bytes: &[u8]) -> bool {
+        bytes.len() >= 4 && bytes[0..4] == COMPRESSED_INVERTED_MAGIC.to_le_bytes()
+    }
+
+    #[test]
+    fn raw_writer_leaves_shards_unwrapped_and_flags_the_footer() {
+        let raw_dir = scratch("raw");
+        let zst_dir = scratch("zst");
+        assert!(build(&raw_dir, true).posting_blobs_raw);
+        assert!(!build(&zst_dir, false).posting_blobs_raw);
+        assert!(shard_files(&raw_dir)
+            .iter()
+            .all(|p| !is_wrapped(&fs::read(p).unwrap())));
+        assert!(shard_files(&zst_dir)
+            .iter()
+            .any(|p| is_wrapped(&fs::read(p).unwrap())));
+        // The flag round-trips through footer.json, and a footer without it
+        // (every pre-#245 segment) reads as `false`.
+        let footer = SegmentReader::read_footer(&raw_dir).unwrap();
+        assert!(footer.posting_blobs_raw);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(zst_dir.join("footer.json")).unwrap()).unwrap();
+        assert!(
+            json.get("posting_blobs_raw").is_none(),
+            "omitted when false"
+        );
+        json.as_object_mut().unwrap().remove("posting_blobs_raw");
+        let old: Footer = serde_json::from_value(json).unwrap();
+        assert!(!old.posting_blobs_raw);
+
+        // Both read identically when whole (a raw shard is what any reader,
+        // old or new, already accepts: the wrapper was always optional).
+        let a = SegmentReader::open_with_options(raw_dir.clone(), false).unwrap();
+        let b = SegmentReader::open_with_options(zst_dir.clone(), false).unwrap();
+        for term in ["alpha", "w7", "w399", "gamma"] {
+            let pa: Vec<_> = a.postings(term).unwrap().to_vec();
+            let pb: Vec<_> = b.postings(term).unwrap().to_vec();
+            assert_eq!(pa, pb, "{term}");
+        }
+        let raw_size: u64 = shard_files(&raw_dir)
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().len())
+            .sum();
+        let zst_size: u64 = shard_files(&zst_dir)
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().len())
+            .sum();
+        println!("posting shards: raw {raw_size} bytes, zstd {zst_size} bytes");
+        let _ = fs::remove_dir_all(&raw_dir);
+        let _ = fs::remove_dir_all(&zst_dir);
+    }
+
+    /// Copy just `terms`' spans of every shard into the span cache and
+    /// remove the whole shards — the state a ranged cold query leaves.
+    fn keep_only_spans(dir: &Path, terms: &[String]) -> u64 {
+        let spans = posting_term_spans(dir, terms).unwrap();
+        let mut total = 0;
+        for s in &spans {
+            let shard = fs::read(dir.join(&s.file)).unwrap();
+            let d = span_cache::spans_dir(dir, &s.file);
+            fs::create_dir_all(&d).unwrap();
+            let (a, b) = (s.start as usize, (s.start + s.len) as usize);
+            fs::write(
+                d.join(span_cache::span_file_name(s.start, s.start + s.len)),
+                &shard[a..b],
+            )
+            .unwrap();
+            total += s.len;
+        }
+        for p in shard_files(dir) {
+            fs::remove_file(p).unwrap();
+        }
+        total
+    }
+
+    #[test]
+    fn term_spans_serve_postings_when_the_shard_is_absent() {
+        let dir = scratch("spans");
+        build(&dir, true);
+        let whole = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        let terms: Vec<String> = ["alpha", "w7", "gamma"].map(String::from).to_vec();
+        let expected: Vec<Vec<Posting>> = terms
+            .iter()
+            .map(|t| whole.postings(t).unwrap().to_vec())
+            .collect();
+        drop(whole);
+
+        let spans =
+            posting_term_spans(&dir, &[terms.clone(), vec!["absent".into()]].concat()).unwrap();
+        assert_eq!(spans.len(), 3, "terms the TOC lacks are left out");
+        let shard_bytes: u64 = shard_files(&dir)
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().len())
+            .sum();
+        let span_bytes = keep_only_spans(&dir, &terms);
+        assert!(
+            span_bytes * 4 < shard_bytes,
+            "{span_bytes} of {shard_bytes}"
+        );
+
+        let reader = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        for (t, want) in terms.iter().zip(&expected) {
+            assert_eq!(&reader.postings(t).unwrap().to_vec(), want, "{t}");
+        }
+        let batch = reader.postings_for_terms(&terms);
+        assert_eq!(batch.len(), 3);
+        let scoring = reader.scoring_postings_for_terms(&terms);
+        assert_eq!(scoring.len(), 3);
+        assert!(!reader.take_blob_read_failure());
+
+        // A TOC-present term with neither shard nor span is an error, not a
+        // silent non-match (PR #83 class).
+        assert!(reader.postings("w8").is_none());
+        assert!(reader.take_blob_read_failure());
+        let more = vec!["w8".to_string()];
+        assert!(reader.scoring_postings_for_terms(&more).is_empty());
+        assert!(reader.take_blob_read_failure());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spans_are_ignored_for_segments_without_raw_shards() {
+        let dir = scratch("noraw");
+        build(&dir, true);
+        let terms = vec!["alpha".to_string()];
+        keep_only_spans(&dir, &terms);
+        // Same bytes, but the footer no longer vouches that shards are raw.
+        let mut footer = SegmentReader::read_footer(&dir).unwrap();
+        footer.posting_blobs_raw = false;
+        fs::write(
+            dir.join("footer.json"),
+            serde_json::to_vec(&footer).unwrap(),
+        )
+        .unwrap();
+        let reader = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(reader.postings("alpha").is_none());
+        assert!(reader.take_blob_read_failure());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn whole_shard_wins_over_spans() {
+        let dir = scratch("wins");
+        build(&dir, true);
+        let terms = vec!["alpha".to_string()];
+        let saved: Vec<(PathBuf, Vec<u8>)> = shard_files(&dir)
+            .into_iter()
+            .map(|p| {
+                let b = fs::read(&p).unwrap();
+                (p, b)
+            })
+            .collect();
+        keep_only_spans(&dir, &terms);
+        // Corrupt the span: if the reader used it, decoding would differ.
+        let span = posting_term_spans(&dir, &terms).unwrap().remove(0);
+        let d = span_cache::spans_dir(&dir, &span.file);
+        let name = span_cache::span_file_name(span.start, span.start + span.len);
+        fs::write(d.join(name), vec![0xffu8; span.len as usize]).unwrap();
+        for (p, b) in &saved {
+            fs::write(p, b).unwrap();
+        }
+        let reader = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert_eq!(reader.postings("alpha").unwrap().len(), 3000);
+        assert!(!reader.take_blob_read_failure());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
