@@ -33,6 +33,10 @@ struct SegmentEntry {
     footer: Option<Footer>,
 }
 
+fn control_plane_error(e: sqlx::Error) -> KoshaError {
+    KoshaError::ControlPlane(e.to_string())
+}
+
 fn decode_manifest(version: u64, segments_json: &str) -> Option<Manifest> {
     if let Ok(mut manifest) = serde_json::from_str::<Manifest>(segments_json) {
         manifest.version = version;
@@ -300,7 +304,9 @@ impl ControlStore for PgStore {
     }
 
     /// One integer off the primary key, not the `segments_json` text.
-    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
+    /// Query errors surface as `KoshaError::ControlPlane`, never as a
+    /// missing namespace (#232).
+    fn manifest_version(&self, id: &NamespaceId) -> Result<Option<u64>, KoshaError> {
         let id_str = id.0.clone();
         self.rt.block_on(async {
             let row: Option<(i64,)> =
@@ -308,12 +314,32 @@ impl ControlStore for PgStore {
                     .bind(&id_str)
                     .fetch_optional(&self.pool)
                     .await
-                    .ok()?;
-            row.map(|(version,)| version as u64)
+                    .map_err(control_plane_error)?;
+            Ok(row.map(|(version,)| version as u64))
+        })
+    }
+
+    /// The query replicas' refresher poll: one small query for every
+    /// namespace, independent of how many namespaces the pod serves.
+    fn manifest_versions(&self) -> Result<Vec<(NamespaceId, u64)>, KoshaError> {
+        self.rt.block_on(async {
+            let rows: Vec<(String, i64)> =
+                sqlx::query_as("SELECT namespace_id, version FROM kosha.manifests")
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(control_plane_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|(id, version)| (NamespaceId(id), version as u64))
+                .collect())
         })
     }
 
     fn manifest_cloned(&self, id: &NamespaceId) -> Option<Manifest> {
+        self.try_manifest_cloned(id).ok().flatten()
+    }
+
+    fn try_manifest_cloned(&self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
         let id_str = id.0.clone();
         self.rt.block_on(async {
             let row: Option<(i64, String)> = sqlx::query_as(
@@ -322,10 +348,18 @@ impl ControlStore for PgStore {
             .bind(&id_str)
             .fetch_optional(&self.pool)
             .await
-            .ok()?;
+            .map_err(control_plane_error)?;
 
-            let (version, segments_json) = row?;
+            let Some((version, segments_json)) = row else {
+                return Ok(None);
+            };
             decode_manifest(version as u64, &segments_json)
+                .map(Some)
+                .ok_or_else(|| {
+                    KoshaError::ControlPlane(format!(
+                        "manifest row for '{id_str}' (version {version}) is not decodable"
+                    ))
+                })
         })
     }
 

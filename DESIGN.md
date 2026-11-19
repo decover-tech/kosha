@@ -641,7 +641,11 @@ one-time batch job reading from the existing Postgres/S3 document store and repl
 - **Manifest store dependency**: the control-plane metadata store (namespace registry, manifest
   pointers) is a new stateful dependency (likely Postgres, reusing Callosum's existing database)
   and becomes a new availability-critical path for the *write* side; read-path availability should
-  degrade gracefully (serve last-known-good manifest) if it's briefly unavailable.
+  degrade gracefully (serve last-known-good manifest) if it's briefly unavailable. *Implemented
+  for query pods (#232):* a background refresher polls manifest versions every
+  `KOSHA_MANIFEST_REFRESH_MS`; on control-store errors it keeps the last-known-good manifests,
+  counts the errors and lets `manifest_lag_seconds` (in `/v1/stats`) grow. Searches fail only for
+  a namespace the pod has never loaded. The write side still requires the store.
 - **Compaction cost/scheduling**: ~~needs a concrete policy (size-tiered vs. leveled)~~
   **resolved for Phase 1 in §7.1** (size-tiered lite, per-namespace locks, need-based triggers,
   admin `full` mode as emergency-only). Still open: cost model / fair multi-tenant scheduling for
