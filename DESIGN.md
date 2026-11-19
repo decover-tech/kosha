@@ -436,6 +436,25 @@ The SSD layer is a **read-through, write-behind cache**, never authoritative:
   scaffolding, postings, page documents: 3 sequential round trips (4 when the footers must be
   fetched first for pruning). No reader-format change: older binaries read raw shards, so a
   rollback still reads new segments; segments without the flag keep whole-shard hydration.
+- **Usage-driven warming** (#213): every search records decayed read counts (hits, and bytes
+  fetched from S3) per namespace, per segment and per file class (scoring scaffolding, posting
+  shards, doc store, vector index), with a half-life of `KOSHA_ACCESS_HALF_LIFE_SECS` (default
+  600) and at most `KOSHA_ACCESS_MAX_SEGMENTS` segments tracked (default 50,000; the coldest tenth
+  is dropped past it). Every `KOSHA_WARMSET_PERSIST_SECS` (default 60) the pod writes its top
+  namespaces and segments to `_warmset/<KOSHA_ROLE>.json` under the S3 prefix (pods of one role
+  share it; the last writer wins). The readiness-gated boot pass warms `KOSHA_WARMUP_NAMESPACES`
+  (always included, first) plus the namespaces of that warm set, so a restarted pod warms what was
+  actually hot. A usage namespace gets the scoring scaffolding plus only the classes it was seen
+  reading. Items are warmed scaffolding first, then in descending read rate, and the pass stops at
+  `KOSHA_WARMUP_BUDGET_BYTES` (unset is unlimited): the first item that does not fit and
+  everything after it are skipped, and the log and `GET /v1/admin/warmup-status` list what was
+  warmed and what was skipped. On query pods a re-warm thread polls `manifest_version` for hot
+  namespaces every `KOSHA_REWARM_INTERVAL_MS` (default 5000) and, when a flush or compaction
+  publishes, installs the new manifest and fetches the added segments before a user query does,
+  within what is left of the budget (a compaction's removed inputs give their bytes back). It
+  batches like the boot pass (a hydration permit per 8 segments, 2 for doc stores and vector
+  indexes), never touches readiness, and fails open. Warming a segment whole also drops its
+  sparse spans, the same as a promotion. `KOSHA_WARMUP_USAGE=0` restores the static behavior.
 - **Failure mode**: losing a query node's local disk (or the whole node) loses nothing but cache
   warmth. Traffic reroutes (consistent hashing + health checks) and the replacement node rebuilds
   its cache from S3 traffic as queries land.

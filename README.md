@@ -66,7 +66,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 - Whole-response result cache for `POST /search` (bypassable per query with `no_cache`).
 - Cross-replica hydration leases in Postgres: one pod fetches a cold segment from S3, its peers stream the bytes from it over `GET /internal/segment/...` rather than stampeding S3.
 - Bloom filters over terms and filter fields, so a segment that cannot match is skipped without being read.
-- Namespace warmup on boot, gated behind `/readyz` so traffic is not routed to a cold pod.
+- Namespace warmup on boot, gated behind `/readyz` so traffic is not routed to a cold pod. Warming is usage-driven (#213): pods count reads per namespace, segment and file class, persist the hot set to `_warmset/<role>.json` in S3, and warm it at the next boot alongside the explicit `KOSHA_WARMUP_NAMESPACES`. Query pods poll the manifest version of hot namespaces (`KOSHA_REWARM_INTERVAL_MS`, default 5000) and fetch the segments a flush or compaction adds before the next query. `KOSHA_WARMUP_BUDGET_BYTES` caps what warming keeps local (hottest first); `GET /v1/admin/warmup-status` reports what was warmed and skipped. `KOSHA_WARMUP_USAGE=0` turns the usage-driven part off.
 
 ### Control plane and operations
 
@@ -75,7 +75,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 - Read/write split: query pods forward every mutating route to `KOSHA_INGEST_HOST` and serve reads locally.
 - Backpressure controls: max concurrent searches, search queue depth and timeout, hydration concurrency, admission timeout.
 - `GET /healthz` (liveness), `GET /readyz` (readiness), `GET /v1/stats` and per-namespace stats.
-- Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, import a namespace.
+- Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, warmup status, import a namespace.
 - Schema migrations via `kosha-server migrate`.
 
 ### API and clients

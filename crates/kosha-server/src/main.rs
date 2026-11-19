@@ -34,6 +34,8 @@ mod posting_spans;
 mod s3_storage;
 #[cfg(feature = "s3")]
 mod segment_commit;
+mod warm;
+mod warm_run;
 
 #[cfg(feature = "s3")]
 use hydration_budget::{HydrationBudget, RequestHydration};
@@ -353,6 +355,10 @@ struct AppState {
     /// real queries also touch, a materially different risk tier than
     /// phases 1-4's pure disk-byte prefetch.
     warmup_hydrate_segment_cache: bool,
+    /// Usage-driven warming (#213): read tracking, the persisted warm set,
+    /// the byte budget, re-warm on manifest change and their reports. See
+    /// `warm` and `warm_run`.
+    warming: warm_run::Warming,
     /// `KOSHA_INGEST_HOST` — set only on query-role pods (deployment-query.yaml).
     /// When present, write-path requests this pod receives are forwarded here
     /// instead of executed locally — see `is_write_path`/`forward_to_ingest`.
@@ -570,8 +576,8 @@ struct HydrationOutcome {
 /// `vector.idx` depends entirely on the query that drove it
 /// (`query_needs_filter_store` / `query.knn.is_some()`). A pass for a plain
 /// unfiltered, unsorted, non-kNN query — including warmup's own probe query,
-/// see `run_warmup` — legitimately reports `outcome.missing.is_empty()` with
-/// *neither* file ever having been checked. Recording that success as a
+/// see `warm_run::scaffolding_probe_query` — legitimately reports
+/// `outcome.missing.is_empty()` with *neither* file ever having been checked. Recording that success as a
 /// flat `true` let a *later* query that actually needs `filters.bin` (a
 /// `query.filter`, a non-`_score`/`_id` sort, or `aggs`) or `vector.idx` (a
 /// `knn` query) take the cached-verdict fast path (`ensure_query_posting_blobs`
@@ -1405,6 +1411,7 @@ impl AppState {
             warmup_namespaces,
             warmup_posting_blobs,
             warmup_hydrate_segment_cache,
+            warming: warm_run::Warming::from_env(),
             ingest_host,
             write_http_client,
         }
@@ -1432,22 +1439,34 @@ impl AppState {
     /// first query still works via the live `hydrate_segments_for_search`
     /// path, only its latency is at stake, never correctness.
     fn spawn_warmup(self: &Arc<Self>) {
-        if self.warmup_namespaces.is_empty() {
-            return;
-        }
         #[cfg(not(feature = "s3"))]
         {
             // No durable tier → nothing to prefetch; pod is ready as-is.
-            return;
         }
         #[cfg(feature = "s3")]
         {
+            // Usage-driven warming (#213) needs object storage to read the
+            // persisted warm set from; explicit namespaces warm either way.
+            let usage = self.warming.cfg.usage && self.s3_storage.is_some();
+            if self.warmup_namespaces.is_empty() && !usage {
+                return;
+            }
             self.warmup_complete
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             let state = Arc::clone(self);
             std::thread::Builder::new()
                 .name("kosha-warmup".into())
-                .spawn(move || state.run_warmup())
+                .spawn(move || {
+                    let start = Instant::now();
+                    state.run_boot_warmup(&*state);
+                    state
+                        .warmup_complete
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    println!(
+                        "warmup: complete in {:.1}s — pod is ready",
+                        start.elapsed().as_secs_f64()
+                    );
+                })
                 .expect("failed to spawn warmup thread");
         }
     }
@@ -1533,297 +1552,6 @@ impl AppState {
     fn is_ready(&self) -> bool {
         self.warmup_complete
             .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    #[cfg(feature = "s3")]
-    fn run_warmup(&self) {
-        let start = std::time::Instant::now();
-        let total = self.warmup_namespaces.len();
-        for (idx, ns_name) in self.warmup_namespaces.iter().enumerate() {
-            let ns = NamespaceId(ns_name.clone());
-            let (manifest, tombstones) = {
-                let Some(m) = self.indexer.manifest_cloned(&ns) else {
-                    eprintln!("warmup: namespace '{ns_name}' not found in control plane; skipping");
-                    continue;
-                };
-                let t = self.indexer.get_tombstones(&ns);
-                (m, t)
-            };
-            if manifest.segments.is_empty() {
-                println!("warmup: '{ns_name}' has no segments; nothing to prefetch");
-                continue;
-            }
-            // Empty query → bloom-prune is a no-op, no posting blobs or
-            // doc spans are fetched — just the scoring scaffolding
-            // (footer.json + inverted.idx + doc_store.offsets) for every
-            // segment in the manifest. The first real query then pays
-            // only for its term shards + page doc spans.
-            let query = kosha_core::SearchQuery {
-                query_text: String::new(),
-                max_results: 0,
-                bm25_params: Default::default(),
-                from: 0,
-                filter: None,
-                sort: Vec::new(),
-                search_after: None,
-                highlight: None,
-                aggs: std::collections::HashMap::new(),
-                wildcard: None,
-                match_phrase: None,
-                knn: None,
-                exact_total_hits: None,
-                total_hits_cap: None,
-                operator: None,
-                no_cache: None,
-                collapse: None,
-                source_includes: None,
-                source_excludes: None,
-            };
-            let needs_filters = query_needs_filter_store(&query);
-            let needs_vectors = query.knn.is_some();
-            let t_ns = std::time::Instant::now();
-            let outcome = self.hydrate_segments_for_search(
-                &ns,
-                &manifest,
-                &query,
-                &RequestHydration::unlimited(),
-            );
-            let _ = tombstones;
-            let dur = t_ns.elapsed();
-            // query.filter is always None above, so bloom_pruned is always
-            // false here — this condition is defensive consistency with
-            // the search-path callers (see HydrationOutcome::bloom_pruned),
-            // not a behavior change for warmup itself.
-            if outcome.missing.is_empty() && !outcome.bloom_pruned {
-                // Mirror the search path's verdict caching (handle_search_post):
-                // record only what this pass actually verified — see
-                // `HydrationVerdict`. Warmup's probe query is unfiltered,
-                // unsorted, and non-kNN, so `needs_filters`/`needs_vectors`
-                // are both false here: this merge is a no-op today (neither
-                // flag is set), which is exactly the point — warmup's own
-                // success must NOT be mistaken for "filters.bin/vector.idx
-                // are local," or a later filtered/sorted/kNN query on this
-                // same pod would wrongly take the cached-verdict fast path
-                // and silently skip hydrating the file it actually needs.
-                self.completed_hydrations
-                    .lock()
-                    .unwrap()
-                    .entry((ns.0.clone(), manifest.version))
-                    .or_default()
-                    .merge(needs_filters, needs_vectors);
-                println!(
-                    "warmup: [{}/{}] '{ns_name}' ready: fetched {} file(s), {:.1} MB in {:.1}s",
-                    idx + 1,
-                    total,
-                    outcome.files_fetched,
-                    outcome.bytes_fetched as f64 / (1024.0 * 1024.0),
-                    dur.as_secs_f64(),
-                );
-            } else {
-                eprintln!(
-                    "warn: warmup: [{}/{}] '{ns_name}' partial — {} segment(s) still missing \
-                     after fetch ({:.1}s); live cold-query fallback (HTTP 503 + client retry) \
-                     will cover the rest",
-                    idx + 1,
-                    total,
-                    outcome.missing.len(),
-                    dur.as_secs_f64(),
-                );
-            }
-
-            // Phase 2 — bulk posting-blob prefetch (the cold-start-convoy
-            // fix). The scoring-set pass above leaves every `postings-XX.bin`
-            // shard to first-touch queries; at 8 QPS those all fan out to S3
-            // at once, saturate the hydrator, and queue behind each other
-            // (measured: ~3 minutes of 7–12s p99 after a cold start, vs
-            // 529ms steady-state). Prefetching the shards here moves that
-            // transient off the query path entirely.
-            //
-            // Batched in small segment groups on purpose:
-            // `ensure_posting_blobs_local` holds a `hydration_semaphore`
-            // permit (default 4) for the duration of each call, so one
-            // whole-namespace call would starve live queries arriving
-            // mid-warmup — recreating the convoy in a different queue. Short
-            // batches interleave with query traffic, and each batch's
-            // verified shards land in the presence cache as it completes.
-            // Requires `inverted.idx` local to detect split segments, which
-            // phase 1 just ensured.
-            if self.warmup_posting_blobs {
-                let t_blobs = std::time::Instant::now();
-                let all_blobs = kosha_segment::all_posting_blob_files();
-                let seg_paths: Vec<PathBuf> = manifest
-                    .segments
-                    .iter()
-                    .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
-                    .collect();
-                let mut blob_files = 0usize;
-                let mut blob_bytes = 0u64;
-                let mut blob_missing = 0usize;
-                for chunk in seg_paths.chunks(8) {
-                    let o = self.ensure_posting_blobs_local(
-                        &ns,
-                        manifest.version,
-                        chunk,
-                        &all_blobs,
-                        &RequestHydration::unlimited(),
-                    );
-                    blob_files += o.files_fetched;
-                    blob_bytes += o.bytes_fetched;
-                    blob_missing += o.missing.len();
-                }
-                if blob_missing == 0 {
-                    println!(
-                        "warmup: [{}/{}] '{ns_name}' posting blobs ready: fetched {} blob(s), \
-                         {:.1} MB in {:.1}s",
-                        idx + 1,
-                        total,
-                        blob_files,
-                        blob_bytes as f64 / (1024.0 * 1024.0),
-                        t_blobs.elapsed().as_secs_f64(),
-                    );
-                } else {
-                    eprintln!(
-                        "warn: warmup: [{}/{}] '{ns_name}' posting blobs partial — {} blob(s) \
-                         still missing after fetch ({:.1}s); first-touch queries will hydrate \
-                         the rest",
-                        idx + 1,
-                        total,
-                        blob_missing,
-                        t_blobs.elapsed().as_secs_f64(),
-                    );
-                }
-
-                // Phase 3 — doc stores. Kept in both read modes: a
-                // namespace named for warmup is meant to be fully local,
-                // and a whole local file makes the ranged path (#245, see
-                // `hydrate_page_docs`) a no-op. History: page
-                // materialization used to ask for the WHOLE
-                // `doc_store.bin` of every page-hit segment, so on a
-                // cold pod the first queries pay full-file S3 fetches — for
-                // large compacted segments that is a multi-GB in-memory GET
-                // on the query path (the round-7 incident: a 10.6GB merged
-                // doc store failed repeatedly under memory pressure and
-                // 100% of queries 503'd). Prefetching here moves that cost
-                // into the readiness gate, batched like the blobs so the
-                // hydration semaphore is never held for the whole namespace.
-                // Chunks of 2, not 8: post-compaction doc stores are the
-                // largest files in a segment, and a fat batch of them holds
-                // the hydration permit (and a large slice of the in-flight
-                // byte budget) away from live queries for its whole
-                // duration. This used to be a heap constraint as well — the
-                // fetch buffered each body whole — which streaming to disk
-                // has removed, so whether 2 is still the right number is now
-                // a throughput question to measure, not a memory one.
-                let t_ds = std::time::Instant::now();
-                let mut ds_files = 0usize;
-                let mut ds_bytes = 0u64;
-                let warmup_request = RequestHydration::unlimited();
-                for chunk in seg_paths.chunks(2) {
-                    let (files, bytes) = self.ensure_doc_store_local(chunk, &warmup_request);
-                    ds_files += files;
-                    ds_bytes += bytes;
-                }
-                if ds_files > 0 {
-                    println!(
-                        "warmup: [{}/{}] '{ns_name}' doc stores ready: fetched {} file(s), \
-                         {:.1} MB in {:.1}s",
-                        idx + 1,
-                        total,
-                        ds_files,
-                        ds_bytes as f64 / (1024.0 * 1024.0),
-                        t_ds.elapsed().as_secs_f64(),
-                    );
-                }
-
-                // Phase 4 — vector indexes, only for namespaces that have
-                // them. A cold kNN query otherwise hydrates `vector.idx`
-                // (hundreds of MB to GBs per segment at embedding scale)
-                // on the query path — the doc-store lesson (#123/#126) in
-                // vector form.
-                //
-                // 2026-08-15: previously probed only the *first* segment's
-                // tiny `vector.offsets` sidecar and skipped this whole phase
-                // for the namespace if that one segment lacked it, on the
-                // assumption that "segments are format-homogeneous within a
-                // namespace in practice." A bulk migration can violate that:
-                // a single flush batch with zero embedded source documents
-                // produces one vector-less segment sitting alongside
-                // hundreds of segments that do have vectors — the single-
-                // segment probe then silently skipped vector warmup for the
-                // *entire* namespace, leaving `vector.idx`/`vector.offsets`
-                // never hydrated and every kNN query returning empty with no
-                // error (`load_vector_index`'s local-file-missing path is
-                // deliberately silent). `ensure_files_local` already
-                // tolerates per-segment missing files (see its doc comment),
-                // so there's no need for the namespace-wide gate at all —
-                // always attempt the fetch and let each segment's own
-                // presence/absence of `vector.offsets` decide for itself.
-                let t_vec = std::time::Instant::now();
-                let mut vec_files = 0usize;
-                let mut vec_bytes = 0u64;
-                for chunk in seg_paths.chunks(8) {
-                    let (files, bytes) =
-                        self.ensure_files_local(chunk, "vector.offsets", &warmup_request);
-                    vec_files += files;
-                    vec_bytes += bytes;
-                }
-                // Same chunks-of-2 as doc stores, for the same
-                // permit-fairness reason.
-                for chunk in seg_paths.chunks(2) {
-                    let (files, bytes) =
-                        self.ensure_files_local(chunk, "vector.idx", &warmup_request);
-                    vec_files += files;
-                    vec_bytes += bytes;
-                }
-                if vec_files > 0 {
-                    println!(
-                        "warmup: [{}/{}] '{ns_name}' vector indexes ready: fetched {} file(s), \
-                         {:.1} MB in {:.1}s",
-                        idx + 1,
-                        total,
-                        vec_files,
-                        vec_bytes as f64 / (1024.0 * 1024.0),
-                        t_vec.elapsed().as_secs_f64(),
-                    );
-                }
-
-                // Phase 5 — actually open every segment into the live
-                // `Searcher::segment_cache`, not just prefetch its bytes.
-                // Phase 4 above makes `open_segment` *fast* on first
-                // touch; without this, it's still first-touch — the
-                // first wave of real kNN queries pays for opening every
-                // segment itself (global_probe_cutoff touches all of
-                // them on every query), reproducing the same convoy
-                // phase 4 exists to prevent, just one query later.
-                if self.warmup_hydrate_segment_cache {
-                    let t_cache = std::time::Instant::now();
-                    match self.searcher.warm_segments(&ns, &manifest, true) {
-                        Ok(o) => println!(
-                            "warmup: [{}/{}] '{ns_name}' segment cache warmed: {} opened, \
-                             {} already cached, ~{:.1} MB charged in {:.1}s",
-                            idx + 1,
-                            total,
-                            o.opened,
-                            o.already_cached,
-                            o.bytes as f64 / (1024.0 * 1024.0),
-                            t_cache.elapsed().as_secs_f64(),
-                        ),
-                        Err(e) => eprintln!(
-                            "warn: warmup: [{}/{}] '{ns_name}' segment cache warm failed: \
-                             {e} — first real kNN queries will cold-open (fail-open)",
-                            idx + 1,
-                            total,
-                        ),
-                    }
-                }
-            }
-        }
-        self.warmup_complete
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        println!(
-            "warmup: complete in {:.1}s — pod is ready",
-            start.elapsed().as_secs_f64()
-        );
     }
 
     /// Persist the indexer's current manifest for a namespace into the
@@ -4033,6 +3761,8 @@ fn main() {
     // `/readyz` keeps HPA/kube endpoints from sending traffic while it
     // runs (Tier 1 O2). Liveness (`/healthz`) is unaffected.
     state.spawn_warmup();
+    state.spawn_rewarmer();
+    state.spawn_warm_set_persister();
     state.spawn_doc_store_promoter();
     state.spawn_posting_promoter();
     state.spawn_idle_flush_timer();
@@ -4151,6 +3881,7 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
             let body = serde_json::json!({
                 "status": "warming",
                 "warmup_namespaces": state.warmup_namespaces,
+                "boot_namespaces": *state.warming.boot_namespaces.lock().unwrap(),
             })
             .to_string();
             let resp = format!(
@@ -4562,6 +4293,10 @@ fn route_inner(
 
     if request_line.starts_with("POST /v1/admin/compact-namespace") {
         return handle_compact_namespace(body, tenant, state);
+    }
+
+    if request_line.starts_with("GET /v1/admin/warmup-status") {
+        return json_ok(&state.warmup_status_json());
     }
 
     if request_line.starts_with("GET /v1/admin/compaction-status") {
@@ -5193,6 +4928,15 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     };
     if let Some(ref key) = cache_key {
         if let Some(resp) = state.result_cache.lock().unwrap().lookup(key) {
+            // Still demand for this namespace (#213): a cached response is
+            // one eviction or publish away from reading the same files.
+            state.record_search_access(
+                &ns,
+                manifest,
+                &query,
+                &kosha_query::SearchPhaseStats::default(),
+                &HydrationOutcome::default(),
+            );
             return resp;
         }
     }
@@ -5358,6 +5102,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                 result.total_hits,
                 result.knn_degraded_segments,
             );
+            state.record_search_access(&ns, manifest, &query, &phases, &hydration);
             let resp = json_ok(&result);
             // Only successful responses enter the cache, after the search
             // proved every needed file readable.
@@ -5741,6 +5486,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
                 result.total_hits,
                 result.knn_degraded_segments,
             );
+            state.record_search_access(&ns, manifest, &query, &phases, &hydration);
             json_ok(&result)
         }
         Err(e) => {
@@ -9218,7 +8964,7 @@ mod tests {
     // Same bug family as #166 (LazyFilters) and #167 (bloom_pruned), one
     // layer up: `completed_hydrations` used to be a flat `bool`, so ANY
     // successful, non-bloom-pruned pass — including warmup's own probe
-    // query (unfiltered, unsorted, non-kNN — see `run_warmup`) or an
+    // query (unfiltered, unsorted, non-kNN — see `warm_run::scaffolding_probe_query`) or an
     // ordinary plain-text search — got cached as "namespace hydrated" for
     // that manifest version. But `hydrate_segments_for_search` only ever
     // checks `filters.bin`/`vector.idx` when the *driving* query needs
@@ -10890,5 +10636,378 @@ mod tests {
             redact_database_url("postgresql://localhost/kosha"),
             "postgresql://localhost/kosha"
         );
+    }
+
+    // ── Usage-driven warming (#213) ─────────────────────────────────────
+
+    /// Stands in for S3 in warming tests: `remote` is the ingest pod's
+    /// data dir (every published segment), `local` the query pod's cache,
+    /// and `warm_sets` the bucket prefix the warm set is persisted under.
+    struct MirrorStorage {
+        remote: PathBuf,
+        local: PathBuf,
+        warm_sets: PathBuf,
+    }
+
+    impl MirrorStorage {
+        fn new(remote: &Path, local: &Path, warm_sets: &Path) -> Self {
+            Self {
+                remote: remote.to_path_buf(),
+                local: local.to_path_buf(),
+                warm_sets: warm_sets.to_path_buf(),
+            }
+        }
+    }
+
+    impl warm_run::WarmStorage for MirrorStorage {
+        fn class_sizes(
+            &self,
+            ns: &NamespaceId,
+        ) -> Result<HashMap<(String, warm::FileClass), u64>, String> {
+            Ok(warm_run::local_class_sizes(&self.remote.join(&ns.0)))
+        }
+
+        fn warm_batch(
+            &self,
+            ns: &NamespaceId,
+            _manifest: &kosha_core::Manifest,
+            class: warm::FileClass,
+            segments: &[String],
+        ) -> warm_run::BatchOutcome {
+            let mut o = warm_run::BatchOutcome::default();
+            for seg in segments {
+                let from = self.remote.join(&ns.0).join(seg);
+                let to = self.local.join(&ns.0).join(seg);
+                fs::create_dir_all(&to).unwrap();
+                for f in fs::read_dir(&from).unwrap().flatten() {
+                    let name = f.file_name().to_string_lossy().into_owned();
+                    // Files no class names (`_COMMIT`) travel with the
+                    // scaffolding so the segment opens.
+                    let c = warm::FileClass::of_file(&name).unwrap_or(warm::FileClass::Scoring);
+                    let dest = to.join(&name);
+                    if c != class || !f.path().is_file() || dest.exists() {
+                        continue;
+                    }
+                    o.bytes += fs::copy(f.path(), &dest).unwrap();
+                    o.files += 1;
+                }
+            }
+            o
+        }
+
+        fn load_warm_set(&self, role: &str) -> Result<Option<warm::WarmSet>, String> {
+            match fs::read(self.warm_sets.join(warm::warm_set_path(role))) {
+                Ok(b) => Ok(Some(serde_json::from_slice(&b).unwrap())),
+                Err(_) => Ok(None),
+            }
+        }
+
+        fn store_warm_set(&self, role: &str, set: &warm::WarmSet) -> Result<(), String> {
+            let path = self.warm_sets.join(warm::warm_set_path(role));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, serde_json::to_vec(set).unwrap()).map_err(|e| e.to_string())
+        }
+    }
+
+    /// An ingest pod publishing to `shared`, with namespaces pre-created.
+    fn warm_ingest(shared: &SharedManifestStore, namespaces: &[&str]) -> AppState {
+        for ns in namespaces {
+            shared
+                .inner
+                .lock()
+                .unwrap()
+                .ensure_namespace(NamespaceId(tenant_namespace("test", ns)));
+        }
+        let ingest = test_state();
+        *ingest.controller.lock().unwrap() = Box::new(shared.clone());
+        ingest
+    }
+
+    /// A query replica (writes forwarded, manifests from `shared`) with an
+    /// empty cache and default warming configuration.
+    fn warm_query_replica(shared: &SharedManifestStore) -> AppState {
+        let mut q = test_state();
+        q.ingest_host = Some("http://ingest.invalid".into());
+        q.warmup_namespaces.clear();
+        q.warming =
+            warm_run::Warming::new(warm::WarmConfig::default(), warm::AccessConfig::default());
+        *q.controller.lock().unwrap() = Box::new(shared.clone());
+        q
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = test_state().data_dir.join(tag);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn search_hits(state: &AppState, ns: &str) -> String {
+        handle_search_post(
+            format!(r#"{{"namespace":"{ns}","query_text":"segment"}}"#).as_bytes(),
+            state,
+        )
+    }
+
+    fn stored_segments(shared: &SharedManifestStore, ns: &NamespaceId) -> Vec<String> {
+        shared
+            .inner
+            .lock()
+            .unwrap()
+            .manifest(ns)
+            .unwrap()
+            .segments
+            .iter()
+            .map(|e| e.segment_id.0.clone())
+            .collect()
+    }
+
+    /// Acceptance (a): after a compaction publishes, the re-warm poll on a
+    /// query pod installs the new manifest and makes the merged segment's
+    /// files local — for a namespace that is hot from traffic, with no
+    /// explicit warmup list — before the next user query arrives, so that
+    /// query pays no cold fetch. A namespace nobody queries is left to lazy
+    /// hydration, as before.
+    #[test]
+    fn rewarm_makes_a_compacted_segment_local_before_the_next_search() {
+        let shared = shared_store();
+        let ingest = warm_ingest(&shared, &["hot", "idle"]);
+        let ns = seed_segments(&ingest, "hot", 3);
+        let idle = seed_segments(&ingest, "idle", 1);
+        let mut query = warm_query_replica(&shared);
+        // Hot means at least two decayed searches here: 3 on `hot`, 1 on
+        // `idle`.
+        let mut cfg = warm::WarmConfig::default();
+        cfg.limits.min_score = 2.0;
+        query.warming = warm_run::Warming::new(cfg, warm::AccessConfig::default());
+        let storage = MirrorStorage::new(&ingest.data_dir, &query.data_dir, &scratch_dir("ws"));
+        // The replica already holds today's segments (earlier traffic).
+        copy_tree(&ingest.data_dir.join("test"), &query.data_dir.join("test"));
+        for _ in 0..3 {
+            assert!(search_hits(&query, &ns.0).contains("\"total_hits\":3"));
+        }
+        assert!(search_hits(&query, &idle.0).contains("\"total_hits\":1"));
+        assert!(
+            query.run_rewarm_tick(&storage).is_none(),
+            "nothing changed yet"
+        );
+
+        let response =
+            handle_compact_namespace(br#"{"namespace":"hot","mode":"full"}"#, "test", &ingest);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let merged = stored_segments(&shared, &ns);
+        assert_eq!(merged.len(), 1);
+        let merged_dir = query.data_dir.join(&ns.0).join(&merged[0]);
+        assert!(!merged_dir.exists(), "the merged segment starts cold");
+        // A flush publishes a new segment on the idle namespace too.
+        let idle_before = stored_segments(&shared, &idle);
+        index_one(&ingest, &idle.0, "late");
+        route(
+            "POST /flush HTTP/1.1\r\n",
+            &HashMap::new(),
+            br#"{"namespace":"idle"}"#,
+            "test",
+            &ingest,
+        );
+        assert_eq!(stored_segments(&shared, &idle).len(), idle_before.len() + 1);
+
+        let report = query
+            .run_rewarm_tick(&storage)
+            .expect("a hot namespace's manifest changed");
+        assert_eq!(report.trigger, "rewarm");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.warmed.iter().all(|i| i.segment == merged[0]));
+        assert!(report.skipped.is_empty());
+        assert_eq!(report.namespaces.len(), 1, "idle is not re-warmed");
+        // Installed before any user query asked for it...
+        assert_eq!(
+            query.indexer.manifest_version(&ns),
+            shared
+                .inner
+                .lock()
+                .unwrap()
+                .manifest(&ns)
+                .map(|m| m.version)
+        );
+        // ...and every file of the merged segment is local.
+        for f in fs::read_dir(ingest.data_dir.join(&ns.0).join(&merged[0]))
+            .unwrap()
+            .flatten()
+        {
+            assert!(
+                merged_dir.join(f.file_name()).is_file(),
+                "{:?} not warmed",
+                f.file_name()
+            );
+        }
+        // The idle namespace's new segment stays cold until queried.
+        let idle_new: Vec<String> = stored_segments(&shared, &idle)
+            .into_iter()
+            .filter(|s| !idle_before.contains(s))
+            .collect();
+        assert!(!query.data_dir.join(&idle.0).join(&idle_new[0]).exists());
+
+        // The next search is served from local files.
+        assert!(search_hits(&query, &ns.0).contains("\"total_hits\":3"));
+        // Compacted inputs no longer count; a second poll has nothing to do.
+        let rates = query.warming.tracker.namespace(&ns.0).unwrap();
+        assert!(rates.segments.iter().all(|(s, _)| s == &merged[0]));
+        assert!(query.run_rewarm_tick(&storage).is_none());
+    }
+
+    /// Acceptance (b): traffic shifts from namespace A to B; the pod
+    /// persists its warm set; a restarted pod with an empty cache and the
+    /// same (empty) `KOSHA_WARMUP_NAMESPACES` warms B, not A.
+    #[test]
+    fn restarted_pod_warms_the_namespace_traffic_shifted_to() {
+        let shared = shared_store();
+        let ingest = warm_ingest(&shared, &["a", "b"]);
+        let a = seed_segments(&ingest, "a", 2);
+        let b = seed_segments(&ingest, "b", 2);
+        let warm_sets = scratch_dir("warmsets");
+
+        let pod1 = warm_query_replica(&shared);
+        copy_tree(&ingest.data_dir.join("test"), &pod1.data_dir.join("test"));
+        let storage1 = MirrorStorage::new(&ingest.data_dir, &pod1.data_dir, &warm_sets);
+        for _ in 0..20 {
+            assert!(search_hits(&pod1, &a.0).contains("\"total_hits\":2"));
+        }
+        // Two hours (12 half-lives) later, all traffic is on B.
+        pod1.warming.tracker.advance(Duration::from_secs(2 * 3600));
+        for _ in 0..10 {
+            assert!(search_hits(&pod1, &b.0).contains("\"total_hits\":2"));
+        }
+        let rates = pod1.warming.tracker.namespace(&b.0).unwrap();
+        // Repeats are served from the result cache: still demand for the
+        // namespace's scaffolding and postings, but no page read.
+        assert!(
+            rates.hits.postings > 9.0 && rates.hits.doc_store > 0.9,
+            "{rates:?}"
+        );
+        assert_eq!(pod1.persist_warm_set(&storage1), Ok(1), "only B is hot");
+        drop(pod1);
+
+        let pod2 = warm_query_replica(&shared);
+        assert!(pod2.warmup_namespaces.is_empty(), "no environment change");
+        let storage2 = MirrorStorage::new(&ingest.data_dir, &pod2.data_dir, &warm_sets);
+        let report = pod2.run_boot_warmup(&storage2);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let warmed: Vec<&str> = report
+            .namespaces
+            .iter()
+            .map(|n| n.namespace.as_str())
+            .collect();
+        assert_eq!(warmed, vec![b.0.as_str()]);
+        assert_eq!(report.namespaces[0].source, Some(warm::Source::Usage));
+        assert_eq!(report.skipped_items, 0);
+        for seg in stored_segments(&shared, &b) {
+            let dir = pod2.data_dir.join(&b.0).join(&seg);
+            assert!(dir.join("inverted.idx").is_file(), "{seg} scaffolding");
+            assert!(dir.join("doc_store.bin").is_file(), "{seg} doc store");
+        }
+        assert!(!pod2.data_dir.join(&a.0).exists(), "A is no longer hot");
+        assert!(search_hits(&pod2, &b.0).contains("\"total_hits\":2"));
+        let status = pod2.warmup_status_json();
+        assert_eq!(status["warm_set"]["loaded_namespaces"], 1);
+        assert_eq!(status["boot"]["namespaces"][0]["namespace"], b.0.as_str());
+    }
+
+    /// Acceptance (c): the boot pass stops at `KOSHA_WARMUP_BUDGET_BYTES`
+    /// and reports what it warmed and what it skipped (log, and
+    /// `GET /v1/admin/warmup-status`); a later re-warm spends only what the
+    /// budget has left.
+    #[test]
+    fn warmup_honors_the_byte_budget_and_reports_warmed_and_skipped() {
+        let shared = shared_store();
+        let ingest = warm_ingest(&shared, &["big"]);
+        let ns = seed_segments(&ingest, "big", 3);
+        let sizes = warm_run::local_class_sizes(&ingest.data_dir.join(&ns.0));
+        let scoring: u64 = sizes
+            .iter()
+            .filter(|((_, c), _)| *c == warm::FileClass::Scoring)
+            .map(|(_, b)| *b)
+            .sum();
+        let total: u64 = sizes.values().sum();
+        assert!(total > scoring, "segments have more than scaffolding");
+
+        let mut pod = warm_query_replica(&shared);
+        pod.warmup_namespaces = vec![ns.0.clone()];
+        pod.admin_auth_key = Some("admin-key".into());
+        pod.warming = warm_run::Warming::new(
+            warm::WarmConfig {
+                budget_bytes: Some(scoring),
+                ..Default::default()
+            },
+            warm::AccessConfig::default(),
+        );
+        let storage = MirrorStorage::new(&ingest.data_dir, &pod.data_dir, &scratch_dir("ws"));
+        let report = pod.run_boot_warmup(&storage);
+
+        assert_eq!(report.budget_bytes, Some(scoring));
+        assert_eq!(report.warmed_items, 3);
+        assert_eq!(report.warmed_bytes, scoring);
+        assert!(report
+            .warmed
+            .iter()
+            .all(|i| i.class == warm::FileClass::Scoring));
+        assert!(report.skipped_items > 0);
+        assert_eq!(report.skipped_bytes, total - scoring);
+        assert!(report
+            .skipped
+            .iter()
+            .all(|i| i.class != warm::FileClass::Scoring));
+        for seg in stored_segments(&shared, &ns) {
+            let dir = pod.data_dir.join(&ns.0).join(&seg);
+            assert!(dir.join("inverted.idx").is_file());
+            assert!(!dir.join("doc_store.bin").exists(), "over budget");
+        }
+
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "Bearer admin-key".to_string());
+        let response = route(
+            "GET /v1/admin/warmup-status HTTP/1.1",
+            &headers,
+            b"",
+            "service",
+            &pod,
+        );
+        let status = json_body(&response);
+        assert_eq!(status["boot"]["warmed_items"], 3);
+        assert_eq!(status["boot"]["skipped_items"], report.skipped_items);
+        assert!(!status["boot"]["skipped"].as_array().unwrap().is_empty());
+        assert_eq!(status["budget_remaining_bytes"], 0);
+        assert_eq!(status["config"]["budget_bytes"], scoring);
+
+        // A flush adds a segment; the budget is spent, so the re-warm
+        // reports it skipped rather than overrunning.
+        index_one(&ingest, &ns.0, "late");
+        route(
+            "POST /flush HTTP/1.1\r\n",
+            &HashMap::new(),
+            br#"{"namespace":"big"}"#,
+            "test",
+            &ingest,
+        );
+        let rewarm = pod.run_rewarm_tick(&storage).expect("manifest changed");
+        assert_eq!(rewarm.available_bytes, Some(0));
+        assert_eq!(rewarm.warmed_items, 0);
+        assert!(rewarm.skipped_items > 0);
+        assert_eq!(pod.warmup_status_json()["rewarms"][0]["warmed_items"], 0);
+    }
+
+    #[test]
+    fn searches_record_reads_per_segment_and_class() {
+        let state = test_state();
+        let ns = seed_segments(&state, "tracked", 2);
+        let response = search_hits(&state, &ns.0);
+        assert!(response.contains("\"total_hits\":2"), "{response}");
+        let rates = state.warming.tracker.namespace(&ns.0).unwrap();
+        assert!((rates.hits.scoring - 1.0).abs() < 1e-3);
+        assert!((rates.hits.postings - 1.0).abs() < 1e-3);
+        assert!((rates.hits.doc_store - 1.0).abs() < 1e-3, "page read");
+        assert_eq!(rates.hits.vectors, 0.0);
+        assert_eq!(rates.segments.len(), 2);
+        for (_, v) in &rates.segments {
+            assert!((v[warm::FileClass::DocStore.index()] - 1.0).abs() < 1e-3);
+        }
     }
 }

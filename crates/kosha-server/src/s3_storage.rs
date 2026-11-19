@@ -594,6 +594,17 @@ impl S3Storage {
         ns_path: &str,
         wants: impl Fn(&str) -> bool,
     ) -> Result<std::collections::HashMap<String, u64>, KoshaError> {
+        Ok(sum_segment_sizes(
+            self.list_namespace_objects(ns_path)?,
+            wants,
+        ))
+    }
+
+    /// Every object under a namespace prefix as `(<segment>/<file>, size)`,
+    /// from one paginated LIST (about one request per 1,000 objects). The
+    /// raw listing behind [`Self::segment_sizes`]; usage-driven warming
+    /// (#213) sizes each file class of each segment from it.
+    pub fn list_namespace_objects(&self, ns_path: &str) -> Result<Vec<(String, u64)>, KoshaError> {
         let mut prefix = self.s3_key(ns_path);
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
@@ -626,7 +637,7 @@ impl S3Storage {
             }
             Ok::<_, KoshaError>(out)
         })?;
-        Ok(sum_segment_sizes(objects, wants))
+        Ok(objects)
     }
 
     /// Ground-truth durability check for one segment prefix, unlike

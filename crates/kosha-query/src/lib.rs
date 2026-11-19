@@ -930,7 +930,7 @@ pub fn flat_knn(query_vector: &[f32], vectors: &[(u32, Vec<f32>)], k: usize) -> 
 /// across rayon workers, so it can legitimately exceed `score_wall_ms` under
 /// parallelism — read it together with `open_cold` as "average cold-open
 /// cost", not as a wall-clock share.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct SearchPhaseStats {
     /// Admission-gate wait (`MemoryLedger::admit`) plus the byte-estimate
     /// pass. Near-zero unless the pod is shedding load.
@@ -953,6 +953,12 @@ pub struct SearchPhaseStats {
     /// Under the global probe budget it should land near
     /// `num_candidates` for the whole query. Zero for non-kNN queries.
     pub knn_postings_probed: usize,
+    /// Segment directories holding at least one document of the returned
+    /// page, deduplicated, in page order: the segments whose doc store this
+    /// search read. The server's access tracker (#213) counts these as
+    /// doc-store reads per segment, so usage-driven warming knows which
+    /// segments' doc stores are actually hot.
+    pub page_segments: Vec<PathBuf>,
 }
 
 /// Shared-atomic collector threaded through the parallel scoring pass to
@@ -3061,6 +3067,12 @@ impl Searcher {
         // hydrator for them once (ranged spans or whole files — its call,
         // see `DocStoreHydrator`). Whatever it fetched is persisted, so a
         // warm repeat finds every document local and never gets here.
+        for cand in &candidates[from..to] {
+            let dir = cand.reader.segment_dir();
+            if !phase_stats.page_segments.iter().any(|d| d == dir) {
+                phase_stats.page_segments.push(dir.to_path_buf());
+            }
+        }
         if let Some(ensure_doc_store) = doc_store_hydrator {
             let mut page_segs: Vec<(&Arc<TrackedSegment>, Vec<u32>)> = Vec::new();
             for cand in &candidates[from..to] {
