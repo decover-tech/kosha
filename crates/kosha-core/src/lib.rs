@@ -191,6 +191,39 @@ pub struct Bm25Overrides {
     /// Length normalization. Must be finite and within `[0, 1]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub b: Option<f64>,
+    /// Where IDF and `avgdl` come from (issue #246). Omitted means the
+    /// engine default ([`Bm25StatsScope::Namespace`] unless the server
+    /// runs with `KOSHA_BM25_STATS=segment`). Not serialized when omitted,
+    /// so result-cache keys of requests that don't set it are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<Bm25StatsScope>,
+}
+
+/// Which corpus BM25's collection statistics (`N`, `df`, `avgdl`) are
+/// taken from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Bm25StatsScope {
+    /// Summed over every segment of the namespace's manifest, so a
+    /// document scores the same whichever segment it landed in and scores
+    /// from different segments can be merged by value.
+    #[default]
+    Namespace,
+    /// Each segment's own `N`, `df` and `avgdl` — the pre-#246 behavior,
+    /// kept as a debug / A-B switch. Scores from different segments are
+    /// not comparable under this scope.
+    Segment,
+}
+
+impl Bm25StatsScope {
+    /// Parse the wire / env spelling (`namespace` or `segment`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "namespace" => Some(Self::Namespace),
+            "segment" => Some(Self::Segment),
+            _ => None,
+        }
+    }
 }
 
 impl Bm25Overrides {
@@ -199,6 +232,7 @@ impl Bm25Overrides {
         Self {
             k1: Some(k1),
             b: Some(b),
+            stats: None,
         }
     }
 
@@ -2290,6 +2324,32 @@ mod bm25_overrides {
     }
 
     #[test]
+    fn stats_scope_parses_and_defaults() {
+        let q = query(r#"{"query_text": "x"}"#);
+        assert_eq!(q.bm25_params.stats, None);
+        let q = query(r#"{"query_text": "x", "bm25_params": {"stats": "segment"}}"#);
+        assert_eq!(q.bm25_params.stats, Some(Bm25StatsScope::Segment));
+        let q = query(r#"{"query_text": "x", "bm25_params": {"stats": "namespace", "b": 0.5}}"#);
+        assert_eq!(q.bm25_params.stats, Some(Bm25StatsScope::Namespace));
+        assert_eq!(q.bm25_params.b, Some(0.5));
+        assert!(serde_json::from_str::<SearchQuery>(
+            r#"{"query_text": "x", "bm25_params": {"stats": "shard"}}"#
+        )
+        .is_err());
+        assert_eq!(
+            Bm25StatsScope::parse(" Segment "),
+            Some(Bm25StatsScope::Segment)
+        );
+        assert_eq!(Bm25StatsScope::parse("bogus"), None);
+        let v = serde_json::to_value(Bm25Overrides {
+            stats: Some(Bm25StatsScope::Segment),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(v, serde_json::json!({"stats": "segment"}));
+    }
+
+    #[test]
     fn default_overrides_serialize_empty() {
         // Keeps result-cache keys and fan-out payloads small, and an older
         // node reading this falls back to its own 1.2 / 0.75 default.
@@ -2316,6 +2376,7 @@ mod bm25_overrides {
             Bm25Overrides {
                 k1: None,
                 b: Some(f64::NAN),
+                stats: None,
             },
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");

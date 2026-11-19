@@ -71,6 +71,12 @@ def build(oracle: Oracle, seed: int) -> List[Dict]:
     # ── BM25 parameters ──
     add("bm25/params-k1-2-b0", {"query_text": mid[1], "bm25_params": {"k1": 2.0, "b": 0.0}})
     add("bm25/params-b1", {"query_text": "%s %s" % (common[0], common[1]), "bm25_params": {"k1": 1.2, "b": 1.0}})
+    # Issue #246: namespace-level statistics are the default; the debug
+    # switch restores each segment's own N / df / avgdl.
+    add("bm25/stats-segment", {"query_text": mid[0], "bm25_params": {"stats": "segment"}})
+    add("bm25/stats-segment-or", {"query_text": "%s %s" % (mid[2], rare[0]) if rare else mid[2],
+                                  "operator": "or", "bm25_params": {"stats": "segment"}})
+    add("bm25/stats-namespace", {"query_text": mid[1], "bm25_params": {"stats": "namespace"}})
 
     # ── Filters alone (filter-only scoring path) ──
     add("filter/term-keyword", {"filter": {"term": {"status": "open"}}})

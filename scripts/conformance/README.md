@@ -45,7 +45,7 @@ known-bug check), `--strict` (also fail when a known bug *didn't* trip).
 | --- | --- |
 | `buffered` | Docs indexed, not flushed. Nothing may be visible yet. |
 | `one-segment` | First flush. |
-| `many-segments` | Five more flushes. BM25 statistics are per segment, so scores now depend on layout. |
+| `many-segments` | Five more flushes. BM25 statistics are namespace-level (summed over every segment), so scores must not depend on which segment a doc landed in; `bm25_params.stats: "segment"` queries check the per-segment debug switch. |
 | `upserts` | Already-flushed ids re-indexed (segment rewrite path). Buffered ids replaced before their first flush. |
 | `deletes` | Delete-by-query, a delete issued while matching docs are still buffered (they are flushed and deleted too), and deleted ids re-indexed. |
 | `compacted` | Tiered compaction via `POST /v1/admin/compact-namespace`. |
@@ -78,7 +78,7 @@ in order.
 
 `oracle.py` is brute force and models Kosha's documented semantics:
 
-- per-segment BM25 statistics (tombstoned docs included)
+- namespace-level BM25 statistics, `N` / `df` / `avgdl` summed over every segment (tombstoned docs included), and per-segment statistics for `bm25_params.stats: "segment"`
 - one inverted index shared by all Text fields
 - AND by default
 - the write path's buffer → segment → rewrite → tombstone → compact behavior

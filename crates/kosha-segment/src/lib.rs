@@ -2403,6 +2403,17 @@ pub enum ScoringPostingsRef<'a> {
     Decoded(PostingsRef<'a>),
 }
 
+impl ScoringPostingsRef<'_> {
+    /// The term's document frequency in this segment (number of postings,
+    /// deleted documents included — the same `df` BM25 scores with).
+    pub fn doc_count(&self) -> usize {
+        match self {
+            Self::Blocked(b) => b.doc_count(),
+            Self::Decoded(p) => p.len(),
+        }
+    }
+}
+
 impl std::ops::Deref for PostingsRef<'_> {
     type Target = [Posting];
     fn deref(&self) -> &[Posting] {
@@ -4119,6 +4130,30 @@ impl SegmentReader {
             .into_iter()
             .map(|(t, p)| (t, ScoringPostingsRef::Decoded(p)))
             .collect()
+    }
+
+    /// Document frequency of each of `terms` that this segment contains,
+    /// for namespace-level BM25 statistics (issue #246). Goes through the
+    /// same scoring-postings fetch the scoring pass uses, so on v5 segments
+    /// only the term's span header is decoded and on older formats the
+    /// decode lands in the postings cache the scoring pass then hits.
+    /// `None` when a TOC-present term's posting blob could not be read —
+    /// a partial answer would silently understate `df`.
+    pub fn doc_frequencies(&self, terms: &[String]) -> Option<Vec<(String, u32)>> {
+        let dfs: Vec<(String, u32)> = self
+            .scoring_postings_for_terms(terms)
+            .into_iter()
+            .map(|(term, postings)| {
+                (
+                    term.to_string(),
+                    u32::try_from(postings.doc_count()).unwrap_or(u32::MAX),
+                )
+            })
+            .collect();
+        if self.take_blob_read_failure() {
+            return None;
+        }
+        Some(dfs)
     }
 
     /// Zero-I/O: `doc_id` + `field_length` for one document, without

@@ -8,9 +8,10 @@ use rayon::prelude::*;
 
 use kosha_core::{
     segment_may_contain_terms, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
-    AggMetricResult, Aggregation, AggregationResults, Bm25Params, DocSet, DocumentId, FieldType,
-    FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry, NamespaceId, ScoredDocument,
-    SearchQuery, SearchResult, SortSpec, TermBloomMode, TotalHitsRelation,
+    AggMetricResult, Aggregation, AggregationResults, Bm25Params, Bm25StatsScope, DocSet,
+    DocumentId, FieldType, FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry,
+    NamespaceId, ScoredDocument, SearchQuery, SearchResult, SortSpec, TermBloomMode,
+    TotalHitsRelation,
 };
 use kosha_segment::{
     tokenize, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
@@ -590,17 +591,61 @@ pub fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u6
 // ─── BM25 scorer ────────────────────────────────────────────────────────────
 
 pub struct Bm25Scorer {
-    num_docs: u32,
+    /// `N`. `f64` because a namespace-level count (issue #246) is a sum
+    /// over segments and need not fit the per-segment `u32`.
+    num_docs: f64,
     avg_field_length: f64,
     params: Bm25Params,
+    /// Namespace-level document frequencies, when scoring with
+    /// [`Bm25StatsScope::Namespace`] statistics. `None` = segment-local.
+    corpus: Option<Arc<CorpusStats>>,
 }
 
 impl Bm25Scorer {
+    /// Segment-local statistics: `N`, `avgdl` and every `df` come from the
+    /// one segment being scored.
     pub fn new(num_docs: u32, avg_field_length: f64, params: Bm25Params) -> Self {
         Self {
-            num_docs,
+            num_docs: num_docs as f64,
             avg_field_length,
             params,
+            corpus: None,
+        }
+    }
+
+    /// Namespace-level statistics (issue #246): `N` and `avgdl` from the
+    /// whole manifest, and [`Self::doc_frequency`] answers with the summed
+    /// `df` of every term `stats` carries.
+    pub fn with_corpus(stats: Arc<CorpusStats>, params: Bm25Params) -> Self {
+        Self {
+            num_docs: stats.num_docs as f64,
+            avg_field_length: stats.avg_field_length(),
+            params,
+            corpus: Some(stats),
+        }
+    }
+
+    /// The `df` to score `term` with: the namespace-level value when this
+    /// scorer carries corpus statistics for the term, else `segment_df`
+    /// (the term's posting count in the segment being scored).
+    ///
+    /// Every score and every block-max ceiling for a term must use the
+    /// same value, or WAND would prune against a bound computed for a
+    /// different IDF than the hits are scored with.
+    pub fn doc_frequency(&self, term: &str, segment_df: u32) -> u32 {
+        self.corpus
+            .as_ref()
+            .and_then(|c| c.doc_frequencies.get(term))
+            .map_or(segment_df, |&df| u32::try_from(df).unwrap_or(u32::MAX))
+    }
+
+    /// `df = N`: the constant-score IDF a filter-only match is scored
+    /// with, so it also agrees across segments under namespace stats.
+    pub fn match_all_doc_frequency(&self) -> u32 {
+        if self.num_docs >= u32::MAX as f64 {
+            u32::MAX
+        } else {
+            self.num_docs as u32
         }
     }
 
@@ -610,7 +655,7 @@ impl Bm25Scorer {
         doc_frequency: u32,
         doc_field_length: u32,
     ) -> f64 {
-        let n = self.num_docs as f64;
+        let n = self.num_docs;
         let df = doc_frequency as f64;
         let tf = term_frequency as f64;
         let doc_len = doc_field_length as f64;
@@ -646,6 +691,135 @@ impl Bm25Scorer {
         // minimum). The result is ≥ any individual doc's score.
         self.score_term(max_tf, doc_frequency, min_field_length)
     }
+}
+
+// ─── Namespace-level BM25 statistics (issue #246) ───────────────────────────
+
+/// BM25 collection statistics over a whole namespace: the sum of every
+/// manifest segment's `doc_count` and `total_field_length` (both in the
+/// footer, so available for any segment ever written), and the summed
+/// per-segment document frequency of the query's terms.
+///
+/// Scoring every segment with these instead of its own statistics makes a
+/// document's score independent of which segment it landed in, which is
+/// what lets `search_inner` merge per-segment top-k lists by score. Deleted
+/// documents still count, as they do in each segment's own `df` (and in
+/// Lucene) until compaction drops them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CorpusStats {
+    pub num_docs: u64,
+    pub total_field_length: u64,
+    /// `df` for the terms of one query (other terms are not carried).
+    pub doc_frequencies: HashMap<String, u64>,
+}
+
+impl CorpusStats {
+    /// `Σ total_field_length / Σ doc_count` — for a single segment exactly
+    /// the footer's own `avg_field_length`.
+    pub fn avg_field_length(&self) -> f64 {
+        if self.num_docs == 0 {
+            0.0
+        } else {
+            self.total_field_length as f64 / self.num_docs as f64
+        }
+    }
+}
+
+/// Engine-wide default for [`Bm25StatsScope`] (`KOSHA_BM25_STATS`,
+/// `namespace` unless set to `segment`). A request's
+/// `bm25_params.stats` overrides it.
+fn bm25_stats_engine_default() -> Bm25StatsScope {
+    static DEFAULT: std::sync::OnceLock<Bm25StatsScope> = std::sync::OnceLock::new();
+    *DEFAULT.get_or_init(|| {
+        std::env::var("KOSHA_BM25_STATS")
+            .ok()
+            .and_then(|v| Bm25StatsScope::parse(&v))
+            .unwrap_or_default()
+    })
+}
+
+/// The terms whose namespace-level `df` a search for `query` computes, or
+/// `None` when it scores with per-segment statistics (requested via
+/// `bm25_params.stats` / `KOSHA_BM25_STATS`, a wildcard, or no lexical leg
+/// at all). The server uses this to hydrate the postings the `df` pass
+/// reads in segments the query's filter would otherwise skip.
+pub fn namespace_stats_terms(query: &SearchQuery) -> Option<Vec<String>> {
+    let scope = query
+        .bm25_params
+        .stats
+        .unwrap_or_else(bm25_stats_engine_default);
+    if scope == Bm25StatsScope::Segment || query.wildcard.is_some() || query.is_pure_knn() {
+        return None;
+    }
+    let mut terms = tokenize(&query.query_text);
+    if let Some(ref phrase) = query.match_phrase {
+        terms.extend(tokenize(&phrase.phrase));
+    }
+    terms.sort();
+    terms.dedup();
+    Some(terms)
+}
+
+/// Cache key for [`CorpusStatsCache`]: namespace, manifest version, and a
+/// fingerprint of the manifest's segment list. The version alone is the
+/// natural key, but nothing stops two different manifests sharing a
+/// version (tests, a namespace recreated from scratch), and a stale `df`
+/// would quietly skew every score — the fingerprint costs one hash pass
+/// over the segment ids.
+type CorpusKey = (String, u64, u64);
+
+/// Per-manifest corpus totals plus a lazily filled `term → df` map.
+struct CorpusEntry {
+    num_docs: u64,
+    total_field_length: u64,
+    doc_frequencies: Mutex<HashMap<String, u64>>,
+}
+
+/// Most manifest versions kept at once, across namespaces. A new version
+/// of a namespace replaces the old ones on insert, so this only bounds
+/// the number of distinct namespaces with cached statistics.
+const CORPUS_STATS_MAX_ENTRIES: usize = 256;
+/// Most cached `df` values per manifest version. Past it the term map is
+/// cleared and refilled — query-term vocabularies are Zipfian, so the hot
+/// terms come straight back.
+const CORPUS_STATS_MAX_TERMS: usize = 100_000;
+
+#[derive(Default)]
+struct CorpusStatsCache {
+    entries: Mutex<HashMap<CorpusKey, Arc<CorpusEntry>>>,
+}
+
+impl CorpusStatsCache {
+    fn get(&self, key: &CorpusKey) -> Option<Arc<CorpusEntry>> {
+        self.entries.lock().unwrap().get(key).cloned()
+    }
+
+    fn insert(&self, key: CorpusKey, entry: Arc<CorpusEntry>) -> Arc<CorpusEntry> {
+        let mut entries = self.entries.lock().unwrap();
+        // Older versions of the same namespace are dead once a newer one is
+        // being queried.
+        entries.retain(|k, _| k.0 != key.0 || k.1 > key.1);
+        if entries.len() >= CORPUS_STATS_MAX_ENTRIES {
+            entries.clear();
+        }
+        Arc::clone(entries.entry(key).or_insert(entry))
+    }
+}
+
+/// Fingerprint of a manifest's segment set (ids, in order, plus any
+/// rewritten-footer CRCs). See [`CorpusKey`].
+fn manifest_segments_fingerprint(manifest: &Manifest) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    manifest.segments.len().hash(&mut hasher);
+    for entry in &manifest.segments {
+        entry.segment_id.0.hash(&mut hasher);
+        manifest
+            .footer_crc32
+            .get(&entry.segment_id)
+            .hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 // ─── Wildcard matcher ───────────────────────────────────────────────────────
@@ -940,6 +1114,38 @@ pub struct SearchPhaseStats {
     /// Under the global probe budget it should land near
     /// `num_candidates` for the whole query. Zero for non-kNN queries.
     pub knn_postings_probed: usize,
+    /// Time spent resolving namespace-level BM25 statistics (issue #246):
+    /// one cache lookup when warm, the per-segment `df` pass for terms not
+    /// seen yet at this manifest version when cold.
+    pub bm25_stats_ms: f64,
+    /// Which statistics the lexical scores used — see [`Bm25StatsUsed`].
+    pub bm25_stats: Bm25StatsUsed,
+}
+
+/// Which BM25 collection statistics a search actually scored with.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Bm25StatsUsed {
+    /// Namespace-level `N` / `df` / `avgdl` (the default).
+    #[default]
+    Namespace,
+    /// Each segment's own statistics, because the request or
+    /// `KOSHA_BM25_STATS` asked for them, or the query is a wildcard
+    /// (whose per-segment expansions have no namespace-level `df` yet).
+    Segment,
+    /// Namespace statistics were requested but some segment's footer or
+    /// postings could not be read, so this search fell back to
+    /// per-segment statistics rather than score with a partial `df`.
+    SegmentFallback,
+}
+
+impl Bm25StatsUsed {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Namespace => "namespace",
+            Self::Segment => "segment",
+            Self::SegmentFallback => "segment_fallback",
+        }
+    }
 }
 
 /// Shared-atomic collector threaded through the parallel scoring pass to
@@ -959,6 +1165,8 @@ pub struct Searcher {
     data_dir: PathBuf,
     segment_cache: SegmentCache,
     ledger: Arc<MemoryLedger>,
+    /// Namespace-level BM25 statistics per manifest version (issue #246).
+    corpus_stats: CorpusStatsCache,
 }
 
 /// Result of a [`Searcher::warm_segments`] pass — how many segments were
@@ -1016,6 +1224,7 @@ impl Searcher {
             data_dir,
             segment_cache: SegmentCache::new(capacity, max_bytes),
             ledger: Arc::new(MemoryLedger::new(max_live_bytes, admission_timeout)),
+            corpus_stats: CorpusStatsCache::default(),
         }
     }
 
@@ -1302,6 +1511,154 @@ impl Searcher {
         Some((all[idx], budget))
     }
 
+    /// Namespace-level BM25 statistics for `terms` at this manifest (issue
+    /// #246).
+    ///
+    /// `N` and the total field length are summed from every manifest
+    /// segment's footer once per `(namespace, manifest version, segment
+    /// set)` and cached. `df` is computed lazily, only for query terms not
+    /// already cached at that key: each segment whose term bloom admits the
+    /// term contributes its posting count (a bloom "no" is a definite zero,
+    /// so most segments are never opened for a rare term). A warm query is
+    /// therefore one hash of the segment list plus a map lookup per term.
+    ///
+    /// Returns `None` — and the caller falls back to per-segment
+    /// statistics for the whole search — when any segment's footer or, for
+    /// a term its bloom admits, its postings can't be read here. Scoring
+    /// with a `df` that silently omits a segment would be wrong in a way
+    /// nobody could see; the old per-segment behavior is at least the
+    /// documented one.
+    fn namespace_corpus_stats(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        // Sorted and deduplicated — see [`namespace_stats_terms`].
+        terms: &[String],
+        permit: &AdmissionPermit,
+        open_stats: &OpenStatsCollector,
+    ) -> Option<Arc<CorpusStats>> {
+        let seg_dir =
+            |entry: &ManifestEntry| self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+        let key = (
+            namespace.0.clone(),
+            manifest.version,
+            manifest_segments_fingerprint(manifest),
+        );
+        let corpus = match self.corpus_stats.get(&key) {
+            Some(corpus) => corpus,
+            None => {
+                let totals: Option<Vec<(u64, u64)>> = manifest
+                    .segments
+                    .par_iter()
+                    .map(|entry| {
+                        let footer = manifest.footer_or_read(&entry.segment_id, || {
+                            SegmentReader::read_footer(&seg_dir(entry)).ok()
+                        })?;
+                        Some((footer.doc_count as u64, footer.total_field_length))
+                    })
+                    .collect();
+                let (num_docs, total_field_length) =
+                    totals?.into_iter().fold((0u64, 0u64), |(n, l), (dn, dl)| {
+                        (n.saturating_add(dn), l.saturating_add(dl))
+                    });
+                self.corpus_stats.insert(
+                    key,
+                    Arc::new(CorpusEntry {
+                        num_docs,
+                        total_field_length,
+                        doc_frequencies: Mutex::new(HashMap::new()),
+                    }),
+                )
+            }
+        };
+
+        let wanted: Vec<String> = terms.to_vec();
+        let mut doc_frequencies: HashMap<String, u64> = HashMap::with_capacity(wanted.len());
+        let missing: Vec<String> = {
+            let cached = corpus.doc_frequencies.lock().unwrap();
+            wanted
+                .into_iter()
+                .filter(|term| match cached.get(term) {
+                    Some(&df) => {
+                        doc_frequencies.insert(term.clone(), df);
+                        false
+                    }
+                    None => true,
+                })
+                .collect()
+        };
+        if !missing.is_empty() {
+            let per_segment: Option<Vec<Vec<u64>>> = manifest
+                .segments
+                .par_iter()
+                .map(|entry| {
+                    let dir = seg_dir(entry);
+                    let footer = manifest.footer_or_read(&entry.segment_id, || {
+                        SegmentReader::read_footer(&dir).ok()
+                    })?;
+                    let mut dfs = vec![0u64; missing.len()];
+                    let candidates: Vec<String> = missing
+                        .iter()
+                        .filter(|term| {
+                            footer
+                                .term_bloom
+                                .as_ref()
+                                .is_none_or(|bloom| bloom.may_contain(term))
+                        })
+                        .cloned()
+                        .collect();
+                    if candidates.is_empty() {
+                        return Some(dfs);
+                    }
+                    if !dir.exists() {
+                        return None;
+                    }
+                    // Open with the same vector flag the scoring pass will
+                    // use for this segment, so the two passes share one
+                    // cache entry. A segment the filter prunes is never
+                    // opened by the scoring pass, so it is opened lexical-only.
+                    let load_vectors = query.knn.is_some()
+                        && query.segment_may_match_filters(footer.filter_blooms.as_ref());
+                    let reader = self
+                        .open_segment(
+                            &namespace.0,
+                            &entry.segment_id.0,
+                            dir,
+                            load_vectors,
+                            manifest.segment_footer(&entry.segment_id),
+                            Some(permit),
+                            Some(open_stats),
+                        )
+                        .ok()?;
+                    for (term, df) in reader.doc_frequencies(&candidates)? {
+                        if let Some(i) = missing.iter().position(|t| *t == term) {
+                            dfs[i] = df as u64;
+                        }
+                    }
+                    Some(dfs)
+                })
+                .collect();
+            let per_segment = per_segment?;
+            let mut cached = corpus.doc_frequencies.lock().unwrap();
+            if cached.len() + missing.len() > CORPUS_STATS_MAX_TERMS {
+                cached.clear();
+            }
+            for (i, term) in missing.into_iter().enumerate() {
+                let df = per_segment
+                    .iter()
+                    .fold(0u64, |sum, dfs| sum.saturating_add(dfs[i]));
+                cached.insert(term.clone(), df);
+                doc_frequencies.insert(term, df);
+            }
+        }
+        Some(Arc::new(CorpusStats {
+            num_docs: corpus.num_docs,
+            total_field_length: corpus.total_field_length,
+            doc_frequencies,
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn score_segment(
         &self,
@@ -1334,6 +1691,9 @@ impl Searcher {
         // Canonical JSON of `query.filter` and `query.knn.filter`, computed
         // once per request: the key into each segment's filter-set cache.
         filter_keys: &FilterKeys,
+        // Namespace-level BM25 statistics (issue #246); `None` scores this
+        // segment with its own `N` / `df` / `avgdl`.
+        corpus: Option<&Arc<CorpusStats>>,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
         let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
         if !seg_dir.exists() {
@@ -1420,11 +1780,18 @@ impl Searcher {
         // and every score ceiling the WAND paths use is computed from
         // those through this same scorer, so pruning bounds always match
         // the parameters the hits are scored with.
-        let scorer = Bm25Scorer::new(
-            total_docs,
-            reader.avg_field_length(),
-            query.bm25_params.resolve(reader.bm25_params()),
-        );
+        //
+        // Collection statistics are namespace-level by default (issue
+        // #246): `N`, `avgdl` and each query term's `df` are the same for
+        // every segment, so the same document scores the same wherever it
+        // lives and the cross-segment merge compares like with like. The
+        // WAND ceilings go through `scorer.doc_frequency` too, so they are
+        // computed with exactly the IDF the hits get.
+        let params = query.bm25_params.resolve(reader.bm25_params());
+        let scorer = match corpus {
+            Some(corpus) => Bm25Scorer::with_corpus(Arc::clone(corpus), params),
+            None => Bm25Scorer::new(total_docs, reader.avg_field_length(), params),
+        };
 
         let has_query =
             !query_terms.is_empty() || query.wildcard.is_some() || query.match_phrase.is_some();
@@ -1600,11 +1967,17 @@ impl Searcher {
                     // varint-decoded at all. Older formats degrade to the
                     // classic full decode, walked in the same 128-posting
                     // windows the pre-skip-table code used — identical cost.
-                    let sources: Vec<ScoringBlocks<'_>> = reader
+                    // Alongside each source, the `df` its scores and block
+                    // ceilings use (namespace-level unless segment stats).
+                    let (score_dfs, sources): (Vec<u32>, Vec<ScoringBlocks<'_>>) = reader
                         .scoring_postings_for_terms(terms_for_bm25)
                         .into_iter()
-                        .map(|(_, scoring)| ScoringBlocks::new(scoring))
-                        .collect();
+                        .map(|(term, scoring)| {
+                            let source = ScoringBlocks::new(scoring);
+                            let segment_df = u32::try_from(source.doc_count()).unwrap_or(u32::MAX);
+                            (scorer.doc_frequency(term, segment_df), source)
+                        })
+                        .unzip();
                     if reader.take_blob_read_failure() {
                         // A TOC-present term's blob shard was unreadable —
                         // fall through to the general path, whose refetch
@@ -1632,7 +2005,7 @@ impl Searcher {
 
                     if let [source] = sources.as_slice() {
                         // ── Single present term: block-by-block walk ──
-                        let df = source.doc_count() as u32;
+                        let df = score_dfs[0];
                         let total_hits = if segment_has_tombstones {
                             let mut count = 0;
                             let mut postings = Vec::new();
@@ -1796,8 +2169,11 @@ impl Searcher {
                             return None;
                         }
 
-                        let mut cursors: Vec<TermCursor<'_>> =
-                            sources.iter().map(TermCursor::new).collect();
+                        let mut cursors: Vec<TermCursor<'_>> = sources
+                            .iter()
+                            .zip(&score_dfs)
+                            .map(|(source, &df)| TermCursor::new(source, df))
+                            .collect();
 
                         // Format guard: pivoting needs every term's
                         // remaining-ceiling bound. A legacy source with no
@@ -1834,7 +2210,16 @@ impl Searcher {
                             // see the doc comment above. Before that,
                             // top-k being full still prunes *scoring*
                             // below, just never candidate discovery.
-                            let can_skip = count_budget.is_some_and(|cap| total_hits >= cap);
+                            //
+                            // Pivoting also needs a full top-k: until `k`
+                            // candidates exist there is no k-th-best score
+                            // to skip against (any doc can still enter),
+                            // and `floor()` has no entry to read — a capped
+                            // OR asking for more hits than the cap
+                            // (`max_results` 1000, cap 10) used to index
+                            // past the end and panic here.
+                            let can_skip =
+                                count_budget.is_some_and(|cap| total_hits >= cap) && topk.is_full();
                             let pivot_pos = if can_skip && !ranking_settled {
                                 let floor = topk.floor();
                                 let mut acc = 0.0;
@@ -1919,7 +2304,7 @@ impl Searcher {
                                             let sp = cursor.current();
                                             score += scorer.score_term(
                                                 sp.term_frequency,
-                                                cursor.df,
+                                                cursor.score_df,
                                                 meta.field_length,
                                             );
                                         }
@@ -1971,8 +2356,11 @@ impl Searcher {
                     // only the *alignment probe order* (which cursor gets
                     // asked first each pass) is sorted by df, tracked
                     // separately as an index list.
-                    let mut cursors: Vec<TermCursor<'_>> =
-                        sources.iter().map(TermCursor::new).collect();
+                    let mut cursors: Vec<TermCursor<'_>> = sources
+                        .iter()
+                        .zip(&score_dfs)
+                        .map(|(source, &df)| TermCursor::new(source, df))
+                        .collect();
 
                     // Probe/alignment order: smallest posting list first.
                     // Ties broken by first occurrence (arbitrary — any order
@@ -2065,7 +2453,7 @@ impl Searcher {
                                         let sp = cursor.current();
                                         score += scorer.score_term(
                                             sp.term_frequency,
-                                            cursor.df,
+                                            cursor.score_df,
                                             meta.field_length,
                                         );
                                     }
@@ -2155,7 +2543,8 @@ impl Searcher {
 
             let mut doc_frequencies: HashMap<&str, u32> = HashMap::new();
             for (t, p) in &term_postings {
-                doc_frequencies.insert(t, p.len() as u32);
+                let segment_df = u32::try_from(p.len()).unwrap_or(u32::MAX);
+                doc_frequencies.insert(t, scorer.doc_frequency(t, segment_df));
             }
 
             // ── Postings AND/OR ──
@@ -2347,7 +2736,11 @@ impl Searcher {
                         continue;
                     }
                     if let Some(meta) = reader.doc_meta(doc_seq) {
-                        let score = scorer.score_term(1, total_docs, meta.field_length);
+                        let score = scorer.score_term(
+                            1,
+                            scorer.match_all_doc_frequency(),
+                            meta.field_length,
+                        );
                         seg_hits.insert(doc_seq, score);
                     }
                 }
@@ -2849,6 +3242,39 @@ impl Searcher {
             _ => None,
         };
 
+        // ── BM25 collection statistics (issue #246) ────────────────────
+        // Namespace-level by default, so every segment scores with the same
+        // `N` / `df` / `avgdl`. Wildcards keep per-segment statistics: their
+        // expansion is per segment, and a namespace-level `df` for every
+        // expanded term would mean expanding the pattern everywhere first.
+        let t_stats = Instant::now();
+        // Opens done by the `df` pass, kept apart so a segment it opens cold
+        // and the scoring pass then finds cached is reported once, as cold.
+        let stats_open_stats = OpenStatsCollector::default();
+        let corpus: Option<Arc<CorpusStats>> = match namespace_stats_terms(query) {
+            None => {
+                phase_stats.bm25_stats = Bm25StatsUsed::Segment;
+                None
+            }
+            Some(stats_terms) => {
+                let corpus = self.namespace_corpus_stats(
+                    namespace,
+                    manifest,
+                    query,
+                    &stats_terms,
+                    &permit,
+                    &stats_open_stats,
+                );
+                phase_stats.bm25_stats = if corpus.is_some() {
+                    Bm25StatsUsed::Namespace
+                } else {
+                    Bm25StatsUsed::SegmentFallback
+                };
+                corpus
+            }
+        };
+        phase_stats.bm25_stats_ms = t_stats.elapsed().as_secs_f64() * 1e3;
+
         let t_score = Instant::now();
         let segment_outputs: Vec<SegmentOutput> = manifest
             .segments
@@ -2869,6 +3295,7 @@ impl Searcher {
                     &open_stats,
                     knn_cutoff,
                     &filter_keys,
+                    corpus.as_ref(),
                 )
             })
             .collect::<Result<Vec<Option<SegmentOutput>>, KoshaError>>()?
@@ -2876,9 +3303,16 @@ impl Searcher {
             .flatten()
             .collect();
         phase_stats.score_wall_ms = t_score.elapsed().as_secs_f64() * 1e3;
-        phase_stats.open_cold = open_stats.cold.load(Ordering::Relaxed);
-        phase_stats.open_cached = open_stats.cached.load(Ordering::Relaxed);
-        phase_stats.open_total_ms = open_stats.open_nanos.load(Ordering::Relaxed) as f64 / 1e6;
+        let stats_cold = stats_open_stats.cold.load(Ordering::Relaxed);
+        phase_stats.open_cold = open_stats.cold.load(Ordering::Relaxed) + stats_cold;
+        phase_stats.open_cached = open_stats
+            .cached
+            .load(Ordering::Relaxed)
+            .saturating_sub(stats_cold);
+        phase_stats.open_total_ms = (open_stats.open_nanos.load(Ordering::Relaxed)
+            + stats_open_stats.open_nanos.load(Ordering::Relaxed))
+            as f64
+            / 1e6;
         phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
         let t_materialize = Instant::now();
 
@@ -3352,8 +3786,13 @@ fn resolve_total_hits(
 /// leapfrog never decodes a block it doesn't land in.
 struct TermCursor<'a> {
     source: &'a ScoringBlocks<'a>,
-    /// The term's document frequency in this segment.
+    /// The term's document frequency in this segment. Orders the
+    /// alignment probes (rarest list first); never used for scoring.
     df: u32,
+    /// The `df` this term is scored with — the namespace-level value under
+    /// namespace statistics (issue #246), else equal to `df`. Every block
+    /// ceiling uses it too, so pruning bounds match the scores.
+    score_df: u32,
     block: usize,
     /// `buf` holds `block`'s decoded postings.
     loaded: bool,
@@ -3380,9 +3819,10 @@ struct TermCursor<'a> {
 }
 
 impl<'a> TermCursor<'a> {
-    fn new(source: &'a ScoringBlocks<'a>) -> Self {
+    fn new(source: &'a ScoringBlocks<'a>, score_df: u32) -> Self {
         TermCursor {
             df: source.doc_count() as u32,
+            score_df,
             block: 0,
             loaded: false,
             buf: Vec::with_capacity(SCORING_BLOCK_LEN),
@@ -3468,7 +3908,7 @@ impl<'a> TermCursor<'a> {
             for b in 0..n {
                 match self.source.stored_summary(b) {
                     Some((max_tf, min_fl)) => {
-                        arr.push(scorer.block_max_score(max_tf, self.df, min_fl));
+                        arr.push(scorer.block_max_score(max_tf, self.score_df, min_fl));
                     }
                     None => {
                         all_stored = false;
@@ -3504,14 +3944,16 @@ impl<'a> TermCursor<'a> {
         if self.block != self.ub_block {
             self.ub_block = self.block;
             self.block_ub = match self.source.stored_summary(self.block) {
-                Some((max_tf, min_fl)) => scorer.block_max_score(max_tf, self.df, min_fl),
+                Some((max_tf, min_fl)) => scorer.block_max_score(max_tf, self.score_df, min_fl),
                 None => {
                     // The cursor sits on an intersection member inside this
                     // block, so `buf` necessarily holds it. A block with no
                     // resolvable metas can't contribute score (the scoring
                     // pass skips meta-less docs), so its ceiling is zero.
                     match block_bounds(&self.buf, reader) {
-                        Some((max_tf, min_fl)) => scorer.block_max_score(max_tf, self.df, min_fl),
+                        Some((max_tf, min_fl)) => {
+                            scorer.block_max_score(max_tf, self.score_df, min_fl)
+                        }
                         None => 0.0,
                     }
                 }
@@ -9592,6 +10034,680 @@ mod tests {
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Namespace-level BM25 statistics (issue #246): scores must not depend on
+/// how the corpus happens to be split into segments.
+#[cfg(test)]
+mod corpus_stats_tests {
+    use super::*;
+    use kosha_core::{Bm25Overrides, DocumentId, Field, ManifestEntry, SegmentId};
+    use kosha_segment::SegmentWriter;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    /// Deterministic xorshift — the property test must be reproducible.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[derive(Clone)]
+    struct Doc {
+        id: String,
+        content: String,
+        matter: String,
+    }
+
+    const VOCAB: [&str; 10] = [
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+    ];
+
+    /// Zipf-ish: "alpha" is in most documents, "kappa" in a handful, so the
+    /// corpus has both stopword-scale and rare terms, and docs have widely
+    /// varying lengths (so `avgdl` matters).
+    fn random_corpus(rng: &mut Rng, n: usize) -> Vec<Doc> {
+        (0..n)
+            .map(|i| {
+                let len = 1 + rng.below(40);
+                let words: Vec<&str> = (0..len)
+                    .map(|_| {
+                        let r = rng.below(1 << VOCAB.len());
+                        // Index of the highest set bit: P(i) ~ 2^-(10-i).
+                        let idx = (usize::BITS - 1 - (r | 1).leading_zeros()) as usize;
+                        VOCAB[VOCAB.len() - 1 - idx]
+                    })
+                    .collect();
+                Doc {
+                    id: format!("doc-{i:05}"),
+                    content: words.join(" "),
+                    matter: format!("m{}", rng.below(4)),
+                }
+            })
+            .collect()
+    }
+
+    fn empty_manifest(version: u64) -> Manifest {
+        Manifest {
+            version,
+            segments: Vec::new(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        }
+    }
+
+    /// Write `groups` as one segment each under `dir/ns/`, and return the
+    /// manifest plus `doc id → (segment, doc_seq)` for building tombstones.
+    fn write_segments(
+        dir: &Path,
+        ns: &str,
+        prefix: &str,
+        groups: &[Vec<Doc>],
+        version: u64,
+    ) -> (Manifest, HashMap<String, (SegmentId, u32)>) {
+        let mut manifest = empty_manifest(version);
+        let mut locations = HashMap::new();
+        for (g, docs) in groups.iter().enumerate() {
+            let id = SegmentId(format!("{prefix}-{g:03}"));
+            let mut w = SegmentWriter::new(id.clone(), dir.join(ns).join(&id.0));
+            for (seq, doc) in docs.iter().enumerate() {
+                w.add_document(
+                    DocumentId(doc.id.clone()),
+                    vec![
+                        Field::text("content", doc.content.clone()),
+                        Field::keyword("matter", doc.matter.clone()),
+                    ],
+                );
+                locations.insert(doc.id.clone(), (id.clone(), seq as u32));
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id: id,
+                doc_count: docs.len() as u32,
+            });
+        }
+        (manifest, locations)
+    }
+
+    fn tombstones_for(
+        deleted: &HashSet<String>,
+        locations: &HashMap<String, (SegmentId, u32)>,
+    ) -> HashMap<SegmentId, HashSet<u32>> {
+        let mut out: HashMap<SegmentId, HashSet<u32>> = HashMap::new();
+        for id in deleted {
+            let (seg, seq) = &locations[id];
+            out.entry(seg.clone()).or_default().insert(*seq);
+        }
+        out
+    }
+
+    /// Split `docs` into `k` non-empty random groups. Half the time the
+    /// docs are first ordered by matter, so whole segments hold no doc of
+    /// a given matter and a filter on it prunes them by bloom — their
+    /// documents must still count toward `df`.
+    fn random_split(rng: &mut Rng, docs: &[Doc], by_matter: bool) -> Vec<Vec<Doc>> {
+        let mut docs = docs.to_vec();
+        for i in (1..docs.len()).rev() {
+            docs.swap(i, rng.below(i + 1));
+        }
+        if by_matter {
+            docs.sort_by(|a, b| a.matter.cmp(&b.matter));
+        }
+        let k = 2 + rng.below(9);
+        let mut cuts: Vec<usize> = (0..k - 1).map(|_| 1 + rng.below(docs.len() - 1)).collect();
+        // Always include a one-document segment: tiny segments are where
+        // per-segment IDF used to go furthest wrong.
+        cuts.push(1);
+        cuts.sort();
+        cuts.dedup();
+        let mut groups = Vec::new();
+        let mut start = 0;
+        for cut in cuts.into_iter().chain([docs.len()]) {
+            if cut > start {
+                groups.push(docs[start..cut].to_vec());
+                start = cut;
+            }
+        }
+        groups
+    }
+
+    fn query(text: &str, max: usize) -> SearchQuery {
+        serde_json::from_value(serde_json::json!({
+            "query_text": text,
+            "max_results": max,
+            "exact_total_hits": true,
+        }))
+        .unwrap()
+    }
+
+    fn matter_filter(m: &str) -> Option<kosha_core::FilterClause> {
+        Some(kosha_core::FilterClause::Term {
+            term: HashMap::from([("matter".to_string(), m.to_string())]),
+        })
+    }
+
+    fn assert_same_scores(label: &str, a: &SearchResult, b: &SearchResult) {
+        const TOL: f64 = 1e-9;
+        assert_eq!(a.total_hits, b.total_hits, "{label}: total_hits");
+        assert_eq!(a.results.len(), b.results.len(), "{label}: page size");
+        if a.results.len() == a.total_hits {
+            // Every hit is on the page: compare doc by doc, ties included.
+            let by_id: HashMap<&str, f64> = b
+                .results
+                .iter()
+                .map(|d| (d.doc_id.0.as_str(), d.score))
+                .collect();
+            for d in &a.results {
+                let other = by_id
+                    .get(d.doc_id.0.as_str())
+                    .unwrap_or_else(|| panic!("{label}: {} missing", d.doc_id.0));
+                assert!(
+                    (d.score - other).abs() <= TOL * d.score.abs().max(1.0),
+                    "{label}: {} scored {} vs {other}",
+                    d.doc_id.0,
+                    d.score
+                );
+            }
+        }
+        for (i, (x, y)) in a.results.iter().zip(&b.results).enumerate() {
+            assert!(
+                (x.score - y.score).abs() <= TOL * x.score.abs().max(1.0),
+                "{label}: score at rank {i}: {} ({}) vs {} ({})",
+                x.score,
+                x.doc_id.0,
+                y.score,
+                y.doc_id.0
+            );
+            // Ids must agree except where the two scores are a genuine tie,
+            // which the (score desc, id asc) order may break either way
+            // when the sums differ in the last ulp.
+            if x.doc_id != y.doc_id {
+                let tied = a
+                    .results
+                    .iter()
+                    .chain(&b.results)
+                    .filter(|d| (d.score - x.score).abs() <= TOL * x.score.abs().max(1.0))
+                    .count();
+                assert!(
+                    tied > 2,
+                    "{label}: rank {i}: {} vs {}",
+                    x.doc_id.0,
+                    y.doc_id.0
+                );
+            }
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kosha-test-corpus-stats-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Acceptance criterion 1 of #246, as a property test: one segment vs
+    /// N random segments gives the same hits, ranking and scores — for
+    /// single-term, AND, OR, phrase, filter-only and filtered queries, with
+    /// deletes, on both the block-max WAND path and the exhaustive path.
+    #[test]
+    fn scores_are_identical_however_the_corpus_is_split() {
+        let ns = NamespaceId("ns".into());
+        let mut checked_differs_under_segment_stats = false;
+        for seed in 1..=8u64 {
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
+            let n = 300 + rng.below(500);
+            let docs = random_corpus(&mut rng, n);
+            let deleted: HashSet<String> = docs
+                .iter()
+                .filter(|_| rng.below(20) == 0)
+                .map(|d| d.id.clone())
+                .collect();
+
+            let dir = scratch(&format!("split-{seed}"));
+            let (one, one_loc) = write_segments(&dir, &ns.0, "one", std::slice::from_ref(&docs), 1);
+            let groups = random_split(&mut rng, &docs, seed % 2 == 0);
+            let (many, many_loc) = write_segments(&dir, &ns.0, "many", &groups, 1);
+            assert!(
+                many.segments.len() >= 2,
+                "seed {seed}: split must produce segments"
+            );
+            let one_tomb = tombstones_for(&deleted, &one_loc);
+            let many_tomb = tombstones_for(&deleted, &many_loc);
+            let searcher = Searcher::new(dir.clone());
+
+            let mut cases: Vec<(String, SearchQuery)> = Vec::new();
+            for text in [
+                "alpha",
+                "eta",
+                "kappa",
+                "alpha beta",
+                "gamma theta",
+                "beta iota kappa",
+            ] {
+                for max in [5, 1000] {
+                    cases.push((format!("and '{text}' k={max}"), query(text, max)));
+                    let mut or = query(text, max);
+                    or.operator = Some(kosha_core::QueryOperator::Or);
+                    cases.push((format!("or '{text}' k={max}"), or));
+                    let mut capped_or = query(text, max);
+                    capped_or.operator = Some(kosha_core::QueryOperator::Or);
+                    capped_or.exact_total_hits = Some(false);
+                    capped_or.total_hits_cap = Some(10);
+                    cases.push((format!("capped or '{text}' k={max}"), capped_or));
+                    let mut filtered = query(text, max);
+                    filtered.filter = matter_filter("m1");
+                    cases.push((format!("filtered '{text}' k={max}"), filtered));
+                }
+            }
+            let mut deep = query("alpha beta", 7);
+            deep.from = 13;
+            cases.push(("deep page".into(), deep));
+            let mut phrase = query("", 1000);
+            phrase.match_phrase = Some(kosha_core::MatchPhraseQuery {
+                field: "content".into(),
+                phrase: "alpha beta".into(),
+                slop: 0,
+            });
+            cases.push(("phrase".into(), phrase));
+            let mut filter_only = query("", 1000);
+            filter_only.filter = matter_filter("m2");
+            cases.push(("filter-only".into(), filter_only));
+
+            for (label, q) in &cases {
+                let label = format!("seed {seed}, {} segments, {label}", many.segments.len());
+                let (single, single_stats) = searcher
+                    .search_with_stats(&ns, &one, q, Some(&one_tomb))
+                    .unwrap();
+                let (split, split_stats) = searcher
+                    .search_with_stats(&ns, &many, q, Some(&many_tomb))
+                    .unwrap();
+                assert_eq!(single_stats.bm25_stats, Bm25StatsUsed::Namespace, "{label}");
+                assert_eq!(split_stats.bm25_stats, Bm25StatsUsed::Namespace, "{label}");
+                assert_same_scores(&label, &single, &split);
+
+                // WAND pruning against namespace-level IDF must agree with
+                // the exhaustive path on the multi-segment corpus, where
+                // global and per-segment `df` differ.
+                if q.from == 0 && q.match_phrase.is_none() && !q.query_text.is_empty() {
+                    let mut legacy = q.clone();
+                    legacy.search_after = force_legacy_search_after();
+                    legacy.exact_total_hits = Some(true);
+                    legacy.total_hits_cap = None;
+                    let exhaustive = searcher
+                        .search(&ns, &many, &legacy, Some(&many_tomb))
+                        .unwrap();
+                    let mut wand = split.clone();
+                    if q.exact_total_hits == Some(false) {
+                        // Capped mode reports a capped count; compare pages.
+                        wand.total_hits = exhaustive.total_hits;
+                    }
+                    assert_same_scores(
+                        &format!("{label} (wand vs exhaustive)"),
+                        &wand,
+                        &exhaustive,
+                    );
+                }
+
+                // The debug switch restores per-segment statistics; on a
+                // split corpus that has to change some score, or this test
+                // would pass without the fix.
+                if !checked_differs_under_segment_stats && !q.query_text.is_empty() {
+                    let mut seg = q.clone();
+                    seg.bm25_params.stats = Some(Bm25StatsScope::Segment);
+                    let (per_segment, stats) = searcher
+                        .search_with_stats(&ns, &many, &seg, Some(&many_tomb))
+                        .unwrap();
+                    assert_eq!(stats.bm25_stats, Bm25StatsUsed::Segment);
+                    checked_differs_under_segment_stats = per_segment
+                        .results
+                        .iter()
+                        .zip(&split.results)
+                        .any(|(a, b)| (a.score - b.score).abs() > 1e-6);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(
+            checked_differs_under_segment_stats,
+            "segment-local statistics never changed a score — the corpus doesn't exercise #246"
+        );
+    }
+
+    /// Acceptance criterion 2 of #246: block-max WAND must prune against
+    /// ceilings computed with the same namespace-level IDF the hits get.
+    /// The corpus concentrates "beta" in one multi-block segment, where its
+    /// segment-local IDF is near zero while its namespace IDF is large — a
+    /// ceiling built from the local `df` would sit far below the real
+    /// scores and prune hits that belong on the page.
+    #[test]
+    fn wand_bounds_use_namespace_idf_on_skewed_segments() {
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("wand-skew");
+        let mut dense = Vec::new();
+        for i in 0..1200 {
+            // tf grows along the postings list, so the best hits sit in the
+            // last blocks: a too-low ceiling prunes exactly those.
+            let mut content = "beta ".repeat(1 + i / 150);
+            if i % 3 == 0 {
+                content.push_str(&"gamma ".repeat(1 + i / 300));
+            }
+            content.push_str(&"pad ".repeat(i % 13));
+            dense.push(Doc {
+                id: format!("dense-{i:05}"),
+                content,
+                matter: "m0".into(),
+            });
+        }
+        let mut sparse = Vec::new();
+        for i in 0..3000 {
+            let mut content = "filler ".repeat(1 + i % 5);
+            if i % 50 == 0 {
+                content.push_str("beta gamma ");
+            }
+            sparse.push(Doc {
+                id: format!("sparse-{i:05}"),
+                content,
+                matter: "m1".into(),
+            });
+        }
+        let (many, _) = write_segments(&dir, &ns.0, "many", &[dense.clone(), sparse.clone()], 1);
+        let all: Vec<Doc> = dense.into_iter().chain(sparse).collect();
+        let (one, _) = write_segments(&dir, &ns.0, "one", &[all], 1);
+        let searcher = Searcher::new(dir.clone());
+        for text in ["beta", "beta gamma"] {
+            for or in [false, true] {
+                for capped in [false, true] {
+                    let mut q = query(text, 10);
+                    if or {
+                        q.operator = Some(kosha_core::QueryOperator::Or);
+                    }
+                    if capped {
+                        q.exact_total_hits = Some(false);
+                        q.total_hits_cap = Some(50);
+                    }
+                    let label = format!("'{text}' or={or} capped={capped}");
+                    let wand = searcher.search(&ns, &many, &q, None).unwrap();
+                    let mut legacy = q.clone();
+                    legacy.search_after = force_legacy_search_after();
+                    legacy.exact_total_hits = Some(true);
+                    let exhaustive = searcher.search(&ns, &many, &legacy, None).unwrap();
+                    let single = searcher.search(&ns, &one, &q, None).unwrap();
+                    let mut wand_page = wand.clone();
+                    wand_page.total_hits = exhaustive.total_hits;
+                    assert_same_scores(
+                        &format!("{label} wand vs exhaustive"),
+                        &wand_page,
+                        &exhaustive,
+                    );
+                    assert_same_scores(&format!("{label} split vs one"), &wand, &single);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a capped OR query asking for more hits than the cap
+    /// reached the WAND pivot with a top-k that was not yet full and
+    /// panicked reading its k-th-best score. Found by the split property
+    /// test above.
+    #[test]
+    fn capped_or_with_page_larger_than_cap_does_not_panic() {
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("capped-or");
+        let mut rng = Rng(5);
+        let docs = random_corpus(&mut rng, 600);
+        let (manifest, _) = write_segments(&dir, &ns.0, "one", &[docs], 1);
+        let searcher = Searcher::new(dir.clone());
+        let mut q = query("alpha beta", 1000);
+        q.operator = Some(kosha_core::QueryOperator::Or);
+        q.exact_total_hits = Some(false);
+        q.total_hits_cap = Some(10);
+        let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+        let mut exact = q.clone();
+        exact.exact_total_hits = Some(true);
+        let full = searcher.search(&ns, &manifest, &exact, None).unwrap();
+        assert_eq!(page_ids(&r), page_ids(&full));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn page_ids(r: &SearchResult) -> Vec<String> {
+        r.results.iter().map(|d| d.doc_id.0.clone()).collect()
+    }
+
+    /// `N`, `avgdl` and `df` must equal the hand-computed namespace sums.
+    #[test]
+    fn corpus_scores_match_hand_computed_bm25() {
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("hand");
+        let doc = |id: &str, content: &str| Doc {
+            id: id.into(),
+            content: content.into(),
+            matter: "m0".into(),
+        };
+        // Segment a: 1 doc with "rare"; segment b: 3 docs, none with it.
+        let groups = vec![
+            vec![doc("a1", "rare common")],
+            vec![
+                doc("b1", "common filler filler"),
+                doc("b2", "common"),
+                doc("b3", "filler filler filler filler"),
+            ],
+        ];
+        let (manifest, _) = write_segments(&dir, &ns.0, "seg", &groups, 1);
+        let searcher = Searcher::new(dir.clone());
+        let r = searcher
+            .search(&ns, &manifest, &query("rare", 10), None)
+            .unwrap();
+        assert_eq!(r.results.len(), 1);
+        // N = 4, df(rare) = 1, avgdl = (2 + 3 + 1 + 4) / 4 = 2.5, dl = 2.
+        let expected = Bm25Scorer::new(4, 2.5, Bm25Params::default()).score_term(1, 1, 2);
+        assert!((r.results[0].score - expected).abs() < 1e-12);
+        // Per-segment statistics would have used N = 1, avgdl = 2.
+        let mut seg = query("rare", 10);
+        seg.bm25_params.stats = Some(Bm25StatsScope::Segment);
+        let r = searcher.search(&ns, &manifest, &seg, None).unwrap();
+        let local = Bm25Scorer::new(1, 2.0, Bm25Params::default()).score_term(1, 1, 2);
+        assert!((r.results[0].score - local).abs() < 1e-12);
+        assert!((expected - local).abs() > 1e-3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cached statistics follow the manifest: a new version — or a
+    /// different segment list under the same version number — must never
+    /// be scored with the previous one's `N` / `df`.
+    #[test]
+    fn cached_statistics_follow_the_manifest() {
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("cache");
+        let mut rng = Rng(42);
+        let docs = random_corpus(&mut rng, 400);
+        let (first, second) = docs.split_at(250);
+        let (v1, _) = write_segments(&dir, &ns.0, "a", &[first.to_vec()], 1);
+        let (mut v2, _) = write_segments(&dir, &ns.0, "b", &[second.to_vec()], 2);
+        v2.segments.splice(0..0, v1.segments.clone());
+        let (all_in_one, _) = write_segments(&dir, &ns.0, "c", std::slice::from_ref(&docs), 9);
+        let searcher = Searcher::new(dir.clone());
+        let q = query("gamma eta", 1000);
+
+        let only_first = searcher.search(&ns, &v1, &q, None).unwrap();
+        let (both, stats) = searcher.search_with_stats(&ns, &v2, &q, None).unwrap();
+        assert_eq!(stats.bm25_stats, Bm25StatsUsed::Namespace);
+        let reference = searcher.search(&ns, &all_in_one, &q, None).unwrap();
+        assert_same_scores("v2 vs one segment", &both, &reference);
+        assert!(only_first.total_hits < both.total_hits);
+
+        // Same version number, different segment list: still fresh stats.
+        let mut v2_same_version = v2.clone();
+        v2_same_version.version = 1;
+        let r = searcher.search(&ns, &v2_same_version, &q, None).unwrap();
+        assert_same_scores("same version, new segments", &r, &reference);
+        // And back: v1 with its own statistics, not v2's.
+        let again = searcher.search(&ns, &v1, &q, None).unwrap();
+        assert_same_scores("v1 again", &again, &only_first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Segments written before term blooms existed (`term_bloom: None` in
+    /// the footer) can't be skipped for `df`, so every one is opened —
+    /// and still gives the same scores. Old data must never come back as
+    /// zero hits or different scores.
+    #[test]
+    fn legacy_footers_without_term_bloom_still_aggregate() {
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("legacy");
+        let mut rng = Rng(7);
+        let docs = random_corpus(&mut rng, 300);
+        let groups = random_split(&mut rng, &docs, false);
+        let (many, _) = write_segments(&dir, &ns.0, "many", &groups, 1);
+        let (one, _) = write_segments(&dir, &ns.0, "one", &[docs], 1);
+        for entry in &many.segments {
+            let path = dir
+                .join(&ns.0)
+                .join(&entry.segment_id.0)
+                .join("footer.json");
+            let mut footer: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            footer.as_object_mut().unwrap().remove("term_bloom");
+            std::fs::write(&path, serde_json::to_vec(&footer).unwrap()).unwrap();
+        }
+        let searcher = Searcher::new(dir.clone());
+        for text in ["kappa", "alpha iota"] {
+            let q = query(text, 1000);
+            let (r, stats) = searcher.search_with_stats(&ns, &many, &q, None).unwrap();
+            assert_eq!(stats.bm25_stats, Bm25StatsUsed::Namespace);
+            let reference = searcher.search(&ns, &one, &q, None).unwrap();
+            assert!(reference.total_hits > 0);
+            assert_same_scores(text, &r, &reference);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A segment whose footer can't be read here (listed in the manifest
+    /// but absent locally) makes namespace statistics incomplete. The
+    /// search must fall back to per-segment statistics — the documented
+    /// pre-#246 behavior — rather than score with a `df` missing it.
+    #[test]
+    fn unreadable_segment_falls_back_to_segment_statistics() {
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("fallback");
+        let mut rng = Rng(11);
+        let docs = random_corpus(&mut rng, 200);
+        let groups = random_split(&mut rng, &docs, false);
+        let (mut many, _) = write_segments(&dir, &ns.0, "many", &groups, 1);
+        many.segments.push(ManifestEntry {
+            segment_id: SegmentId("not-hydrated".into()),
+            doc_count: 50,
+        });
+        let searcher = Searcher::new(dir.clone());
+        let q = query("alpha beta", 50);
+        let (r, stats) = searcher.search_with_stats(&ns, &many, &q, None).unwrap();
+        assert_eq!(stats.bm25_stats, Bm25StatsUsed::SegmentFallback);
+        let mut seg = q.clone();
+        seg.bm25_params.stats = Some(Bm25StatsScope::Segment);
+        let per_segment = searcher.search(&ns, &many, &seg, None).unwrap();
+        assert_same_scores("fallback", &r, &per_segment);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_terms_follow_scope_and_query_shape() {
+        let q = query("Alpha beta alpha", 10);
+        assert_eq!(
+            namespace_stats_terms(&q),
+            Some(vec!["alpha".to_string(), "beta".to_string()])
+        );
+        let mut seg = q.clone();
+        seg.bm25_params = Bm25Overrides {
+            stats: Some(Bm25StatsScope::Segment),
+            ..Default::default()
+        };
+        assert_eq!(namespace_stats_terms(&seg), None);
+        let mut wildcard = q.clone();
+        wildcard.wildcard = Some(kosha_core::WildcardQuery {
+            field: "content".into(),
+            pattern: "al*".into(),
+            case_insensitive: false,
+        });
+        assert_eq!(namespace_stats_terms(&wildcard), None);
+    }
+
+    /// Overhead of the `df` aggregation (issue #246 asks for it measured).
+    /// Run with `cargo test -p kosha-query --release -- --ignored
+    /// --nocapture bm25_namespace_stats_overhead`.
+    #[test]
+    #[ignore]
+    fn bm25_namespace_stats_overhead() {
+        let ns = NamespaceId("ns".into());
+        let dir = scratch("overhead");
+        let segments: usize = std::env::var("KOSHA_STATS_BENCH_SEGMENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        let mut rng = Rng(3);
+        let groups: Vec<Vec<Doc>> = (0..segments)
+            .map(|s| {
+                let mut docs = random_corpus(&mut rng, 200);
+                for d in &mut docs {
+                    d.id = format!("s{s}-{}", d.id);
+                }
+                docs
+            })
+            .collect();
+        let (manifest, _) = write_segments(&dir, &ns.0, "seg", &groups, 1);
+        let searcher = Searcher::new(dir.clone());
+        let percentile = |mut v: Vec<f64>, p: f64| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[((v.len() - 1) as f64 * p) as usize]
+        };
+        for text in ["kappa", "alpha beta", "gamma eta theta"] {
+            // Cold: first query at this manifest version computes `df`.
+            let mut q = query(text, 10);
+            q.exact_total_hits = Some(false);
+            let (_, cold) = searcher
+                .search_with_stats(&ns, &manifest, &q, None)
+                .unwrap();
+            let iters = 300;
+            let mut stats_ms = Vec::new();
+            let mut ns_wall = Vec::new();
+            let mut seg_wall = Vec::new();
+            let mut seg_q = q.clone();
+            seg_q.bm25_params.stats = Some(Bm25StatsScope::Segment);
+            for _ in 0..iters {
+                let t = Instant::now();
+                let (_, s) = searcher
+                    .search_with_stats(&ns, &manifest, &q, None)
+                    .unwrap();
+                ns_wall.push(t.elapsed().as_secs_f64() * 1e3);
+                stats_ms.push(s.bm25_stats_ms);
+                let t = Instant::now();
+                searcher.search(&ns, &manifest, &seg_q, None).unwrap();
+                seg_wall.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!(
+                "{segments} segments, '{text}': cold df pass {:.3} ms | warm stats p50 {:.4} ms p99 {:.4} ms | \
+                 query p50 namespace {:.3} ms vs segment {:.3} ms",
+                cold.bm25_stats_ms,
+                percentile(stats_ms.clone(), 0.5),
+                percentile(stats_ms, 0.99),
+                percentile(ns_wall, 0.5),
+                percentile(seg_wall, 0.5),
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
