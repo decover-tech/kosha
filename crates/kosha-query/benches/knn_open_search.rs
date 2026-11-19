@@ -127,6 +127,7 @@ fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, dim: us
         version: 1,
         segments: entries,
         segment_footers: Default::default(),
+        footer_crc32: Default::default(),
         wal_checkpoint: 0,
         wal_origin: None,
         tombstones: Default::default(),

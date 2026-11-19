@@ -86,6 +86,7 @@ impl NamespaceState {
                 version: 0,
                 segments: Vec::new(),
                 segment_footers: Default::default(),
+                footer_crc32: Default::default(),
                 wal_checkpoint: 0,
                 wal_origin: None,
                 tombstones: Default::default(),
@@ -1519,12 +1520,17 @@ impl Indexer {
     /// Also advances the namespace's segment counter past any restored
     /// segment IDs, so future flushes can't collide with segments that exist
     /// in durable storage (e.g. S3) but not on local disk.
-    pub fn restore_manifest(&self, namespace: NamespaceId, manifest: Manifest) {
+    pub fn restore_manifest(&self, namespace: NamespaceId, mut manifest: Manifest) {
         let handle = self.ns_handle(&namespace);
         let mut state = handle.state.lock().unwrap();
         if state.known && state.manifest.version > manifest.version {
             return;
         }
+        // Persisted manifests no longer carry footers (#241). Keep every
+        // footer this process already parsed for a segment the new version
+        // still lists, so a manifest refresh costs no footer I/O for
+        // unchanged segments.
+        manifest.carry_segment_footers_from(&state.manifest);
         let checkpoint_applies = manifest
             .wal_origin
             .as_deref()
@@ -1580,6 +1586,35 @@ impl Indexer {
         self.manifest_cloned(namespace)
     }
 
+    /// Cache parsed footers on the in-memory manifest for segments it lists
+    /// and has no footer for yet (e.g. a query pod that just hydrated
+    /// `footer.json` for segments published by another node). Later
+    /// snapshots then skip the footer phase for those segments. Returns how
+    /// many were cached. Never changes the manifest version or what gets
+    /// published: footers are not persisted (#241).
+    pub fn remember_segment_footers(
+        &self,
+        namespace: &NamespaceId,
+        footers: impl IntoIterator<Item = std::sync::Arc<kosha_core::Footer>>,
+    ) -> usize {
+        let map = self.namespaces.lock().unwrap();
+        let Some(handle) = map.get(namespace) else {
+            return 0;
+        };
+        let mut state = handle.state.lock().unwrap();
+        if !state.known {
+            return 0;
+        }
+        footers
+            .into_iter()
+            .filter(|footer| {
+                state
+                    .manifest
+                    .remember_listed_segment_footer(footer.clone())
+            })
+            .count()
+    }
+
     pub fn manifest_cloned(&self, namespace: &NamespaceId) -> Option<Manifest> {
         self.publication_snapshot(namespace)
             .map(|(_, manifest)| manifest)
@@ -1598,22 +1633,29 @@ impl Indexer {
     ///
     /// The manifest's copy of a footer is the one searches prune with, so a
     /// footer rewritten on disk (new blooms) changes nothing until it is
-    /// installed here. Returns how many were installed.
+    /// installed here. Each footer comes with the CRC32 of the rewritten
+    /// `footer.json`; it is recorded in [`Manifest::footer_crc32`], which is
+    /// persisted (footers are not, #241) and tells query replicas to drop
+    /// their cached copy and local file. Returns how many were installed.
     pub fn replace_segment_footers(
         &self,
         namespace: &NamespaceId,
-        footers: Vec<kosha_core::Footer>,
+        footers: Vec<(kosha_core::Footer, u32)>,
     ) -> usize {
         let handle = self.ns_handle(namespace);
         let mut state = handle.state.lock().unwrap();
         let mut replaced = 0;
-        for footer in footers {
+        for (footer, crc32) in footers {
             let referenced = state
                 .manifest
                 .segments
                 .iter()
                 .any(|entry| entry.segment_id == footer.segment_id);
             if referenced {
+                state
+                    .manifest
+                    .footer_crc32
+                    .insert(footer.segment_id.clone(), crc32);
                 state.manifest.remember_segment_footer(footer);
                 replaced += 1;
             }
@@ -1669,12 +1711,17 @@ impl Indexer {
         }
         let mut manifest = state.manifest.clone();
         manifest.tombstones = state.tombstones.clone();
-        manifest.deletion_vectors.retain(|segment, _| {
-            manifest
-                .segments
-                .iter()
-                .any(|entry| &entry.segment_id == segment)
-        });
+        let listed: std::collections::HashSet<SegmentId> = manifest
+            .segments
+            .iter()
+            .map(|entry| entry.segment_id.clone())
+            .collect();
+        manifest
+            .deletion_vectors
+            .retain(|segment, _| listed.contains(segment));
+        manifest
+            .footer_crc32
+            .retain(|segment, _| listed.contains(segment));
         Some((state.published_version, manifest))
     }
 
@@ -2116,6 +2163,65 @@ mod tests {
         let records = live_records(&dir, &ns, &manifest);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].fields[0].value, "new");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #241: persisted manifests carry no footers. A reader that installs a
+    /// newer version must keep the footers it already parsed for segments
+    /// that version still lists (zero footer I/O on refresh), and the search
+    /// path can cache footers it hydrated for new segments.
+    #[test]
+    fn restore_manifest_carries_parsed_footers_across_versions() {
+        let dir = std::env::temp_dir().join(format!("kosha-footer-carry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let writer = Indexer::new(dir.join("writer"));
+        let ns = NamespaceId("a".into());
+        let doc = |id: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", id)],
+        };
+        writer
+            .index_documents(ns.clone(), vec![doc("one")])
+            .unwrap();
+        writer.flush_namespace(&ns).unwrap();
+        let v1 = writer.manifest(&ns).unwrap();
+        let seg1 = v1.segments[0].segment_id.clone();
+        assert!(
+            v1.segment_footer(&seg1).is_some(),
+            "writer keeps footers in memory"
+        );
+
+        // Round-trip through the persisted form, as a query pod sees it.
+        let persisted = |m: &Manifest| -> Manifest {
+            serde_json::from_str(&serde_json::to_string(m).unwrap()).unwrap()
+        };
+        let reader = Indexer::new(dir.join("reader"));
+        reader.restore_manifest(ns.clone(), persisted(&v1));
+        assert!(reader.manifest(&ns).unwrap().segment_footers.is_empty());
+
+        // The search path hydrated footer.json and caches the parse.
+        let footer = Arc::new(v1.segment_footer(&seg1).unwrap().clone());
+        assert_eq!(reader.remember_segment_footers(&ns, [footer.clone()]), 1);
+        assert_eq!(reader.remember_segment_footers(&ns, [footer.clone()]), 0);
+
+        writer
+            .index_documents(ns.clone(), vec![doc("two")])
+            .unwrap();
+        writer.flush_namespace(&ns).unwrap();
+        let v2 = writer.manifest(&ns).unwrap();
+        assert!(v2.version > v1.version);
+        reader.restore_manifest(ns.clone(), persisted(&v2));
+        let installed = reader.manifest(&ns).unwrap();
+        assert_eq!(installed.version, v2.version);
+        assert!(
+            Arc::ptr_eq(&installed.segment_footers[&seg1], &footer),
+            "surviving segment's parsed footer is reused, not re-read"
+        );
+        assert_eq!(
+            installed.segment_footers.len(),
+            1,
+            "new segment not cached yet"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

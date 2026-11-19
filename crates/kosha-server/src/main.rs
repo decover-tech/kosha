@@ -2423,6 +2423,28 @@ impl AppState {
             .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
             .collect();
 
+        // A footer rewritten after commit (bloom rebuild) is recorded by CRC
+        // in the manifest. A local copy that doesn't match is the old one:
+        // remove it so the hydration below fetches the current file.
+        for entry in &manifest.segments {
+            let Some(&expected) = manifest.footer_crc32.get(&entry.segment_id) else {
+                continue;
+            };
+            if manifest.segment_footer(&entry.segment_id).is_some() {
+                continue;
+            }
+            let path = self
+                .data_dir
+                .join(&ns.0)
+                .join(&entry.segment_id.0)
+                .join("footer.json");
+            if let Ok(bytes) = std::fs::read(&path) {
+                if crc32fast::hash(&bytes) != expected {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+
         // New manifests carry the search footer metadata inline, so cold
         // search can skip the footer-first S3 phase entirely. Legacy
         // manifests fall back to hydrating footer.json for pruning and
@@ -2430,13 +2452,50 @@ impl AppState {
         let (footer_files, footer_bytes) =
             self.ensure_files_local(&missing_manifest_footer_paths, "footer.json", request);
 
+        // Persisted manifests no longer carry footers (#241), so the
+        // fallback above is now the normal path for segments this pod has
+        // not seen yet. Parse each such footer once and cache it on the
+        // in-memory manifest: later queries (and later manifest versions,
+        // via `restore_manifest`'s carry-over) skip both the S3 fetch and
+        // the local parse for it.
+        let fetched_footers: HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>> = manifest
+            .segments
+            .iter()
+            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
+            .filter_map(|entry| {
+                let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                let bytes = std::fs::read(seg_path.join("footer.json")).ok()?;
+                // Still not the recorded rewrite (e.g. S3 fetch failed and
+                // left nothing usable): don't cache or prune with it.
+                if manifest
+                    .footer_crc32
+                    .get(&entry.segment_id)
+                    .is_some_and(|&expected| crc32fast::hash(&bytes) != expected)
+                {
+                    return None;
+                }
+                let footer: kosha_core::Footer = serde_json::from_slice(&bytes).ok()?;
+                // A footer.json from a different segment id (a corrupt or
+                // misplaced file) must not be cached under this id.
+                (footer.segment_id == entry.segment_id)
+                    .then(|| (entry.segment_id.clone(), Arc::new(footer)))
+            })
+            .collect();
+        if !fetched_footers.is_empty() {
+            self.indexer
+                .remember_segment_footers(ns, fetched_footers.values().cloned());
+        }
+
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
             if needs_bloom_check {
-                let footer = manifest.footer_or_read(&entry.segment_id, || {
-                    SegmentReader::read_footer(&seg_path).ok()
-                });
-                if let Some(footer) = footer.as_deref() {
+                // Borrowed, never cloned: footers hold every bloom. A
+                // segment with no cached footer was already read (once)
+                // into `fetched_footers` above.
+                let footer = manifest
+                    .segment_footer(&entry.segment_id)
+                    .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
+                if let Some(footer) = footer {
                     if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
                         continue;
                     }
@@ -5034,7 +5093,16 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
                     ));
                     continue;
                 }
-                new_footers.push(footer);
+                // The CRC of the rewritten file travels in the persisted
+                // manifest (footers themselves don't, #241) so replicas
+                // drop their cached footer and stale local footer.json.
+                match std::fs::read(seg_path.join("footer.json")) {
+                    Ok(bytes) => new_footers.push((footer, crc32fast::hash(&bytes))),
+                    Err(e) => errors.push(format!(
+                        "{}: rebuilt but footer.json unreadable: {e}",
+                        entry.segment_id.0
+                    )),
+                }
             }
             Err(e) => errors.push(format!("{}: {e}", entry.segment_id.0)),
         }
@@ -5375,12 +5443,13 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
             segment_id: footer.segment_id.clone(),
             doc_count: footer.doc_count,
         });
-        segment_footers.insert(footer.segment_id.clone(), footer);
+        segment_footers.insert(footer.segment_id.clone(), std::sync::Arc::new(footer));
     }
     kosha_core::Manifest {
         version: 1,
         segments,
         segment_footers,
+        footer_crc32: Default::default(),
         wal_checkpoint: 0,
         wal_origin: None,
         tombstones: Default::default(),
@@ -6774,6 +6843,7 @@ mod tests {
                 },
             ],
             segment_footers: Default::default(),
+            footer_crc32: Default::default(),
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
@@ -7492,6 +7562,7 @@ mod tests {
                 doc_count: 10,
             }],
             segment_footers: HashMap::new(),
+            footer_crc32: Default::default(),
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
@@ -7628,6 +7699,7 @@ mod tests {
                 doc_count: 10,
             }],
             segment_footers: HashMap::new(),
+            footer_crc32: Default::default(),
             wal_checkpoint: 0,
             wal_origin: None,
             tombstones: Default::default(),
@@ -8634,8 +8706,8 @@ mod tests {
         assert_eq!(
             m.segment_footers.len(),
             3,
-            "every footer must ride along (manifest-carried footers skip \
-             the footer-first hydration phase on cold search)"
+            "every footer is cached in memory on the importing pod (not \
+             persisted — #241), so its first searches skip footer hydration"
         );
     }
 
