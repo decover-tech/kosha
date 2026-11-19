@@ -147,6 +147,8 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         collapse: None,
         source_includes: None,
         source_excludes: None,
+        rank: None,
+        mode: None,
     }
 }
 

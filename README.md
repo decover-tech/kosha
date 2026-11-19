@@ -12,7 +12,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 > **Status: Phase 1 complete — BM25 lexical + kNN/ANN search implemented.**
 > All seven crates have functional BM25 indexing, query, filtering,
-> aggregation, and HNSW vector search. RRF fusion and rerank are Phase 2
+> aggregation, HNSW vector search, and RRF hybrid fusion. Rerank is Phase 2
 > (DESIGN.md §3.1).
 
 ## Install
@@ -35,9 +35,9 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | `match_phrase` | Positional postings, configurable `slop` |
 | `wildcard` | Per-field pattern match, case-insensitive by default |
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
-| Hybrid retrieval | A `knn` clause and `query_text` in one request; vector and BM25 hits merged per segment |
+| Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
 | Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `bool` (`must` / `must_not` / `should` / `minimum_should_match`), `match_all` |
-| kNN-scoped filters | `knn.filter` restricts vector candidates; the top-level `filter` still governs the merged result set |
+| kNN-scoped filters | `knn.filter` restricts only the vector list; the top-level `filter` restricts both the lexical and the vector list |
 | Sorting | Multi-field `sort` over stored fields, plus `_id` |
 | Pagination | `from` / `max_results`, and an OpenSearch-style `search_after` cursor |
 | Highlighting | Per-field, with configurable `pre_tags` / `post_tags` |
@@ -87,7 +87,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 ### Not supported yet
 
-- RRF fusion and reranking (Phase 2, DESIGN.md §3.1).
+- Reranking (Phase 2, DESIGN.md §3.1). Per-retriever weights for RRF.
 - Configurable analyzers — tokenization is fixed (whitespace split, ASCII-punctuation trim, lowercase). The `analyzer` field exists in the schema proto but is not honored.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
 - `kosha-vector-spfresh` (SPFresh/SPANN with LIRE rebalancing) is a standalone, benchmarked prototype; it is not wired into the segment format or the query path.

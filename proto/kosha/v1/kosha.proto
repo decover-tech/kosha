@@ -237,15 +237,35 @@ message SearchRequest {
   // kNN / ANN vector search (Phase 2).
   optional KnnQuery knn = 13;
 
-  // Mode — defaults to LEXICAL in Phase 1.
+  // Mode. UNSPECIFIED infers it from the clauses present; any other value
+  // is checked against them (HTTP: "mode": "lexical" | "semantic" | "hybrid").
   RetrievalMode mode = 14;
+
+  // How a hybrid request fuses its lexical and kNN lists.
+  // HTTP: "rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}.
+  optional Rank rank = 15;
 }
 
 enum RetrievalMode {
   RETRIEVAL_MODE_UNSPECIFIED = 0;
-  RETRIEVAL_MODE_LEXICAL = 1;
-  RETRIEVAL_MODE_SEMANTIC = 2;  // Phase 2
-  RETRIEVAL_MODE_HYBRID = 3;    // Phase 2
+  RETRIEVAL_MODE_LEXICAL = 1;   // query_text / wildcard / match_phrase; no knn
+  RETRIEVAL_MODE_SEMANTIC = 2;  // knn only
+  // A lexical query plus knn, fused by Reciprocal Rank Fusion over
+  // namespace-wide ranks (see Rank). Every request with both is hybrid.
+  RETRIEVAL_MODE_HYBRID = 3;
+}
+
+message Rank {
+  optional RrfRank rrf = 1;
+}
+
+// score(d) = sum over retrievers r of 1 / (rank_constant + rank_r(d)).
+message RrfRank {
+  // Per-retriever list length and fused list length. Default: max_results;
+  // must be >= max_results.
+  optional int32 rank_window_size = 1;
+  // Default 60; must be >= 1.
+  optional int32 rank_constant = 2;
 }
 
 message SortSpec {
@@ -287,9 +307,20 @@ message SearchResponse {
 
 message ScoredDocument {
   string doc_id = 1;
-  double score = 2;
+  double score = 2;  // the fused RRF score for a hybrid request
   repeated Field fields = 3;
   repeated string highlights = 4;
+  // Hybrid requests only.
+  optional RankDetails rank_details = 5;
+}
+
+// 1-based ranks in each retriever's namespace-wide list; unset when the hit
+// was not in that retriever's window.
+message RankDetails {
+  optional int32 lexical_rank = 1;
+  optional double lexical_score = 2;
+  optional int32 knn_rank = 3;
+  optional double knn_score = 4;
 }
 
 // ─── Stats ──────────────────────────────────────────────────────────────────

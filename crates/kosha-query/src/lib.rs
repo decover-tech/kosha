@@ -10,8 +10,8 @@ use kosha_core::{
     segment_may_contain_terms, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
     AggMetricResult, Aggregation, AggregationResults, Bm25Params, Bm25StatsScope, DocSet,
     DocumentId, FieldType, FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry,
-    NamespaceId, ScoredDocument, SearchQuery, SearchResult, SortSpec, TermBloomMode,
-    TotalHitsRelation,
+    NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery, SearchResult, SortSpec,
+    TermBloomMode, TotalHitsRelation,
 };
 use kosha_segment::{
     tokenize, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
@@ -1785,9 +1785,15 @@ impl Searcher {
             None => Bm25Scorer::new(total_docs, reader.avg_field_length(), params),
         };
 
+        // Hybrid requests keep their lexical and vector lists apart here and
+        // fuse them by rank in `search_inner`, once both lists are known
+        // across the whole namespace (issue #228).
+        let rrf = query.rrf();
         let has_query =
             !query_terms.is_empty() || query.wildcard.is_some() || query.match_phrase.is_some();
-        let has_only_filter = !has_query && query.filter.is_some();
+        // A hybrid request whose text tokenizes to nothing has an empty
+        // lexical list, not a "match every filtered document" one.
+        let has_only_filter = !has_query && query.filter.is_some() && rrf.is_none();
         // A filter-only request for no hits (`size: 0`), with no kNN leg
         // and nothing to aggregate, needs only the number of passing
         // documents, not each of them materialized as a candidate.
@@ -1981,6 +1987,7 @@ impl Searcher {
                         // No query term appears in this segment.
                         return Some(SegmentOutput {
                             candidates: Vec::new(),
+                            vector_candidates: Vec::new(),
                             aggs: HashMap::new(),
                             total_hits: 0,
                             hits_capped: false,
@@ -2015,6 +2022,7 @@ impl Searcher {
                             // Pure count-only: skip all scoring; total_hits IS df.
                             return Some(SegmentOutput {
                                 candidates: Vec::new(),
+                                vector_candidates: Vec::new(),
                                 aggs: HashMap::new(),
                                 total_hits,
                                 hits_capped: false,
@@ -2093,6 +2101,7 @@ impl Searcher {
 
                         return Some(SegmentOutput {
                             candidates: topk.into_candidates(&reader),
+                            vector_candidates: Vec::new(),
                             aggs: HashMap::new(),
                             total_hits,
                             hits_capped: false,
@@ -2330,6 +2339,7 @@ impl Searcher {
 
                         return Some(SegmentOutput {
                             candidates: topk.into_candidates(&reader),
+                            vector_candidates: Vec::new(),
                             aggs: HashMap::new(),
                             total_hits,
                             hits_capped,
@@ -2500,6 +2510,7 @@ impl Searcher {
 
                     Some(SegmentOutput {
                         candidates: topk.into_candidates(&reader),
+                        vector_candidates: Vec::new(),
                         aggs: HashMap::new(),
                         total_hits,
                         hits_capped,
@@ -2743,6 +2754,9 @@ impl Searcher {
         // one, else HNSW, else flat fallback — unchanged for anything that
         // isn't a v2 segment) ──
         let mut knn_segment_degraded = false;
+        // Hybrid only: this segment's vector hits, nearest first, kept out
+        // of `seg_hits` so the two retrievers can be ranked separately.
+        let mut knn_hits: Vec<(u32, f64)> = Vec::new();
         if let Some(ref knn) = query.knn {
             // The kNN-scoped filter, the top-level filter and tombstones
             // all decide which documents may be a vector hit, and they are
@@ -2883,23 +2897,29 @@ impl Searcher {
                     Vec::new()
                 }
             };
-            // Merge with this segment's BM25 hits or use kNN directly.
-            // Per-segment HashMap keeps hybrid merge O(k), not O(hits·k).
-            // (A no-op on an empty `knn_results`, same as before this
-            // block existed — no separate emptiness gate needed.)
-            for (kept, (doc_seq, score)) in knn_results
+            let knn_results = knn_results
                 .into_iter()
                 // Filters and tombstones were applied inside the probe.
                 .filter(|(doc_seq, _)| reader.doc_meta(*doc_seq).is_some())
-                .enumerate()
-            {
-                if kept >= knn.k {
-                    break;
+                .take(knn.k);
+            if rrf.is_some() {
+                // Hybrid: fused by rank across the namespace, never here.
+                // Merging per segment is what issue #250 was about: a
+                // segment's own top neighbour got rank 1 however far it
+                // was from the namespace's, and vector-only hits were
+                // dropped from segments that had lexical matches.
+                knn_hits.extend(knn_results);
+            } else {
+                // kNN alone, or kNN next to a filter with no query text.
+                // Either way every vector hit passed the filter and so is
+                // already in `seg_hits` (filter-only) or `seg_hits` is
+                // empty (pure kNN): one formula applies per request.
+                for (doc_seq, score) in knn_results {
+                    seg_hits
+                        .entry(doc_seq)
+                        .and_modify(|lexical| *lexical = *lexical * 0.5 + score * 0.5 * 100.0)
+                        .or_insert((score + 1.0) * 10.0);
                 }
-                seg_hits
-                    .entry(doc_seq)
-                    .and_modify(|lexical| *lexical = *lexical * 0.5 + score * 0.5 * 100.0)
-                    .or_insert((score + 1.0) * 10.0);
             }
         }
 
@@ -2922,13 +2942,26 @@ impl Searcher {
         };
         let total_hits = filter_only_count.unwrap_or(seg_hits.len());
 
-        let effective_k = query.from.saturating_add(query.max_results);
+        // Hybrid: the lexical retriever's list is its best
+        // `rank_window_size` by BM25 across the namespace, so each segment
+        // hands back its own best `rank_window_size`, whatever the page.
+        // Sort, cursor and collapse apply to the fused list, not here.
+        let effective_k = match rrf {
+            Some(params) => params.rank_window_size,
+            None => query.from.saturating_add(query.max_results),
+        };
         let has_cursor = query.search_after.as_ref().is_some_and(|a| !a.is_empty());
         // The page is ordered by score alone (ties by `_id`), with no
         // cursor to locate and no grouping: the cheap cut below applies.
-        let score_ranked =
-            sort_is_default_ranking(&query.sort) && !has_cursor && query.collapse.is_none();
+        let score_ranked = rrf.is_some()
+            || (sort_is_default_ranking(&query.sort) && !has_cursor && query.collapse.is_none());
 
+        // Hybrid: which vector hits also matched lexically (and so are
+        // already counted in `total_hits` and the aggregations).
+        let knn_hits: Vec<(u32, f64, bool)> = knn_hits
+            .into_iter()
+            .map(|(doc_seq, score)| (doc_seq, score, seg_hits.contains_key(&doc_seq)))
+            .collect();
         let mut ranked: Vec<(f64, u32)> = seg_hits.into_iter().map(|(d, s)| (s, d)).collect();
         if score_ranked {
             // Cut to this segment's top `effective_k` by score *before*
@@ -2959,7 +2992,11 @@ impl Searcher {
         let sort_value_maps = if sort_value_fields.is_empty() {
             HashMap::new()
         } else {
-            let wanted: HashSet<u32> = ranked.iter().map(|(_, doc_seq)| *doc_seq).collect();
+            let wanted: HashSet<u32> = ranked
+                .iter()
+                .map(|(_, doc_seq)| *doc_seq)
+                .chain(knn_hits.iter().map(|(doc_seq, _, _)| *doc_seq))
+                .collect();
             build_sort_value_maps(
                 filter_store
                     .as_ref()
@@ -2984,7 +3021,30 @@ impl Searcher {
                 doc_id: DocumentId(meta.doc_id.to_owned()),
                 score,
                 sort_values,
+                rank_details: None,
             });
+        }
+        let mut vector_candidates = Vec::with_capacity(knn_hits.len());
+        for (doc_seq, score, lexical_match) in knn_hits {
+            let Some(meta) = reader.doc_meta(doc_seq) else {
+                continue;
+            };
+            let sort_values = if sort_value_fields.is_empty() {
+                Vec::new()
+            } else {
+                extract_sort_values(doc_seq, sort_value_fields, &sort_value_maps)
+            };
+            vector_candidates.push((
+                HitCandidate {
+                    reader: Arc::clone(&reader),
+                    doc_seq,
+                    doc_id: DocumentId(meta.doc_id.to_owned()),
+                    score,
+                    sort_values,
+                    rank_details: None,
+                },
+                lexical_match,
+            ));
         }
 
         // ── Cut under a custom order, a cursor or a collapse ──
@@ -2994,7 +3054,7 @@ impl Searcher {
         // only has to hand back its own first `k` under that order. These
         // requests used to hand back every hit they had, and the reduce
         // step sorted the whole lot to keep one page.
-        if !score_ranked {
+        if !score_ranked && rrf.is_none() {
             let rank = |a: &HitCandidate, b: &HitCandidate| {
                 compare_candidates(a, b, &query.sort, sort_value_fields)
             };
@@ -3033,6 +3093,7 @@ impl Searcher {
 
         Ok(Some(SegmentOutput {
             candidates,
+            vector_candidates,
             aggs,
             total_hits,
             hits_capped: false,
@@ -3323,8 +3384,10 @@ impl Searcher {
         let mut total_hits: usize = 0;
         let mut any_capped = false;
         let mut knn_degraded_segments: u32 = 0;
+        let mut vector_candidates: Vec<(HitCandidate, bool)> = Vec::new();
         for output in segment_outputs {
             candidates.extend(output.candidates);
+            vector_candidates.extend(output.vector_candidates);
             total_hits += output.total_hits;
             any_capped |= output.hits_capped;
             if output.knn_segment_degraded {
@@ -3346,6 +3409,32 @@ impl Searcher {
         // walking ~10⁶ candidates and reporting "at least 10,000" for free.
         // `exact_total_hits: true` (per query, or `KOSHA_EXACT_TOTAL_HITS`
         // engine-wide) restores the old unconditional-exact behavior.
+        // ── Hybrid: Reciprocal Rank Fusion over namespace-wide lists ──
+        // Each segment handed back its best `rank_window_size` lexical hits
+        // and its nearest vector hits. Only now, with every segment's
+        // lists in hand, are the two retrievers ranked — globally — and
+        // fused. Fusing per-segment ranks instead would give a segment's
+        // best match rank 1 however weak it is namespace-wide (issue #228).
+        if let Some(params) = query.rrf() {
+            let knn_k = query.knn.as_ref().map_or(0, |knn| knn.k);
+            let fused = rrf_fuse(
+                std::mem::take(&mut candidates),
+                vector_candidates,
+                params,
+                knn_k,
+            );
+            candidates = fused.candidates;
+            // A hit is a document matching the lexical query, or one in the
+            // vector retriever's window: lexical matches are already
+            // counted, so only vector-only window members are added.
+            total_hits += fused.vector_only.len();
+            if !query.aggs.is_empty() && !fused.vector_only.is_empty() {
+                for (name, state) in aggregate_vector_only(query, &fused.vector_only) {
+                    all_aggs.entry(name).or_default().merge(state);
+                }
+            }
+        }
+
         let (mut total_hits, total_hits_relation) =
             resolve_total_hits(total_hits, exact, cap, any_capped);
 
@@ -3475,6 +3564,7 @@ impl Searcher {
                 score: cand.score,
                 fields: doc_rec.fields,
                 highlights: None,
+                rank_details: cand.rank_details.clone(),
             };
             if let Some(ref highlight) = query.highlight {
                 if !query_terms.is_empty() {
@@ -4045,6 +4135,7 @@ impl BoundedTopK {
                 doc_id,
                 score,
                 sort_values: Vec::new(),
+                rank_details: None,
             })
             .collect()
     }
@@ -4064,6 +4155,9 @@ struct HitCandidate {
     /// Values for the request's stored-field keys (sort keys, then the
     /// collapse field), parallel to `search_inner`'s `sort_value_fields`.
     sort_values: Vec<SortValue>,
+    /// Hybrid (RRF) only: the hit's rank in each retriever's list, set
+    /// when the lists are fused.
+    rank_details: Option<RankDetails>,
 }
 
 /// One segment's independent contribution to a query: its scored candidates
@@ -4083,6 +4177,10 @@ struct HitCandidate {
 /// score alone — still have `total_hits == candidates.len()`.
 struct SegmentOutput {
     candidates: Vec<HitCandidate>,
+    /// Hybrid (RRF) requests only: this segment's vector hits, each with
+    /// whether it also matched the lexical query (and so is already in
+    /// `total_hits` and `aggs`). Empty otherwise.
+    vector_candidates: Vec<(HitCandidate, bool)>,
     aggs: HashMap<String, AggregationState>,
     total_hits: usize,
     /// True when the multi-term join stopped counting early under a
@@ -4095,6 +4193,123 @@ struct SegmentOutput {
     /// Always `false` on every fast path below except the general path,
     /// which is the only one that runs kNN at all.
     knn_segment_degraded: bool,
+}
+
+/// What [`rrf_fuse`] hands back to `search_inner`.
+struct FusedLists {
+    /// The fused list, best first, at most `rank_window_size` long; each
+    /// hit's `score` is its RRF score and `rank_details` its ranks.
+    candidates: Vec<HitCandidate>,
+    /// Members of the vector window that did not match the lexical query:
+    /// the hits `total_hits` and the aggregations have not seen yet.
+    vector_only: Vec<(Arc<TrackedSegment>, u32)>,
+}
+
+/// Rank both retrievers across the whole namespace and fuse them with
+/// Reciprocal Rank Fusion: `score(d) = Σ_r 1 / (rank_constant + rank_r(d))`.
+///
+/// `lexical` holds every segment's best `rank_window_size` BM25 hits, which
+/// is a superset of the namespace's best `rank_window_size`; `vector` every
+/// segment's nearest `k`, a superset of the namespace's nearest `k`. Each is
+/// ordered (score descending, `_id` ascending — the same order the
+/// per-segment cuts used, so a cut can never disagree with this one) and cut
+/// to its window before ranks are assigned. The vector window is
+/// `min(k, rank_window_size)`: `knn.k` is how many neighbours the vector
+/// retriever returns, as in Elasticsearch.
+fn rrf_fuse(
+    mut lexical: Vec<HitCandidate>,
+    mut vector: Vec<(HitCandidate, bool)>,
+    params: RrfParams,
+    knn_k: usize,
+) -> FusedLists {
+    let by_score = |a: &HitCandidate, b: &HitCandidate| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.doc_id.0.cmp(&b.doc_id.0))
+    };
+    let window = params.rank_window_size;
+    lexical.sort_by(by_score);
+    lexical.truncate(window);
+    vector.sort_by(|a, b| by_score(&a.0, &b.0));
+    vector.truncate(window.min(knn_k));
+
+    let constant = f64::from(params.rank_constant);
+    let contribution = |rank: usize| 1.0 / (constant + rank as f64);
+    let mut fused: Vec<HitCandidate> = Vec::with_capacity(lexical.len() + vector.len());
+    let mut position: HashMap<String, usize> = HashMap::with_capacity(lexical.len());
+    for (i, mut cand) in lexical.into_iter().enumerate() {
+        let rank = i + 1;
+        cand.rank_details = Some(RankDetails {
+            lexical_rank: Some(rank as u32),
+            lexical_score: Some(cand.score),
+            ..RankDetails::default()
+        });
+        cand.score = contribution(rank);
+        position.insert(cand.doc_id.0.clone(), fused.len());
+        fused.push(cand);
+    }
+    let mut vector_only = Vec::new();
+    for (i, (mut cand, lexical_match)) in vector.into_iter().enumerate() {
+        let rank = i + 1;
+        if !lexical_match {
+            vector_only.push((Arc::clone(&cand.reader), cand.doc_seq));
+        }
+        match position.get(&cand.doc_id.0) {
+            Some(&at) => {
+                let hit = &mut fused[at];
+                hit.score += contribution(rank);
+                let details = hit.rank_details.get_or_insert_with(RankDetails::default);
+                details.knn_rank = Some(rank as u32);
+                details.knn_score = Some(cand.score);
+            }
+            None => {
+                cand.rank_details = Some(RankDetails {
+                    knn_rank: Some(rank as u32),
+                    knn_score: Some(cand.score),
+                    ..RankDetails::default()
+                });
+                cand.score = contribution(rank);
+                fused.push(cand);
+            }
+        }
+    }
+    fused.sort_by(by_score);
+    fused.truncate(window);
+    FusedLists {
+        candidates: fused,
+        vector_only,
+    }
+}
+
+/// Aggregations over the vector-only members of a hybrid request's vector
+/// window, grouped by segment: a hybrid request aggregates over the same
+/// documents its `total_hits` counts (lexical matches plus the vector
+/// window), and the per-segment pass only saw the lexical matches.
+fn aggregate_vector_only(
+    query: &SearchQuery,
+    vector_only: &[(Arc<TrackedSegment>, u32)],
+) -> Vec<(String, AggregationState)> {
+    let mut by_segment: Vec<(&Arc<TrackedSegment>, HashSet<u32>)> = Vec::new();
+    for (reader, doc_seq) in vector_only {
+        match by_segment
+            .iter_mut()
+            .find(|(seen, _)| Arc::ptr_eq(seen, reader))
+        {
+            Some((_, seqs)) => {
+                seqs.insert(*doc_seq);
+            }
+            None => by_segment.push((reader, HashSet::from([*doc_seq]))),
+        }
+    }
+    let mut out = Vec::new();
+    for (reader, wanted) in by_segment {
+        let store = reader.filter_store();
+        for (name, agg) in &query.aggs {
+            out.push((name.clone(), aggregate_matches(&store, &wanted, agg)));
+        }
+    }
+    out
 }
 
 fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
@@ -4747,6 +4962,8 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            rank: None,
+            mode: None,
         }
     }
 
@@ -6801,6 +7018,8 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            rank: None,
+            mode: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
@@ -9357,6 +9576,8 @@ mod tests {
                     collapse: None,
                     source_includes: None,
                     source_excludes: None,
+                    rank: None,
+                    mode: None,
                 },
                 None,
             )
@@ -9462,6 +9683,8 @@ mod tests {
                     collapse: None,
                     source_includes: None,
                     source_excludes: None,
+                    rank: None,
+                    mode: None,
                 },
                 None,
             )
@@ -9542,6 +9765,8 @@ mod tests {
                     collapse: None,
                     source_includes: None,
                     source_excludes: None,
+                    rank: None,
+                    mode: None,
                 },
                 None,
             )
@@ -9574,6 +9799,8 @@ mod tests {
                     collapse: None,
                     source_includes: None,
                     source_excludes: None,
+                    rank: None,
+                    mode: None,
                 },
                 None,
             )
@@ -9854,6 +10081,8 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            rank: None,
+            mode: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -9943,6 +10172,8 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            rank: None,
+            mode: None,
         };
 
         let first = searcher.search(&ns, &manifest, &q, None).unwrap();
@@ -10023,6 +10254,8 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            rank: None,
+            mode: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
@@ -10701,5 +10934,736 @@ mod corpus_stats_tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Hybrid retrieval: Reciprocal Rank Fusion of the lexical and vector
+/// lists (issues #228 and #250).
+#[cfg(test)]
+mod rrf_tests {
+    use super::*;
+    use kosha_core::{
+        DocumentId, Field, KnnQuery, ManifestEntry, RankSpec, RetrievalMode, RrfSpec, SegmentId,
+    };
+    use kosha_segment::SegmentWriter;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Clone)]
+    struct Doc {
+        id: String,
+        text: String,
+        matter: String,
+        angle: f32,
+    }
+
+    fn doc(id: &str, text: &str, matter: &str, angle: f32) -> Doc {
+        Doc {
+            id: id.into(),
+            text: text.into(),
+            matter: matter.into(),
+            angle,
+        }
+    }
+
+    fn unit(angle: f32) -> Vec<f32> {
+        vec![angle.cos(), angle.sin(), 0.0, 0.0]
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kosha-rrf-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// One segment per group; returns the manifest and each doc's
+    /// `(segment, doc_seq)` for tombstones.
+    fn write(
+        dir: &Path,
+        prefix: &str,
+        groups: &[Vec<Doc>],
+    ) -> (Manifest, HashMap<String, (SegmentId, u32)>) {
+        let mut manifest = Manifest {
+            version: 1,
+            segments: Vec::new(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        };
+        let mut locations = HashMap::new();
+        for (g, docs) in groups.iter().enumerate() {
+            let id = SegmentId(format!("{prefix}-{g:03}"));
+            let mut w = SegmentWriter::new(id.clone(), dir.join("ns").join(&id.0));
+            for (seq, d) in docs.iter().enumerate() {
+                w.add_document(
+                    DocumentId(d.id.clone()),
+                    vec![
+                        Field::text("content", d.text.clone()),
+                        Field::keyword("matter", d.matter.clone()),
+                        Field::vector("emb", unit(d.angle)),
+                    ],
+                );
+                locations.insert(d.id.clone(), (id.clone(), seq as u32));
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id: id,
+                doc_count: docs.len() as u32,
+            });
+        }
+        (manifest, locations)
+    }
+
+    fn ns() -> NamespaceId {
+        NamespaceId("ns".into())
+    }
+
+    fn hybrid(text: &str, max: usize, k: usize, rank: Option<RrfSpec>) -> SearchQuery {
+        let mut q: SearchQuery =
+            serde_json::from_value(serde_json::json!({"query_text": text, "max_results": max}))
+                .unwrap();
+        q.knn = Some(KnnQuery {
+            field: "emb".into(),
+            vector: unit(0.0),
+            k,
+            // Far above the corpus size: the vector probe is exhaustive, so
+            // the vector retriever's list is exact and the tests below
+            // compare fusion, not ANN recall.
+            num_candidates: 100_000,
+            filter: None,
+        });
+        q.rank = rank.map(|rrf| RankSpec { rrf: Some(rrf) });
+        q
+    }
+
+    fn rrf(window: Option<usize>, constant: Option<u32>) -> Option<RrfSpec> {
+        Some(RrfSpec {
+            rank_window_size: window,
+            rank_constant: constant,
+        })
+    }
+
+    fn ids(r: &SearchResult) -> Vec<String> {
+        r.results.iter().map(|d| d.doc_id.0.clone()).collect()
+    }
+
+    fn matter(m: &str) -> FilterClause {
+        serde_json::from_value(serde_json::json!({"term": {"matter": m}})).unwrap()
+    }
+
+    /// The fixture for "agreement by both retrievers wins": `lex_top` is
+    /// the best lexical match and far from the query vector; `vec_top` is
+    /// the query vector itself and has no query term; `both` is second on
+    /// each list.
+    fn agreement_corpus() -> Vec<Doc> {
+        let mut docs = vec![
+            doc("lex_top", "breach breach breach breach", "m0", 3.0),
+            doc("both", "breach breach breach notice", "m0", 0.01),
+            doc("vec_top", "unrelated words entirely", "m0", 0.0),
+        ];
+        // Weaker lexical matches, far from the query vector.
+        for i in 0..10 {
+            docs.push(doc(
+                &format!("lexfill{i:02}"),
+                &format!("breach {}", "padding ".repeat(5 + i)),
+                "m1",
+                2.0 + 0.08 * i as f32,
+            ));
+        }
+        // Weaker vector neighbours with no query term.
+        for i in 0..10 {
+            docs.push(doc(
+                &format!("vecfill{i:02}"),
+                "padding words",
+                "m2",
+                0.5 + 0.1 * i as f32,
+            ));
+        }
+        docs
+    }
+
+    #[test]
+    fn doc_ranked_high_by_both_retrievers_outranks_single_retriever_winners() {
+        let dir = scratch("agreement");
+        let (manifest, _) = write(&dir, "s", &[agreement_corpus()]);
+        let searcher = Searcher::new(dir.clone());
+        // No `rank`: a hybrid request fuses with RRF defaults (#250).
+        let q = hybrid("breach", 10, 10, None);
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        let got = ids(&r);
+        assert_eq!(got[0], "both", "agreement must win: {got:?}");
+        assert_eq!(&got[1..3], ["lex_top", "vec_top"], "{got:?}");
+
+        let both = &r.results[0];
+        let details = both.rank_details.as_ref().unwrap();
+        assert_eq!(details.lexical_rank, Some(2));
+        assert_eq!(details.knn_rank, Some(2));
+        assert!((both.score - 2.0 / 62.0).abs() < 1e-12, "{}", both.score);
+
+        // The vector-only hit is kept, with no lexical rank (#250).
+        let vec_top = r.results.iter().find(|d| d.doc_id.0 == "vec_top").unwrap();
+        let details = vec_top.rank_details.as_ref().unwrap();
+        assert_eq!(details.lexical_rank, None);
+        assert_eq!(details.knn_rank, Some(1));
+        assert!(details.knn_score.unwrap() > 0.99);
+        assert!((vec_top.score - 1.0 / 61.0).abs() < 1e-12);
+        let lex_top = r.results.iter().find(|d| d.doc_id.0 == "lex_top").unwrap();
+        assert_eq!(lex_top.rank_details.as_ref().unwrap().lexical_rank, Some(1));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Deterministic xorshift.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const VOCAB: [&str; 6] = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+
+    fn random_corpus(rng: &mut Rng, n: usize) -> Vec<Doc> {
+        (0..n)
+            .map(|i| {
+                let len = 1 + rng.below(12);
+                let words: Vec<&str> = (0..len).map(|_| VOCAB[rng.below(VOCAB.len())]).collect();
+                Doc {
+                    id: format!("doc-{i:04}"),
+                    text: words.join(" "),
+                    matter: format!("m{}", rng.below(3)),
+                    angle: (rng.below(100_000) as f32) / 100_000.0 * std::f32::consts::PI,
+                }
+            })
+            .collect()
+    }
+
+    fn random_split(rng: &mut Rng, docs: &[Doc]) -> Vec<Vec<Doc>> {
+        let k = 2 + rng.below(10);
+        let mut groups: Vec<Vec<Doc>> = vec![Vec::new(); k];
+        // A one-document segment: the per-segment trap's worst case (its
+        // only match would be "rank 1" if ranks were per segment).
+        groups[0].push(docs[0].clone());
+        for d in &docs[1..] {
+            groups[1 + rng.below(k - 1)].push(d.clone());
+        }
+        groups.retain(|g| !g.is_empty());
+        groups
+    }
+
+    fn assert_same_fusion(label: &str, a: &SearchResult, b: &SearchResult) {
+        assert_eq!(ids(a), ids(b), "{label}: page differs");
+        for (x, y) in a.results.iter().zip(&b.results) {
+            assert_eq!(x.score, y.score, "{label}: {} score", x.doc_id.0);
+            let (dx, dy) = (x.rank_details.as_ref(), y.rank_details.as_ref());
+            assert_eq!(
+                dx.map(|d| (d.lexical_rank, d.knn_rank)),
+                dy.map(|d| (d.lexical_rank, d.knn_rank)),
+                "{label}: {} ranks",
+                x.doc_id.0
+            );
+        }
+        assert_eq!(a.total_hits, b.total_hits, "{label}: total_hits");
+    }
+
+    #[test]
+    fn fused_ranking_is_identical_for_one_or_many_segments() {
+        let mut rng = Rng(0x5eed_1234_abcd_0001);
+        for trial in 0..6 {
+            let dir = scratch(&format!("split-{trial}"));
+            let docs = random_corpus(&mut rng, 160);
+            let (single, single_loc) = write(&dir, "one", std::slice::from_ref(&docs));
+            let groups = random_split(&mut rng, &docs);
+            let (many, many_loc) = write(&dir, "many", &groups);
+            let searcher = Searcher::new(dir.clone());
+
+            // Delete a few documents in both layouts: fused lists are cut
+            // after deletes, never before.
+            let deleted: HashSet<String> = (0..5)
+                .map(|_| docs[rng.below(docs.len())].id.clone())
+                .collect();
+            let tomb = |loc: &HashMap<String, (SegmentId, u32)>| {
+                let mut t: HashMap<SegmentId, HashSet<u32>> = HashMap::new();
+                for id in &deleted {
+                    let (seg, seq) = &loc[id];
+                    t.entry(seg.clone()).or_default().insert(*seq);
+                }
+                t
+            };
+            let (single_t, many_t) = (tomb(&single_loc), tomb(&many_loc));
+
+            for (text, window, k) in [("gamma", 20, 15), ("alpha beta", 30, 40), ("zeta", 10, 10)] {
+                let mut q = hybrid(text, 10, k, rrf(Some(window), None));
+                q.operator = Some(kosha_core::QueryOperator::Or);
+                let label = format!("trial {trial} {text:?} ({} segments)", groups.len());
+                let a = searcher
+                    .search(&ns(), &single, &q, Some(&single_t))
+                    .unwrap();
+                let b = searcher.search(&ns(), &many, &q, Some(&many_t)).unwrap();
+                assert_same_fusion(&label, &a, &b);
+                assert!(!a.results.is_empty(), "{label}: no hits");
+                for hit in &a.results {
+                    assert!(!deleted.contains(&hit.doc_id.0), "{label}: deleted hit");
+                }
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn rank_constant_and_window_are_honored() {
+        let dir = scratch("params");
+        let (manifest, _) = write(&dir, "s", &[agreement_corpus()]);
+        let searcher = Searcher::new(dir.clone());
+
+        let r = searcher
+            .search(
+                &ns(),
+                &manifest,
+                &hybrid("breach", 5, 10, rrf(None, Some(1))),
+                None,
+            )
+            .unwrap();
+        assert_eq!(r.results[0].doc_id.0, "both");
+        assert!((r.results[0].score - 2.0 / 3.0).abs() < 1e-12);
+
+        // Default window = max_results: each retriever contributes only
+        // that many, and the fused list is that long.
+        let r = searcher
+            .search(&ns(), &manifest, &hybrid("breach", 3, 10, None), None)
+            .unwrap();
+        assert_eq!(r.results.len(), 3);
+        for hit in &r.results {
+            let d = hit.rank_details.as_ref().unwrap();
+            assert!(d.lexical_rank.is_none_or(|x| x <= 3));
+            assert!(d.knn_rank.is_none_or(|x| x <= 3));
+        }
+
+        // A wider window lets ranks past the page contribute, and the
+        // fused list is at most `rank_window_size` long: paging past it
+        // returns nothing.
+        let mut q = hybrid("breach", 3, 10, rrf(Some(8), None));
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert!(r
+            .results
+            .iter()
+            .any(|h| h.rank_details.as_ref().unwrap().lexical_rank.is_some()));
+        q.from = 8;
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert!(r.results.is_empty(), "{:?}", ids(&r));
+
+        // knn.k bounds the vector list inside the window.
+        let r = searcher
+            .search(
+                &ns(),
+                &manifest,
+                &hybrid("breach", 10, 2, rrf(Some(10), None)),
+                None,
+            )
+            .unwrap();
+        let max_knn = r
+            .results
+            .iter()
+            .filter_map(|h| h.rank_details.as_ref().unwrap().knn_rank)
+            .max();
+        assert_eq!(max_knn, Some(2));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_rank_and_mode_combinations_are_rejected() {
+        let bad = |q: SearchQuery| matches!(q.validate(), Err(KoshaError::InvalidQuery(_)));
+        // rank without a vector leg, or without a lexical one.
+        let mut q = hybrid("breach", 10, 10, rrf(None, None));
+        q.knn = None;
+        assert!(bad(q));
+        let q = hybrid("", 10, 10, rrf(None, None));
+        assert!(bad(q));
+        assert!(bad(hybrid("x", 10, 10, rrf(Some(5), None))));
+        assert!(bad(hybrid("x", 10, 10, rrf(Some(0), None))));
+        assert!(bad(hybrid("x", 10, 10, rrf(None, Some(0)))));
+        let mut q = hybrid("x", 10, 10, None);
+        q.rank = Some(RankSpec { rrf: None });
+        assert!(bad(q));
+        assert!(hybrid("x", 10, 10, rrf(Some(10), Some(1)))
+            .validate()
+            .is_ok());
+
+        let mut q = hybrid("", 10, 10, None);
+        q.mode = Some(RetrievalMode::Hybrid);
+        assert!(bad(q));
+        let mut q = hybrid("x", 10, 10, None);
+        q.mode = Some(RetrievalMode::Lexical);
+        assert!(bad(q.clone()));
+        q.mode = Some(RetrievalMode::Semantic);
+        assert!(bad(q.clone()));
+        q.mode = Some(RetrievalMode::Hybrid);
+        assert!(q.validate().is_ok());
+
+        // The JSON shape, Elasticsearch-style; unknown keys are a 400, not
+        // silently ignored.
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "x", "mode": "hybrid",
+            "knn": {"field": "emb", "vector": [1.0, 0.0, 0.0, 0.0], "k": 50},
+            "rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}}))
+        .unwrap();
+        assert_eq!(
+            q.rrf(),
+            Some(RrfParams {
+                rank_window_size: 100,
+                rank_constant: 60
+            })
+        );
+        assert!(serde_json::from_value::<SearchQuery>(serde_json::json!({
+            "query_text": "x", "rank": {"rrf": {"window": 10}}}))
+        .is_err());
+    }
+
+    #[test]
+    fn pagination_walks_the_fused_list() {
+        let dir = scratch("paging");
+        let mut rng = Rng(42);
+        let docs = random_corpus(&mut rng, 120);
+        let groups = random_split(&mut rng, &docs);
+        let (manifest, _) = write(&dir, "s", &groups);
+        let searcher = Searcher::new(dir.clone());
+        let mut q = hybrid("alpha", 30, 25, rrf(Some(30), None));
+        q.operator = Some(kosha_core::QueryOperator::Or);
+        let full = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert_eq!(full.results.len(), 30);
+        let full_ids = ids(&full);
+
+        // from / max_results: slices of the same fused list.
+        let mut paged = Vec::new();
+        for from in (0..30).step_by(7) {
+            let mut p = q.clone();
+            p.from = from;
+            p.max_results = 7;
+            paged.extend(ids(&searcher.search(&ns(), &manifest, &p, None).unwrap()));
+        }
+        assert_eq!(paged, full_ids);
+
+        // search_after on [_score desc, _id asc] over the fused score.
+        let mut p = q.clone();
+        p.max_results = 7;
+        p.sort = serde_json::from_value(
+            serde_json::json!([{"_score": {"order": "desc"}}, {"_id": {"order": "asc"}}]),
+        )
+        .unwrap();
+        let mut walked = Vec::new();
+        loop {
+            let r = searcher.search(&ns(), &manifest, &p, None).unwrap();
+            let Some(last) = r.results.last() else { break };
+            p.search_after = Some(vec![last.score.to_string(), last.doc_id.0.clone()]);
+            walked.extend(ids(&r));
+        }
+        assert_eq!(walked, full_ids);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn top_level_filter_scopes_both_lists_and_knn_filter_only_the_vector_list() {
+        let dir = scratch("filters");
+        let mut rng = Rng(7);
+        let docs = random_corpus(&mut rng, 150);
+        let groups = random_split(&mut rng, &docs);
+        let (manifest, _) = write(&dir, "s", &groups);
+        let matter_of: HashMap<String, String> = docs
+            .iter()
+            .map(|d| (d.id.clone(), d.matter.clone()))
+            .collect();
+        let searcher = Searcher::new(dir.clone());
+
+        let mut q = hybrid("beta", 40, 20, rrf(Some(40), None));
+        q.operator = Some(kosha_core::QueryOperator::Or);
+        q.filter = Some(matter("m1"));
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert!(!r.results.is_empty());
+        for hit in &r.results {
+            assert_eq!(matter_of[&hit.doc_id.0], "m1", "{}", hit.doc_id.0);
+        }
+        assert!(r
+            .results
+            .iter()
+            .any(|h| h.rank_details.as_ref().unwrap().knn_rank.is_some()));
+
+        let mut q = hybrid("beta", 40, 20, rrf(Some(40), None));
+        q.operator = Some(kosha_core::QueryOperator::Or);
+        q.knn.as_mut().unwrap().filter = Some(matter("m2"));
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        let mut lexical_matters = HashSet::new();
+        for hit in &r.results {
+            let d = hit.rank_details.as_ref().unwrap();
+            if d.knn_rank.is_some() {
+                assert_eq!(matter_of[&hit.doc_id.0], "m2", "{}", hit.doc_id.0);
+            }
+            if d.lexical_rank.is_some() {
+                lexical_matters.insert(matter_of[&hit.doc_id.0].clone());
+            }
+        }
+        assert!(
+            lexical_matters.len() > 1,
+            "knn.filter must not scope the lexical list"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn total_hits_and_aggregations_cover_lexical_matches_plus_the_vector_window() {
+        let dir = scratch("totals");
+        let docs = agreement_corpus();
+        let lexical_matches = docs.iter().filter(|d| d.text.contains("breach")).count();
+        let (manifest, _) = write(&dir, "s", &[docs[..10].to_vec(), docs[10..].to_vec()]);
+        let searcher = Searcher::new(dir.clone());
+        let mut q = hybrid("breach", 3, 5, rrf(Some(5), None));
+        q.exact_total_hits = Some(true);
+        q.aggs = serde_json::from_value(
+            serde_json::json!({"per_document": {"terms": {"field": "matter", "size": 10}}}),
+        )
+        .unwrap();
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        // The vector window (k = 5) is vec_top, both, vecfill00..02: four
+        // of them have no query term.
+        assert_eq!(r.total_hits, lexical_matches + 4);
+        assert_eq!(r.total_hits_relation, TotalHitsRelation::Eq);
+        let buckets = r.aggregations.unwrap().per_document.unwrap().buckets;
+        let counted: u64 = buckets.iter().map(|b| b.doc_count as u64).sum();
+        assert_eq!(counted as usize, r.total_hits, "{buckets:?}");
+
+        // The cap still applies to the combined count.
+        q.exact_total_hits = Some(false);
+        q.total_hits_cap = Some(4);
+        q.aggs.clear();
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert_eq!(r.total_hits, 4);
+        assert_eq!(r.total_hits_relation, TotalHitsRelation::Gte);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Recall and latency on a labelled synthetic fixture (issue #228's
+    /// acceptance numbers). Each query has 10 relevant documents that are
+    /// moderately good on BOTH signals — they carry one or two query terms
+    /// and sit near the query vector — next to 30 lexical distractors (the
+    /// same term pattern, a random vector) and 30 vector distractors (about
+    /// as near the query vector, no query term): each retriever alone sees
+    /// 40 equally plausible documents, and only agreement separates them.
+    /// Run with `cargo test -p kosha-query --release -- --ignored
+    /// --nocapture rrf_recall_and_latency`.
+    #[test]
+    #[ignore]
+    fn rrf_recall_and_latency() {
+        const DIM: usize = 64;
+        const QUERIES: usize = 100;
+        const SEGMENTS: usize = 20;
+        let background: usize = std::env::var("KOSHA_RRF_BENCH_BACKGROUND")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(13_000);
+        let dir = scratch("recall");
+        let mut rng = Rng(0x00c0_ffee_1234_5678);
+        let mut gauss = || {
+            let u1 = (rng.below(1 << 30) as f64 + 1.0) / (1u64 << 30) as f64;
+            let u2 = rng.below(1 << 30) as f64 / (1u64 << 30) as f64;
+            ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()) as f32
+        };
+        let normalize = |v: Vec<f32>| {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.into_iter().map(|x| x / n).collect::<Vec<f32>>()
+        };
+        let random_vec = |g: &mut dyn FnMut() -> f32| normalize((0..DIM).map(|_| g()).collect());
+        let mut docs: Vec<(String, String, Vec<f32>)> = Vec::new();
+        let mut word_rng = Rng(99);
+        let mut filler = |n: usize| {
+            (0..n)
+                .map(|_| format!("w{}", word_rng.below(5000)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut queries = Vec::new();
+        for q in 0..QUERIES {
+            let qv = random_vec(&mut gauss);
+            let terms = [format!("q{q}a"), format!("q{q}b"), format!("q{q}c")];
+            let near = |g: &mut dyn FnMut() -> f32, sigma: f32| {
+                normalize(qv.iter().map(|x| x + sigma * g()).collect())
+            };
+            let mut relevant = HashSet::new();
+            for i in 0..10 {
+                let id = format!("q{q}-rel{i}");
+                // One or two of the three query terms.
+                let mut text = vec![terms[i % 3].clone()];
+                if i % 2 == 0 {
+                    text.push(terms[(i + 1) % 3].clone());
+                }
+                text.push(filler(20 + i * 3));
+                docs.push((id.clone(), text.join(" "), near(&mut gauss, 0.12)));
+                relevant.insert(id);
+            }
+            for i in 0..30 {
+                // The relevant documents' term pattern, a random vector.
+                let mut text = vec![terms[i % 3].clone()];
+                if i % 2 == 0 {
+                    text.push(terms[(i + 1) % 3].clone());
+                }
+                text.push(filler(20 + i));
+                docs.push((
+                    format!("q{q}-lex{i}"),
+                    text.join(" "),
+                    random_vec(&mut gauss),
+                ));
+            }
+            for i in 0..30 {
+                docs.push((
+                    format!("q{q}-vec{i}"),
+                    filler(20 + i),
+                    near(&mut gauss, 0.13),
+                ));
+            }
+            queries.push((terms.join(" "), qv, relevant));
+        }
+        for i in 0..background {
+            docs.push((format!("bg{i}"), filler(30), random_vec(&mut gauss)));
+        }
+        // Spread over segments in a shuffled order.
+        let mut groups: Vec<Vec<(String, String, Vec<f32>)>> = vec![Vec::new(); SEGMENTS];
+        let mut place = Rng(5);
+        for d in docs {
+            groups[place.below(SEGMENTS)].push(d);
+        }
+        let mut manifest = Manifest {
+            version: 1,
+            segments: Vec::new(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+        };
+        for (g, docs) in groups.iter().enumerate() {
+            let id = SegmentId(format!("seg-{g:03}"));
+            let mut w = SegmentWriter::new(id.clone(), dir.join("ns").join(&id.0));
+            for (doc_id, text, v) in docs {
+                w.add_document(
+                    DocumentId(doc_id.clone()),
+                    vec![
+                        Field::text("content", text.clone()),
+                        Field::vector("emb", v.clone()),
+                    ],
+                );
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id: id,
+                doc_count: docs.len() as u32,
+            });
+        }
+        let searcher = Searcher::new(dir.clone());
+        let percentile = |mut v: Vec<f64>, p: f64| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[((v.len() - 1) as f64 * p) as usize]
+        };
+        let run = |label: &str, build: &dyn Fn(&str, &[f32]) -> SearchQuery| {
+            let mut recall = 0.0;
+            let mut times = Vec::new();
+            for round in 0..3 {
+                for (text, qv, relevant) in &queries {
+                    let q = build(text, qv);
+                    let t = Instant::now();
+                    let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+                    let ms = t.elapsed().as_secs_f64() * 1e3;
+                    if round > 0 {
+                        // Round 0 warms the segment cache.
+                        times.push(ms);
+                    } else {
+                        let hit = r
+                            .results
+                            .iter()
+                            .filter(|d| relevant.contains(&d.doc_id.0))
+                            .count();
+                        recall += hit as f64 / 10.0;
+                    }
+                }
+            }
+            println!(
+                "{label:<34} recall@10 {:.3}   p50 {:>7.2} ms   p95 {:>7.2} ms",
+                recall / QUERIES as f64,
+                percentile(times.clone(), 0.5),
+                percentile(times, 0.95)
+            );
+        };
+        let lexical = |text: &str| {
+            let mut q: SearchQuery =
+                serde_json::from_value(serde_json::json!({"query_text": text, "max_results": 10}))
+                    .unwrap();
+            q.operator = Some(kosha_core::QueryOperator::Or);
+            q
+        };
+        let knn = |qv: &[f32], k: usize| KnnQuery {
+            field: "emb".into(),
+            vector: qv.to_vec(),
+            k,
+            num_candidates: 100,
+            filter: None,
+        };
+        println!(
+            "{} docs in {SEGMENTS} segments, {QUERIES} queries, 10 relevant each",
+            QUERIES * 70 + background
+        );
+        run("lexical only (BM25, OR)", &|text, _| lexical(text));
+        run("vector only (knn k=10)", &|_, qv| {
+            let mut q = lexical("");
+            q.knn = Some(knn(qv, 10));
+            q
+        });
+        for window in [10usize, 50, 100] {
+            run(
+                &format!("hybrid RRF (window {window}, k {window})"),
+                &|text, qv| {
+                    let mut q = lexical(text);
+                    q.knn = Some(knn(qv, window));
+                    q.rank = Some(RankSpec {
+                        rrf: Some(RrfSpec {
+                            rank_window_size: Some(window),
+                            rank_constant: None,
+                        }),
+                    });
+                    q
+                },
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pure_knn_and_lexical_requests_are_unchanged() {
+        let dir = scratch("unchanged");
+        let (manifest, _) = write(&dir, "s", &[agreement_corpus()]);
+        let searcher = Searcher::new(dir.clone());
+        let mut q = hybrid("", 3, 3, None);
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert_eq!(r.results[0].doc_id.0, "vec_top");
+        assert!(r.results[0].rank_details.is_none());
+        // Pure kNN keeps its historical score scale.
+        assert!(
+            (r.results[0].score - 20.0).abs() < 1e-3,
+            "{}",
+            r.results[0].score
+        );
+        q.knn = None;
+        q.query_text = "breach".into();
+        let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
+        assert_eq!(r.results[0].doc_id.0, "lex_top");
+        assert!(r.results[0].rank_details.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
