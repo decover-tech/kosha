@@ -12,6 +12,7 @@ services:
       # No idle-buffer flush timer (#241): the "buffered" stage asserts
       # unflushed docs stay invisible, and segments come only from /flush.
       KOSHA_FLUSH_MAX_AGE_MS: "0"
+      KOSHA_COMPACTION_INTERVAL_MS: "0"
       # The compacted checkpoint calls /v1/admin/compact-namespace, which
       # needs the dedicated admin credential (#263). Dev-only value.
       KOSHA_ADMIN_API_KEY: sk-kosha-admin-dev
