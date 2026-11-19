@@ -289,6 +289,11 @@ message SearchRequest {
   // How a hybrid request fuses its lexical and kNN lists.
   // HTTP: "rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}.
   optional Rank rank = 15;
+
+  // Restrict query_text to these Text fields, each optionally boosted:
+  // ["title^2", "content"]. Scores sum boost x per-field BM25. Empty = the
+  // combined index of every Text field; "_all" names it explicitly.
+  repeated string fields = 16;
 }
 
 enum RetrievalMode {
@@ -331,9 +336,12 @@ message WildcardQuery {
 }
 
 message MatchPhraseQuery {
+  // The field the phrase must occur in; "", "_all" or "*" = any one field.
   string field = 1;
   string phrase = 2;
   int32 slop = 3;
+  // Several fields, any one of them (overrides field when non-empty).
+  repeated string fields = 4;
 }
 
 message KnnQuery {

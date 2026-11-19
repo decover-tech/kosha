@@ -104,6 +104,62 @@ pub struct SegmentWriter {
     analyzed_fields: BTreeMap<String, AnalyzerSpec>,
     /// Whether any `Text` value went through `default_analyzer`.
     default_analyzer_used: bool,
+    /// Write per-field postings, norms and statistics, and separate the
+    /// positions of consecutive `Text` values (#249). See
+    /// [`field_index_enabled`].
+    field_index: bool,
+    /// Per-field statistics for the footer's `field_index`.
+    field_stats: BTreeMap<String, kosha_core::FieldStats>,
+}
+
+/// Whether new segments get per-field indexes (#249):
+/// `KOSHA_FIELD_INDEX`, on unless set to `off` / `0` / `false`. Off writes
+/// segments exactly as before #249 (combined index only, no position
+/// gaps), e.g. ahead of a rollback to an older binary.
+pub fn field_index_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_field_index_enabled(std::env::var("KOSHA_FIELD_INDEX").ok().as_deref())
+    })
+}
+
+fn parse_field_index_enabled(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("off" | "0" | "false" | "no")
+    )
+}
+
+/// Append one occurrence of `key` at `pos` in document `doc_seq` to an
+/// in-memory postings map, keeping `inverted_bytes` up to date.
+fn push_posting(
+    index: &mut HashMap<String, Vec<Posting>>,
+    inverted_bytes: &mut usize,
+    key: &str,
+    doc_seq: u32,
+    pos: u32,
+) {
+    let postings = match index.get_mut(key) {
+        Some(postings) => postings,
+        None => {
+            *inverted_bytes += TERM_ENTRY_OVERHEAD + key.len();
+            index.entry(key.to_string()).or_default()
+        }
+    };
+    if let Some(last) = postings.last_mut() {
+        if last.doc_id == doc_seq {
+            last.term_frequency += 1;
+            last.positions.push(pos);
+            *inverted_bytes += 4;
+            return;
+        }
+    }
+    postings.push(Posting {
+        doc_id: doc_seq,
+        term_frequency: 1,
+        positions: vec![pos],
+    });
+    *inverted_bytes += POSTING_OVERHEAD + 4;
 }
 
 impl SegmentWriter {
@@ -145,7 +201,17 @@ impl SegmentWriter {
             field_analyzers: HashMap::new(),
             analyzed_fields: BTreeMap::new(),
             default_analyzer_used: false,
+            field_index: field_index_enabled(),
+            field_stats: BTreeMap::new(),
         }
+    }
+
+    /// Override whether this writer builds per-field indexes (#249).
+    /// Production writers use `KOSHA_FIELD_INDEX`; see
+    /// [`field_index_enabled`].
+    pub fn with_field_index(mut self, enabled: bool) -> Self {
+        self.field_index = enabled;
+        self
     }
 
     /// Analyze `Text` fields with `config` (the namespace schema's
@@ -207,6 +273,13 @@ impl SegmentWriter {
         // Vector fields whose value moves to `doc_vectors.bin` (#243); their
         // doc-store value is blanked after the loop below.
         let mut moved_to_sidecar: Vec<usize> = Vec::new();
+        // Position of the next `Text` value's first token (#249): each
+        // value starts `position_gap` past the previous one's last token,
+        // so no phrase spans two values. Always 0 without a field index.
+        let mut position_base: u32 = 0;
+        // This document's token count per indexed field, in first-seen
+        // order (a field may occur more than once).
+        let mut doc_field_lengths: Vec<(usize, u32)> = Vec::new();
 
         for (index, field) in fields.iter().enumerate() {
             if field.field_type == FieldType::Text {
@@ -225,28 +298,53 @@ impl SegmentWriter {
                 };
                 let tokens = analyzer.analyze_with_positions(&field.value);
                 field_length += tokens.len() as u32;
-                for (token, pos) in tokens {
-                    let postings = match self.inverted_index.get_mut(&token) {
-                        Some(postings) => postings,
+                let per_field = self.field_index
+                    && !tokens.is_empty()
+                    && kosha_core::fields::is_indexable_field_name(&field.name);
+                let field_prefix = if per_field {
+                    let slot = match doc_field_lengths
+                        .iter()
+                        .position(|&(i, _)| fields[i].name == field.name)
+                    {
+                        Some(slot) => slot,
                         None => {
-                            self.inverted_bytes += TERM_ENTRY_OVERHEAD + token.len();
-                            self.inverted_index.entry(token).or_default()
+                            doc_field_lengths.push((index, 0));
+                            doc_field_lengths.len() - 1
                         }
                     };
-                    if let Some(last) = postings.last_mut() {
-                        if last.doc_id == doc_seq {
-                            last.term_frequency += 1;
-                            last.positions.push(pos);
-                            self.inverted_bytes += 4;
-                            continue;
-                        }
+                    doc_field_lengths[slot].1 += tokens.len() as u32;
+                    kosha_core::fields::field_term_key(&field.name, "")
+                } else {
+                    String::new()
+                };
+                let mut field_key = field_prefix.clone();
+                let mut last_pos = 0u32;
+                for (token, pos) in &tokens {
+                    let pos = position_base.saturating_add(*pos);
+                    last_pos = pos;
+                    push_posting(
+                        &mut self.inverted_index,
+                        &mut self.inverted_bytes,
+                        token,
+                        doc_seq,
+                        pos,
+                    );
+                    if per_field {
+                        field_key.truncate(field_prefix.len());
+                        field_key.push_str(token);
+                        push_posting(
+                            &mut self.inverted_index,
+                            &mut self.inverted_bytes,
+                            &field_key,
+                            doc_seq,
+                            pos,
+                        );
                     }
-                    postings.push(Posting {
-                        doc_id: doc_seq,
-                        term_frequency: 1,
-                        positions: vec![pos],
-                    });
-                    self.inverted_bytes += POSTING_OVERHEAD + 4;
+                }
+                if self.field_index && !tokens.is_empty() {
+                    position_base = last_pos
+                        .saturating_add(1)
+                        .saturating_add(kosha_core::fields::DEFAULT_POSITION_GAP);
                 }
             }
             match field.field_type {
@@ -316,6 +414,28 @@ impl SegmentWriter {
                     // indexes them, but the stored document is lossless.
                 }
             }
+        }
+        // Norms: one posting per field this document has, whose term
+        // frequency is the field's length (#249).
+        for &(index, length) in &doc_field_lengths {
+            let name = &fields[index].name;
+            let norms = kosha_core::fields::field_norms_key(name);
+            let postings = match self.inverted_index.get_mut(&norms) {
+                Some(postings) => postings,
+                None => {
+                    self.inverted_bytes += TERM_ENTRY_OVERHEAD + norms.len();
+                    self.inverted_index.entry(norms).or_default()
+                }
+            };
+            postings.push(Posting {
+                doc_id: doc_seq,
+                term_frequency: length,
+                positions: Vec::new(),
+            });
+            self.inverted_bytes += POSTING_OVERHEAD;
+            let stats = self.field_stats.entry(name.clone()).or_default();
+            stats.doc_count += 1;
+            stats.total_length += length as u64;
         }
         for index in moved_to_sidecar {
             fields[index].value.clear();
@@ -512,6 +632,12 @@ impl SegmentWriter {
                 // Rollout/rollback compatibility mode — see
                 // `postings_write_version`.
                 write_postings_varint_delta(&mut encoded, &postings);
+            } else if kosha_core::fields::is_field_key(&term) {
+                // Per-field postings (#249) carry no per-field length in
+                // their block summaries: `min_field_length` 0 is a valid,
+                // if loose, ceiling. Only the combined index is scored on
+                // the block-max WAND paths.
+                write_postings_skip_split(&mut encoded, &postings, &[]);
             } else {
                 write_postings_skip_split(&mut encoded, &postings, &self.field_lengths);
             }
@@ -539,10 +665,17 @@ impl SegmentWriter {
         }
 
         // Every term is in `pool` exactly once, sorted (no duplicates).
-        self.term_bloom = Some(build_term_bloom(entries.iter().map(|&(off, len, ..)| {
-            std::str::from_utf8(&pool[off as usize..off as usize + len as usize])
-                .expect("pool holds UTF-8 terms")
-        })));
+        // Per-field keys stay out of the bloom: each is also a combined
+        // term, and queries test the bloom with that (#249).
+        self.term_bloom = Some(build_term_bloom(
+            entries
+                .iter()
+                .map(|&(off, len, ..)| {
+                    std::str::from_utf8(&pool[off as usize..off as usize + len as usize])
+                        .expect("pool holds UTF-8 terms")
+                })
+                .filter(|term| !kosha_core::fields::is_field_key(term)),
+        ));
 
         let table_len = entries.len() as u64 * SPLIT_INVERTED_TABLE_ENTRY_LEN as u64;
         let pool_base = INVERTED_HEADER_LEN as u64 + table_len;
@@ -768,6 +901,10 @@ impl SegmentWriter {
             text_filter_ignore_above: self.text_filter_ignore_above,
             doc_vectors: !self.doc_vector_entries.is_empty(),
             analysis: self.segment_analysis(),
+            field_index: self.field_index.then(|| kosha_core::FieldIndex {
+                position_gap: kosha_core::fields::DEFAULT_POSITION_GAP,
+                fields: self.field_stats.clone(),
+            }),
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -3538,6 +3675,9 @@ pub struct SegmentReader {
     /// segment whose footer sets `doc_vectors` (#243). Only success is
     /// cached: the file may be hydrated after the segment was opened.
     doc_vectors: Mutex<Option<Arc<DocVectors>>>,
+    /// Per-field document lengths decoded from the norms lists (#249),
+    /// dense by doc_seq, for the fields queries have asked about.
+    field_lengths: Mutex<HashMap<String, Arc<Vec<u32>>>>,
 }
 
 impl SegmentReader {
@@ -3607,6 +3747,7 @@ impl SegmentReader {
             vector_index,
             vector_index_degraded,
             doc_vectors: Mutex::new(None),
+            field_lengths: Mutex::new(HashMap::new()),
         })
     }
 
@@ -4378,10 +4519,54 @@ impl SegmentReader {
         self.inverted.contains_term(term)
     }
 
-    /// All terms in sorted order. Zero-copy for v2 segments (borrows the
-    /// term pool); allocates only the pointer Vec.
+    /// All combined-index terms in sorted order (per-field keys, #249,
+    /// are left out). Zero-copy for v2 segments (borrows the term pool);
+    /// allocates only the pointer Vec.
     pub fn all_terms(&self) -> Vec<&str> {
-        self.inverted.all_terms()
+        let mut terms = self.inverted.all_terms();
+        terms.retain(|t| !kosha_core::fields::is_field_key(t));
+        terms
+    }
+
+    /// This segment's per-field index (#249), or `None` for a segment
+    /// with only the combined index.
+    pub fn field_index(&self) -> Option<&kosha_core::FieldIndex> {
+        self.footer.field_index.as_ref()
+    }
+
+    /// Every document's length in `field`, indexed by doc_seq (0 for a
+    /// document without the field), decoded from the field's norms list
+    /// once and kept for later queries. `Ok(None)` when the segment has
+    /// no per-field index. An error when the norms' posting blob can't be
+    /// read: scoring without lengths would silently skew every score.
+    pub fn field_lengths(&self, field: &str) -> Result<Option<Arc<Vec<u32>>>, KoshaError> {
+        if self.footer.field_index.is_none() {
+            return Ok(None);
+        }
+        if let Some(found) = self.field_lengths.lock().unwrap().get(field) {
+            return Ok(Some(Arc::clone(found)));
+        }
+        let mut lengths = vec![0u32; self.doc_count() as usize];
+        if let Some(postings) = self.postings(&kosha_core::fields::field_norms_key(field)) {
+            for posting in postings.iter() {
+                if let Some(slot) = lengths.get_mut(posting.doc_id as usize) {
+                    *slot = posting.term_frequency;
+                }
+            }
+        }
+        if self.take_blob_read_failure() {
+            return Err(KoshaError::CorruptSegment(format!(
+                "segment {:?}: norms of field {field:?} unreadable (evicted or corrupt) — \
+                 retry after rehydration",
+                self.segment_dir
+            )));
+        }
+        let lengths = Arc::new(lengths);
+        self.field_lengths
+            .lock()
+            .unwrap()
+            .insert(field.to_string(), Arc::clone(&lengths));
+        Ok(Some(lengths))
     }
 
     /// Read `footer.json` without opening the rest of the segment.
@@ -4409,7 +4594,12 @@ impl SegmentReader {
     pub fn rewrite_term_bloom(segment_dir: &Path) -> Result<Footer, KoshaError> {
         let mut footer = Self::read_footer(segment_dir)?;
         let inverted = Self::read_inverted(segment_dir, None)?;
-        footer.term_bloom = Some(build_term_bloom(inverted.all_terms()));
+        footer.term_bloom = Some(build_term_bloom(
+            inverted
+                .all_terms()
+                .into_iter()
+                .filter(|term| !kosha_core::fields::is_field_key(term)),
+        ));
         let json = serde_json::to_string_pretty(&footer)?;
         atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
         Ok(footer)
@@ -5120,7 +5310,12 @@ mod tests {
             assert_eq!(&*got, postings.as_slice(), "postings mismatch for {term}");
             assert!(r.contains_term(term));
         }
-        let mut expected_terms: Vec<&str> = expected.keys().map(|s| s.as_str()).collect();
+        // `all_terms` lists the combined index only (#249).
+        let mut expected_terms: Vec<&str> = expected
+            .keys()
+            .map(|s| s.as_str())
+            .filter(|t| !kosha_core::fields::is_field_key(t))
+            .collect();
         expected_terms.sort();
         assert_eq!(r.all_terms(), expected_terms);
         assert!(r.postings("absent-term").is_none());
@@ -5496,7 +5691,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing term {term}"));
             assert_eq!(&*got, postings.as_slice(), "postings mismatch for {term}");
         }
-        let mut expected_terms: Vec<&str> = expected.keys().map(|s| s.as_str()).collect();
+        // `all_terms` lists the combined index only (#249).
+        let mut expected_terms: Vec<&str> = expected
+            .keys()
+            .map(|s| s.as_str())
+            .filter(|t| !kosha_core::fields::is_field_key(t))
+            .collect();
         expected_terms.sort();
         assert_eq!(r.all_terms(), expected_terms);
 
@@ -5605,7 +5805,8 @@ mod tests {
         fs::write(dir.join("inverted.idx"), &raw).unwrap();
 
         let r = SegmentReader::open(dir.clone()).unwrap();
-        let first_term = r.all_terms()[0].to_string();
+        // The first table entry: per-field keys (#249) sort first.
+        let first_term = expected.keys().min().unwrap().to_string();
         assert!(
             r.postings(&first_term).is_none(),
             "corrupt postings must decode to None, not panic or garbage"
@@ -6162,8 +6363,12 @@ mod tests {
              after padding — the padding is appended past the parsed body, \
              not corrupting it"
         );
+        // `ALLOC` is process-wide, so tests running on other threads add
+        // to the count while this one opens the segment (enough to cross
+        // 1 MiB under a loaded full-workspace run). Reading the body would
+        // allocate at least 64 MiB, so 16 MiB still separates the two.
         assert!(
-            allocated < 1024 * 1024,
+            allocated < 16 * 1024 * 1024,
             "opening a segment with a 64MiB-padded vector.idx allocated \
              {allocated} bytes — the lazy path must only read the small \
              vector.offsets sidecar, not the full vector.idx body"

@@ -150,6 +150,7 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         source_excludes: None,
         rank: None,
         mode: None,
+        fields: Vec::new(),
     }
 }
 

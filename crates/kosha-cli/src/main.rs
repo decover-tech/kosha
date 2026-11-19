@@ -578,6 +578,7 @@ fn build_search_query(
         source_excludes: None,
         rank: None,
         mode: None,
+        fields: Vec::new(),
     }
 }
 

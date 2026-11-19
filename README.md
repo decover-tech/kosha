@@ -31,8 +31,9 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | --- | --- |
 | BM25 lexical search | `k1` / `b` tunable per request: `bm25_params: {"k1": 2.0, "b": 0.3}` on `POST /search`, `k1=` / `b=` on `GET /search`. Either may be omitted and falls back to the segment's build-time value (1.2 / 0.75 unless built otherwise). `k1` must be ≥ 0 and `b` in [0, 1]; anything else (or non-numeric) is a 400. WAND pruning bounds are recomputed for the request's values, so results match exhaustive scoring. `k3` is not supported. IDF and `avgdl` are namespace-level (summed over all segments), so a document scores the same whichever segment holds it; `bm25_params: {"stats": "segment"}` / `bm25_stats=segment` (or `KOSHA_BM25_STATS=segment` server-wide) switches back to per-segment statistics for debugging. Wildcard queries use per-segment statistics |
 | `operator: and` / `or` | AND (default) requires every query term; OR scores the union |
+| Multi-field BM25 (`fields`) | `"fields": ["title^2", "content"]` restricts `query_text` to those `Text` fields (`GET /search?...&fields=title^2,content`). Each field has its own postings, document lengths and statistics (`N` = documents with the field, `avgdl` = its mean length, namespace-level like the combined index), and a hit scores `Σ boost × BM25_field` — Elasticsearch `multi_match` `most_fields`, turbopuffer `Sum` of per-attribute BM25. With AND every query term must match in at least one of the listed fields. `_all` names the combined index of every `Text` field and may be mixed in (`["title^3", "_all"]`). Each field reads the query with the analyzer it was indexed with. Boosts must be > 0; field patterns (`title*`) are not supported. Field queries take an exhaustive per-field path, not block-max WAND (~2 ms vs ~0.3 ms warm for a 10k-hit term on 100k docs, `cargo bench -p kosha-query --bench field_bm25`); rare terms cost the same. See [Per-field indexes](#per-field-indexes) for segments written before this existed |
 | Block-max WAND | Skip-list postings, rarest-first probe ordering, leapfrog AND join |
-| `match_phrase` | Positional postings, configurable `slop`. A word a `stop` filter removed still counts as a position, so `"state of the art"` matches across the removed stopwords and `"state art"` does not |
+| `match_phrase` | Positional postings, configurable `slop`. Matches only inside one field: `field` (or a `fields` list, any one of them) restricts it, and `_all` / `*` / no field means any single `Text` field. A phrase never spans two fields or two values of a multi-valued field, at any slop. A word a `stop` filter removed still counts as a position, so `"state of the art"` matches across the removed stopwords and `"state art"` does not |
 | Configurable analyzers | Per-field `analyzer` in the namespace schema: `standard`, `standard@2` (Unicode), `keyword`, `lowercase`, `whitespace`, plus `lowercase` / `stop` / `stem` filters. See [Analyzers](#analyzers) |
 | `wildcard` | Per-field pattern match, case-insensitive by default |
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
@@ -47,6 +48,8 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | Degradation signal | `knn_degraded_segments` reports segments whose vector search failed, so a 200 with silently missing neighbors is visible to the caller |
 
 ### Indexing and writes
+
+- Per-field inverted indexes (#249): besides the combined index of every `Text` field, each segment indexes each `Text` field on its own — postings, per-document lengths and statistics — for `fields` queries and field-restricted phrases. See [Per-field indexes](#per-field-indexes).
 
 - Bulk document indexing, with field types `Text`, `Keyword`, `Integer`, `Float`, `Date`, `Boolean`, `Vector`.
 - `Text` values longer than 256 chars (`KOSHA_TEXT_FILTER_IGNORE_ABOVE`; `off` disables the cap) are full-text searchable and returned in hits, but are not copied into the filter columns, so `term`/`terms`/`range` filters, `sort`, and aggregations do not see them. This matches Elasticsearch's dynamic-mapping `keyword` `ignore_above: 256`. Use `Keyword` for a long value that must be exact-matched.
@@ -89,9 +92,37 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 ### Not supported yet
 
 - Reranking (Phase 2, DESIGN.md §3.1). Per-retriever weights for RRF.
+- Multi-field scoring other than a boosted sum (`dis_max` / `best_fields` tie-breakers, turbopuffer `Product` / `Max` of fields), field-name patterns in `fields`, and block-max WAND for `fields` queries.
 - Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
 - `kosha-vector-spfresh` (SPFresh/SPANN with LIRE rebalancing) is a standalone, benchmarked prototype; it is not wired into the segment format or the query path.
+
+## Per-field indexes
+
+Every segment has always held one **combined** inverted index: all `Text` fields of a document
+tokenized together, with one length per document. It is unchanged and still answers every query
+without `fields`, so default ranking is exactly what it was. Segments written since #249 add, in
+the same `inverted.idx` and posting blobs:
+
+- each field's own postings (key `\0{field}\0{term}`; no analyzer emits a NUL, so field keys
+  never collide with combined terms) and a norms list holding each document's length in the field;
+- `field_index` in `footer.json`: per-field `doc_count` / `total_length`, and the position gap.
+
+Positions of consecutive `Text` values in a document are now 65,536 apart in both indexes, and
+the phrase slop is clamped below the gap, so a phrase cannot match across fields.
+
+**Existing namespaces keep working without reindexing.** A segment written before this change has
+no `field_index`. A `fields` query or a field-restricted phrase is answered there from its combined
+index (it matches the terms in any field, boosts ignored) — never with zero hits — and phrases
+there can still span fields as before. Compaction rewrites such segments with per-field indexes.
+Until then a namespace with both kinds scores them with different statistics.
+
+**Cost.** On a two-field corpus (`title` ~6 words, `content` ~60) per-field indexes make the
+inverted index 2.3x larger on disk and segment builds 1.5x slower (`cargo bench -p kosha-query
+--bench field_bm25`). `KOSHA_FIELD_INDEX=off` writes segments exactly as before (no field
+postings, no position gap). **Before rolling back** to a binary older than this change, set it and
+compact: an older binary ignores `field_index` but lists field keys among a segment's terms, so a
+leading-`*` wildcard could match them.
 
 ## Analyzers
 
@@ -123,9 +154,10 @@ The first name picks the analyzer, every later name appends a filter:
 | `stem` | English Snowball stemmer (`rust-stemmers`): `running`, `runs` and `run` all match each other |
 
 `default_analyzer` covers every `Text` field the schema does not list (clients send every JSON
-string as `Text`). All text fields share one term space, so a query matches a document if it
-matches one analysis of the query across its fields — e.g. a stemmed `title` term and an unstemmed
-`body` term together.
+string as `Text`). The combined index (a query without `fields`) holds every text field's terms,
+so a query matches a document if it matches one analysis of the query across its fields — e.g. a
+stemmed `title` term and an unstemmed `body` term together. A `fields` query reads each listed
+field with that field's own chain.
 
 **Compatibility.** Each segment records the chains it was written with in its footer, and every
 query is analyzed per segment with those chains, so changing the schema (or the tokenizer version)

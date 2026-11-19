@@ -1487,6 +1487,7 @@ impl AppState {
                 source_excludes: None,
                 rank: None,
                 mode: None,
+                fields: Vec::new(),
             };
             let needs_filters = query_needs_filter_store(&query);
             let needs_vectors = query.knn.is_some();
@@ -4969,6 +4970,17 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         source_excludes: None,
         rank: None,
         mode: None,
+        // `fields=title^2,content` (issue #249).
+        fields: params
+            .get("fields")
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
     if let Err(e) = query.validate() {
         return search_error_response(&e);
@@ -7051,6 +7063,75 @@ mod tests {
     }
 
     #[test]
+    fn field_restricted_search_over_http_and_through_the_result_cache() {
+        // Issue #249: `fields` reaches the scorer over POST and GET, is part
+        // of the result-cache key (the same text with other fields must not
+        // be served a cached answer), and bad specs are a 400.
+        let state = test_state();
+        let ns = NamespaceId("fieldsns".into());
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    Document {
+                        id: DocumentId("t".into()),
+                        fields: vec![
+                            Field::text("title", "alpha"),
+                            Field::text("content", "other words"),
+                        ],
+                    },
+                    Document {
+                        id: DocumentId("c".into()),
+                        fields: vec![
+                            Field::text("title", "other words"),
+                            Field::text("content", "alpha"),
+                        ],
+                    },
+                ],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let ids = |resp: &str| -> Vec<String> {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            v["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let post = |fields: &str| {
+            let body =
+                format!(r#"{{"namespace":"fieldsns","query_text":"alpha","fields":{fields}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        for _ in 0..2 {
+            assert_eq!(ids(&post(r#"["title"]"#)), ["t"]);
+            assert_eq!(ids(&post(r#"["content"]"#)), ["c"]);
+            assert_eq!(ids(&post(r#"["title^3","content"]"#)), ["t", "c"]);
+            assert_eq!(ids(&post(r#"["title","content^3"]"#)), ["c", "t"]);
+        }
+        let get = |qs: &str| {
+            handle_search_get(
+                &format!("GET /search?ns=fieldsns&q=alpha{qs} HTTP/1.1"),
+                &state,
+            )
+        };
+        assert_eq!(ids(&get("&fields=content")), ["c"]);
+        assert_eq!(ids(&get("&fields=title%5E3,content")), ["t", "c"]);
+        for bad in [r#"["title^0"]"#, r#"["ti*"]"#, r#"["a","a"]"#] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+        assert!(get("&fields=title%5Ex").starts_with("HTTP/1.1 400"));
+    }
+
+    #[test]
     fn hybrid_search_fuses_with_rrf_over_http() {
         // Issue #228: `rank.rrf` over HTTP — fused score plus per-retriever
         // ranks in the response, vector-only hits kept (#250), parameters
@@ -7151,6 +7232,7 @@ mod tests {
             text_filter_ignore_above: None,
             doc_vectors: false,
             analysis: None,
+            field_index: None,
         };
         let mut query: SearchQuery = serde_json::from_str(
             r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
@@ -8411,6 +8493,7 @@ mod tests {
             source_excludes: None,
             rank: None,
             mode: None,
+            fields: Vec::new(),
         };
 
         let unfiltered = state.hydrate_segments_for_search(
@@ -8551,6 +8634,7 @@ mod tests {
             source_excludes: None,
             rank: None,
             mode: None,
+            fields: Vec::new(),
         };
         let verdict_key = (ns.0.clone(), manifest.version);
 
@@ -9776,6 +9860,7 @@ mod tests {
             source_excludes: None,
             rank: None,
             mode: None,
+            fields: Vec::new(),
         };
         let with_vec = |v: Vec<f32>, k: usize| {
             let mut q = base.clone();
@@ -9853,6 +9938,7 @@ mod tests {
             text_filter_ignore_above: None,
             doc_vectors: false,
             analysis: None,
+            field_index: None,
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.

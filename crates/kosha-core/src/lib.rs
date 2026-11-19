@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod deletes;
+pub mod fields;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ pub use analysis::{
     TokenizerKind,
 };
 pub use docset::{evaluate_filter, DocSet};
+pub use fields::{FieldBoost, FieldIndex, FieldStats, ALL_FIELD};
 
 /// Pluggable namespace registry and manifest store.
 ///
@@ -517,10 +519,42 @@ fn default_case_insensitive() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchPhraseQuery {
+    /// The field the phrase must occur in (#249). `_all`, `*` or empty
+    /// means any one `Text` field — never across two of them. Segments
+    /// written before #249 have no per-field index and match the phrase
+    /// in their combined index.
+    #[serde(default)]
     pub field: String,
     pub phrase: String,
     #[serde(default)]
     pub slop: u32,
+    /// Several fields the phrase may occur in (any one of them, scored
+    /// with the best). Overrides `field` when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
+impl MatchPhraseQuery {
+    /// The specific fields the phrase is restricted to, or `None` when it
+    /// may occur in any field (`_all`, `*`, or no field named).
+    pub fn restricted_fields(&self) -> Option<Vec<String>> {
+        let named: Vec<&str> = if self.fields.is_empty() {
+            vec![self.field.as_str()]
+        } else {
+            self.fields.iter().map(String::as_str).collect()
+        };
+        let mut out: Vec<String> = Vec::with_capacity(named.len());
+        for name in named {
+            let name = name.trim();
+            if name.is_empty() || name == "*" || name == fields::ALL_FIELD {
+                return None;
+            }
+            if !out.iter().any(|f| f == name) {
+                out.push(name.to_string());
+            }
+        }
+        Some(out)
+    }
 }
 
 // ─── Aggregation types ─────────────────────────────────────────────────────
@@ -840,6 +874,13 @@ pub struct Footer {
     /// current schema says. See [`analysis`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis: Option<SegmentAnalysis>,
+    /// Per-field postings and statistics (issue #249). `None` — every
+    /// segment written before per-field indexes existed, or with
+    /// `KOSHA_FIELD_INDEX=off` — means the segment has only the combined
+    /// index: a field-restricted query is answered from it (matching in
+    /// any field), never with zero hits. See [`fields`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_index: Option<FieldIndex>,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -1036,9 +1077,12 @@ pub fn segment_may_contain_terms(
     let Some(bloom) = bloom else {
         return true; // legacy footer — cannot prune
     };
+    // A per-field key (#249) is checked as its plain term: the bloom
+    // holds only combined-index terms, and every field term is one.
+    let may_contain = |t: &String| bloom.may_contain(fields::bloom_term(t));
     match mode {
-        TermBloomMode::And => terms.iter().all(|t| bloom.may_contain(t)),
-        TermBloomMode::Or => terms.iter().any(|t| bloom.may_contain(t)),
+        TermBloomMode::And => terms.iter().all(may_contain),
+        TermBloomMode::Or => terms.iter().any(may_contain),
     }
 }
 
@@ -1518,6 +1562,16 @@ pub struct SearchQuery {
     /// `hybrid` and forgot the vector gets a 400, not lexical-only hits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<RetrievalMode>,
+    /// Restrict `query_text` to these `Text` fields, each optionally
+    /// boosted: `["title^2", "content"]` (issue #249; Elasticsearch
+    /// `multi_match` `most_fields`). A document's score is the sum over
+    /// fields of `boost × BM25` computed with that field's own length and
+    /// statistics. With the AND operator every query term has to match in
+    /// at least one of the fields. Empty (the default) searches the
+    /// combined index of every `Text` field, as before; `_all` names that
+    /// combined index and may be listed alongside real fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
 }
 
 /// Proto `RetrievalMode`, as the JSON API spells it.
@@ -1594,6 +1648,25 @@ impl SearchQuery {
         self.bm25_params
             .validate()
             .map_err(KoshaError::InvalidQuery)?;
+        if !self.fields.is_empty() {
+            fields::parse_field_boosts(&self.fields).map_err(KoshaError::InvalidQuery)?;
+            if self.match_phrase.is_some() || self.wildcard.is_some() {
+                return Err(KoshaError::InvalidQuery(
+                    "fields applies to query_text; restrict match_phrase with its own \
+                     field / fields, and wildcard with its field"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(ref phrase) = self.match_phrase {
+            for name in phrase.fields.iter().chain(std::iter::once(&phrase.field)) {
+                if name.contains('^') || (name.contains('*') && name.trim() != "*") {
+                    return Err(KoshaError::InvalidQuery(format!(
+                        "match_phrase field {name:?}: boosts and field patterns are not supported"
+                    )));
+                }
+            }
+        }
         let has_lexical = self.has_lexical_query();
         let has_knn = self.knn.is_some();
         match self.mode {
@@ -1651,6 +1724,20 @@ impl SearchQuery {
     /// wildcard or a phrase. A filter alone is not one.
     pub fn has_lexical_query(&self) -> bool {
         !self.query_text.trim().is_empty() || self.wildcard.is_some() || self.match_phrase.is_some()
+    }
+
+    /// The parsed `fields` list, or `None` when `query_text` searches the
+    /// combined index (no `fields`, or only `_all` unboosted). An invalid
+    /// list is `None` too; [`Self::validate`] rejects it first.
+    pub fn field_boosts(&self) -> Option<Vec<FieldBoost>> {
+        if self.fields.is_empty() {
+            return None;
+        }
+        let parsed = fields::parse_field_boosts(&self.fields).ok()?;
+        if parsed.len() == 1 && parsed[0].is_all() && parsed[0].boost == 1.0 {
+            return None;
+        }
+        Some(parsed)
     }
 
     /// True when the request has both a lexical retriever and `knn`: its
@@ -2205,6 +2292,7 @@ mod tests {
             text_filter_ignore_above: Some(256),
             doc_vectors: false,
             analysis: None,
+            field_index: None,
         }
     }
 

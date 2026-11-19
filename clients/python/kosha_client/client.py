@@ -349,33 +349,39 @@ class KoshaClient:
     def _text_leaf(cls, clause: dict) -> tuple[str, Any] | None:
         """``("text"|"phrase"|"wildcard", payload)`` for a full-text leaf.
 
-        Kosha has one text index covering every text field of a document,
-        so the field a clause names selects nothing: ``match`` on ``title``
-        and on ``content`` are the same query.
+        A text payload is ``(text, operator, fields)``: ``fields`` are the
+        Kosha field specs (``"title^2"``) the clause searches, ``()`` for
+        every text field. Kosha scores a multi-field query as the sum of
+        each field's boosted BM25 (``multi_match`` ``most_fields``);
+        ``best_fields`` and ``cross_fields`` are mapped to the same sum.
         """
         if not isinstance(clause, dict) or len(clause) != 1:
             return None
         kind, spec = next(iter(clause.items()))
         if kind == "match":
-            for _field, value in (spec or {}).items():
+            for field, value in (spec or {}).items():
+                boost = 1
                 if isinstance(value, dict):
                     extra = set(value) - {"query", "operator", "boost"}
                     if extra:
                         raise cls._unsupported(f"match option(s) {sorted(extra)}")
                     text = str(value.get("query", ""))
                     operator = str(value.get("operator", "or")).lower()
+                    boost = value.get("boost", 1)
                 else:
                     text, operator = str(value), "or"
-                return "text", (text, operator)
+                return "text", (text, operator, (cls._field_spec(field, boost),))
             return None
         if kind == "multi_match":
             spec = spec or {}
             kind_of = spec.get("type", "best_fields")
             if kind_of not in ("best_fields", "most_fields", "cross_fields"):
                 raise cls._unsupported(f"multi_match type {kind_of!r}")
+            fields = tuple(str(f) for f in cls._as_list(spec.get("fields")))
             return "text", (
                 str(spec.get("query", "")),
                 str(spec.get("operator", "or")).lower(),
+                () if any(cls._is_all_fields(f) for f in fields) else fields,
             )
         if kind == "match_phrase":
             for field, value in (spec or {}).items():
@@ -401,6 +407,49 @@ class KoshaClient:
             return None
         return None
 
+    @staticmethod
+    def _is_all_fields(spec: str) -> bool:
+        name = spec.split("^", 1)[0].strip()
+        return name in ("", "*", "_all")
+
+    @classmethod
+    def _field_spec(cls, field: str, boost: Any = 1) -> str:
+        """``field`` or ``field^boost``; ``""`` when it names every field."""
+        if cls._is_all_fields(field):
+            return ""
+        try:
+            boost = float(boost)
+        except (TypeError, ValueError):
+            raise cls._unsupported(f"boost {boost!r}") from None
+        if boost == 1:
+            return field
+        return f"{field}^{boost:g}"
+
+    @classmethod
+    def _merge_fields(cls, groups) -> tuple:
+        """The union of several clauses' field lists: ``()`` (every field)
+        if any clause searches every field, else each field once, with its
+        highest boost."""
+        best: "dict[str, float]" = {}
+        for fields in groups:
+            if not fields or any(not f for f in fields):
+                return ()
+            for spec in fields:
+                name, _, boost = spec.partition("^")
+                value = float(boost) if boost else 1.0
+                best[name] = max(best.get(name, 0.0), value)
+        return tuple(cls._field_spec(name, boost) for name, boost in best.items())
+
+    @classmethod
+    def _merge_text(cls, payloads) -> list:
+        """Clauses with the same text and operator are one clause over the
+        union of their fields (the keyword compiler repeats a term per
+        field)."""
+        merged: "dict[tuple, list]" = {}
+        for text, operator, fields in payloads:
+            merged.setdefault((text, operator), []).append(fields)
+        return [(text, op, cls._merge_fields(groups)) for (text, op), groups in merged.items()]
+
     @classmethod
     def _plan_query(cls, query: dict | None) -> dict:
         """Split an OpenSearch query into the parts Kosha's query has.
@@ -413,8 +462,8 @@ class KoshaClient:
         type Kosha does not have).
         """
         plan: dict = {
-            "required_text": [],   # [(text, operator)] every one must match
-            "any_text": [],        # [(text, operator)] at least one must match
+            "required_text": [],   # [(text, operator, fields)] every one must match
+            "any_text": [],        # [(text, operator, fields)] at least one must match
             "phrase": None,
             "wildcard": None,
             "knn": None,
@@ -525,7 +574,7 @@ class KoshaClient:
             raise cls._unsupported("a should group mixing text, phrase and wildcard")
         what = kinds.pop()
         if what == "text":
-            distinct = list(dict.fromkeys(payload for _, payload in leaves))
+            distinct = cls._merge_text(payload for _, payload in leaves)
             if len(distinct) == 1:
                 plan["required_text"].append(distinct[0])
             else:
@@ -536,7 +585,13 @@ class KoshaClient:
             }
             if len(same) > 1:
                 raise cls._unsupported(f"a should group of different {what} clauses")
-            cls._set_once(plan, what, leaves[0][1])
+            chosen = dict(leaves[0][1])
+            if what == "phrase":
+                # The same phrase in several fields: any one of them.
+                fields = list(dict.fromkeys(p["field"] for _, p in leaves))
+                if len(fields) > 1:
+                    chosen["fields"] = fields
+            cls._set_once(plan, what, chosen)
 
     @classmethod
     def _knn(cls, spec: dict) -> dict:
@@ -569,28 +624,34 @@ class KoshaClient:
         raise cls._unsupported(f"knn clause {spec!r}")
 
     @classmethod
-    def _resolve_text(cls, plan: dict) -> tuple[str, str | None]:
-        """The plan's text clauses as one ``(query_text, operator)``."""
-        required = list(dict.fromkeys(plan["required_text"]))
-        any_of = list(dict.fromkeys(plan["any_text"]))
+    def _resolve_text(cls, plan: dict) -> tuple[str, str | None, tuple]:
+        """The plan's text clauses as one ``(query_text, operator, fields)``.
+
+        Kosha's query has one field list for all of its text. Clauses on
+        different fields are searched over the union of those fields: a
+        superset of the matches, never fewer.
+        """
+        required = cls._merge_text(plan["required_text"])
+        any_of = cls._merge_text(plan["any_text"])
         if required and any_of:
             raise cls._unsupported("text that must match combined with an OR group of text")
         if any_of:
-            if any(op == "and" and len(text.split()) > 1 for text, op in any_of):
+            if any(op == "and" and len(text.split()) > 1 for text, op, _ in any_of):
                 raise cls._unsupported("an OR group of multi-word AND clauses")
-            return " ".join(text for text, _ in any_of), "or"
+            fields = cls._merge_fields(f for _, _, f in any_of)
+            return " ".join(text for text, _, _ in any_of), "or", fields
         if not required:
-            return "", None
+            return "", None, ()
         if len(required) == 1:
-            text, operator = required[0]
-            return text, operator
+            return required[0]
         # Several clauses, all required: every term of every clause, which
         # is only the same thing if no clause is itself an OR of words.
-        if any(op != "and" and len(text.split()) > 1 for text, op in required):
+        if any(op != "and" and len(text.split()) > 1 for text, op, _ in required):
             raise cls._unsupported(
                 "several required text clauses where one is a multi-word OR"
             )
-        return " ".join(text for text, _ in required), "and"
+        fields = cls._merge_fields(f for _, _, f in required)
+        return " ".join(text for text, _, _ in required), "and", fields
 
     @classmethod
     def _translate_search(cls, body: dict, params: dict | None = None) -> tuple[dict, dict]:
@@ -607,7 +668,7 @@ class KoshaClient:
         if body.get("post_filter"):
             plan["must"].append(cls._to_filter(body["post_filter"]))
 
-        text, operator = cls._resolve_text(plan)
+        text, operator, fields = cls._resolve_text(plan)
         if plan["phrase"] and text:
             raise cls._unsupported("a phrase and separate query text in one query")
 
@@ -619,6 +680,8 @@ class KoshaClient:
         }
         if operator and text:
             kosha["operator"] = operator
+        if fields and text:
+            kosha["fields"] = list(fields)
 
         must, must_not = plan["must"], plan["must_not"]
         if must_not or len(must) > 1:

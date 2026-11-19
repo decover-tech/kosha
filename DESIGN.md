@@ -216,6 +216,18 @@ reading in full (scored with its best). An analyzer change (schema edit, tokeniz
 never makes older segments go dark: they keep answering with the analysis they were written with
 until compaction re-analyzes their stored documents under the current schema.
 
+**Per-field indexes (#249).** `inverted.idx` keeps the **combined** index (every `Text` field of a
+document in one postings list per term, one length per document) that every query without
+`fields` reads, and segments written since #249 add each field's own postings under the key
+`\0{field}\0{term}`, a per-field norms list (posting tf = the document's length in that field),
+and `field_index` in the footer (per-field `doc_count` / `total_length`, position gap). Field keys
+use the same posting blobs, caches and hydration as any term; the term bloom holds only combined
+terms (a field term is always also one), so bloom checks strip the field prefix. Consecutive `Text`
+values of a document are a 65,536-position gap apart in both indexes and the phrase slop is
+clamped below it, so a phrase never matches across fields. A segment without `field_index`
+(written before #249, or with `KOSHA_FIELD_INDEX=off`) answers field-restricted queries from its
+combined index rather than with zero hits, until compaction rewrites it.
+
 Segments are sized to a target (e.g. 128–512MB) so that a full segment fetch/cache-fill is a
 bounded, predictable operation. Small/continuous writes are buffered (§7) and flushed as a segment
 once they cross the size or time threshold — never written as one-object-per-document (that's
@@ -374,6 +386,14 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      `bm25_params.stats: "segment"` (or `KOSHA_BM25_STATS=segment` engine-wide) restores
      per-segment statistics for A/B debugging. Wildcard queries keep per-segment statistics,
      since their expansion is per segment.
+     A `fields` query (`["title^2", "content"]`, issue #249) scores
+     `Σ_fields boost × BM25_field`, each field with its own postings, per-document lengths and
+     statistics (`N` = documents with the field, `avgdl` = its mean length, `df` from its own
+     postings — namespace-level, summed from the footers' `field_index` and the field keys'
+     posting counts). Each field reads the query with the analysis chain its segment indexed it
+     with; with AND, each query position must match in some listed field. It runs on an
+     exhaustive per-field path (per-field block summaries carry no lengths yet, so no WAND).
+     `match_phrase` with a `field` (or `fields`) is matched in that field's postings.
    - Semantic: ANN search over `vector.idx` (HNSW graph traversal or IVF-PQ probe), scored by
      cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
      query in `query_builder.py`.

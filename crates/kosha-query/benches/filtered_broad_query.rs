@@ -103,6 +103,7 @@ fn main() {
         source_excludes: None,
         rank: None,
         mode: None,
+        fields: Vec::new(),
     };
 
     // Warm the segment cache.

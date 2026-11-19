@@ -220,6 +220,7 @@ fn mk_query(text: &str) -> SearchQuery {
         source_excludes: None,
         rank: None,
         mode: None,
+        fields: Vec::new(),
     }
 }
 
@@ -309,6 +310,7 @@ fn measure_format(root: &Path, ns: &NamespaceId, manifest: &Manifest) -> FormatR
         field: "t".into(),
         phrase: "breach warranty".into(),
         slop: 0,
+        fields: Vec::new(),
     });
     let mut wildcard = mk_query("");
     wildcard.wildcard = Some(WildcardQuery {

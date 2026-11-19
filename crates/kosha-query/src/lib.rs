@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+use kosha_core::fields::{field_norms_key, field_term_key, segment_field_chain};
 use kosha_core::{
     segment_may_contain_terms, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
     AggMetricResult, Aggregation, AggregationResults, Bm25Params, Bm25StatsScope, DocSet,
@@ -13,7 +14,7 @@ use kosha_core::{
     NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery, SearchResult, SortSpec,
     TermBloomMode, TotalHitsRelation,
 };
-use kosha_core::{AnalyzerSpec, Footer, SegmentAnalysis};
+use kosha_core::{AnalyzerSpec, FieldBoost, Footer, SegmentAnalysis};
 use kosha_segment::{
     tokenize, Analyzer, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
 };
@@ -618,6 +619,39 @@ impl Bm25Scorer {
         }
     }
 
+    /// Scorer for one field of a multi-field query (#249): `N` is the
+    /// number of documents with the field and `avgdl` its mean length —
+    /// over the namespace when `corpus` is given (whose `df` map also
+    /// holds the field's keys), else over the segment (`segment_stats`).
+    pub fn for_field(
+        corpus: Option<&Arc<CorpusStats>>,
+        segment_stats: &kosha_core::FieldStats,
+        field: &str,
+        params: Bm25Params,
+    ) -> Self {
+        match corpus {
+            Some(corpus) => {
+                let totals = corpus.fields.get(field).copied().unwrap_or_default();
+                Self {
+                    num_docs: totals.num_docs as f64,
+                    avg_field_length: totals.avg_length(),
+                    params,
+                    corpus: Some(Arc::clone(corpus)),
+                }
+            }
+            None => Self {
+                num_docs: segment_stats.doc_count as f64,
+                avg_field_length: if segment_stats.doc_count == 0 {
+                    0.0
+                } else {
+                    segment_stats.total_length as f64 / segment_stats.doc_count as f64
+                },
+                params,
+                corpus: None,
+            },
+        }
+    }
+
     /// The `df` to score `term` with: the namespace-level value when this
     /// scorer carries corpus statistics for the term, else `segment_df`
     /// (the term's posting count in the segment being scored).
@@ -702,8 +736,31 @@ impl Bm25Scorer {
 pub struct CorpusStats {
     pub num_docs: u64,
     pub total_field_length: u64,
-    /// `df` for the terms of one query (other terms are not carried).
+    /// `df` for the terms of one query (other terms are not carried),
+    /// including per-field keys (#249).
     pub doc_frequencies: HashMap<String, u64>,
+    /// Per-field `N` and total length (#249), summed over the segments
+    /// that have a per-field index.
+    pub fields: HashMap<String, FieldTotals>,
+}
+
+/// Namespace-level statistics of one field (#249): the sum of
+/// [`kosha_core::FieldStats`] over the segments that record it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FieldTotals {
+    /// Documents with at least one token in the field.
+    pub num_docs: u64,
+    pub total_length: u64,
+}
+
+impl FieldTotals {
+    pub fn avg_length(&self) -> f64 {
+        if self.num_docs == 0 {
+            0.0
+        } else {
+            self.total_length as f64 / self.num_docs as f64
+        }
+    }
 }
 
 impl CorpusStats {
@@ -762,6 +819,9 @@ pub fn uses_namespace_stats(query: &SearchQuery) -> bool {
 pub struct AnalyzedQuery {
     /// `query_text`'s terms.
     pub terms: Vec<String>,
+    /// `query_text`'s terms with their positions: the query "slots" a
+    /// multi-field AND query (#249) needs matched in some field.
+    pub positioned: Vec<(String, u32)>,
     /// `match_phrase.phrase`'s terms and their positions (relative; a
     /// `stop` filter leaves gaps, matched against the same gaps in the
     /// index).
@@ -798,6 +858,10 @@ impl AnalyzedQuery {
 pub struct QueryAnalysis {
     text: String,
     phrase: Option<String>,
+    /// `query_text`'s fields and boosts (#249), `None` = combined index.
+    fields: Option<Vec<FieldBoost>>,
+    /// The fields `match_phrase` is restricted to (#249), `None` = any.
+    phrase_fields: Option<Vec<String>>,
     /// Whether the text has any lexical content at all (by the legacy
     /// reading or any chain's). Decides whether the request is a lexical
     /// query, the same way in every segment, so a query whose words a
@@ -813,8 +877,68 @@ impl QueryAnalysis {
             has_text: !tokenize(&query.query_text).is_empty(),
             text: query.query_text.clone(),
             phrase: query.match_phrase.as_ref().map(|mp| mp.phrase.clone()),
+            fields: query.field_boosts(),
+            phrase_fields: query
+                .match_phrase
+                .as_ref()
+                .and_then(|mp| mp.restricted_fields()),
             by_chain: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// `query_text`'s fields and boosts, when restricted (#249).
+    pub fn fields(&self) -> Option<&[FieldBoost]> {
+        self.fields.as_deref()
+    }
+
+    /// The fields `match_phrase` is restricted to, when restricted (#249).
+    pub fn phrase_fields(&self) -> Option<&[String]> {
+        self.phrase_fields.as_deref()
+    }
+
+    /// Whether the request reads per-field indexes at all.
+    pub fn is_field_query(&self) -> bool {
+        self.fields.is_some() || self.phrase_fields.is_some()
+    }
+
+    /// The query as a segment with `analysis` indexed `field` (`_all`:
+    /// the segment's default chain).
+    pub fn for_field(&self, analysis: Option<&SegmentAnalysis>, field: &str) -> Arc<AnalyzedQuery> {
+        self.for_chain(&segment_field_chain(analysis, field))
+    }
+
+    /// The inverted-index keys a field query reads in a segment with
+    /// `analysis` (#249): each field's terms under that field's chain and
+    /// its norms list (plain terms for `_all`). Empty for a query on the
+    /// combined index.
+    pub fn field_keys(&self, analysis: Option<&SegmentAnalysis>) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(ref fields) = self.fields {
+            for boost in fields {
+                let reading = self.for_field(analysis, &boost.field);
+                if boost.is_all() {
+                    keys.extend(reading.terms.iter().cloned());
+                } else {
+                    keys.extend(
+                        reading
+                            .terms
+                            .iter()
+                            .map(|term| field_term_key(&boost.field, term)),
+                    );
+                    keys.push(field_norms_key(&boost.field));
+                }
+            }
+        }
+        if let Some(ref fields) = self.phrase_fields {
+            for field in fields {
+                let reading = self.for_field(analysis, field);
+                if let Some(ref phrase) = reading.phrase {
+                    keys.extend(phrase.iter().map(|(term, _)| field_term_key(field, term)));
+                }
+                keys.push(field_norms_key(field));
+            }
+        }
+        keys
     }
 
     pub fn for_chain(&self, spec: &AnalyzerSpec) -> Arc<AnalyzedQuery> {
@@ -824,6 +948,7 @@ impl QueryAnalysis {
         let analyzer = Analyzer::new(spec);
         let analyzed = Arc::new(AnalyzedQuery {
             terms: analyzer.analyze(&self.text),
+            positioned: analyzer.analyze_with_positions(&self.text),
             phrase: self
                 .phrase
                 .as_ref()
@@ -878,6 +1003,7 @@ impl QueryAnalysis {
                     terms.extend(phrase.iter().map(|(t, _)| t.clone()));
                 }
             }
+            terms.extend(self.field_keys(analysis));
         }
         if seen.is_empty() {
             // No segments: the legacy reading, as before #220.
@@ -886,6 +1012,7 @@ impl QueryAnalysis {
             if let Some(ref phrase) = reading[0].phrase {
                 terms.extend(phrase.iter().map(|(t, _)| t.clone()));
             }
+            terms.extend(self.field_keys(None));
         }
         terms.sort();
         terms.dedup();
@@ -908,6 +1035,8 @@ struct CorpusEntry {
     /// The distinct footer `analysis` values across the manifest's
     /// segments (#220): which readings of a query need a `df`.
     analyses: Vec<Option<SegmentAnalysis>>,
+    /// Per-field totals (#249) over the segments with a field index.
+    fields: HashMap<String, FieldTotals>,
     doc_frequencies: Mutex<HashMap<String, u64>>,
 }
 
@@ -1059,6 +1188,163 @@ pub fn match_phrase_score_at(
         }
     }
     0.0
+}
+
+/// The slop a phrase with query `positions` may use in `reader` (#249):
+/// on a segment whose `Text` values are `position_gap` apart, clamped so
+/// that no match can straddle two values. Unchanged on older segments.
+fn segment_phrase_slop(reader: &SegmentReader, positions: &[u32], slop: u32) -> u32 {
+    match reader.field_index() {
+        Some(field_index) => {
+            let span = match (positions.iter().min(), positions.iter().max()) {
+                (Some(first), Some(last)) => last - first,
+                _ => 0,
+            };
+            slop.min(kosha_core::fields::max_phrase_slop(
+                field_index.position_gap,
+                span,
+            ))
+        }
+        None => slop,
+    }
+}
+
+// ─── Multi-field BM25 (issue #249) ──────────────────────────────────────────
+
+/// Score `query_text` over several fields of one segment that has
+/// per-field indexes: `Σ_fields boost × BM25_field`, each field scored with
+/// its own postings, document lengths and statistics (`N` = documents with
+/// the field, `avgdl` = its mean length; namespace-wide when `corpus` is
+/// given). This is Elasticsearch's `multi_match` `most_fields` and
+/// turbopuffer's `Sum` of per-attribute BM25.
+///
+/// Each field reads the query with the analysis chain the segment indexed
+/// that field with (#220), so a stemmed `title` and an unstemmed `content`
+/// are each searched with their own terms. A query position ("slot") is
+/// matched when any field's term at that position occurs; with AND every
+/// slot some field reads a term at must be matched, in any of the fields.
+/// A field the segment doesn't have contributes nothing.
+#[allow(clippy::too_many_arguments)]
+fn score_field_query(
+    reader: &SegmentReader,
+    segment: &str,
+    analysis: &QueryAnalysis,
+    fields: &[FieldBoost],
+    operator: kosha_core::QueryOperator,
+    corpus: Option<&Arc<CorpusStats>>,
+    params: Bm25Params,
+    combined: &Bm25Scorer,
+    rejected: &dyn Fn(u32) -> bool,
+) -> Result<HashMap<u32, f64>, KoshaError> {
+    let Some(field_index) = reader.field_index() else {
+        return Ok(HashMap::new());
+    };
+    let segment_analysis = reader.footer().analysis.as_ref();
+
+    // How each field is scored, and which (slot, key) pairs it reads.
+    struct FieldScoring {
+        boost: f64,
+        scorer: Option<Bm25Scorer>,
+        lengths: Option<Arc<Vec<u32>>>,
+    }
+    let mut scoring: Vec<FieldScoring> = Vec::with_capacity(fields.len());
+    let mut slots: std::collections::BTreeMap<u32, Vec<(usize, String)>> =
+        std::collections::BTreeMap::new();
+    for (i, field) in fields.iter().enumerate() {
+        let reading = analysis.for_field(segment_analysis, &field.field);
+        let present = field.is_all() || field_index.fields.contains_key(&field.field);
+        for (term, slot) in &reading.positioned {
+            let entry = slots.entry(*slot).or_default();
+            if present {
+                let key = if field.is_all() {
+                    term.clone()
+                } else {
+                    field_term_key(&field.field, term)
+                };
+                entry.push((i, key));
+            }
+        }
+        scoring.push(if present && !field.is_all() {
+            let stats = &field_index.fields[&field.field];
+            FieldScoring {
+                boost: field.boost,
+                scorer: Some(Bm25Scorer::for_field(
+                    corpus,
+                    stats,
+                    &field.field,
+                    params.clone(),
+                )),
+                lengths: reader.field_lengths(&field.field)?,
+            }
+        } else {
+            // `_all` scores with the combined scorer and lengths; an
+            // absent field reads no keys, so its scorer is never used.
+            FieldScoring {
+                boost: field.boost,
+                scorer: None,
+                lengths: None,
+            }
+        });
+    }
+
+    let mut matched: Option<HashMap<u32, f64>> = None;
+    for keys in slots.values() {
+        let mut slot_scores: HashMap<u32, f64> = HashMap::new();
+        for (i, key) in keys {
+            let Some(postings) = reader.postings(key) else {
+                continue;
+            };
+            let field = &scoring[*i];
+            let scorer = field.scorer.as_ref().unwrap_or(combined);
+            let segment_df = u32::try_from(postings.len()).unwrap_or(u32::MAX);
+            let df = scorer.doc_frequency(key, segment_df);
+            for posting in postings.iter() {
+                if rejected(posting.doc_id) {
+                    continue;
+                }
+                let length = match field.lengths {
+                    Some(ref lengths) => lengths.get(posting.doc_id as usize).copied().unwrap_or(0),
+                    None => match reader.doc_meta(posting.doc_id) {
+                        Some(meta) => meta.field_length,
+                        None => continue,
+                    },
+                };
+                *slot_scores.entry(posting.doc_id).or_insert(0.0) +=
+                    field.boost * scorer.score_term(posting.term_frequency, df, length);
+            }
+        }
+        if reader.take_blob_read_failure() {
+            return Err(KoshaError::CorruptSegment(format!(
+                "segment {segment}: posting blob unreadable for a present field term \
+                 (evicted or corrupt) — retry after rehydration"
+            )));
+        }
+        matched = Some(match matched {
+            None => slot_scores,
+            Some(mut so_far) => {
+                if operator == kosha_core::QueryOperator::Or {
+                    for (doc_seq, score) in slot_scores {
+                        *so_far.entry(doc_seq).or_insert(0.0) += score;
+                    }
+                } else {
+                    so_far.retain(|doc_seq, score| match slot_scores.get(doc_seq) {
+                        Some(add) => {
+                            *score += add;
+                            true
+                        }
+                        None => false,
+                    });
+                }
+                so_far
+            }
+        });
+        if operator != kosha_core::QueryOperator::Or
+            && matched.as_ref().is_some_and(|m| m.is_empty())
+        {
+            break;
+        }
+    }
+    Ok(matched.unwrap_or_default())
 }
 
 // ─── Filter applier ─────────────────────────────────────────────────────────
@@ -1702,7 +1988,13 @@ impl Searcher {
         let corpus = match self.corpus_stats.get(&key) {
             Some(corpus) => corpus,
             None => {
-                let totals: Option<Vec<(u64, u64, Option<SegmentAnalysis>)>> = manifest
+                type SegmentTotals = (
+                    u64,
+                    u64,
+                    Option<SegmentAnalysis>,
+                    Option<kosha_core::FieldIndex>,
+                );
+                let totals: Option<Vec<SegmentTotals>> = manifest
                     .segments
                     .par_iter()
                     .map(|entry| {
@@ -1713,16 +2005,24 @@ impl Searcher {
                             footer.doc_count as u64,
                             footer.total_field_length,
                             footer.analysis.clone(),
+                            footer.field_index.clone(),
                         ))
                     })
                     .collect();
                 let mut analyses: Vec<Option<SegmentAnalysis>> = Vec::new();
                 let (mut num_docs, mut total_field_length) = (0u64, 0u64);
-                for (docs, length, segment_analysis) in totals? {
+                let mut fields: HashMap<String, FieldTotals> = HashMap::new();
+                for (docs, length, segment_analysis, field_index) in totals? {
                     num_docs = num_docs.saturating_add(docs);
                     total_field_length = total_field_length.saturating_add(length);
                     if !analyses.contains(&segment_analysis) {
                         analyses.push(segment_analysis);
+                    }
+                    for (name, stats) in field_index.iter().flat_map(|fi| fi.fields.iter()) {
+                        let totals = fields.entry(name.clone()).or_default();
+                        totals.num_docs = totals.num_docs.saturating_add(stats.doc_count as u64);
+                        totals.total_length =
+                            totals.total_length.saturating_add(stats.total_length);
                     }
                 }
                 self.corpus_stats.insert(
@@ -1731,6 +2031,7 @@ impl Searcher {
                         num_docs,
                         total_field_length,
                         analyses,
+                        fields,
                         doc_frequencies: Mutex::new(HashMap::new()),
                     }),
                 )
@@ -1765,10 +2066,9 @@ impl Searcher {
                     let candidates: Vec<String> = missing
                         .iter()
                         .filter(|term| {
-                            footer
-                                .term_bloom
-                                .as_ref()
-                                .is_none_or(|bloom| bloom.may_contain(term))
+                            footer.term_bloom.as_ref().is_none_or(|bloom| {
+                                bloom.may_contain(kosha_core::fields::bloom_term(term))
+                            })
                         })
                         .cloned()
                         .collect();
@@ -1820,6 +2120,7 @@ impl Searcher {
             num_docs: corpus.num_docs,
             total_field_length: corpus.total_field_length,
             doc_frequencies,
+            fields: corpus.fields.clone(),
         }))
     }
 
@@ -1955,8 +2256,8 @@ impl Searcher {
         // computed with exactly the IDF the hits get.
         let params = query.bm25_params.resolve(reader.bm25_params());
         let scorer = match corpus {
-            Some(corpus) => Bm25Scorer::with_corpus(Arc::clone(corpus), params),
-            None => Bm25Scorer::new(total_docs, reader.avg_field_length(), params),
+            Some(corpus) => Bm25Scorer::with_corpus(Arc::clone(corpus), params.clone()),
+            None => Bm25Scorer::new(total_docs, reader.avg_field_length(), params.clone()),
         };
 
         // Hybrid requests keep their lexical and vector lists apart here and
@@ -2011,13 +2312,14 @@ impl Searcher {
         // ── Match phrase ──
         let phrase_match: Option<(Vec<String>, Vec<u32>, u32)> =
             query.match_phrase.as_ref().map(|mp| {
-                let (terms, positions) = primary
+                let (terms, positions): (Vec<String>, Vec<u32>) = primary
                     .phrase
                     .clone()
                     .unwrap_or_default()
                     .into_iter()
                     .unzip();
-                (terms, positions, mp.slop)
+                let slop = segment_phrase_slop(&reader, &positions, mp.slop);
+                (terms, positions, slop)
             });
 
         let phrase_tokenized = phrase_match.as_ref().map(|p| &p.0);
@@ -2031,7 +2333,30 @@ impl Searcher {
             && effective_terms
                 .iter()
                 .any(|term| !reader.contains_term(term));
-        if multi_reading
+        // A multi-field query (#249) on a segment with per-field indexes.
+        // A segment without them (written before #249) takes the paths
+        // below and answers from its combined index instead.
+        let field_query = analysis
+            .fields()
+            .filter(|_| analysis.has_text() && !is_wildcard_mode && reader.field_index().is_some());
+        if let Some(fields) = field_query {
+            let scored = score_field_query(
+                &reader,
+                &entry.segment_id.0,
+                analysis,
+                fields,
+                operator,
+                corpus,
+                params.clone(),
+                &scorer,
+                &rejected,
+            )?;
+            for (doc_seq, score) in scored {
+                if reader.doc_meta(doc_seq).is_some() {
+                    seg_hits.insert(doc_seq, score);
+                }
+            }
+        } else if multi_reading
             || ((!effective_terms.is_empty() || phrase_tokenized.is_some())
                 && !missing_required_term)
         {
@@ -2721,9 +3046,21 @@ impl Searcher {
             // The general path, as a function of one reading of the query:
             // run once for an ordinary segment, and once per reading for a
             // segment whose fields used different analysis chains (#220).
+            //
+            // `scorer` and `lengths` are the combined index's by default; a
+            // phrase restricted to a field (#249) passes that field's keys,
+            // scorer and per-document lengths instead.
             let score_reading = |terms_for_bm25: &[String],
-                                 phrase_match: Option<&(Vec<String>, Vec<u32>, u32)>|
+                                 phrase_match: Option<&(Vec<String>, Vec<u32>, u32)>,
+                                 scorer: &Bm25Scorer,
+                                 lengths: Option<&[u32]>|
              -> Result<HashMap<u32, f64>, KoshaError> {
+                let length_of = |doc_seq: u32, combined: u32| -> u32 {
+                    match lengths {
+                        Some(lengths) => lengths.get(doc_seq as usize).copied().unwrap_or(0),
+                        None => combined,
+                    }
+                };
                 let phrase_tokenized = phrase_match.map(|p| &p.0);
                 // `PostingsRef`: legacy segments lend a borrow into their parsed
                 // map; v2 segments hand out a shared Arc of the on-demand decode
@@ -2785,7 +3122,7 @@ impl Searcher {
                                 let score = scorer.score_term(
                                     posting.term_frequency,
                                     df,
-                                    meta.field_length,
+                                    length_of(posting.doc_id, meta.field_length),
                                 );
                                 *scored.entry(posting.doc_id).or_insert(0.0) += score;
                             }
@@ -2842,6 +3179,7 @@ impl Searcher {
 
                     for doc_seq in and_candidates {
                         if let Some(meta) = reader.doc_meta(doc_seq) {
+                            let field_length = length_of(doc_seq, meta.field_length);
                             // Summed in query-term order, as the WAND join does,
                             // so both paths round identically.
                             let mut total_score = 0.0;
@@ -2849,7 +3187,7 @@ impl Searcher {
                                 if let Some(p) = lookup(term_index, doc_seq) {
                                     let df = doc_frequencies.get(term).copied().unwrap_or(0);
                                     total_score +=
-                                        scorer.score_term(p.term_frequency, df, meta.field_length);
+                                        scorer.score_term(p.term_frequency, df, field_length);
                                 }
                             }
                             scored.insert(doc_seq, total_score);
@@ -2922,7 +3260,47 @@ impl Searcher {
 
                 Ok(scored)
             };
-            let scored = if multi_reading {
+            let restricted_phrase = analysis
+                .phrase_fields()
+                .zip(query.match_phrase.as_ref())
+                .zip(reader.field_index());
+            let scored = if let Some(((phrase_fields, mp), field_index)) = restricted_phrase {
+                // A phrase restricted to fields (#249): matched in each
+                // field's own postings, read with that field's chain and
+                // scored with its statistics; a document matches if the
+                // phrase occurs in one of the fields, scored with the best.
+                let segment_analysis = reader.footer().analysis.as_ref();
+                let mut best: HashMap<u32, f64> = HashMap::new();
+                for field in phrase_fields {
+                    let Some(stats) = field_index.fields.get(field) else {
+                        continue;
+                    };
+                    let reading = analysis.for_field(segment_analysis, field);
+                    let (keys, positions): (Vec<String>, Vec<u32>) = reading
+                        .phrase
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(term, pos)| (field_term_key(field, &term), pos))
+                        .unzip();
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let slop = segment_phrase_slop(&reader, &positions, mp.slop);
+                    let field_scorer = Bm25Scorer::for_field(corpus, stats, field, params.clone());
+                    let lengths = reader.field_lengths(field)?.unwrap_or_default();
+                    let phrase = (keys.clone(), positions, slop);
+                    let scored =
+                        score_reading(&keys, Some(&phrase), &field_scorer, Some(&lengths[..]))?;
+                    for (doc_seq, score) in scored {
+                        let slot = best.entry(doc_seq).or_insert(score);
+                        if score > *slot {
+                            *slot = score;
+                        }
+                    }
+                }
+                best
+            } else if multi_reading {
                 // A document matches if it matches some one reading in
                 // full, and scores with its best reading — Elasticsearch's
                 // `cross_fields` grouping by analyzer, combined `dis_max`.
@@ -2930,13 +3308,14 @@ impl Searcher {
                 for reading in &readings {
                     let phrase: Option<(Vec<String>, Vec<u32>, u32)> =
                         query.match_phrase.as_ref().map(|mp| {
-                            let (terms, positions) = reading
+                            let (terms, positions): (Vec<String>, Vec<u32>) = reading
                                 .phrase
                                 .clone()
                                 .unwrap_or_default()
                                 .into_iter()
                                 .unzip();
-                            (terms, positions, mp.slop)
+                            let slop = segment_phrase_slop(&reader, &positions, mp.slop);
+                            (terms, positions, slop)
                         });
                     let bm25_terms = match phrase {
                         Some((ref terms, _, _)) => terms.clone(),
@@ -2947,7 +3326,9 @@ impl Searcher {
                     if missing || (bm25_terms.is_empty() && phrase.is_none()) {
                         continue;
                     }
-                    for (doc_seq, score) in score_reading(&bm25_terms, phrase.as_ref())? {
+                    for (doc_seq, score) in
+                        score_reading(&bm25_terms, phrase.as_ref(), &scorer, None)?
+                    {
                         let slot = best.entry(doc_seq).or_insert(score);
                         if score > *slot {
                             *slot = score;
@@ -2956,7 +3337,7 @@ impl Searcher {
                 }
                 best
             } else {
-                score_reading(terms_for_bm25, phrase_match.as_ref())?
+                score_reading(terms_for_bm25, phrase_match.as_ref(), &scorer, None)?
             };
 
             // `accept` already ran on every candidate above.
@@ -5027,6 +5408,30 @@ pub fn segment_may_match_query_terms(
     mode: TermBloomMode,
     footer: &Footer,
 ) -> bool {
+    // A segment without per-field indexes answers a field query from its
+    // combined index, with the readings below.
+    if let Some(fields) = analysis.fields().filter(|_| footer.field_index.is_some()) {
+        // A multi-field query (#249) reads each field with that field's
+        // chain, and an AND matches each term in any one field. Every
+        // field term is also a combined-index term, so the bloom is a
+        // valid test — with AND only when all fields read the query the
+        // same way (term `i` then means the same thing in every field).
+        let readings: Vec<Arc<AnalyzedQuery>> = fields
+            .iter()
+            .map(|f| analysis.for_field(footer.analysis.as_ref(), &f.field))
+            .collect();
+        let same = readings.windows(2).all(|w| w[0].terms == w[1].terms);
+        let (terms, mode) = if same {
+            (readings[0].terms.clone(), mode)
+        } else {
+            let mut union: Vec<String> = readings.iter().flat_map(|r| r.terms.clone()).collect();
+            union.sort();
+            union.dedup();
+            (union, TermBloomMode::Or)
+        };
+        return terms.is_empty()
+            || segment_may_contain_terms(&terms, mode, footer.term_bloom.as_ref());
+    }
     analysis
         .for_segment(footer.analysis.as_ref())
         .iter()
@@ -5234,6 +5639,7 @@ mod tests {
             source_excludes: None,
             rank: None,
             mode: None,
+            fields: Vec::new(),
         }
     }
 
@@ -6703,6 +7109,7 @@ mod tests {
             field: "content".into(),
             phrase: "contract breach".into(),
             slop: 0,
+            fields: Vec::new(),
         });
         query.filter = Some(matter_filter("m1"));
         let r = searcher.search(&ns, &manifest, &query, None).unwrap();
@@ -6995,6 +7402,7 @@ mod tests {
             field: "t".into(),
             phrase: "quick brown".into(),
             slop: 0,
+            fields: Vec::new(),
         });
         let r = searcher.search(&ns, &manifest, &query, None).unwrap();
         assert_eq!(
@@ -7305,6 +7713,7 @@ mod tests {
             source_excludes: None,
             rank: None,
             mode: None,
+            fields: Vec::new(),
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
@@ -9889,6 +10298,7 @@ mod tests {
                     source_excludes: None,
                     rank: None,
                     mode: None,
+                    fields: Vec::new(),
                 },
                 None,
             )
@@ -9997,6 +10407,7 @@ mod tests {
                     source_excludes: None,
                     rank: None,
                     mode: None,
+                    fields: Vec::new(),
                 },
                 None,
             )
@@ -10080,6 +10491,7 @@ mod tests {
                     source_excludes: None,
                     rank: None,
                     mode: None,
+                    fields: Vec::new(),
                 },
                 None,
             )
@@ -10114,6 +10526,7 @@ mod tests {
                     source_excludes: None,
                     rank: None,
                     mode: None,
+                    fields: Vec::new(),
                 },
                 None,
             )
@@ -10400,6 +10813,7 @@ mod tests {
             source_excludes: None,
             rank: None,
             mode: None,
+            fields: Vec::new(),
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -10492,6 +10906,7 @@ mod tests {
             source_excludes: None,
             rank: None,
             mode: None,
+            fields: Vec::new(),
         };
 
         let first = searcher.search(&ns, &manifest, &q, None).unwrap();
@@ -10575,6 +10990,7 @@ mod tests {
             source_excludes: None,
             rank: None,
             mode: None,
+            fields: Vec::new(),
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
@@ -10867,6 +11283,7 @@ mod corpus_stats_tests {
                 field: "content".into(),
                 phrase: "alpha beta".into(),
                 slop: 0,
+                fields: Vec::new(),
             });
             cases.push(("phrase".into(), phrase));
             let mut filter_only = query("", 1000);
@@ -12084,6 +12501,7 @@ mod analyzer_tests {
             field: "body".into(),
             phrase: text.into(),
             slop: 0,
+            fields: Vec::new(),
         });
         q
     }
@@ -12354,5 +12772,661 @@ mod analyzer_tests {
         };
         let terms = namespace_stats_terms(&q, [None, Some(&stemmed), None]).unwrap();
         assert_eq!(terms, ["hello", "hello,world", "run", "running", "world"]);
+    }
+}
+
+#[cfg(test)]
+mod field_tests {
+    //! Per-field indexes and multi-field BM25 (issue #249).
+    use super::*;
+    use kosha_core::{
+        AnalysisConfig, DocumentId, Field, FieldSchema, ManifestEntry, MatchPhraseQuery,
+        NamespaceSchema, SegmentId,
+    };
+    use kosha_segment::SegmentWriter;
+    use std::path::{Path, PathBuf};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "kosha-fields-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn empty_manifest() -> Manifest {
+        Manifest {
+            version: 1,
+            segments: Vec::new(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+        }
+    }
+
+    fn doc(id: &'static str, title: &str, content: &str) -> (&'static str, Vec<Field>) {
+        (
+            id,
+            vec![Field::text("title", title), Field::text("content", content)],
+        )
+    }
+
+    struct Seg<'a> {
+        name: &'a str,
+        field_index: bool,
+        config: Option<&'a AnalysisConfig>,
+    }
+
+    fn seg(name: &str) -> Seg<'_> {
+        Seg {
+            name,
+            field_index: true,
+            config: None,
+        }
+    }
+
+    fn add_segment(
+        root: &Path,
+        manifest: &mut Manifest,
+        seg: Seg<'_>,
+        docs: Vec<(&str, Vec<Field>)>,
+    ) {
+        let id = SegmentId(seg.name.into());
+        let mut writer = SegmentWriter::new(id.clone(), root.join("ns").join(seg.name))
+            .with_field_index(seg.field_index);
+        if let Some(config) = seg.config {
+            writer = writer.with_analysis(config);
+        }
+        for (doc, fields) in docs {
+            writer.add_document(DocumentId(doc.into()), fields);
+        }
+        let footer = writer.finalize(Bm25Params::default()).unwrap();
+        manifest.version += 1;
+        manifest.segments.push(ManifestEntry {
+            segment_id: id,
+            doc_count: footer.doc_count,
+        });
+    }
+
+    fn query(text: &str, fields: &[&str]) -> SearchQuery {
+        serde_json::from_value(serde_json::json!({
+            "query_text": text,
+            "max_results": 50,
+            "fields": fields,
+        }))
+        .unwrap()
+    }
+
+    fn phrase(text: &str, field: &str, slop: u32) -> SearchQuery {
+        let mut q = query("", &[]);
+        q.match_phrase = Some(MatchPhraseQuery {
+            field: field.into(),
+            phrase: text.into(),
+            slop,
+            fields: Vec::new(),
+        });
+        q
+    }
+
+    fn run(root: &Path, manifest: &Manifest, q: &SearchQuery) -> SearchResult {
+        q.validate().unwrap();
+        Searcher::new(root.to_path_buf())
+            .search(&NamespaceId("ns".into()), manifest, q, None)
+            .unwrap()
+    }
+
+    /// Hit ids in rank order.
+    fn ranked(root: &Path, manifest: &Manifest, q: &SearchQuery) -> Vec<String> {
+        let result = run(root, manifest, q);
+        assert_eq!(result.total_hits, result.results.len(), "{q:?}");
+        result.results.into_iter().map(|d| d.doc_id.0).collect()
+    }
+
+    fn hits(root: &Path, manifest: &Manifest, q: &SearchQuery) -> Vec<String> {
+        let mut ids = ranked(root, manifest, q);
+        ids.sort();
+        ids
+    }
+
+    fn score_of(root: &Path, manifest: &Manifest, q: &SearchQuery, id: &str) -> f64 {
+        run(root, manifest, q)
+            .results
+            .into_iter()
+            .find(|d| d.doc_id.0 == id)
+            .unwrap_or_else(|| panic!("{id} not hit by {q:?}"))
+            .score
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
+    }
+
+    fn corpus(root: &Path) -> Manifest {
+        let mut manifest = empty_manifest();
+        add_segment(
+            root,
+            &mut manifest,
+            seg("s1"),
+            vec![
+                doc("t_rust", "rust", "python tutorial"),
+                doc("c_rust", "python", "rust tutorial"),
+                doc("both", "rust guide", "rust book"),
+                doc("none", "go", "java"),
+            ],
+        );
+        manifest
+    }
+
+    #[test]
+    fn field_restricted_query_ignores_matches_in_other_fields() {
+        let root = temp_root("restrict");
+        let manifest = corpus(&root);
+        assert_eq!(
+            hits(&root, &manifest, &query("rust", &[])),
+            ["both", "c_rust", "t_rust"]
+        );
+        assert_eq!(
+            hits(&root, &manifest, &query("rust", &["title"])),
+            ["both", "t_rust"]
+        );
+        assert_eq!(
+            hits(&root, &manifest, &query("rust", &["content"])),
+            ["both", "c_rust"]
+        );
+        // `python` is only in t_rust's content and c_rust's title.
+        assert_eq!(
+            hits(&root, &manifest, &query("python", &["title"])),
+            ["c_rust"]
+        );
+        // A field nobody has matches nothing.
+        assert!(hits(&root, &manifest, &query("rust", &["summary"])).is_empty());
+        // `_all` is the combined index, the same as no fields.
+        assert_eq!(
+            hits(&root, &manifest, &query("rust", &["_all"])),
+            ["both", "c_rust", "t_rust"]
+        );
+        // Segment-local statistics take the same per-field path.
+        let mut q = query("rust", &["title"]);
+        q.bm25_params.stats = Some(Bm25StatsScope::Segment);
+        assert_eq!(hits(&root, &manifest, &q), ["both", "t_rust"]);
+    }
+
+    #[test]
+    fn and_needs_each_term_in_some_field_and_or_needs_one() {
+        let root = temp_root("and-or");
+        let manifest = corpus(&root);
+        // `rust` in the title and `tutorial` in the content.
+        assert_eq!(
+            hits(
+                &root,
+                &manifest,
+                &query("rust tutorial", &["title", "content"])
+            ),
+            ["c_rust", "t_rust"]
+        );
+        assert!(hits(&root, &manifest, &query("rust tutorial", &["title"])).is_empty());
+        let mut or = query("rust tutorial", &["title"]);
+        or.operator = Some(kosha_core::QueryOperator::Or);
+        assert_eq!(hits(&root, &manifest, &or), ["both", "t_rust"]);
+    }
+
+    #[test]
+    fn field_boost_changes_ranking() {
+        let root = temp_root("boost");
+        let mut manifest = empty_manifest();
+        add_segment(
+            &root,
+            &mut manifest,
+            seg("s1"),
+            vec![
+                doc("in_title", "contract law", "notes on several topics"),
+                doc("in_content", "notes on several topics", "contract law"),
+                doc("filler", "unrelated", "nothing here"),
+            ],
+        );
+        assert_eq!(
+            ranked(
+                &root,
+                &manifest,
+                &query("contract", &["title^3", "content"])
+            ),
+            ["in_title", "in_content"]
+        );
+        assert_eq!(
+            ranked(
+                &root,
+                &manifest,
+                &query("contract", &["title", "content^3"])
+            ),
+            ["in_content", "in_title"]
+        );
+        // Sum composition: a boost scales the field's BM25 exactly, and a
+        // multi-field score is the sum of the per-field ones.
+        let one = score_of(&root, &manifest, &query("contract", &["title"]), "in_title");
+        let two = score_of(
+            &root,
+            &manifest,
+            &query("contract", &["title^2"]),
+            "in_title",
+        );
+        assert!(close(two, 2.0 * one), "{two} != 2 × {one}");
+    }
+
+    #[test]
+    fn multi_field_score_is_the_sum_of_field_scores() {
+        let root = temp_root("sum");
+        let manifest = corpus(&root);
+        let title = score_of(&root, &manifest, &query("rust", &["title"]), "both");
+        let content = score_of(&root, &manifest, &query("rust", &["content"]), "both");
+        let sum = score_of(
+            &root,
+            &manifest,
+            &query("rust", &["title^2", "content"]),
+            "both",
+        );
+        assert!(close(sum, 2.0 * title + content), "{sum}");
+        // Per-field length normalization: a one-token title outscores the
+        // same term in a two-token title.
+        let short = score_of(&root, &manifest, &query("rust", &["title"]), "t_rust");
+        assert!(short > title);
+    }
+
+    #[test]
+    fn field_scores_match_hand_computed_bm25() {
+        let root = temp_root("hand");
+        let manifest = corpus(&root);
+        // title lengths: 1, 1, 2, 1 → N = 4, avgdl = 5/4; df(rust) = 2.
+        let (n, avgdl, df, tf, dl) = (4.0f64, 1.25f64, 2.0f64, 1.0f64, 2.0f64);
+        let (k1, b) = (1.2, 0.75);
+        let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+        let expected = idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * dl / avgdl));
+        let got = score_of(&root, &manifest, &query("rust", &["title"]), "both");
+        assert!(close(got, expected), "{got} vs {expected}");
+    }
+
+    #[test]
+    fn field_scores_do_not_depend_on_how_documents_are_split() {
+        let docs = || {
+            vec![
+                doc("a", "rust", "python tutorial"),
+                doc("b", "python", "rust tutorial"),
+                doc("c", "rust guide", "rust book"),
+                doc("d", "go", "java rust"),
+                doc("e", "a much longer rust title here", "x"),
+            ]
+        };
+        let one = temp_root("split-one");
+        let mut single = empty_manifest();
+        add_segment(&one, &mut single, seg("s1"), docs());
+        let many = temp_root("split-many");
+        let mut split = empty_manifest();
+        let mut all = docs();
+        let tail = all.split_off(2);
+        add_segment(&many, &mut split, seg("p1"), all);
+        // Different field sets per segment: `d`'s segment has no title hit.
+        add_segment(&many, &mut split, seg("p2"), tail);
+        for fields in [
+            &["title"][..],
+            &["title^2", "content"],
+            &["content", "_all^0.5"],
+        ] {
+            let q = query("rust", fields);
+            let a = run(&one, &single, &q);
+            let b = run(&many, &split, &q);
+            let scores = |r: &SearchResult| {
+                let mut v: Vec<(String, f64)> = r
+                    .results
+                    .iter()
+                    .map(|d| (d.doc_id.0.clone(), d.score))
+                    .collect();
+                v.sort_by(|x, y| x.0.cmp(&y.0));
+                v
+            };
+            let (a, b) = (scores(&a), scores(&b));
+            assert_eq!(a.len(), b.len(), "{fields:?}");
+            for ((ida, sa), (idb, sb)) in a.iter().zip(&b) {
+                assert_eq!(ida, idb);
+                assert!(close(*sa, *sb), "{fields:?} {ida}: {sa} vs {sb}");
+            }
+        }
+    }
+
+    #[test]
+    fn phrase_never_matches_across_fields() {
+        let root = temp_root("phrase");
+        let mut manifest = empty_manifest();
+        add_segment(
+            &root,
+            &mut manifest,
+            seg("s1"),
+            vec![
+                doc("split", "the quick brown", "fox jumps over"),
+                doc("whole", "x", "quick brown fox jumps"),
+                (
+                    "multi",
+                    vec![
+                        Field::text("tags", "alpha brown"),
+                        Field::text("tags", "fox omega"),
+                    ],
+                ),
+            ],
+        );
+        // "brown fox" spans title → content in `split` and two values of
+        // `tags` in `multi`: neither matches, at any slop.
+        for slop in [0, 3, 1000, u32::MAX] {
+            for field in ["", "_all", "*", "content", "title", "tags"] {
+                let found = hits(&root, &manifest, &phrase("brown fox", field, slop));
+                assert!(
+                    found.iter().all(|id| id == "whole"),
+                    "field {field:?} slop {slop}: {found:?}"
+                );
+            }
+        }
+        assert_eq!(
+            hits(&root, &manifest, &phrase("brown fox", "_all", 0)),
+            ["whole"]
+        );
+        // Restricted to a field, the phrase must be in that field.
+        assert_eq!(
+            hits(&root, &manifest, &phrase("quick brown", "title", 0)),
+            ["split"]
+        );
+        assert_eq!(
+            hits(&root, &manifest, &phrase("quick brown", "content", 0)),
+            ["whole"]
+        );
+        assert_eq!(
+            hits(&root, &manifest, &phrase("quick brown", "_all", 0)),
+            ["split", "whole"]
+        );
+        // Several fields: any one of them.
+        let mut either = phrase("fox jumps", "", 0);
+        either.match_phrase.as_mut().unwrap().fields = vec!["title".into(), "content".into()];
+        assert_eq!(hits(&root, &manifest, &either), ["split", "whole"]);
+        // Slop works within a field.
+        assert_eq!(
+            hits(&root, &manifest, &phrase("quick fox", "content", 1)),
+            ["whole"]
+        );
+    }
+
+    #[test]
+    fn segments_without_a_field_index_answer_from_the_combined_index() {
+        let root = temp_root("legacy");
+        let mut manifest = empty_manifest();
+        // The pre-#220 fixture segment, written long before #249.
+        let legacy_dir = root.join("ns").join("legacy-seg");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kosha-segment/tests/fixtures/legacy-seg");
+        for entry in std::fs::read_dir(fixture).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(&path, legacy_dir.join(path.file_name().unwrap())).unwrap();
+        }
+        manifest.segments.push(ManifestEntry {
+            segment_id: SegmentId("legacy-seg".into()),
+            doc_count: 3,
+        });
+        // A segment written with the field index switched off.
+        add_segment(
+            &root,
+            &mut manifest,
+            Seg {
+                name: "off",
+                field_index: false,
+                config: None,
+            },
+            vec![doc("o1", "shoes", "running"), doc("o2", "boots", "shoes")],
+        );
+        add_segment(
+            &root,
+            &mut manifest,
+            seg("new"),
+            vec![doc("n1", "shoes", "running"), doc("n2", "boots", "shoes")],
+        );
+        // The legacy fixture's d2 has `shoes` in title and body. Old
+        // segments can't tell fields apart, so a field query is answered
+        // from their combined index — never with zero hits.
+        assert_eq!(
+            hits(&root, &manifest, &query("shoes", &["title"])),
+            ["d2", "n1", "o1", "o2"]
+        );
+        assert_eq!(
+            hits(&root, &manifest, &query("shoes", &["body"])),
+            ["d2", "o1", "o2"]
+        );
+        // Unrestricted queries are unchanged everywhere.
+        assert_eq!(
+            hits(&root, &manifest, &query("shoes", &[])),
+            ["d2", "n1", "n2", "o1", "o2"]
+        );
+        // So are phrases, restricted or not.
+        assert_eq!(
+            hits(&root, &manifest, &phrase("state of the art", "body", 0)),
+            ["d2"]
+        );
+        assert_eq!(
+            hits(&root, &manifest, &phrase("legacy tokenizer", "", 0)),
+            ["d1"]
+        );
+        // Mixed fleet: both kinds of segment in one namespace-stats search
+        // (d2 has `running` in its body and `shoes` in both fields).
+        let mut q = query("shoes running", &["title", "content"]);
+        q.operator = Some(kosha_core::QueryOperator::And);
+        assert_eq!(hits(&root, &manifest, &q), ["d2", "n1", "o1"]);
+    }
+
+    #[test]
+    fn each_field_reads_the_query_with_its_own_analyzer() {
+        let root = temp_root("analyzers");
+        let schema = NamespaceSchema {
+            fields: [(
+                "title".to_string(),
+                FieldSchema {
+                    analyzer: vec!["standard@2".into(), "lowercase".into(), "stem".into()],
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            default_analyzer: vec!["standard".into()],
+            default_stopwords: None,
+        };
+        let config = schema.resolve().unwrap();
+        let mut manifest = empty_manifest();
+        add_segment(
+            &root,
+            &mut manifest,
+            Seg {
+                name: "s1",
+                field_index: true,
+                config: Some(&config),
+            },
+            vec![
+                doc("title_runs", "Runs daily", "nothing"),
+                doc("content_runs", "nothing", "runs daily"),
+            ],
+        );
+        // `running` stems to `run` in the stemmed title only.
+        assert_eq!(
+            hits(&root, &manifest, &query("running", &["title"])),
+            ["title_runs"]
+        );
+        assert!(hits(&root, &manifest, &query("running", &["content"])).is_empty());
+        assert_eq!(
+            hits(&root, &manifest, &query("runs", &["content"])),
+            ["content_runs"]
+        );
+        // AND across fields with different chains: `running` (stemmed, in
+        // the title) and `daily` (in either).
+        assert_eq!(
+            hits(
+                &root,
+                &manifest,
+                &query("running daily", &["title", "content"])
+            ),
+            ["title_runs"]
+        );
+    }
+
+    #[test]
+    fn field_queries_respect_filters_tombstones_and_pages() {
+        let root = temp_root("pages");
+        let mut manifest = empty_manifest();
+        let docs: Vec<(&'static str, Vec<Field>)> = [
+            "d00", "d01", "d02", "d03", "d04", "d05", "d06", "d07", "d08", "d09",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| {
+            (
+                id,
+                vec![
+                    Field::text("title", format!("rust {}", "pad ".repeat(i))),
+                    Field::text("content", "rust"),
+                    Field::keyword("parity", if i % 2 == 0 { "even" } else { "odd" }),
+                ],
+            )
+        })
+        .collect();
+        add_segment(&root, &mut manifest, seg("s1"), docs);
+        let full = ranked(&root, &manifest, &query("rust", &["title"]));
+        assert_eq!(full.len(), 10);
+        // Shorter titles rank first.
+        assert_eq!(full[0], "d00");
+        let mut page = query("rust", &["title"]);
+        page.from = 3;
+        page.max_results = 4;
+        let result = run(&root, &manifest, &page);
+        assert_eq!(result.total_hits, 10);
+        let ids: Vec<String> = result.results.iter().map(|d| d.doc_id.0.clone()).collect();
+        assert_eq!(ids, full[3..7]);
+
+        let mut filtered = query("rust", &["title"]);
+        filtered.filter =
+            Some(serde_json::from_value(serde_json::json!({"term": {"parity": "odd"}})).unwrap());
+        assert_eq!(
+            hits(&root, &manifest, &filtered),
+            ["d01", "d03", "d05", "d07", "d09"]
+        );
+
+        let tombstones = HashMap::from([(
+            SegmentId("s1".into()),
+            std::collections::HashSet::from([0u32, 1]),
+        )]);
+        let result = Searcher::new(root.clone())
+            .search(
+                &NamespaceId("ns".into()),
+                &manifest,
+                &query("rust", &["title"]),
+                Some(&tombstones),
+            )
+            .unwrap();
+        assert_eq!(result.total_hits, 8);
+        assert!(result
+            .results
+            .iter()
+            .all(|d| d.doc_id.0 != "d00" && d.doc_id.0 != "d01"));
+    }
+
+    #[test]
+    fn hybrid_field_query_fuses_the_field_restricted_list() {
+        let root = temp_root("hybrid");
+        let mut manifest = empty_manifest();
+        add_segment(
+            &root,
+            &mut manifest,
+            seg("s1"),
+            vec![
+                (
+                    "t",
+                    vec![
+                        Field::text("title", "rust"),
+                        Field::text("content", "x"),
+                        Field::vector("emb", vec![1.0, 0.0]),
+                    ],
+                ),
+                (
+                    "c",
+                    vec![
+                        Field::text("title", "x"),
+                        Field::text("content", "rust"),
+                        Field::vector("emb", vec![0.0, 1.0]),
+                    ],
+                ),
+            ],
+        );
+        let mut q = query("rust", &["title"]);
+        q.knn = Some(kosha_core::KnnQuery {
+            field: "emb".into(),
+            vector: vec![0.0, 1.0],
+            k: 1,
+            num_candidates: 100,
+            filter: None,
+        });
+        let result = run(&root, &manifest, &q);
+        let lexical: Vec<&str> = result
+            .results
+            .iter()
+            .filter(|d| d.rank_details.as_ref().unwrap().lexical_rank.is_some())
+            .map(|d| d.doc_id.0.as_str())
+            .collect();
+        assert_eq!(lexical, ["t"]);
+    }
+
+    #[test]
+    fn stats_and_hydration_terms_include_field_keys() {
+        let q = query("Rust", &["title^2", "_all"]);
+        let terms = namespace_stats_terms(&q, [None]).unwrap();
+        assert!(terms.contains(&"rust".to_string()));
+        assert!(terms.contains(&field_term_key("title", "rust")));
+        assert!(terms.contains(&field_norms_key("title")));
+        let mut p = phrase("Quick Fox", "content", 0);
+        p.bm25_params.stats = Some(Bm25StatsScope::Namespace);
+        let terms = namespace_stats_terms(&p, [None]).unwrap();
+        assert!(terms.contains(&field_term_key("content", "quick")));
+        assert!(terms.contains(&field_norms_key("content")));
+        // A combined-index query reads no field keys.
+        let plain = namespace_stats_terms(&query("rust", &[]), [None]).unwrap();
+        assert_eq!(plain, ["rust"]);
+    }
+
+    #[test]
+    fn invalid_field_requests_are_rejected() {
+        for bad in [
+            serde_json::json!({"query_text": "x", "fields": ["title^0"]}),
+            serde_json::json!({"query_text": "x", "fields": ["ti*"]}),
+            serde_json::json!({"query_text": "x", "fields": ["a", "a^2"]}),
+            serde_json::json!({"query_text": "x", "fields": ["a"],
+                "match_phrase": {"field": "a", "phrase": "x"}}),
+            serde_json::json!({"query_text": "", "match_phrase": {"field": "a^2", "phrase": "x"}}),
+        ] {
+            let q: SearchQuery = serde_json::from_value(bad.clone()).unwrap();
+            assert!(q.validate().is_err(), "{bad}");
+        }
+        // `fields` is left out of the serialized request (and so of the
+        // result-cache key) when empty, and present when set.
+        let plain: SearchQuery =
+            serde_json::from_value(serde_json::json!({"query_text": "x"})).unwrap();
+        assert!(!serde_json::to_string(&plain).unwrap().contains("fields"));
+        let restricted = query("x", &["title"]);
+        assert!(serde_json::to_string(&restricted)
+            .unwrap()
+            .contains("\"fields\":[\"title\"]"));
+        // A phrase without a field still parses (any field).
+        let q: SearchQuery = serde_json::from_value(
+            serde_json::json!({"query_text": "", "match_phrase": {"phrase": "x y"}}),
+        )
+        .unwrap();
+        assert!(q.match_phrase.unwrap().restricted_fields().is_none());
     }
 }

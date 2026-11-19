@@ -3,7 +3,8 @@
 //! `tests/fixtures/legacy-seg` was written by the segment writer as it was
 //! before analyzers existed (commit 30d0ff0, `feat/rrf-hybrid`) from the
 //! documents in [`fixture_docs`]. A segment written today with no analyzer
-//! — or with an explicit `["standard"]` — must be byte-identical to it.
+//! — or with an explicit `["standard"]` — and without per-field indexes
+//! (`KOSHA_FIELD_INDEX=off`, #249) must be byte-identical to it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -59,8 +60,11 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn write(dir: &Path, config: Option<&AnalysisConfig>) -> kosha_core::Footer {
+    // Per-field indexes (#249) add keys to the inverted index; with them
+    // off a segment is exactly what the pre-analyzer writer produced.
     let mut writer = SegmentWriter::new(SegmentId("legacy-seg".into()), dir.to_path_buf())
-        .with_text_filter_ignore_above(Some(256));
+        .with_text_filter_ignore_above(Some(256))
+        .with_field_index(false);
     if let Some(config) = config {
         writer = writer.with_analysis(config);
     }
