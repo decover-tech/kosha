@@ -214,6 +214,44 @@ class KoshaClient:
             return []
         return list(value) if isinstance(value, (list, tuple)) else [value]
 
+    @classmethod
+    def _translate_highlight(cls, highlight: dict) -> dict:
+        """ES ``highlight`` → Kosha's: every field, with its tags.
+
+        ``fields`` is either a map of field name to options or ES's ordered
+        list of single-key maps. Each field keeps its own ``pre_tags`` /
+        ``post_tags``; top-level tags pass through as the fallback. Other
+        highlighter options (``number_of_fragments``, ``type``, ...) change
+        only how a hit is marked up, never which documents match, so they
+        are dropped.
+        """
+        if not isinstance(highlight, dict):
+            raise cls._unsupported("highlight that is not an object")
+        raw = highlight.get("fields")
+        entries: list = []
+        if isinstance(raw, dict):
+            entries = list(raw.items())
+        elif isinstance(raw, (list, tuple)) and all(isinstance(e, dict) for e in raw):
+            entries = [item for entry in raw for item in entry.items()]
+        else:
+            raise cls._unsupported("highlight without a `fields` object")
+        spec: dict = {}
+        for key in ("pre_tags", "post_tags"):
+            tags = cls._as_list(highlight.get(key))
+            if tags:
+                spec[key] = tags
+        fields: dict = {}
+        for name, options in entries:
+            options = options or {}
+            field_spec = {}
+            for key in ("pre_tags", "post_tags"):
+                tags = cls._as_list(options.get(key))
+                if tags:
+                    field_spec[key] = tags
+            fields[name] = field_spec
+        spec["fields"] = fields
+        return spec
+
     @staticmethod
     def _scalar(value: Any) -> str:
         """A filter value as Kosha compares it: always a string.
@@ -677,23 +715,14 @@ class KoshaClient:
             if excludes:
                 kosha["source_excludes"] = excludes
 
-        highlight_field = None
         highlight = body.get("highlight")
-        if highlight and isinstance(highlight.get("fields"), dict):
-            highlight_field, options = next(iter(highlight["fields"].items()))
-            options = options or {}
-            spec = {"field": highlight_field}
-            for key in ("pre_tags", "post_tags"):
-                tags = options.get(key, highlight.get(key))
-                if tags:
-                    spec[key] = cls._as_list(tags)
-            kosha["highlight"] = spec
+        if highlight:
+            kosha["highlight"] = cls._translate_highlight(highlight)
 
         context = {
             "size": size,
             "sort": sort or [],
             "collapse_field": (collapse or {}).get("field"),
-            "highlight_field": highlight_field,
         }
         return kosha, context
 
@@ -766,7 +795,6 @@ class KoshaClient:
         context = context or {}
         sort = context.get("sort") or []
         collapse_field = context.get("collapse_field")
-        highlight_field = context.get("highlight_field")
 
         hits = []
         for k_hit in result.get("results", []):
@@ -786,8 +814,9 @@ class KoshaClient:
                 "_score": score,
                 "_source": source,
             }
-            if highlight_field and k_hit.get("highlights"):
-                hit["highlight"] = {highlight_field: k_hit["highlights"]}
+            if k_hit.get("highlight"):
+                # Per-field fragments, already ES-shaped.
+                hit["highlight"] = dict(k_hit["highlight"])
             if sort:
                 # The values this hit sorted by, in sort-key order: what a
                 # caller passes back as ``search_after`` for the next page.

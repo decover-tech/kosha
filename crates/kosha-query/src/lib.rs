@@ -9,9 +9,9 @@ use rayon::prelude::*;
 use kosha_core::{
     segment_may_contain_terms, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
     AggMetricResult, Aggregation, AggregationResults, Bm25Params, Bm25StatsScope, DocSet,
-    DocumentId, FieldType, FilterClause, FilterStore, KoshaError, Manifest, ManifestEntry,
-    NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery, SearchResult, SortSpec,
-    TermBloomMode, TotalHitsRelation,
+    DocumentId, FieldType, FilterClause, FilterStore, HighlightConfig, KoshaError, Manifest,
+    ManifestEntry, NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery, SearchResult,
+    SortSpec, TermBloomMode, TotalHitsRelation,
 };
 use kosha_segment::{
     tokenize, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
@@ -952,6 +952,45 @@ pub fn apply_highlight(
         }
     }
     result
+}
+
+/// Fills `doc`'s highlight output for `config`, marking up `query_terms`
+/// (the query's analyzed terms, shared by every field) in each requested
+/// field. A requested field the document lacks, or that is not a text
+/// field, is skipped silently, as OpenSearch does. A multi-valued field
+/// yields one fragment per value.
+///
+/// The legacy single-field request form fills `doc.highlights` (the flat
+/// list it always returned); the `fields` form fills the per-field
+/// `doc.highlight` map.
+pub fn apply_highlights(
+    doc: &mut ScoredDocument,
+    config: &HighlightConfig,
+    query_terms: &[String],
+) {
+    let mut by_field: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for requested in &config.fields {
+        let pre = config.pre_tag(requested);
+        let post = config.post_tag(requested);
+        let fragments: Vec<String> = doc
+            .fields
+            .iter()
+            .filter(|f| f.name == requested.name && f.field_type == FieldType::Text)
+            .map(|f| apply_highlight(&f.value, query_terms, pre, post))
+            .collect();
+        if !fragments.is_empty() {
+            by_field.insert(requested.name.clone(), fragments);
+        }
+    }
+    if by_field.is_empty() {
+        return;
+    }
+    if config.legacy_single_field {
+        doc.highlights = by_field.into_values().next();
+    } else {
+        doc.highlight = Some(by_field);
+    }
 }
 
 // ─── Searcher ───────────────────────────────────────────────────────────────
@@ -3572,29 +3611,12 @@ impl Searcher {
                 score: cand.score,
                 fields: doc_rec.fields,
                 highlights: None,
+                highlight: None,
                 rank_details: cand.rank_details.clone(),
             };
             if let Some(ref highlight) = query.highlight {
                 if !query_terms.is_empty() {
-                    let pre = highlight
-                        .pre_tags
-                        .first()
-                        .map(|s| s.as_str())
-                        .unwrap_or("<b>");
-                    let post = highlight
-                        .post_tags
-                        .first()
-                        .map(|s| s.as_str())
-                        .unwrap_or("</b>");
-                    let mut highlights = Vec::new();
-                    for field in &doc.fields {
-                        if field.name == highlight.field && field.field_type == FieldType::Text {
-                            highlights.push(apply_highlight(&field.value, &query_terms, pre, post));
-                        }
-                    }
-                    if !highlights.is_empty() {
-                        doc.highlights = Some(highlights);
-                    }
+                    apply_highlights(&mut doc, highlight, &query_terms);
                 }
             }
             // After highlighting, which reads the field it marks up even
@@ -4948,6 +4970,50 @@ mod tests {
     use super::*;
     use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId, SortOrder};
     use kosha_segment::SegmentWriter;
+
+    /// #195: each requested field is marked up with its own tags; a
+    /// multi-valued field gives one fragment per value; absent and
+    /// non-text fields are skipped; the legacy form fills `highlights`.
+    #[test]
+    fn apply_highlights_runs_per_field() {
+        let doc = || ScoredDocument {
+            doc_id: DocumentId("d".into()),
+            score: 1.0,
+            fields: vec![
+                Field::text("title", "Breach of contract"),
+                Field::text("body", "the contract was void"),
+                Field::text("body", "no breach here"),
+                Field::keyword("kind", "contract"),
+            ],
+            highlights: None,
+            highlight: None,
+            rank_details: None,
+        };
+        let terms = vec!["contract".to_string(), "breach".to_string()];
+        let config: HighlightConfig = serde_json::from_value(serde_json::json!({
+            "fields": {"title": {"pre_tags": ["["], "post_tags": ["]"]}, "body": {}, "kind": {}, "gone": {}}
+        }))
+        .unwrap();
+        let mut d = doc();
+        apply_highlights(&mut d, &config, &terms);
+        assert!(d.highlights.is_none());
+        let map = d.highlight.unwrap();
+        assert_eq!(map.len(), 2, "{map:?}");
+        assert_eq!(map["title"], ["[Breach] of [contract]"]);
+        assert_eq!(
+            map["body"],
+            ["the <b>contract</b> was void", "no <b>breach</b> here"]
+        );
+
+        let mut d = doc();
+        apply_highlights(&mut d, &HighlightConfig::single_field("title"), &terms);
+        assert!(d.highlight.is_none());
+        assert_eq!(d.highlights.unwrap(), ["<b>Breach</b> of <b>contract</b>"]);
+
+        let mut d = doc();
+        apply_highlights(&mut d, &HighlightConfig::for_fields(["kind"]), &terms);
+        assert!(d.highlight.is_none() && d.highlights.is_none());
+    }
 
     fn mk_query(text: &str, max: usize) -> SearchQuery {
         SearchQuery {

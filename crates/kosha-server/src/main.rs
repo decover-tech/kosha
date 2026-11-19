@@ -10521,6 +10521,134 @@ mod tests {
         AppState::new(dir)
     }
 
+    // ─── Multi-field highlighting (#195) ─────────────────────────────────
+
+    fn highlight_state(ns: &str) -> AppState {
+        let state = test_state();
+        let ns = NamespaceId(ns.into());
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId("d1".into()),
+                    fields: vec![
+                        Field::text("title", "Contract law basics"),
+                        Field::text("body", "A contract needs an offer"),
+                        Field::keyword("tag", "contract"),
+                    ],
+                }],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+        state
+    }
+
+    fn search_body(response: &str) -> &str {
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        &response[response.find("\r\n\r\n").unwrap() + 4..]
+    }
+
+    /// #195: the legacy single-field request form must answer byte for byte
+    /// what it did before multi-field highlighting existed: the flat
+    /// `highlights` list, and no per-field `highlight` map. The expected
+    /// body was captured from origin/main before this change.
+    #[test]
+    fn legacy_single_field_highlight_response_is_unchanged() {
+        let state = highlight_state("hl/legacy");
+        let req = br#"{"namespace":"hl/legacy","query_text":"contract","no_cache":true,
+            "highlight":{"field":"body","pre_tags":["<em>"],"post_tags":["</em>"]}}"#;
+        let body = search_body(&handle_search_post(req, &state)).to_string();
+        assert_eq!(body, LEGACY_HIGHLIGHT_SNAPSHOT);
+        // Default tags, the minimal legacy form.
+        let req = br#"{"namespace":"hl/legacy","query_text":"contract","no_cache":true,
+            "highlight":{"field":"title"}}"#;
+        let value: serde_json::Value =
+            serde_json::from_str(search_body(&handle_search_post(req, &state))).unwrap();
+        let hit = &value["results"][0];
+        assert_eq!(
+            hit["highlights"],
+            serde_json::json!(["<b>Contract</b> law basics"])
+        );
+        assert!(hit.get("highlight").is_none(), "{hit}");
+    }
+
+    const LEGACY_HIGHLIGHT_SNAPSHOT: &str = r#"{"results":[{"doc_id":"d1","score":0.39556284962119864,"fields":[{"name":"title","field_type":"Text","value":"Contract law basics"},{"name":"body","field_type":"Text","value":"A contract needs an offer"},{"name":"tag","field_type":"Keyword","value":"contract"}],"highlights":["A <em>contract</em> needs an offer"]}],"total_hits":1,"total_hits_relation":"eq"}"#;
+
+    /// #195: two fields in one request, each with its own tags (falling
+    /// back to the top-level tags, then the defaults); a requested field the
+    /// document lacks, or that is not text, is skipped silently.
+    #[test]
+    fn multi_field_highlight_uses_per_field_tags() {
+        let state = highlight_state("hl/multi");
+        let req = br#"{"namespace":"hl/multi","query_text":"contract",
+            "highlight":{"pre_tags":["<i>"],"post_tags":["</i>"],"fields":{
+                "title":{"pre_tags":["<mark>"],"post_tags":["</mark>"]},
+                "body":{},
+                "missing":{},
+                "tag":{}}}}"#;
+        let value: serde_json::Value =
+            serde_json::from_str(search_body(&handle_search_post(req, &state))).unwrap();
+        let hit = &value["results"][0];
+        assert_eq!(
+            hit["highlight"],
+            serde_json::json!({
+                "title": ["<mark>Contract</mark> law basics"],
+                "body": ["A <i>contract</i> needs an offer"],
+            })
+        );
+        assert!(hit.get("highlights").is_none(), "{hit}");
+
+        // No top-level tags: per-field tags, then the `<b>` defaults. The
+        // same field asked for in the legacy form must not hit the cache
+        // entry of the `fields` form (different response shape).
+        let req = br#"{"namespace":"hl/multi","query_text":"contract",
+            "highlight":{"fields":{"title":{},"body":{"pre_tags":["["],"post_tags":["]"]}}}}"#;
+        let value: serde_json::Value =
+            serde_json::from_str(search_body(&handle_search_post(req, &state))).unwrap();
+        assert_eq!(
+            value["results"][0]["highlight"],
+            serde_json::json!({
+                "title": ["<b>Contract</b> law basics"],
+                "body": ["A [contract] needs an offer"],
+            })
+        );
+        let req = br#"{"namespace":"hl/multi","query_text":"contract",
+            "highlight":{"field":"title"}}"#;
+        let value: serde_json::Value =
+            serde_json::from_str(search_body(&handle_search_post(req, &state))).unwrap();
+        assert_eq!(
+            value["results"][0]["highlights"],
+            serde_json::json!(["<b>Contract</b> law basics"])
+        );
+        assert!(value["results"][0].get("highlight").is_none());
+
+        // Only unhighlightable fields requested: no map at all.
+        let req = br#"{"namespace":"hl/multi","query_text":"contract",
+            "highlight":{"fields":{"tag":{},"nope":{}}}}"#;
+        let value: serde_json::Value =
+            serde_json::from_str(search_body(&handle_search_post(req, &state))).unwrap();
+        assert!(value["results"][0].get("highlight").is_none());
+    }
+
+    /// #195: `field` and `fields` together is a 400, as is neither.
+    #[test]
+    fn conflicting_highlight_field_and_fields_is_400() {
+        let state = highlight_state("hl/bad");
+        let both = br#"{"namespace":"hl/bad","query_text":"contract",
+            "highlight":{"field":"body","fields":{"title":{}}}}"#;
+        let response = handle_search_post(both, &state);
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("not both"), "{response}");
+        let neither = br#"{"namespace":"hl/bad","query_text":"contract","highlight":{}}"#;
+        let response = handle_search_post(neither, &state);
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        let dup = br#"{"namespace":"hl/bad","query_text":"contract",
+            "highlight":{"fields":[{"body":{}},{"body":{}}]}}"#;
+        assert!(handle_search_post(dup, &state).starts_with("HTTP/1.1 400"));
+    }
+
     fn rc_key(ns: &str, v: u64, q: &str) -> (String, u64, String) {
         (ns.to_string(), v, q.to_string())
     }

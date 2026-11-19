@@ -40,7 +40,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | kNN-scoped filters | `knn.filter` restricts only the vector list; the top-level `filter` restricts both the lexical and the vector list |
 | Sorting | Multi-field `sort` over stored fields, plus `_id` |
 | Pagination | `from` / `max_results`, and an OpenSearch-style `search_after` cursor |
-| Highlighting | Per-field, with configurable `pre_tags` / `post_tags` |
+| Highlighting | Any number of text fields per request, Elasticsearch-shaped: `"highlight": {"pre_tags": ["<em>"], "post_tags": ["</em>"], "fields": {"title": {}, "body": {"pre_tags": ["<mark>"], "post_tags": ["</mark>"]}}}`. Each field's tags fall back to the top-level `pre_tags` / `post_tags`, then to `<b>` / `</b>`. Hits return `"highlight": {"title": ["..."], "body": ["..."]}` (one fragment per field value, the whole value with the query's terms marked up); requested fields that a hit lacks or that are not `Text` are left out silently. The legacy single-field form `"highlight": {"field": "body"}` still works and still returns the flat `"highlights": [...]` list; that form and `highlights` are deprecated. Giving both `field` and `fields` is a 400. Fragment size/count options and other highlighter types are not supported (unknown options are ignored) |
 | Aggregations | `terms`, `cardinality`, `composite` |
 | Total-hit accounting | Capped counting with an `eq` / `gte` relation (`track_total_hits`-style), overridable per query via `exact_total_hits` / `total_hits_cap` |
 | Degradation signal | `knn_degraded_segments` reports segments whose vector search failed, so a 200 with silently missing neighbors is visible to the caller |
