@@ -1385,10 +1385,11 @@ impl Indexer {
             // `?` here is deliberate: a doc that fails to read must abort
             // the whole compaction, not just be skipped from the merge
             // output — see `iter_doc_records`'s doc comment for the
-            // incident this silent-drop used to cause. Nothing has been
-            // written to `seg_dir` yet at this point (finalize() hasn't run
-            // and add_document only builds in-memory state), so aborting
-            // here leaves no partial output on disk to clean up.
+            // incident this silent-drop used to cause. `add_document`
+            // streams into `seg_dir/.build` (#242), but aborting here drops
+            // the writer, and `SegmentWriter`'s `Drop` removes that scratch
+            // (and `seg_dir` itself, still empty), so no partial output is
+            // left on disk.
             for doc_rec in reader.iter_doc_records() {
                 let doc_rec = doc_rec?;
                 if ts.is_some_and(|set| set.contains(&doc_rec.doc_seq)) {
