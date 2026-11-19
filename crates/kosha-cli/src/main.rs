@@ -567,6 +567,7 @@ fn build_search_query(
         highlight: None,
         aggs: Default::default(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         exact_total_hits: exact.then_some(true),

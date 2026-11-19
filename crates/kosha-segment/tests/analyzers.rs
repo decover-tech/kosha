@@ -91,6 +91,11 @@ fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
 fn footer_without_timestamp(bytes: &[u8]) -> serde_json::Value {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
     value.as_object_mut().unwrap().remove("created_at");
+    // `fuzzy_bloom` (#201) is optional footer metadata added after the
+    // fixture was written; readers without it ignore the key and readers
+    // with it treat its absence as "can't prune". Everything else must
+    // match byte for byte.
+    value.as_object_mut().unwrap().remove("fuzzy_bloom");
     value
 }
 

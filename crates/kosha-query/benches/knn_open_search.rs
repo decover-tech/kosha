@@ -150,6 +150,7 @@ fn mk_query(text: &str, knn: Option<KnnQuery>) -> SearchQuery {
         highlight: None,
         aggs: HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn,
         exact_total_hits: None,

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use kosha_core::fields::{field_norms_key, field_term_key, segment_field_chain};
+use kosha_core::fuzzy::{ExpandStats, FuzzyQuery, MAX_FUZZY_EDITS};
 use kosha_core::{
     segment_may_contain_terms, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
     AggMetricResult, Aggregation, AggregationResults, Bm25Params, Bm25StatsScope, DocSet,
@@ -697,6 +698,29 @@ impl Bm25Scorer {
         idf * tf_component
     }
 
+    /// BM25's term-frequency saturation divided by its ceiling `k1 + 1`:
+    /// `tf / (tf + k1 · (1 − b + b · dl / avgdl))`, in `(0, 1]` for any
+    /// matching document. Fuzzy scoring (#201) ranks within an edit-distance
+    /// tier by it.
+    pub fn tf_norm(&self, term_frequency: u32, doc_field_length: u32) -> f64 {
+        if term_frequency == 0 {
+            return 0.0;
+        }
+        let tf = term_frequency as f64;
+        let avgdl = if self.avg_field_length > 0.0 {
+            self.avg_field_length
+        } else {
+            1.0
+        };
+        let (k1, b) = (self.params.k1, self.params.b);
+        let denominator = tf + k1 * (1.0 - b + b * doc_field_length as f64 / avgdl);
+        if denominator > 0.0 {
+            (tf / denominator).min(1.0)
+        } else {
+            1.0
+        }
+    }
+
     /// Block-max upper bound for [`Self::score_term`] over a block of
     /// postings: returns the highest BM25 score any single doc in the block
     /// could achieve, given the maximum term frequency (`max_tf`) and the
@@ -791,8 +815,10 @@ fn bm25_stats_engine_default() -> Bm25StatsScope {
 /// The terms whose namespace-level `df` a search for `query` computes, or
 /// `None` when it scores with per-segment statistics (requested via
 /// `bm25_params.stats` / `KOSHA_BM25_STATS`, a wildcard, or no lexical leg
-/// at all). The server uses this to hydrate the postings the `df` pass
-/// reads in segments the query's filter would otherwise skip.
+/// at all) or needs no term's `df` (a fuzzy clause: its scores use the
+/// namespace `avgdl` but no IDF). The server uses this to hydrate the
+/// postings the `df` pass reads in segments the query's filter would
+/// otherwise skip.
 ///
 /// `analyses` is every segment's footer `analysis` (#220): the query is
 /// analyzed with each distinct chain they name, and the result is the
@@ -801,7 +827,8 @@ pub fn namespace_stats_terms<'a>(
     query: &SearchQuery,
     analyses: impl IntoIterator<Item = Option<&'a SegmentAnalysis>>,
 ) -> Option<Vec<String>> {
-    uses_namespace_stats(query).then(|| QueryAnalysis::new(query).union_terms(analyses))
+    (uses_namespace_stats(query) && query.fuzzy.is_none())
+        .then(|| QueryAnalysis::new(query).union_terms(analyses))
 }
 
 /// Whether `query` scores with namespace-level BM25 statistics; see
@@ -826,6 +853,8 @@ pub struct AnalyzedQuery {
     /// `stop` filter leaves gaps, matched against the same gaps in the
     /// index).
     pub phrase: Option<Vec<(String, u32)>>,
+    /// `fuzzy.value`'s tokens (#201), each expanded on its own.
+    pub fuzzy: Vec<String>,
 }
 
 impl AnalyzedQuery {
@@ -845,6 +874,9 @@ impl AnalyzedQuery {
         }
     }
 }
+
+/// Pre-hashed bloom probes ([`kosha_core::bloom_key_hashes`]).
+type BloomProbes = Vec<(u64, u64)>;
 
 /// A request's lexical text, analyzed lazily once per distinct chain and
 /// shared by every segment of the request (#220, #221).
@@ -868,6 +900,11 @@ pub struct QueryAnalysis {
     /// `stop` filter removes matches nothing instead of turning into a
     /// filter-only "match everything" in some segments.
     has_text: bool,
+    /// The request's `fuzzy` clause (#201).
+    fuzzy: Option<FuzzyQuery>,
+    /// Fuzzy-bloom probes per token: the hashes of its deletion
+    /// neighbourhood, computed once and shared by every segment.
+    fuzzy_probes: Mutex<HashMap<String, Arc<BloomProbes>>>,
     by_chain: Mutex<HashMap<AnalyzerSpec, Arc<AnalyzedQuery>>>,
 }
 
@@ -882,8 +919,98 @@ impl QueryAnalysis {
                 .match_phrase
                 .as_ref()
                 .and_then(|mp| mp.restricted_fields()),
+            fuzzy: query.fuzzy.clone(),
+            fuzzy_probes: Mutex::new(HashMap::new()),
             by_chain: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The request's `fuzzy` clause, if any.
+    pub fn fuzzy(&self) -> Option<&FuzzyQuery> {
+        self.fuzzy.as_ref()
+    }
+
+    /// The readings of `fuzzy.value` a segment with `analysis` is
+    /// searched with: the field's own chain when the clause names a field
+    /// and the segment has per-field indexes, else one per distinct chain
+    /// of the segment (its combined index holds every chain's terms; a
+    /// document matches if it matches one reading). Never empty.
+    pub fn fuzzy_readings(
+        &self,
+        analysis: Option<&SegmentAnalysis>,
+        has_field_index: bool,
+    ) -> Vec<Arc<AnalyzedQuery>> {
+        let field = self
+            .fuzzy
+            .as_ref()
+            .and_then(|f| f.restricted_field())
+            .filter(|_| has_field_index);
+        if let Some(field) = field {
+            return vec![self.for_field(analysis, field)];
+        }
+        let mut readings: Vec<Arc<AnalyzedQuery>> = Vec::new();
+        for chain in kosha_core::analysis::segment_query_chains(analysis) {
+            let reading = self.for_chain(&chain);
+            if !readings.iter().any(|r| r.fuzzy == reading.fuzzy) {
+                readings.push(reading);
+            }
+        }
+        readings
+    }
+
+    /// Whether a segment with `footer` may hold a fuzzy match, by its
+    /// blooms (#201): some reading's tokens must each (AND) or one of them
+    /// (OR) possibly be there. An exact token is tested against the term
+    /// bloom, a one-edit token's deletion neighbourhood against the fuzzy
+    /// bloom (see [`kosha_core::fuzzy`]). A two-edit token, or a segment
+    /// without the bloom it needs, can't be ruled out.
+    fn fuzzy_segment_may_match(&self, mode: TermBloomMode, footer: &Footer) -> bool {
+        let Some(ref fuzzy) = self.fuzzy else {
+            return true;
+        };
+        if let (Some(field), Some(field_index)) = (fuzzy.restricted_field(), &footer.field_index) {
+            if !field_index.fields.contains_key(field) {
+                return false; // the segment has no such field: no hits
+            }
+        }
+        let token_may_match = |token: &String| -> bool {
+            match fuzzy.params_for(token).max_edits {
+                0 => footer
+                    .term_bloom
+                    .as_ref()
+                    .is_none_or(|bloom| bloom.may_contain(token)),
+                1 => {
+                    let Some(bloom) = footer.fuzzy_bloom.as_ref() else {
+                        return true;
+                    };
+                    let probes = {
+                        let mut cache = self.fuzzy_probes.lock().unwrap();
+                        Arc::clone(cache.entry(token.clone()).or_insert_with(|| {
+                            Arc::new(
+                                kosha_core::fuzzy::deletion_neighbourhood(
+                                    token,
+                                    fuzzy.prefix_length,
+                                )
+                                .iter()
+                                .map(|p| kosha_core::bloom_key_hashes(p))
+                                .collect(),
+                            )
+                        }))
+                    };
+                    probes.iter().any(|&h| bloom.may_contain_hashed(h))
+                }
+                _ => true,
+            }
+        };
+        self.fuzzy_readings(footer.analysis.as_ref(), footer.field_index.is_some())
+            .iter()
+            .any(|reading| {
+                !reading.fuzzy.is_empty()
+                    && match mode {
+                        TermBloomMode::And => reading.fuzzy.iter().all(token_may_match),
+                        TermBloomMode::Or => reading.fuzzy.iter().any(token_may_match),
+                    }
+            })
     }
 
     /// `query_text`'s fields and boosts, when restricted (#249).
@@ -953,6 +1080,11 @@ impl QueryAnalysis {
                 .phrase
                 .as_ref()
                 .map(|phrase| analyzer.analyze_with_positions(phrase)),
+            fuzzy: self
+                .fuzzy
+                .as_ref()
+                .map(|fuzzy| analyzer.analyze(&fuzzy.value))
+                .unwrap_or_default(),
         });
         Arc::clone(
             self.by_chain
@@ -1207,6 +1339,141 @@ fn segment_phrase_slop(reader: &SegmentReader, positions: &[u32], slop: u32) -> 
         }
         None => slop,
     }
+}
+
+// ─── Fuzzy matching (issue #201) ────────────────────────────────────────────
+
+/// Score a `fuzzy` clause on one segment.
+///
+/// Each token of the value (read with the segment's own analysis chain)
+/// expands to the dictionary terms within its edit budget
+/// ([`kosha_core::fuzzy::expand`]). A document's score for a token is
+/// tiered by the fewest edits it matches with:
+///
+/// `score = (MAX_FUZZY_EDITS − edits) + tf_norm`, `tf_norm ∈ (0, 1]`
+///
+/// so an exact match scores in `(2, 3]`, one edit in `(1, 2]` and two in
+/// `(0, 1]`: a document holding the exact term always outranks one that
+/// only matches through an edit, whatever their term frequencies or
+/// lengths. Within a tier, BM25's length-normalized tf saturation
+/// ([`Bm25Scorer::tf_norm`], namespace `avgdl` unless segment statistics
+/// were asked for) orders documents. IDF is left out on purpose: the
+/// expansions — and so any per-term `df` — differ from segment to
+/// segment, and an IDF factor would let a rare 1-edit term in one segment
+/// outrank an exact match in another. Several tokens add up (AND requires
+/// each of them; OR any), so a document whose every token matches with
+/// fewer edits ranks first.
+#[allow(clippy::too_many_arguments)]
+fn score_fuzzy_query(
+    reader: &SegmentReader,
+    segment: &str,
+    analysis: &QueryAnalysis,
+    fuzzy: &FuzzyQuery,
+    operator: kosha_core::QueryOperator,
+    corpus: Option<&Arc<CorpusStats>>,
+    params: Bm25Params,
+    combined: &Bm25Scorer,
+    rejected: &dyn Fn(u32) -> bool,
+) -> Result<HashMap<u32, f64>, KoshaError> {
+    let field_index = reader.field_index();
+    // A segment without per-field indexes (before #249) answers a field
+    // restriction from its combined index, never with zero hits.
+    let (key_prefix, field_scorer, lengths) =
+        match fuzzy.restricted_field().filter(|_| field_index.is_some()) {
+            Some(field) => {
+                let Some(stats) = field_index.and_then(|fi| fi.fields.get(field)) else {
+                    return Ok(HashMap::new());
+                };
+                (
+                    field_term_key(field, ""),
+                    Some(Bm25Scorer::for_field(corpus, stats, field, params)),
+                    reader.field_lengths(field)?,
+                )
+            }
+            None => (String::new(), None, None),
+        };
+    let scorer = field_scorer.as_ref().unwrap_or(combined);
+    let readings =
+        analysis.fuzzy_readings(reader.footer().analysis.as_ref(), field_index.is_some());
+    let dict = reader.term_dictionary();
+    let and = operator == kosha_core::QueryOperator::And;
+
+    let mut best: HashMap<u32, f64> = HashMap::new();
+    for reading in &readings {
+        let mut matched: Option<HashMap<u32, f64>> = None;
+        for token in &reading.fuzzy {
+            let expansions = kosha_core::fuzzy::expand(
+                &dict,
+                &key_prefix,
+                token,
+                &fuzzy.params_for(token),
+                &mut ExpandStats::default(),
+            );
+            let keys: Vec<String> = expansions.iter().map(|e| e.key.clone()).collect();
+            let edits_of: HashMap<&str, u8> = expansions
+                .iter()
+                .map(|e| (e.key.as_str(), e.edits))
+                .collect();
+            let postings = reader.postings_for_terms(&keys);
+            if reader.take_blob_read_failure() {
+                return Err(KoshaError::CorruptSegment(format!(
+                    "segment {segment}: posting blob unreadable for a fuzzy expansion \
+                     (evicted or corrupt) — retry after rehydration"
+                )));
+            }
+            // Best tier per document over the token's expansions.
+            let mut group: HashMap<u32, f64> = HashMap::new();
+            for (key, list) in &postings {
+                let edits = edits_of.get(key).copied().unwrap_or(MAX_FUZZY_EDITS);
+                let tier = f64::from(MAX_FUZZY_EDITS.saturating_sub(edits));
+                for posting in list.iter() {
+                    if rejected(posting.doc_id) {
+                        continue;
+                    }
+                    let Some(meta) = reader.doc_meta(posting.doc_id) else {
+                        continue;
+                    };
+                    let length = match lengths {
+                        Some(ref lengths) => {
+                            lengths.get(posting.doc_id as usize).copied().unwrap_or(0)
+                        }
+                        None => meta.field_length,
+                    };
+                    let score = tier + scorer.tf_norm(posting.term_frequency, length);
+                    let slot = group.entry(posting.doc_id).or_insert(score);
+                    if score > *slot {
+                        *slot = score;
+                    }
+                }
+            }
+            matched = Some(match matched.take() {
+                None => group,
+                Some(mut acc) if and => {
+                    acc.retain(|doc, _| group.contains_key(doc));
+                    for (doc, score) in acc.iter_mut() {
+                        *score += group[doc];
+                    }
+                    acc
+                }
+                Some(mut acc) => {
+                    for (doc, score) in group {
+                        *acc.entry(doc).or_insert(0.0) += score;
+                    }
+                    acc
+                }
+            });
+            if and && matched.as_ref().is_some_and(HashMap::is_empty) {
+                break;
+            }
+        }
+        for (doc, score) in matched.unwrap_or_default() {
+            let slot = best.entry(doc).or_insert(score);
+            if score > *slot {
+                *slot = score;
+            }
+        }
+    }
+    Ok(best)
 }
 
 // ─── Multi-field BM25 (issue #249) ──────────────────────────────────────────
@@ -2276,7 +2543,8 @@ impl Searcher {
         let has_query = analysis.has_text()
             || !query_terms.is_empty()
             || query.wildcard.is_some()
-            || query.match_phrase.is_some();
+            || query.match_phrase.is_some()
+            || query.fuzzy.is_some();
         // A hybrid request whose text tokenizes to nothing has an empty
         // lexical list, not a "match every filtered document" one.
         let has_only_filter = !has_query && query.filter.is_some() && rrf.is_none();
@@ -2339,7 +2607,24 @@ impl Searcher {
         let field_query = analysis
             .fields()
             .filter(|_| analysis.has_text() && !is_wildcard_mode && reader.field_index().is_some());
-        if let Some(fields) = field_query {
+        if let Some(ref fuzzy) = query.fuzzy {
+            let scored = score_fuzzy_query(
+                &reader,
+                &entry.segment_id.0,
+                analysis,
+                fuzzy,
+                operator,
+                corpus,
+                params.clone(),
+                &scorer,
+                &rejected,
+            )?;
+            for (doc_seq, score) in scored {
+                if reader.doc_meta(doc_seq).is_some() {
+                    seg_hits.insert(doc_seq, score);
+                }
+            }
+        } else if let Some(fields) = field_query {
             let scored = score_field_query(
                 &reader,
                 &entry.segment_id.0,
@@ -5546,6 +5831,17 @@ pub fn term_bloom_prune_mode(query: &SearchQuery) -> Option<TermBloomMode> {
     if query.knn.is_some() || query.wildcard.is_some() {
         return None;
     }
+    if let Some(ref fuzzy) = query.fuzzy {
+        // Expansion is per segment, but its candidates can be enumerated
+        // and tested against the bloom (see `QueryAnalysis::fuzzy_segment_may_match`).
+        if tokenize(&fuzzy.value).is_empty() {
+            return None;
+        }
+        return Some(match query.operator {
+            Some(kosha_core::QueryOperator::Or) => TermBloomMode::Or,
+            _ => TermBloomMode::And,
+        });
+    }
     // No lexical text (by the legacy reading): nothing to prune on, as
     // before #220. A chain that does find terms in such text (`keyword`
     // on "...") just goes unpruned.
@@ -5572,6 +5868,9 @@ pub fn segment_may_match_query_terms(
     mode: TermBloomMode,
     footer: &Footer,
 ) -> bool {
+    if analysis.fuzzy().is_some() {
+        return analysis.fuzzy_segment_may_match(mode, footer);
+    }
     // A segment without per-field indexes answers a field query from its
     // combined index, with the readings below.
     if let Some(fields) = analysis.fields().filter(|_| footer.field_index.is_some()) {
@@ -5792,6 +6091,7 @@ mod tests {
             highlight: None,
             aggs: HashMap::new(),
             wildcard: None,
+            fuzzy: None,
             match_phrase: None,
             knn: None,
             exact_total_hits: None,
@@ -7868,6 +8168,7 @@ mod tests {
                 pattern: "hel*".into(),
                 case_insensitive: true,
             }),
+            fuzzy: None,
             match_phrase: None,
             knn: None,
             exact_total_hits: None,
@@ -10455,6 +10756,7 @@ mod tests {
                     highlight: None,
                     aggs: HashMap::new(),
                     wildcard: None,
+                    fuzzy: None,
                     match_phrase: None,
                     knn: None,
                     exact_total_hits: None,
@@ -10566,6 +10868,7 @@ mod tests {
                     highlight: None,
                     aggs: HashMap::new(),
                     wildcard: None,
+                    fuzzy: None,
                     match_phrase: None,
                     knn: None,
                     exact_total_hits: None,
@@ -10652,6 +10955,7 @@ mod tests {
                     highlight: None,
                     aggs: HashMap::new(),
                     wildcard: None,
+                    fuzzy: None,
                     match_phrase: None,
                     knn: None,
                     exact_total_hits: None,
@@ -10689,6 +10993,7 @@ mod tests {
                     highlight: None,
                     aggs: HashMap::new(),
                     wildcard: None,
+                    fuzzy: None,
                     match_phrase: None,
                     knn: None,
                     exact_total_hits: None,
@@ -10978,6 +11283,7 @@ mod tests {
             highlight: None,
             aggs: HashMap::new(),
             wildcard: None,
+            fuzzy: None,
             match_phrase: None,
             knn: None,
             exact_total_hits: None,
@@ -11073,6 +11379,7 @@ mod tests {
             highlight: None,
             aggs: HashMap::new(),
             wildcard: None,
+            fuzzy: None,
             match_phrase: None,
             knn: None,
             exact_total_hits: None,
@@ -11159,6 +11466,7 @@ mod tests {
             highlight: None,
             aggs: HashMap::new(),
             wildcard: None,
+            fuzzy: None,
             match_phrase: None,
             knn: None,
             exact_total_hits: None,
@@ -14840,5 +15148,543 @@ mod rank_by_tests {
         let r = searcher.search(&ns(), &manifest, &now, None).unwrap();
         assert!(!r.results.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod fuzzy_tests {
+    //! Fuzzy term matching (issue #201).
+    use super::*;
+    use kosha_core::{
+        AnalysisConfig, DocumentId, Field, FieldSchema, ManifestEntry, NamespaceSchema, SegmentId,
+    };
+    use kosha_segment::SegmentWriter;
+    use std::path::{Path, PathBuf};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "kosha-fuzzy-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn empty_manifest() -> Manifest {
+        Manifest {
+            version: 1,
+            segments: Vec::new(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+        }
+    }
+
+    #[derive(Default)]
+    struct Seg<'a> {
+        no_field_index: bool,
+        config: Option<&'a AnalysisConfig>,
+    }
+
+    fn add(root: &Path, manifest: &mut Manifest, name: &str, seg: Seg<'_>, docs: &[(&str, &str)]) {
+        add_fields(
+            root,
+            manifest,
+            name,
+            seg,
+            docs.iter()
+                .map(|(id, text)| (*id, vec![Field::text("body", *text)]))
+                .collect(),
+        );
+    }
+
+    fn add_fields(
+        root: &Path,
+        manifest: &mut Manifest,
+        name: &str,
+        seg: Seg<'_>,
+        docs: Vec<(&str, Vec<Field>)>,
+    ) {
+        let id = SegmentId(name.into());
+        let mut writer = SegmentWriter::new(id.clone(), root.join("ns").join(name))
+            .with_field_index(!seg.no_field_index);
+        if let Some(config) = seg.config {
+            writer = writer.with_analysis(config);
+        }
+        for (doc, fields) in docs {
+            writer.add_document(DocumentId(doc.into()), fields);
+        }
+        let footer = writer.finalize(Bm25Params::default()).unwrap();
+        manifest.version += 1;
+        manifest.segments.push(ManifestEntry {
+            segment_id: id,
+            doc_count: footer.doc_count,
+        });
+    }
+
+    fn fuzzy(value: &str, extra: serde_json::Value) -> SearchQuery {
+        let mut clause = serde_json::json!({ "value": value });
+        if let serde_json::Value::Object(extra) = extra {
+            clause.as_object_mut().unwrap().extend(extra);
+        }
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "",
+            "max_results": 100,
+            "fuzzy": clause,
+        }))
+        .unwrap();
+        q.validate().unwrap();
+        q
+    }
+
+    fn run_with(searcher: &Searcher, manifest: &Manifest, q: &SearchQuery) -> SearchResult {
+        searcher
+            .search(&NamespaceId("ns".into()), manifest, q, None)
+            .unwrap()
+    }
+
+    fn run(root: &Path, manifest: &Manifest, q: &SearchQuery) -> SearchResult {
+        run_with(&Searcher::new(root.to_path_buf()), manifest, q)
+    }
+
+    fn ranked(root: &Path, manifest: &Manifest, q: &SearchQuery) -> Vec<String> {
+        let result = run(root, manifest, q);
+        assert_eq!(result.total_hits, result.results.len(), "{q:?}");
+        result.results.into_iter().map(|d| d.doc_id.0).collect()
+    }
+
+    fn hits(root: &Path, manifest: &Manifest, q: &SearchQuery) -> Vec<String> {
+        let mut ids = ranked(root, manifest, q);
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn one_edit_finds_receive_for_recieve_and_not_unrelated_short_terms() {
+        let root = temp_root("receive");
+        let mut manifest = empty_manifest();
+        add(
+            &root,
+            &mut manifest,
+            "s1",
+            Seg::default(),
+            &[
+                ("receive", "please receive the parcel"),
+                ("short", "re eve rice sieve"),
+                ("near", "receipt recipe receiver deceive"),
+                ("of", "of on in an"),
+            ],
+        );
+        let q = fuzzy("recieve", serde_json::json!({ "fuzziness": 1 }));
+        assert_eq!(hits(&root, &manifest, &q), ["receive"]);
+        // Case is the analyzer's business, as for query_text.
+        let upper = fuzzy("RECIEVE", serde_json::json!({ "fuzziness": 1 }));
+        assert_eq!(hits(&root, &manifest, &upper), ["receive"]);
+        // Two edits reach receiver / deceive / recipe as well.
+        let two = fuzzy("recieve", serde_json::json!({ "fuzziness": 2 }));
+        assert_eq!(hits(&root, &manifest, &two), ["near", "receive"]);
+        // Without transpositions the swap costs two edits.
+        let no_swap = fuzzy(
+            "recieve",
+            serde_json::json!({ "fuzziness": 1, "transpositions": false }),
+        );
+        assert!(hits(&root, &manifest, &no_swap).is_empty());
+        // "auto" allows no edit on a two-letter token: "ox" finds nothing.
+        assert!(hits(&root, &manifest, &fuzzy("ox", serde_json::json!({}))).is_empty());
+        // ... and one edit on a short word, but never by replacing it whole.
+        assert!(hits(
+            &root,
+            &manifest,
+            &fuzzy("x", serde_json::json!({"fuzziness": 2}))
+        )
+        .is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn exact_matches_always_outrank_edited_ones() {
+        let root = temp_root("tiers");
+        let mut manifest = empty_manifest();
+        let filler = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do".repeat(6);
+        let long_exact = format!("{filler} cat {filler}");
+        // A weak exact match (once, in a very long document) next to strong
+        // one-edit matches (high tf, short documents), split over segments
+        // of different sizes so per-segment statistics would differ.
+        add(
+            &root,
+            &mut manifest,
+            "s1",
+            Seg::default(),
+            &[
+                ("exact_long", long_exact.as_str()),
+                ("cats", "cats cats cats cats"),
+                ("other", "dog"),
+            ],
+        );
+        add(
+            &root,
+            &mut manifest,
+            "s2",
+            Seg::default(),
+            &[
+                ("cart", "cart cart cart"),
+                ("exact_short", "cat"),
+                ("bat", "bat bat"),
+                ("x1", "unrelated"),
+                ("x2", "unrelated words"),
+            ],
+        );
+        let q = fuzzy("cat", serde_json::json!({ "fuzziness": 1 }));
+        let result = run(&root, &manifest, &q);
+        let ids: Vec<&str> = result.results.iter().map(|d| d.doc_id.0.as_str()).collect();
+        assert_eq!(ids.len(), 5, "{ids:?}");
+        let (exact, edited) = ids.split_at(2);
+        let mut exact = exact.to_vec();
+        exact.sort();
+        assert_eq!(exact, ["exact_long", "exact_short"], "{ids:?}");
+        assert!(!edited.contains(&"other"));
+        for hit in &result.results {
+            let is_exact = hit.doc_id.0.starts_with("exact");
+            assert_eq!(
+                hit.score > 2.0,
+                is_exact,
+                "{} scored {}",
+                hit.doc_id.0,
+                hit.score
+            );
+            assert!(hit.score > 0.0 && hit.score <= 3.0);
+        }
+        // Same with segment-level statistics.
+        let mut seg_stats = q.clone();
+        seg_stats.bm25_params.stats = Some(Bm25StatsScope::Segment);
+        let ids = ranked(&root, &manifest, &seg_stats);
+        let mut first: Vec<&str> = ids[..2].iter().map(String::as_str).collect();
+        first.sort();
+        assert_eq!(first, ["exact_long", "exact_short"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The exact-hits invariant: with no edits allowed a fuzzy clause is a
+    /// term query — same hits, same total, same order as `query_text`
+    /// (whose WAND path the existing parity tests pin to the exhaustive
+    /// one), on a corpus split over segments, with pagination.
+    #[test]
+    fn zero_fuzziness_returns_exactly_the_term_query_hits() {
+        let root = temp_root("exact");
+        let mut manifest = empty_manifest();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let words = [
+            "alpha", "alpine", "beta", "betas", "gamma", "delta", "deltas", "omega",
+        ];
+        for s in 0..3 {
+            let docs: Vec<(String, String)> = (0..60)
+                .map(|i| {
+                    let len = 1 + (next() % 12) as usize;
+                    let text: Vec<&str> = (0..len)
+                        .map(|_| words[(next() % words.len() as u64) as usize])
+                        .collect();
+                    (format!("s{s}d{i}"), text.join(" "))
+                })
+                .collect();
+            let docs: Vec<(&str, &str)> =
+                docs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+            add(
+                &root,
+                &mut manifest,
+                &format!("s{s}"),
+                Seg::default(),
+                &docs,
+            );
+        }
+        for word in ["alpha", "beta", "deltas", "omega", "missing"] {
+            let exact: SearchQuery = serde_json::from_value(serde_json::json!({
+                "query_text": word, "max_results": 1000
+            }))
+            .unwrap();
+            let mut fz = fuzzy(word, serde_json::json!({ "fuzziness": 0 }));
+            fz.max_results = 1000;
+            let want = run(&root, &manifest, &exact);
+            let got = run(&root, &manifest, &fz);
+            assert_eq!(got.total_hits, want.total_hits, "{word}");
+            let ids = |r: &SearchResult| -> Vec<String> {
+                r.results.iter().map(|d| d.doc_id.0.clone()).collect()
+            };
+            assert_eq!(ids(&got), ids(&want), "{word}: same documents, same order");
+            // A page is a slice of the full list.
+            let mut page = fz.clone();
+            page.from = 5;
+            page.max_results = 7;
+            let paged = run(&root, &manifest, &page);
+            let full = ids(&got);
+            let end = full.len().min(12);
+            assert_eq!(ids(&paged), full[full.len().min(5)..end].to_vec(), "{word}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bloom_skips_a_segment_whose_bloom_rejects_every_expansion() {
+        let root = temp_root("bloom");
+        let mut manifest = empty_manifest();
+        add(
+            &root,
+            &mut manifest,
+            "hit",
+            Seg::default(),
+            &[("h", "receive it")],
+        );
+        add(
+            &root,
+            &mut manifest,
+            "miss",
+            Seg::default(),
+            &[("m", "apple banana")],
+        );
+        let footer = SegmentReader::read_footer(&root.join("ns").join("miss")).unwrap();
+        assert!(footer.fuzzy_bloom.is_some());
+
+        let q = fuzzy("recieve", serde_json::json!({ "fuzziness": 1 }));
+        assert_eq!(term_bloom_prune_mode(&q), Some(TermBloomMode::And));
+        let analysis = QueryAnalysis::new(&q);
+        assert!(!segment_may_match_query_terms(
+            &analysis,
+            TermBloomMode::And,
+            &footer
+        ));
+        let searcher = Searcher::new(root.clone());
+        let result = run_with(&searcher, &manifest, &q);
+        assert_eq!(result.results.len(), 1);
+        let key = |s: &str| ("ns".to_string(), s.to_string(), false);
+        assert!(searcher.segment_cache.contains(&key("hit")));
+        assert!(
+            !searcher.segment_cache.contains(&key("miss")),
+            "a segment the bloom rules out is never opened"
+        );
+
+        // A footer from before #201 has no fuzzy bloom: it is opened, and
+        // the dictionary still answers correctly.
+        let mut legacy = footer.clone();
+        legacy.fuzzy_bloom = None;
+        assert!(segment_may_match_query_terms(
+            &analysis,
+            TermBloomMode::And,
+            &legacy
+        ));
+        legacy.term_bloom = None;
+        assert!(segment_may_match_query_terms(
+            &analysis,
+            TermBloomMode::And,
+            &legacy
+        ));
+        let hit_footer = SegmentReader::read_footer(&root.join("ns").join("hit")).unwrap();
+        let mut old_hit = hit_footer.clone();
+        old_hit.fuzzy_bloom = None;
+        std::fs::write(
+            root.join("ns").join("hit").join("footer.json"),
+            serde_json::to_vec(&old_hit).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hits(&root, &manifest, &q), ["h"], "old footer still hits");
+
+        // Zero edits prune on the term bloom.
+        let exact = fuzzy("recieve", serde_json::json!({ "fuzziness": 0 }));
+        assert!(!segment_may_match_query_terms(
+            &QueryAnalysis::new(&exact),
+            TermBloomMode::And,
+            &footer
+        ));
+        // Two edits can't be tested against a one-deletion bloom: no
+        // pruning, same answer.
+        let two = fuzzy("recieve", serde_json::json!({ "fuzziness": 2 }));
+        assert!(segment_may_match_query_terms(
+            &QueryAnalysis::new(&two),
+            TermBloomMode::And,
+            &footer
+        ));
+        assert_eq!(hits(&root, &manifest, &two), ["h"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn each_segment_is_expanded_with_its_own_analyzer() {
+        let root = temp_root("analyzers");
+        let mut manifest = empty_manifest();
+        let stem: AnalysisConfig = NamespaceSchema {
+            fields: Default::default(),
+            default_analyzer: vec!["standard@2".into(), "stem".into()],
+            default_stopwords: None,
+        }
+        .resolve()
+        .unwrap();
+        add(
+            &root,
+            &mut manifest,
+            "legacy",
+            Seg::default(),
+            &[("old", "receiving goods")],
+        );
+        add(
+            &root,
+            &mut manifest,
+            "stemmed",
+            Seg {
+                config: Some(&stem),
+                ..Default::default()
+            },
+            &[("new", "receiving goods")],
+        );
+        // The stemmed segment indexed "receiv"; the query reads "recieving"
+        // as "reciev" there — one swap away — and as itself in the legacy one.
+        let q = fuzzy("recieving", serde_json::json!({ "fuzziness": 1 }));
+        assert_eq!(hits(&root, &manifest, &q), ["new", "old"]);
+        // Bloom pruning reads the query with each segment's chain too.
+        let analysis = QueryAnalysis::new(&q);
+        for seg in ["legacy", "stemmed"] {
+            let footer = SegmentReader::read_footer(&root.join("ns").join(seg)).unwrap();
+            assert!(
+                segment_may_match_query_terms(&analysis, TermBloomMode::And, &footer),
+                "{seg}"
+            );
+        }
+        let _ = FieldSchema::default();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn field_restriction_uses_field_postings_and_falls_back_on_old_segments() {
+        let root = temp_root("field");
+        let mut manifest = empty_manifest();
+        let docs = || {
+            vec![
+                (
+                    "title",
+                    vec![Field::text("title", "receive"), Field::text("content", "x")],
+                ),
+                (
+                    "content",
+                    vec![Field::text("title", "y"), Field::text("content", "receive")],
+                ),
+            ]
+        };
+        add_fields(&root, &mut manifest, "fielded", Seg::default(), docs());
+        let q = fuzzy(
+            "recieve",
+            serde_json::json!({ "fuzziness": 1, "field": "title" }),
+        );
+        assert_eq!(hits(&root, &manifest, &q), ["title"]);
+        let any = fuzzy(
+            "recieve",
+            serde_json::json!({ "fuzziness": 1, "field": "_all" }),
+        );
+        assert_eq!(hits(&root, &manifest, &any), ["content", "title"]);
+        let absent = fuzzy(
+            "recieve",
+            serde_json::json!({ "fuzziness": 1, "field": "nope" }),
+        );
+        assert!(hits(&root, &manifest, &absent).is_empty());
+
+        // A segment written without per-field indexes answers from its
+        // combined index rather than returning nothing.
+        let root2 = temp_root("field-legacy");
+        let mut old = empty_manifest();
+        add_fields(
+            &root2,
+            &mut old,
+            "old",
+            Seg {
+                no_field_index: true,
+                ..Default::default()
+            },
+            docs(),
+        );
+        assert_eq!(hits(&root2, &old, &q), ["content", "title"]);
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root2).ok();
+    }
+
+    #[test]
+    fn tokens_combine_with_the_operator_and_deleted_docs_are_skipped() {
+        let root = temp_root("operator");
+        let mut manifest = empty_manifest();
+        add(
+            &root,
+            &mut manifest,
+            "s1",
+            Seg::default(),
+            &[
+                ("both", "receive parcel"),
+                ("one", "receive letter"),
+                ("deleted", "receive parcel"),
+            ],
+        );
+        let and = fuzzy("recieve parcle", serde_json::json!({ "fuzziness": 1 }));
+        assert_eq!(hits(&root, &manifest, &and), ["both", "deleted"]);
+        let mut or = and.clone();
+        or.operator = Some(kosha_core::QueryOperator::Or);
+        let ids = ranked(&root, &manifest, &or);
+        assert_eq!(ids.len(), 3);
+        assert_eq!(
+            ids.last().map(String::as_str),
+            Some("one"),
+            "fewer tokens rank lower"
+        );
+
+        let tombstones: HashMap<SegmentId, HashSet<u32>> =
+            HashMap::from([(SegmentId("s1".into()), HashSet::from([2u32]))]);
+        let result = Searcher::new(root.clone())
+            .search(
+                &NamespaceId("ns".into()),
+                &manifest,
+                &and,
+                Some(&tombstones),
+            )
+            .unwrap();
+        let ids: Vec<&str> = result.results.iter().map(|d| d.doc_id.0.as_str()).collect();
+        assert_eq!(ids, ["both"]);
+        assert_eq!(result.total_hits, 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fuzzy_is_its_own_lexical_query() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<SearchQuery>(v).unwrap();
+        let both = parse(serde_json::json!({
+            "query_text": "receive", "fuzzy": { "value": "recieve" }
+        }));
+        assert!(both.validate().is_err());
+        let fields = parse(serde_json::json!({
+            "query_text": "", "fields": ["title"], "fuzzy": { "value": "recieve" }
+        }));
+        assert!(fields.validate().is_err());
+        let hybrid = parse(serde_json::json!({
+            "query_text": "", "fuzzy": { "value": "recieve" },
+            "knn": { "field": "v", "vector": [1.0, 0.0] }
+        }));
+        hybrid.validate().unwrap();
+        assert!(hybrid.is_hybrid());
+        let too_far = serde_json::from_value::<SearchQuery>(serde_json::json!({
+            "query_text": "", "fuzzy": { "value": "recieve", "fuzziness": 3 }
+        }));
+        assert!(too_far.is_err());
+        // Old requests (no fuzzy) still parse and serialize without it.
+        let plain = parse(serde_json::json!({ "query_text": "receive" }));
+        assert!(plain.fuzzy.is_none());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("fuzzy"));
+        // The clause is part of the request's serialized form (result cache key).
+        assert!(serde_json::to_string(&hybrid).unwrap().contains("recieve"));
     }
 }

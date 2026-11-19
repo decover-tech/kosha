@@ -209,6 +209,7 @@ fn mk_query(text: &str) -> SearchQuery {
         highlight: None,
         aggs: HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         exact_total_hits: None,

@@ -1476,6 +1476,7 @@ impl AppState {
                 highlight: None,
                 aggs: std::collections::HashMap::new(),
                 wildcard: None,
+                fuzzy: None,
                 match_phrase: None,
                 knn: None,
                 exact_total_hits: None,
@@ -4986,6 +4987,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         highlight: None,
         aggs: std::collections::HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         exact_total_hits: None,
@@ -6225,7 +6227,9 @@ fn posting_blob_files_for_query<'a>(
     analysis: &kosha_query::QueryAnalysis,
     analyses: impl IntoIterator<Item = Option<&'a kosha_core::SegmentAnalysis>>,
 ) -> Vec<String> {
-    if query.wildcard.is_some() {
+    // Wildcard and fuzzy (#201) terms are only known once each segment's
+    // dictionary is expanded: every shard may hold one.
+    if query.wildcard.is_some() || query.fuzzy.is_some() {
         return kosha_segment::all_posting_blob_files();
     }
 
@@ -7311,6 +7315,61 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_search_over_http() {
+        // Issue #201: a fuzzy clause over HTTP, validated, cached under its
+        // own key (not the plain query's).
+        let state = test_state();
+        let ns = NamespaceId("fuzzyns".into());
+        let doc = |id: &str, text: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text)],
+        };
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    doc("hit", "we receive goods"),
+                    doc("exact", "recieve is a common typo"),
+                    doc("miss", "rice and sieve"),
+                ],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+        let post = |extra: &str| -> String {
+            let body = format!(r#"{{"namespace":"fuzzyns","query_text":""{extra}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let order = |resp: &str| -> Vec<String> {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let v: serde_json::Value =
+                serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+            v["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let fuzzy = r#","fuzzy":{"value":"recieve","fuzziness":1}"#;
+        // The exact term first, the one-edit match after it.
+        assert_eq!(order(&post(fuzzy)), ["exact", "hit"]);
+        assert_eq!(order(&post(fuzzy)), ["exact", "hit"]);
+        let exact_only = r#","fuzzy":{"value":"recieve","fuzziness":0}"#;
+        assert_eq!(order(&post(exact_only)), ["exact"]);
+        for bad in [
+            r#","fuzzy":{"value":"recieve","fuzziness":3}"#,
+            r#","fuzzy":{"value":"recieve","max_expansions":0}"#,
+            r#","fuzzy":{"value":""}"#,
+            r#","fuzzy":{"value":"x"},"wildcard":{"field":"text","pattern":"r*"}"#,
+        ] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+    }
+
+    #[test]
     fn hybrid_search_fuses_with_rrf_over_http() {
         // Issue #228: `rank.rrf` over HTTP — fused score plus per-retriever
         // ranks in the response, vector-only hits kept (#250), parameters
@@ -7412,6 +7471,7 @@ mod tests {
             doc_vectors: false,
             analysis: None,
             field_index: None,
+            fuzzy_bloom: kosha_core::fuzzy::build_fuzzy_bloom(terms.iter().copied()),
         };
         let mut query: SearchQuery = serde_json::from_str(
             r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
@@ -7454,6 +7514,23 @@ mod tests {
         assert_eq!(
             decide(&query, &same_matter_one_term),
             SegmentHydration::Skip
+        );
+
+        // Fuzzy (#201): a segment is hydrated when its bloom admits some
+        // expansion of the token, skipped when it admits none, and every
+        // posting-blob shard is fetched (expansions are per segment).
+        let fuzzy: SearchQuery = serde_json::from_str(
+            r#"{"query_text": "", "fuzzy": {"value": "braech", "fuzziness": 1}}"#,
+        )
+        .unwrap();
+        assert_eq!(decide(&fuzzy, &other_matter), SegmentHydration::Scoring);
+        assert_eq!(decide(&fuzzy, &no_terms), SegmentHydration::Skip);
+        let mut old_bloom = no_terms.clone();
+        old_bloom.fuzzy_bloom = None;
+        assert_eq!(decide(&fuzzy, &old_bloom), SegmentHydration::Scoring);
+        assert_eq!(
+            posting_blob_files_for_query(&fuzzy, &kosha_query::QueryAnalysis::new(&fuzzy), [None]),
+            kosha_segment::all_posting_blob_files()
         );
     }
 
@@ -8661,6 +8738,7 @@ mod tests {
             highlight: None,
             aggs: std::collections::HashMap::new(),
             wildcard: None,
+            fuzzy: None,
             match_phrase: None,
             knn: None,
             exact_total_hits: None,
@@ -8804,6 +8882,7 @@ mod tests {
             highlight: None,
             aggs: std::collections::HashMap::new(),
             wildcard: None,
+            fuzzy: None,
             match_phrase: None,
             knn: None,
             exact_total_hits: None,
@@ -10032,6 +10111,7 @@ mod tests {
             highlight: None,
             aggs: std::collections::HashMap::new(),
             wildcard: None,
+            fuzzy: None,
             match_phrase: None,
             knn: None,
             exact_total_hits: None,
@@ -10142,6 +10222,7 @@ mod tests {
             doc_vectors: false,
             analysis: None,
             field_index: None,
+            fuzzy_bloom: None,
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.

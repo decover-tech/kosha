@@ -92,6 +92,7 @@ fn main() {
         highlight: None,
         aggs: Default::default(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         exact_total_hits: None,

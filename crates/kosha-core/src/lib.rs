@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod deletes;
 pub mod fields;
+pub mod fuzzy;
 pub mod rank;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ pub use analysis::{
 };
 pub use docset::{evaluate_filter, DocSet};
 pub use fields::{FieldBoost, FieldIndex, FieldStats, ALL_FIELD};
+pub use fuzzy::{Fuzziness, FuzzyQuery};
 pub use rank::{CompiledRankBy, RankBySpec};
 
 /// Pluggable namespace registry and manifest store.
@@ -981,6 +983,14 @@ pub struct Footer {
     /// any field), never with zero hits. See [`fields`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_index: Option<FieldIndex>,
+    /// Bloom over the deletion neighbourhood of the combined-index terms
+    /// (each term and every string one character deletion away from it),
+    /// for pruning one-edit fuzzy queries (issue #201): see
+    /// [`fuzzy::build_fuzzy_bloom`]. `None` — segments written before
+    /// #201, and segments whose neighbourhood is too large for a useful
+    /// bloom — means fuzzy queries cannot prune the segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzzy_bloom: Option<BloomFilter>,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -1053,12 +1063,18 @@ impl BloomFilter {
     /// A filter that cannot be read (empty, or a bit that falls outside the
     /// text) cannot prune: the answer is `true`.
     pub fn may_contain(&self, value: &str) -> bool {
+        self.may_contain_hashed(bloom_key_hashes(value))
+    }
+
+    /// [`Self::may_contain`] for a value already hashed with
+    /// [`bloom_key_hashes`]: the hashes do not depend on the filter, so a
+    /// caller probing many blooms with many values hashes each value once.
+    pub fn may_contain_hashed(&self, (h1, h2): (u64, u64)) -> bool {
         if self.num_bits == 0 || self.bits_b64.is_empty() {
             return true;
         }
         let text = self.bits_b64.as_bytes();
         let m = self.num_bits as u64;
-        let (h1, h2) = bloom_hashes(value);
         for i in 0..self.k {
             let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) % m;
             match base64_byte(text, (bit / 8) as usize) {
@@ -1202,7 +1218,12 @@ fn bloom_num_hashes(num_bits: usize, n: usize) -> usize {
     ((num_bits as f64 / n as f64) * 2f64.ln()).round() as usize
 }
 
-/// Stable FNV-1a based double hash (not `DefaultHasher`, which is not portable).
+/// The two hashes a [`BloomFilter`] probes `value` with (stable FNV-1a
+/// double hash; not `DefaultHasher`, which is not portable).
+pub fn bloom_key_hashes(value: &str) -> (u64, u64) {
+    bloom_hashes(value)
+}
+
 fn bloom_hashes(value: &str) -> (u64, u64) {
     let h1 = fnv1a64(value.as_bytes(), 0x9e3779b97f4a7c15);
     let h2 = fnv1a64(value.as_bytes(), 0xbf58476d1ce4e5b9) | 1; // odd → full period
@@ -1596,6 +1617,13 @@ pub struct SearchQuery {
     pub aggs: std::collections::HashMap<String, Aggregation>,
     #[serde(default)]
     pub wildcard: Option<WildcardQuery>,
+    /// Typo-tolerant term matching (issue #201): each token of
+    /// `fuzzy.value` matches the terms within `fuzziness` edits of it. A
+    /// lexical retriever of its own, so it cannot be combined with
+    /// `query_text`, `wildcard` or `match_phrase`; it can be the lexical
+    /// leg of a hybrid request. See [`fuzzy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzzy: Option<FuzzyQuery>,
     #[serde(default)]
     pub match_phrase: Option<MatchPhraseQuery>,
     #[serde(default)]
@@ -1791,6 +1819,21 @@ impl SearchQuery {
         self.bm25_params
             .validate()
             .map_err(KoshaError::InvalidQuery)?;
+        if let Some(ref fuzzy) = self.fuzzy {
+            fuzzy.validate().map_err(KoshaError::InvalidQuery)?;
+            if !self.query_text.trim().is_empty()
+                || self.wildcard.is_some()
+                || self.match_phrase.is_some()
+                || !self.fields.is_empty()
+            {
+                return Err(KoshaError::InvalidQuery(
+                    "fuzzy is a lexical query of its own; it cannot be combined with \
+                     query_text, fields, wildcard or match_phrase (restrict it with \
+                     fuzzy.field)"
+                        .into(),
+                ));
+            }
+        }
         if !self.fields.is_empty() {
             fields::parse_field_boosts(&self.fields).map_err(KoshaError::InvalidQuery)?;
             if self.match_phrase.is_some() || self.wildcard.is_some() {
@@ -1847,7 +1890,7 @@ impl SearchQuery {
             if !self.has_lexical_query() && self.knn.is_none() {
                 return Err(KoshaError::InvalidQuery(
                     "rank_by rescores the best hits of a query; it needs query_text, \
-                     wildcard, match_phrase or knn, not a filter alone"
+                     wildcard, match_phrase, fuzzy or knn, not a filter alone"
                         .into(),
                 ));
             }
@@ -1857,8 +1900,8 @@ impl SearchQuery {
         match self.mode {
             Some(RetrievalMode::Hybrid) if !(has_lexical && has_knn) => {
                 return Err(KoshaError::InvalidQuery(
-                    "mode \"hybrid\" needs both a lexical query (query_text, wildcard or \
-                     match_phrase) and knn"
+                    "mode \"hybrid\" needs both a lexical query (query_text, wildcard, \
+                     match_phrase or fuzzy) and knn"
                         .into(),
                 ));
             }
@@ -1883,7 +1926,7 @@ impl SearchQuery {
             if !self.is_hybrid() {
                 return Err(KoshaError::InvalidQuery(
                     "rank.rrf fuses a lexical query with knn; the request needs both \
-                     (query_text, wildcard or match_phrase, plus knn)"
+                     (query_text, wildcard, match_phrase or fuzzy, plus knn)"
                         .into(),
                 ));
             }
@@ -1937,7 +1980,10 @@ impl SearchQuery {
     /// True when the request has a lexical retriever: query text, a
     /// wildcard or a phrase. A filter alone is not one.
     pub fn has_lexical_query(&self) -> bool {
-        !self.query_text.trim().is_empty() || self.wildcard.is_some() || self.match_phrase.is_some()
+        !self.query_text.trim().is_empty()
+            || self.wildcard.is_some()
+            || self.match_phrase.is_some()
+            || self.fuzzy.is_some()
     }
 
     /// The parsed `fields` list, or `None` when `query_text` searches the
@@ -1986,6 +2032,7 @@ impl SearchQuery {
             && self.query_text.trim().is_empty()
             && self.wildcard.is_none()
             && self.match_phrase.is_none()
+            && self.fuzzy.is_none()
             && self.filter.is_none()
     }
 
@@ -2524,6 +2571,7 @@ mod tests {
             doc_vectors: false,
             analysis: None,
             field_index: None,
+            fuzzy_bloom: None,
         }
     }
 

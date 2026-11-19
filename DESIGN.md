@@ -386,6 +386,25 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      `bm25_params.stats: "segment"` (or `KOSHA_BM25_STATS=segment` engine-wide) restores
      per-segment statistics for A/B debugging. Wildcard queries keep per-segment statistics,
      since their expansion is per segment.
+     **Fuzzy** (`fuzzy: {field, value, fuzziness, prefix_length, max_expansions,
+     transpositions}`, issue #201) analyzes the value with each segment's chains and expands each
+     token against that segment's term table. Every inverted-index format keeps the table sorted,
+     so it already is the leaf order of a trie: the expansion is a Levenshtein automaton in DP
+     form (optimal string alignment, so an adjacent swap is one edit) whose rows are shared across
+     consecutive terms' common prefix, and a prefix whose row minimum exceeds the budget skips its
+     whole range by binary search; `prefix_length` narrows the range up front. No sidecar is
+     needed, so segments already on S3 expand the same way. The best `max_expansions` terms per
+     token (fewest edits, then term order; the exact term first) are read like any term and
+     scored in edit-distance tiers, `(2 − edits) + tf_norm` with `tf_norm ∈ (0, 1]` the BM25 tf
+     saturation under the namespace `avgdl`, so an exact match outranks every one-edit match in
+     the namespace, whatever their tf or length. IDF is left out because the expansions (and so
+     any `df`) differ per segment; a per-segment IDF would let a rare typo in one segment outrank
+     an exact hit in another. Pruning: `footer.json` carries `fuzzy_bloom`, a bloom over the
+     vocabulary's one-deletion neighbourhood (SymSpell's observation: two strings are within one
+     edit only if their deletion neighbourhoods meet), so a one-edit token costs `len + 1` bloom
+     probes; zero-edit tokens use the term bloom; two-edit tokens, segments written before #201
+     and segments too large for a useful neighbourhood bloom are always opened. Every posting
+     blob shard is hydrated for a fuzzy query, as for a wildcard.
      A `fields` query (`["title^2", "content"]`, issue #249) scores
      `Σ_fields boost × BM25_field`, each field with its own postings, per-document lengths and
      statistics (`N` = documents with the field, `avgdl` = its mean length, `df` from its own

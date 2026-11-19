@@ -309,6 +309,10 @@ message SearchRequest {
   // GeoPoint fields, applied to the best `window_size` hits by the query's
   // own score. See README "Score modifiers".
   google.protobuf.Struct rank_by = 18;
+
+  // Typo-tolerant term matching (HTTP "fuzzy"). A lexical query of its own:
+  // not combinable with query_text / fields / wildcard / match_phrase.
+  optional FuzzyQuery fuzzy = 19;
 }
 
 message LimitPer {
@@ -318,7 +322,7 @@ message LimitPer {
 
 enum RetrievalMode {
   RETRIEVAL_MODE_UNSPECIFIED = 0;
-  RETRIEVAL_MODE_LEXICAL = 1;   // query_text / wildcard / match_phrase; no knn
+  RETRIEVAL_MODE_LEXICAL = 1;   // query_text / wildcard / match_phrase / fuzzy; no knn
   RETRIEVAL_MODE_SEMANTIC = 2;  // knn only
   // A lexical query plus knn, fused by Reciprocal Rank Fusion over
   // namespace-wide ranks (see Rank). Every request with both is hybrid.
@@ -347,6 +351,21 @@ message HighlightConfig {
   string field = 1;
   repeated string pre_tags = 2;
   repeated string post_tags = 3;
+}
+
+message FuzzyQuery {
+  // "", "_all" or "*" = every Text field.
+  string field = 1;
+  // Analyzed per segment; each token is expanded.
+  string value = 2;
+  // "0", "1", "2", "auto" (default) or "auto:low,high".
+  optional string fuzziness = 3;
+  // Leading characters that must match exactly (default 0).
+  optional int32 prefix_length = 4;
+  // Terms per token per segment, nearest first (default 50, max 1024).
+  optional int32 max_expansions = 5;
+  // An adjacent swap counts as one edit (default true).
+  optional bool transpositions = 6;
 }
 
 message WildcardQuery {

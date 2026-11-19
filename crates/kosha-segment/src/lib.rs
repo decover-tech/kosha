@@ -80,6 +80,9 @@ pub struct SegmentWriter {
     /// Term bloom built by `write_inverted_index` from the merged vocabulary
     /// (the in-memory index alone no longer holds every term).
     term_bloom: Option<kosha_core::BloomFilter>,
+    /// Deletion-neighbourhood bloom for fuzzy pruning (#201), built with
+    /// `term_bloom`; `None` when the vocabulary is too large for one.
+    fuzzy_bloom: Option<kosha_core::BloomFilter>,
     total_field_length: u64,
     filter_string: HashMap<String, Vec<(u32, String)>>,
     filter_integer: HashMap<String, Vec<(u32, i64)>>,
@@ -188,6 +191,7 @@ impl SegmentWriter {
             io_error: None,
             finalized: false,
             term_bloom: None,
+            fuzzy_bloom: None,
             total_field_length: 0,
             filter_string: HashMap::new(),
             filter_integer: HashMap::new(),
@@ -680,15 +684,17 @@ impl SegmentWriter {
         // Every term is in `pool` exactly once, sorted (no duplicates).
         // Per-field keys stay out of the bloom: each is also a combined
         // term, and queries test the bloom with that (#249).
-        self.term_bloom = Some(build_term_bloom(
+        let combined_terms = || {
             entries
                 .iter()
                 .map(|&(off, len, ..)| {
                     std::str::from_utf8(&pool[off as usize..off as usize + len as usize])
                         .expect("pool holds UTF-8 terms")
                 })
-                .filter(|term| !kosha_core::fields::is_field_key(term)),
-        ));
+                .filter(|term| !kosha_core::fields::is_field_key(term))
+        };
+        self.term_bloom = Some(build_term_bloom(combined_terms()));
+        self.fuzzy_bloom = kosha_core::fuzzy::build_fuzzy_bloom(combined_terms());
 
         let table_len = entries.len() as u64 * SPLIT_INVERTED_TABLE_ENTRY_LEN as u64;
         let pool_base = INVERTED_HEADER_LEN as u64 + table_len;
@@ -918,6 +924,8 @@ impl SegmentWriter {
                 position_gap: kosha_core::fields::DEFAULT_POSITION_GAP,
                 fields: self.field_stats.clone(),
             }),
+            // Built with the term bloom; without one, nothing to prune on.
+            fuzzy_bloom: self.fuzzy_bloom.clone(),
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -3466,6 +3474,36 @@ impl InvertedAccess {
     }
 }
 
+/// A segment's term table, read in place in sorted (bytewise) order: the
+/// dictionary a fuzzy query (#201) walks. Combined-index terms and
+/// per-field keys alike; per-field keys sort first.
+pub struct TermDictionary<'a>(TermDictionaryInner<'a>);
+
+enum TermDictionaryInner<'a> {
+    Lazy(&'a LazyInvertedIndex),
+    Split(&'a SplitInvertedIndex),
+    /// Legacy eager segments: their map is unordered, so sort a view once.
+    Sorted(Vec<&'a str>),
+}
+
+impl kosha_core::fuzzy::SortedTerms for TermDictionary<'_> {
+    fn term_count(&self) -> usize {
+        match &self.0 {
+            TermDictionaryInner::Lazy(lazy) => lazy.term_count,
+            TermDictionaryInner::Split(split) => split.term_count,
+            TermDictionaryInner::Sorted(terms) => terms.len(),
+        }
+    }
+
+    fn term(&self, i: usize) -> &str {
+        match &self.0 {
+            TermDictionaryInner::Lazy(lazy) => lazy.term_at(i),
+            TermDictionaryInner::Split(split) => split.term_at(i),
+            TermDictionaryInner::Sorted(terms) => terms[i],
+        }
+    }
+}
+
 // ─── Segment reader ─────────────────────────────────────────────────────────
 
 /// A document's location within `doc_store.bin`, plus the small scalar
@@ -4532,6 +4570,16 @@ impl SegmentReader {
         self.inverted.contains_term(term)
     }
 
+    /// The whole term table, sorted, read in place (no copy for v2+
+    /// segments). See [`TermDictionary`].
+    pub fn term_dictionary(&self) -> TermDictionary<'_> {
+        TermDictionary(match &self.inverted {
+            InvertedAccess::Lazy(lazy) => TermDictionaryInner::Lazy(lazy),
+            InvertedAccess::Split(split) => TermDictionaryInner::Split(split),
+            InvertedAccess::Eager(_) => TermDictionaryInner::Sorted(self.inverted.all_terms()),
+        })
+    }
+
     /// All combined-index terms in sorted order (per-field keys, #249,
     /// are left out). Zero-copy for v2 segments (borrows the term pool);
     /// allocates only the pointer Vec.
@@ -4607,12 +4655,14 @@ impl SegmentReader {
     pub fn rewrite_term_bloom(segment_dir: &Path) -> Result<Footer, KoshaError> {
         let mut footer = Self::read_footer(segment_dir)?;
         let inverted = Self::read_inverted(segment_dir, None)?;
-        footer.term_bloom = Some(build_term_bloom(
-            inverted
-                .all_terms()
-                .into_iter()
-                .filter(|term| !kosha_core::fields::is_field_key(term)),
-        ));
+        let combined: Vec<&str> = inverted
+            .all_terms()
+            .into_iter()
+            .filter(|term| !kosha_core::fields::is_field_key(term))
+            .collect();
+        footer.term_bloom = Some(build_term_bloom(combined.iter().copied()));
+        // Segments written before #201 gain fuzzy pruning here too.
+        footer.fuzzy_bloom = kosha_core::fuzzy::build_fuzzy_bloom(combined.iter().copied());
         let json = serde_json::to_string_pretty(&footer)?;
         atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
         Ok(footer)
