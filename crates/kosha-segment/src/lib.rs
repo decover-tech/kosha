@@ -64,6 +64,9 @@ pub struct SegmentWriter {
     /// Spill `inverted_index` to a sorted run once `inverted_bytes` passes
     /// this. See [`segment_build_memory_bytes`].
     build_memory_bytes: usize,
+    /// Inverted-index version `finalize` writes; see
+    /// [`postings_write_version`].
+    postings_write_version: u32,
     /// Sorted posting runs spilled so far, oldest (lowest doc_seq) first.
     runs: Vec<PathBuf>,
     /// First I/O error from streaming in `add_document`, which can't return
@@ -115,6 +118,7 @@ impl SegmentWriter {
             inverted_bytes: 0,
             peak_inverted_bytes: 0,
             build_memory_bytes: segment_build_memory_bytes(),
+            postings_write_version: postings_write_version(),
             runs: Vec::new(),
             io_error: None,
             finalized: false,
@@ -139,6 +143,14 @@ impl SegmentWriter {
         self
     }
 
+    /// Override the inverted-index version (tests; production uses
+    /// `KOSHA_POSTINGS_WRITE_VERSION`).
+    #[cfg(test)]
+    fn with_postings_write_version(mut self, version: u32) -> Self {
+        self.postings_write_version = version;
+        self
+    }
+
     /// Override where this writer stores parsed vector values (#243).
     /// Production writers use `KOSHA_VECTOR_STORE`; see [`VectorStoreMode`].
     pub fn with_vector_store_mode(mut self, mode: VectorStoreMode) -> Self {
@@ -155,12 +167,34 @@ impl SegmentWriter {
         self
     }
 
-    pub fn add_document(&mut self, doc_id: DocumentId, mut fields: Vec<Field>) {
+    pub fn add_document(&mut self, doc_id: DocumentId, fields: Vec<Field>) {
+        self.add_document_with_vectors(doc_id, fields, Vec::new());
+    }
+
+    /// [`Self::add_document`] with some `Vector` fields' values supplied
+    /// already parsed, as `(index into fields, vector)`. Compaction uses
+    /// this with [`SegmentReader::iter_doc_records_raw`] so sidecar vectors
+    /// pass through as f32 instead of being printed to JSON by the reader
+    /// and parsed back here (#242). A supplied vector is used as is, so it
+    /// stays bit-identical; the field's own value is ignored, and may be
+    /// the empty sidecar placeholder. If the vector ends up stored inline
+    /// (`KOSHA_VECTOR_STORE=inline`, or an empty vector) and the field's
+    /// value is empty, the writer fills in its JSON, exactly as
+    /// `SegmentReader::doc_record_full` would have.
+    pub fn add_document_with_vectors(
+        &mut self,
+        doc_id: DocumentId,
+        mut fields: Vec<Field>,
+        mut vectors: Vec<(usize, Vec<f32>)>,
+    ) {
         let doc_seq = self.field_lengths.len() as u32;
         let mut field_length: u32 = 0;
         // Vector fields whose value moves to `doc_vectors.bin` (#243); their
         // doc-store value is blanked after the loop below.
         let mut moved_to_sidecar: Vec<usize> = Vec::new();
+        // Supplied vectors stored inline in place of an empty value:
+        // `(field index, index into self.vectors)`.
+        let mut needs_json: Vec<(usize, usize)> = Vec::new();
 
         for (index, field) in fields.iter().enumerate() {
             if field.field_type == FieldType::Text {
@@ -228,7 +262,16 @@ impl SegmentWriter {
                     }
                 }
                 FieldType::Vector => {
-                    if let Ok(vec) = serde_json::from_str::<Vec<f32>>(&field.value) {
+                    let supplied = vectors
+                        .iter_mut()
+                        .find(|(i, _)| *i == index)
+                        .map(|(_, v)| std::mem::take(v));
+                    let was_supplied = supplied.is_some();
+                    let parsed = match supplied {
+                        Some(vec) => Some(vec),
+                        None => serde_json::from_str::<Vec<f32>>(&field.value).ok(),
+                    };
+                    if let Some(vec) = parsed {
                         // An empty value is the sidecar placeholder; a
                         // literal `[]` would be indistinguishable from it
                         // once blanked, so it stays inline.
@@ -250,6 +293,8 @@ impl SegmentWriter {
                                 self.vectors.len() as u32,
                             ));
                             moved_to_sidecar.push(index);
+                        } else if was_supplied && field.value.is_empty() {
+                            needs_json.push((index, self.vectors.len()));
                         }
                         self.vectors.push((doc_seq, vec));
                     }
@@ -260,6 +305,14 @@ impl SegmentWriter {
         }
         for index in moved_to_sidecar {
             fields[index].value.clear();
+        }
+        for (index, v) in needs_json {
+            match serde_json::to_string(&self.vectors[v].1) {
+                Ok(json) => fields[index].value = json,
+                Err(e) => {
+                    self.io_error.get_or_insert(e.into());
+                }
+            }
         }
 
         self.total_field_length += field_length as u64;
@@ -419,8 +472,9 @@ impl SegmentWriter {
         // Every spilled run plus what's still in memory, merged in term
         // order. Sorted term order is load-bearing: the reader
         // binary-searches the term table (see `LazyInvertedIndex::find`).
-        // Memory: one term's postings at a time plus the term table, not the
-        // whole index (#242).
+        // Memory: the term table plus a bounded per-term encoder; a term's
+        // postings stream from the runs into it and are never all resident,
+        // however many documents contain the term (#242).
         let mut sources: Vec<PostingSource> = Vec::with_capacity(self.runs.len() + 1);
         for path in &self.runs {
             sources.push(PostingSource::Run(RunReader::open(path)?));
@@ -429,7 +483,7 @@ impl SegmentWriter {
             .into_iter()
             .collect();
         in_memory.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        sources.push(PostingSource::Memory(in_memory.into_iter()));
+        sources.push(PostingSource::memory(in_memory));
         self.inverted_bytes = 0;
 
         // Postings go straight to one raw file per shard; query nodes can
@@ -443,20 +497,17 @@ impl SegmentWriter {
         let mut pool: Vec<u8> = Vec::new();
         // (term_off_in_pool, term_len, blob_id, postings_off_in_blob, postings_len)
         let mut entries: Vec<(u64, u32, u32, u64, u32)> = Vec::new();
-        let write_version = postings_write_version();
-        let mut encoded: Vec<u8> = Vec::new();
+        let write_version = self.postings_write_version;
+        // Rollout/rollback compatibility: v4 (`KOSHA_POSTINGS_WRITE_VERSION=4`)
+        // streams through the same encoder; see `postings_write_version`.
+        let mut encoder = TermEncoder::new(
+            write_version,
+            &build_dir,
+            term_spill_limit(self.build_memory_bytes),
+        );
 
         let mut merger = TermMerger::new(sources)?;
-        while let Some((term, postings)) = merger.next_term()? {
-            encoded.clear();
-            if write_version == SPLIT_INVERTED_VERSION {
-                // Rollout/rollback compatibility mode — see
-                // `postings_write_version`.
-                write_postings_varint_delta(&mut encoded, &postings);
-            } else {
-                write_postings_skip_split(&mut encoded, &postings, &self.field_lengths);
-            }
-            drop(postings);
+        while let Some(term) = merger.next_term(&mut encoder, &self.field_lengths)? {
             let blob_id = posting_blob_id_for_term(&term);
             let blob = match &mut blobs[blob_id] {
                 Some(blob) => blob,
@@ -465,9 +516,15 @@ impl SegmentWriter {
                     slot.insert(std::io::BufWriter::new(file))
                 }
             };
-            std::io::Write::write_all(blob, &encoded)?;
+            let encoded_len = encoder.finish(blob)?;
+            let encoded_len = u32::try_from(encoded_len).map_err(|_| {
+                KoshaError::Io(std::io::Error::other(format!(
+                    "postings for term {term:?} encode to {encoded_len} bytes, over the \
+                     4 GiB per-term limit of the inverted index format"
+                )))
+            })?;
             let p_off = blob_lens[blob_id];
-            blob_lens[blob_id] += encoded.len() as u64;
+            blob_lens[blob_id] += encoded_len as u64;
             let term_off = pool.len() as u64;
             pool.extend_from_slice(term.as_bytes());
             entries.push((
@@ -475,9 +532,10 @@ impl SegmentWriter {
                 term.len() as u32,
                 blob_id as u32,
                 p_off,
-                encoded.len() as u32,
+                encoded_len,
             ));
         }
+        drop(encoder);
 
         // Every term is in `pool` exactly once, sorted (no duplicates).
         self.term_bloom = Some(build_term_bloom(entries.iter().map(|&(off, len, ..)| {
@@ -1405,8 +1463,11 @@ fn text_value_within_cap(value: &str, cap: Option<u32>) -> bool {
 //   per document the writer keeps only its field length and offsets entry.
 // - Once the in-memory postings pass `KOSHA_SEGMENT_BUILD_MEMORY_BYTES`,
 //   they are written to a sorted run file and freed. `finalize` k-way
-//   merges the runs and what's left in memory by term, one term at a time,
-//   and streams each term's encoded postings to its shard file.
+//   merges the runs and what's left in memory by term. A term's postings
+//   stream from the runs, posting by posting, into a `TermEncoder` that
+//   writes the encoded span to its shard file; the encoder's sections
+//   spill to scratch files past `term_spill_limit`, so even a term in
+//   every document is never resident in full.
 // - Each posting shard is compressed file-to-file.
 //
 // Output bytes are unchanged; `.build/` is removed before `finalize`
@@ -1543,6 +1604,9 @@ fn write_run_entry(
     Ok(())
 }
 
+/// Reads a run file entry by entry. A term's postings are read one posting
+/// at a time ([`RunReader::read_posting`]) straight into the encoder, so a
+/// stopword's run slice is never materialized as a `Vec<Posting>`.
 struct RunReader {
     input: std::io::BufReader<fs::File>,
 }
@@ -1560,7 +1624,9 @@ impl RunReader {
         Ok(u32::from_le_bytes(b))
     }
 
-    fn next_entry(&mut self) -> Result<Option<(String, Vec<Posting>)>, KoshaError> {
+    /// The next entry's term and posting count, or `None` at end of run.
+    /// The caller must read exactly `count` postings before asking again.
+    fn next_header(&mut self) -> Result<Option<(String, u32)>, KoshaError> {
         let mut b = [0u8; 4];
         match self.input.read_exact(&mut b) {
             Ok(()) => {}
@@ -1571,98 +1637,390 @@ impl RunReader {
         self.input.read_exact(&mut term)?;
         let term = String::from_utf8(term)
             .map_err(|_| KoshaError::CorruptSegment("posting run: non-UTF-8 term".into()))?;
-        let count = self.read_u32()? as usize;
-        let mut postings = Vec::with_capacity(count);
-        for _ in 0..count {
-            let doc_id = self.read_u32()?;
-            let term_frequency = self.read_u32()?;
-            let n = self.read_u32()? as usize;
-            let mut positions = Vec::with_capacity(n);
-            for _ in 0..n {
-                positions.push(self.read_u32()?);
-            }
-            postings.push(Posting {
-                doc_id,
-                term_frequency,
-                positions,
-            });
+        let count = self.read_u32()?;
+        Ok(Some((term, count)))
+    }
+
+    /// One posting of the current entry: `(doc_id, tf)`, with its
+    /// positions written into `positions` (cleared first).
+    fn read_posting(&mut self, positions: &mut Vec<u32>) -> Result<(u32, u32), KoshaError> {
+        let doc_id = self.read_u32()?;
+        let term_frequency = self.read_u32()?;
+        let n = self.read_u32()? as usize;
+        positions.clear();
+        for _ in 0..n {
+            positions.push(self.read_u32()?);
         }
-        Ok(Some((term, postings)))
+        Ok((doc_id, term_frequency))
     }
 }
 
 enum PostingSource {
     Run(RunReader),
-    Memory(std::vec::IntoIter<(String, Vec<Posting>)>),
+    /// What was still in memory at `finalize` (at most the build budget).
+    /// `current` holds the postings of the entry last returned by
+    /// `next_header` until they are drained.
+    Memory {
+        entries: std::vec::IntoIter<(String, Vec<Posting>)>,
+        current: Vec<Posting>,
+    },
 }
 
 impl PostingSource {
-    fn next_entry(&mut self) -> Result<Option<(String, Vec<Posting>)>, KoshaError> {
-        match self {
-            Self::Run(run) => run.next_entry(),
-            Self::Memory(it) => Ok(it.next()),
+    fn memory(entries: Vec<(String, Vec<Posting>)>) -> Self {
+        Self::Memory {
+            entries: entries.into_iter(),
+            current: Vec::new(),
         }
+    }
+
+    fn next_header(&mut self) -> Result<Option<(String, u32)>, KoshaError> {
+        match self {
+            Self::Run(run) => run.next_header(),
+            Self::Memory { entries, current } => Ok(entries.next().map(|(term, postings)| {
+                let count = postings.len() as u32;
+                *current = postings;
+                (term, count)
+            })),
+        }
+    }
+
+    /// Feed the current entry's `count` postings to `encoder`.
+    fn drain_into(
+        &mut self,
+        count: u32,
+        encoder: &mut TermEncoder,
+        field_lengths: &[u32],
+        positions: &mut Vec<u32>,
+    ) -> Result<(), KoshaError> {
+        match self {
+            Self::Run(run) => {
+                for _ in 0..count {
+                    let (doc_id, tf) = run.read_posting(positions)?;
+                    encoder.push(doc_id, tf, positions, field_lengths)?;
+                }
+            }
+            Self::Memory { current, .. } => {
+                for p in std::mem::take(current) {
+                    encoder.push(p.doc_id, p.term_frequency, &p.positions, field_lengths)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
 /// K-way merge of term-sorted sources. Sources are given in doc_seq order
 /// (each covers a later doc range than the one before), so one term's
 /// postings are the concatenation of its sources' postings in source order.
+///
+/// Only each source's head *term* and posting count are resident; the
+/// postings themselves stream from the sources into a [`TermEncoder`]
+/// (#242), so a term in every document costs no more memory than a rare
+/// one.
 struct TermMerger {
     sources: Vec<PostingSource>,
-    heads: Vec<Option<Vec<Posting>>>,
+    /// Posting count of each source's head entry.
+    head_counts: Vec<u32>,
     heap: std::collections::BinaryHeap<std::cmp::Reverse<(String, usize)>>,
+    positions: Vec<u32>,
 }
 
 impl TermMerger {
     fn new(mut sources: Vec<PostingSource>) -> Result<Self, KoshaError> {
-        let mut heads = Vec::with_capacity(sources.len());
+        let mut head_counts = vec![0; sources.len()];
         let mut heap = std::collections::BinaryHeap::new();
         for (i, source) in sources.iter_mut().enumerate() {
-            match source.next_entry()? {
-                Some((term, postings)) => {
-                    heap.push(std::cmp::Reverse((term, i)));
-                    heads.push(Some(postings));
-                }
-                None => heads.push(None),
+            if let Some((term, count)) = source.next_header()? {
+                heap.push(std::cmp::Reverse((term, i)));
+                head_counts[i] = count;
             }
         }
         Ok(Self {
             sources,
-            heads,
+            head_counts,
             heap,
+            positions: Vec::new(),
         })
     }
 
-    fn advance(&mut self, i: usize) -> Result<(), KoshaError> {
-        match self.sources[i].next_entry()? {
-            Some((term, postings)) => {
-                self.heap.push(std::cmp::Reverse((term, i)));
-                self.heads[i] = Some(postings);
-            }
-            None => self.heads[i] = None,
+    /// Stream source `i`'s head postings into `encoder`, then move it on.
+    fn drain_and_advance(
+        &mut self,
+        i: usize,
+        encoder: &mut TermEncoder,
+        field_lengths: &[u32],
+    ) -> Result<(), KoshaError> {
+        self.sources[i].drain_into(
+            self.head_counts[i],
+            encoder,
+            field_lengths,
+            &mut self.positions,
+        )?;
+        if let Some((term, count)) = self.sources[i].next_header()? {
+            self.heap.push(std::cmp::Reverse((term, i)));
+            self.head_counts[i] = count;
         }
         Ok(())
     }
 
-    fn next_term(&mut self) -> Result<Option<(String, Vec<Posting>)>, KoshaError> {
+    /// Encode the next term's postings, from every source that has it, into
+    /// `encoder`. Returns the term, or `None` when every source is done.
+    fn next_term(
+        &mut self,
+        encoder: &mut TermEncoder,
+        field_lengths: &[u32],
+    ) -> Result<Option<String>, KoshaError> {
         let Some(std::cmp::Reverse((term, i))) = self.heap.pop() else {
             return Ok(None);
         };
-        let mut postings = self.heads[i].take().unwrap_or_default();
-        self.advance(i)?;
-        // Equal terms pop in ascending source index: doc_seq order.
+        self.drain_and_advance(i, encoder, field_lengths)?;
+        // Equal terms pop in ascending source index: doc_seq order. A
+        // source's next term is strictly greater (runs hold each term
+        // once), so advancing never re-queues `term`.
         while self
             .heap
             .peek()
             .is_some_and(|std::cmp::Reverse((t, _))| *t == term)
         {
             let std::cmp::Reverse((_, j)) = self.heap.pop().unwrap();
-            postings.extend(self.heads[j].take().unwrap_or_default());
-            self.advance(j)?;
+            self.drain_and_advance(j, encoder, field_lengths)?;
         }
-        Ok(Some((term, postings)))
+        Ok(Some(term))
     }
+}
+
+/// An append-only byte buffer that moves to a scratch file once it holds
+/// `limit` bytes, so one term's encoded section never needs to be resident
+/// in full. Reused across terms.
+struct SpillBuf {
+    mem: Vec<u8>,
+    path: PathBuf,
+    file: Option<fs::File>,
+    /// Bytes already written to `file` for the current term.
+    spilled: u64,
+    limit: usize,
+    /// Total bytes ever moved to `file` (tests and diagnostics).
+    spilled_total: u64,
+}
+
+impl SpillBuf {
+    fn new(path: PathBuf, limit: usize) -> Self {
+        Self {
+            mem: Vec::new(),
+            path,
+            file: None,
+            spilled: 0,
+            limit: limit.max(1),
+            spilled_total: 0,
+        }
+    }
+
+    fn len(&self) -> u64 {
+        self.spilled + self.mem.len() as u64
+    }
+
+    fn maybe_spill(&mut self) -> Result<(), KoshaError> {
+        if self.mem.len() < self.limit {
+            return Ok(());
+        }
+        let file = match &mut self.file {
+            Some(file) => file,
+            slot => slot.insert(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&self.path)?,
+            ),
+        };
+        std::io::Write::write_all(file, &self.mem)?;
+        self.spilled += self.mem.len() as u64;
+        self.spilled_total += self.mem.len() as u64;
+        self.mem.clear();
+        Ok(())
+    }
+
+    /// Append everything buffered for this term to `out`, in order, and
+    /// reset for the next term.
+    fn drain_to(&mut self, out: &mut impl std::io::Write) -> Result<(), KoshaError> {
+        if self.spilled > 0 {
+            let file = self.file.as_mut().expect("spilled bytes have a file");
+            file.seek(SeekFrom::Start(0))?;
+            let copied = std::io::copy(&mut Read::by_ref(file).take(self.spilled), out)?;
+            if copied != self.spilled {
+                return Err(KoshaError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "term spill file shorter than written",
+                )));
+            }
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            self.spilled = 0;
+        }
+        out.write_all(&self.mem)?;
+        self.mem.clear();
+        Ok(())
+    }
+}
+
+/// Encodes one term's postings incrementally, as they arrive in doc_seq
+/// order, into exactly the bytes [`write_postings_skip_split`] (v5) or
+/// [`write_postings_varint_delta`] (v4) would produce from the whole list
+/// (#242). Memory per term: the v5 skip table (a few bytes per 128
+/// postings) plus two [`SpillBuf`]s capped at their limit; everything past
+/// that goes to scratch files and is copied to the shard on `finish`.
+///
+/// Both layouts put the posting count (and for v5 the skip table) before
+/// the posting bytes, which is why the bytes are buffered rather than
+/// written straight to the shard.
+struct TermEncoder {
+    version: u32,
+    count: u32,
+    /// v5 skip-table entries so far.
+    skip: Vec<u8>,
+    /// v5: scoring section. v4: the whole body.
+    scoring: SpillBuf,
+    /// v5 positions section (unused by v4).
+    positions: SpillBuf,
+    prev_doc: u32,
+    // Current v5 block.
+    in_block: usize,
+    block_start: u64,
+    block_max_tf: u32,
+    block_min_fl: u32,
+    block_last: u32,
+    prev_block_last: u32,
+}
+
+impl TermEncoder {
+    fn new(version: u32, scratch_dir: &Path, spill_limit: usize) -> Self {
+        Self {
+            version,
+            count: 0,
+            skip: Vec::new(),
+            scoring: SpillBuf::new(scratch_dir.join("term-scoring"), spill_limit),
+            positions: SpillBuf::new(scratch_dir.join("term-positions"), spill_limit),
+            prev_doc: 0,
+            in_block: 0,
+            block_start: 0,
+            block_max_tf: 0,
+            block_min_fl: u32::MAX,
+            block_last: 0,
+            prev_block_last: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        doc_id: u32,
+        term_frequency: u32,
+        positions: &[u32],
+        field_lengths: &[u32],
+    ) -> Result<(), KoshaError> {
+        self.count += 1;
+        if self.version == SPLIT_INVERTED_VERSION {
+            // v4: [doc delta][tf][n_positions][position deltas] per posting.
+            let out = &mut self.scoring.mem;
+            put_var_u32(out, doc_id.wrapping_sub(self.prev_doc));
+            self.prev_doc = doc_id;
+            put_var_u32(out, term_frequency);
+            put_var_u32(out, positions.len() as u32);
+            let mut prev_pos = 0u32;
+            for &pos in positions {
+                put_var_u32(out, pos.wrapping_sub(prev_pos));
+                prev_pos = pos;
+            }
+            return self.scoring.maybe_spill();
+        }
+
+        if self.in_block == 0 {
+            self.block_start = self.scoring.len();
+            self.block_max_tf = 0;
+            self.block_min_fl = u32::MAX;
+        }
+        put_var_u32(&mut self.scoring.mem, doc_id.wrapping_sub(self.prev_doc));
+        self.prev_doc = doc_id;
+        put_var_u32(&mut self.scoring.mem, term_frequency);
+        self.block_max_tf = self.block_max_tf.max(term_frequency);
+        if let Some(&field_length) = field_lengths.get(doc_id as usize) {
+            self.block_min_fl = self.block_min_fl.min(field_length);
+        }
+        self.block_last = doc_id;
+        self.in_block += 1;
+        if self.in_block == SCORING_BLOCK_LEN {
+            self.close_block();
+        }
+
+        let out = &mut self.positions.mem;
+        put_var_u32(out, positions.len() as u32);
+        let mut prev_pos = 0u32;
+        for &pos in positions {
+            put_var_u32(out, pos.wrapping_sub(prev_pos));
+            prev_pos = pos;
+        }
+        self.scoring.maybe_spill()?;
+        self.positions.maybe_spill()
+    }
+
+    /// Append the current block's skip entry (same fields and order as
+    /// `write_postings_skip_split`).
+    fn close_block(&mut self) {
+        put_var_u32(
+            &mut self.skip,
+            self.block_last.wrapping_sub(self.prev_block_last),
+        );
+        self.prev_block_last = self.block_last;
+        put_var_u32(
+            &mut self.skip,
+            (self.scoring.len() - self.block_start) as u32,
+        );
+        put_var_u32(&mut self.skip, self.block_max_tf);
+        put_var_u32(
+            &mut self.skip,
+            if self.block_min_fl == u32::MAX {
+                0
+            } else {
+                self.block_min_fl
+            },
+        );
+        self.in_block = 0;
+    }
+
+    /// Write the finished term span to `out` and reset for the next term.
+    /// Returns the span's length.
+    fn finish(&mut self, out: &mut impl std::io::Write) -> Result<u64, KoshaError> {
+        if self.in_block > 0 {
+            self.close_block();
+        }
+        let mut header = Vec::with_capacity(5);
+        put_var_u32(&mut header, self.count);
+        let len = header.len() as u64
+            + self.skip.len() as u64
+            + self.scoring.len()
+            + self.positions.len();
+        out.write_all(&header)?;
+        out.write_all(&self.skip)?;
+        self.scoring.drain_to(out)?;
+        self.positions.drain_to(out)?;
+        self.count = 0;
+        self.skip.clear();
+        self.prev_doc = 0;
+        self.prev_block_last = 0;
+        Ok(len)
+    }
+
+    #[cfg(test)]
+    fn spilled_total(&self) -> u64 {
+        self.scoring.spilled_total + self.positions.spilled_total
+    }
+}
+
+/// Per-buffer cap of a [`TermEncoder`]'s in-memory bytes: a sixteenth of
+/// the build budget, between 4 KiB and 8 MiB.
+fn term_spill_limit(build_memory_bytes: usize) -> usize {
+    (build_memory_bytes / 16).clamp(4 * 1024, 8 * 1024 * 1024)
 }
 
 /// File-to-file version of [`maybe_compress_inverted`]: the same output
@@ -2584,8 +2942,8 @@ fn decode_postings_bytes(mut buf: &[u8]) -> Option<(Vec<Posting>, usize)> {
 /// order so the batched decode can emit deterministically.
 type PendingBlobReads<'a> = Vec<(usize, usize, &'a str, usize, usize, bool)>;
 
-/// v4 span codec, retained for reading fixtures/tests — the production
-/// writer moved to [`write_postings_skip_split`] (v5).
+/// v4 span codec, retained for fixtures/tests and as the byte-identity
+/// reference for [`TermEncoder`]'s v4 mode (`KOSHA_POSTINGS_WRITE_VERSION=4`).
 #[cfg_attr(not(test), allow(dead_code))]
 fn write_postings_varint_delta(out: &mut Vec<u8>, postings: &[Posting]) {
     put_var_u32(out, postings.len() as u32);
@@ -2675,6 +3033,11 @@ pub struct ScoringBlockSummary {
 /// positions bytes: per posting (same ordinal order), n_positions +
 ///                  position deltas — read only by the full-postings path
 /// ```
+///
+/// The production writer encodes the same bytes incrementally with
+/// [`TermEncoder`] (#242); this whole-list version is the reference the
+/// byte-identity tests compare against.
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_postings_skip_split(out: &mut Vec<u8>, postings: &[Posting], field_lengths: &[u32]) {
     put_var_u32(out, postings.len() as u32);
 
@@ -3453,6 +3816,16 @@ struct LazyVectorIndex {
 /// lazy v2 vector index.
 pub type BudgetedKnnResult = Option<Result<(Vec<(u32, f64)>, usize), KoshaError>>;
 
+/// One stored document plus its sidecar vectors, as yielded by
+/// [`SegmentReader::iter_doc_records_raw`]. `record`'s sidecar `Vector`
+/// fields keep their empty placeholder value; `vectors` holds each one's
+/// value as `(index into record.fields, vector)`.
+#[derive(Debug, Clone)]
+pub struct RawDocRecord {
+    pub record: DocRecord,
+    pub vectors: Vec<(usize, Vec<f32>)>,
+}
+
 pub struct SegmentReader {
     segment_dir: PathBuf,
     footer: Footer,
@@ -3580,30 +3953,34 @@ impl SegmentReader {
     }
 
     /// Put sidecar vectors back into the placeholder (empty-valued)
-    /// `Vector` fields of `record` (#243). No-op for segments that store
-    /// vectors inline. A placeholder with no matching sidecar entry is
-    /// corruption and fails loudly: returning the empty value would let a
-    /// compaction write the document out without its vector.
+    /// `Vector` fields of `record` (#243), as JSON. No-op for segments that
+    /// store vectors inline.
     fn fill_doc_vectors(&self, record: &mut DocRecord) -> Result<(), KoshaError> {
-        if !self.footer.doc_vectors
-            || !record
-                .fields
-                .iter()
-                .any(|f| f.field_type == FieldType::Vector && f.value.is_empty())
-        {
-            return Ok(());
+        for (index, vector) in self.sidecar_vectors(record)? {
+            record.fields[index].value = serde_json::to_string(&vector)?;
+        }
+        Ok(())
+    }
+
+    /// The sidecar vectors of `record`'s placeholder (empty-valued)
+    /// `Vector` fields, as `(field index, vector)`; empty for segments that
+    /// store vectors inline. A placeholder with no matching sidecar entry
+    /// is corruption and fails loudly: returning the empty value would let
+    /// a compaction write the document out without its vector.
+    fn sidecar_vectors(&self, record: &DocRecord) -> Result<Vec<(usize, Vec<f32>)>, KoshaError> {
+        let is_placeholder = |f: &Field| f.field_type == FieldType::Vector && f.value.is_empty();
+        if !self.footer.doc_vectors || !record.fields.iter().any(is_placeholder) {
+            return Ok(Vec::new());
         }
         let dv = self.doc_vectors()?;
         let mut stored = dv.vectors_for(record.doc_seq)?.into_iter();
-        for field in record
-            .fields
-            .iter_mut()
-            .filter(|f| f.field_type == FieldType::Vector && f.value.is_empty())
-        {
+        let mut out = Vec::new();
+        for (index, field) in record.fields.iter().enumerate() {
+            if !is_placeholder(field) {
+                continue;
+            }
             match stored.next() {
-                Some((name, vector)) if name == field.name => {
-                    field.value = serde_json::to_string(&vector)?;
-                }
+                Some((name, vector)) if name == field.name => out.push((index, vector)),
                 _ => {
                     return Err(KoshaError::CorruptSegment(format!(
                         "{DOC_VECTORS_FILE} in {:?} has no vector for doc_seq {} field '{}'",
@@ -3612,7 +3989,7 @@ impl SegmentReader {
                 }
             }
         }
-        Ok(())
+        Ok(out)
     }
 
     /// Loads this segment's vectors, dispatching on `vector.idx`'s format —
@@ -4291,6 +4668,29 @@ impl SegmentReader {
                 self.doc_count()
             ))),
             Err(e) => Err(e),
+        })
+    }
+
+    /// [`Self::iter_doc_records`] for merges: each record as stored, with
+    /// its sidecar vectors returned as f32 next to it instead of printed
+    /// into the placeholder fields as JSON (#242). Feed the result to
+    /// [`SegmentWriter::add_document_with_vectors`]. Inline-stored vectors
+    /// (`KOSHA_VECTOR_STORE=inline`, pre-#243 segments) stay in their
+    /// fields as JSON, as before. Same error contract as
+    /// `iter_doc_records`: callers must propagate every `Err`.
+    pub fn iter_doc_records_raw(
+        &self,
+    ) -> impl Iterator<Item = Result<RawDocRecord, KoshaError>> + '_ {
+        (0..self.doc_count()).map(move |seq| {
+            let record = self.doc_record_stored(seq)?.ok_or_else(|| {
+                KoshaError::NotFound(format!(
+                    "doc_seq {seq} missing from doc_store in segment {:?} (doc_count={})",
+                    self.segment_dir,
+                    self.doc_count()
+                ))
+            })?;
+            let vectors = self.sidecar_vectors(&record)?;
+            Ok(RawDocRecord { record, vectors })
         })
     }
 
@@ -7249,15 +7649,18 @@ mod bounded_build_tests {
 
     /// A few thousand docs with a Zipf-ish vocabulary: shared stopwords
     /// (long posting lists across every run), mid-frequency words and
-    /// per-doc unique terms, plus filters and a vector.
+    /// per-doc unique terms, plus filters and a vector. `stop` is the
+    /// very-high-df term: in every doc, 1 to 9 times, so its encoded
+    /// postings are far bigger than a small build's per-term spill limit.
     fn corpus(n: usize) -> Vec<(DocumentId, Vec<Field>)> {
         (0..n)
             .map(|i| {
                 let text = format!(
                     "the quick brown fox number {i} jumps over the lazy dog topic{} \
-                     unique{i}term the end word{}",
+                     unique{i}term the end word{}{}",
                     i % 37,
-                    (i * 7919) % 1013
+                    (i * 7919) % 1013,
+                    " stop".repeat(1 + i % 9)
                 );
                 (
                     DocumentId(format!("doc-{i:05}")),
@@ -7290,8 +7693,18 @@ mod bounded_build_tests {
         budget: usize,
         docs: &[(DocumentId, Vec<Field>)],
     ) -> (Footer, usize, usize) {
+        build_version(dir, budget, docs, SKIP_SPLIT_INVERTED_VERSION)
+    }
+
+    fn build_version(
+        dir: &Path,
+        budget: usize,
+        docs: &[(DocumentId, Vec<Field>)],
+        version: u32,
+    ) -> (Footer, usize, usize) {
         let mut w = SegmentWriter::new(SegmentId("seg".into()), dir.to_path_buf())
-            .with_build_memory_bytes(budget);
+            .with_build_memory_bytes(budget)
+            .with_postings_write_version(version);
         for (id, fields) in docs {
             w.add_document(id.clone(), fields.clone());
         }
@@ -7315,8 +7728,9 @@ mod bounded_build_tests {
     }
 
     /// The spill path must be invisible in the output: a segment built with
-    /// a tiny budget (dozens of runs) is byte-for-byte the segment built
-    /// fully in memory, footer aside from its timestamp.
+    /// a tiny budget (dozens of runs, and a 4 KiB per-term encoder limit
+    /// that the very-high-df `stop` spills past) is byte-for-byte the
+    /// segment built fully in memory, footer aside from its timestamp.
     #[test]
     fn spilled_build_is_byte_identical_to_in_memory_build() {
         let docs = corpus(3_000);
@@ -7325,8 +7739,153 @@ mod bounded_build_tests {
         let (fb, runs_b, _) = build(&b_dir, 64 * 1024, &docs);
         assert_eq!(runs_a, 0);
         assert!(runs_b >= 10, "expected many runs, got {runs_b}");
+        assert_eq!(term_spill_limit(64 * 1024), 4 * 1024);
 
-        let (a, b) = (files(&a_dir), files(&b_dir));
+        assert_same_files(&a_dir, &b_dir, &fa, &fb);
+        assert!(!b_dir.join(BUILD_DIR).exists(), "scratch removed");
+
+        // And it reads back: postings, blooms and stored docs.
+        let r = SegmentReader::open(b_dir.clone()).unwrap();
+        assert_eq!(r.doc_count(), 3_000);
+        let the = r.postings("the").unwrap();
+        assert_eq!(the.len(), 3_000);
+        assert!(the.windows(2).all(|w| w[0].doc_id < w[1].doc_id));
+        assert_eq!(the[42].positions, vec![0, 8, 13]);
+        assert_eq!(r.postings("unique1234term").unwrap()[0].doc_id, 1234);
+        // The high-df term: every doc, right tf and positions, and its
+        // bytes are what the whole-list reference encoder produces.
+        let stop = r.postings("stop").unwrap().into_owned();
+        assert_eq!(stop.len(), 3_000);
+        for (i, p) in stop.iter().enumerate() {
+            assert_eq!(p.doc_id, i as u32);
+            assert_eq!(p.term_frequency as usize, 1 + i % 9);
+            assert_eq!(
+                p.positions,
+                (16..16 + (1 + i as u32 % 9)).collect::<Vec<_>>()
+            );
+        }
+        let field_lengths: Vec<u32> = r.iter_doc_meta().map(|m| m.field_length).collect();
+        let mut reference = Vec::new();
+        write_postings_skip_split(&mut reference, &stop, &field_lengths);
+        assert!(reference.len() > 3 * term_spill_limit(64 * 1024));
+        let blob = read_inverted_payload(
+            fs::read(b_dir.join(posting_blob_file_for_term("stop"))).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            blob.windows(reference.len()).any(|w| w == reference),
+            "streamed `stop` span equals the reference encoding"
+        );
+        assert!(fb
+            .term_bloom
+            .as_ref()
+            .unwrap()
+            .may_contain("unique2999term"));
+        let rec = r.doc_record_full(2_999).unwrap().unwrap();
+        assert_eq!(rec.doc_id.0, "doc-02999");
+        fs::remove_dir_all(a_dir).unwrap();
+        fs::remove_dir_all(b_dir).unwrap();
+    }
+
+    /// `KOSHA_POSTINGS_WRITE_VERSION=4` streams through the same encoder:
+    /// spilled and in-memory v4 builds are identical and read back.
+    #[test]
+    fn spilled_v4_build_is_byte_identical_to_in_memory_build() {
+        let docs = corpus(2_000);
+        let (a_dir, b_dir) = (scratch("mem4"), scratch("spill4"));
+        let (fa, _, _) = build_version(&a_dir, usize::MAX, &docs, SPLIT_INVERTED_VERSION);
+        let (fb, runs_b, _) = build_version(&b_dir, 64 * 1024, &docs, SPLIT_INVERTED_VERSION);
+        assert!(runs_b >= 5, "expected several runs, got {runs_b}");
+        assert_same_files(&a_dir, &b_dir, &fa, &fb);
+        let toc = read_inverted_payload(fs::read(b_dir.join("inverted.idx")).unwrap()).unwrap();
+        assert_eq!(toc[4..8], SPLIT_INVERTED_VERSION.to_le_bytes());
+        let r = SegmentReader::open(b_dir.clone()).unwrap();
+        let stop = r.postings("stop").unwrap().into_owned();
+        assert_eq!(stop.len(), 2_000);
+        let mut reference = Vec::new();
+        write_postings_varint_delta(&mut reference, &stop);
+        let blob = read_inverted_payload(
+            fs::read(b_dir.join(posting_blob_file_for_term("stop"))).unwrap(),
+        )
+        .unwrap();
+        assert!(blob.windows(reference.len()).any(|w| w == reference));
+        fs::remove_dir_all(a_dir).unwrap();
+        fs::remove_dir_all(b_dir).unwrap();
+    }
+
+    /// The streaming encoder emits exactly the whole-list encoders' bytes,
+    /// for both versions, across block boundaries, spills and reuse.
+    #[test]
+    fn term_encoder_matches_whole_list_encoders() {
+        let dir = scratch("encoder");
+        fs::create_dir_all(&dir).unwrap();
+        let field_lengths: Vec<u32> = (0..5_000u32).map(|i| 3 + (i * 31) % 200).collect();
+        let mut x = 7u64;
+        let mut rand = move |m: u32| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 33) as u32) % m
+        };
+        // Lengths around the block size, and one in every doc.
+        let mut terms: Vec<Vec<Posting>> = Vec::new();
+        for n in [1usize, 2, 127, 128, 129, 255, 256, 257, 1_000, 5_000] {
+            let mut doc = 0u32;
+            let postings = (0..n)
+                .map(|k| {
+                    doc = if n == 5_000 {
+                        k as u32
+                    } else {
+                        doc + 1 + rand(3)
+                    };
+                    let tf = 1 + rand(6);
+                    let mut pos = 0;
+                    let positions = (0..tf)
+                        .map(|_| {
+                            pos += rand(400);
+                            pos
+                        })
+                        .collect();
+                    Posting {
+                        doc_id: doc,
+                        term_frequency: tf,
+                        positions,
+                    }
+                })
+                .collect();
+            terms.push(postings);
+        }
+        for version in [SKIP_SPLIT_INVERTED_VERSION, SPLIT_INVERTED_VERSION] {
+            // A 64-byte limit spills nearly every posting.
+            let mut encoder = TermEncoder::new(version, &dir, 64);
+            for postings in &terms {
+                let mut expected = Vec::new();
+                if version == SPLIT_INVERTED_VERSION {
+                    write_postings_varint_delta(&mut expected, postings);
+                } else {
+                    write_postings_skip_split(&mut expected, postings, &field_lengths);
+                }
+                for p in postings {
+                    encoder
+                        .push(p.doc_id, p.term_frequency, &p.positions, &field_lengths)
+                        .unwrap();
+                }
+                let mut got = Vec::new();
+                let len = encoder.finish(&mut got).unwrap();
+                assert_eq!(len as usize, got.len());
+                assert!(
+                    got == expected,
+                    "v{version}, {} postings: streamed bytes differ",
+                    postings.len()
+                );
+            }
+            assert!(encoder.spilled_total() > 0, "the spill files were used");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn assert_same_files(a_dir: &Path, b_dir: &Path, fa: &Footer, fb: &Footer) {
+        let (a, b) = (files(a_dir), files(b_dir));
         let names: Vec<&str> = a.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, b.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>());
         assert!(names.iter().any(|n| n.starts_with("postings")), "{names:?}");
@@ -7339,30 +7898,169 @@ mod bounded_build_tests {
                 "{name} differs between in-memory and spilled builds"
             );
         }
-        let mut fa_json = serde_json::to_value(&fa).unwrap();
-        let mut fb_json = serde_json::to_value(&fb).unwrap();
+        let mut fa_json = serde_json::to_value(fa).unwrap();
+        let mut fb_json = serde_json::to_value(fb).unwrap();
         fa_json["created_at"] = serde_json::Value::Null;
         fb_json["created_at"] = serde_json::Value::Null;
         assert_eq!(fa_json, fb_json);
-        assert!(!b_dir.join(BUILD_DIR).exists(), "scratch removed");
+    }
 
-        // And it reads back: postings, blooms and stored docs.
-        let r = SegmentReader::open(b_dir.clone()).unwrap();
-        assert_eq!(r.doc_count(), 3_000);
-        let the = r.postings("the").unwrap();
-        assert_eq!(the.len(), 3_000);
-        assert!(the.windows(2).all(|w| w[0].doc_id < w[1].doc_id));
-        assert_eq!(the[42].positions, vec![0, 8, 13]);
-        assert_eq!(r.postings("unique1234term").unwrap()[0].doc_id, 1234);
-        assert!(fb
-            .term_bloom
-            .as_ref()
-            .unwrap()
-            .may_contain("unique2999term"));
-        let rec = r.doc_record_full(2_999).unwrap().unwrap();
-        assert_eq!(rec.doc_id.0, "doc-02999");
-        fs::remove_dir_all(a_dir).unwrap();
-        fs::remove_dir_all(b_dir).unwrap();
+    /// Tricky f32s: their JSON round trip is exact too, but the raw path
+    /// must not depend on that.
+    fn vector_docs(n: usize) -> Vec<(DocumentId, Vec<Field>)> {
+        (0..n)
+            .map(|i| {
+                let v = [
+                    1.0f32 / 3.0 + i as f32,
+                    -0.0,
+                    f32::MIN_POSITIVE / 7.0,
+                    f32::MAX,
+                    std::f32::consts::PI * i as f32,
+                ];
+                let mut fields = vec![
+                    Field::text("body", format!("doc {i} text")),
+                    Field::keyword("tag", format!("t{}", i % 3)),
+                    Field {
+                        name: "emb".into(),
+                        field_type: FieldType::Vector,
+                        value: serde_json::to_string(&v).unwrap(),
+                    },
+                ];
+                if i % 2 == 0 {
+                    fields.push(Field::text("notes", "after the vector"));
+                }
+                (DocumentId(format!("v{i}")), fields)
+            })
+            .collect()
+    }
+
+    fn write_segment(dir: &Path, mode: VectorStoreMode, docs: &[(DocumentId, Vec<Field>)]) {
+        let mut w = SegmentWriter::new(SegmentId("v".into()), dir.to_path_buf())
+            .with_vector_store_mode(mode);
+        for (id, fields) in docs {
+            w.add_document(id.clone(), fields.clone());
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+    }
+
+    /// Re-write `src` through the merge path (`iter_doc_records_raw` +
+    /// `add_document_with_vectors`).
+    fn remerge(src: &Path, dst: &Path, mode: VectorStoreMode) {
+        let r = SegmentReader::open(src.to_path_buf()).unwrap();
+        let mut w = SegmentWriter::new(SegmentId("v".into()), dst.to_path_buf())
+            .with_vector_store_mode(mode);
+        for raw in r.iter_doc_records_raw() {
+            let raw = raw.unwrap();
+            w.add_document_with_vectors(raw.record.doc_id, raw.record.fields, raw.vectors);
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+    }
+
+    fn vector_bits(dir: &Path) -> Vec<(String, String, Vec<u32>)> {
+        let r = SegmentReader::open(dir.to_path_buf()).unwrap();
+        let mut out = Vec::new();
+        for rec in r.iter_doc_records() {
+            let rec = rec.unwrap();
+            for f in rec
+                .fields
+                .iter()
+                .filter(|f| f.field_type == FieldType::Vector)
+            {
+                let v: Vec<f32> = serde_json::from_str(&f.value).unwrap();
+                out.push((
+                    rec.doc_id.0.clone(),
+                    f.name.clone(),
+                    v.iter().map(|x| x.to_bits()).collect(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// The merge path hands sidecar vectors over as f32: a sidecar →
+    /// sidecar re-merge reproduces every file, and sidecar ↔ inline
+    /// conversions keep the vectors bit-identical.
+    #[test]
+    fn raw_records_pass_vectors_through_bit_identically() {
+        let docs = vector_docs(300);
+        let sidecar = scratch("vec-sidecar");
+        let inline = scratch("vec-inline");
+        write_segment(&sidecar, VectorStoreMode::Sidecar, &docs);
+        write_segment(&inline, VectorStoreMode::Inline, &docs);
+        let expected = vector_bits(&sidecar);
+        assert_eq!(expected.len(), 300);
+        assert_eq!(vector_bits(&inline), expected);
+
+        let raw = SegmentReader::open(sidecar.clone()).unwrap();
+        let first = raw.iter_doc_records_raw().next().unwrap().unwrap();
+        assert!(first.record.fields[2].value.is_empty(), "placeholder kept");
+        assert_eq!(first.vectors.len(), 1);
+        assert_eq!(first.vectors[0].0, 2, "index into the record's fields");
+        let want: Vec<f32> = serde_json::from_str(&docs[0].1[2].value).unwrap();
+        assert_eq!(
+            first.vectors[0]
+                .1
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            want.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+
+        // sidecar → sidecar: same bytes, file for file.
+        let again = scratch("vec-sidecar2");
+        remerge(&sidecar, &again, VectorStoreMode::Sidecar);
+        let (fa, fb) = (
+            SegmentReader::read_footer(&sidecar).unwrap(),
+            SegmentReader::read_footer(&again).unwrap(),
+        );
+        assert_same_files(&sidecar, &again, &fa, &fb);
+
+        // sidecar → inline: the writer fills in the JSON, exactly as
+        // `doc_record_full` does, so the doc store matches an inline build.
+        let to_inline = scratch("vec-to-inline");
+        remerge(&sidecar, &to_inline, VectorStoreMode::Inline);
+        assert!(!SegmentReader::read_footer(&to_inline).unwrap().doc_vectors);
+        assert_eq!(
+            fs::read(to_inline.join("doc_store.bin")).unwrap(),
+            fs::read(inline.join("doc_store.bin")).unwrap()
+        );
+        assert_eq!(vector_bits(&to_inline), expected);
+
+        // inline → sidecar: nothing supplied, parsed from the JSON.
+        let to_sidecar = scratch("vec-to-sidecar");
+        remerge(&inline, &to_sidecar, VectorStoreMode::Sidecar);
+        assert_eq!(
+            fs::read(to_sidecar.join(DOC_VECTORS_FILE)).unwrap(),
+            fs::read(sidecar.join(DOC_VECTORS_FILE)).unwrap()
+        );
+        assert_eq!(vector_bits(&to_sidecar), expected);
+
+        for d in [sidecar, inline, again, to_inline, to_sidecar] {
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// A placeholder with no sidecar entry fails the raw read too.
+    #[test]
+    fn raw_records_reject_a_missing_sidecar_vector() {
+        let dir = scratch("vec-missing");
+        write_segment(&dir, VectorStoreMode::Sidecar, &vector_docs(3));
+        // Rewrite the sidecar with doc 1's entries dropped.
+        let mut w = SegmentWriter::new(SegmentId("x".into()), scratch("vec-missing-src"))
+            .with_vector_store_mode(VectorStoreMode::Sidecar);
+        let docs = vector_docs(3);
+        w.add_document(docs[0].0.clone(), docs[0].1.clone());
+        w.add_document(docs[2].0.clone(), docs[2].1.clone());
+        let other = w.output_dir.clone();
+        w.finalize(Bm25Params::default()).unwrap();
+        fs::copy(other.join(DOC_VECTORS_FILE), dir.join(DOC_VECTORS_FILE)).unwrap();
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let results: Vec<_> = r.iter_doc_records_raw().collect();
+        assert!(results
+            .iter()
+            .any(|r| matches!(r, Err(KoshaError::CorruptSegment(_)))));
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(other).unwrap();
     }
 
     /// The in-memory postings never exceed the budget by more than one

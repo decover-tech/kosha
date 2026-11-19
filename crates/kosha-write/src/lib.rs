@@ -1493,14 +1493,21 @@ impl Indexer {
             // the writer, and `SegmentWriter`'s `Drop` removes that scratch
             // (and `seg_dir` itself, still empty), so no partial output is
             // left on disk.
-            for doc_rec in reader.iter_doc_records() {
-                let doc_rec = doc_rec?;
+            //
+            // `iter_doc_records_raw` hands sidecar vectors over as f32, so
+            // they pass straight into the output without a JSON round trip
+            // (#242); inline-stored vectors stay JSON in their fields.
+            for raw in reader.iter_doc_records_raw() {
+                let kosha_segment::RawDocRecord {
+                    record: doc_rec,
+                    vectors,
+                } = raw?;
                 if ts.is_some_and(|set| set.contains(&doc_rec.doc_seq)) {
                     continue;
                 }
                 seq_remap.insert((entry.segment_id.clone(), doc_rec.doc_seq), next_new_seq);
                 next_new_seq += 1;
-                writer.add_document(doc_rec.doc_id, doc_rec.fields);
+                writer.add_document_with_vectors(doc_rec.doc_id, doc_rec.fields, vectors);
                 any_docs = true;
             }
         }
@@ -2571,9 +2578,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// #243: compaction reads every input doc through `iter_doc_records`,
-    /// which must put sidecar vectors back, or the merged segment would
-    /// lose them. The merged segment stores them in a sidecar again.
+    /// #243: compaction reads every input doc through `iter_doc_records_raw`,
+    /// which must hand sidecar vectors over, or the merged segment would
+    /// lose them. The merged segment stores them in a sidecar again, and
+    /// they are bit-identical (no JSON round trip since #242).
     #[test]
     fn compaction_preserves_sidecar_vectors() {
         let dir = std::env::temp_dir().join(format!("kosha-compact-docvec-{}", std::process::id()));
@@ -2624,7 +2632,8 @@ mod tests {
             let i: usize = record.doc_id.0[1..].parse().unwrap();
             let emb = record.fields.iter().find(|f| f.name == "emb").unwrap();
             let got: Vec<f32> = serde_json::from_str(&emb.value).unwrap();
-            assert_eq!(got, vector(i), "doc {i}");
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&vector(i)), "doc {i}");
             seen += 1;
         }
         assert_eq!(seen, 3);
