@@ -147,8 +147,8 @@ def test_match_defaults_to_or_like_opensearch():
 
 
 def test_one_term_across_fields_is_one_clause():
-    # A typical keyword query builder searches each term in four fields.
-    # Kosha has one text index, so the four clauses are the same clause.
+    # A typical keyword query builder searches each term in four fields:
+    # one clause over those four fields (Kosha's `fields`, #249).
     per_field = [
         {"match": {field: {"query": "indemnity"}}}
         for field in ("content", "title", "author", "labels")
@@ -164,7 +164,91 @@ def test_one_term_across_fields_is_one_clause():
         }
     )
     assert kosha["query_text"] == "indemnity"
+    assert kosha["fields"] == ["content", "title", "author", "labels"]
     assert kosha["filter"] == SCOPE_KOSHA
+
+
+def test_match_on_a_field_restricts_and_boosts_it():
+    kosha = translate({"query": {"match": {"title": {"query": "indemnity", "boost": 2}}}})
+    assert kosha["query_text"] == "indemnity"
+    assert kosha["fields"] == ["title^2"]
+    kosha = translate({"query": {"match": {"content": "indemnity"}}})
+    assert kosha["fields"] == ["content"]
+
+
+def test_multi_match_maps_fields_and_boosts():
+    kosha = translate(
+        {
+            "query": {
+                "multi_match": {
+                    "query": "breach of contract",
+                    "fields": ["title^3", "content"],
+                    "type": "most_fields",
+                    "operator": "and",
+                }
+            }
+        }
+    )
+    assert kosha["query_text"] == "breach of contract"
+    assert kosha["operator"] == "and"
+    assert kosha["fields"] == ["title^3", "content"]
+    # No fields (or `*`) searches every text field: no restriction.
+    for spec in ({"query": "x"}, {"query": "x", "fields": ["*"]}):
+        assert "fields" not in translate({"query": {"multi_match": spec}})
+
+
+def test_same_term_in_several_fields_keeps_the_highest_boost():
+    should = [
+        {"match": {"title": {"query": "indemnity", "boost": 2}}},
+        {"match": {"title": {"query": "indemnity", "boost": 5}}},
+        {"match": {"content": {"query": "indemnity"}}},
+    ]
+    kosha = translate({"query": {"bool": {"should": should, "minimum_should_match": 1}}})
+    assert kosha["fields"] == ["title^5", "content"]
+
+
+def test_required_clauses_on_different_fields_search_their_union():
+    kosha = translate(
+        {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"match": {"title": "indemnity"}},
+                        {"match": {"content": "liability"}},
+                    ]
+                }
+            }
+        }
+    )
+    assert kosha["query_text"] == "indemnity liability"
+    assert kosha["fields"] == ["title", "content"]
+    # One clause over every field lifts the restriction.
+    kosha = translate(
+        {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"match": {"title": "indemnity"}},
+                        {"multi_match": {"query": "liability"}},
+                    ]
+                }
+            }
+        }
+    )
+    assert "fields" not in kosha
+
+
+def test_one_phrase_across_fields_keeps_every_field():
+    should = [
+        {"match_phrase": {field: "breach of contract"}} for field in ("content", "title")
+    ]
+    kosha = translate({"query": {"bool": {"should": should, "minimum_should_match": 1}}})
+    assert kosha["match_phrase"] == {
+        "field": "content",
+        "phrase": "breach of contract",
+        "slop": 0,
+        "fields": ["content", "title"],
+    }
 
 
 def test_several_required_terms_are_joined_with_and():

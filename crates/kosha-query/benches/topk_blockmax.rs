@@ -139,6 +139,7 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         highlight: None,
         aggs: HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         // This bench's entire point is the exact-count invariant across
@@ -148,10 +149,13 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
         rank: None,
         mode: None,
+        fields: Vec::new(),
     }
 }
 

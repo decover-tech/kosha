@@ -134,6 +134,7 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         highlight: None,
         aggs: std::collections::HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         exact_total_hits: None,
@@ -141,10 +142,13 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
         rank: None,
         mode: None,
+        fields: Vec::new(),
     }
 }
 

@@ -1,5 +1,8 @@
 pub mod analysis;
 pub mod deletes;
+pub mod fields;
+pub mod fuzzy;
+pub mod rank;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -13,6 +16,9 @@ pub use analysis::{
     TokenizerKind,
 };
 pub use docset::{evaluate_filter, DocSet};
+pub use fields::{FieldBoost, FieldIndex, FieldStats, ALL_FIELD};
+pub use fuzzy::{Fuzziness, FuzzyQuery};
+pub use rank::{CompiledRankBy, RankBySpec};
 
 /// Pluggable namespace registry and manifest store.
 ///
@@ -114,6 +120,11 @@ pub enum FieldType {
     Date,
     Boolean,
     Vector,
+    /// A latitude/longitude pair (issue #212). Accepted as `"lat,lon"`,
+    /// `{"lat": .., "lon": ..}` or GeoJSON `[lon, lat]`; stored as given and
+    /// copied into the filter columns as the canonical `"lat,lon"` text,
+    /// where `geo_distance` filters and geo decays read it.
+    GeoPoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +175,13 @@ impl Field {
             name: n.into(),
             field_type: FieldType::Boolean,
             value: v.to_string(),
+        }
+    }
+    pub fn geo_point(n: impl Into<String>, lat: f64, lon: f64) -> Self {
+        Self {
+            name: n.into(),
+            field_type: FieldType::GeoPoint,
+            value: rank::canonical_geo(lat, lon),
         }
     }
     pub fn vector(n: impl Into<String>, v: Vec<f32>) -> Self {
@@ -332,6 +350,81 @@ pub enum FilterClause {
     Exists {
         exists: ExistsFilter,
     },
+    /// A `GeoPoint` field within `distance` of a point (issue #212).
+    GeoDistance {
+        geo_distance: GeoDistanceFilter,
+    },
+}
+
+/// Body of a `geo_distance` clause, in Elasticsearch's shape:
+/// `{"distance": "10km", "<field>": {"lat": .., "lon": ..}}`. The point may
+/// also be `"lat,lon"` or GeoJSON `[lon, lat]`; the distance a number of
+/// meters or a string with a unit (`m`, `km`, `mi`, ...).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeoDistanceFilter {
+    pub field: String,
+    pub lat: f64,
+    pub lon: f64,
+    /// Meters.
+    pub distance: f64,
+}
+
+impl Serialize for GeoDistanceFilter {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("distance", &self.distance)?;
+        map.serialize_entry(
+            &self.field,
+            &serde_json::json!({"lat": self.lat, "lon": self.lon}),
+        )?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for GeoDistanceFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut obj = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let distance = obj
+            .remove("distance")
+            .ok_or_else(|| D::Error::custom("geo_distance needs a \"distance\""))?;
+        let distance = rank::parse_distance_meters(&distance)
+            .filter(|d| d.is_finite() && *d >= 0.0)
+            .ok_or_else(|| {
+                D::Error::custom(format!(
+                    "geo_distance.distance {distance} is not a distance (e.g. \"10km\" or meters)"
+                ))
+            })?;
+        // Elasticsearch options that only change precision are accepted
+        // and ignored; everything else is the field.
+        obj.remove("distance_type");
+        obj.remove("validation_method");
+        let mut fields = obj.into_iter();
+        let (field, point) = fields
+            .next()
+            .ok_or_else(|| D::Error::custom("geo_distance needs a field and a point"))?;
+        if let Some((extra, _)) = fields.next() {
+            return Err(D::Error::custom(format!(
+                "geo_distance takes one field, found `{field}` and `{extra}`"
+            )));
+        }
+        let (lat, lon) = match &point {
+            serde_json::Value::String(s) => rank::parse_geo_str(s),
+            other => rank::parse_geo_json(other),
+        }
+        .ok_or_else(|| {
+            D::Error::custom(format!(
+                "geo_distance point for `{field}` must be {{\"lat\": .., \"lon\": ..}}, \"lat,lon\" or [lon, lat] within range"
+            ))
+        })?;
+        Ok(Self {
+            field,
+            lat,
+            lon,
+            distance,
+        })
+    }
 }
 
 /// Body of an `exists` clause.
@@ -342,7 +435,15 @@ pub struct ExistsFilter {
 }
 
 /// Clause keys `FilterClause` accepts, as reported in parse errors.
-const FILTER_CLAUSE_KEYS: [&str; 6] = ["term", "terms", "range", "bool", "match_all", "exists"];
+const FILTER_CLAUSE_KEYS: [&str; 7] = [
+    "term",
+    "terms",
+    "range",
+    "bool",
+    "match_all",
+    "exists",
+    "geo_distance",
+];
 
 /// Deserialized by dispatching on the clause's single key rather than with
 /// `#[serde(untagged)]`.
@@ -411,6 +512,9 @@ impl<'de> Deserialize<'de> for FilterClause {
             }),
             "exists" => Ok(FilterClause::Exists {
                 exists: body(inner)?,
+            }),
+            "geo_distance" => Ok(FilterClause::GeoDistance {
+                geo_distance: body(inner)?,
             }),
             other => {
                 let hint = match other {
@@ -796,10 +900,42 @@ fn default_case_insensitive() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchPhraseQuery {
+    /// The field the phrase must occur in (#249). `_all`, `*` or empty
+    /// means any one `Text` field — never across two of them. Segments
+    /// written before #249 have no per-field index and match the phrase
+    /// in their combined index.
+    #[serde(default)]
     pub field: String,
     pub phrase: String,
     #[serde(default)]
     pub slop: u32,
+    /// Several fields the phrase may occur in (any one of them, scored
+    /// with the best). Overrides `field` when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
+impl MatchPhraseQuery {
+    /// The specific fields the phrase is restricted to, or `None` when it
+    /// may occur in any field (`_all`, `*`, or no field named).
+    pub fn restricted_fields(&self) -> Option<Vec<String>> {
+        let named: Vec<&str> = if self.fields.is_empty() {
+            vec![self.field.as_str()]
+        } else {
+            self.fields.iter().map(String::as_str).collect()
+        };
+        let mut out: Vec<String> = Vec::with_capacity(named.len());
+        for name in named {
+            let name = name.trim();
+            if name.is_empty() || name == "*" || name == fields::ALL_FIELD {
+                return None;
+            }
+            if !out.iter().any(|f| f == name) {
+                out.push(name.to_string());
+            }
+        }
+        Some(out)
+    }
 }
 
 // ─── Aggregation types ─────────────────────────────────────────────────────
@@ -1119,6 +1255,21 @@ pub struct Footer {
     /// current schema says. See [`analysis`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis: Option<SegmentAnalysis>,
+    /// Per-field postings and statistics (issue #249). `None` — every
+    /// segment written before per-field indexes existed, or with
+    /// `KOSHA_FIELD_INDEX=off` — means the segment has only the combined
+    /// index: a field-restricted query is answered from it (matching in
+    /// any field), never with zero hits. See [`fields`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_index: Option<FieldIndex>,
+    /// Bloom over the deletion neighbourhood of the combined-index terms
+    /// (each term and every string one character deletion away from it),
+    /// for pruning one-edit fuzzy queries (issue #201): see
+    /// [`fuzzy::build_fuzzy_bloom`]. `None` — segments written before
+    /// #201, and segments whose neighbourhood is too large for a useful
+    /// bloom — means fuzzy queries cannot prune the segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzzy_bloom: Option<BloomFilter>,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -1191,12 +1342,18 @@ impl BloomFilter {
     /// A filter that cannot be read (empty, or a bit that falls outside the
     /// text) cannot prune: the answer is `true`.
     pub fn may_contain(&self, value: &str) -> bool {
+        self.may_contain_hashed(bloom_key_hashes(value))
+    }
+
+    /// [`Self::may_contain`] for a value already hashed with
+    /// [`bloom_key_hashes`]: the hashes do not depend on the filter, so a
+    /// caller probing many blooms with many values hashes each value once.
+    pub fn may_contain_hashed(&self, (h1, h2): (u64, u64)) -> bool {
         if self.num_bits == 0 || self.bits_b64.is_empty() {
             return true;
         }
         let text = self.bits_b64.as_bytes();
         let m = self.num_bits as u64;
-        let (h1, h2) = bloom_hashes(value);
         for i in 0..self.k {
             let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) % m;
             match base64_byte(text, (bit / 8) as usize) {
@@ -1315,9 +1472,12 @@ pub fn segment_may_contain_terms(
     let Some(bloom) = bloom else {
         return true; // legacy footer — cannot prune
     };
+    // A per-field key (#249) is checked as its plain term: the bloom
+    // holds only combined-index terms, and every field term is one.
+    let may_contain = |t: &String| bloom.may_contain(fields::bloom_term(t));
     match mode {
-        TermBloomMode::And => terms.iter().all(|t| bloom.may_contain(t)),
-        TermBloomMode::Or => terms.iter().any(|t| bloom.may_contain(t)),
+        TermBloomMode::And => terms.iter().all(may_contain),
+        TermBloomMode::Or => terms.iter().any(may_contain),
     }
 }
 
@@ -1337,7 +1497,12 @@ fn bloom_num_hashes(num_bits: usize, n: usize) -> usize {
     ((num_bits as f64 / n as f64) * 2f64.ln()).round() as usize
 }
 
-/// Stable FNV-1a based double hash (not `DefaultHasher`, which is not portable).
+/// The two hashes a [`BloomFilter`] probes `value` with (stable FNV-1a
+/// double hash; not `DefaultHasher`, which is not portable).
+pub fn bloom_key_hashes(value: &str) -> (u64, u64) {
+    bloom_hashes(value)
+}
+
 fn bloom_hashes(value: &str) -> (u64, u64) {
     let h1 = fnv1a64(value.as_bytes(), 0x9e3779b97f4a7c15);
     let h2 = fnv1a64(value.as_bytes(), 0xbf58476d1ce4e5b9) | 1; // odd → full period
@@ -1502,7 +1667,8 @@ pub fn segment_may_match(
         // absence of a bloom cannot prove the field is absent.
         FilterClause::Range { .. }
         | FilterClause::MatchAll { .. }
-        | FilterClause::Exists { .. } => true,
+        | FilterClause::Exists { .. }
+        | FilterClause::GeoDistance { .. } => true,
     }
 }
 
@@ -1730,6 +1896,13 @@ pub struct SearchQuery {
     pub aggs: std::collections::HashMap<String, Aggregation>,
     #[serde(default)]
     pub wildcard: Option<WildcardQuery>,
+    /// Typo-tolerant term matching (issue #201): each token of
+    /// `fuzzy.value` matches the terms within `fuzziness` edits of it. A
+    /// lexical retriever of its own, so it cannot be combined with
+    /// `query_text`, `wildcard` or `match_phrase`; it can be the lexical
+    /// leg of a hybrid request. See [`fuzzy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzzy: Option<FuzzyQuery>,
     #[serde(default)]
     pub match_phrase: Option<MatchPhraseQuery>,
     #[serde(default)]
@@ -1775,6 +1948,24 @@ pub struct SearchQuery {
     /// `total_hits` still counts matching documents, not groups.
     #[serde(default)]
     pub collapse: Option<CollapseSpec>,
+    /// Result diversification (issue #211): at most `max` hits per distinct
+    /// value of `field`, applied while the result list is collected, so the
+    /// page is filled from the next-best groups rather than cut short.
+    /// `collapse` is the `max: 1` special case with one difference:
+    /// documents with no value for the field are never capped here.
+    ///
+    /// The cap is a function of the result order alone: a hit is kept when
+    /// fewer than `max` hits of its group rank above it. A `search_after`
+    /// cursor therefore needs no extra state: each page is the same capped
+    /// list resumed after the cursor, so a document appears at most once
+    /// and a group spent on earlier pages is never refilled.
+    ///
+    /// `total_hits` (and aggregations) count matching documents before the
+    /// cap, as with `collapse`. A pure kNN request is the exception it
+    /// already was: there `total_hits` is the size of the returned
+    /// neighbour set, which is the diversified one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_per: Option<LimitPerSpec>,
     /// Return only these stored fields with each hit (OpenSearch
     /// `_source.includes`). `None` returns every field.
     #[serde(default)]
@@ -1797,6 +1988,25 @@ pub struct SearchQuery {
     /// `hybrid` and forgot the vector gets a 400, not lexical-only hits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<RetrievalMode>,
+    /// Restrict `query_text` to these `Text` fields, each optionally
+    /// boosted: `["title^2", "content"]` (issue #249; Elasticsearch
+    /// `multi_match` `most_fields`). A document's score is the sum over
+    /// fields of `boost × BM25` computed with that field's own length and
+    /// statistics. With the AND operator every query term has to match in
+    /// at least one of the fields. Empty (the default) searches the
+    /// combined index of every `Text` field, as before; `_all` names that
+    /// combined index and may be listed alongside real fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+    /// Score modifiers (issue #212): blend numeric, date and geo attributes
+    /// into the score with field-value boosts and linear / exp / gauss
+    /// decays. Applied in a rescore window: the query is ranked by its own
+    /// score first (BM25, fused RRF, or vector similarity, exactly as
+    /// without `rank_by`), the best `window_size` hits are rescored from
+    /// the filter columns and re-sorted, and only those are returned. See
+    /// [`rank::RankBySpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_by: Option<RankBySpec>,
 }
 
 /// Proto `RetrievalMode`, as the JSON API spells it.
@@ -1858,12 +2068,27 @@ pub struct RankDetails {
     pub knn_rank: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub knn_score: Option<f64>,
+    /// `rank_by` requests only: the hit's score before the modifiers (BM25,
+    /// fused RRF or vector score); `score` is the modified one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_score: Option<f64>,
 }
 
 /// See `SearchQuery.collapse`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollapseSpec {
     pub field: String,
+}
+
+/// See `SearchQuery.limit_per`. JSON: `"limit_per": {"field": "author", "max": 2}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitPerSpec {
+    /// A keyword (or other filterable) field. Documents without a value
+    /// for it are not capped.
+    pub field: String,
+    /// Hits allowed per distinct value; must be >= 1.
+    pub max: usize,
 }
 
 impl SearchQuery {
@@ -1873,13 +2098,89 @@ impl SearchQuery {
         self.bm25_params
             .validate()
             .map_err(KoshaError::InvalidQuery)?;
+        if let Some(ref fuzzy) = self.fuzzy {
+            fuzzy.validate().map_err(KoshaError::InvalidQuery)?;
+            if !self.query_text.trim().is_empty()
+                || self.wildcard.is_some()
+                || self.match_phrase.is_some()
+                || !self.fields.is_empty()
+            {
+                return Err(KoshaError::InvalidQuery(
+                    "fuzzy is a lexical query of its own; it cannot be combined with \
+                     query_text, fields, wildcard or match_phrase (restrict it with \
+                     fuzzy.field)"
+                        .into(),
+                ));
+            }
+        }
+        if !self.fields.is_empty() {
+            fields::parse_field_boosts(&self.fields).map_err(KoshaError::InvalidQuery)?;
+            if self.match_phrase.is_some() || self.wildcard.is_some() {
+                return Err(KoshaError::InvalidQuery(
+                    "fields applies to query_text; restrict match_phrase with its own \
+                     field / fields, and wildcard with its field"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(ref phrase) = self.match_phrase {
+            for name in phrase.fields.iter().chain(std::iter::once(&phrase.field)) {
+                if name.contains('^') || (name.contains('*') && name.trim() != "*") {
+                    return Err(KoshaError::InvalidQuery(format!(
+                        "match_phrase field {name:?}: boosts and field patterns are not supported"
+                    )));
+                }
+            }
+        }
+        if let Some(ref limit) = self.limit_per {
+            if limit.max == 0 {
+                return Err(KoshaError::InvalidQuery(
+                    "limit_per.max must be >= 1".into(),
+                ));
+            }
+            let field = limit.field.trim();
+            if field.is_empty() || field == "_id" || field == "_score" {
+                return Err(KoshaError::InvalidQuery(format!(
+                    "limit_per.field must name a stored keyword field, not {:?}",
+                    limit.field
+                )));
+            }
+            if self.collapse.is_some() {
+                return Err(KoshaError::InvalidQuery(
+                    "collapse and limit_per cannot be combined; collapse is limit_per with max 1"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(ref rank_by) = self.rank_by {
+            rank_by
+                .compile(self.max_results, 0)
+                .map_err(KoshaError::InvalidQuery)?;
+            if !sort_is_by_score(&self.sort) {
+                return Err(KoshaError::InvalidQuery(
+                    "rank_by reorders by the modified score; it cannot be combined with a \
+                     sort other than [_score desc] / [_score desc, _id asc]"
+                        .into(),
+                ));
+            }
+            // The window is the best hits by the query's own score. A
+            // filter alone scores every document the same, so its "best"
+            // window would be an arbitrary cut that drops correct results.
+            if !self.has_lexical_query() && self.knn.is_none() {
+                return Err(KoshaError::InvalidQuery(
+                    "rank_by rescores the best hits of a query; it needs query_text, \
+                     wildcard, match_phrase, fuzzy or knn, not a filter alone"
+                        .into(),
+                ));
+            }
+        }
         let has_lexical = self.has_lexical_query();
         let has_knn = self.knn.is_some();
         match self.mode {
             Some(RetrievalMode::Hybrid) if !(has_lexical && has_knn) => {
                 return Err(KoshaError::InvalidQuery(
-                    "mode \"hybrid\" needs both a lexical query (query_text, wildcard or \
-                     match_phrase) and knn"
+                    "mode \"hybrid\" needs both a lexical query (query_text, wildcard, \
+                     match_phrase or fuzzy) and knn"
                         .into(),
                 ));
             }
@@ -1904,7 +2205,7 @@ impl SearchQuery {
             if !self.is_hybrid() {
                 return Err(KoshaError::InvalidQuery(
                     "rank.rrf fuses a lexical query with knn; the request needs both \
-                     (query_text, wildcard or match_phrase, plus knn)"
+                     (query_text, wildcard, match_phrase or fuzzy, plus knn)"
                         .into(),
                 ));
             }
@@ -1926,10 +2227,56 @@ impl SearchQuery {
         Ok(())
     }
 
+    /// The compiled `rank_by` for this request, `"now"` resolved to the
+    /// current time. `None` without `rank_by`; an invalid one is an error
+    /// ([`Self::validate`] reports it first).
+    pub fn compiled_rank_by(&self) -> Result<Option<CompiledRankBy>, KoshaError> {
+        let Some(ref rank_by) = self.rank_by else {
+            return Ok(None);
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        rank_by
+            .compile(self.max_results, now_ms)
+            .map(Some)
+            .map_err(KoshaError::InvalidQuery)
+    }
+
+    /// How many hits each segment must hand back, best first by the
+    /// query's own score, for the page to be right: `from + max_results`,
+    /// widened to the rescore window under `rank_by` (0 stays 0: nothing
+    /// is returned, so nothing is rescored).
+    pub fn collect_depth(&self) -> usize {
+        let page = self.from.saturating_add(self.max_results);
+        match self.rank_by {
+            Some(ref rank_by) if page > 0 => page.max(rank_by.window(self.max_results)),
+            _ => page,
+        }
+    }
+
     /// True when the request has a lexical retriever: query text, a
     /// wildcard or a phrase. A filter alone is not one.
     pub fn has_lexical_query(&self) -> bool {
-        !self.query_text.trim().is_empty() || self.wildcard.is_some() || self.match_phrase.is_some()
+        !self.query_text.trim().is_empty()
+            || self.wildcard.is_some()
+            || self.match_phrase.is_some()
+            || self.fuzzy.is_some()
+    }
+
+    /// The parsed `fields` list, or `None` when `query_text` searches the
+    /// combined index (no `fields`, or only `_all` unboosted). An invalid
+    /// list is `None` too; [`Self::validate`] rejects it first.
+    pub fn field_boosts(&self) -> Option<Vec<FieldBoost>> {
+        if self.fields.is_empty() {
+            return None;
+        }
+        let parsed = fields::parse_field_boosts(&self.fields).ok()?;
+        if parsed.len() == 1 && parsed[0].is_all() && parsed[0].boost == 1.0 {
+            return None;
+        }
+        Some(parsed)
     }
 
     /// True when the request has both a lexical retriever and `knn`: its
@@ -1964,6 +2311,7 @@ impl SearchQuery {
             && self.query_text.trim().is_empty()
             && self.wildcard.is_none()
             && self.match_phrase.is_none()
+            && self.fuzzy.is_none()
             && self.filter.is_none()
     }
 
@@ -2001,10 +2349,13 @@ impl SearchQuery {
     }
 
     /// Whether answering needs a segment's filter columns (`filters.bin`):
-    /// any filter, any aggregation, a collapse, or a sort on a stored field.
+    /// any filter, any aggregation, a collapse or `limit_per`, `rank_by`
+    /// (its modifiers read the columns), or a sort on a stored field.
     pub fn needs_filter_columns(&self) -> bool {
         self.filter.is_some()
             || self.collapse.is_some()
+            || self.limit_per.is_some()
+            || self.rank_by.is_some()
             || self.knn.as_ref().is_some_and(|k| k.filter.is_some())
             || !self.aggs.is_empty()
             || self.sort.iter().any(|spec| {
@@ -2025,6 +2376,20 @@ impl SearchQuery {
                 .as_ref()
                 .is_some_and(|unwanted| unwanted.iter().any(|f| f == field))
     }
+}
+
+/// True when `sort` orders by score, best first (ties by `_id`): no sort,
+/// `[_score desc]` or `[_score desc, _id asc]`.
+pub fn sort_is_by_score(sort: &[SortSpec]) -> bool {
+    let keys: Vec<(&str, &str)> = sort
+        .iter()
+        .flat_map(|spec| spec.fields.iter())
+        .map(|(field, order)| (field.as_str(), order.order.as_str()))
+        .collect();
+    matches!(
+        keys.as_slice(),
+        [] | [("_score", "desc")] | [("_score", "desc"), ("_id", "asc")]
+    )
 }
 
 /// See `SearchQuery.operator`.
@@ -2569,6 +2934,8 @@ mod tests {
             text_filter_ignore_above: Some(256),
             doc_vectors: false,
             analysis: None,
+            field_index: None,
+            fuzzy_bloom: None,
         }
     }
 

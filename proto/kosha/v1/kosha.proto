@@ -180,6 +180,8 @@ enum FieldType {
   FIELD_TYPE_DATE = 5;
   FIELD_TYPE_BOOLEAN = 6;
   FIELD_TYPE_VECTOR = 7;
+  // "lat,lon", {"lat": .., "lon": ..} or GeoJSON [lon, lat].
+  FIELD_TYPE_GEO_POINT = 8;
 }
 
 message CreateNamespaceResponse {
@@ -260,7 +262,8 @@ message SearchRequest {
   optional double bm25_k1 = 5;
   optional double bm25_b = 6;
 
-  // Filters — Kosha-native filter clause (term/terms/range/bool).
+  // Filters — Kosha-native filter clause (term/terms/range/bool/exists/
+  // geo_distance).
   // Same shape as the ES bool filter that KoshaClient already translates.
   google.protobuf.Struct filter = 7;
 
@@ -289,11 +292,37 @@ message SearchRequest {
   // How a hybrid request fuses its lexical and kNN lists.
   // HTTP: "rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}.
   optional Rank rank = 15;
+
+  // Restrict query_text to these Text fields, each optionally boosted:
+  // ["title^2", "content"]. Scores sum boost x per-field BM25. Empty = the
+  // combined index of every Text field; "_all" names it explicitly.
+  repeated string fields = 16;
+
+  // At most `max` hits per distinct value of a keyword field, applied while
+  // collecting results (the page stays full). HTTP:
+  // "limit_per": {"field": "author", "max": 2}. total_hits counts matches
+  // before the cap.
+  optional LimitPer limit_per = 17;
+
+  // Score modifiers, same shape as the HTTP "rank_by" object: field-value
+  // boosts and linear / exp / gauss decays over Integer, Float, Date and
+  // GeoPoint fields, applied to the best `window_size` hits by the query's
+  // own score. See README "Score modifiers".
+  google.protobuf.Struct rank_by = 18;
+
+  // Typo-tolerant term matching (HTTP "fuzzy"). A lexical query of its own:
+  // not combinable with query_text / fields / wildcard / match_phrase.
+  optional FuzzyQuery fuzzy = 19;
+}
+
+message LimitPer {
+  string field = 1;
+  int32 max = 2;  // >= 1
 }
 
 enum RetrievalMode {
   RETRIEVAL_MODE_UNSPECIFIED = 0;
-  RETRIEVAL_MODE_LEXICAL = 1;   // query_text / wildcard / match_phrase; no knn
+  RETRIEVAL_MODE_LEXICAL = 1;   // query_text / wildcard / match_phrase / fuzzy; no knn
   RETRIEVAL_MODE_SEMANTIC = 2;  // knn only
   // A lexical query plus knn, fused by Reciprocal Rank Fusion over
   // namespace-wide ranks (see Rank). Every request with both is hybrid.
@@ -345,6 +374,21 @@ message HighlightFragments {
   repeated string fragments = 1;
 }
 
+message FuzzyQuery {
+  // "", "_all" or "*" = every Text field.
+  string field = 1;
+  // Analyzed per segment; each token is expanded.
+  string value = 2;
+  // "0", "1", "2", "auto" (default) or "auto:low,high".
+  optional string fuzziness = 3;
+  // Leading characters that must match exactly (default 0).
+  optional int32 prefix_length = 4;
+  // Terms per token per segment, nearest first (default 50, max 1024).
+  optional int32 max_expansions = 5;
+  // An adjacent swap counts as one edit (default true).
+  optional bool transpositions = 6;
+}
+
 message WildcardQuery {
   string field = 1;
   string pattern = 2;
@@ -352,9 +396,12 @@ message WildcardQuery {
 }
 
 message MatchPhraseQuery {
+  // The field the phrase must occur in; "", "_all" or "*" = any one field.
   string field = 1;
   string phrase = 2;
   int32 slop = 3;
+  // Several fields, any one of them (overrides field when non-empty).
+  repeated string fields = 4;
 }
 
 message KnnQuery {
@@ -393,6 +440,8 @@ message RankDetails {
   optional double lexical_score = 2;
   optional int32 knn_rank = 3;
   optional double knn_score = 4;
+  // rank_by requests: the score before the modifiers.
+  optional double base_score = 5;
 }
 
 // ─── Stats ──────────────────────────────────────────────────────────────────

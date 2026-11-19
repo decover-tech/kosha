@@ -100,6 +100,7 @@ fn mk_query(text: &str) -> SearchQuery {
         highlight: None,
         aggs: HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         // This bench validates total_hits correctness itself (HIT_COUNT,
@@ -110,10 +111,13 @@ fn mk_query(text: &str) -> SearchQuery {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
         rank: None,
         mode: None,
+        fields: Vec::new(),
     }
 }
 

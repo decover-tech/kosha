@@ -3,7 +3,8 @@
 //! `tests/fixtures/legacy-seg` was written by the segment writer as it was
 //! before analyzers existed (commit 30d0ff0, `feat/rrf-hybrid`) from the
 //! documents in [`fixture_docs`]. A segment written today with no analyzer
-//! — or with an explicit `["standard"]` — must be byte-identical to it.
+//! — or with an explicit `["standard"]` — and without per-field indexes
+//! (`KOSHA_FIELD_INDEX=off`, #249) must be byte-identical to it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -59,8 +60,11 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn write(dir: &Path, config: Option<&AnalysisConfig>) -> kosha_core::Footer {
+    // Per-field indexes (#249) add keys to the inverted index; with them
+    // off a segment is exactly what the pre-analyzer writer produced.
     let mut writer = SegmentWriter::new(SegmentId("legacy-seg".into()), dir.to_path_buf())
-        .with_text_filter_ignore_above(Some(256));
+        .with_text_filter_ignore_above(Some(256))
+        .with_field_index(false);
     if let Some(config) = config {
         writer = writer.with_analysis(config);
     }
@@ -87,6 +91,11 @@ fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
 fn footer_without_timestamp(bytes: &[u8]) -> serde_json::Value {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
     value.as_object_mut().unwrap().remove("created_at");
+    // `fuzzy_bloom` (#201) is optional footer metadata added after the
+    // fixture was written; readers without it ignore the key and readers
+    // with it treat its absence as "can't prune". Everything else must
+    // match byte for byte.
+    value.as_object_mut().unwrap().remove("fuzzy_bloom");
     value
 }
 

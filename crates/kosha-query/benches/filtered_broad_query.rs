@@ -92,6 +92,7 @@ fn main() {
         highlight: None,
         aggs: Default::default(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         exact_total_hits: None,
@@ -99,10 +100,13 @@ fn main() {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
         rank: None,
         mode: None,
+        fields: Vec::new(),
     };
 
     // Warm the segment cache.

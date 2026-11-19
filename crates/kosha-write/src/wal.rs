@@ -657,6 +657,7 @@ fn field_type_code(field_type: FieldType) -> u8 {
         FieldType::Date => 4,
         FieldType::Boolean => 5,
         FieldType::Vector => 6,
+        FieldType::GeoPoint => 7,
     }
 }
 
@@ -669,6 +670,7 @@ fn field_type_from_code(code: u8) -> Result<FieldType, KoshaError> {
         4 => FieldType::Date,
         5 => FieldType::Boolean,
         6 => FieldType::Vector,
+        7 => FieldType::GeoPoint,
         _ => return Err(invalid("unknown WAL field type")),
     })
 }
@@ -1184,6 +1186,21 @@ mod tests {
         );
         assert_eq!(decoded.documents[0].fields[1].value, "[1, 2.50]");
         assert_eq!(decoded.timestamp, record.timestamp);
+    }
+
+    #[test]
+    fn geo_points_replay_with_their_type() {
+        // #212 GeoPoint fields go through the v3 binary record as strings.
+        let mut record = record("ns", "g");
+        record.documents[0].fields = vec![Field {
+            name: "loc".into(),
+            field_type: FieldType::GeoPoint,
+            value: "52.52,13.405".into(),
+        }];
+        let decoded = decode_record(&encode_record(&record)).unwrap();
+        let field = &decoded.documents[0].fields[0];
+        assert_eq!(field.field_type, FieldType::GeoPoint);
+        assert_eq!(field.value, "52.52,13.405");
     }
 
     #[test]

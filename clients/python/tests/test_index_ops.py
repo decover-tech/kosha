@@ -32,6 +32,7 @@ SCHEMA = {
         "created": {"type": "FIELD_TYPE_DATE"},
         "active": {"type": "FIELD_TYPE_BOOLEAN"},
         "embedding": {"type": "FIELD_TYPE_VECTOR"},
+        "location": {"type": "FIELD_TYPE_GEO_POINT"},
     }
 }
 
@@ -43,6 +44,7 @@ EXPECTED = {
     "created": {"type": "date"},
     "active": {"type": "boolean"},
     "embedding": {"type": "knn_vector"},
+    "location": {"type": "geo_point"},
 }
 
 
@@ -66,6 +68,9 @@ def test_type_spellings_are_translated():
     assert ops_type({"type": "keyword"}) == "keyword"
     assert ops_type({"type": 3}) == "long"
     assert ops_type({"type": "FIELD_TYPE_VECTOR"}) == "knn_vector"
+    # GeoPoint (#212): every spelling, including the server's `GeoPoint`.
+    assert ops_type({"type": "GeoPoint"}) == "geo_point"
+    assert ops_type({"type": 8}) == "geo_point"
     # Only Text fields are analyzed: an analyzer with no type means text.
     assert ops_type({"analyzer": ["standard", "stem"]}) == "text"
     assert ops_type({"type": "FIELD_TYPE_UNSPECIFIED"}) is None

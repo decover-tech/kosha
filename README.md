@@ -31,16 +31,21 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | --- | --- |
 | BM25 lexical search | `k1` / `b` tunable per request: `bm25_params: {"k1": 2.0, "b": 0.3}` on `POST /search`, `k1=` / `b=` on `GET /search`. Either may be omitted and falls back to the segment's build-time value (1.2 / 0.75 unless built otherwise). `k1` must be ≥ 0 and `b` in [0, 1]; anything else (or non-numeric) is a 400. WAND pruning bounds are recomputed for the request's values, so results match exhaustive scoring. `k3` is not supported. IDF and `avgdl` are namespace-level (summed over all segments), so a document scores the same whichever segment holds it; `bm25_params: {"stats": "segment"}` / `bm25_stats=segment` (or `KOSHA_BM25_STATS=segment` server-wide) switches back to per-segment statistics for debugging. Wildcard queries use per-segment statistics |
 | `operator: and` / `or` | AND (default) requires every query term; OR scores the union |
+| Multi-field BM25 (`fields`) | `"fields": ["title^2", "content"]` restricts `query_text` to those `Text` fields (`GET /search?...&fields=title^2,content`). Each field has its own postings, document lengths and statistics (`N` = documents with the field, `avgdl` = its mean length, namespace-level like the combined index), and a hit scores `Σ boost × BM25_field` — Elasticsearch `multi_match` `most_fields`, turbopuffer `Sum` of per-attribute BM25. With AND every query term must match in at least one of the listed fields. `_all` names the combined index of every `Text` field and may be mixed in (`["title^3", "_all"]`). Each field reads the query with the analyzer it was indexed with. Boosts must be > 0; field patterns (`title*`) are not supported. Field queries take an exhaustive per-field path, not block-max WAND (~2 ms vs ~0.3 ms warm for a 10k-hit term on 100k docs, `cargo bench -p kosha-query --bench field_bm25`); rare terms cost the same. See [Per-field indexes](#per-field-indexes) for segments written before this existed |
 | Block-max WAND | Skip-list postings, rarest-first probe ordering, leapfrog AND join; one top-k floor shared across segments, visited highest score ceiling first, with segments that cannot reach the page skipped |
-| `match_phrase` | Positional postings, configurable `slop`. A word a `stop` filter removed still counts as a position, so `"state of the art"` matches across the removed stopwords and `"state art"` does not |
+| `match_phrase` | Positional postings, configurable `slop`. Matches only inside one field: `field` (or a `fields` list, any one of them) restricts it, and `_all` / `*` / no field means any single `Text` field. A phrase never spans two fields or two values of a multi-valued field, at any slop. A word a `stop` filter removed still counts as a position, so `"state of the art"` matches across the removed stopwords and `"state art"` does not |
 | Configurable analyzers | Per-field `analyzer` in the namespace schema: `standard`, `standard@2` (Unicode), `keyword`, `lowercase`, `whitespace`, plus `lowercase` / `stop` / `stem` filters. See [Analyzers](#analyzers) |
 | `wildcard` | Per-field pattern match, case-insensitive by default |
+| `fuzzy` | Typo-tolerant term matching: `"fuzzy": {"field": "content", "value": "recieve", "fuzziness": 1}` finds `receive`. `fuzziness` is `0`, `1`, `2` or `"auto"` (default; Elasticsearch `AUTO:3,6`: exact below 3 characters, one edit up to 5, two from 6; `"auto:low,high"` moves the thresholds). An edit is an insertion, deletion, substitution or — with `transpositions` (default `true`) — a swap of adjacent characters. `prefix_length` (default 0) leading characters must match exactly and make expansion cheaper; `max_expansions` (default 50, at most 1024) caps the terms each token expands to per segment, nearest first, the exact term always kept. A non-exact match must leave a character of the shorter string untouched (`ox` never matches `o`). The value is analyzed with each segment's own analyzer and every token is expanded against that segment's sorted term dictionary (a Levenshtein-automaton walk that skips whole prefix ranges); several tokens combine with `operator` (AND by default). Scoring is tiered so **an exact match always outranks a one-edit match, which always outranks a two-edit one**: per token, `score = (2 − edits) + tf_norm` with `tf_norm ∈ (0, 1]` BM25's length-normalized tf saturation (namespace `avgdl`); no IDF, since expansions differ per segment. `field` (`""` / `_all` / `*` = every `Text` field) restricts it to one field's postings; segments written before per-field indexes answer from their combined index. Its own lexical query: not combinable with `query_text` / `fields` / `wildcard` / `match_phrase`, but can be the lexical leg of a hybrid request and takes `rank_by`. Segments are bloom-pruned for 0- and 1-edit tokens (see [Fuzzy bloom](#fuzzy-bloom)). Runs on an exhaustive path (no block-max WAND). On 1M docs x 30 words in 8 segments (1.08M distinct terms), warm: ~0.5–1 ms at 1 edit and ~3.5–4.5 ms at 2 edits for mid-frequency and rare words, ~10–14 ms when an expansion is a very frequent word (every posting is scored; the exact `query_text` WAND query takes 0.5 ms). The dictionary walk itself is ~0.2 ms per segment at 1 edit and ~2 ms at 2 edits (~0.3 ms with `prefix_length: 2`). Non-fuzzy queries are unchanged (`cargo bench -p kosha-query --bench fuzzy_expansion`) |
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
-| Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
+| Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase` / `fuzzy`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
 | Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `bool` (`must` / `must_not` / `should` / `minimum_should_match`), `match_all` |
 | kNN-scoped filters | `knn.filter` restricts only the vector list; the top-level `filter` restricts both the lexical and the vector list |
 | Sorting | Multi-field `sort` over stored fields, plus `_id` |
 | Pagination | `from` / `max_results`, and an OpenSearch-style `search_after` cursor |
+| Result diversification | `"limit_per": {"field": "author", "max": 2}` returns at most `max` hits per distinct value of a keyword field. The cap is applied while the result list is collected, so a page is filled from the next-best groups instead of coming back short; documents without the field are not capped. `collapse: {"field": ...}` is the one-per-group case (and groups missing values together); the two cannot be combined. `search_after` and `from` resume the same capped list, so no document repeats and a group spent on an earlier page is never refilled. `total_hits` and aggregations count matching documents before the cap (a pure kNN request reports its neighbour set, which is the diversified one). Works for BM25, kNN (diversity is found within the probed `num_candidates`) and hybrid, where each retriever's list is diversified before fusion and `rank_details` ranks are positions in those lists |
+| Score modifiers | `rank_by` blends attributes into the score: `field_value` (`modifier(factor × value)`, Elasticsearch `field_value_factor` modifiers) and `decay` (`linear` / `exp` / `gauss` around an `origin`, with `scale`, `offset`, `decay`) over `Integer`, `Float`, `Date` and `GeoPoint` fields, each with a `weight`. Functions combine by `score_mode` (`sum` default, `multiply`, `avg`, `max`, `min`) and apply to the text score by `boost_mode` (`multiply` default: `text_weight × score × F`; `sum`: `text_weight × score + F`; `replace`: `F`). A decay's `origin` picks its axis: a number (numeric field), a date or `"now"` (scale like `"30d"`), or `{"lat", "lon"}` (scale like `"5km"`). Values come from the filter columns, never the doc store. Applied in a rescore window: the best `window_size` hits by the query's own score (BM25, fused RRF or vector; default `max(100, max_results)`, at most 10,000; a hybrid request rescores within its fused `rank_window_size` list, a kNN request within its `k` neighbours) are rescored and re-sorted, so block-max WAND keeps pruning on BM25 alone; hits below the window are not returned, `total_hits` still counts every match. Each hit reports `rank_details.base_score`. Missing values use the function's `missing` (default 0, which under `multiply` zeroes the hit). `collapse` / `limit_per` apply to the rescored order; `sort` must be by `_score`; `origin: "now"` responses are not cached. Example — halve the score every 30 days: `"rank_by": {"functions": [{"decay": {"field": "published", "function": "exp", "origin": "now", "scale": "30d", "decay": 0.5}}]}` |
+| Geo | `GeoPoint` fields (`"lat,lon"`, `{"lat", "lon"}` or GeoJSON `[lon, lat]`; invalid points are a 400 at index time). `{"geo_distance": {"distance": "10km", "<field>": {"lat": .., "lon": ..}}}` filters by great-circle distance; a `decay` with a geo `origin` ranks by distance |
 | Highlighting | Any number of text fields per request, Elasticsearch-shaped: `"highlight": {"pre_tags": ["<em>"], "post_tags": ["</em>"], "fields": {"title": {}, "body": {"pre_tags": ["<mark>"], "post_tags": ["</mark>"]}}}`. Each field's tags fall back to the top-level `pre_tags` / `post_tags`, then to `<b>` / `</b>`. Hits return `"highlight": {"title": ["..."], "body": ["..."]}` (one fragment per field value, the whole value with the query's terms marked up); requested fields that a hit lacks or that are not `Text` are left out silently. The legacy single-field form `"highlight": {"field": "body"}` still works and still returns the flat `"highlights": [...]` list; that form and `highlights` are deprecated. Giving both `field` and `fields` is a 400. Fragment size/count options and other highlighter types are not supported (unknown options are ignored) |
 | Aggregations | `terms`, `cardinality`, `composite` |
 | Total-hit accounting | Capped counting with an `eq` / `gte` relation (`track_total_hits`-style), overridable per query via `exact_total_hits` / `total_hits_cap` |
@@ -48,7 +53,9 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 ### Indexing and writes
 
-- Bulk document indexing, with field types `Text`, `Keyword`, `Integer`, `Float`, `Date`, `Boolean`, `Vector`.
+- Per-field inverted indexes (#249): besides the combined index of every `Text` field, each segment indexes each `Text` field on its own — postings, per-document lengths and statistics — for `fields` queries and field-restricted phrases. See [Per-field indexes](#per-field-indexes).
+
+- Bulk document indexing, with field types `Text`, `Keyword`, `Integer`, `Float`, `Date`, `Boolean`, `Vector`, `GeoPoint`.
 - `Text` values longer than 256 chars (`KOSHA_TEXT_FILTER_IGNORE_ABOVE`; `off` disables the cap) are full-text searchable and returned in hits, but are not copied into the filter columns, so `term`/`terms`/`range` filters, `sort`, and aggregations do not see them. This matches Elasticsearch's dynamic-mapping `keyword` `ignore_above: 256`. Use `Keyword` for a long value that must be exact-matched.
 - Vector field values are stored once, as binary f32, in each segment's `doc_vectors.bin` instead of as JSON text in `doc_store.bin` (`KOSHA_VECTOR_STORE=sidecar`, the default). Hits and compaction still see the full vector, which comes back as the f32 values that were indexed, re-serialized as JSON. Its text can differ from what was sent: digits beyond f32 precision are lost, and so is number formatting. Set `KOSHA_VECTOR_STORE=inline` to keep the old layout. **Before rolling back to a release older than this change, set `inline` and compact:** older binaries can't read the sidecar, and an older binary compacting a sidecar segment drops its vectors.
 - Upsert by document id — segments holding a prior version of an id are rewritten.
@@ -89,9 +96,57 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 ### Not supported yet
 
 - Reranking (Phase 2, DESIGN.md §3.1). Per-retriever weights for RRF.
+- Multi-field scoring other than a boosted sum (`dis_max` / `best_fields` tie-breakers, turbopuffer `Product` / `Max` of fields), field-name patterns in `fields`, and block-max WAND for `fields` queries.
 - Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document.
+- Fuzzy: block-max WAND over expansions (fuzzy queries score every posting of every expansion), highlighting of fuzzy matches, fuzzy inside `fields` / `match_phrase`, bloom pruning for two-edit tokens.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
 - `kosha-vector-spfresh` (SPFresh/SPANN with LIRE rebalancing) is a standalone, benchmarked prototype; it is not wired into the segment format or the query path.
+
+## Per-field indexes
+
+Every segment has always held one **combined** inverted index: all `Text` fields of a document
+tokenized together, with one length per document. It is unchanged and still answers every query
+without `fields`, so default ranking is exactly what it was. Segments written since #249 add, in
+the same `inverted.idx` and posting blobs:
+
+- each field's own postings (key `\0{field}\0{term}`; no analyzer emits a NUL, so field keys
+  never collide with combined terms) and a norms list holding each document's length in the field;
+- `field_index` in `footer.json`: per-field `doc_count` / `total_length`, and the position gap.
+
+Positions of consecutive `Text` values in a document are now 65,536 apart in both indexes, and
+the phrase slop is clamped below the gap, so a phrase cannot match across fields.
+
+**Existing namespaces keep working without reindexing.** A segment written before this change has
+no `field_index`. A `fields` query or a field-restricted phrase is answered there from its combined
+index (it matches the terms in any field, boosts ignored) — never with zero hits — and phrases
+there can still span fields as before. Compaction rewrites such segments with per-field indexes.
+Until then a namespace with both kinds scores them with different statistics.
+
+**Cost.** On a two-field corpus (`title` ~6 words, `content` ~60) per-field indexes make the
+inverted index 2.3x larger on disk and segment builds 1.5x slower (`cargo bench -p kosha-query
+--bench field_bm25`). An open segment's term dictionary holds the field keys too: on the
+one-field `segment_memory` corpus resident memory while open goes from 6.9 to 13.1 MiB and a cold
+broad query from ~2 to ~5.6 ms (`cargo bench -p kosha-query --bench segment_memory`, with and
+without `KOSHA_FIELD_INDEX=off`); warm queries are unchanged. `KOSHA_FIELD_INDEX=off` writes segments exactly as before (no field
+postings, no position gap). **Before rolling back** to a binary older than this change, set it and
+compact: an older binary ignores `field_index` but lists field keys among a segment's terms, so a
+leading-`*` wildcard could match them.
+
+## Fuzzy bloom
+
+A fuzzy token can't be looked up in a segment's term bloom: its expansions are only known from the
+dictionary. Testing every string within one edit would take hundreds of probes, and a 1%
+false-positive bloom says "maybe" to at least one of them nearly every time. Segments written
+since #201 therefore add `fuzzy_bloom` to `footer.json`: a bloom over every combined-index term and
+every string one character deletion away from it. Two strings are within one edit only if these
+neighbourhoods meet, so a one-edit token needs `len + 1` probes, and a segment that rejects all of
+them for a required token is skipped without being fetched or opened. Zero-edit tokens are tested
+against the ordinary term bloom; two-edit tokens are never pruned.
+
+The neighbourhood is ~8x the vocabulary, so the bloom is only written for segments with at most
+32,768 neighbourhood strings (about 4,000 terms, ≤ ~40 KB of footer); larger segments, and every
+segment written before #201, have none and are always searched. `POST /v1/admin/rebuild-filter-blooms`
+also writes it for existing small segments. Older binaries ignore the key.
 
 ## Analyzers
 
@@ -123,9 +178,10 @@ The first name picks the analyzer, every later name appends a filter:
 | `stem` | English Snowball stemmer (`rust-stemmers`): `running`, `runs` and `run` all match each other |
 
 `default_analyzer` covers every `Text` field the schema does not list (clients send every JSON
-string as `Text`). All text fields share one term space, so a query matches a document if it
-matches one analysis of the query across its fields — e.g. a stemmed `title` term and an unstemmed
-`body` term together.
+string as `Text`). The combined index (a query without `fields`) holds every text field's terms,
+so a query matches a document if it matches one analysis of the query across its fields — e.g. a
+stemmed `title` term and an unstemmed `body` term together. A `fields` query reads each listed
+field with that field's own chain.
 
 **Compatibility.** Each segment records the chains it was written with in its footer, and every
 query is analyzed per segment with those chains, so changing the schema (or the tokenizer version)

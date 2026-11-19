@@ -3686,6 +3686,7 @@ fn warmup_probe_query() -> kosha_core::SearchQuery {
         highlight: None,
         aggs: std::collections::HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         exact_total_hits: None,
@@ -3693,10 +3694,13 @@ fn warmup_probe_query() -> kosha_core::SearchQuery {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
         rank: None,
         mode: None,
+        fields: Vec::new(),
     }
 }
 
@@ -4394,6 +4398,24 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
         Ok(r) => r,
         Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
     };
+    // A GeoPoint that is not a point would be stored but never indexed, so
+    // `geo_distance` and geo decays could never see it: refuse it (#212).
+    for doc in &request.documents {
+        for field in &doc.fields {
+            if field.field_type == kosha_core::FieldType::GeoPoint
+                && kosha_core::rank::parse_geo_str(&field.value).is_none()
+            {
+                return json_error(
+                    400,
+                    &format!(
+                        "document {:?}: GeoPoint field {:?} must be \"lat,lon\", \
+                         {{\"lat\": .., \"lon\": ..}} or [lon, lat] within range, got {:?}",
+                        doc.id.0, field.name, field.value
+                    ),
+                );
+            }
+        }
+    }
 
     let ns = request.namespace;
 
@@ -4935,20 +4957,27 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // inlined (see `canonical_query_for_cache`): a 1024-dim vector is
     // ~14KB of JSON. Deletions are part of a versioned snapshot; immutable
     // generation references also participate in cache identity.
-    let cache_key = if result_cache_budget() > 0 && !query.no_cache.unwrap_or(false) {
-        canonical_query_for_cache(&query).map(|mut canonical| {
-            let mut generations: Vec<_> = manifest
-                .deletion_vectors
-                .iter()
-                .map(|(segment, vector)| (&segment.0, &vector.generation))
-                .collect();
-            generations.sort_unstable();
-            canonical.push_str(&serde_json::to_string(&generations).unwrap());
-            (ns.0.clone(), manifest.version, canonical)
-        })
-    } else {
-        None
-    };
+    // A `rank_by` decaying from `"now"` (#212) answers differently a moment
+    // later on an unchanged manifest, so it is never cached.
+    let time_dependent = query
+        .rank_by
+        .as_ref()
+        .is_some_and(|rank_by| rank_by.is_time_dependent());
+    let cache_key =
+        if result_cache_budget() > 0 && !query.no_cache.unwrap_or(false) && !time_dependent {
+            canonical_query_for_cache(&query).map(|mut canonical| {
+                let mut generations: Vec<_> = manifest
+                    .deletion_vectors
+                    .iter()
+                    .map(|(segment, vector)| (&segment.0, &vector.generation))
+                    .collect();
+                generations.sort_unstable();
+                canonical.push_str(&serde_json::to_string(&generations).unwrap());
+                (ns.0.clone(), manifest.version, canonical)
+            })
+        } else {
+            None
+        };
     if let Some(ref key) = cache_key {
         if let Some(resp) = state.result_cache.lock().unwrap().lookup(key) {
             return resp;
@@ -5362,6 +5391,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         highlight: None,
         aggs: std::collections::HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         exact_total_hits: None,
@@ -5369,10 +5399,23 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
         rank: None,
         mode: None,
+        // `fields=title^2,content` (issue #249).
+        fields: params
+            .get("fields")
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
     if let Err(e) = query.validate() {
         return search_error_response(&e);
@@ -6604,7 +6647,9 @@ fn posting_blob_files_for_query<'a>(
     analysis: &kosha_query::QueryAnalysis,
     analyses: impl IntoIterator<Item = Option<&'a kosha_core::SegmentAnalysis>>,
 ) -> Vec<String> {
-    if query.wildcard.is_some() {
+    // Wildcard and fuzzy (#201) terms are only known once each segment's
+    // dictionary is expanded: every shard may hold one.
+    if query.wildcard.is_some() || query.fuzzy.is_some() {
         return kosha_segment::all_posting_blob_files();
     }
 
@@ -7955,6 +8000,280 @@ mod tests {
     }
 
     #[test]
+    fn field_restricted_search_over_http_and_through_the_result_cache() {
+        // Issue #249: `fields` reaches the scorer over POST and GET, is part
+        // of the result-cache key (the same text with other fields must not
+        // be served a cached answer), and bad specs are a 400.
+        let state = test_state();
+        let ns = NamespaceId("fieldsns".into());
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    Document {
+                        id: DocumentId("t".into()),
+                        fields: vec![
+                            Field::text("title", "alpha"),
+                            Field::text("content", "other words"),
+                        ],
+                    },
+                    Document {
+                        id: DocumentId("c".into()),
+                        fields: vec![
+                            Field::text("title", "other words"),
+                            Field::text("content", "alpha"),
+                        ],
+                    },
+                ],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let ids = |resp: &str| -> Vec<String> {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            v["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let post = |fields: &str| {
+            let body =
+                format!(r#"{{"namespace":"fieldsns","query_text":"alpha","fields":{fields}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        for _ in 0..2 {
+            assert_eq!(ids(&post(r#"["title"]"#)), ["t"]);
+            assert_eq!(ids(&post(r#"["content"]"#)), ["c"]);
+            assert_eq!(ids(&post(r#"["title^3","content"]"#)), ["t", "c"]);
+            assert_eq!(ids(&post(r#"["title","content^3"]"#)), ["c", "t"]);
+        }
+        let get = |qs: &str| {
+            handle_search_get(
+                &format!("GET /search?ns=fieldsns&q=alpha{qs} HTTP/1.1"),
+                &state,
+            )
+        };
+        assert_eq!(ids(&get("&fields=content")), ["c"]);
+        assert_eq!(ids(&get("&fields=title%5E3,content")), ["t", "c"]);
+        for bad in [r#"["title^0"]"#, r#"["ti*"]"#, r#"["a","a"]"#] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+        assert!(get("&fields=title%5Ex").starts_with("HTTP/1.1 400"));
+    }
+
+    #[test]
+    fn limit_per_diversifies_over_http() {
+        // Issue #211: one author holds 20 of 26 matches and all the best
+        // ones; `limit_per` keeps the page full with at most 2 of them,
+        // and is part of the result-cache key.
+        let state = test_state();
+        let ns = NamespaceId("limitns".into());
+        let mut docs = Vec::new();
+        for i in 0..20 {
+            docs.push(Document {
+                id: DocumentId(format!("dom-{i:02}")),
+                fields: vec![
+                    Field::text("text", "breach breach"),
+                    Field::keyword("author", "dom"),
+                ],
+            });
+        }
+        for i in 0..6 {
+            docs.push(Document {
+                id: DocumentId(format!("other-{i}")),
+                fields: vec![
+                    Field::text("text", "breach of a much longer contract text"),
+                    Field::keyword("author", format!("author{i}")),
+                ],
+            });
+        }
+        state.indexer.index_documents(ns.clone(), docs).unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |extra: &str| {
+            let body = format!(
+                r#"{{"namespace":"limitns","query_text":"breach","max_results":5{extra}}}"#
+            );
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let doms = |resp: &str| -> (usize, usize) {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let hits = v["results"].as_array().unwrap();
+            let dom = hits
+                .iter()
+                .filter(|h| h["doc_id"].as_str().unwrap().starts_with("dom-"))
+                .count();
+            assert_eq!(v["total_hits"], 26, "counted before the cap: {v}");
+            (hits.len(), dom)
+        };
+        // Uncapped first, so a cache keyed without limit_per would serve it.
+        assert_eq!(doms(&post("")), (5, 5));
+        let capped = r#","limit_per":{"field":"author","max":2}"#;
+        assert_eq!(doms(&post(capped)), (5, 2));
+        assert_eq!(doms(&post(capped)), (5, 2));
+        for bad in [
+            r#","limit_per":{"field":"author","max":0}"#,
+            r#","limit_per":{"field":"author"}"#,
+            r#","limit_per":{"field":"author","max":2},"collapse":{"field":"author"}"#,
+        ] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+    }
+
+    #[test]
+    fn rank_by_and_geo_over_http() {
+        // Issue #212: GeoPoint ingest, a geo_distance filter, a recency
+        // decay and a distance decay over HTTP, rank_by in the cache key,
+        // and "now" never served from the cache.
+        let state = test_state();
+        let index = |docs: serde_json::Value| {
+            let body = serde_json::json!({"namespace": "rankns", "documents": docs});
+            handle_index(body.to_string().as_bytes(), &state)
+        };
+        let bad = index(serde_json::json!([{"id": "x", "fields": [
+            {"name": "loc", "field_type": "GeoPoint", "value": "somewhere"}
+        ]}]));
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        let ok = index(serde_json::json!([
+            {"id": "old", "fields": [
+                {"name": "text", "field_type": "Text", "value": "breach breach breach"},
+                {"name": "published", "field_type": "Date", "value": "2025-11-19"},
+                {"name": "loc", "field_type": "GeoPoint", "value": "{\"lat\": 52.52, \"lon\": 13.405}"}
+            ]},
+            {"id": "recent", "fields": [
+                {"name": "text", "field_type": "Text", "value": "breach of the supply contract"},
+                {"name": "published", "field_type": "Date", "value": "2026-11-12"},
+                {"name": "loc", "field_type": "GeoPoint", "value": "48.8566,2.3522"}
+            ]}
+        ]));
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        let ns = NamespaceId("rankns".into());
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |extra: &str| -> serde_json::Value {
+            let body = format!(r#"{{"namespace":"rankns","query_text":"breach"{extra}}}"#);
+            let resp = handle_search_post(body.as_bytes(), &state);
+            assert!(resp.starts_with("HTTP/1.1 200"), "{extra}: {resp}");
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+        };
+        let order = |v: &serde_json::Value| -> Vec<String> {
+            v["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // Plain first, so a cache keyed without rank_by would serve it.
+        assert_eq!(order(&post("")), ["old", "recent"]);
+        let recency = r#","rank_by":{"functions":[{"decay":{"field":"published","function":"exp","origin":"2026-11-19","scale":"30d"}}]}"#;
+        let v = post(recency);
+        assert_eq!(order(&v), ["recent", "old"]);
+        assert!(
+            v["results"][0]["rank_details"]["base_score"].is_number(),
+            "{v}"
+        );
+        assert_eq!(order(&post(recency)), ["recent", "old"]);
+
+        // Within 500 km of Paris: only "recent".
+        let near_paris =
+            r#","filter":{"geo_distance":{"distance":"500km","loc":{"lat":48.85,"lon":2.35}}}"#;
+        assert_eq!(order(&post(near_paris)), ["recent"]);
+        // Nearest to Berlin first.
+        let berlin = r#","rank_by":{"functions":[{"decay":{"field":"loc","function":"gauss","origin":{"lat":52.5,"lon":13.4},"scale":"200km"}}],"boost_mode":"replace"}"#;
+        assert_eq!(order(&post(berlin)), ["old", "recent"]);
+
+        // A fixed origin is cacheable; "now" is computed per request and
+        // never cached.
+        let hits_before = state.result_cache.lock().unwrap().hits;
+        post(recency);
+        assert_eq!(state.result_cache.lock().unwrap().hits, hits_before + 1);
+        let hits_before = hits_before + 1;
+        let now = r#","rank_by":{"functions":[{"decay":{"field":"published","function":"linear","origin":"now","scale":"3650d"}}]}"#;
+        post(now);
+        post(now);
+        assert_eq!(state.result_cache.lock().unwrap().hits, hits_before);
+
+        for bad in [
+            r#","rank_by":{"functions":[]}"#,
+            r#","rank_by":{"functions":[{"field_value":{"field":"votes"}}],"bogus":1}"#,
+            r#","rank_by":{"functions":[{"field_value":{"field":"votes"}}]},"sort":[{"published":{"order":"desc"}}]"#,
+            r#","filter":{"geo_distance":{"distance":"far","loc":"0,0"}}"#,
+        ] {
+            let body = format!(r#"{{"namespace":"rankns","query_text":"breach"{bad}}}"#);
+            let resp = handle_search_post(body.as_bytes(), &state);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+    }
+
+    #[test]
+    fn fuzzy_search_over_http() {
+        // Issue #201: a fuzzy clause over HTTP, validated, cached under its
+        // own key (not the plain query's).
+        let state = test_state();
+        let ns = NamespaceId("fuzzyns".into());
+        let doc = |id: &str, text: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text)],
+        };
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    doc("hit", "we receive goods"),
+                    doc("exact", "recieve is a common typo"),
+                    doc("miss", "rice and sieve"),
+                ],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+        let post = |extra: &str| -> String {
+            let body = format!(r#"{{"namespace":"fuzzyns","query_text":""{extra}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let order = |resp: &str| -> Vec<String> {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let v: serde_json::Value =
+                serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+            v["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let fuzzy = r#","fuzzy":{"value":"recieve","fuzziness":1}"#;
+        // The exact term first, the one-edit match after it.
+        assert_eq!(order(&post(fuzzy)), ["exact", "hit"]);
+        assert_eq!(order(&post(fuzzy)), ["exact", "hit"]);
+        let exact_only = r#","fuzzy":{"value":"recieve","fuzziness":0}"#;
+        assert_eq!(order(&post(exact_only)), ["exact"]);
+        for bad in [
+            r#","fuzzy":{"value":"recieve","fuzziness":3}"#,
+            r#","fuzzy":{"value":"recieve","max_expansions":0}"#,
+            r#","fuzzy":{"value":""}"#,
+            r#","fuzzy":{"value":"x"},"wildcard":{"field":"text","pattern":"r*"}"#,
+        ] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+    }
+
+    #[test]
     fn hybrid_search_fuses_with_rrf_over_http() {
         // Issue #228: `rank.rrf` over HTTP — fused score plus per-retriever
         // ranks in the response, vector-only hits kept (#250), parameters
@@ -8055,6 +8374,8 @@ mod tests {
             text_filter_ignore_above: None,
             doc_vectors: false,
             analysis: None,
+            field_index: None,
+            fuzzy_bloom: kosha_core::fuzzy::build_fuzzy_bloom(terms.iter().copied()),
         };
         let mut query: SearchQuery = serde_json::from_str(
             r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
@@ -8097,6 +8418,23 @@ mod tests {
         assert_eq!(
             decide(&query, &same_matter_one_term),
             SegmentHydration::Skip
+        );
+
+        // Fuzzy (#201): a segment is hydrated when its bloom admits some
+        // expansion of the token, skipped when it admits none, and every
+        // posting-blob shard is fetched (expansions are per segment).
+        let fuzzy: SearchQuery = serde_json::from_str(
+            r#"{"query_text": "", "fuzzy": {"value": "braech", "fuzziness": 1}}"#,
+        )
+        .unwrap();
+        assert_eq!(decide(&fuzzy, &other_matter), SegmentHydration::Scoring);
+        assert_eq!(decide(&fuzzy, &no_terms), SegmentHydration::Skip);
+        let mut old_bloom = no_terms.clone();
+        old_bloom.fuzzy_bloom = None;
+        assert_eq!(decide(&fuzzy, &old_bloom), SegmentHydration::Scoring);
+        assert_eq!(
+            posting_blob_files_for_query(&fuzzy, &kosha_query::QueryAnalysis::new(&fuzzy), [None]),
+            kosha_segment::all_posting_blob_files()
         );
     }
 
@@ -9372,6 +9710,7 @@ mod tests {
             highlight: None,
             aggs: std::collections::HashMap::new(),
             wildcard: None,
+            fuzzy: None,
             match_phrase: None,
             knn: None,
             exact_total_hits: None,
@@ -9379,10 +9718,13 @@ mod tests {
             operator: None,
             no_cache: None,
             collapse: None,
+            limit_per: None,
+            rank_by: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
             mode: None,
+            fields: Vec::new(),
         };
 
         let unfiltered = state.hydrate_segments_for_search(
@@ -9512,6 +9854,7 @@ mod tests {
             highlight: None,
             aggs: std::collections::HashMap::new(),
             wildcard: None,
+            fuzzy: None,
             match_phrase: None,
             knn: None,
             exact_total_hits: None,
@@ -9519,10 +9862,13 @@ mod tests {
             operator: None,
             no_cache: None,
             collapse: None,
+            limit_per: None,
+            rank_by: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
             mode: None,
+            fields: Vec::new(),
         };
         let verdict_key = (ns.0.clone(), manifest.version);
 
@@ -10865,6 +11211,7 @@ mod tests {
             highlight: None,
             aggs: std::collections::HashMap::new(),
             wildcard: None,
+            fuzzy: None,
             match_phrase: None,
             knn: None,
             exact_total_hits: None,
@@ -10872,10 +11219,13 @@ mod tests {
             operator: None,
             no_cache: None,
             collapse: None,
+            limit_per: None,
+            rank_by: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
             mode: None,
+            fields: Vec::new(),
         };
         let with_vec = |v: Vec<f32>, k: usize| {
             let mut q = base.clone();
@@ -10930,6 +11280,24 @@ mod tests {
         moded.mode = Some(kosha_core::RetrievalMode::Hybrid);
         assert_ne!(canonical_query_for_cache(&moded).unwrap(), default_rrf);
 
+        // `limit_per` changes the page (issue #211), on both key shapes.
+        let limited = |max: usize, vector: bool| {
+            let mut q = if vector {
+                with_vec(vec![0.1_f32; 1024], 10)
+            } else {
+                base.clone()
+            };
+            q.limit_per = Some(kosha_core::LimitPerSpec {
+                field: "author".into(),
+                max,
+            });
+            canonical_query_for_cache(&q).unwrap()
+        };
+        assert_ne!(limited(2, false), canonical_query_for_cache(&base).unwrap());
+        assert_ne!(limited(2, false), limited(3, false));
+        assert_ne!(limited(2, true), a, "limit_per must be part of the kNN key");
+        assert_ne!(limited(2, true), limited(3, true));
+
         // The whole point: no raw embedding in the key.
         assert!(
             a.len() < 1024,
@@ -10953,6 +11321,8 @@ mod tests {
             text_filter_ignore_above: None,
             doc_vectors: false,
             analysis: None,
+            field_index: None,
+            fuzzy_bloom: None,
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.

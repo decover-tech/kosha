@@ -108,6 +108,7 @@ search body) raises `KoshaRequestError(400)` before anything runs.
 | `FIELD_TYPE_DATE` | `date` |
 | `FIELD_TYPE_BOOLEAN` | `boolean` |
 | `FIELD_TYPE_VECTOR` | `knn_vector` |
+| `FIELD_TYPE_GEO_POINT` | `geo_point` |
 
 Kosha is schemaless, so a namespace with no registered schema, or a server that predates the
 schema route (404/405), returns `{"<index>": {"mappings": {"properties": {}}}}`. A field the
