@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod deletes;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,6 +8,10 @@ use serde::{Deserialize, Serialize};
 // ─── Control store trait (in-memory or Postgres) ──────────────────────────
 
 pub mod docset;
+pub use analysis::{
+    AnalysisConfig, AnalyzerSpec, FieldSchema, NamespaceSchema, SegmentAnalysis, TokenFilterSpec,
+    TokenizerKind,
+};
 pub use docset::{evaluate_filter, DocSet};
 
 /// Pluggable namespace registry and manifest store.
@@ -855,6 +860,15 @@ pub struct Footer {
     /// before #243) means vectors are inline JSON in the doc store.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub doc_vectors: bool,
+    /// The analysis chains this segment's `Text` fields were indexed with
+    /// (issues #220, #221). `None` — every segment written before
+    /// analyzers existed, and every segment written since with default
+    /// settings — means the legacy `standard@1` chain for every field.
+    /// Queries are analyzed per segment with these chains, so a segment
+    /// keeps matching the way it was written whatever the namespace's
+    /// current schema says. See [`analysis`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<SegmentAnalysis>,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -1297,9 +1311,32 @@ pub struct Manifest {
     /// readable for legacy manifests and is populated in memory by readers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub deletion_vectors: HashMap<SegmentId, deletes::DeletionVector>,
+    /// Namespace schema (`POST /v1/namespaces/{ns}/schema`). Read by the
+    /// segment writers (flush and compaction) for each field's analyzer.
+    /// Segments record the chains they actually used in their own footer,
+    /// so editing the schema never changes how an existing segment is
+    /// searched. `None` = no schema: every field uses `standard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<NamespaceSchema>,
 }
 
 impl Manifest {
+    /// The analysis settings new segments of this namespace are written
+    /// with. A schema this binary cannot resolve (one set by a newer
+    /// version naming an analyzer this one lacks) falls back to the
+    /// default chain: the segments written are then recorded as such in
+    /// their footers, so they stay searchable either way.
+    pub fn analysis_config(&self) -> AnalysisConfig {
+        match self.schema.as_ref().map(NamespaceSchema::resolve) {
+            Some(Ok(config)) => config,
+            Some(Err(e)) => {
+                eprintln!("kosha: namespace schema not resolvable ({e}); using default analysis");
+                AnalysisConfig::default()
+            }
+            None => AnalysisConfig::default(),
+        }
+    }
+
     /// Semantic equality, independent of hash-map serialization order.
     pub fn same_contents(&self, other: &Self) -> bool {
         if self.tombstones != other.tombstones {
@@ -2202,6 +2239,7 @@ mod tests {
             format_version: SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: Some(256),
             doc_vectors: false,
+            analysis: None,
         }
     }
 
@@ -2221,6 +2259,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         }
     }
 

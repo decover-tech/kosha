@@ -13,8 +13,9 @@ use kosha_core::{
     NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery, SearchResult, SortSpec,
     TermBloomMode, TotalHitsRelation,
 };
+use kosha_core::{AnalyzerSpec, Footer, SegmentAnalysis};
 use kosha_segment::{
-    tokenize, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
+    tokenize, Analyzer, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
 };
 
 /// Optional callback the searcher invokes to ensure `doc_store.bin` is
@@ -743,21 +744,161 @@ fn bm25_stats_engine_default() -> Bm25StatsScope {
 /// `bm25_params.stats` / `KOSHA_BM25_STATS`, a wildcard, or no lexical leg
 /// at all). The server uses this to hydrate the postings the `df` pass
 /// reads in segments the query's filter would otherwise skip.
-pub fn namespace_stats_terms(query: &SearchQuery) -> Option<Vec<String>> {
+///
+/// `analyses` is every segment's footer `analysis` (#220): the query is
+/// analyzed with each distinct chain they name, and the result is the
+/// union of those readings — every term some segment will score with.
+pub fn namespace_stats_terms<'a>(
+    query: &SearchQuery,
+    analyses: impl IntoIterator<Item = Option<&'a SegmentAnalysis>>,
+) -> Option<Vec<String>> {
+    uses_namespace_stats(query).then(|| QueryAnalysis::new(query).union_terms(analyses))
+}
+
+/// Whether `query` scores with namespace-level BM25 statistics; see
+/// [`namespace_stats_terms`].
+pub fn uses_namespace_stats(query: &SearchQuery) -> bool {
     let scope = query
         .bm25_params
         .stats
         .unwrap_or_else(bm25_stats_engine_default);
-    if scope == Bm25StatsScope::Segment || query.wildcard.is_some() || query.is_pure_knn() {
-        return None;
+    !(scope == Bm25StatsScope::Segment || query.wildcard.is_some() || query.is_pure_knn())
+}
+
+/// The request's lexical text read by one analysis chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyzedQuery {
+    /// `query_text`'s terms.
+    pub terms: Vec<String>,
+    /// `match_phrase.phrase`'s terms and their positions (relative; a
+    /// `stop` filter leaves gaps, matched against the same gaps in the
+    /// index).
+    pub phrase: Option<Vec<(String, u32)>>,
+}
+
+impl AnalyzedQuery {
+    /// The terms the lexical leg scores with: the phrase's when there is
+    /// one (as before #220), else `query_text`'s.
+    pub fn scoring_terms(&self) -> Vec<String> {
+        match &self.phrase {
+            Some(phrase) => phrase.iter().map(|(t, _)| t.clone()).collect(),
+            None => self.terms.clone(),
+        }
     }
-    let mut terms = tokenize(&query.query_text);
-    if let Some(ref phrase) = query.match_phrase {
-        terms.extend(tokenize(&phrase.phrase));
+
+    fn is_empty(&self) -> bool {
+        match &self.phrase {
+            Some(phrase) => phrase.is_empty(),
+            None => self.terms.is_empty(),
+        }
     }
-    terms.sort();
-    terms.dedup();
-    Some(terms)
+}
+
+/// A request's lexical text, analyzed lazily once per distinct chain and
+/// shared by every segment of the request (#220, #221).
+///
+/// A query only matches the terms a segment's analyzer wrote, so it is
+/// analyzed **per segment** with the chains in that segment's footer
+/// (`Footer::analysis`; absent = the legacy `standard@1` chain). A
+/// segment whose fields used more than one chain gets one reading per
+/// chain, and a document matches if it matches any one reading in full
+/// (scored with the best) — see [`Searcher::score_segment`].
+pub struct QueryAnalysis {
+    text: String,
+    phrase: Option<String>,
+    /// Whether the text has any lexical content at all (by the legacy
+    /// reading or any chain's). Decides whether the request is a lexical
+    /// query, the same way in every segment, so a query whose words a
+    /// `stop` filter removes matches nothing instead of turning into a
+    /// filter-only "match everything" in some segments.
+    has_text: bool,
+    by_chain: Mutex<HashMap<AnalyzerSpec, Arc<AnalyzedQuery>>>,
+}
+
+impl QueryAnalysis {
+    pub fn new(query: &SearchQuery) -> Self {
+        Self {
+            has_text: !tokenize(&query.query_text).is_empty(),
+            text: query.query_text.clone(),
+            phrase: query.match_phrase.as_ref().map(|mp| mp.phrase.clone()),
+            by_chain: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn for_chain(&self, spec: &AnalyzerSpec) -> Arc<AnalyzedQuery> {
+        if let Some(found) = self.by_chain.lock().unwrap().get(spec) {
+            return Arc::clone(found);
+        }
+        let analyzer = Analyzer::new(spec);
+        let analyzed = Arc::new(AnalyzedQuery {
+            terms: analyzer.analyze(&self.text),
+            phrase: self
+                .phrase
+                .as_ref()
+                .map(|phrase| analyzer.analyze_with_positions(phrase)),
+        });
+        Arc::clone(
+            self.by_chain
+                .lock()
+                .unwrap()
+                .entry(spec.clone())
+                .or_insert(analyzed),
+        )
+    }
+
+    /// The distinct readings of the query for a segment whose footer
+    /// holds `analysis`. Never empty. Readings with no terms are dropped
+    /// unless every reading is empty.
+    pub fn for_segment(&self, analysis: Option<&SegmentAnalysis>) -> Vec<Arc<AnalyzedQuery>> {
+        let mut readings: Vec<Arc<AnalyzedQuery>> = Vec::new();
+        for chain in kosha_core::analysis::segment_query_chains(analysis) {
+            let reading = self.for_chain(&chain);
+            if !readings.iter().any(|r| **r == *reading) {
+                readings.push(reading);
+            }
+        }
+        if readings.len() > 1 && readings.iter().any(|r| !r.is_empty()) {
+            readings.retain(|r| !r.is_empty());
+        }
+        readings
+    }
+
+    /// Whether the request has lexical text at all (see `has_text`).
+    pub fn has_text(&self) -> bool {
+        self.has_text
+    }
+
+    /// Every term any of `analyses` reads the query as, sorted and
+    /// deduplicated.
+    pub fn union_terms<'a>(
+        &self,
+        analyses: impl IntoIterator<Item = Option<&'a SegmentAnalysis>>,
+    ) -> Vec<String> {
+        let mut seen: HashSet<Option<&SegmentAnalysis>> = HashSet::new();
+        let mut terms: Vec<String> = Vec::new();
+        for analysis in analyses {
+            if !seen.insert(analysis) {
+                continue;
+            }
+            for reading in self.for_segment(analysis) {
+                terms.extend(reading.terms.iter().cloned());
+                if let Some(ref phrase) = reading.phrase {
+                    terms.extend(phrase.iter().map(|(t, _)| t.clone()));
+                }
+            }
+        }
+        if seen.is_empty() {
+            // No segments: the legacy reading, as before #220.
+            let reading = self.for_segment(None);
+            terms.extend(reading[0].terms.iter().cloned());
+            if let Some(ref phrase) = reading[0].phrase {
+                terms.extend(phrase.iter().map(|(t, _)| t.clone()));
+            }
+        }
+        terms.sort();
+        terms.dedup();
+        terms
+    }
 }
 
 /// Cache key for [`CorpusStatsCache`]: namespace, manifest version, and a
@@ -772,6 +913,9 @@ type CorpusKey = (String, u64, u64);
 struct CorpusEntry {
     num_docs: u64,
     total_field_length: u64,
+    /// The distinct footer `analysis` values across the manifest's
+    /// segments (#220): which readings of a query need a `df`.
+    analyses: Vec<Option<SegmentAnalysis>>,
     doc_frequencies: Mutex<HashMap<String, u64>>,
 }
 
@@ -880,6 +1024,19 @@ pub fn match_phrase_score(
     postings_list: &[&[u32]], // positions for each query term, per doc
     slop: u32,
 ) -> f64 {
+    let offsets: Vec<u32> = (0..postings_list.len() as u32).collect();
+    match_phrase_score_at(postings_list, &offsets, slop)
+}
+
+/// [`match_phrase_score`] for a phrase whose terms sit at `query_positions`
+/// (the analyzer's positions, which skip any word a `stop` filter
+/// removed): term `i` is expected `query_positions[i] -
+/// query_positions[0]` after the first.
+pub fn match_phrase_score_at(
+    postings_list: &[&[u32]], // positions for each query term, per doc
+    query_positions: &[u32],
+    slop: u32,
+) -> f64 {
     if postings_list.is_empty() {
         return 0.0;
     }
@@ -890,8 +1047,12 @@ pub fn match_phrase_score(
     let first_positions = postings_list[0];
     for &start_pos in first_positions {
         let mut matched = true;
+        let base = query_positions.first().copied().unwrap_or(0);
         for (i, positions) in postings_list[1..].iter().enumerate() {
-            let expected = start_pos + (i as u32) + 1;
+            let gap = query_positions
+                .get(i + 1)
+                .map_or(i as u32 + 1, |&p| p.saturating_sub(base));
+            let expected = start_pos + gap;
             let found = positions.iter().any(|&p| {
                 let dist = p.abs_diff(expected);
                 dist <= slop
@@ -1533,8 +1694,9 @@ impl Searcher {
         namespace: &NamespaceId,
         manifest: &Manifest,
         query: &SearchQuery,
-        // Sorted and deduplicated — see [`namespace_stats_terms`].
-        terms: &[String],
+        // The `df` terms are every reading of the query by any segment's
+        // analysis chains — see [`namespace_stats_terms`].
+        analysis: &QueryAnalysis,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
     ) -> Option<Arc<CorpusStats>> {
@@ -1548,32 +1710,42 @@ impl Searcher {
         let corpus = match self.corpus_stats.get(&key) {
             Some(corpus) => corpus,
             None => {
-                let totals: Option<Vec<(u64, u64)>> = manifest
+                let totals: Option<Vec<(u64, u64, Option<SegmentAnalysis>)>> = manifest
                     .segments
                     .par_iter()
                     .map(|entry| {
                         let footer = manifest.footer_or_read(&entry.segment_id, || {
                             SegmentReader::read_footer(&seg_dir(entry)).ok()
                         })?;
-                        Some((footer.doc_count as u64, footer.total_field_length))
+                        Some((
+                            footer.doc_count as u64,
+                            footer.total_field_length,
+                            footer.analysis.clone(),
+                        ))
                     })
                     .collect();
-                let (num_docs, total_field_length) =
-                    totals?.into_iter().fold((0u64, 0u64), |(n, l), (dn, dl)| {
-                        (n.saturating_add(dn), l.saturating_add(dl))
-                    });
+                let mut analyses: Vec<Option<SegmentAnalysis>> = Vec::new();
+                let (mut num_docs, mut total_field_length) = (0u64, 0u64);
+                for (docs, length, segment_analysis) in totals? {
+                    num_docs = num_docs.saturating_add(docs);
+                    total_field_length = total_field_length.saturating_add(length);
+                    if !analyses.contains(&segment_analysis) {
+                        analyses.push(segment_analysis);
+                    }
+                }
                 self.corpus_stats.insert(
                     key,
                     Arc::new(CorpusEntry {
                         num_docs,
                         total_field_length,
+                        analyses,
                         doc_frequencies: Mutex::new(HashMap::new()),
                     }),
                 )
             }
         };
 
-        let wanted: Vec<String> = terms.to_vec();
+        let wanted: Vec<String> = analysis.union_terms(corpus.analyses.iter().map(Option::as_ref));
         let mut doc_frequencies: HashMap<String, u64> = HashMap::with_capacity(wanted.len());
         let missing: Vec<String> = {
             let cached = corpus.doc_frequencies.lock().unwrap();
@@ -1665,13 +1837,15 @@ impl Searcher {
         namespace: &NamespaceId,
         entry: &ManifestEntry,
         query: &SearchQuery,
-        query_terms: &[String],
+        // The query's lexical text, analyzed per chain; this segment reads
+        // it with the chains its footer names (#220).
+        analysis: &QueryAnalysis,
         // `Some(cap)` = capped-count mode: the multi-term join may stop
         // counting once `cap` members are seen AND the suffix-max bound
         // proves the page can no longer change. `None` = exact counting
         // (v1-identical walk-to-completion).
         count_budget: Option<usize>,
-        term_prune: Option<&(Vec<String>, TermBloomMode)>,
+        term_prune: Option<TermBloomMode>,
         sort_value_fields: &[String],
         tombstones: Option<
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
@@ -1712,8 +1886,8 @@ impl Searcher {
                 if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
                     return Ok(None);
                 }
-                if let Some((terms, mode)) = term_prune {
-                    if !segment_may_contain_terms(terms, *mode, footer.term_bloom.as_ref()) {
+                if let Some(mode) = term_prune {
+                    if !segment_may_match_query_terms(analysis, mode, footer) {
                         return Ok(None);
                     }
                 }
@@ -1797,8 +1971,19 @@ impl Searcher {
         // fuse them by rank in `search_inner`, once both lists are known
         // across the whole namespace (issue #228).
         let rrf = query.rrf();
-        let has_query =
-            !query_terms.is_empty() || query.wildcard.is_some() || query.match_phrase.is_some();
+        // This segment's readings of the query (#220): one per distinct
+        // analysis chain its footer names — one for every segment whose
+        // fields share a chain, which is nearly all of them.
+        let readings = analysis.for_segment(reader.footer().analysis.as_ref());
+        let primary = Arc::clone(&readings[0]);
+        // A document matches any one reading in full (a mixed-analyzer
+        // segment). Scored on the general path only; see below.
+        let multi_reading = readings.len() > 1 && query.wildcard.is_none();
+        let query_terms: &[String] = &primary.terms;
+        let has_query = analysis.has_text()
+            || !query_terms.is_empty()
+            || query.wildcard.is_some()
+            || query.match_phrase.is_some();
         // A hybrid request whose text tokenizes to nothing has an empty
         // lexical list, not a "match every filtered document" one.
         let has_only_filter = !has_query && query.filter.is_some() && rrf.is_none();
@@ -1832,12 +2017,16 @@ impl Searcher {
         };
 
         // ── Match phrase ──
-        let phrase_match = if let Some(ref mp) = query.match_phrase {
-            let phrase_terms = tokenize(&mp.phrase);
-            Some((phrase_terms, mp.slop))
-        } else {
-            None
-        };
+        let phrase_match: Option<(Vec<String>, Vec<u32>, u32)> =
+            query.match_phrase.as_ref().map(|mp| {
+                let (terms, positions) = primary
+                    .phrase
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .unzip();
+                (terms, positions, mp.slop)
+            });
 
         let phrase_tokenized = phrase_match.as_ref().map(|p| &p.0);
 
@@ -1850,7 +2039,10 @@ impl Searcher {
             && effective_terms
                 .iter()
                 .any(|term| !reader.contains_term(term));
-        if (!effective_terms.is_empty() || phrase_tokenized.is_some()) && !missing_required_term {
+        if multi_reading
+            || ((!effective_terms.is_empty() || phrase_tokenized.is_some())
+                && !missing_required_term)
+        {
             let terms_for_bm25 = if let Some(ref pt) = phrase_tokenized {
                 pt
             } else {
@@ -1937,6 +2129,7 @@ impl Searcher {
             // one. Every request scoped to a matter carries a filter, so
             // this is the path nearly all of them take.
             let can_block_max_wand = !effective_terms.is_empty()
+                && !multi_reading
                 && !is_wildcard_mode
                 && phrase_tokenized.is_none()
                 && query.knn.is_none()
@@ -2533,195 +2726,246 @@ impl Searcher {
                 // v4-equivalent) instead of truncating or inflating.
             }
 
-            // `PostingsRef`: legacy segments lend a borrow into their parsed
-            // map; v2 segments hand out a shared Arc of the on-demand decode
-            // — see `SegmentReader::postings`. Fetched once per term here
-            // and held for the whole scoring pass either way.
-            let term_postings: Vec<(&str, kosha_segment::PostingsRef<'_>)> =
-                reader.postings_for_terms(terms_for_bm25);
-            if reader.take_blob_read_failure() {
-                // A term the TOC contains could not be served (blob shard
-                // evicted/corrupt). Erroring here — instead of scoring
-                // without the term — is what keeps eviction races from
-                // producing silently-wrong results, and what lets the
-                // server invalidate its hydration/presence caches and
-                // refetch on retry.
-                return Err(KoshaError::CorruptSegment(format!(
-                    "segment {}: posting blob unreadable for a present term                      (evicted or corrupt) — retry after rehydration",
-                    entry.segment_id.0
-                )));
-            }
-
-            let mut doc_frequencies: HashMap<&str, u32> = HashMap::new();
-            for (t, p) in &term_postings {
-                let segment_df = u32::try_from(p.len()).unwrap_or(u32::MAX);
-                doc_frequencies.insert(t, scorer.doc_frequency(t, segment_df));
-            }
-
-            // ── Postings AND/OR ──
-            // AND for a multi-term query and for a phrase (a phrase needs
-            // every one of its terms in the document before positions are
-            // worth looking at); OR for a wildcard expansion, an explicit
-            // `operator: or`, or a single term.
-            //
-            // `accept` is asked before anything is scored, so a document the
-            // filter or a tombstone rules out costs one bit test, not a
-            // `doc_meta` lookup and a BM25 evaluation per term.
-            let mut scored: HashMap<u32, f64> = HashMap::new();
-            let is_phrase = phrase_tokenized.is_some();
-            let use_and = term_postings.len() > 1
-                && !is_wildcard_mode
-                && (is_phrase || operator == kosha_core::QueryOperator::And);
-            // `postings_for_terms` only returns terms this segment contains.
-            // A phrase with a term missing here can match nothing here.
-            let phrase_term_missing = phrase_tokenized.is_some_and(|terms| {
-                let wanted: HashSet<&str> = terms.iter().map(String::as_str).collect();
-                let present: HashSet<&str> = term_postings.iter().map(|(t, _)| *t).collect();
-                wanted.iter().any(|t| !present.contains(t))
-            });
-
-            if phrase_term_missing {
-                // No candidate at all.
-            } else if !use_and {
-                for (term, postings) in &term_postings {
-                    let df = doc_frequencies.get(term).copied().unwrap_or(0);
-                    for posting in postings.iter() {
-                        if restricted && !accept(posting.doc_id) {
-                            continue;
-                        }
-                        if let Some(meta) = reader.doc_meta(posting.doc_id) {
-                            let score =
-                                scorer.score_term(posting.term_frequency, df, meta.field_length);
-                            *scored.entry(posting.doc_id).or_insert(0.0) += score;
-                        }
-                    }
-                }
-            } else {
-                // Intersect starting from the shortest list. Postings are
-                // stored in ascending doc order in every format the writer
-                // emits, so membership in another list is a binary search;
-                // legacy unordered segments get a per-term map instead (the
-                // earlier code built that map for every segment, i.e. hashed
-                // every posting of every term whatever the intersection
-                // turned out to be).
-                let ordered = reader.has_ordered_postings();
-                let maps: Vec<HashMap<u32, &kosha_core::Posting>> = if ordered {
-                    Vec::new()
-                } else {
-                    term_postings
-                        .iter()
-                        .map(|(_, postings)| postings.iter().map(|p| (p.doc_id, p)).collect())
-                        .collect()
-                };
-                let lookup = |term_index: usize, doc_seq: u32| -> Option<&kosha_core::Posting> {
-                    if ordered {
-                        let postings: &[kosha_core::Posting] = &term_postings[term_index].1;
-                        postings
-                            .binary_search_by_key(&doc_seq, |p| p.doc_id)
-                            .ok()
-                            .map(|i| &postings[i])
-                    } else {
-                        maps[term_index].get(&doc_seq).copied()
-                    }
-                };
-
-                let shortest = (0..term_postings.len())
-                    .min_by_key(|&i| term_postings[i].1.len())
-                    .expect("use_and implies at least two terms");
-                let mut and_candidates: Vec<u32> = term_postings[shortest]
-                    .1
-                    .iter()
-                    .map(|p| p.doc_id)
-                    .filter(|doc_seq| !restricted || accept(*doc_seq))
-                    .collect();
-                for term_index in 0..term_postings.len() {
-                    if term_index == shortest {
-                        continue;
-                    }
-                    and_candidates.retain(|doc_seq| lookup(term_index, *doc_seq).is_some());
-                    if and_candidates.is_empty() {
-                        break;
-                    }
-                }
-
-                for doc_seq in and_candidates {
-                    if let Some(meta) = reader.doc_meta(doc_seq) {
-                        // Summed in query-term order, as the WAND join does,
-                        // so both paths round identically.
-                        let mut total_score = 0.0;
-                        for (term_index, (term, _)) in term_postings.iter().enumerate() {
-                            if let Some(p) = lookup(term_index, doc_seq) {
-                                let df = doc_frequencies.get(term).copied().unwrap_or(0);
-                                total_score +=
-                                    scorer.score_term(p.term_frequency, df, meta.field_length);
-                            }
-                        }
-                        scored.insert(doc_seq, total_score);
-                    }
-                }
-            }
-
-            // Apply phrase matching (filter out docs that don't match the phrase).
-            if let Some((ref phrase_terms, slop)) = phrase_match {
-                // Fetch each phrase term's postings once (not once per
-                // candidate doc) and index by doc_id for O(1) lookup.
-                // `postings()` is an on-demand decode for v2 segments, so
-                // the once-per-term discipline matters for real: the decoded
-                // handles are bound first (they must outlive the maps, which
-                // borrow position slices out of them).
-                let phrase_postings_data: Vec<Option<kosha_segment::PostingsRef<'_>>> =
-                    phrase_terms.iter().map(|pt| reader.postings(pt)).collect();
+            // The general path, as a function of one reading of the query:
+            // run once for an ordinary segment, and once per reading for a
+            // segment whose fields used different analysis chains (#220).
+            let score_reading = |terms_for_bm25: &[String],
+                                 phrase_match: Option<&(Vec<String>, Vec<u32>, u32)>|
+             -> Result<HashMap<u32, f64>, KoshaError> {
+                let phrase_tokenized = phrase_match.map(|p| &p.0);
+                // `PostingsRef`: legacy segments lend a borrow into their parsed
+                // map; v2 segments hand out a shared Arc of the on-demand decode
+                // — see `SegmentReader::postings`. Fetched once per term here
+                // and held for the whole scoring pass either way.
+                let term_postings: Vec<(&str, kosha_segment::PostingsRef<'_>)> =
+                    reader.postings_for_terms(terms_for_bm25);
                 if reader.take_blob_read_failure() {
-                    // Same contract as the scoring fetch above: an
-                    // unreadable blob for a TOC-present phrase term must
-                    // error, not silently fail the phrase.
+                    // A term the TOC contains could not be served (blob shard
+                    // evicted/corrupt). Erroring here — instead of scoring
+                    // without the term — is what keeps eviction races from
+                    // producing silently-wrong results, and what lets the
+                    // server invalidate its hydration/presence caches and
+                    // refetch on retry.
                     return Err(KoshaError::CorruptSegment(format!(
-                        "segment {}: posting blob unreadable for a phrase \
-                         term (evicted or corrupt) — retry after rehydration",
+                        "segment {}: posting blob unreadable for a present term                      (evicted or corrupt) — retry after rehydration",
                         entry.segment_id.0
                     )));
                 }
-                let phrase_postings: Vec<HashMap<u32, &[u32]>> = phrase_postings_data
-                    .iter()
-                    .map(|data| {
-                        data.as_ref()
-                            .map(|postings| {
-                                postings
-                                    .iter()
-                                    .map(|p| (p.doc_id, p.positions.as_slice()))
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect();
 
-                let doc_ids: Vec<u32> = scored.keys().copied().collect();
-                for doc_id in doc_ids {
-                    // Borrowed positions straight out of `phrase_postings`
-                    // (which already holds `&[u32]` slices into the
-                    // decoded postings) — `match_phrase_score` only reads,
-                    // so there's no need to clone each term's position
-                    // list into a fresh `Vec` per candidate doc.
-                    let mut term_positions: Vec<&[u32]> = Vec::new();
-                    for term_map in &phrase_postings {
-                        if let Some(&positions) = term_map.get(&doc_id) {
-                            term_positions.push(positions);
+                let mut doc_frequencies: HashMap<&str, u32> = HashMap::new();
+                for (t, p) in &term_postings {
+                    let segment_df = u32::try_from(p.len()).unwrap_or(u32::MAX);
+                    doc_frequencies.insert(t, scorer.doc_frequency(t, segment_df));
+                }
+
+                // ── Postings AND/OR ──
+                // AND for a multi-term query and for a phrase (a phrase needs
+                // every one of its terms in the document before positions are
+                // worth looking at); OR for a wildcard expansion, an explicit
+                // `operator: or`, or a single term.
+                //
+                // `accept` is asked before anything is scored, so a document the
+                // filter or a tombstone rules out costs one bit test, not a
+                // `doc_meta` lookup and a BM25 evaluation per term.
+                let mut scored: HashMap<u32, f64> = HashMap::new();
+                let is_phrase = phrase_tokenized.is_some();
+                let use_and = term_postings.len() > 1
+                    && !is_wildcard_mode
+                    && (is_phrase || operator == kosha_core::QueryOperator::And);
+                // `postings_for_terms` only returns terms this segment contains.
+                // A phrase with a term missing here can match nothing here.
+                let phrase_term_missing = phrase_tokenized.is_some_and(|terms| {
+                    let wanted: HashSet<&str> = terms.iter().map(String::as_str).collect();
+                    let present: HashSet<&str> = term_postings.iter().map(|(t, _)| *t).collect();
+                    wanted.iter().any(|t| !present.contains(t))
+                });
+
+                if phrase_term_missing {
+                    // No candidate at all.
+                } else if !use_and {
+                    for (term, postings) in &term_postings {
+                        let df = doc_frequencies.get(term).copied().unwrap_or(0);
+                        for posting in postings.iter() {
+                            if restricted && !accept(posting.doc_id) {
+                                continue;
+                            }
+                            if let Some(meta) = reader.doc_meta(posting.doc_id) {
+                                let score = scorer.score_term(
+                                    posting.term_frequency,
+                                    df,
+                                    meta.field_length,
+                                );
+                                *scored.entry(posting.doc_id).or_insert(0.0) += score;
+                            }
                         }
                     }
-                    if term_positions.len() < phrase_terms.len() {
-                        // Not all phrase terms appear in this doc.
-                        scored.remove(&doc_id);
-                        continue;
-                    }
-                    let phrase_score = match_phrase_score(&term_positions, slop);
-                    if phrase_score == 0.0 {
-                        scored.remove(&doc_id);
+                } else {
+                    // Intersect starting from the shortest list. Postings are
+                    // stored in ascending doc order in every format the writer
+                    // emits, so membership in another list is a binary search;
+                    // legacy unordered segments get a per-term map instead (the
+                    // earlier code built that map for every segment, i.e. hashed
+                    // every posting of every term whatever the intersection
+                    // turned out to be).
+                    let ordered = reader.has_ordered_postings();
+                    let maps: Vec<HashMap<u32, &kosha_core::Posting>> = if ordered {
+                        Vec::new()
                     } else {
-                        // Boost the score for matching the phrase.
-                        *scored.get_mut(&doc_id).unwrap() *= 1.0 + phrase_score * 0.5;
+                        term_postings
+                            .iter()
+                            .map(|(_, postings)| postings.iter().map(|p| (p.doc_id, p)).collect())
+                            .collect()
+                    };
+                    let lookup =
+                        |term_index: usize, doc_seq: u32| -> Option<&kosha_core::Posting> {
+                            if ordered {
+                                let postings: &[kosha_core::Posting] = &term_postings[term_index].1;
+                                postings
+                                    .binary_search_by_key(&doc_seq, |p| p.doc_id)
+                                    .ok()
+                                    .map(|i| &postings[i])
+                            } else {
+                                maps[term_index].get(&doc_seq).copied()
+                            }
+                        };
+
+                    let shortest = (0..term_postings.len())
+                        .min_by_key(|&i| term_postings[i].1.len())
+                        .expect("use_and implies at least two terms");
+                    let mut and_candidates: Vec<u32> = term_postings[shortest]
+                        .1
+                        .iter()
+                        .map(|p| p.doc_id)
+                        .filter(|doc_seq| !restricted || accept(*doc_seq))
+                        .collect();
+                    for term_index in 0..term_postings.len() {
+                        if term_index == shortest {
+                            continue;
+                        }
+                        and_candidates.retain(|doc_seq| lookup(term_index, *doc_seq).is_some());
+                        if and_candidates.is_empty() {
+                            break;
+                        }
+                    }
+
+                    for doc_seq in and_candidates {
+                        if let Some(meta) = reader.doc_meta(doc_seq) {
+                            // Summed in query-term order, as the WAND join does,
+                            // so both paths round identically.
+                            let mut total_score = 0.0;
+                            for (term_index, (term, _)) in term_postings.iter().enumerate() {
+                                if let Some(p) = lookup(term_index, doc_seq) {
+                                    let df = doc_frequencies.get(term).copied().unwrap_or(0);
+                                    total_score +=
+                                        scorer.score_term(p.term_frequency, df, meta.field_length);
+                                }
+                            }
+                            scored.insert(doc_seq, total_score);
+                        }
                     }
                 }
-            }
+
+                // Apply phrase matching (filter out docs that don't match the phrase).
+                if let Some((phrase_terms, phrase_positions, slop)) = phrase_match {
+                    // Fetch each phrase term's postings once (not once per
+                    // candidate doc) and index by doc_id for O(1) lookup.
+                    // `postings()` is an on-demand decode for v2 segments, so
+                    // the once-per-term discipline matters for real: the decoded
+                    // handles are bound first (they must outlive the maps, which
+                    // borrow position slices out of them).
+                    let phrase_postings_data: Vec<Option<kosha_segment::PostingsRef<'_>>> =
+                        phrase_terms.iter().map(|pt| reader.postings(pt)).collect();
+                    if reader.take_blob_read_failure() {
+                        // Same contract as the scoring fetch above: an
+                        // unreadable blob for a TOC-present phrase term must
+                        // error, not silently fail the phrase.
+                        return Err(KoshaError::CorruptSegment(format!(
+                            "segment {}: posting blob unreadable for a phrase \
+                             term (evicted or corrupt) — retry after rehydration",
+                            entry.segment_id.0
+                        )));
+                    }
+                    let phrase_postings: Vec<HashMap<u32, &[u32]>> = phrase_postings_data
+                        .iter()
+                        .map(|data| {
+                            data.as_ref()
+                                .map(|postings| {
+                                    postings
+                                        .iter()
+                                        .map(|p| (p.doc_id, p.positions.as_slice()))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
+
+                    let doc_ids: Vec<u32> = scored.keys().copied().collect();
+                    for doc_id in doc_ids {
+                        // Borrowed positions straight out of `phrase_postings`
+                        // (which already holds `&[u32]` slices into the
+                        // decoded postings) — `match_phrase_score` only reads,
+                        // so there's no need to clone each term's position
+                        // list into a fresh `Vec` per candidate doc.
+                        let mut term_positions: Vec<&[u32]> = Vec::new();
+                        for term_map in &phrase_postings {
+                            if let Some(&positions) = term_map.get(&doc_id) {
+                                term_positions.push(positions);
+                            }
+                        }
+                        if term_positions.len() < phrase_terms.len() {
+                            // Not all phrase terms appear in this doc.
+                            scored.remove(&doc_id);
+                            continue;
+                        }
+                        let phrase_score =
+                            match_phrase_score_at(&term_positions, phrase_positions, *slop);
+                        if phrase_score == 0.0 {
+                            scored.remove(&doc_id);
+                        } else {
+                            // Boost the score for matching the phrase.
+                            *scored.get_mut(&doc_id).unwrap() *= 1.0 + phrase_score * 0.5;
+                        }
+                    }
+                }
+
+                Ok(scored)
+            };
+            let scored = if multi_reading {
+                // A document matches if it matches some one reading in
+                // full, and scores with its best reading — Elasticsearch's
+                // `cross_fields` grouping by analyzer, combined `dis_max`.
+                let mut best: HashMap<u32, f64> = HashMap::new();
+                for reading in &readings {
+                    let phrase: Option<(Vec<String>, Vec<u32>, u32)> =
+                        query.match_phrase.as_ref().map(|mp| {
+                            let (terms, positions) = reading
+                                .phrase
+                                .clone()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .unzip();
+                            (terms, positions, mp.slop)
+                        });
+                    let bm25_terms = match phrase {
+                        Some((ref terms, _, _)) => terms.clone(),
+                        None => reading.terms.clone(),
+                    };
+                    let missing = operator == kosha_core::QueryOperator::And
+                        && reading.terms.iter().any(|term| !reader.contains_term(term));
+                    if missing || (bm25_terms.is_empty() && phrase.is_none()) {
+                        continue;
+                    }
+                    for (doc_seq, score) in score_reading(&bm25_terms, phrase.as_ref())? {
+                        let slot = best.entry(doc_seq).or_insert(score);
+                        if score > *slot {
+                            *slot = score;
+                        }
+                    }
+                }
+                best
+            } else {
+                score_reading(terms_for_bm25, phrase_match.as_ref())?
+            };
 
             // `accept` already ran on every candidate above.
             for (doc_seq, score) in scored {
@@ -3248,8 +3492,11 @@ impl Searcher {
             .admit(estimate, |needed| self.segment_cache.evict_idle(needed))?;
         phase_stats.admit_wall_ms = t_admit.elapsed().as_secs_f64() * 1e3;
 
+        // Legacy reading, for highlighting only: scoring analyzes the
+        // query per segment (`QueryAnalysis`, #220).
         let query_terms = tokenize(&query.query_text);
-        let term_prune = term_bloom_prune_for_query(query);
+        let query_analysis = QueryAnalysis::new(query);
+        let term_prune = term_bloom_prune_mode(query);
 
         // Score-only candidates (#37): defer `fields.clone()` until after
         // top-k / page selection so clone+sort cost scales with page size,
@@ -3312,17 +3559,17 @@ impl Searcher {
         // Opens done by the `df` pass, kept apart so a segment it opens cold
         // and the scoring pass then finds cached is reported once, as cold.
         let stats_open_stats = OpenStatsCollector::default();
-        let corpus: Option<Arc<CorpusStats>> = match namespace_stats_terms(query) {
-            None => {
+        let corpus: Option<Arc<CorpusStats>> = match uses_namespace_stats(query) {
+            false => {
                 phase_stats.bm25_stats = Bm25StatsUsed::Segment;
                 None
             }
-            Some(stats_terms) => {
+            true => {
                 let corpus = self.namespace_corpus_stats(
                     namespace,
                     manifest,
                     query,
-                    &stats_terms,
+                    &query_analysis,
                     &permit,
                     &stats_open_stats,
                 );
@@ -3346,9 +3593,9 @@ impl Searcher {
                     namespace,
                     entry,
                     query,
-                    &query_terms,
+                    &query_analysis,
                     count_budget,
-                    term_prune.as_ref(),
+                    term_prune,
                     &sort_value_fields,
                     tombstones,
                     manifest_footer,
@@ -4754,24 +5001,47 @@ fn finish_aggregations(
     Some(result)
 }
 
-pub fn term_bloom_prune_for_query(query: &SearchQuery) -> Option<(Vec<String>, TermBloomMode)> {
-    // Hybrid retrieval is a union: lexical absence says nothing about the
-    // vector leg. Wildcards need vocabulary expansion before pruning.
+/// How a query's terms may prune segments by their footer term bloom, or
+/// `None` when they can't (hybrid: lexical absence says nothing about the
+/// vector leg; wildcard: needs vocabulary expansion first). Phrase and
+/// multi-term BM25 use AND semantics.
+pub fn term_bloom_prune_mode(query: &SearchQuery) -> Option<TermBloomMode> {
     if query.knn.is_some() || query.wildcard.is_some() {
         return None;
     }
-    let (terms, mode) = if let Some(phrase) = &query.match_phrase {
-        (tokenize(&phrase.phrase), TermBloomMode::And)
-    } else {
-        (
-            tokenize(&query.query_text),
-            match query.operator {
-                Some(kosha_core::QueryOperator::Or) => TermBloomMode::Or,
-                _ => TermBloomMode::And,
-            },
-        )
-    };
-    (!terms.is_empty()).then_some((terms, mode))
+    // No lexical text (by the legacy reading): nothing to prune on, as
+    // before #220. A chain that does find terms in such text (`keyword`
+    // on "...") just goes unpruned.
+    let text = query
+        .match_phrase
+        .as_ref()
+        .map_or(query.query_text.as_str(), |mp| mp.phrase.as_str());
+    if tokenize(text).is_empty() {
+        return None;
+    }
+    Some(match (&query.match_phrase, query.operator) {
+        (Some(_), _) => TermBloomMode::And,
+        (None, Some(kosha_core::QueryOperator::Or)) => TermBloomMode::Or,
+        (None, _) => TermBloomMode::And,
+    })
+}
+
+/// Whether a segment with `footer` may hold a lexical match, judged by its
+/// term bloom against each of the query's readings for that segment (see
+/// [`QueryAnalysis::for_segment`]): it may if any one reading may. A
+/// reading with no terms never prunes.
+pub fn segment_may_match_query_terms(
+    analysis: &QueryAnalysis,
+    mode: TermBloomMode,
+    footer: &Footer,
+) -> bool {
+    analysis
+        .for_segment(footer.analysis.as_ref())
+        .iter()
+        .any(|reading| {
+            let terms = reading.scoring_terms();
+            terms.is_empty() || segment_may_contain_terms(&terms, mode, footer.term_bloom.as_ref())
+        })
 }
 
 pub fn compute_single_aggregation(store: &FilterStore, field: &str) -> AggregationResults {
@@ -4993,6 +5263,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         for (segment, docs) in [
             (
@@ -5199,6 +5470,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5333,6 +5605,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5424,6 +5697,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -5594,6 +5868,7 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                schema: None,
             },
             all,
         )
@@ -5855,6 +6130,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
 
         // Reproduce the production regime exactly, independent of how this
@@ -6021,6 +6297,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let result = searcher.search(
             &NamespaceId("test".into()),
@@ -6076,6 +6353,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -6148,6 +6426,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -6235,6 +6514,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let result = searcher
             .search(
@@ -6319,6 +6599,7 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                schema: None,
             },
         )
     }
@@ -6714,6 +6995,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut query = mk_query("", 10);
@@ -6793,6 +7075,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -6881,6 +7164,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
 
         // Generous entry-count cap (10) but a byte budget that fits s1 alone,
@@ -7000,6 +7284,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -7066,6 +7351,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
@@ -7120,6 +7406,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7291,6 +7578,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mk_knn_q = |num_candidates: usize| {
@@ -7418,6 +7706,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 1);
@@ -7489,6 +7778,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -7555,6 +7845,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -7626,6 +7917,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         (dir, manifest)
     }
@@ -7745,6 +8037,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         // Fresh searcher (no warm in-memory segment cache) so opening the
         // segment for these searches goes through the real `try_read_doc_index`
@@ -7825,6 +8118,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         // Fresh searcher so each segment is actually opened (Lazy), not
         // served from a warm cache populated by an earlier call here.
@@ -7945,6 +8239,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -7996,6 +8291,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -8055,6 +8351,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8153,6 +8450,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -8198,6 +8496,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -8258,6 +8557,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         }
     }
 
@@ -8311,6 +8611,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         }
     }
 
@@ -8500,6 +8801,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8632,6 +8934,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let run = |b: f64| {
@@ -8803,6 +9106,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let scores = |q: SearchQuery| -> Vec<(String, f64)> {
@@ -8963,6 +9267,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
 
         // Baseline (uncorrupted): "alpha beta" intersects, "beta" matches.
@@ -9058,6 +9363,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         // Open + warm the segment so the reader is cached, THEN evict
@@ -9112,6 +9418,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -9252,6 +9559,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -9316,6 +9624,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -9499,6 +9808,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -9549,6 +9859,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -9656,6 +9967,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -9737,6 +10049,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut id_sort = std::collections::HashMap::new();
@@ -9863,6 +10176,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -9934,6 +10248,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -9988,6 +10303,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -10065,6 +10381,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -10158,6 +10475,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -10238,6 +10556,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -10342,6 +10661,7 @@ mod corpus_stats_tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         }
     }
 
@@ -10861,7 +11181,7 @@ mod corpus_stats_tests {
     fn stats_terms_follow_scope_and_query_shape() {
         let q = query("Alpha beta alpha", 10);
         assert_eq!(
-            namespace_stats_terms(&q),
+            namespace_stats_terms(&q, [None]),
             Some(vec!["alpha".to_string(), "beta".to_string()])
         );
         let mut seg = q.clone();
@@ -10869,14 +11189,14 @@ mod corpus_stats_tests {
             stats: Some(Bm25StatsScope::Segment),
             ..Default::default()
         };
-        assert_eq!(namespace_stats_terms(&seg), None);
+        assert_eq!(namespace_stats_terms(&seg, [None]), None);
         let mut wildcard = q.clone();
         wildcard.wildcard = Some(kosha_core::WildcardQuery {
             field: "content".into(),
             pattern: "al*".into(),
             case_insensitive: false,
         });
-        assert_eq!(namespace_stats_terms(&wildcard), None);
+        assert_eq!(namespace_stats_terms(&wildcard, [None]), None);
     }
 
     /// Overhead of the `df` aggregation (issue #246 asks for it measured).
@@ -11000,6 +11320,7 @@ mod rrf_tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let mut locations = HashMap::new();
         for (g, docs) in groups.iter().enumerate() {
@@ -11556,6 +11877,7 @@ mod rrf_tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         for (g, docs) in groups.iter().enumerate() {
             let id = SegmentId(format!("seg-{g:03}"));
@@ -11673,5 +11995,372 @@ mod rrf_tests {
         assert_eq!(r.results[0].doc_id.0, "lex_top");
         assert!(r.results[0].rank_details.is_none());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// Configurable, versioned analyzers end to end: write path, footer, and
+/// per-segment query analysis (issues #220, #221).
+#[cfg(test)]
+mod analyzer_tests {
+    use super::*;
+    use kosha_core::{
+        AnalysisConfig, DocumentId, Field, FieldSchema, ManifestEntry, MatchPhraseQuery,
+        NamespaceSchema, SegmentId,
+    };
+    use kosha_segment::SegmentWriter;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "kosha-analyzer-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn empty_manifest() -> Manifest {
+        Manifest {
+            version: 1,
+            segments: Vec::new(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+        }
+    }
+
+    fn schema(default: &[&str], fields: &[(&str, &[&str])]) -> NamespaceSchema {
+        NamespaceSchema {
+            fields: fields
+                .iter()
+                .map(|(name, analyzer)| {
+                    (
+                        name.to_string(),
+                        FieldSchema {
+                            analyzer: analyzer.iter().map(|s| s.to_string()).collect(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            default_analyzer: default.iter().map(|s| s.to_string()).collect(),
+            default_stopwords: None,
+        }
+    }
+
+    /// Write one segment of `docs` under `config` and add it to `manifest`.
+    /// The footer is deliberately *not* cached on the manifest, so search
+    /// reads `footer.json` the way a fresh query pod does.
+    fn add_segment(
+        root: &Path,
+        manifest: &mut Manifest,
+        name: &str,
+        config: &AnalysisConfig,
+        docs: Vec<(&str, Vec<Field>)>,
+    ) {
+        let id = SegmentId(name.into());
+        let mut writer =
+            SegmentWriter::new(id.clone(), root.join("ns").join(name)).with_analysis(config);
+        for (doc, fields) in docs {
+            writer.add_document(DocumentId(doc.into()), fields);
+        }
+        let footer = writer.finalize(Bm25Params::default()).unwrap();
+        manifest.version += 1;
+        manifest.segments.push(ManifestEntry {
+            segment_id: id,
+            doc_count: footer.doc_count,
+        });
+    }
+
+    fn query(text: &str) -> SearchQuery {
+        serde_json::from_value(serde_json::json!({ "query_text": text, "max_results": 50 }))
+            .unwrap()
+    }
+
+    fn phrase(text: &str) -> SearchQuery {
+        let mut q = query("");
+        q.match_phrase = Some(MatchPhraseQuery {
+            field: "body".into(),
+            phrase: text.into(),
+            slop: 0,
+        });
+        q
+    }
+
+    fn hits(root: &Path, manifest: &Manifest, q: &SearchQuery) -> Vec<String> {
+        let searcher = Searcher::new(root.to_path_buf());
+        let result = searcher
+            .search(&NamespaceId("ns".into()), manifest, q, None)
+            .unwrap();
+        assert_eq!(result.total_hits, result.results.len(), "{q:?}");
+        let mut ids: Vec<String> = result.results.into_iter().map(|d| d.doc_id.0).collect();
+        ids.sort();
+        ids
+    }
+
+    /// The pre-#220 segment fixture (written by the old writer) still
+    /// returns hits for its own terms next to a segment written with the
+    /// Unicode tokenizer — neither goes dark for the other's analysis.
+    #[test]
+    fn pre_change_segment_round_trips_next_to_unicode_segment() {
+        let root = temp_root("roundtrip");
+        let legacy_dir = root.join("ns").join("legacy-seg");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kosha-segment/tests/fixtures/legacy-seg");
+        for entry in std::fs::read_dir(fixture).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(&path, legacy_dir.join(path.file_name().unwrap())).unwrap();
+        }
+        let mut manifest = empty_manifest();
+        manifest.segments.push(ManifestEntry {
+            segment_id: SegmentId("legacy-seg".into()),
+            doc_count: 3,
+        });
+        let unicode = schema(&["standard@2"], &[]).resolve().unwrap();
+        add_segment(
+            &root,
+            &mut manifest,
+            "unicode-seg",
+            &unicode,
+            vec![
+                ("n1", vec![Field::text("body", "hello,world again")]),
+                ("n2", vec![Field::text("body", "naïve.café foo(bar)")]),
+            ],
+        );
+
+        // Analyzed per segment: `hello,world` is one legacy term in the old
+        // segment and `hello` AND `world` in the new one.
+        assert_eq!(hits(&root, &manifest, &query("hello,world")), ["d1", "n1"]);
+        assert_eq!(hits(&root, &manifest, &query("Naïve.Café")), ["d3", "n2"]);
+        // Legacy reads `foo(bar)` as the term `foo(bar` (the `)` trimmed),
+        // which is exactly what the old segment indexed for d3.
+        assert_eq!(hits(&root, &manifest, &query("foo(bar)")), ["d3", "n2"]);
+        assert_eq!(hits(&root, &manifest, &query("bar")), ["n2"]);
+        // The legacy segment's own whole-word terms still match.
+        assert_eq!(hits(&root, &manifest, &query("legacy tokenizer")), ["d1"]);
+        assert_eq!(hits(&root, &manifest, &query("shoes")), ["d2"]);
+        // A term only the Unicode tokenizer splits out reaches only the new
+        // segment (the old one never indexed it) — and still hits there.
+        assert_eq!(hits(&root, &manifest, &query("world")), ["n1"]);
+        // Phrases use the new tokenizer's positions: `hello,world` is two
+        // adjacent tokens in the Unicode segment, one token in the old one.
+        assert_eq!(hits(&root, &manifest, &phrase("hello world")), ["n1"]);
+        assert_eq!(hits(&root, &manifest, &phrase("hello,world again")), ["n1"]);
+        assert_eq!(hits(&root, &manifest, &phrase("world again")), ["n1"]);
+        assert!(hits(&root, &manifest, &phrase("again hello")).is_empty());
+        assert_eq!(hits(&root, &manifest, &phrase("hello,world from")), ["d1"]);
+        // Segment-level statistics take the same per-segment path.
+        let mut q = query("hello,world");
+        q.bm25_params.stats = Some(Bm25StatsScope::Segment);
+        assert_eq!(hits(&root, &manifest, &q), ["d1", "n1"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn stemming_matches_in_both_directions() {
+        let root = temp_root("stem");
+        let mut manifest = empty_manifest();
+        let config = schema(&["standard", "stem"], &[]).resolve().unwrap();
+        add_segment(
+            &root,
+            &mut manifest,
+            "s",
+            &config,
+            vec![
+                (
+                    "running",
+                    vec![Field::text("body", "Running every morning")],
+                ),
+                ("run", vec![Field::text("body", "a quick run")]),
+                ("other", vec![Field::text("body", "walking")]),
+            ],
+        );
+        assert_eq!(hits(&root, &manifest, &query("run")), ["run", "running"]);
+        assert_eq!(
+            hits(&root, &manifest, &query("running")),
+            ["run", "running"]
+        );
+        assert_eq!(hits(&root, &manifest, &query("RUNS")), ["run", "running"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn stop_filter_applies_to_index_and_query_and_keeps_phrase_gaps() {
+        let root = temp_root("stop");
+        let mut manifest = empty_manifest();
+        let config = schema(&["standard", "stop"], &[]).resolve().unwrap();
+        add_segment(
+            &root,
+            &mut manifest,
+            "s",
+            &config,
+            vec![
+                ("art", vec![Field::text("body", "The state of the art")]),
+                ("plain", vec![Field::text("body", "state art")]),
+            ],
+        );
+        let reader = SegmentReader::open(root.join("ns").join("s")).unwrap();
+        assert!(!reader.contains_term("the") && !reader.contains_term("of"));
+        // A query of nothing but stopwords matches nothing (it does not
+        // turn into "match every document").
+        assert!(hits(&root, &manifest, &query("the of")).is_empty());
+        // Stopwords in a query are dropped, not required.
+        assert_eq!(
+            hits(&root, &manifest, &query("the state of the art")),
+            ["art", "plain"]
+        );
+        // A phrase spans the removed stopwords, at the right distance.
+        assert_eq!(hits(&root, &manifest, &phrase("state of the art")), ["art"]);
+        assert_eq!(hits(&root, &manifest, &phrase("state art")), ["plain"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn keyword_field_is_not_tokenized() {
+        let root = temp_root("keyword");
+        let mut manifest = empty_manifest();
+        let config = schema(&[], &[("sku", &["keyword"])]).resolve().unwrap();
+        add_segment(
+            &root,
+            &mut manifest,
+            "s",
+            &config,
+            vec![("k1", vec![Field::text("sku", "ABC-123 Rev B")])],
+        );
+        let reader = SegmentReader::open(root.join("ns").join("s")).unwrap();
+        assert_eq!(reader.all_terms(), ["ABC-123 Rev B"]);
+        assert_eq!(hits(&root, &manifest, &query("ABC-123 Rev B")), ["k1"]);
+        for partial in ["ABC-123", "rev", "abc-123 rev b"] {
+            assert!(
+                hits(&root, &manifest, &query(partial)).is_empty(),
+                "{partial}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two fields, different chains, one namespace (and one segment).
+    #[test]
+    fn mixed_analyzer_schema() {
+        let root = temp_root("mixed");
+        let mut manifest = empty_manifest();
+        let config = schema(
+            &[],
+            &[("title", &["standard", "stem"]), ("sku", &["keyword"])],
+        )
+        .resolve()
+        .unwrap();
+        add_segment(
+            &root,
+            &mut manifest,
+            "s",
+            &config,
+            vec![
+                (
+                    "m1",
+                    vec![
+                        Field::text("title", "Running Shoes"),
+                        Field::text("body", "lightweight trainers"),
+                        Field::text("sku", "SKU-42"),
+                    ],
+                ),
+                (
+                    "m2",
+                    vec![
+                        Field::text("title", "Rain jacket"),
+                        Field::text("body", "running gear for wet days"),
+                        Field::text("sku", "SKU-7"),
+                    ],
+                ),
+            ],
+        );
+        // `title` is stemmed, `body` is not: "run" reaches m1 through its
+        // stemmed title only; m2's unstemmed body holds "running".
+        assert_eq!(hits(&root, &manifest, &query("run")), ["m1"]);
+        assert_eq!(hits(&root, &manifest, &query("running")), ["m1", "m2"]);
+        // One reading may span fields: stemmed title + default body.
+        assert_eq!(
+            hits(&root, &manifest, &query("running lightweight")),
+            ["m1"]
+        );
+        // The keyword field matches its whole value, case and all.
+        assert_eq!(hits(&root, &manifest, &query("SKU-42")), ["m1"]);
+        assert!(hits(&root, &manifest, &query("sku")).is_empty());
+        // OR unions every reading's terms.
+        let mut or = query("shoe jacket");
+        or.operator = Some(kosha_core::QueryOperator::Or);
+        assert_eq!(hits(&root, &manifest, &or), ["m1", "m2"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Query-time symmetry: a document's own text, used as the query,
+    /// must find it under every analyzer. A query path that analyzed with
+    /// anything but the segment's chain (the classic silent mismatch:
+    /// stemmed index, unstemmed query) fails this.
+    #[test]
+    fn every_analyzer_finds_a_document_by_its_own_text() {
+        let text = "The Runners' café: naïve.state-of-the-art RUNNING (2024)";
+        for analyzer in [
+            &["standard"][..],
+            &["standard@2"],
+            &["standard", "stem"],
+            &["standard@2", "stop", "stem"],
+            &["whitespace"],
+            &["whitespace", "lowercase", "stem"],
+            &["keyword"],
+            &["lowercase"],
+        ] {
+            let root = temp_root("symmetry");
+            let mut manifest = empty_manifest();
+            let config = schema(analyzer, &[]).resolve().unwrap();
+            add_segment(
+                &root,
+                &mut manifest,
+                "s",
+                &config,
+                vec![
+                    ("doc", vec![Field::text("body", text)]),
+                    ("noise", vec![Field::text("body", "unrelated words")]),
+                ],
+            );
+            assert_eq!(
+                hits(&root, &manifest, &query(text)),
+                ["doc"],
+                "{analyzer:?}"
+            );
+            // And the index really holds this chain's terms, not legacy ones
+            // (otherwise the check above proves nothing).
+            let reader = SegmentReader::open(root.join("ns").join("s")).unwrap();
+            let mut expected = kosha_segment::Analyzer::new(&config.default).analyze(text);
+            expected
+                .extend(kosha_segment::Analyzer::new(&config.default).analyze("unrelated words"));
+            expected.sort();
+            expected.dedup();
+            assert_eq!(reader.all_terms(), expected, "{analyzer:?}");
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn namespace_stats_terms_union_every_segment_reading() {
+        let q = query("Running hello,world");
+        let stem = schema(&["standard@2", "stem"], &[]).resolve().unwrap();
+        let stemmed = kosha_core::SegmentAnalysis {
+            default: stem.default.clone(),
+            fields: BTreeMap::new(),
+            default_used: true,
+        };
+        let terms = namespace_stats_terms(&q, [None, Some(&stemmed), None]).unwrap();
+        assert_eq!(terms, ["hello", "hello,world", "run", "running", "world"]);
     }
 }

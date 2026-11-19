@@ -32,7 +32,8 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | BM25 lexical search | `k1` / `b` tunable per request: `bm25_params: {"k1": 2.0, "b": 0.3}` on `POST /search`, `k1=` / `b=` on `GET /search`. Either may be omitted and falls back to the segment's build-time value (1.2 / 0.75 unless built otherwise). `k1` must be ≥ 0 and `b` in [0, 1]; anything else (or non-numeric) is a 400. WAND pruning bounds are recomputed for the request's values, so results match exhaustive scoring. `k3` is not supported. IDF and `avgdl` are namespace-level (summed over all segments), so a document scores the same whichever segment holds it; `bm25_params: {"stats": "segment"}` / `bm25_stats=segment` (or `KOSHA_BM25_STATS=segment` server-wide) switches back to per-segment statistics for debugging. Wildcard queries use per-segment statistics |
 | `operator: and` / `or` | AND (default) requires every query term; OR scores the union |
 | Block-max WAND | Skip-list postings, rarest-first probe ordering, leapfrog AND join |
-| `match_phrase` | Positional postings, configurable `slop` |
+| `match_phrase` | Positional postings, configurable `slop`. A word a `stop` filter removed still counts as a position, so `"state of the art"` matches across the removed stopwords and `"state art"` does not |
+| Configurable analyzers | Per-field `analyzer` in the namespace schema: `standard`, `standard@2` (Unicode), `keyword`, `lowercase`, `whitespace`, plus `lowercase` / `stop` / `stem` filters. See [Analyzers](#analyzers) |
 | `wildcard` | Per-field pattern match, case-insensitive by default |
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
 | Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
@@ -88,9 +89,66 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 ### Not supported yet
 
 - Reranking (Phase 2, DESIGN.md §3.1). Per-retriever weights for RRF.
-- Configurable analyzers — tokenization is fixed (whitespace split, ASCII-punctuation trim, lowercase). The `analyzer` field exists in the schema proto but is not honored.
+- Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
 - `kosha-vector-spfresh` (SPFresh/SPANN with LIRE rebalancing) is a standalone, benchmarked prototype; it is not wired into the segment format or the query path.
+
+## Analyzers
+
+A namespace schema chooses how each `Text` field is analyzed (issues #220, #221). Set it with
+`POST /v1/namespaces/{ns}/schema` (read it back with `GET`); the body is a proto `NamespaceSchema`:
+
+```json
+{"fields": {
+   "title": {"analyzer": ["standard@2", "stop", "stem"]},
+   "sku":   {"analyzer": ["keyword"]},
+   "body":  {"analyzer": ["standard", "stop"], "stopwords": ["the", "a"]}},
+ "default_analyzer": ["standard@2"]}
+```
+
+The first name picks the analyzer, every later name appends a filter:
+
+| Analyzer | Tokens |
+| --- | --- |
+| `standard` (default) | Legacy tokenizer: split on whitespace, trim ASCII punctuation from each word's edges, lowercase. `hello,world` is one token |
+| `standard@2` | Unicode: UAX #29 word boundaries (`unicode-segmentation`), also split at `.`/`:` between letters, lowercase. `hello,world` → `hello` `world`; `naïve.café` → `naïve` `café`; `3.14` stays whole; Han ideographs are one token each |
+| `keyword` | The whole value, untouched — one token, case-sensitive |
+| `lowercase` | The whole value, lowercased — one token |
+| `whitespace` | Split on whitespace; case and punctuation kept |
+
+| Filter | Effect |
+| --- | --- |
+| `lowercase` | Unicode lowercase |
+| `stop` | Drop stopwords: Lucene's 33-word English list, or the field's `stopwords` (`default_stopwords` for `default_analyzer`). Applied to the query too; a query of only stopwords matches nothing |
+| `stem` | English Snowball stemmer (`rust-stemmers`): `running`, `runs` and `run` all match each other |
+
+`default_analyzer` covers every `Text` field the schema does not list (clients send every JSON
+string as `Text`). All text fields share one term space, so a query matches a document if it
+matches one analysis of the query across its fields — e.g. a stemmed `title` term and an unstemmed
+`body` term together.
+
+**Compatibility.** Each segment records the chains it was written with in its footer, and every
+query is analyzed per segment with those chains, so changing the schema (or the tokenizer version)
+never makes existing segments return zero hits: they answer as they were written until compaction
+rewrites them, re-analyzing their stored documents under the current schema. An invalid schema is
+rejected with a 400 and changes nothing.
+
+**Why `standard` still means the legacy tokenizer.** The Unicode tokenizer is opt-in
+(`standard@2`), not the new default, for three reasons: segments written with no schema stay
+byte-identical to every earlier release; old segments' terms (`hello,world`) are only reachable
+by the legacy reading anyway; and rollback stays safe. A binary older than this change ignores the
+footer `analysis` field and analyzes every query the legacy way, so after **rolling back** it,
+segments written with any non-default analyzer return wrong or missing hits for affected terms
+until they are rewritten. Before rolling back past this change, remove the schema (`POST` one with
+no analyzers) and run a full compaction (`POST /v1/admin/compact-namespace`) so every segment is
+legacy again. Flipping the default to `standard@2` later only needs a new default here: old
+segments keep their recorded version.
+
+Throughput on the repository's Markdown (16 MB, ~2 KB documents; `cargo bench -p kosha-segment
+--bench tokenizer`, Apple M5): `standard` 249 MB/s, `standard@2` 147 MB/s (0.59x),
+`standard@2` + `stop` + `stem` 41 MB/s; whole segment build 61 / 50 / 28 MB/s (`standard@2`
+costs 0.82x of a legacy build; the Snowball stemmer is most of the rest). All-ASCII words take a
+hand-written UAX #29 fast path checked against `unicode-segmentation` by a differential test.
 
 ## Authorization and durability
 

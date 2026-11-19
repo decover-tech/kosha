@@ -57,6 +57,7 @@ impl Controller {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                schema: None,
             },
         );
         Ok(())
@@ -77,6 +78,7 @@ impl Controller {
                     wal_origin: None,
                     tombstones: Default::default(),
                     deletion_vectors: Default::default(),
+                    schema: None,
                 },
             );
         }
@@ -227,6 +229,7 @@ mod tests {
             wal_origin: Some("writer-a".into()),
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         ctrl.compare_and_swap_manifest(&ns, 0, candidate.clone())
             .unwrap();
@@ -314,6 +317,7 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                schema: None,
             },
         )
         .unwrap();
@@ -333,6 +337,7 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                schema: None,
             },
         )
         .unwrap();
@@ -361,6 +366,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
 
         // CAS with version 0 → should succeed (initial version is 0).
@@ -381,6 +387,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         assert!(ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2).is_err());
     }
