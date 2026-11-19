@@ -2555,27 +2555,27 @@ impl AppState {
                 .remember_segment_footers(ns, fetched_footers.values().cloned());
         }
 
+        let stats_terms = kosha_query::namespace_stats_terms(query).filter(|t| !t.is_empty());
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
+        let mut stats_only: Vec<PathBuf> = Vec::new();
         for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
-            if needs_bloom_check {
-                // Borrowed, never cloned: footers hold every bloom. A
-                // segment with no cached footer was already read (once)
-                // into `fetched_footers` above.
-                let footer = manifest
-                    .segment_footer(&entry.segment_id)
-                    .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
-                if let Some(footer) = footer {
-                    if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
-                        continue;
-                    }
-                    if let Some((ref terms, mode)) = term_prune {
-                        if !segment_may_contain_terms(terms, mode, footer.term_bloom.as_ref()) {
-                            continue;
-                        }
-                    }
-                }
+            // Borrowed, never cloned: footers hold every bloom. A segment
+            // with no cached footer was already read (once) into
+            // `fetched_footers` above.
+            let footer = manifest
+                .segment_footer(&entry.segment_id)
+                .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
+            match segment_search_hydration(
+                query,
+                needs_bloom_check,
+                term_prune.as_ref(),
+                stats_terms.as_deref(),
+                footer,
+            ) {
+                SegmentHydration::Scoring => to_hydrate.push(seg_path),
+                SegmentHydration::StatsOnly => stats_only.push(seg_path),
+                SegmentHydration::Skip => {}
             }
-            to_hydrate.push(seg_path);
         }
         let mut outcome = self.ensure_scoring_files_local(
             &to_hydrate,
@@ -2594,6 +2594,29 @@ impl AppState {
         outcome.files_fetched += postings_outcome.files_fetched;
         outcome.bytes_fetched += postings_outcome.bytes_fetched;
         outcome.missing.extend(postings_outcome.missing);
+        if !stats_only.is_empty() {
+            // Best effort: whatever is still missing afterwards doesn't fail
+            // the search. The searcher then can't read that segment's `df`
+            // and scores the whole search with per-segment statistics
+            // (`bm25_stats: segment_fallback`) — the pre-#246 behavior —
+            // rather than with a `df` that leaves the segment out.
+            let stats_files = self.ensure_scoring_files_local(
+                &stats_only,
+                false,
+                false,
+                &paths_with_manifest_footer,
+                request,
+            );
+            let stats_postings = self.ensure_posting_blobs_local(
+                ns,
+                manifest.version,
+                &stats_only,
+                &posting_files,
+                request,
+            );
+            outcome.files_fetched += stats_files.files_fetched + stats_postings.files_fetched;
+            outcome.bytes_fetched += stats_files.bytes_fetched + stats_postings.bytes_fetched;
+        }
         outcome.files_fetched += footer_files;
         outcome.bytes_fetched += footer_bytes;
         // `to_hydrate` only covers every manifest segment when the bloom
@@ -4862,8 +4885,22 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
                 .map_err(|_| format!("'{name}' must be a number, got '{v}'")),
         }
     };
+    // `bm25_stats=segment|namespace` (issue #246): where IDF / avgdl come
+    // from. Absent means the engine default.
+    let stats = match params.get("bm25_stats") {
+        None => None,
+        Some(v) => match kosha_core::Bm25StatsScope::parse(v) {
+            Some(scope) => Some(scope),
+            None => {
+                return json_error(
+                    400,
+                    &format!("'bm25_stats' must be 'namespace' or 'segment', got '{v}'"),
+                )
+            }
+        },
+    };
     let bm25_params = match (parse_param("k1"), parse_param("b")) {
-        (Ok(k1), Ok(b)) => kosha_core::Bm25Overrides { k1, b },
+        (Ok(k1), Ok(b)) => kosha_core::Bm25Overrides { k1, b, stats },
         (Err(e), _) | (_, Err(e)) => return json_error(400, &e),
     };
 
@@ -5976,6 +6013,54 @@ fn body_val_fallback(body: &[u8]) -> serde_json::Value {
     serde_json::json!({})
 }
 
+/// What one segment needs hydrated for a search — see
+/// [`segment_search_hydration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "s3")]
+enum SegmentHydration {
+    /// The full scoring set: the segment may hold a hit.
+    Scoring,
+    /// Only the inverted index and the query terms' posting blobs: the
+    /// segment can't hold a hit (its filter or AND-term bloom rules it
+    /// out), but it may contain a query term, and namespace-level BM25
+    /// statistics (issue #246) count its documents in that term's `df`.
+    StatsOnly,
+    /// Nothing.
+    Skip,
+}
+
+/// Decide what a segment needs hydrated for `query` from its footer's
+/// blooms. `stats_terms` is [`kosha_query::namespace_stats_terms`]: when
+/// set, a segment the query's own pruning skips is still hydrated for
+/// `df` if its term bloom admits any one of them (OR — a segment holding
+/// only some terms of an AND query still contributes to their `df`).
+/// No footer means it can't be pruned, so it gets the full scoring set.
+#[cfg(feature = "s3")]
+fn segment_search_hydration(
+    query: &SearchQuery,
+    needs_bloom_check: bool,
+    term_prune: Option<&(Vec<String>, TermBloomMode)>,
+    stats_terms: Option<&[String]>,
+    footer: Option<&kosha_core::Footer>,
+) -> SegmentHydration {
+    let Some(footer) = footer.filter(|_| needs_bloom_check) else {
+        return SegmentHydration::Scoring;
+    };
+    let admitted = query.segment_may_match_filters(footer.filter_blooms.as_ref())
+        && term_prune.is_none_or(|(terms, mode)| {
+            segment_may_contain_terms(terms, *mode, footer.term_bloom.as_ref())
+        });
+    if admitted {
+        SegmentHydration::Scoring
+    } else if stats_terms.is_some_and(|terms| {
+        segment_may_contain_terms(terms, TermBloomMode::Or, footer.term_bloom.as_ref())
+    }) {
+        SegmentHydration::StatsOnly
+    } else {
+        SegmentHydration::Skip
+    }
+}
+
 /// Lexical terms used for footer term-bloom prune before hydrate/open.
 ///
 /// Wildcard queries cannot be pruned here — expansion needs the segment
@@ -6143,13 +6228,14 @@ fn log_search_timing(
     let total_ms = hydrate_ms
         + queue_ms
         + phases.admit_wall_ms
+        + phases.bm25_stats_ms
         + phases.score_wall_ms
         + phases.materialize_wall_ms;
     println!(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
-         hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} score_ms={:.1} \
-         materialize_ms={:.1} opens_cold={} opens_cached={} open_total_ms={:.1} \
-         knn_postings={} knn_degraded={} hits={}",
+         hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
+         score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
+         open_total_ms={:.1} knn_postings={} knn_degraded={} hits={}",
         ns.0,
         total_ms,
         hydrate_ms,
@@ -6157,6 +6243,8 @@ fn log_search_timing(
         hydration.bytes_fetched as f64 / (1024.0 * 1024.0),
         queue_ms,
         phases.admit_wall_ms,
+        phases.bm25_stats.as_str(),
+        phases.bm25_stats_ms,
         phases.score_wall_ms,
         phases.materialize_wall_ms,
         phases.open_cold,
@@ -6860,6 +6948,139 @@ mod tests {
             let resp = get(bad);
             assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
         }
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn filter_pruned_segments_still_hydrate_for_namespace_bm25_stats() {
+        // Issue #246: a segment the filter rules out holds no hit, but its
+        // documents count toward a query term's `df`, so it needs its
+        // inverted index + posting blob (never filters/vectors) — unless
+        // its term bloom says no query term is there, or the request
+        // asked for per-segment statistics.
+        let footer = |matter: &str, terms: &[&str]| kosha_core::Footer {
+            segment_id: kosha_core::SegmentId("s".into()),
+            doc_count: 1,
+            total_field_length: 1,
+            avg_field_length: 1.0,
+            bm25_params: Default::default(),
+            created_at: String::new(),
+            filter_blooms: Some(HashMap::from([(
+                "matter".to_string(),
+                kosha_core::BloomFilter::build([matter]),
+            )])),
+            term_bloom: Some(kosha_core::build_term_bloom(terms.iter().copied())),
+            format_version: kosha_core::SEGMENT_FORMAT_VERSION,
+            text_filter_ignore_above: None,
+            doc_vectors: false,
+        };
+        let mut query: SearchQuery = serde_json::from_str(
+            r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
+        )
+        .unwrap();
+        let decide = |query: &SearchQuery, f: &kosha_core::Footer| {
+            let term_prune = term_bloom_prune_for_query(query);
+            let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
+            let stats_terms = kosha_query::namespace_stats_terms(query);
+            segment_search_hydration(
+                query,
+                needs_bloom_check,
+                term_prune.as_ref(),
+                stats_terms.as_deref(),
+                Some(f),
+            )
+        };
+        let same_matter = footer("m1", &["contract", "breach"]);
+        let other_matter = footer("m2", &["contract", "breach"]);
+        let other_matter_one_term = footer("m2", &["contract"]);
+        let same_matter_one_term = footer("m1", &["breach"]);
+        let no_terms = footer("m2", &["unrelated"]);
+        assert_eq!(decide(&query, &same_matter), SegmentHydration::Scoring);
+        assert_eq!(decide(&query, &other_matter), SegmentHydration::StatsOnly);
+        assert_eq!(
+            decide(&query, &other_matter_one_term),
+            SegmentHydration::StatsOnly
+        );
+        // AND term pruning skips it for scoring, not for `df(breach)`.
+        assert_eq!(
+            decide(&query, &same_matter_one_term),
+            SegmentHydration::StatsOnly
+        );
+        assert_eq!(decide(&query, &no_terms), SegmentHydration::Skip);
+
+        query.bm25_params.stats = Some(kosha_core::Bm25StatsScope::Segment);
+        assert_eq!(decide(&query, &same_matter), SegmentHydration::Scoring);
+        assert_eq!(decide(&query, &other_matter), SegmentHydration::Skip);
+        assert_eq!(
+            decide(&query, &same_matter_one_term),
+            SegmentHydration::Skip
+        );
+    }
+
+    #[test]
+    fn search_uses_namespace_bm25_stats_with_segment_switch() {
+        // Issue #246: IDF comes from the whole namespace by default, so a
+        // document scores the same however the namespace is split into
+        // segments; `bm25_params.stats` / `bm25_stats=` switch back to
+        // per-segment statistics, keyed separately in the result cache.
+        let state = test_state();
+        let ns = NamespaceId("statsns".into());
+        let doc = |id: &str, text: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text)],
+        };
+        // Segment 1: the only "rare" doc. Segment 2: many docs without it.
+        state
+            .indexer
+            .index_documents(ns.clone(), vec![doc("r", "rare common")])
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                (0..9)
+                    .map(|i| doc(&format!("c{i}"), "common filler"))
+                    .collect(),
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let score = |resp: &str| -> f64 {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(v["results"][0]["doc_id"], "r");
+            v["results"][0]["score"].as_f64().unwrap()
+        };
+        let post = |params: &str| {
+            let body =
+                format!(r#"{{"namespace":"statsns","query_text":"rare","bm25_params":{params}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let get = |qs: &str| {
+            handle_search_get(
+                &format!("GET /search?ns=statsns&q=rare{qs} HTTP/1.1"),
+                &state,
+            )
+        };
+        // N = 10 docs, df = 1, avgdl = 2, dl = 2.
+        let namespace_expected = (1.0f64 + (10.0 - 1.0 + 0.5) / 1.5).ln();
+        // Segment-local: N = 1, df = 1.
+        let segment_expected = (1.0f64 + 0.5 / 1.5).ln();
+        for _ in 0..2 {
+            assert!((score(&post("{}")) - namespace_expected).abs() < 1e-9);
+            assert!((score(&post(r#"{"stats":"segment"}"#)) - segment_expected).abs() < 1e-9);
+            assert!((score(&get("")) - namespace_expected).abs() < 1e-9);
+            assert!((score(&get("&bm25_stats=segment")) - segment_expected).abs() < 1e-9);
+            assert!((score(&get("&bm25_stats=namespace")) - namespace_expected).abs() < 1e-9);
+        }
+        let resp = post(r#"{"stats":"shard"}"#);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        let resp = get("&bm25_stats=shard");
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("bm25_stats"), "{resp}");
     }
 
     #[test]

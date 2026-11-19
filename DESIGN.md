@@ -346,6 +346,21 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      otherwise HTTP 400). Nothing on disk bakes them in: postings keep raw term frequencies and
      block summaries keep `max_tf` / `min_field_length`, so block-max WAND ceilings are computed
      at query time with the same scorer as the hits and pruning stays exact for any valid values.
+     BM25's collection statistics are **namespace-level** (issue #246): `N = Σ doc_count` and
+     `avgdl = Σ total_field_length / N` over every manifest segment's footer, and
+     `df(term) = Σ` per-segment posting counts, computed lazily for query terms only (a segment
+     whose term bloom rules the term out contributes 0 without being opened) and cached per
+     `(namespace, manifest version, segment-list fingerprint, term)`. Every segment scores with
+     the same values, so a document's score does not depend on which segment it landed in and
+     the cross-segment merge compares like with like; the block-max ceilings take their `df`
+     from the same scorer. Deleted documents still count until compaction drops them, as they do
+     in Lucene. If any segment's footer or a term's postings can't be read locally, the search
+     falls back to per-segment statistics as a whole (reported as `segment_fallback`) rather than
+     score with a partial `df`; the server therefore also hydrates the inverted index and posting
+     blob of segments the query's filter prunes but whose term bloom admits a query term.
+     `bm25_params.stats: "segment"` (or `KOSHA_BM25_STATS=segment` engine-wide) restores
+     per-segment statistics for A/B debugging. Wildcard queries keep per-segment statistics,
+     since their expansion is per segment.
    - Semantic: ANN search over `vector.idx` (HNSW graph traversal or IVF-PQ probe), scored by
      cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
      query in `query_builder.py`.
