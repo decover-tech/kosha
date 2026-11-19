@@ -21,6 +21,18 @@ CREATE TABLE IF NOT EXISTS kosha.manifests (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- ── Retired namespaces ────────────────────────────────────────────────────
+-- One row per namespace id that was deleted (DELETE /v1/namespaces/{ns}),
+-- holding the highest manifest version any deleted incarnation reached. A
+-- re-created namespace starts at last_version + 1, so manifest versions never
+-- repeat for one id and caches keyed by (namespace, version) on query
+-- replicas cannot serve a deleted incarnation's data.
+CREATE TABLE IF NOT EXISTS kosha.retired_namespaces (
+    id           TEXT PRIMARY KEY,
+    last_version BIGINT NOT NULL,
+    retired_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Index for listing recently-active namespaces.
 CREATE INDEX IF NOT EXISTS idx_manifests_updated_at
     ON kosha.manifests (updated_at DESC);

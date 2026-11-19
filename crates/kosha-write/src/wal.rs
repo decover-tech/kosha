@@ -162,6 +162,35 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Discard every record of a deleted namespace, whatever its sequence,
+    /// so a restart cannot replay them and resurrect the namespace. Files
+    /// that also hold another namespace's records (only legacy multi-record
+    /// files can) are kept and reported in the returned count of skipped
+    /// files; every file this writer produces holds one record.
+    pub fn discard_namespace(&mut self, namespace: &NamespaceId) -> Result<usize, KoshaError> {
+        let mut shared = 0;
+        let mut eligible = Vec::new();
+        for (seq, namespaces) in &self.record_namespaces {
+            if !namespaces.contains(namespace) {
+                continue;
+            }
+            if namespaces.len() == 1 {
+                eligible.push(*seq);
+            } else {
+                shared += 1;
+            }
+        }
+        for seq in eligible {
+            match std::fs::remove_file(self.wal_dir.join(format!("wal-{seq:020x}.wal"))) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            self.record_namespaces.remove(&seq);
+        }
+        Ok(shared)
+    }
+
     /// Append a batch of documents to the WAL.
     pub fn append(
         &mut self,

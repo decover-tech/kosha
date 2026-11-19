@@ -316,6 +316,49 @@ impl Cache {
         Ok(())
     }
 
+    /// Remove everything under the directory `prefix` (a deleted
+    /// namespace's segments), tracked or not, and drop the tracked keys
+    /// below it from the size accounting and LRU order. Only the bytes the
+    /// cache had accounted for are subtracted, so files written straight to
+    /// disk by the indexer cannot underflow the total.
+    pub fn evict_prefix(&self, prefix: &str) -> Result<(), KoshaError> {
+        let prefix = prefix.trim_matches('/');
+        if prefix.is_empty() {
+            return Err(KoshaError::NotFound(
+                "refusing to evict the cache root".into(),
+            ));
+        }
+        let dir = self.path_for(prefix)?;
+        let below = format!("{prefix}/");
+        let mut freed = 0u64;
+        {
+            let mut recency = self.recency.lock().unwrap();
+            recency.retain(|key| {
+                if !key.starts_with(&below) {
+                    return true;
+                }
+                if let Ok(path) = self.path_for(key) {
+                    freed += path.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+                false
+            });
+        }
+        if dir.is_dir() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        let mut total = self.total_bytes.load(Ordering::Relaxed);
+        while let Err(actual) = self.total_bytes.compare_exchange_weak(
+            total,
+            total.saturating_sub(freed),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            total = actual;
+        }
+        self.eviction_generation.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Monotonic counter bumped once per file/dir this cache has actually
     /// removed (LRU `enforce_limit` or an explicit `evict` call) — never on
     /// a no-op `evict` of an already-absent key. Callers that cache their
@@ -372,6 +415,30 @@ fn dir_size(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn evict_prefix_removes_one_namespace_and_keeps_its_neighbours() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-evict-prefix-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
+        cache.put_bytes("t/gone/seg-1/a.bin", &[0; 100]).unwrap();
+        cache.put_bytes("t/gone2/seg-1/a.bin", &[0; 10]).unwrap();
+        // Written behind the cache's back (the indexer does this).
+        fs::create_dir_all(dir.join("t/gone/seg-2")).unwrap();
+        fs::write(dir.join("t/gone/seg-2/b.bin"), [0; 1000]).unwrap();
+        let generation = cache.eviction_generation();
+
+        cache.evict_prefix("t/gone").unwrap();
+        assert!(!dir.join("t/gone").exists());
+        assert!(cache.contains("t/gone2/seg-1/a.bin"));
+        assert_eq!(cache.total_size(), 10, "only tracked bytes are released");
+        assert!(cache.eviction_generation() > generation);
+        assert!(cache.evict_prefix("/").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn cache_miss_returns_none() {

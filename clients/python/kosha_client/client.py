@@ -1383,29 +1383,143 @@ class TasksOps:
 class IndexOps:
     """Mimics ``opensearchpy.client.IndicesClient`` for compatibility.
 
-    Phase 1 is schema-less — Kosha creates namespaces on first write, so
-    ``create()`` and ``exists()`` are mostly no-ops.
+    ``create`` and ``delete`` are real: ``POST /v1/namespaces`` and
+    ``DELETE /v1/namespaces/{ns}``. Kosha still creates a namespace on its
+    first write, so calling ``create`` first is optional.
     """
 
     def __init__(self, client: KoshaClient) -> None:
         self._client = client
 
+    # Elasticsearch mapping type -> proto ``FieldType`` name. Types not
+    # listed here (object, nested, geo_point, ...) have no Kosha equivalent
+    # and are left out of the schema rather than guessed.
+    _FIELD_TYPES_FROM_ES = {
+        "text": "FIELD_TYPE_TEXT",
+        "match_only_text": "FIELD_TYPE_TEXT",
+        "keyword": "FIELD_TYPE_KEYWORD",
+        "constant_keyword": "FIELD_TYPE_KEYWORD",
+        "long": "FIELD_TYPE_INTEGER",
+        "integer": "FIELD_TYPE_INTEGER",
+        "short": "FIELD_TYPE_INTEGER",
+        "byte": "FIELD_TYPE_INTEGER",
+        "double": "FIELD_TYPE_FLOAT",
+        "float": "FIELD_TYPE_FLOAT",
+        "half_float": "FIELD_TYPE_FLOAT",
+        "scaled_float": "FIELD_TYPE_FLOAT",
+        "date": "FIELD_TYPE_DATE",
+        "date_nanos": "FIELD_TYPE_DATE",
+        "boolean": "FIELD_TYPE_BOOLEAN",
+        "knn_vector": "FIELD_TYPE_VECTOR",
+        "dense_vector": "FIELD_TYPE_VECTOR",
+    }
+
+    @staticmethod
+    def _ignored(params: dict) -> set[int]:
+        """Status codes the caller asked to ignore (opensearchpy ``ignore``)."""
+        ignore = params.get("ignore", ())
+        if isinstance(ignore, int):
+            ignore = (ignore,)
+        return {int(code) for code in ignore}
+
+    @classmethod
+    def _schema_from_mappings(cls, mappings: Any) -> dict | None:
+        """``NamespaceSchema`` for the plain fields of an ES ``mappings``.
+
+        Each top-level property with a type Kosha has (see
+        ``_FIELD_TYPES_FROM_ES``) becomes a ``FieldSchema``: ``index: false``
+        maps to ``indexed: false``, a text field's ``analyzer`` is passed
+        through. Object/nested properties, multi-fields and unknown types
+        are skipped. ``None`` when nothing translates.
+        """
+        if not isinstance(mappings, dict):
+            return None
+        properties = mappings.get("properties")
+        if not isinstance(properties, dict):
+            return None
+        fields: dict[str, dict] = {}
+        for name, spec in properties.items():
+            if not isinstance(spec, dict):
+                continue
+            field_type = cls._FIELD_TYPES_FROM_ES.get(str(spec.get("type", "")))
+            if field_type is None:
+                logger.info(
+                    "IndexOps.create: mapping for %r (type %r) has no Kosha "
+                    "equivalent; left out of the schema",
+                    name,
+                    spec.get("type", "object"),
+                )
+                continue
+            field = {
+                "type": field_type,
+                "indexed": spec.get("index", True) is not False,
+                "stored": True,
+            }
+            analyzer = spec.get("analyzer")
+            if field_type == "FIELD_TYPE_TEXT" and isinstance(analyzer, str):
+                field["analyzer"] = [analyzer]
+            fields[name] = field
+        return {"fields": fields} if fields else None
+
     def create(self, index: str, body: dict | None = None, **params: Any) -> dict:
-        logger.info("IndexOps.create(%s) — no-op (Kosha is schema-less)", index)
-        return {"acknowledged": True, "shards_acknowledged": True, "index": index}
+        """Create the namespace (``POST /v1/namespaces``).
+
+        ``body["mappings"]`` is translated to a ``NamespaceSchema`` where
+        the mapping is straightforward; ``settings`` are ignored (Kosha has
+        no shards, replicas or refresh interval). An existing namespace
+        raises ``KoshaRequestError`` with status 409; ``ignore=400`` (what
+        ES callers pass for ``resource_already_exists_exception``) or
+        ``ignore=409`` returns the error body instead.
+        """
+        ns = self._client._resolve_ns(index)
+        request: dict[str, Any] = {"namespace": ns}
+        schema = self._schema_from_mappings((body or {}).get("mappings"))
+        if schema is not None:
+            request["schema"] = schema
+        if (body or {}).get("settings"):
+            logger.debug("IndexOps.create(%s): settings ignored", ns)
+        try:
+            self._client._transport.request("POST", "v1/namespaces", request)
+        except KoshaRequestError as e:
+            ignored = self._ignored(params)
+            if e.status_code in ignored or (e.status_code == 409 and 400 in ignored):
+                return e.info or {"error": e.error, "status": e.status_code}
+            raise
+        return {"acknowledged": True, "shards_acknowledged": True, "index": ns}
 
     def exists(self, index: str, **params: Any) -> bool:
-        try:
-            self._client.count(index=index)
-            return True
-        except KoshaRequestError:
-            return False
+        """Whether every named namespace exists (``GET .../stats``)."""
+        for name in self._index_names(index):
+            ns = urllib.parse.quote(name, safe="")
+            try:
+                self._client._v1_request("GET", ns, "stats")
+            except KoshaRequestError as e:
+                if e.status_code == 404:
+                    return False
+                raise
+        return True
 
     def delete(self, index: str, **params: Any) -> dict:
-        logger.info(
-            "IndexOps.delete(%s) — no-op (Kosha does not support index deletion yet)",
-            index,
+        """Delete each named namespace (``DELETE /v1/namespaces/{ns}``).
+
+        Deleting removes the namespace's documents and segments for good. A
+        missing namespace raises ``KoshaRequestError`` with status 404 (ES
+        ``NotFoundError``) unless ``ignore_unavailable=True`` or
+        ``ignore=404`` is passed.
+        """
+        if index is None or index == "" or index == []:
+            raise ValueError("indices.delete needs an index name")
+        skip_missing = bool(params.get("ignore_unavailable")) or 404 in self._ignored(
+            params
         )
+        for name in self._index_names(index):
+            path = f"v1/namespaces/{urllib.parse.quote(name, safe='')}"
+            try:
+                self._client._transport.request("DELETE", path)
+            except KoshaRequestError as e:
+                if e.status_code == 404 and skip_missing:
+                    continue
+                raise
         return {"acknowledged": True}
 
     def put_mapping(self, index: str, body: dict, **params: Any) -> dict:

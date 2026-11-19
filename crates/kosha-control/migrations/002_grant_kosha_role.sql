@@ -11,3 +11,4 @@ ALTER SCHEMA kosha OWNER TO kosha;
 ALTER TABLE kosha.namespaces OWNER TO kosha;
 ALTER TABLE kosha.manifests OWNER TO kosha;
 ALTER TABLE kosha.api_keys OWNER TO kosha;
+ALTER TABLE kosha.retired_namespaces OWNER TO kosha;

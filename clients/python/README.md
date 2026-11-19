@@ -66,7 +66,35 @@ schema lists without a type appears as `{}`; the client never guesses a type.
 `client.indices.get_settings(index=...)` reports only `{"index": {"provided_name": "<index>"}}`.
 Kosha has no shards, replicas or refresh interval per namespace, so none are reported.
 
+## Creating and deleting indices
+
+`client.indices.create(index=..., body=...)` calls `POST /v1/namespaces`. Plain top-level
+fields in `body["mappings"]["properties"]` are sent as the namespace schema (ES type to
+`FieldType`, the reverse of the table above, plus `integer`/`short`/`byte` → `INTEGER`,
+`float`/`half_float`/`scaled_float` → `FLOAT`, `date_nanos` → `DATE`, `dense_vector` →
+`VECTOR`); object, nested and other types with no Kosha equivalent are left out, and
+`settings` are ignored. Creating an index that exists raises `KoshaRequestError` with status
+409; `ignore=400` (what ES callers pass for `resource_already_exists_exception`) or
+`ignore=409` returns the error body instead. Creating first is optional: Kosha still creates a
+namespace on its first write.
+
+`client.indices.delete(index=...)` calls `DELETE /v1/namespaces/{ns}` for each named index and
+permanently removes its documents and segments. A missing index raises `KoshaRequestError`
+with status 404 (ES `NotFoundError`), unless `ignore_unavailable=True` or `ignore=404` is
+passed. `client.indices.exists(index=...)` reads `GET /v1/namespaces/{ns}/stats`: 404 means
+absent; other errors are raised.
+
 ## Changelog
+
+### 0.2.15
+
+- **Behavior change:** `indices.delete()` deletes the namespace (`DELETE /v1/namespaces/{ns}`)
+  instead of logging and returning `{"acknowledged": true}` without deleting anything. A
+  missing index now raises a 404 `KoshaRequestError`.
+- `indices.create()` creates the namespace (`POST /v1/namespaces`) with a schema translated
+  from the ES mappings, and raises 409 when it already exists.
+- `indices.exists()` uses the namespace stats route and raises errors other than 404 instead
+  of reporting them as "absent".
 
 ### 0.2.14
 

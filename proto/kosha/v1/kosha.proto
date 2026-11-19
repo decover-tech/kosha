@@ -92,7 +92,8 @@ service KoshaService {
     };
   }
 
-  // Delete a namespace and its segments.
+  // Delete a namespace and its segments. Permanent; a re-created namespace
+  // of the same name starts empty.
   rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse) {
     option (google.api.http) = {
       delete: "/v1/namespaces/{namespace}"
@@ -153,6 +154,10 @@ message DeleteNamespaceRequest {
 message DeleteNamespaceResponse {
   string namespace = 1;
   bool acknowledged = 2;
+  // False when the namespace was deleted but some of its stored objects
+  // (local segment files or S3 objects) could not be removed. They are
+  // unreferenced and never reused by a re-created namespace.
+  bool storage_reclaimed = 3;
 }
 
 // ─── Document model ─────────────────────────────────────────────────────────

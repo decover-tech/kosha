@@ -80,7 +80,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 ### API and clients
 
-- HTTP/JSON `/v1` API — `documents`, `search`, `flush`, `delete`, `exists`, `stats` — with the Phase 1 unversioned routes still served for backward compatibility.
+- HTTP/JSON `/v1` API (see [HTTP routes](#http-routes)) — namespace create and delete, `documents`, `search`, `flush`, `delete`, `exists`, `stats` — with the Phase 1 unversioned routes still served for backward compatibility.
 - `proto/kosha/v1/kosha.proto` is the canonical API contract and the source for generated stubs and the OpenAPI spec.
 - `kosha` CLI (built from `crates/kosha-cli`, not yet on crates.io): health, index, search, flush, delete, stats, admin commands, named profiles, `--json` output, and a `kosha curl` escape hatch.
 - OpenSearch-compatible Python client, [`kosha-client` on PyPI](https://pypi.org/project/kosha-client/): `search`, `index`, `bulk`, `count`, `update`, `delete_by_query`, `update_by_query`, `scroll`, plus `indices` and `tasks` namespaces, translating the ES query DSL to Kosha's native shape.
@@ -91,6 +91,50 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 - Configurable analyzers — tokenization is fixed (whitespace split, ASCII-punctuation trim, lowercase). The `analyzer` field exists in the schema proto but is not honored.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
 - `kosha-vector-spfresh` (SPFresh/SPANN with LIRE rebalancing) is a standalone, benchmarked prototype; it is not wired into the segment format or the query path.
+
+## HTTP routes
+
+Every `/v1/namespaces` route is scoped to the caller's tenant: `{ns}` is an
+unqualified name, stored as `{tenant}/{ns}`, and another tenant's namespace of
+the same name is invisible (404). Query pods (`KOSHA_INGEST_HOST` set) forward
+the routes marked *write* to the ingest pod.
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `POST /v1/namespaces` | `CreateNamespaceRequest` → `CreateNamespaceResponse` | *write*. 409 if it exists, 400 for an invalid name or schema. Optional: namespaces still auto-create on first write. The schema is validated and echoed back but not stored or enforced yet (#283). |
+| `DELETE /v1/namespaces/{ns}` | → `DeleteNamespaceResponse` | *write*. 404 if it does not exist. Permanent; see below. |
+| `POST /v1/namespaces/{ns}/documents` | `IndexDocumentsRequest` → `IndexDocumentsResponse` | *write*. Upsert by id. |
+| `POST /v1/namespaces/{ns}/flush` | → `FlushResponse` | *write*. Make buffered writes searchable. |
+| `POST /v1/namespaces/{ns}/delete` | `DeleteByQueryRequest` → `DeleteByQueryResponse` | *write*. Delete by query. |
+| `POST /v1/namespaces/{ns}/search` | `SearchRequest` → `SearchResponse` | 404 for a missing namespace. |
+| `POST /v1/namespaces/{ns}/exists` | ids → per-id existence | |
+| `GET /v1/namespaces/{ns}/stats` | → `NamespaceStats` | 404 for a missing namespace. |
+| `GET /v1/healthz`, `GET /healthz`, `GET /readyz` | | Unauthenticated probes. |
+| `GET /v1/stats` | | Admin key only. |
+| `/v1/admin/*` | | Admin key only; see the operations list above. |
+
+**Deleting a namespace** (`DELETE /v1/namespaces/{ns}`) runs on the ingest pod
+under the namespace's publication lock:
+
+1. The control store drops the namespace and its manifest. It keeps the highest
+   manifest version the namespace reached (`kosha.retired_namespaces` in
+   Postgres), and a re-created namespace of the same name starts above it, so a
+   query pod's caches, which are keyed by manifest version, can never serve the
+   deleted data.
+2. The writer discards the namespace's manifest, write buffer, pending deletes
+   and every WAL record for it, so neither a later flush nor a restart brings the
+   documents back.
+3. Its local segment directory and per-namespace caches are removed.
+4. With S3 configured, every object under the namespace's prefix
+   (`{KOSHA_S3_PREFIX}/{tenant}/{ns}/`) is deleted before the response returns.
+   If that fails, the namespace is still deleted and the response says
+   `"storage_reclaimed": false`; the leftover objects are unreferenced, and a
+   re-created namespace never reuses their keys.
+
+Query pods answer 404 for the namespace as soon as the control store has no
+manifest for it. Their local disk copies of its segments are not removed
+eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them. Re-creating the
+namespace, explicitly or by writing to it, starts it empty.
 
 ## Authorization and durability
 
