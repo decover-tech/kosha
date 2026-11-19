@@ -200,10 +200,28 @@ a directory of objects in S3:
 s3://kosha-{env}/{namespace_id}/segments/{segment_id}/
     doc_store.bin       # document payloads (content, metadata), compressed, block-addressed
     inverted.idx         # term → postings list (docId, freq, positions) for lexical search
-    vector.idx           # ANN index (HNSW graph or IVF-PQ codebook + posting lists) — Phase 2, not written in Phase 1
+    vector.idx           # ANN index of the first vector column (cluster centroids + posting lists)
+    vector.offsets       # its centroids and posting byte ranges, read at open
+    vector.<n>.idx       # ANN index of vector column n (#204), and vector.<n>.offsets beside it
+    doc_vectors.bin      # stored vector values, binary f32 (#243)
     filters.bin          # columnar filter fields (dates, ids, tags) for fast predicate eval
-    footer.json          # offsets, counts, schema version, checksum (reserves a vector.idx slot even in Phase 1)
+    footer.json          # counts, blooms, analysis chains, vector columns, format version
 ```
+
+**Vector columns are per segment (#204).** Every `Vector` field gets its own ANN index, with its
+own dimension. The footer's `vector_fields` lists each column's name, dimension, vector count and
+file slot: slot 0 is `vector.idx` + `vector.offsets`, so a segment with one vector field is
+byte-identical to one written before columns existed, and slot `n` is `vector.<n>.idx` +
+`vector.<n>.offsets` (field names never appear in object keys). A kNN loads, hydrates and probes
+only the column `knn.field` names; its centroids alone take part in the global probe budget. A
+footer without `vector_fields` is a legacy segment: its single unnamed index answers a kNN on any
+field, unless its `doc_vectors.bin` names exactly one field, which then binds it. A `knn.field`
+that no segment indexes and no legacy segment could answer, or a query vector whose dimension
+differs from the field's, is a 400. The writer fixes each field's dimension per namespace at the
+first vector written to it (from segment footers and the write buffer) and rejects a document that
+disagrees with a 400; a segment writer that still meets one stores it without indexing it rather
+than failing the flush. There is no namespace schema for vector fields: everything above is read
+from segment footers.
 
 **Analysis is versioned per segment (#220, #221).** `inverted.idx` holds whatever terms the
 analyzer produced at write time, so a segment's `footer.json` records the exact analysis chains its
@@ -384,7 +402,8 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      `bm25_params.stats: "segment"` (or `KOSHA_BM25_STATS=segment` engine-wide) restores
      per-segment statistics for A/B debugging. Wildcard queries keep per-segment statistics,
      since their expansion is per segment.
-   - Semantic: ANN search over `vector.idx` (HNSW graph traversal or IVF-PQ probe), scored by
+   - Semantic: ANN search over the `knn.field` column's index (cluster centroids probed under a
+     global budget, then the closest posting lists), scored by
      cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
      query in `query_builder.py`.
 5. **Fusion**: candidate sets from lexical and semantic retrieval are merged via Reciprocal Rank

@@ -86,7 +86,13 @@ fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
 
 fn footer_without_timestamp(bytes: &[u8]) -> serde_json::Value {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-    value.as_object_mut().unwrap().remove("created_at");
+    let object = value.as_object_mut().unwrap();
+    object.remove("created_at");
+    // Additive since #204: a segment without vectors says so explicitly
+    // (`[]`), which no reader before #204 looks at.
+    if object.get("vector_fields") == Some(&serde_json::json!([])) {
+        object.remove("vector_fields");
+    }
     value
 }
 

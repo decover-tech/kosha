@@ -1,0 +1,25 @@
+{
+  "segment_id": "legacy-vec",
+  "doc_count": 24,
+  "total_field_length": 96,
+  "avg_field_length": 4.0,
+  "bm25_params": {
+    "k1": 1.2,
+    "b": 0.75
+  },
+  "created_at": "2026-11-19T22:40:45Z",
+  "filter_blooms": {
+    "body": {
+      "bits_b64": "K3cqLMsCcgc0LWbEVEQOXSntKFWC3Jzu2DW6kSA=",
+      "num_bits": 231,
+      "k": 7
+    }
+  },
+  "term_bloom": {
+    "bits_b64": "BVe1/VFaKPAYN1xWHLBRwcZKhRbWbB8eB26Gaocr7t4E",
+    "num_bits": 259,
+    "k": 7
+  },
+  "format_version": 2,
+  "text_filter_ignore_above": 256
+}
