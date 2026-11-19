@@ -1470,7 +1470,7 @@ impl AppState {
             let query = kosha_core::SearchQuery {
                 query_text: String::new(),
                 max_results: 0,
-                bm25_params: kosha_core::Bm25Params { k1: 1.2, b: 0.75 },
+                bm25_params: Default::default(),
                 from: 0,
                 filter: None,
                 sort: Vec::new(),
@@ -4443,6 +4443,11 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         Ok(q) => q,
         Err(e) => return json_error(400, &format!("invalid search query: {e}")),
     };
+    // Reject out-of-range parameters before touching storage or the
+    // result cache (the searcher checks again for non-HTTP callers).
+    if let Err(e) = query.validate() {
+        return search_error_response(&e);
+    }
 
     if let Err(e) = state.refresh_query_namespace(&ns) {
         return search_error_response(&e);
@@ -4845,13 +4850,27 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
 
-    let k1: f64 = params.get("k1").and_then(|v| v.parse().ok()).unwrap_or(1.2);
-    let b: f64 = params.get("b").and_then(|v| v.parse().ok()).unwrap_or(0.75);
+    // `k1` / `b` are optional; an absent one uses the segment's build-time
+    // value. A present but unparsable one is a 400 — it used to fall back
+    // to the default silently, so a typo looked like it had no effect.
+    let parse_param = |name: &str| -> Result<Option<f64>, String> {
+        match params.get(name) {
+            None => Ok(None),
+            Some(v) => v
+                .parse::<f64>()
+                .map(Some)
+                .map_err(|_| format!("'{name}' must be a number, got '{v}'")),
+        }
+    };
+    let bm25_params = match (parse_param("k1"), parse_param("b")) {
+        (Ok(k1), Ok(b)) => kosha_core::Bm25Overrides { k1, b },
+        (Err(e), _) | (_, Err(e)) => return json_error(400, &e),
+    };
 
     let query = SearchQuery {
         query_text,
         max_results,
-        bm25_params: kosha_core::Bm25Params { k1, b },
+        bm25_params,
         from: 0,
         filter: None,
         sort: vec![],
@@ -4869,6 +4888,9 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         source_includes: None,
         source_excludes: None,
     };
+    if let Err(e) = query.validate() {
+        return search_error_response(&e);
+    }
 
     if let Err(e) = state.refresh_query_namespace(&ns) {
         return search_error_response(&e);
@@ -6152,6 +6174,7 @@ fn log_search_timing(
 fn search_error_response(e: &KoshaError) -> String {
     match e {
         KoshaError::Overloaded(_) => json_error(429, &format!("search overloaded: {e}")),
+        KoshaError::InvalidQuery(_) => json_error(400, &e.to_string()),
         _ => json_error(500, &format!("search error: {e}")),
     }
 }
@@ -6760,6 +6783,83 @@ mod tests {
             hits + 1,
             "deletes must not disable result caching"
         );
+    }
+
+    #[test]
+    fn search_honors_and_validates_bm25_params() {
+        // Issue #247: per-request k1/b reach the scorer over HTTP (both
+        // POST and GET), are part of the result-cache key, and out-of-range
+        // or unparsable values are a 400 rather than a silent default.
+        let state = test_state();
+        let ns = NamespaceId("bm25ns".into());
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    Document {
+                        id: DocumentId("long".into()),
+                        fields: vec![Field::text(
+                            "text",
+                            format!("alpha alpha alpha{}", " filler".repeat(60)),
+                        )],
+                    },
+                    Document {
+                        id: DocumentId("short".into()),
+                        fields: vec![Field::text("text", "alpha")],
+                    },
+                    Document {
+                        id: DocumentId("other".into()),
+                        fields: vec![Field::text("text", "unrelated words")],
+                    },
+                ],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |params: &str| {
+            let body =
+                format!(r#"{{"namespace":"bm25ns","query_text":"alpha","bm25_params":{params}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let first_hit = |resp: &str| -> String {
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            v["results"][0]["doc_id"].as_str().unwrap().to_string()
+        };
+        // Run each twice so the second answer comes from the result cache:
+        // the cache must key on the parameters, not just the query text.
+        for _ in 0..2 {
+            let b0 = post(r#"{"k1":1.2,"b":0.0}"#);
+            assert!(b0.starts_with("HTTP/1.1 200"), "{b0}");
+            assert_eq!(first_hit(&b0), "long", "b=0 ignores length");
+            let b1 = post(r#"{"k1":1.2,"b":1.0}"#);
+            assert_eq!(first_hit(&b1), "short", "b=1 penalizes length");
+        }
+        let get = |qs: &str| {
+            handle_search_get(
+                &format!("GET /search?ns=bm25ns&q=alpha{qs} HTTP/1.1"),
+                &state,
+            )
+        };
+        assert_eq!(first_hit(&get("&b=0")), "long");
+        assert_eq!(first_hit(&get("&k1=1.2&b=1")), "short");
+
+        for bad in [
+            r#"{"k1":-1}"#,
+            r#"{"b":1.5}"#,
+            r#"{"b":-0.5}"#,
+            r#"{"k1":1.2,"b":2}"#,
+        ] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+            assert!(resp.contains("bm25_params"), "{bad}: {resp}");
+        }
+        for bad in ["&k1=-0.5", "&b=1.01", "&b=NaN", "&k1=abc", "&b="] {
+            let resp = get(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
     }
 
     #[test]
@@ -7888,7 +7988,7 @@ mod tests {
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
             max_results: 10,
-            bm25_params: kosha_core::Bm25Params::default(),
+            bm25_params: Default::default(),
             from: 0,
             filter: None,
             sort: Vec::new(),
@@ -8025,7 +8125,7 @@ mod tests {
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
             max_results: 10,
-            bm25_params: kosha_core::Bm25Params::default(),
+            bm25_params: Default::default(),
             from: 0,
             filter: None,
             sort: Vec::new(),
@@ -9155,7 +9255,7 @@ mod tests {
         let base = kosha_core::SearchQuery {
             query_text: String::new(),
             max_results: 10,
-            bm25_params: kosha_core::Bm25Params::default(),
+            bm25_params: Default::default(),
             from: 0,
             filter: None,
             sort: Vec::new(),

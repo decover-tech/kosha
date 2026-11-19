@@ -29,7 +29,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 | Feature | Notes |
 | --- | --- |
-| BM25 lexical search | Tunable `k1` / `b` per request (defaults 1.2 / 0.75) |
+| BM25 lexical search | `k1` / `b` tunable per request: `bm25_params: {"k1": 2.0, "b": 0.3}` on `POST /search`, `k1=` / `b=` on `GET /search`. Either may be omitted and falls back to the segment's build-time value (1.2 / 0.75 unless built otherwise). `k1` must be ≥ 0 and `b` in [0, 1]; anything else (or non-numeric) is a 400. WAND pruning bounds are recomputed for the request's values, so results match exhaustive scoring. `k3` is not supported |
 | `operator: and` / `or` | AND (default) requires every query term; OR scores the union |
 | Block-max WAND | Skip-list postings, rarest-first probe ordering, leapfrog AND join |
 | `match_phrase` | Positional postings, configurable `slop` |
