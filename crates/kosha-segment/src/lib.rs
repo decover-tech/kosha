@@ -4610,6 +4610,7 @@ pub fn compute_aggregations(
             .map(|(k, c)| AggBucket {
                 key: k.to_string(),
                 doc_count: c,
+                ..Default::default()
             })
             .collect();
         buckets.sort_by_key(|b| std::cmp::Reverse(b.doc_count));
