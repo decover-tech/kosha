@@ -618,7 +618,7 @@ fn vector_slots_on_disk(seg_dir: &std::path::Path) -> Vec<u32> {
 }
 
 /// Reject a kNN that cannot be answered as asked (#204) — see
-/// [`Searcher::global_probe_cutoff`]. `statuses` holds one entry per
+/// [`Searcher::knn_plan`]. `statuses` holds one entry per
 /// segment present locally; with none there is nothing to judge by.
 fn check_knn_field<'a>(
     namespace: &NamespaceId,
@@ -1289,6 +1289,132 @@ fn effective_knn_budget(requested: usize, total_centroids: usize) -> usize {
     requested.max(floor)
 }
 
+/// Namespace-wide number of filter-passing documents at or below which a
+/// filtered kNN query skips the centroid probe and scores every passing
+/// document's vector exactly (#252). `KOSHA_KNN_EXACT_THRESHOLD`, default
+/// 50,000; `0` turns exact filtered kNN off. Scoring 50k vectors of 1024
+/// dims is ~200 MB of multiply-adds — a few milliseconds per core — and
+/// reads only the passing documents' vectors, while a probe for the same
+/// selective filter hydrates whole postings of documents it then rejects.
+pub const DEFAULT_KNN_EXACT_THRESHOLD: usize = 50_000;
+
+fn knn_exact_threshold_from_env() -> usize {
+    std::env::var("KOSHA_KNN_EXACT_THRESHOLD")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_KNN_EXACT_THRESHOLD)
+}
+
+/// A segment whose filter passes at most this fraction of its documents is
+/// searched exactly even when the namespace as a whole is above
+/// [`DEFAULT_KNN_EXACT_THRESHOLD`] (#252): a probe there would mostly
+/// hydrate rejected vectors, and keep probing outward to find `k` that
+/// pass. `KOSHA_KNN_EXACT_FRACTION`, default 1%. Still bounded by the
+/// threshold in absolute documents per segment.
+pub const DEFAULT_KNN_EXACT_FRACTION: f64 = 0.01;
+
+fn knn_exact_fraction_from_env() -> f64 {
+    std::env::var("KOSHA_KNN_EXACT_FRACTION")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .unwrap_or(DEFAULT_KNN_EXACT_FRACTION)
+}
+
+/// Most a filter's selectivity may widen the global probe budget (#252).
+/// A filter passing a fraction `s` of the probed segments' documents
+/// leaves about `s` of each probed posting usable, so the budget is
+/// scaled by `1 / s` — up to this factor, beyond which the per-segment
+/// outward probe (or the exact path) takes over.
+/// `KOSHA_KNN_FILTER_BUDGET_MAX_SCALE`, default 8.
+fn knn_filter_budget_max_scale() -> f64 {
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("KOSHA_KNN_FILTER_BUDGET_MAX_SCALE")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|f| *f >= 1.0 && f.is_finite())
+            .unwrap_or(8.0)
+    })
+}
+
+/// [`effective_knn_budget`] widened for a filter that passes `selectivity`
+/// of the documents in the segments that will be probed (#252). `None`
+/// (no filter) or a selectivity of 1 leaves the budget as it is.
+fn filtered_knn_budget(budget: usize, selectivity: Option<f64>) -> usize {
+    match selectivity {
+        Some(s) if s > 0.0 && s < 1.0 => {
+            let scale = (1.0 / s).min(knn_filter_budget_max_scale());
+            ((budget as f64) * scale).ceil() as usize
+        }
+        _ => budget,
+    }
+}
+
+/// How many documents of one segment a filtered kNN may return: those
+/// passing both the query filter and `knn.filter`, less deleted ones.
+///
+/// Kept behind this one function so columnar filter bitmaps (#244) can
+/// replace the counting without touching the planner.
+fn knn_passing_count(
+    filter: Option<&DocSet>,
+    knn_filter: Option<&DocSet>,
+    tombstones: Option<&HashSet<u32>>,
+    doc_count: u32,
+) -> usize {
+    let passes = |doc_seq: u32| {
+        filter.is_none_or(|set| set.contains(doc_seq))
+            && knn_filter.is_none_or(|set| set.contains(doc_seq))
+    };
+    let passing = match (filter, knn_filter) {
+        (Some(a), Some(b)) => a.intersection_count(b),
+        (Some(set), None) | (None, Some(set)) => set.count(),
+        (None, None) => doc_count as usize,
+    };
+    let deleted = tombstones.map_or(0, |seqs| {
+        seqs.iter()
+            .filter(|&&doc_seq| doc_seq < doc_count && passes(doc_seq))
+            .count()
+    });
+    passing.saturating_sub(deleted)
+}
+
+/// How a kNN query searched (#252); see `SearchResult::knn_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnnMode {
+    /// Centroid-probed postings in every segment.
+    Ann,
+    /// Every filter-passing vector scored, in every segment.
+    Exact,
+    /// Some segments each way.
+    Mixed,
+}
+
+impl KnnMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ann => "ann",
+            Self::Exact => "exact",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+/// Everything decided about a kNN query before any segment is scored (see
+/// [`Searcher::knn_plan`]), so every segment searches the way the plan
+/// says rather than deciding alone.
+#[derive(Debug, Default)]
+struct KnnPlan {
+    /// The global probe budget: see [`Searcher::knn_plan`].
+    cutoff: Option<(f32, usize)>,
+    /// Segments searched exactly over their filter-passing documents.
+    exact_segments: HashSet<kosha_core::SegmentId>,
+    mode: Option<KnnMode>,
+    /// Filter-passing, undeleted documents across the segments searched;
+    /// `None` without a filter.
+    filtered_candidates: Option<u64>,
+}
+
 /// Flat kNN search: compute cosine similarity against all stored vectors,
 /// return top-K (doc_seq, score) pairs.
 pub fn flat_knn(query_vector: &[f32], vectors: &[(u32, Vec<f32>)], k: usize) -> Vec<(u32, f64)> {
@@ -1330,6 +1456,12 @@ pub struct SearchPhaseStats {
     /// Under the global probe budget it should land near
     /// `num_candidates` for the whole query. Zero for non-kNN queries.
     pub knn_postings_probed: usize,
+    /// Vectors scored by exact filtered kNN (#252), summed over segments.
+    pub knn_exact_vectors: usize,
+    /// See `SearchResult::knn_mode`; `None` for a non-kNN query.
+    pub knn_mode: Option<KnnMode>,
+    /// See `SearchResult::knn_filtered_candidates`.
+    pub knn_filtered_candidates: Option<u64>,
     /// Time spent resolving namespace-level BM25 statistics (issue #246):
     /// one cache lookup when warm, the per-segment `df` pass for terms not
     /// seen yet at this manifest version when cold.
@@ -1375,6 +1507,9 @@ struct OpenStatsCollector {
     /// Vector postings hydrated across segments (kNN only) — see
     /// [`SearchPhaseStats::knn_postings_probed`].
     knn_postings: AtomicUsize,
+    /// Vectors scored by exact filtered kNN — see
+    /// [`SearchPhaseStats::knn_exact_vectors`].
+    knn_exact_vectors: AtomicUsize,
 }
 
 pub struct Searcher {
@@ -1383,6 +1518,10 @@ pub struct Searcher {
     ledger: Arc<MemoryLedger>,
     /// Namespace-level BM25 statistics per manifest version (issue #246).
     corpus_stats: CorpusStatsCache,
+    /// See [`DEFAULT_KNN_EXACT_THRESHOLD`]; `0` disables exact filtered kNN.
+    knn_exact_threshold: usize,
+    /// See [`DEFAULT_KNN_EXACT_FRACTION`].
+    knn_exact_fraction: f64,
 }
 
 /// Result of a [`Searcher::warm_segments`] pass — how many segments were
@@ -1441,7 +1580,21 @@ impl Searcher {
             segment_cache: SegmentCache::new(capacity, max_bytes),
             ledger: Arc::new(MemoryLedger::new(max_live_bytes, admission_timeout)),
             corpus_stats: CorpusStatsCache::default(),
+            knn_exact_threshold: knn_exact_threshold_from_env(),
+            knn_exact_fraction: knn_exact_fraction_from_env(),
         }
+    }
+
+    /// Overrides when a filtered kNN query is answered exactly rather than
+    /// by probing (#252): at or below `threshold` filter-passing documents
+    /// namespace-wide, or in a segment where at most `fraction` of the
+    /// documents pass. `threshold == 0` turns the exact path off. The
+    /// defaults come from `KOSHA_KNN_EXACT_THRESHOLD` and
+    /// `KOSHA_KNN_EXACT_FRACTION`.
+    pub fn with_knn_exact_policy(mut self, threshold: usize, fraction: f64) -> Self {
+        self.knn_exact_threshold = threshold;
+        self.knn_exact_fraction = fraction.max(0.0);
+        self
     }
 
     /// Return the cached parsed segment for `(namespace, segment_id,
@@ -1511,7 +1664,7 @@ impl Searcher {
     /// still empty when `/readyz` flips true and the first wave of real
     /// query traffic pays for every [`Searcher::open_segment`] itself —
     /// which, at corpus scale, is exactly what
-    /// [`Searcher::global_probe_cutoff`] does on every kNN query (it opens
+    /// [`Searcher::knn_plan`] does on every kNN query (it opens
     /// every segment to read centroids), turning first-touch cost into a
     /// whole-namespace cold-start convoy.
     ///
@@ -1530,7 +1683,7 @@ impl Searcher {
     /// apply to the newly-warmed set, same as any other idle cache entry.
     /// Per-segment open failures are logged and skipped, not fatal — a
     /// missing/corrupt segment shouldn't block warming the rest, matching
-    /// how `global_probe_cutoff`'s `par_iter().filter_map(...)` already
+    /// how `knn_plan`'s `par_iter().filter_map(...)` already
     /// treats a failed open as "contributes nothing" rather than an error.
     pub fn warm_segments(
         &self,
@@ -1631,25 +1784,43 @@ impl Searcher {
     /// caller reduces their outputs (candidates flattened, aggregations
     /// merged) — see [`Searcher::search`], which runs this via
     /// `par_iter().map(...)` across the manifest instead of one at a time.
-    /// The distance cutoff that admits about `num_candidates` posting
-    /// probes across the WHOLE query (or the corpus-scaled floor from
-    /// [`effective_knn_budget`], whichever is larger), paired with that
-    /// same effective budget so the caller can apply it as the per-segment
-    /// `max_probes` safety cap too — using the raw client `num_candidates`
-    /// there instead would silently re-shrink a floor-widened cutoff back
-    /// down in any segment where more than the client's own request
-    /// qualifies. `None` to fall back to per-segment `nprobe`.
+    /// Plans a kNN query before any segment is scored: the global probe
+    /// budget, and which segments skip the probe for an exact scan of
+    /// their filter-passing documents (#252).
+    ///
+    /// **Probe budget.** The distance cutoff that admits about
+    /// `num_candidates` posting probes across the WHOLE query (or the
+    /// corpus-scaled floor from [`effective_knn_budget`], whichever is
+    /// larger), paired with that same effective budget so the caller can
+    /// apply it as the per-segment `max_probes` safety cap too — using the
+    /// raw client `num_candidates` there instead would silently re-shrink a
+    /// floor-widened cutoff back down in any segment where more than the
+    /// client's own request qualifies. `None` to fall back to per-segment
+    /// `nprobe`. With a filter, the budget is widened by the inverse of its
+    /// selectivity over the segments that will be probed (see
+    /// [`filtered_knn_budget`]): a posting where one vector in twenty
+    /// passes yields a twentieth of the candidates an unfiltered one does.
     ///
     /// Cheap by construction: it only reads posting centroids, which are
     /// already resident in every open segment's `LazyVectorIndex` (loaded
     /// from the small `vector.offsets` sidecar), so this pass does no
     /// posting I/O at all — the expensive part of a kNN query is
     /// `hydrate_posting`, and that is precisely what the cutoff then
-    /// prevents.
+    /// prevents. The filter sets it counts are the ones scoring would
+    /// build anyway, and stay cached on the segment for it.
     ///
-    /// Returns `None` when no segment can report centroids (legacy flat
-    /// vector segments), so those namespaces keep their existing behavior
-    /// rather than silently searching nothing.
+    /// The cutoff is `None` when no segment can report centroids (legacy
+    /// flat vector segments), so those namespaces keep their existing
+    /// behavior rather than silently searching nothing.
+    ///
+    /// **Exact segments.** Only for a query with a filter (top-level or
+    /// `knn.filter`): when at most `knn_exact_threshold` documents pass
+    /// across the namespace, every segment is searched exactly; otherwise a
+    /// segment where at most `knn_exact_fraction` of its documents pass
+    /// (and no more than the threshold) is. A segment where nothing passes
+    /// is planned exact too, which costs nothing, where a probe would walk
+    /// every posting looking for `k` that pass. Unfiltered kNN is never
+    /// planned exact, so its behavior and latency are unchanged.
     ///
     /// The same walk checks the query against `knn.field` (#204) and fails
     /// with [`KoshaError::InvalidQuery`] — a client error, never an empty
@@ -1659,18 +1830,41 @@ impl Searcher {
     /// `knn.vector`'s dimension differs from the field's. Judged on the
     /// segments present locally; with none present there is nothing to
     /// judge by and the query proceeds.
-    fn global_probe_cutoff(
+    #[allow(clippy::too_many_arguments)]
+    fn knn_plan(
         &self,
         namespace: &NamespaceId,
         manifest: &Manifest,
         query: &SearchQuery,
         knn: &kosha_core::KnnQuery,
+        filter_keys: &FilterKeys,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
-    ) -> Result<Option<(f32, usize)>, KoshaError> {
+    ) -> Result<KnnPlan, KoshaError> {
         let budgeted = knn_global_budget_enabled();
         let requested = knn.num_candidates.max(1);
         let prunable = query.has_prunable_filter();
+        let filter_clauses = (
+            query.filter.as_ref().zip(filter_keys.query.as_deref()),
+            knn.filter.as_ref().zip(filter_keys.knn.as_deref()),
+        );
+        let restricted = filter_clauses.0.is_some() || filter_clauses.1.is_some();
+
+        struct SegmentInfo<'m> {
+            segment_id: &'m kosha_core::SegmentId,
+            status: VectorFieldStatus,
+            /// Lower-bound distances to `knn.field`'s centroids (global
+            /// budgeting only).
+            distances: Option<Vec<f32>>,
+            /// The column is a lazy posting index the query vector fits.
+            probeable: bool,
+            /// `(passing documents, doc_count)`, for a filtered query.
+            passing: Option<(usize, u32)>,
+        }
+
         // Distances from every segment's centroids for `knn.field`,
         // gathered in parallel — zero posting I/O, centroids are resident
         // once the column is loaded. Kept untruncated per-segment (unlike
@@ -1681,7 +1875,7 @@ impl Searcher {
         // the first place — a segment that fails to open or has no lazy
         // index contributes nothing, and simply takes the per-segment
         // fallback path later.
-        let per_segment: Vec<(VectorFieldStatus, Option<Vec<f32>>)> = manifest
+        let per_segment: Vec<SegmentInfo<'_>> = manifest
             .segments
             .par_iter()
             .filter_map(|entry| {
@@ -1705,7 +1899,13 @@ impl Searcher {
                             if let Some(status) =
                                 kosha_segment::footer_vector_field_status(footer, &knn.field)
                             {
-                                return Some((status, None));
+                                return Some(SegmentInfo {
+                                    segment_id: &entry.segment_id,
+                                    status,
+                                    distances: None,
+                                    probeable: false,
+                                    passing: Some((0, footer.doc_count)),
+                                });
                             }
                         }
                     }
@@ -1729,41 +1929,147 @@ impl Searcher {
                     VectorFieldStatus::Legacy { dim } => dim == Some(knn.vector.len()),
                     VectorFieldStatus::Absent => false,
                 };
-                let distances = if budgeted && fits {
+                let probeable = fits
+                    && reader
+                        .vector_field(&knn.field)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|index| index.has_lazy_index());
+                let distances = if budgeted && probeable {
                     reader.knn_centroid_distances(&knn.field, &knn.vector)
                 } else {
                     None
                 };
-                Some((status, distances))
+                let passing = restricted.then(|| {
+                    let doc_count = reader.doc_count();
+                    let filter = filter_clauses
+                        .0
+                        .map(|(clause, key)| reader.filter_set(key, clause));
+                    let knn_filter = filter_clauses
+                        .1
+                        .map(|(clause, key)| reader.filter_set(key, clause));
+                    let deleted = tombstones
+                        .and_then(|t| t.get(&entry.segment_id))
+                        .filter(|seqs| !seqs.is_empty());
+                    let passing = knn_passing_count(
+                        filter.as_deref(),
+                        knn_filter.as_deref(),
+                        deleted,
+                        doc_count,
+                    );
+                    (passing, doc_count)
+                });
+                Some(SegmentInfo {
+                    segment_id: &entry.segment_id,
+                    status,
+                    distances,
+                    probeable,
+                    passing,
+                })
             })
             .collect();
 
-        check_knn_field(namespace, knn, per_segment.iter().map(|(status, _)| status))?;
-        if !budgeted {
-            return Ok(None);
+        check_knn_field(namespace, knn, per_segment.iter().map(|info| &info.status))?;
+
+        // ── exact or probed, per segment ──
+        let threshold = self.knn_exact_threshold;
+        let exact_enabled = restricted && threshold > 0;
+        let filtered_candidates: Option<u64> = restricted.then(|| {
+            per_segment
+                .iter()
+                .filter_map(|info| info.passing)
+                .map(|(passing, _)| passing as u64)
+                .sum()
+        });
+        let namespace_exact = exact_enabled && filtered_candidates.unwrap_or(0) <= threshold as u64;
+        let mut exact_segments = HashSet::new();
+        let (mut exact_count, mut ann_count) = (0usize, 0usize);
+        for info in per_segment.iter().filter(|info| info.probeable) {
+            let Some((passing, doc_count)) = info.passing else {
+                ann_count += 1;
+                continue;
+            };
+            let exact = exact_enabled
+                && (passing == 0
+                    || namespace_exact
+                    || (passing <= threshold
+                        && passing as f64 <= self.knn_exact_fraction * doc_count as f64));
+            if exact {
+                exact_segments.insert(info.segment_id.clone());
+            }
+            // A segment nothing passes in returns nothing either way.
+            if passing > 0 {
+                if exact {
+                    exact_count += 1;
+                } else {
+                    ann_count += 1;
+                }
+            }
         }
-        let all: Vec<f32> = per_segment
-            .into_iter()
-            .filter_map(|(_, distances)| distances)
+        let mode = match (exact_count, ann_count) {
+            (0, 0) if namespace_exact => KnnMode::Exact,
+            (0, _) => KnnMode::Ann,
+            (_, 0) => KnnMode::Exact,
+            _ => KnnMode::Mixed,
+        };
+        let mut plan = KnnPlan {
+            cutoff: None,
+            exact_segments,
+            mode: Some(mode),
+            filtered_candidates,
+        };
+
+        if !budgeted {
+            return Ok(plan);
+        }
+        // Only the segments that will be probed share the budget: an exact
+        // segment never reads a posting, and one where nothing passes is
+        // planned exact.
+        let probed: Vec<&SegmentInfo<'_>> = per_segment
+            .iter()
+            .filter(|info| info.distances.is_some())
+            .filter(|info| !plan.exact_segments.contains(info.segment_id))
+            .collect();
+        let selectivity = restricted.then(|| {
+            let (passing, docs) = probed
+                .iter()
+                .filter_map(|info| info.passing)
+                .fold((0u64, 0u64), |(p, d), (passing, docs)| {
+                    (p + passing as u64, d + docs as u64)
+                });
+            if docs == 0 {
+                1.0
+            } else {
+                passing as f64 / docs as f64
+            }
+        });
+        let mut all: Vec<f32> = probed
+            .iter()
+            .filter_map(|info| info.distances.as_deref())
             .flatten()
+            .copied()
             .collect();
 
         if all.is_empty() {
-            return Ok(None); // no v2 vector segments — keep legacy behavior
+            return Ok(plan); // no v2 vector segments to probe — keep legacy behavior
         }
         let total_centroids = all.len();
-        let budget = effective_knn_budget(requested, total_centroids);
-        let mut all = all;
+        let budget = filtered_knn_budget(
+            effective_knn_budget(requested, total_centroids),
+            selectivity,
+        );
         if all.len() <= budget {
             // The whole namespace has fewer centroids than the budget:
             // nothing to prune, admit everything.
-            return Ok(Some((f32::INFINITY, budget)));
+            plan.cutoff = Some((f32::INFINITY, budget));
+            return Ok(plan);
         }
         let idx = budget - 1;
         all.select_nth_unstable_by(idx, |a, b| {
             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
         });
-        Ok(Some((all[idx], budget)))
+        plan.cutoff = Some((all[idx], budget));
+        Ok(plan)
     }
 
     /// Namespace-level BM25 statistics for `terms` at this manifest (issue
@@ -1948,7 +2254,7 @@ impl Searcher {
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
         // `Some((cutoff, effective_budget))` = a global probe budget was
-        // computed for this kNN query (see `global_probe_cutoff`): probe
+        // computed for this kNN query (see `knn_plan`): probe
         // only centroids within `cutoff`, capped at `effective_budget` per
         // segment — NOT this segment's raw `knn.num_candidates`, which
         // `effective_budget` may already have widened past (see
@@ -1956,6 +2262,9 @@ impl Searcher {
         // flat segments, or budgeting disabled) — fall back to per-segment
         // `nprobe`.
         knn_cutoff: Option<(f32, usize)>,
+        // The plan put this segment on the exact path (#252): score every
+        // filter-passing document's vector instead of probing.
+        knn_exact: bool,
         // Canonical JSON of `query.filter` and `query.knn.filter`, computed
         // once per request: the key into each segment's filter-set cache.
         filter_keys: &FilterKeys,
@@ -3166,6 +3475,38 @@ impl Searcher {
                 Ok(Some(index)) if index.dim().is_some_and(|dim| dim != knn.vector.len()) => {
                     Vec::new()
                 }
+                Ok(Some(index)) if index.has_lazy_index() && knn_exact => {
+                    // Every document the filters and tombstones let
+                    // through, scored exactly (#252). Planned only for a
+                    // filtered query, so one of the sets exists.
+                    let base = knn_filter_set.as_deref().or(filter_set.as_deref());
+                    let candidates: Vec<u32> = match base {
+                        Some(set) => set.iter().filter(|&doc_seq| knn_accept(doc_seq)).collect(),
+                        None => (0..total_docs)
+                            .filter(|&doc_seq| knn_accept(doc_seq))
+                            .collect(),
+                    };
+                    match reader.knn_exact_filtered(&knn.field, &knn.vector, fetch_k, &candidates) {
+                        Some(Ok(exact)) => {
+                            open_stats
+                                .knn_postings
+                                .fetch_add(exact.postings_hydrated, Ordering::Relaxed);
+                            open_stats
+                                .knn_exact_vectors
+                                .fetch_add(exact.vectors_scored, Ordering::Relaxed);
+                            exact.hits
+                        }
+                        Some(Err(e)) => {
+                            eprintln!(
+                                "WARN: exact knn failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
+                                reader.segment_dir().display()
+                            );
+                            knn_segment_degraded = true;
+                            Vec::new()
+                        }
+                        None => Vec::new(),
+                    }
+                }
                 Ok(Some(index)) if index.has_lazy_index() => {
                     let probe = match knn_cutoff {
                         Some((cutoff, effective_budget)) => reader
@@ -3554,6 +3895,8 @@ impl Searcher {
                     // No segments existed to search, degraded or otherwise —
                     // distinct from "searched N segments, 0 degraded".
                     knn_degraded_segments: None,
+                    knn_mode: None,
+                    knn_filtered_candidates: None,
                 },
                 phase_stats,
             ));
@@ -3652,12 +3995,24 @@ impl Searcher {
         //
         // The same pass rejects a `knn.field` nothing can answer, or a
         // vector of the wrong dimension for it (#204).
-        let knn_cutoff = match query.knn {
-            Some(ref knn) => {
-                self.global_probe_cutoff(namespace, manifest, query, knn, &permit, &open_stats)?
-            }
-            None => None,
+        //
+        // The same pass decides, once for the whole query, which segments
+        // answer a filtered kNN exactly instead (#252).
+        let knn_plan = match query.knn {
+            Some(ref knn) => self.knn_plan(
+                namespace,
+                manifest,
+                query,
+                knn,
+                &filter_keys,
+                tombstones,
+                &permit,
+                &open_stats,
+            )?,
+            None => KnnPlan::default(),
         };
+        phase_stats.knn_mode = knn_plan.mode;
+        phase_stats.knn_filtered_candidates = knn_plan.filtered_candidates;
 
         // ── BM25 collection statistics (issue #246) ────────────────────
         // Namespace-level by default, so every segment scores with the same
@@ -3710,7 +4065,8 @@ impl Searcher {
                     manifest_footer,
                     &permit,
                     &open_stats,
-                    knn_cutoff,
+                    knn_plan.cutoff,
+                    knn_plan.exact_segments.contains(&entry.segment_id),
                     &filter_keys,
                     corpus.as_ref(),
                 )
@@ -3731,6 +4087,7 @@ impl Searcher {
             as f64
             / 1e6;
         phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
+        phase_stats.knn_exact_vectors = open_stats.knn_exact_vectors.load(Ordering::Relaxed);
         let t_materialize = Instant::now();
 
         let mut candidates: Vec<HitCandidate> = Vec::new();
@@ -3972,6 +4329,8 @@ impl Searcher {
                 total_hits_relation,
                 aggregations: merged_aggs,
                 knn_degraded_segments: query.knn.as_ref().map(|_| knn_degraded_segments),
+                knn_mode: phase_stats.knn_mode.map(|mode| mode.as_str().to_string()),
+                knn_filtered_candidates: phase_stats.knn_filtered_candidates,
             },
             phase_stats,
         ))
@@ -7349,7 +7708,7 @@ mod tests {
         assert_eq!(
             stats.open_cached, 2,
             "a kNN query opens each segment twice — once in \
-             global_probe_cutoff for centroid distances, once in the actual \
+             knn_plan for centroid distances, once in the actual \
              per-segment scoring pass — and both must be served from the \
              cache warm_segments filled, not a fresh open"
         );
@@ -7570,7 +7929,7 @@ mod tests {
         // "tpuf-comparable" default every existing recall test runs well
         // above (knn_global_budget_preserves_top_hit_against_brute_force
         // uses 8 segments at num_candidates=32, a 4x-over-segment-count
-        // ratio; the real run's ratio was ~0.5x). `global_probe_cutoff`
+        // ratio; the real run's ratio was ~0.5x). `knn_plan`
         // provably preserves the true global top-`num_candidates`
         // *centroids* (per-segment truncation can't drop a true top-K
         // member — proved by construction, not just tested here) — so the
@@ -7725,7 +8084,7 @@ mod tests {
             thin.results
         );
 
-        // Generous budget (>= total segment count): global_probe_cutoff's
+        // Generous budget (>= total segment count): knn_plan's
         // own short-circuit admits every segment, the target's centroid
         // now qualifies, and the buried true neighbour — by far the
         // single closest individual document in the corpus — is found.
@@ -12819,5 +13178,419 @@ mod vector_column_tests {
             Err(KoshaError::InvalidQuery(_))
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Filtered kNN (#252): exact search for selective filters, a probe budget
+/// widened by selectivity, and `knn_mode` reporting.
+#[cfg(test)]
+mod filtered_knn_tests {
+    use super::*;
+    use kosha_core::{DocumentId, Field, KnnQuery, ManifestEntry, SegmentId};
+    use kosha_segment::{SegmentWriter, VectorStoreMode};
+    use std::path::{Path, PathBuf};
+
+    const DIM: usize = 32;
+
+    /// `(field, documents passing)` of the synthetic corpus: every
+    /// `period`-th document has `field = "y"`.
+    const SELECTIVITIES: [(&str, usize); 5] = [
+        ("s50", 2),      // 50%
+        ("s5", 20),      // 5%
+        ("s05", 200),    // 0.5%
+        ("s005", 2000),  // 0.05%
+        ("s0025", 4000), // 0.025%: fewer passing documents than k
+    ];
+
+    fn temp_dir(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-query-filtered-knn-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn coord(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1u64 << 23) as f32 * 2.0 - 1.0
+        }
+        fn vector(&mut self) -> Vec<f32> {
+            (0..DIM).map(|_| self.coord()).collect()
+        }
+    }
+
+    struct Corpus {
+        ns: NamespaceId,
+        manifest: Manifest,
+        /// `(doc id, global index, vector)`, in write order.
+        docs: Vec<(String, usize, Vec<f32>)>,
+    }
+
+    /// `segments` x `per_segment` random `DIM`-dim vectors. Document `i`
+    /// (global) has `s* = "y"` per [`SELECTIVITIES`], and `skew = "y"` for
+    /// every document of segment 0 plus the first 10 of segment 1.
+    fn corpus(dir: &Path, segments: usize, per_segment: usize, mode: VectorStoreMode) -> Corpus {
+        let ns = NamespaceId("ns".into());
+        let mut rng = Lcg(0x05ee_d252);
+        let mut docs = Vec::new();
+        let mut entries = Vec::new();
+        for seg in 0..segments {
+            let id = format!("seg{seg}");
+            let mut w = SegmentWriter::new(SegmentId(id.clone()), dir.join(&ns.0).join(&id))
+                .with_vector_store_mode(mode);
+            for local in 0..per_segment {
+                let i = seg * per_segment + local;
+                let vector = rng.vector();
+                let doc_id = format!("d{i}");
+                let mut fields = vec![Field::vector("emb", vector.clone())];
+                for (name, period) in SELECTIVITIES {
+                    let value = if i.is_multiple_of(period) { "y" } else { "n" };
+                    fields.push(Field::keyword(name, value));
+                }
+                let skew = seg == 0 || (seg == 1 && local < 10);
+                fields.push(Field::keyword("skew", if skew { "y" } else { "n" }));
+                w.add_document(DocumentId(doc_id.clone()), fields);
+                docs.push((doc_id, i, vector));
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: SegmentId(id),
+                doc_count: per_segment as u32,
+            });
+        }
+        Corpus {
+            ns,
+            manifest: Manifest {
+                version: 1,
+                segments: entries,
+                segment_footers: Default::default(),
+                footer_crc32: Default::default(),
+                wal_checkpoint: 0,
+                wal_origin: None,
+                tombstones: Default::default(),
+                deletion_vectors: Default::default(),
+                schema: None,
+            },
+            docs,
+        }
+    }
+
+    fn term(field: &str) -> FilterClause {
+        FilterClause::Term {
+            term: HashMap::from([(field.to_string(), "y".to_string())]),
+        }
+    }
+
+    fn knn_query(vector: Vec<f32>, k: usize, filter: Option<FilterClause>) -> SearchQuery {
+        let mut q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "",
+            "max_results": k,
+        }))
+        .unwrap();
+        q.knn = Some(KnnQuery {
+            field: "emb".into(),
+            vector,
+            k,
+            num_candidates: 100,
+            filter,
+        });
+        q
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        cosine_similarity(a, b)
+    }
+
+    /// Brute-force top `k` ids of the documents `passes` keeps.
+    fn brute_force(
+        corpus: &Corpus,
+        query: &[f32],
+        k: usize,
+        passes: impl Fn(usize) -> bool,
+    ) -> Vec<String> {
+        let mut scored: Vec<(&str, f64)> = corpus
+            .docs
+            .iter()
+            .filter(|(_, i, _)| passes(*i))
+            .map(|(id, _, v)| (id.as_str(), cosine(query, v)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored
+            .into_iter()
+            .take(k)
+            .map(|(id, _)| id.to_string())
+            .collect()
+    }
+
+    fn ids(r: &SearchResult) -> Vec<String> {
+        r.results.iter().map(|d| d.doc_id.0.clone()).collect()
+    }
+
+    fn recall(got: &[String], truth: &[String]) -> f64 {
+        if truth.is_empty() {
+            return 1.0;
+        }
+        let hit = got.iter().filter(|id| truth.contains(id)).count();
+        hit as f64 / truth.len() as f64
+    }
+
+    /// The acceptance test of #252: recall@10 >= 0.95 against brute force
+    /// at 50%, 5%, 0.5% and 0.05% selectivity, and always
+    /// `min(k, |filtered|)` results — under the default policy (exact
+    /// everywhere for a 20k corpus), a low threshold (probe the broad
+    /// filters, exact for the selective ones), and with the exact path
+    /// off (the widened probe alone).
+    #[test]
+    fn filtered_knn_recall_at_every_selectivity() {
+        let dir = temp_dir("recall");
+        let corpus = corpus(&dir, 4, 5_000, VectorStoreMode::Sidecar);
+        let mut rng = Lcg(0xfeed);
+        let queries: Vec<Vec<f32>> = (0..10).map(|_| rng.vector()).collect();
+        let k = 10;
+        // (label, threshold, expected mode per selectivity)
+        let policies: [(&str, usize, [&str; 5]); 3] = [
+            ("default", DEFAULT_KNN_EXACT_THRESHOLD, ["exact"; 5]),
+            (
+                "threshold-500",
+                500,
+                ["ann", "ann", "exact", "exact", "exact"],
+            ),
+            ("exact-off", 0, ["ann"; 5]),
+        ];
+        for (label, threshold, modes) in policies {
+            let searcher = Searcher::new(dir.clone())
+                .with_knn_exact_policy(threshold, DEFAULT_KNN_EXACT_FRACTION);
+            for ((field, period), mode) in SELECTIVITIES.into_iter().zip(modes) {
+                let passing = corpus.docs.len().div_ceil(period);
+                let mut total_recall = 0.0;
+                for query in &queries {
+                    let q = knn_query(query.clone(), k, Some(term(field)));
+                    let r = searcher
+                        .search(&corpus.ns, &corpus.manifest, &q, None)
+                        .unwrap();
+                    let truth = brute_force(&corpus, query, k, |i| i.is_multiple_of(period));
+                    assert_eq!(
+                        r.results.len(),
+                        k.min(passing),
+                        "{label} {field}: min(k, |filtered|) results"
+                    );
+                    assert_eq!(r.knn_mode.as_deref(), Some(mode), "{label} {field}");
+                    assert_eq!(r.knn_filtered_candidates, Some(passing as u64));
+                    assert_eq!(r.knn_degraded_segments, Some(0));
+                    if mode == "exact" {
+                        assert_eq!(ids(&r), truth, "{label} {field}: exact is exact");
+                    }
+                    total_recall += recall(&ids(&r), &truth);
+                }
+                let mean = total_recall / queries.len() as f64;
+                eprintln!("filtered kNN {label} {field}: mode {mode} recall@10 {mean:.3}");
+                assert!(
+                    mean >= 0.95,
+                    "{label} {field}: recall@10 {mean:.3} below 0.95"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unfiltered_knn_is_never_exact() {
+        let dir = temp_dir("unfiltered");
+        let corpus = corpus(&dir, 2, 500, VectorStoreMode::Sidecar);
+        let searcher = Searcher::new(dir.clone());
+        let q = knn_query(corpus.docs[0].2.clone(), 5, None);
+        let (r, stats) = searcher
+            .search_with_stats(&corpus.ns, &corpus.manifest, &q, None)
+            .unwrap();
+        assert_eq!(r.knn_mode.as_deref(), Some("ann"));
+        assert_eq!(r.knn_filtered_candidates, None);
+        assert_eq!(stats.knn_exact_vectors, 0);
+        assert_eq!(r.results[0].doc_id.0, "d0");
+        // Not a kNN query: no mode at all, and nothing serialized.
+        let mut lexical = knn_query(vec![0.0; DIM], 5, None);
+        lexical.knn = None;
+        lexical.filter = Some(term("s50"));
+        let r = searcher
+            .search(&corpus.ns, &corpus.manifest, &lexical, None)
+            .unwrap();
+        assert_eq!(r.knn_mode, None);
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("knn_mode").is_none());
+        assert!(json.get("knn_filtered_candidates").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One segment where the filter passes everything is probed; one where
+    /// it passes 10 of 2,000 (0.5%) is scanned exactly: `mixed`.
+    #[test]
+    fn per_segment_fraction_gives_mixed_mode() {
+        let dir = temp_dir("mixed");
+        let corpus = corpus(&dir, 3, 2_000, VectorStoreMode::Sidecar);
+        let searcher = Searcher::new(dir.clone()).with_knn_exact_policy(1_000, 0.01);
+        let query = corpus.docs[2_003].2.clone(); // seg1, local 3: passes
+        let q = knn_query(query.clone(), 10, Some(term("skew")));
+        let (r, stats) = searcher
+            .search_with_stats(&corpus.ns, &corpus.manifest, &q, None)
+            .unwrap();
+        assert_eq!(r.knn_mode.as_deref(), Some("mixed"));
+        assert_eq!(r.knn_filtered_candidates, Some(2_010));
+        assert_eq!(stats.knn_exact_vectors, 10, "only seg1's 10 are scanned");
+        assert_eq!(r.results.len(), 10);
+        assert_eq!(r.results[0].doc_id.0, "d2003");
+        let truth = brute_force(&corpus, &query, 10, |i| {
+            i < 2_000 || (2_000..2_010).contains(&i)
+        });
+        assert!(
+            recall(&ids(&r), &truth) >= 0.9,
+            "{:?} vs {truth:?}",
+            ids(&r)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Segments that store vectors inline have no sidecar: the exact path
+    /// scores every posting instead, with the same answer and scores.
+    #[test]
+    fn exact_path_without_a_sidecar_scores_postings() {
+        let sidecar_dir = temp_dir("sidecar");
+        let inline_dir = temp_dir("inline");
+        let sidecar = corpus(&sidecar_dir, 2, 1_000, VectorStoreMode::Sidecar);
+        let inline = corpus(&inline_dir, 2, 1_000, VectorStoreMode::Inline);
+        let query = Lcg(7).vector();
+        let q = knn_query(query.clone(), 10, Some(term("s5")));
+        let (a, a_stats) = Searcher::new(sidecar_dir.clone())
+            .search_with_stats(&sidecar.ns, &sidecar.manifest, &q, None)
+            .unwrap();
+        let (b, b_stats) = Searcher::new(inline_dir.clone())
+            .search_with_stats(&inline.ns, &inline.manifest, &q, None)
+            .unwrap();
+        assert_eq!(a.knn_mode.as_deref(), Some("exact"));
+        assert_eq!(b.knn_mode.as_deref(), Some("exact"));
+        assert_eq!(ids(&a), ids(&b));
+        assert_eq!(
+            ids(&a),
+            brute_force(&sidecar, &query, 10, |i| i.is_multiple_of(20))
+        );
+        for (x, y) in a.results.iter().zip(&b.results) {
+            assert!(
+                (x.score - y.score).abs() < 1e-4,
+                "{} vs {}",
+                x.score,
+                y.score
+            );
+        }
+        assert_eq!(a_stats.knn_exact_vectors, 100);
+        assert_eq!(b_stats.knn_exact_vectors, 100);
+        assert_eq!(
+            a_stats.knn_postings_probed, 0,
+            "the sidecar needs no posting"
+        );
+        assert!(
+            b_stats.knn_postings_probed > 0,
+            "inline segments hydrate postings"
+        );
+        std::fs::remove_dir_all(&sidecar_dir).ok();
+        std::fs::remove_dir_all(&inline_dir).ok();
+    }
+
+    /// Exact search scores what the probe scores: with the exact path off,
+    /// a probe over everything returns the same hits and scores.
+    #[test]
+    fn exact_and_probed_scores_agree() {
+        let dir = temp_dir("agree");
+        let corpus = corpus(&dir, 2, 1_000, VectorStoreMode::Sidecar);
+        let query = Lcg(11).vector();
+        let mut q = knn_query(query, 10, Some(term("s5")));
+        q.knn.as_mut().unwrap().num_candidates = 100_000;
+        let exact = Searcher::new(dir.clone())
+            .search(&corpus.ns, &corpus.manifest, &q, None)
+            .unwrap();
+        let probed = Searcher::new(dir.clone())
+            .with_knn_exact_policy(0, 0.0)
+            .search(&corpus.ns, &corpus.manifest, &q, None)
+            .unwrap();
+        assert_eq!(exact.knn_mode.as_deref(), Some("exact"));
+        assert_eq!(probed.knn_mode.as_deref(), Some("ann"));
+        assert_eq!(ids(&exact), ids(&probed));
+        for (x, y) in exact.results.iter().zip(&probed.results) {
+            assert!(
+                (x.score - y.score).abs() < 1e-4,
+                "{} vs {}",
+                x.score,
+                y.score
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Deleted documents are not candidates, and do not count as passing.
+    #[test]
+    fn exact_path_skips_tombstoned_documents() {
+        let dir = temp_dir("tombstones");
+        let corpus = corpus(&dir, 2, 1_000, VectorStoreMode::Sidecar);
+        let query = corpus.docs[40].2.clone(); // d40 passes s5
+        let q = knn_query(query.clone(), 5, Some(term("s5")));
+        let searcher = Searcher::new(dir.clone());
+        let r = searcher
+            .search(&corpus.ns, &corpus.manifest, &q, None)
+            .unwrap();
+        assert_eq!(r.results[0].doc_id.0, "d40");
+        let tombstones = HashMap::from([(SegmentId("seg0".into()), HashSet::from([40u32]))]);
+        let r = searcher
+            .search(&corpus.ns, &corpus.manifest, &q, Some(&tombstones))
+            .unwrap();
+        assert_eq!(r.knn_mode.as_deref(), Some("exact"));
+        assert_eq!(r.knn_filtered_candidates, Some(99));
+        assert!(!ids(&r).contains(&"d40".to_string()));
+        assert_eq!(
+            ids(&r),
+            brute_force(&corpus, &query, 5, |i| i.is_multiple_of(20) && i != 40)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn passing_count_combines_filters_and_tombstones() {
+        let mut a = DocSet::empty(100);
+        let mut b = DocSet::empty(100);
+        for i in 0..50 {
+            a.insert(i);
+        }
+        for i in 25..100 {
+            b.insert(i);
+        }
+        let deleted = HashSet::from([0u32, 30, 99, 500]);
+        assert_eq!(knn_passing_count(None, None, None, 100), 100);
+        assert_eq!(knn_passing_count(Some(&a), None, None, 100), 50);
+        assert_eq!(knn_passing_count(None, Some(&b), None, 100), 75);
+        assert_eq!(knn_passing_count(Some(&a), Some(&b), None, 100), 25);
+        // 30 is in both; 0 only in `a`; 99 only in `b`; 500 is no document.
+        assert_eq!(
+            knn_passing_count(Some(&a), Some(&b), Some(&deleted), 100),
+            24
+        );
+        assert_eq!(knn_passing_count(None, None, Some(&deleted), 100), 97);
+    }
+
+    #[test]
+    fn filter_widens_the_probe_budget_up_to_the_cap() {
+        assert_eq!(filtered_knn_budget(100, None), 100);
+        assert_eq!(filtered_knn_budget(100, Some(1.0)), 100);
+        assert_eq!(filtered_knn_budget(100, Some(0.5)), 200);
+        assert_eq!(filtered_knn_budget(100, Some(0.25)), 400);
+        assert_eq!(filtered_knn_budget(100, Some(0.001)), 800, "capped at 8x");
+        assert_eq!(filtered_knn_budget(100, Some(0.0)), 100);
     }
 }

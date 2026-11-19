@@ -315,7 +315,7 @@ struct AppState {
     /// bytes are fast to open but nothing has opened them yet — the first
     /// wave of real kNN queries still pays for every first-touch
     /// `open_segment` itself, which at corpus scale (every segment, on
-    /// every query — see `global_probe_cutoff`) reproduces the same
+    /// every query — see `knn_plan`) reproduces the same
     /// cold-start convoy this field's sibling exists to prevent. Its own
     /// flag rather than folding into `warmup_posting_blobs`: this phase
     /// mutates the *live* `segment_cache`/`MemoryLedger` that concurrent
@@ -1738,7 +1738,7 @@ impl AppState {
                 // Phase 4 above makes `open_segment` *fast* on first
                 // touch; without this, it's still first-touch — the
                 // first wave of real kNN queries pays for opening every
-                // segment itself (global_probe_cutoff touches all of
+                // segment itself (knn_plan touches all of
                 // them on every query), reproducing the same convoy
                 // phase 4 exists to prevent, just one query later.
                 if self.warmup_hydrate_segment_cache {
@@ -6795,7 +6795,8 @@ fn log_search_timing(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
          score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
-         open_total_ms={:.1} knn_postings={} knn_degraded={} hits={}",
+         open_total_ms={:.1} knn_postings={} knn_mode={} knn_exact_vectors={} \
+         knn_filtered={} knn_degraded={} hits={}",
         ns.0,
         total_ms,
         hydrate_ms,
@@ -6811,6 +6812,11 @@ fn log_search_timing(
         phases.open_cached,
         phases.open_total_ms,
         phases.knn_postings_probed,
+        phases.knn_mode.map_or("-", |mode| mode.as_str()),
+        phases.knn_exact_vectors,
+        phases
+            .knn_filtered_candidates
+            .map_or_else(|| "-".to_string(), |n| n.to_string()),
         knn_degraded_segments.unwrap_or(0),
         total_hits,
     );
