@@ -75,27 +75,33 @@ another and let the SSD cache warm."
 
 ### 3.1 Phasing
 
-This document describes the target architecture, but it is built in phases. **Phase 1 (this
-implementation effort) is BM25 lexical search only** — no vector index, no ANN, no fusion, no
-rerank hook. Concretely, Phase 1 includes:
+This document describes the target architecture, which was built in phases.
 
-- The S3 segment format and manifest (§6), but each segment contains `doc_store.bin`,
-  `inverted.idx`, and `filters.bin` only — `vector.idx` is not built or read.
+> **Where the implementation stands (keep in sync with the README's supported-features table).**
+> Phase 1 (BM25 lexical search on the S3 + SSD-cache storage model) is complete, and most of
+> what was deferred to Phase 2 has shipped too: segments now carry a posting-based
+> `vector.idx` (cluster-and-posting ANN with centroid probing and triangle-inequality bounds),
+> requests take a `knn` clause with `knn.filter`, and a lexical query plus `knn` is fused with
+> RRF (§8 step 5). Still not implemented: the rerank hook (§8 step 6) and per-retriever RRF
+> weights. The phase plan below is kept as the historical record of how the work was ordered.
+
+Phase 1 was BM25 lexical search only — no vector index, no ANN, no fusion, no rerank hook.
+Concretely, Phase 1 included:
+
+- The S3 segment format and manifest (§6), with each segment containing `doc_store.bin`,
+  `inverted.idx`, and `filters.bin` only.
 - The full write path (§7): WAL, buffering, flush-to-segment, compaction.
 - The full SSD caching layer (§9): read-through cache over segment files, exactly as described.
-- The read path (§8), restricted to step 4's lexical branch only: postings intersection/union +
-  BM25 scoring. Steps 4's semantic branch, step 5 (fusion), and step 6 (rerank hook) are stubbed
-  as no-ops or simply omitted from the Phase 1 API surface.
-- Structured filters and cursor pagination (single cursor, not the lexical/semantic pair) — a
-  namespace running Phase 1 only ever has one retrieval mode, so `SearchCursor`'s dual-cursor
-  shape collapses to one field.
-- Multi-tenancy (§10), migration approach (§14), and operational model (§15) apply unchanged —
-  none of them are vector-specific.
+- The read path (§8), restricted to step 4's lexical branch: postings intersection/union +
+  BM25 scoring.
+- Structured filters and cursor pagination.
+- Multi-tenancy (§10), migration approach (§14), and operational model (§15) — none of them
+  are vector-specific.
 
-**Explicitly deferred to Phase 2**: `vector.idx`, ANN retrieval, RRF fusion, the rerank hook, and
-embedding-dependent parts of the namespace schema (vector dimension/metric). The segment
-`footer.json` and manifest format should still *reserve* the field for a vector index reference so
-Phase 2 can add it without a segment format migration, but Phase 1 never writes or reads it.
+**Deferred to Phase 2** (since implemented, except the rerank hook): `vector.idx`, ANN
+retrieval, RRF fusion, the rerank hook, and embedding-dependent parts of the namespace schema.
+The segment footer reserved a slot for the vector index so Phase 2 could add it without a
+segment format migration.
 
 Rationale: BM25 alone is a complete, independently useful retrieval mode (Sage already runs a pure
 lexical path via `search_filter.lexical_search=True`), and it lets us prove out the harder,
@@ -200,9 +206,9 @@ a directory of objects in S3:
 s3://kosha-{env}/{namespace_id}/segments/{segment_id}/
     doc_store.bin       # document payloads (content, metadata), compressed, block-addressed
     inverted.idx         # term → postings list (docId, freq, positions) for lexical search
-    vector.idx           # ANN index (HNSW graph or IVF-PQ codebook + posting lists) — Phase 2, not written in Phase 1
+    vector.idx           # ANN index: cluster postings (+ vector.offsets with centroids), written when the segment has vectors
     filters.bin          # columnar filter fields (dates, ids, tags) for fast predicate eval
-    footer.json          # offsets, counts, schema version, checksum (reserves a vector.idx slot even in Phase 1)
+    footer.json          # offsets, counts, schema version, checksum, analysis chains
 ```
 
 **Analysis is versioned per segment (#220, #221).** `inverted.idx` holds whatever terms the
@@ -316,7 +322,7 @@ Indexer
 
 Given a namespace manifest and a `CompactionPolicy`:
 
-| Knob | Default (Phase 1) | Meaning |
+| Knob | Default | Meaning |
 |------|-------------------|---------|
 | `max_mergeable_docs` | 50_000 | Segment with `doc_count >=` this is never a merge input |
 | `max_segments_per_merge` | 32 | Cap inputs per pass |
@@ -332,9 +338,14 @@ calls.
 **Triggers & scheduling**
 
 - **Do not** schedule blind periodic full compaction against live ingest/query nodes.
-- A future in-process or compaction-role loop should call `needs_compaction(ns)` (segment-count /
-  size thresholds above) and, when true, run one tiered pass. Backoff when publish CAS fails or
-  when the node is under query load.
+- The background scheduler on the write pod (`crates/kosha-server/src/compaction_sched.rs`,
+  #242) calls `needs_compaction(ns)` every `KOSHA_COMPACTION_INTERVAL_MS` (default 30 s, `0`
+  disables) and runs one tiered pass per due namespace, at most
+  `KOSHA_COMPACTION_MAX_CONCURRENT` at a time, oldest-compacted namespace first. A failed pass
+  backs off exponentially; a pass that merged nothing waits for the manifest to change. A
+  separate compaction node role is still future work.
+- Merged segments are capped at `max_merged_segment_bytes` (default 5 GiB,
+  `KOSHA_COMPACT_MAX_SEGMENT_BYTES`); larger segments are never merge inputs again.
 - The `POST /v1/admin/compact-namespace` route remains the emergency lever; default body mode is
   `tiered`. Pass `"mode": "full"` only for deliberate one-shot remediation.
 
@@ -384,8 +395,10 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      `bm25_params.stats: "segment"` (or `KOSHA_BM25_STATS=segment` engine-wide) restores
      per-segment statistics for A/B debugging. Wildcard queries keep per-segment statistics,
      since their expansion is per segment.
-   - Semantic: ANN search over `vector.idx` (HNSW graph traversal or IVF-PQ probe), scored by
-     cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
+   - Semantic: ANN search over `vector.idx` — probe the nearest cluster centroids (one probe
+     budget for the whole query, bounded with triangle-inequality radii) and score the
+     postings' unit-norm vectors by dot product (cosine); older segments fall back to flat or
+     HNSW search. This is the direct replacement for OpenSearch's `script_score` cosineSimilarity
      query in `query_builder.py`.
 5. **Fusion**: candidate sets from lexical and semantic retrieval are merged via Reciprocal Rank
    Fusion, `score(d) = Σ_r 1/(rank_constant + rank_r(d))`, matching `ranking/rrf.py`'s existing
@@ -402,7 +415,7 @@ true in practice since ES refresh intervals are already tuned up for indexing th
    `knn.filter` to the vector one only. `total_hits` and aggregations cover the lexical matches
    plus the vector window; `from`/`sort`/`collapse`/`search_after` apply within the fused list,
    which is at most `rank_window_size` long. Each hit carries its per-retriever ranks.
-6. **Rerank hook**: an optional, pluggable cross-encoder rerank stage (Cohere today) runs on the
+6. **Rerank hook** (not implemented yet): an optional, pluggable cross-encoder rerank stage (Cohere today) runs on the
    fused top-N before results return — same role as `ChunkGenerator.__re_rank`.
 7. **Cursor**: response includes per-mode (lexical/semantic) cursor state (last score + doc id) so
    pagination works identically to `SearchCursor` today.
@@ -643,7 +656,11 @@ one-time batch job reading from the existing Postgres/S3 document store and repl
 
 ## 17. Open Questions / Risks
 
-- **ANN index choice at scale**: HNSW is simple and fast to query but expensive to build/merge
+- **ANN index choice at scale**: *partly resolved* — segments now write a cluster-and-posting
+  index (`KOSHA_VECTOR_WRITE_VERSION=4`) built at flush/merge time, rather than an HNSW graph
+  rebuilt on every open. Still open: incremental updates (the SPFresh/LIRE prototype in
+  `kosha-vector-spfresh`), quantization, and recall tuning at large segment counts. Original
+  note: HNSW is simple and fast to query but expensive to build/merge
   incrementally at compaction time; IVF-PQ compacts cheaper but costs recall. Needs a benchmark
   against Sage's actual embedding dimensionality and namespace size distribution before locking in
   a default per index profile.

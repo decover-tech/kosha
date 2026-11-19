@@ -10,10 +10,10 @@ built to replace Elasticsearch/OpenSearch and is intended to be reusable as a ge
 
 See [DESIGN.md](DESIGN.md) for the full architecture.
 
-> **Status: Phase 1 complete — BM25 lexical + kNN/ANN search implemented.**
-> All seven crates have functional BM25 indexing, query, filtering,
-> aggregation, HNSW vector search, and RRF hybrid fusion. Rerank is Phase 2
-> (DESIGN.md §3.1).
+> **Status: BM25 lexical, kNN/ANN vector and RRF hybrid search are implemented**,
+> with filtering, aggregations, compaction and a Postgres control plane. See
+> [Supported features](#supported-features) and [Not supported yet](#not-supported-yet);
+> reranking is the main piece of DESIGN.md's target architecture still to come.
 
 ## Install
 
@@ -91,7 +91,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 - Reranking (Phase 2, DESIGN.md §3.1). Per-retriever weights for RRF.
 - Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
-- `kosha-vector-spfresh` (SPFresh/SPANN with LIRE rebalancing) is a standalone, benchmarked prototype; it is not wired into the segment format or the query path.
+- Incremental vector-index updates. Each segment's posting-based `vector.idx` is built once, with `kosha-vector-spfresh`'s clustering, when the segment is written; the crate's incremental SPFresh/LIRE rebalancing (split / merge / reassign) is a benchmarked prototype the server does not use.
 
 ## Analyzers
 
@@ -247,29 +247,37 @@ back requires converting both formats. The SQL column needs no schema change.
 ## Repository layout
 
     crates/
-      kosha-core      shared types, data model, filter/query DSL  — Epic 2
-      kosha-segment   segment format: inverted idx, doc store,    — Epic 2
-                     filter columns, vector store, HNSW graph
-      kosha-write     document buffer + flush-to-segment          — Epic 3
-      kosha-cache     NVMe SSD read-through cache (§9)            — Epic 4
-      kosha-query     BM25 scorer, kNN/ANN search, aggregations,  — Epic 5
-                     wildcard, match phrase, filtering
-      kosha-control   in-memory namespace + manifest store        — Epic 6
-      kosha-server    HTTP API (healthz, index, search, stats,    — Epic 8
-                     delete, flush)
-      kosha-cli       Remote `kosha` CLI (profiles, search,       — Epic 12
-                     index, curl escape hatch)
+      kosha-core            shared types, data model, filter/query DSL, analyzers
+      kosha-segment         segment format: inverted index, doc store, filter
+                            columns, blooms, posting-based vector index
+      kosha-vector-spfresh  vector clustering used to build vector.idx, plus an
+                            incremental SPFresh/LIRE prototype
+      kosha-write           WAL, per-namespace buffer, flush-to-segment, compaction
+      kosha-cache           NVMe SSD read-through cache (DESIGN.md §9)
+      kosha-query           BM25 + WAND, kNN/ANN, RRF fusion, filters, sorting,
+                            highlighting, aggregations, segment cache
+      kosha-control         namespace registry + manifest store (in-memory or
+                            Postgres), hydration leases, SQL migrations
+      kosha-server          HTTP /v1 API, auth, S3 upload/hydration, warmup,
+                            compaction scheduler, `migrate`
+      kosha-cli             remote `kosha` CLI (profiles, search, index, curl)
+      kosha-build-segments  offline parallel segment builder
     clients/
-      python/kosha_client  OpenSearch-compatible Python client    — Epic 11
-                           (spec → codegen → thin client)
-      python/README.md     how the client is structured
+      python/kosha_client   OpenSearch-compatible Python client
+                            (spec → codegen → thin client)
+      python/README.md      how the client is structured
     proto/
-      buf.yaml             Buf module config
-      kosha/v1/kosha.proto  Canonical API contract (source of truth) — Epic 1
-    gen/                   Generated stubs + OpenAPI spec (git-ignored)
-    tools/codegen/         Code generation scripts and docs
-    docs/                  Development and integration guides
-    DESIGN.md              Architecture document (v1 draft)
+      buf.yaml              Buf module config
+      kosha/v1/kosha.proto  canonical API contract (source of truth)
+    gen/                    generated stubs + OpenAPI spec (git-ignored)
+    tools/codegen/          code generation scripts and docs
+    scripts/conformance/    end-to-end BM25 + filter correctness suite
+    scripts/bench/          large-scale benchmark harness
+    docs/                   configuration reference, development guides
+    DESIGN.md               architecture document
+
+[CONTRIBUTING.md](CONTRIBUTING.md#where-does-my-change-go) maps each crate to the kind of
+change that belongs in it.
 
 ## Quickstart (test as a customer would)
 
@@ -319,11 +327,15 @@ Both the CLI and the Python client respect `KOSHA_HOST` and `KOSHA_API_KEY`.
 Prerequisites: Rust stable (via [rustup](https://rustup.rs) — the repo pins the
 channel via `rust-toolchain.toml`), Docker, and optionally `pre-commit`.
 
-    cargo build                                # build the workspace
-    cargo test                                 # run unit tests
-    cargo fmt --all -- --check                 # formatting (CI gate)
-    cargo clippy --all-targets -- -D warnings  # linting (CI gate)
-    pre-commit install                         # optional: run gates on commit
+    cargo build                                                # build the workspace
+    cargo test --all-features                                  # tests, incl. s3/postgres code (CI gate)
+    cargo fmt --all -- --check                                 # formatting (CI gate)
+    cargo clippy --all-targets --all-features -- -D warnings   # linting (CI gate)
+    pre-commit install                                         # optional: run gates on commit
+
+Every `KOSHA_*` environment variable the server reads, with its default and units, is listed
+in [docs/configuration.md](docs/configuration.md). [CONTRIBUTING.md](CONTRIBUTING.md) covers
+the full contributor workflow: crate map, feature flags, benchmarks and PR conventions.
 
 The Postgres CAS integration test races independent writers and checks retries.
 Run it against a dedicated disposable database:
@@ -375,5 +387,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Apache-2.0 (see [LICENSE](LICENSE)). The final open-source license choice is
-confirmed before the v0.1 release (implementation plan step 126).
+Apache-2.0 (see [LICENSE](LICENSE)).

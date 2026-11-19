@@ -1,0 +1,127 @@
+name: Bug report
+description: Something in Kosha (server, CLI or Python client) does not behave as documented.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Kosha bugs usually depend on how the server is deployed and
+        configured, so the fields below ask for those facts. Remove API keys, hostnames and
+        document contents you cannot share.
+
+  - type: input
+    id: version
+    attributes:
+      label: Kosha version
+      description: Image tag, release version or commit SHA (`git rev-parse --short HEAD`). For the Python client, also `pip show kosha-client`.
+      placeholder: "kosha:0.1.0, kosha:main, or a commit SHA such as dd6e523"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How is Kosha running?
+      options:
+        - docker compose (this repo's docker-compose.yml)
+        - plain docker run
+        - Kubernetes
+        - cargo run / binary built from source
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: storage
+    attributes:
+      label: Storage backend
+      description: Which object store holds segments? (`KOSHA_S3_BUCKET` unset means local disk only.)
+      options:
+        - MinIO or another S3-compatible store (KOSHA_S3_ENDPOINT set)
+        - AWS S3
+        - Local disk only (no KOSHA_S3_BUCKET)
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: control-plane
+    attributes:
+      label: Control plane
+      description: Postgres is used when the binary has the `postgres` feature and `DATABASE_URL` is set.
+      options:
+        - Postgres (DATABASE_URL set)
+        - In-memory (no DATABASE_URL)
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: topology
+    attributes:
+      label: Topology
+      options:
+        - Single node (accepts reads and writes)
+        - Separate query and ingest pods (KOSHA_INGEST_HOST set on query pods)
+        - Not sure
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: Any non-default `KOSHA_*` variables (see docs/configuration.md). Leave out secrets.
+      placeholder: |
+        KOSHA_FLUSH_THRESHOLD=5000
+        KOSHA_COMPACTION_INTERVAL_MS=0
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Request that reproduces it
+      description: The smallest sequence of requests (curl, `kosha` CLI or Python) that shows the problem, including the documents indexed and the request body.
+      placeholder: |
+        curl -s -X POST localhost:8080/v1/namespaces/demo/documents -H 'Authorization: Bearer <key>' -d '...'
+        curl -s -X POST localhost:8080/v1/namespaces/demo/search -H 'Authorization: Bearer <key>' -d '{"query_text": "...", "max_results": 10}'
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected response
+      description: What you expected, and why (docs link, Elasticsearch/OpenSearch behavior, ...).
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual response
+      description: The status code and response body you got.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server logs
+      description: Relevant `kosha-server` output around the failure (for example `docker compose logs kosha-server --tail 200`).
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Data size, number of segments (`GET /v1/namespaces/{ns}/stats`), whether it started after an upgrade, etc.
+    validations:
+      required: false
