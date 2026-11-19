@@ -42,9 +42,9 @@ pub trait ControlStore: Send + Sync {
 
     /// Persist a manifest for a namespace (upsert, last-write-wins).
     ///
-    /// Used by the node to publish the current segment list after flush so
-    /// the state survives restarts. For multi-writer publish with optimistic
-    /// concurrency, use `compare_and_swap_manifest` instead.
+    /// Bootstrap and tests only: it can overwrite a concurrent writer's
+    /// commit, so no publish path (flush, compaction, migrate, admin
+    /// import) uses it. Publish with `compare_and_swap_manifest`.
     fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError>;
 
     /// Publish only over the writer's last committed version. An identical
