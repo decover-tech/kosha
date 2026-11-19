@@ -40,22 +40,51 @@ pub trait ControlStore: Send + Sync {
         self.manifest(id).cloned()
     }
 
-    /// The stored manifest's version, without its segment list.
+    /// Owned copy of the manifest, distinguishing "no such namespace"
+    /// (`Ok(None)`) from "the control store could not be read"
+    /// (`Err(KoshaError::ControlPlane)`).
     ///
-    /// A query replica asks this before every search to learn whether the
-    /// ingest node has published since it last looked, so it has to be
-    /// cheap: the manifest itself carries a footer for every segment and
-    /// runs to megabytes for a few hundred segments. The default reads the
-    /// whole manifest; stores that can do better override it.
-    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
-        self.manifest_cloned(id).map(|manifest| manifest.version)
+    /// Query replicas use this to follow published manifests: an
+    /// unreachable control plane must leave them serving their
+    /// last-known-good manifest (DESIGN.md §17), not report the namespace
+    /// missing. The default wraps `manifest_cloned`, which is infallible
+    /// for in-memory stores; stores that talk to a database override it.
+    fn try_manifest_cloned(&self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
+        Ok(self.manifest_cloned(id))
+    }
+
+    /// The stored manifest's version, without its segment list. `Ok(None)`
+    /// means the namespace has no manifest; `Err` means the store could not
+    /// be read and says nothing about the namespace.
+    ///
+    /// Has to be cheap: the manifest itself can run to megabytes for a few
+    /// hundred segments. The default reads the whole manifest; stores that
+    /// can do better override it.
+    fn manifest_version(&self, id: &NamespaceId) -> Result<Option<u64>, KoshaError> {
+        Ok(self
+            .try_manifest_cloned(id)?
+            .map(|manifest| manifest.version))
+    }
+
+    /// Every namespace's stored manifest version in one read: the query
+    /// replicas' manifest refresher polls this (`SELECT namespace_id,
+    /// version FROM kosha.manifests` on Postgres) instead of one round trip
+    /// per namespace per search. `Err` means the store could not be read.
+    fn manifest_versions(&self) -> Result<Vec<(NamespaceId, u64)>, KoshaError> {
+        let mut versions = Vec::new();
+        for id in self.list_namespaces() {
+            if let Some(version) = self.manifest_version(&id)? {
+                versions.push((id, version));
+            }
+        }
+        Ok(versions)
     }
 
     /// Persist a manifest for a namespace (upsert, last-write-wins).
     ///
-    /// Used by the node to publish the current segment list after flush so
-    /// the state survives restarts. For multi-writer publish with optimistic
-    /// concurrency, use `compare_and_swap_manifest` instead.
+    /// Bootstrap and tests only: it can overwrite a concurrent writer's
+    /// commit, so no publish path (flush, compaction, migrate, admin
+    /// import) uses it. Publish with `compare_and_swap_manifest`.
     fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError>;
 
     /// Publish only over the writer's last committed version. An identical
@@ -2212,6 +2241,11 @@ pub enum KoshaError {
     /// Transient by construction — callers should retry with backoff, which
     /// the Python `kosha_client` already does. Maps to HTTP 429.
     Overloaded(String),
+    /// The control store (Postgres) could not be reached or returned an
+    /// error. Says nothing about whether a namespace or manifest exists —
+    /// callers that can (query replicas) keep serving their last-known-good
+    /// manifest instead of failing (DESIGN.md §17).
+    ControlPlane(String),
     /// The request itself is malformed or out of range (e.g. BM25 `b`
     /// outside `[0, 1]`). A client error: maps to HTTP 400.
     InvalidQuery(String),
@@ -2230,6 +2264,7 @@ impl std::fmt::Display for KoshaError {
             Self::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
             Self::CorruptSegment(msg) => write!(f, "corrupt segment data: {msg}"),
             Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
+            Self::ControlPlane(msg) => write!(f, "control plane unavailable: {msg}"),
             Self::InvalidQuery(msg) => write!(f, "invalid query: {msg}"),
         }
     }

@@ -10,22 +10,22 @@ import pytest
 
 from kosha_client import KoshaClient, KoshaRequestError
 
-MATTER = "7f808c2f2d914c0cbf70912832d51036"
+PROJECT = "7f808c2f2d914c0cbf70912832d51036"
 
 
-def matter_filter(matter=MATTER):
-    """`_matter_id_filter` from the backend: a bool with only `should`."""
+def scope_filter(project=PROJECT):
+    """A caller scope filter: a bool with only `should`."""
     return {
         "bool": {
-            "should": [{"term": {"matterId": matter}}, {"term": {"productionId": matter}}]
+            "should": [{"term": {"projectId": project}}, {"term": {"workspaceId": project}}]
         }
     }
 
 
-IN_SCOPE = {"bool": {"must_not": [{"term": {"isFiltered": False}}]}}
-MATTER_KOSHA = {
+IN_SCOPE = {"bool": {"must_not": [{"term": {"isArchived": False}}]}}
+SCOPE_KOSHA = {
     "bool": {
-        "should": [{"term": {"matterId": MATTER}}, {"term": {"productionId": MATTER}}],
+        "should": [{"term": {"projectId": PROJECT}}, {"term": {"workspaceId": PROJECT}}],
         "minimum_should_match": 1,
     }
 }
@@ -46,21 +46,21 @@ def refused(body):
 # ── Filters ────────────────────────────────────────────────────────────────
 
 
-def test_matter_filter_nested_in_bool_filter_is_kept():
+def test_scope_filter_nested_in_bool_filter_is_kept():
     # The exact nesting the benchmark sends: bool.filter -> bool.filter ->
     # bool.should. Kosha's parser used to reject the inner `filter` (400).
     kosha = translate(
         {
             "query": {
                 "bool": {
-                    "filter": [{"bool": {"filter": [matter_filter()]}}],
+                    "filter": [{"bool": {"filter": [scope_filter()]}}],
                     "must": [{"match": {"content": "contract"}}],
                 }
             }
         }
     )
     assert kosha["query_text"] == "contract"
-    assert kosha["filter"] == {"bool": {"must": [MATTER_KOSHA]}}
+    assert kosha["filter"] == {"bool": {"must": [SCOPE_KOSHA]}}
 
 
 def test_booleans_and_numbers_become_the_strings_kosha_stores():
@@ -68,7 +68,7 @@ def test_booleans_and_numbers_become_the_strings_kosha_stores():
     assert kosha["filter"] == {
         "bool": {
             "must": [
-                {"bool": {"must_not": [{"term": {"isFiltered": "false"}}]}},
+                {"bool": {"must_not": [{"term": {"isArchived": "false"}}]}},
                 {"terms": {"pageNumber": ["1", "2"]}},
             ]
         }
@@ -106,7 +106,7 @@ def test_exists_and_range_options():
     ranged = KoshaClient._to_filter(
         {
             "range": {
-                "sentAt": {
+                "publishedAt": {
                     "gte": "2024-01-01",
                     "lte": "2024-12-31",
                     "format": "strict_date_optional_time",
@@ -115,13 +115,13 @@ def test_exists_and_range_options():
             }
         }
     )
-    assert ranged == {"range": {"sentAt": {"gte": "2024-01-01", "lte": "2024-12-31"}}}
+    assert ranged == {"range": {"publishedAt": {"gte": "2024-01-01", "lte": "2024-12-31"}}}
 
 
 @pytest.mark.parametrize(
     "clause",
     [
-        {"nested": {"path": "batesAssignments", "query": {"match_all": {}}}},
+        {"nested": {"path": "comments", "query": {"match_all": {}}}},
         {"term": {"_id": "abc"}},
         {"ids": {"values": ["a"]}},
         {"prefix": {"title": "ab"}},
@@ -147,25 +147,25 @@ def test_match_defaults_to_or_like_opensearch():
 
 
 def test_one_term_across_fields_is_one_clause():
-    # The keyword compiler searches each term in four fields: one clause
-    # over those four fields (Kosha's `fields`, #249).
+    # A typical keyword query builder searches each term in four fields:
+    # one clause over those four fields (Kosha's `fields`, #249).
     per_field = [
         {"match": {field: {"query": "indemnity"}}}
-        for field in ("content", "title", "sender", "recipients")
+        for field in ("content", "title", "author", "labels")
     ]
     kosha = translate(
         {
             "query": {
                 "bool": {
                     "must": [{"bool": {"should": per_field, "minimum_should_match": 1}}],
-                    "filter": [matter_filter()],
+                    "filter": [scope_filter()],
                 }
             }
         }
     )
     assert kosha["query_text"] == "indemnity"
-    assert kosha["fields"] == ["content", "title", "sender", "recipients"]
-    assert kosha["filter"] == MATTER_KOSHA
+    assert kosha["fields"] == ["content", "title", "author", "labels"]
+    assert kosha["filter"] == SCOPE_KOSHA
 
 
 def test_match_on_a_field_restricts_and_boosts_it():
@@ -304,14 +304,14 @@ def test_optional_score_boosts_do_not_change_the_query():
 
 def test_phrase_inside_a_bool_is_kept():
     # This is the benchmark's phrase request. The phrase used to be dropped,
-    # leaving a matter-wide filter query: every phrase "matched" 10,000.
+    # leaving a project-wide filter query: every phrase "matched" 10,000.
     kosha = translate(
         {
             "size": 20,
             "track_total_hits": True,
             "query": {
                 "bool": {
-                    "filter": [matter_filter()],
+                    "filter": [scope_filter()],
                     "must": [{"match_phrase": {"content": "breach of contract"}}],
                 }
             },
@@ -323,7 +323,7 @@ def test_phrase_inside_a_bool_is_kept():
         "slop": 0,
     }
     assert kosha["query_text"] == ""
-    assert kosha["filter"] == MATTER_KOSHA
+    assert kosha["filter"] == SCOPE_KOSHA
     assert kosha["exact_total_hits"] is True
 
 
@@ -371,7 +371,7 @@ def test_knn_filter_is_carried_into_the_vector_search():
                     "contentEmbedding": {
                         "vector": vector,
                         "k": 30,
-                        "filter": {"bool": {"must": [matter_filter(), IN_SCOPE]}},
+                        "filter": {"bool": {"must": [scope_filter(), IN_SCOPE]}},
                     }
                 }
             },
@@ -383,8 +383,8 @@ def test_knn_filter_is_carried_into_the_vector_search():
     assert knn["filter"] == {
         "bool": {
             "must": [
-                MATTER_KOSHA,
-                {"bool": {"must_not": [{"term": {"isFiltered": "false"}}]}},
+                SCOPE_KOSHA,
+                {"bool": {"must_not": [{"term": {"isArchived": "false"}}]}},
             ]
         }
     }
@@ -398,7 +398,7 @@ def test_knn_filter_that_cannot_be_expressed_refuses_the_search():
                     "contentEmbedding": {
                         "vector": [0.1] * 16,
                         "k": 5,
-                        "filter": {"nested": {"path": "batesAssignments", "query": {}}},
+                        "filter": {"nested": {"path": "comments", "query": {}}},
                     }
                 }
             }
@@ -453,7 +453,7 @@ def test_aggregations_pass_through_and_sub_aggregations_are_refused():
         {
             "aggs": {
                 "a": {
-                    "terms": {"field": "senderEmail"},
+                    "terms": {"field": "authorEmail"},
                     "aggs": {"docs": {"cardinality": {"field": "documentId"}}},
                 }
             }
@@ -505,9 +505,9 @@ def test_count_counts_the_query_it_was_given(monkeypatch):
         return {"results": [], "total_hits": 42, "total_hits_relation": "eq"}
 
     monkeypatch.setattr(client, "_request", fake_request)
-    out = client.count(index="idx", body={"query": {"bool": {"filter": [matter_filter()]}}})
+    out = client.count(index="idx", body={"query": {"bool": {"filter": [scope_filter()]}}})
     assert out["count"] == 42
-    assert sent["body"]["filter"] == {"bool": {"must": [MATTER_KOSHA]}}
+    assert sent["body"]["filter"] == {"bool": {"must": [SCOPE_KOSHA]}}
     assert sent["body"]["max_results"] == 0
     assert sent["body"]["exact_total_hits"] is True
 
@@ -523,13 +523,13 @@ def test_delete_by_query_refuses_a_query_it_cannot_fully_express(monkeypatch):
     monkeypatch.setattr(client, "_request", fake_request)
     # Fully expressible: sent as a filter.
     out = client.delete_by_query(
-        index="idx", body={"query": {"bool": {"filter": [matter_filter()]}}}
+        index="idx", body={"query": {"bool": {"filter": [scope_filter()]}}}
     )
     assert out["deleted"] == 3
-    assert calls[-1][2]["filter"] == {"bool": {"must": [MATTER_KOSHA]}}
+    assert calls[-1][2]["filter"] == {"bool": {"must": [SCOPE_KOSHA]}}
 
     # One clause Kosha cannot apply: nothing is sent. Sending the rest of
-    # the filter would delete every document of the matter.
+    # the filter would delete every document of the project.
     calls.clear()
     with pytest.raises(KoshaRequestError):
         client.delete_by_query(
@@ -538,8 +538,8 @@ def test_delete_by_query_refuses_a_query_it_cannot_fully_express(monkeypatch):
                 "query": {
                     "bool": {
                         "filter": [
-                            matter_filter(),
-                            {"nested": {"path": "batesAssignments", "query": {}}},
+                            scope_filter(),
+                            {"nested": {"path": "comments", "query": {}}},
                         ]
                     }
                 }

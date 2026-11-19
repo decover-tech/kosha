@@ -182,8 +182,15 @@ impl ControlStore for Controller {
     fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut Manifest> {
         self.manifest_mut(id)
     }
-    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
-        self.manifest(id).map(|manifest| manifest.version)
+    fn manifest_version(&self, id: &NamespaceId) -> Result<Option<u64>, KoshaError> {
+        Ok(self.manifest(id).map(|manifest| manifest.version))
+    }
+    fn manifest_versions(&self) -> Result<Vec<(NamespaceId, u64)>, KoshaError> {
+        Ok(self
+            .manifests
+            .iter()
+            .map(|(id, manifest)| (id.clone(), manifest.version))
+            .collect())
     }
     fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError> {
         self.save_manifest(id, manifest)
@@ -238,6 +245,30 @@ mod tests {
         let mut older = candidate.clone();
         older.version = 2;
         assert!(ctrl.compare_and_swap_manifest(&ns, 3, older).is_err());
+    }
+
+    #[test]
+    fn manifest_versions_lists_every_namespace_and_distinguishes_missing() {
+        let mut ctrl = Controller::new();
+        let a = NamespaceId("a".into());
+        let b = NamespaceId("b".into());
+        ctrl.ensure_namespace(a.clone());
+        let mut manifest = ctrl.manifest(&a).unwrap().clone();
+        manifest.version = 7;
+        ctrl.save_manifest(&b, &manifest).unwrap();
+        let mut versions = ControlStore::manifest_versions(&ctrl).unwrap();
+        versions.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+        assert_eq!(versions, vec![(a.clone(), 0), (b.clone(), 7)]);
+        assert_eq!(ControlStore::manifest_version(&ctrl, &b).unwrap(), Some(7));
+        assert_eq!(
+            ControlStore::manifest_version(&ctrl, &NamespaceId("missing".into())).unwrap(),
+            None
+        );
+        assert!(
+            ControlStore::try_manifest_cloned(&ctrl, &NamespaceId("missing".into()))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

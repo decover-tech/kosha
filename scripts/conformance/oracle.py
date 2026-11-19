@@ -16,11 +16,15 @@ Visibility (kosha-write ``Indexer``)
     live docs, dropping tombstoned docs.
 
 Scoring (kosha-query ``Bm25Scorer`` / ``score_segment``)
-  * BM25 statistics are PER SEGMENT: N = docs in the segment (tombstoned
-    docs included — segments are immutable), avgdl = mean field length over
-    those docs, df = postings length for the term in that segment. So a
-    document's score legitimately changes after compaction; the model tracks
-    the segment layout so it can predict exact scores, not just rankings.
+  * BM25 statistics are NAMESPACE-LEVEL (issue #246): N = docs summed over
+    every segment (tombstoned docs included — segments are immutable),
+    avgdl = total field length over those docs / N, df = postings length for
+    the term summed over every segment. A document therefore scores the same
+    whichever segment holds it, but its score still legitimately changes
+    after compaction drops tombstoned docs; the model tracks the segment
+    layout so it can predict exact scores, not just rankings.
+    ``bm25_params.stats: "segment"`` switches back to each segment's own
+    N / df / avgdl, which the model mirrors too.
   * idf = ln(1 + (N - df + 0.5) / (df + 0.5)); k1=1.2, b=0.75 by default.
   * All Text fields share one inverted index; field_length is the total
     token count across a document's Text fields.
@@ -101,6 +105,7 @@ class Segment:
             for t in d.terms:
                 self.df[t] = self.df.get(t, 0) + 1
         self.n = len(docs)
+        self.total_length = total
         self.avgdl = (total / self.n) if self.n else 0.0
 
     def live(self) -> Iterable[Doc]:
@@ -259,22 +264,28 @@ class Oracle:
         params = q.get("bm25_params") or {}
         k1, b = params.get("k1", 1.2), params.get("b", 0.75)
         use_and = len(terms) > 1 and q.get("operator", "and") == "and"
+        per_segment = params.get("stats") == "segment"
+        ns_n = sum(s.n for s in self.segments)
+        ns_avgdl = (sum(s.total_length for s in self.segments) / ns_n) if ns_n else 0.0
+        ns_df = {t: sum(s.df.get(t, 0) for s in self.segments) for t in set(terms)}
         out = []
         for seg in self.segments:
+            if per_segment:
+                n, avgdl, df = seg.n, seg.avgdl, seg.df
+            else:
+                n, avgdl, df = ns_n, ns_avgdl, ns_df
             for d in seg.live():
                 if terms:
                     present = [t for t in terms if t in d.terms]
                     if not present or (use_and and len(present) != len(terms)):
                         continue
-                    score = sum(
-                        score_term(d.terms[t], seg.df[t], seg.n, d.length, seg.avgdl, k1, b) for t in present
-                    )
+                    score = sum(score_term(d.terms[t], df[t], n, d.length, avgdl, k1, b) for t in present)
                     if flt is not None and not matches(flt, d):
                         continue
                 elif flt is not None:
                     if not matches(flt, d):
                         continue
-                    score = score_term(1, seg.n, seg.n, d.length, seg.avgdl, k1, b)
+                    score = score_term(1, n, n, d.length, avgdl, k1, b)
                 else:
                     continue
                 out.append((d.id, score, d))
