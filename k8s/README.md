@@ -150,7 +150,6 @@ is deployed:
 
     kubectl apply -f k8s/stage/es-to-kosha-migration-job.yaml
     kubectl logs -n kosha -f job/es-to-kosha-migration
-    kubectl rollout restart deployment/kosha -n kosha
 
 Notes:
 
@@ -171,7 +170,10 @@ Notes:
   (segment IDs continue past any prior/partial run). Old S3 segments become
   unreferenced; they can be garbage-collected later. During migration, the
   namespace is only partially populated, so keep Sage reads on OpenSearch
-  until the Job completes and Kosha is restarted.
+  until the Job completes. No restart is needed afterwards: query pods pick
+  up the published manifest within `KOSHA_MANIFEST_REFRESH_MS` (default
+  500 ms); check `manifest_version` / `manifest_lag_seconds` for the
+  namespace in `GET /v1/stats` on a query pod to confirm.
 - **Delta catch-up** (missing ids only): pass `--ids-file /path/ids.txt`
   (one OpenSearch `_id` per line). This implies `--append` — new segments are
   added to the existing manifest without wiping prior data. Prefer this over

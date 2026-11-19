@@ -26,6 +26,7 @@ mod auth;
 mod compaction_sched;
 #[cfg(feature = "s3")]
 mod hydration_budget;
+mod manifest_follow;
 #[cfg(feature = "migrate")]
 mod migrate;
 #[cfg(feature = "s3")]
@@ -334,6 +335,10 @@ struct AppState {
     /// the *caller's* own retry logic (kosha_client already has
     /// max_retries/retry_on_timeout), rather than retrying twice.
     write_http_client: Option<reqwest::blocking::Client>,
+    /// Query-role manifest following (#232): refresher cadence, per-namespace
+    /// last-confirmed-current times (lag) and control-plane error counters.
+    /// Unused on the ingest pod, whose manifests are authoritative.
+    manifest_follow: manifest_follow::ManifestFollow,
 }
 
 /// Per-segment single-flight completion signal used by
@@ -1343,6 +1348,9 @@ impl AppState {
             warmup_hydrate_segment_cache,
             ingest_host,
             write_http_client,
+            manifest_follow: manifest_follow::ManifestFollow::new(
+                manifest_follow::refresh_interval_from_env(),
+            ),
         }
     }
 
@@ -1494,27 +1502,7 @@ impl AppState {
             // (footer.json + inverted.idx + doc_store.offsets) for every
             // segment in the manifest. The first real query then pays
             // only for its term shards + page doc spans.
-            let query = kosha_core::SearchQuery {
-                query_text: String::new(),
-                max_results: 0,
-                bm25_params: kosha_core::Bm25Params { k1: 1.2, b: 0.75 },
-                from: 0,
-                filter: None,
-                sort: Vec::new(),
-                search_after: None,
-                highlight: None,
-                aggs: std::collections::HashMap::new(),
-                wildcard: None,
-                match_phrase: None,
-                knn: None,
-                exact_total_hits: None,
-                total_hits_cap: None,
-                operator: None,
-                no_cache: None,
-                collapse: None,
-                source_includes: None,
-                source_excludes: None,
-            };
+            let query = warmup_probe_query();
             let needs_filters = query_needs_filter_store(&query);
             let needs_vectors = query.knn.is_some();
             let t_ns = std::time::Instant::now();
@@ -1759,53 +1747,236 @@ impl AppState {
         );
     }
 
-    /// Persist the indexer's current manifest for a namespace into the
-    /// control store, so the segment list survives restarts.
-    fn refresh_query_namespace(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
-        if self.ingest_host.is_some() {
-            // Ask for the version first. This runs before every search on a
-            // query replica, and it used to read and parse the namespace's
-            // whole manifest row each time (megabytes for a few hundred
-            // segments) while holding the control-store lock every other
-            // search was waiting on, then clone the local manifest to
-            // compare one integer. The manifest is only fetched when the
-            // stored version is ahead.
-            let stored = self
-                .controller
-                .lock()
-                .unwrap()
-                .manifest_version(ns)
-                .ok_or_else(|| KoshaError::NamespaceNotFound(ns.clone()))?;
-            if self
-                .indexer
-                .manifest_version(ns)
-                .is_some_and(|local| local >= stored)
-            {
-                return Ok(());
+    /// Make sure a query replica's manifest for `ns` is fresh enough for a
+    /// search (#232). No-op on the ingest pod.
+    ///
+    /// The background refresher (`spawn_manifest_refresher`) keeps followed
+    /// namespaces within about one `KOSHA_MANIFEST_REFRESH_MS` of the
+    /// control store, so by default a search touches neither the control
+    /// store nor its lock. It refreshes synchronously only when
+    /// - the namespace was never loaded or never confirmed current here,
+    /// - the request's `max_staleness_seconds` is below the current lag, or
+    /// - the refresher is disabled (`KOSHA_MANIFEST_REFRESH_MS=0`), the
+    ///   pre-#232 check-before-every-search behavior.
+    ///
+    /// A control-plane error never fails a search for a namespace this pod
+    /// has loaded: it keeps serving the last-known-good manifest (DESIGN.md
+    /// §17) and the lag keeps growing. Other errors (an unreadable
+    /// deletion vector for the new version) still fail the request.
+    fn ensure_query_manifest_fresh(
+        &self,
+        ns: &NamespaceId,
+        max_staleness: Option<Duration>,
+    ) -> Result<(), KoshaError> {
+        if self.ingest_host.is_none() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let loaded = self.indexer.manifest_version(ns).is_some();
+        let lag = self.manifest_follow.lag(ns, now);
+        let max_staleness = max_staleness.or(match self.manifest_follow.interval {
+            Some(_) => None,
+            None => Some(Duration::ZERO),
+        });
+        let refresh = match (loaded, lag, max_staleness) {
+            (false, _, _) | (true, None, _) => true,
+            (true, Some(lag), Some(max)) => lag > max,
+            (true, Some(_), None) => false,
+        };
+        if !refresh {
+            return Ok(());
+        }
+        // While the control store is failing, don't make every search wait
+        // out its timeout under the controller lock: serve last-known-good
+        // and let the refresher find out when it is back.
+        let window = self
+            .manifest_follow
+            .interval
+            .unwrap_or(Duration::from_secs(1))
+            .max(Duration::from_millis(100));
+        if loaded && self.manifest_follow.failing_recently(now, window) {
+            return Ok(());
+        }
+        match self.refresh_query_namespace(ns, false) {
+            Ok(()) => {
+                self.manifest_follow.record_poll_ok();
+                Ok(())
             }
-            let mut manifest = self
-                .controller
-                .lock()
-                .unwrap()
-                .manifest_cloned(ns)
-                .ok_or_else(|| KoshaError::NamespaceNotFound(ns.clone()))?;
-            if self
-                .indexer
-                .manifest_version(ns)
-                .is_none_or(|local| local < manifest.version)
-            {
-                kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
-                    let path = vector.path(ns, segment)?;
-                    #[cfg(feature = "s3")]
-                    if let Some(ref s3) = self.s3_storage {
-                        return s3.read(&path);
-                    }
-                    Ok(std::fs::read(self.data_dir.join(path))?)
-                })?;
-                self.indexer.restore_manifest(ns.clone(), manifest);
+            Err(error @ KoshaError::ControlPlane(_)) => {
+                self.manifest_follow
+                    .record_error(&format!("search refresh of '{}'", ns.0), &error);
+                if loaded {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Bring a query replica's manifest for `ns` up to the stored version:
+    /// one cheap version read, then the manifest itself only if it moved.
+    fn refresh_query_namespace(&self, ns: &NamespaceId, warm: bool) -> Result<(), KoshaError> {
+        let observed_at = Instant::now();
+        let stored = self.controller.lock().unwrap().manifest_version(ns)?;
+        match stored {
+            Some(stored) => self.follow_stored_version(ns, stored, observed_at, warm),
+            None => Ok(()),
+        }
+    }
+
+    /// Install the stored manifest for `ns` if `stored` (read at
+    /// `observed_at`) is ahead of the local one. Shared by the per-search
+    /// path and the background refresher.
+    ///
+    /// The swap is `Indexer::restore_manifest`; a search already running
+    /// holds its own `Arc` from `Indexer::manifest_shared` and finishes on
+    /// the manifest it started with. When `warm` and the namespace is in
+    /// `KOSHA_WARMUP_NAMESPACES`, the new version's footers and scoring set
+    /// are fetched before the swap, so the first search on it is not cold.
+    fn follow_stored_version(
+        &self,
+        ns: &NamespaceId,
+        stored: u64,
+        observed_at: Instant,
+        warm: bool,
+    ) -> Result<(), KoshaError> {
+        if self
+            .indexer
+            .manifest_version(ns)
+            .is_some_and(|local| local >= stored)
+        {
+            self.manifest_follow.confirm(ns, stored, observed_at);
+            return Ok(());
+        }
+        self.manifest_follow.note_stored_version(ns, stored);
+        let Some(mut manifest) = self.controller.lock().unwrap().try_manifest_cloned(ns)? else {
+            return Ok(());
+        };
+        let version = manifest.version;
+        if self
+            .indexer
+            .manifest_version(ns)
+            .is_none_or(|local| local < version)
+        {
+            kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
+                let path = vector.path(ns, segment)?;
+                #[cfg(feature = "s3")]
+                if let Some(ref s3) = self.s3_storage {
+                    return s3.read(&path);
+                }
+                Ok(std::fs::read(self.data_dir.join(path))?)
+            })?;
+            if warm {
+                self.prewarm_followed_manifest(ns, &manifest);
+            }
+            self.indexer.restore_manifest(ns.clone(), manifest);
+        }
+        self.manifest_follow.confirm(ns, version, observed_at);
+        Ok(())
+    }
+
+    /// Fetch the scoring set of a manifest about to be installed, for
+    /// namespaces listed in `KOSHA_WARMUP_NAMESPACES` (same probe as boot
+    /// warmup's first phase). Fail-open: a miss only costs the first search
+    /// on the new version some latency.
+    fn prewarm_followed_manifest(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) {
+        #[cfg(feature = "s3")]
+        {
+            if self.s3_storage.is_none() || !self.warmup_namespaces.contains(&ns.0) {
+                return;
+            }
+            let query = warmup_probe_query();
+            let outcome = self.hydrate_segments_for_search(
+                ns,
+                manifest,
+                &query,
+                &RequestHydration::unlimited(),
+            );
+            if outcome.missing.is_empty() && !outcome.bloom_pruned {
+                self.completed_hydrations
+                    .lock()
+                    .unwrap()
+                    .entry((ns.0.clone(), manifest.version))
+                    .or_default()
+                    .merge(false, false);
+            } else {
+                eprintln!(
+                    "warn: manifest refresh: prewarm of '{}' v{} left {} segment(s) cold",
+                    ns.0,
+                    manifest.version,
+                    outcome.missing.len()
+                );
             }
         }
-        Ok(())
+        #[cfg(not(feature = "s3"))]
+        let _ = (ns, manifest);
+    }
+
+    /// Start the query-role manifest refresher (#232). Every
+    /// `KOSHA_MANIFEST_REFRESH_MS` (default 500; `0` disables) it reads every
+    /// namespace's stored version in one query and installs the ones that
+    /// advanced (`follow_stored_version`). The ingest pod never starts it.
+    /// The thread holds only a `Weak` and exits when the state is dropped.
+    fn spawn_manifest_refresher(self: &Arc<Self>) {
+        if self.ingest_host.is_none() {
+            return;
+        }
+        let Some(interval) = self.manifest_follow.interval else {
+            println!(
+                "manifest refresher disabled (KOSHA_MANIFEST_REFRESH_MS=0); \
+                 query pods check the control store before every search"
+            );
+            return;
+        };
+        println!("manifest refresher: every {} ms", interval.as_millis());
+        let weak = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("kosha-manifest-refresher".into())
+            .spawn(move || loop {
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                state.run_manifest_refresh_tick();
+                drop(state);
+                std::thread::sleep(interval);
+            })
+            .expect("failed to spawn manifest refresher thread");
+    }
+
+    /// One refresher pass: a single batched version read, then fetch and
+    /// swap only namespaces whose version moved. Errors leave the
+    /// last-known-good manifests in place.
+    fn run_manifest_refresh_tick(&self) {
+        let observed_at = Instant::now();
+        let versions = self.controller.lock().unwrap().manifest_versions();
+        let versions = match versions {
+            Ok(versions) => versions,
+            Err(error) => {
+                self.manifest_follow.record_error("version poll", &error);
+                return;
+            }
+        };
+        let mut control_plane_ok = true;
+        for (ns, stored) in versions {
+            match self.follow_stored_version(&ns, stored, observed_at, true) {
+                Ok(()) => {}
+                Err(error @ KoshaError::ControlPlane(_)) => {
+                    control_plane_ok = false;
+                    self.manifest_follow
+                        .record_error(&format!("fetch of '{}'", ns.0), &error);
+                }
+                Err(error) => eprintln!(
+                    "warn: manifest refresh: cannot install '{}' v{stored}: {error} — \
+                     serving the previous version",
+                    ns.0
+                ),
+            }
+        }
+        if control_plane_ok {
+            self.manifest_follow.record_poll_ok();
+        }
     }
 
     /// Read the namespace's committed manifest with its deletion vectors
@@ -1843,7 +2014,7 @@ impl AppState {
             .controller
             .lock()
             .unwrap()
-            .manifest_version(ns)
+            .manifest_version(ns)?
             .unwrap_or(0);
         let local = self.indexer.manifest_version(ns).unwrap_or(0);
         manifest.version = manifest.version.max(expected.max(local) + 1);
@@ -3430,6 +3601,34 @@ fn redact_database_url(url: &str) -> String {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+/// The empty probe query boot warmup and the manifest refresher hydrate
+/// with: no terms, filters or kNN, so only the scoring scaffolding
+/// (`footer.json`, `inverted.idx`, `doc_store.offsets`) is fetched.
+#[cfg(any(feature = "s3", test))]
+fn warmup_probe_query() -> kosha_core::SearchQuery {
+    kosha_core::SearchQuery {
+        query_text: String::new(),
+        max_results: 0,
+        bm25_params: kosha_core::Bm25Params { k1: 1.2, b: 0.75 },
+        from: 0,
+        filter: None,
+        sort: Vec::new(),
+        search_after: None,
+        highlight: None,
+        aggs: std::collections::HashMap::new(),
+        wildcard: None,
+        match_phrase: None,
+        knn: None,
+        exact_total_hits: None,
+        total_hits_cap: None,
+        operator: None,
+        no_cache: None,
+        collapse: None,
+        source_includes: None,
+        source_excludes: None,
+    }
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         #[cfg(feature = "migrate")]
@@ -3485,6 +3684,7 @@ fn main() {
     state.spawn_warmup();
     state.spawn_idle_flush_timer();
     state.spawn_compaction_scheduler();
+    state.spawn_manifest_refresher();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     println!("kosha-server role={role} listening on {addr} data_dir={data_dir}");
 
@@ -4505,12 +4705,17 @@ fn handle_stats(state: &AppState) -> String {
             total_docs += ns_docs;
             total_segments += manifest.segments.len();
 
-            namespaces.push(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "namespace": ns.0,
                 "documents": ns_docs,
                 "segments": manifest.segments.len(),
                 "version": manifest.version,
-            }));
+                "manifest_version": manifest.version,
+            });
+            if state.ingest_host.is_some() {
+                add_manifest_follow_stats(state, &ns, &mut entry);
+            }
+            namespaces.push(entry);
         }
         (namespaces, total_docs, total_segments)
     };
@@ -4545,7 +4750,25 @@ fn handle_stats(state: &AppState) -> String {
         "segment_checksum_failures": segment_checksum_failures,
         "s3_bucket": s3_bucket,
         "s3_prefix": s3_prefix,
+        "manifest_refresh": state
+            .ingest_host
+            .is_some()
+            .then(|| state.manifest_follow.summary_json(Instant::now())),
     }))
+}
+
+/// Per-namespace manifest-following fields for a query replica's stats
+/// (#232): the stored version last seen, when the local manifest was last
+/// confirmed current, and how long ago that was (`manifest_lag_seconds`,
+/// `null` if never — e.g. the control plane has been down since boot).
+fn add_manifest_follow_stats(state: &AppState, ns: &NamespaceId, entry: &mut serde_json::Value) {
+    let status = state.manifest_follow.status(ns);
+    let lag = state.manifest_follow.lag(ns, Instant::now());
+    entry["stored_manifest_version"] = serde_json::json!(status.as_ref().map(|s| s.stored_version));
+    entry["last_refresh_at"] = serde_json::json!(status
+        .as_ref()
+        .map(|s| manifest_follow::unix_seconds(s.last_refresh_at)));
+    entry["manifest_lag_seconds"] = serde_json::json!(lag.map(|d| d.as_secs_f64()));
 }
 
 // ─── POST /search (JSON body, supports filters) ─────────────────────────────
@@ -4562,12 +4785,19 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         None => return json_error(400, "missing 'namespace' in search body"),
     };
 
+    // Query replicas only (#232): how stale a manifest this search accepts.
+    let max_staleness =
+        match manifest_follow::parse_max_staleness(body_val.get("max_staleness_seconds")) {
+            Ok(v) => v,
+            Err(e) => return json_error(400, &e),
+        };
+
     let query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
         Ok(q) => q,
         Err(e) => return json_error(400, &format!("invalid search query: {e}")),
     };
 
-    if let Err(e) = state.refresh_query_namespace(&ns) {
+    if let Err(e) = state.ensure_query_manifest_fresh(&ns, max_staleness) {
         return search_error_response(&e);
     }
 
@@ -4993,7 +5223,16 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         source_excludes: None,
     };
 
-    if let Err(e) = state.refresh_query_namespace(&ns) {
+    let max_staleness = match manifest_follow::parse_max_staleness(
+        params
+            .get("max_staleness_seconds")
+            .map(|v| serde_json::Value::String(v.clone()))
+            .as_ref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &e),
+    };
+    if let Err(e) = state.ensure_query_manifest_fresh(&ns, max_staleness) {
         return search_error_response(&e);
     }
 
@@ -5214,12 +5453,17 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
         None => return json_error(404, &format!("namespace '{namespace}' not found")),
     };
     let ns_docs: u64 = manifest.segments.iter().map(|s| s.doc_count as u64).sum();
-    json_ok(&serde_json::json!({
+    let mut body = serde_json::json!({
         "namespace": namespace,
         "documents": ns_docs,
         "segments": manifest.segments.len(),
         "version": manifest.version,
-    }))
+        "manifest_version": manifest.version,
+    });
+    if state.ingest_host.is_some() {
+        add_manifest_follow_stats(state, &NamespaceId(scoped_ns), &mut body);
+    }
+    json_ok(&body)
 }
 
 /// POST /v1/admin/rebuild-filter-blooms — rewrite footer blooms from segment files.
@@ -6275,6 +6519,7 @@ fn log_search_timing(
 fn search_error_response(e: &KoshaError) -> String {
     match e {
         KoshaError::Overloaded(_) => json_error(429, &format!("search overloaded: {e}")),
+        KoshaError::ControlPlane(_) => json_error(503, &format!("search unavailable: {e}")),
         _ => json_error(500, &format!("search error: {e}")),
     }
 }
@@ -6413,7 +6658,7 @@ mod tests {
         fn manifest_cloned(&self, id: &NamespaceId) -> Option<kosha_core::Manifest> {
             self.inner.lock().unwrap().manifest(id).cloned()
         }
-        fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
+        fn manifest_version(&self, id: &NamespaceId) -> Result<Option<u64>, KoshaError> {
             let mut inner = self.inner.lock().unwrap();
             let version = inner.manifest(id).map(|manifest| manifest.version);
             if let Some(racing) = self.commit_on_next_version_read.lock().unwrap().take() {
@@ -6421,7 +6666,7 @@ mod tests {
                     .compare_and_swap_manifest(id, version.unwrap_or(0), racing)
                     .unwrap();
             }
-            version
+            Ok(version)
         }
         fn save_manifest(
             &mut self,
@@ -6635,6 +6880,331 @@ mod tests {
             lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             commit_on_next_version_read: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// A control store that can be taken down: version reads, the batched
+    /// poll and manifest fetches fail with `ControlPlane` while `down`, the
+    /// way `PgStore` reports an unreachable Postgres (#232).
+    #[derive(Clone)]
+    struct OutageStore {
+        inner: SharedManifestStore,
+        down: Arc<std::sync::atomic::AtomicBool>,
+        reads: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl OutageStore {
+        fn check(&self) -> Result<(), KoshaError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(KoshaError::ControlPlane("injected outage".into()));
+            }
+            Ok(())
+        }
+    }
+    impl ControlStore for OutageStore {
+        fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
+            self.inner.create_namespace(id)
+        }
+        fn ensure_namespace(&mut self, id: NamespaceId) {
+            self.inner.ensure_namespace(id);
+        }
+        fn has_namespace(&self, id: &NamespaceId) -> bool {
+            self.inner.has_namespace(id)
+        }
+        fn manifest(&self, _: &NamespaceId) -> Option<&kosha_core::Manifest> {
+            None
+        }
+        fn manifest_mut(&mut self, _: &NamespaceId) -> Option<&mut kosha_core::Manifest> {
+            None
+        }
+        fn manifest_cloned(&self, id: &NamespaceId) -> Option<kosha_core::Manifest> {
+            self.try_manifest_cloned(id).ok().flatten()
+        }
+        fn try_manifest_cloned(
+            &self,
+            id: &NamespaceId,
+        ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
+            self.check()?;
+            Ok(self.inner.manifest_cloned(id))
+        }
+        fn manifest_version(&self, id: &NamespaceId) -> Result<Option<u64>, KoshaError> {
+            self.check()?;
+            self.inner.manifest_version(id)
+        }
+        fn manifest_versions(&self) -> Result<Vec<(NamespaceId, u64)>, KoshaError> {
+            self.check()?;
+            self.inner.inner.lock().unwrap().manifest_versions()
+        }
+        fn save_manifest(
+            &mut self,
+            id: &NamespaceId,
+            manifest: &kosha_core::Manifest,
+        ) -> Result<(), KoshaError> {
+            self.inner.save_manifest(id, manifest)
+        }
+        fn compare_and_swap_manifest(
+            &mut self,
+            id: &NamespaceId,
+            expected: u64,
+            manifest: kosha_core::Manifest,
+        ) -> Result<(), KoshaError> {
+            self.inner.compare_and_swap_manifest(id, expected, manifest)
+        }
+        fn list_namespaces(&self) -> Vec<NamespaceId> {
+            self.inner.list_namespaces()
+        }
+        fn namespace_count(&self) -> usize {
+            self.inner.namespace_count()
+        }
+    }
+
+    fn outage_store() -> OutageStore {
+        OutageStore {
+            inner: shared_store(),
+            down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// An ingest state and a separate query-role state over one shared
+    /// control store and data directory (standing in for S3).
+    fn ingest_and_query(store: &OutageStore, refresh: Option<Duration>) -> (AppState, AppState) {
+        let ingest = test_state();
+        *ingest.controller.lock().unwrap() = Box::new(store.clone());
+        let mut query = AppState::new(ingest.data_dir.clone());
+        query.ingest_host = Some("http://ingest.invalid".into());
+        query.manifest_follow = manifest_follow::ManifestFollow::new(refresh);
+        *query.controller.lock().unwrap() = Box::new(store.clone());
+        (ingest, query)
+    }
+
+    fn index_text_and_publish(state: &AppState, ns: &NamespaceId, ids: &[&str]) {
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                ids.iter()
+                    .map(|id| Document {
+                        id: DocumentId((*id).into()),
+                        fields: vec![Field::text("text", "hello follower")],
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        state.indexer.flush_namespace(ns).unwrap();
+        state.publish_namespace(ns).unwrap();
+    }
+
+    fn total_hits(response: &str) -> u64 {
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = &response[response.find("\r\n\r\n").unwrap() + 4..];
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        value["total_hits"].as_u64().unwrap()
+    }
+
+    fn stats_json(state: &AppState) -> serde_json::Value {
+        let response = handle_stats(state);
+        serde_json::from_str(&response[response.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+    }
+
+    /// #232 acceptance (a): docs indexed and flushed through the ingest pod
+    /// become searchable on a separate query-role pod within the refresh
+    /// interval — no restart, and no control-store read on the search path.
+    #[test]
+    fn query_replica_follows_ingest_publishes_without_restart() {
+        let store = outage_store();
+        let ns = NamespaceId("tenant/follow".into());
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_millis(20)));
+        index_text_and_publish(&ingest, &ns, &["a"]);
+        let query = Arc::new(query);
+        query.spawn_manifest_refresher();
+        let search = br#"{"namespace":"tenant/follow","query_text":"hello"}"#;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while query.indexer.manifest_version(&ns).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "refresher never loaded the namespace"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+
+        index_text_and_publish(&ingest, &ns, &["b", "c"]);
+        let published = ingest.indexer.manifest_version(&ns).unwrap();
+        let start = Instant::now();
+        while query.indexer.manifest_version(&ns) != Some(published) {
+            assert!(Instant::now() < deadline, "refresher never caught up");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Generous bound for CI noise; the cadence is 20 ms.
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let reads = store.reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 3);
+        // Searches inside the staleness bound do not touch the control store
+        // (the refresher may have polled meanwhile, hence `<=` on the delta).
+        let polls_meanwhile = store.reads.load(std::sync::atomic::Ordering::SeqCst) - reads;
+        assert!(polls_meanwhile <= 3, "{polls_meanwhile}");
+
+        let stats = stats_json(&query);
+        let entry = stats["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["namespace"] == "tenant/follow")
+            .unwrap()
+            .clone();
+        assert_eq!(entry["manifest_version"], published);
+        assert!(entry["last_refresh_at"].as_f64().unwrap() > 0.0);
+        assert!(entry["manifest_lag_seconds"].as_f64().unwrap() < 5.0);
+        assert_eq!(stats["manifest_refresh"]["enabled"], true);
+        assert_eq!(stats["manifest_refresh"]["interval_ms"], 20);
+        // The ingest pod's stats carry no follower block.
+        assert!(stats_json(&ingest)["manifest_refresh"].is_null());
+    }
+
+    /// #232: `max_staleness_seconds` forces a synchronous refresh when the
+    /// last confirmation is older than the bound; without it a search on a
+    /// confirmed namespace serves the local manifest (the refresher's job).
+    #[test]
+    fn max_staleness_knob_refreshes_synchronously() {
+        let store = outage_store();
+        let ns = NamespaceId("tenant/knob".into());
+        // A refresher is configured but not running: only searches refresh.
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_secs(3600)));
+        index_text_and_publish(&ingest, &ns, &["a"]);
+        let search = br#"{"namespace":"tenant/knob","query_text":"hello"}"#;
+        // Never loaded → synchronous load.
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+        index_text_and_publish(&ingest, &ns, &["b"]);
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+        let loose =
+            br#"{"namespace":"tenant/knob","query_text":"hello","max_staleness_seconds":3600}"#;
+        assert_eq!(total_hits(&handle_search_post(loose, &query)), 1);
+        let strict =
+            br#"{"namespace":"tenant/knob","query_text":"hello","max_staleness_seconds":0}"#;
+        assert_eq!(total_hits(&handle_search_post(strict, &query)), 2);
+        let bad = br#"{"namespace":"tenant/knob","query_text":"hello","max_staleness_seconds":-1}"#;
+        assert!(handle_search_post(bad, &query).starts_with("HTTP/1.1 400"));
+        // The GET route takes it as a query parameter.
+        index_text_and_publish(&ingest, &ns, &["c"]);
+        let get = handle_search_get(
+            "GET /search?ns=tenant/knob&q=hello&max_staleness_seconds=0 HTTP/1.1",
+            &query,
+        );
+        assert_eq!(total_hits(&get), 3);
+    }
+
+    /// #232 acceptance (b): a search that took its manifest snapshot before
+    /// a swap completes against that snapshot.
+    #[test]
+    fn snapshot_taken_before_swap_survives_it() {
+        let store = outage_store();
+        let ns = NamespaceId("tenant/snap".into());
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_millis(20)));
+        index_text_and_publish(&ingest, &ns, &["a"]);
+        query.run_manifest_refresh_tick();
+        let snapshot = query.indexer.manifest_shared(&ns).unwrap();
+        let before = snapshot.version;
+
+        index_text_and_publish(&ingest, &ns, &["b", "c"]);
+        query.run_manifest_refresh_tick();
+        let current = query.indexer.manifest_shared(&ns).unwrap();
+        assert!(current.version > before);
+        assert_eq!(snapshot.version, before, "the held snapshot never changes");
+        assert_eq!(snapshot.segments.len(), 1);
+
+        let mut probe = warmup_probe_query();
+        probe.query_text = "hello".into();
+        probe.max_results = 10;
+        let old = query
+            .searcher
+            .search(&ns, &snapshot, &probe, Some(&snapshot.tombstones))
+            .unwrap();
+        assert_eq!(old.total_hits, 1, "in-flight search sees its own snapshot");
+        let new = query
+            .searcher
+            .search(&ns, &current, &probe, Some(&current.tombstones))
+            .unwrap();
+        assert_eq!(new.total_hits, 3);
+    }
+
+    /// #232 acceptance (c): with the control plane down, searches keep
+    /// succeeding on the last-known-good manifest (even ones asking for
+    /// strict freshness), the lag metric grows and errors are counted; the
+    /// pod catches up once the store is back. A namespace never loaded
+    /// still fails, with 503.
+    #[test]
+    fn control_plane_outage_serves_last_known_good_and_lag_grows() {
+        let store = outage_store();
+        let ns = NamespaceId("tenant/outage".into());
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_millis(20)));
+        index_text_and_publish(&ingest, &ns, &["a"]);
+        query.run_manifest_refresh_tick();
+        let search = br#"{"namespace":"tenant/outage","query_text":"hello"}"#;
+        let strict =
+            br#"{"namespace":"tenant/outage","query_text":"hello","max_staleness_seconds":0}"#;
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+
+        store.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        index_text_and_publish(&ingest, &ns, &["b"]);
+        query.run_manifest_refresh_tick();
+        let lag_of = |state: &AppState| {
+            stats_json(state)["namespaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["namespace"] == "tenant/outage")
+                .unwrap()["manifest_lag_seconds"]
+                .as_f64()
+                .unwrap()
+        };
+        let lag_early = lag_of(&query);
+        std::thread::sleep(Duration::from_millis(60));
+        query.run_manifest_refresh_tick();
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+        assert_eq!(total_hits(&handle_search_post(strict, &query)), 1);
+        let lag_late = lag_of(&query);
+        assert!(lag_late >= lag_early + 0.05, "{lag_early} -> {lag_late}");
+        let summary = stats_json(&query)["manifest_refresh"].clone();
+        assert!(summary["control_plane_errors_total"].as_u64().unwrap() >= 2);
+        assert!(summary["consecutive_errors"].as_u64().unwrap() >= 2);
+        assert!(summary["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("injected outage"));
+        assert!(summary["max_manifest_lag_seconds"].as_f64().unwrap() >= lag_late);
+
+        // Never loaded here: nothing to fall back on.
+        let unknown = br#"{"namespace":"tenant/never","query_text":"hello"}"#;
+        let failed = handle_search_post(unknown, &query);
+        assert!(failed.starts_with("HTTP/1.1 503"), "{failed}");
+
+        store.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        query.run_manifest_refresh_tick();
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 2);
+        assert!(lag_of(&query) < lag_late);
+        assert_eq!(
+            stats_json(&query)["manifest_refresh"]["consecutive_errors"],
+            0
+        );
+    }
+
+    /// `KOSHA_MANIFEST_REFRESH_MS=0`: no refresher, so every search checks
+    /// the control store (the pre-#232 behavior) — and an outage still
+    /// serves last-known-good.
+    #[test]
+    fn disabled_refresher_checks_before_every_search() {
+        let store = outage_store();
+        let ns = NamespaceId("tenant/sync".into());
+        let (ingest, query) = ingest_and_query(&store, None);
+        index_text_and_publish(&ingest, &ns, &["a"]);
+        let search = br#"{"namespace":"tenant/sync","query_text":"hello"}"#;
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+        index_text_and_publish(&ingest, &ns, &["b"]);
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 2);
+        store.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 2);
+        // Spawning is a no-op when disabled.
+        Arc::new(query).spawn_manifest_refresher();
     }
 
     fn write_and_flush(state: &AppState, ns: &NamespaceId, id: &str) {
@@ -6997,7 +7567,9 @@ mod tests {
             .unwrap()
             .save_manifest(&ns, &copy_manifest())
             .unwrap();
-        let search = br#"{"namespace":"tenant/ns","query_text":"hello"}"#;
+        // Strict freshness: no refresher runs in this test, so every search
+        // must re-check the control store (#232's `max_staleness_seconds`).
+        let search = br#"{"namespace":"tenant/ns","query_text":"hello","max_staleness_seconds":0}"#;
         assert!(handle_search_post(search, &query).contains("\"total_hits\":1"));
         let response = handle_delete(
             br#"{"namespace":"tenant/ns","filter":{"match_all":{}}}"#,
