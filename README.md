@@ -61,6 +61,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 - S3 as the source of truth; any S3-compatible endpoint works (MinIO locally, path-style supported).
 - Local NVMe read-through cache, size-bounded with LRU eviction.
 - Lazy segment loading — the doc store, filter columns, and postings are read on demand, with ranged GETs for doc-store pages instead of whole-blob fetches.
+- A segment whose `doc_store.offsets` sidecar is missing from S3, or fails the reader's sanity check, is still searchable: the query pod fetches that segment's `doc_store.bin` instead, logs a WARN naming the segment, and counts it in `doc_store_offsets_fallbacks` on `GET /v1/stats`. Repair such segments with `POST /v1/admin/backfill-offset-tables` so cold queries stop paying for the full doc store.
 - In-memory parsed-segment cache governed by a live-bytes ledger and an admission gate, with a per-request hydration byte budget and bounded hydration concurrency.
 - Posting-blob presence cache, postings cache, and vector-postings cache.
 - Whole-response result cache for `POST /search` (bypassable per query with `no_cache`).

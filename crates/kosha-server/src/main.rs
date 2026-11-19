@@ -24,6 +24,8 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 
 mod auth;
 mod compaction_sched;
+#[cfg(all(test, feature = "s3"))]
+mod doc_store_fallback_tests;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 #[cfg(feature = "migrate")]
@@ -59,6 +61,12 @@ struct AppState {
     /// (#231), counting refetch failures again. Reported in `/stats`.
     #[cfg(feature = "s3")]
     segment_checksum_failures: std::sync::atomic::AtomicU64,
+    /// Lazy segments whose `doc_store.offsets` was missing from S3 or
+    /// rejected by the reader, so a search fetched `doc_store.bin` instead
+    /// (#179, #184). Each one should be repaired with
+    /// `POST /v1/admin/backfill-offset-tables`. Reported in `/stats`.
+    #[cfg(feature = "s3")]
+    doc_store_fallbacks: std::sync::atomic::AtomicU64,
     indexer: Indexer,
     searcher: Searcher,
     /// Local segment / SSD cache root (`KOSHA_DATA_DIR`). Never authoritative
@@ -1239,6 +1247,8 @@ impl AppState {
             publication_locks: Mutex::new(HashMap::new()),
             #[cfg(feature = "s3")]
             segment_checksum_failures: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "s3")]
+            doc_store_fallbacks: std::sync::atomic::AtomicU64::new(0),
             indexer,
             searcher,
             data_dir,
@@ -2615,12 +2625,6 @@ impl AppState {
             .iter()
             .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
             .collect();
-        let paths_with_manifest_footer: std::collections::HashSet<PathBuf> = manifest
-            .segments
-            .iter()
-            .filter(|entry| manifest.segment_footer(&entry.segment_id).is_some())
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
-            .collect();
 
         let missing_manifest_footer_paths: Vec<PathBuf> = manifest
             .segments
@@ -2692,6 +2696,22 @@ impl AppState {
                 .remember_segment_footers(ns, fetched_footers.values().cloned());
         }
 
+        // Path -> the segment's footer, borrowed: the manifest's cached copy,
+        // else the one just parsed from local footer.json. Having one means
+        // footer.json need not be (re)fetched or re-parsed. It does NOT mean
+        // the writer emitted a doc_store.offsets sidecar (#179/#184) - see
+        // `segment_is_lazy_capable`.
+        let manifest_footers: HashMap<PathBuf, &kosha_core::Footer> = manifest
+            .segments
+            .iter()
+            .filter_map(|entry| {
+                manifest
+                    .segment_footer(&entry.segment_id)
+                    .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref))
+                    .map(|footer| (self.data_dir.join(&ns.0).join(&entry.segment_id.0), footer))
+            })
+            .collect();
+
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
             if needs_bloom_check {
@@ -2718,7 +2738,7 @@ impl AppState {
             &to_hydrate,
             needs_vectors,
             needs_filters,
-            &paths_with_manifest_footer,
+            &manifest_footers,
             request,
         );
         let postings_outcome = self.ensure_posting_blobs_local(
@@ -2758,14 +2778,25 @@ impl AppState {
     /// Contrast [`AppState::REQUIRED_SEGMENT_FILES`] / `segment_is_complete`,
     /// which is the *full* set used by the compaction/merge path (those read
     /// every document and must have `doc_store.bin`).
+    ///
+    /// `manifest_footer` is the manifest's cached footer for the segment, if
+    /// it has one: with it, `footer.json` need not be local.
+    ///
+    /// Doc-store access is satisfied by `doc_store.bin`, or by a
+    /// `doc_store.offsets` whose header agrees with the footer the reader
+    /// will use. A sidecar the reader would reject is not enough on its own:
+    /// the reader then falls back to `doc_store.bin`, and if that was never
+    /// hydrated the search fails with "No such file or directory" (#184).
+    /// Counting such a segment incomplete sends it back through
+    /// `ensure_scoring_files_local`, which fetches the bulk file.
     #[cfg(feature = "s3")]
     fn segment_is_scoring_complete(
         seg_path: &Path,
         needs_vectors: bool,
         needs_filters: bool,
-        has_manifest_footer: bool,
+        manifest_footer: Option<&kosha_core::Footer>,
     ) -> bool {
-        if !has_manifest_footer && !file_present_nonempty(&seg_path.join("footer.json")) {
+        if manifest_footer.is_none() && !file_present_nonempty(&seg_path.join("footer.json")) {
             return false;
         }
         if !file_present_nonempty(&seg_path.join("inverted.idx")) {
@@ -2774,8 +2805,9 @@ impl AppState {
         if needs_filters && !file_present_nonempty(&seg_path.join("filters.bin")) {
             return false;
         }
-        let doc_access_ok = file_present_nonempty(&seg_path.join("doc_store.offsets"))
-            || file_present_nonempty(&seg_path.join("doc_store.bin"));
+        let doc_access_ok = file_present_nonempty(&seg_path.join("doc_store.bin"))
+            || (file_present_nonempty(&seg_path.join("doc_store.offsets"))
+                && kosha_segment::doc_store_offsets_plausible(seg_path, manifest_footer));
         if !doc_access_ok {
             return false;
         }
@@ -2816,7 +2848,7 @@ impl AppState {
         seg_paths: &[PathBuf],
         needs_vectors: bool,
         needs_filters: bool,
-        paths_with_manifest_footer: &std::collections::HashSet<PathBuf>,
+        manifest_footers: &HashMap<PathBuf, &kosha_core::Footer>,
         request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
         let Some(ref s3) = self.s3_storage else {
@@ -2829,7 +2861,7 @@ impl AppState {
                 p,
                 needs_vectors,
                 needs_filters,
-                paths_with_manifest_footer.contains(p),
+                manifest_footers.get(p).copied(),
             )
         });
 
@@ -2850,6 +2882,11 @@ impl AppState {
             // instead bounded by `hydration_budget`, from each response's
             // `Content-Length` — see the `hydrate_byte_budget` field docs.
             let mut logical_paths: Vec<(String, u64)> = Vec::new();
+            // Segments sent to score with only their offsets sidecar. Each
+            // is checked after the fetch below: a sidecar that is missing
+            // from S3 or that the reader would reject falls back to
+            // `doc_store.bin` (#179, #184).
+            let mut lazy_segments: Vec<&PathBuf> = Vec::new();
             for (seg_path, _) in &owned {
                 let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
                     continue;
@@ -2858,7 +2895,7 @@ impl AppState {
 
                 // `footer.json` is needed only for legacy manifests that do
                 // not carry a footer snapshot.
-                if !paths_with_manifest_footer.contains(seg_path)
+                if !manifest_footers.contains_key(seg_path)
                     && !file_present_nonempty(&seg_path.join("footer.json"))
                 {
                     logical_paths.push((format!("{s3_prefix}/footer.json"), 0));
@@ -2872,24 +2909,28 @@ impl AppState {
 
                 // doc_store: Lazy segments need only the offsets sidecar;
                 // legacy (format_version 0) segments need the full
-                // doc_store.bin because eager open parses it. Decide via the
-                // already-local footer's format_version. NOTE: compare
-                // against 1 — the version that introduced the offsets
-                // sidecar — not SEGMENT_FORMAT_VERSION, which moves with
-                // every format change (it's already 2 for the lazy inverted
-                // index) and would misclassify every v1 segment as legacy,
-                // silently re-fetching all their doc stores.
+                // doc_store.bin because eager open parses it. See
+                // `segment_is_lazy_capable` for how that is decided and
+                // what it used to get wrong.
                 let has_offsets = file_present_nonempty(&seg_path.join("doc_store.offsets"));
+                let has_doc_store = file_present_nonempty(&seg_path.join("doc_store.bin"));
                 let lazy_capable = has_offsets
-                    || paths_with_manifest_footer.contains(seg_path)
-                    || SegmentReader::read_footer(seg_path)
-                        .map(|ft| ft.format_version >= 1)
-                        .unwrap_or(false);
+                    || segment_is_lazy_capable(
+                        manifest_footers.get(seg_path).map(|f| f.format_version),
+                        || {
+                            SegmentReader::read_footer(seg_path)
+                                .ok()
+                                .map(|ft| ft.format_version)
+                        },
+                    );
                 if lazy_capable {
                     if !has_offsets {
                         logical_paths.push((format!("{s3_prefix}/doc_store.offsets"), 0));
                     }
-                } else if !file_present_nonempty(&seg_path.join("doc_store.bin")) {
+                    if !has_doc_store {
+                        lazy_segments.push(seg_path);
+                    }
+                } else if !has_doc_store {
                     logical_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
                 }
 
@@ -2944,6 +2985,76 @@ impl AppState {
                 }
             }
 
+            // Doc-store fallback (#179, #184). A Lazy segment goes to
+            // scoring with only `doc_store.offsets`; `doc_store.bin` is
+            // deferred to page materialize. That is only safe if the reader
+            // will actually use the sidecar. Two ways it won't:
+            //
+            // * The sidecar is not in S3 (a partial upload, or a legacy
+            //   segment whose manifest footer claimed otherwise), or the GET
+            //   failed. The segment would reach scoring with neither
+            //   doc-store file, the one state the reader can't open, and the
+            //   whole search used to 503 with "segment hydration failed".
+            // * The sidecar is there but fails the reader's sanity check
+            //   (doc-count mismatch, truncation). The reader falls back to
+            //   parsing `doc_store.bin`, which was never fetched, and the
+            //   search used to 500 with "No such file or directory".
+            //
+            // Either way, fetch `doc_store.bin` for that segment and serve
+            // the search. It is the expensive path, and it self-heals: once
+            // the bulk file is local, later queries are served from disk.
+            // `footer.json` comes along for a rejected sidecar so the reader
+            // can check the manifest's cached footer against the segment's
+            // own (see `kosha_segment::doc_store_opens_lazily`).
+            let mut fallback_paths: Vec<(String, u64)> = Vec::new();
+            // A shed request skipped its fetches on purpose; its sidecars
+            // are absent because nothing asked for them, and it must not
+            // go on to pull bulk doc stores either.
+            let lazy_segments = if request.is_shed() {
+                Vec::new()
+            } else {
+                lazy_segments
+            };
+            for seg_path in lazy_segments {
+                let manifest_footer = manifest_footers.get(seg_path).copied();
+                let Some(reason) = doc_store_fallback_reason(seg_path, manifest_footer) else {
+                    continue;
+                };
+                let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
+                    continue;
+                };
+                let s3_prefix = rel_path.to_string_lossy().into_owned();
+                eprintln!(
+                    "WARN: segment {s3_prefix}: {}; falling back to the eager doc_store.bin path \
+                     for this search. Repair the sidecar with \
+                     POST /v1/admin/backfill-offset-tables, otherwise every cold query on this \
+                     segment pays for the full doc store.",
+                    reason.describe()
+                );
+                self.doc_store_fallbacks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                fallback_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
+                if reason == DocStoreFallbackReason::Rejected
+                    && !file_present_nonempty(&seg_path.join("footer.json"))
+                {
+                    fallback_paths.push((format!("{s3_prefix}/footer.json"), 0));
+                }
+            }
+            if !fallback_paths.is_empty() {
+                self.hydrate_files(
+                    s3,
+                    &fallback_paths,
+                    self.scoring_hydrate_concurrency,
+                    request,
+                );
+                for (path, _) in &fallback_paths {
+                    if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
+                        outcome.files_fetched += 1;
+                        outcome.bytes_fetched += m.len();
+                    }
+                }
+            }
+
             drop(_permit);
             complete_owned(&self.in_flight_segments, &owned);
         }
@@ -2957,7 +3068,7 @@ impl AppState {
                     p,
                     needs_vectors,
                     needs_filters,
-                    paths_with_manifest_footer.contains(*p),
+                    manifest_footers.get(*p).copied(),
                 )
             })
             .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
@@ -3258,6 +3369,84 @@ fn verify_fetched_against_commit(data_dir: &Path, fetched: &[(String, u64)]) -> 
 fn env_flag_default_on(raw: Option<&str>) -> bool {
     raw.map(|v| !matches!(v.trim(), "0" | "false" | "off"))
         .unwrap_or(true)
+}
+
+/// Whether hydration should fetch a segment's `doc_store.offsets` sidecar
+/// (Lazy open) or its full `doc_store.bin` (legacy eager open), for a
+/// segment with no sidecar on local disk yet.
+///
+/// The sidecar arrived with `Footer::format_version` 1, so the version is
+/// the signal. Compare against 1, not `SEGMENT_FORMAT_VERSION`: that
+/// constant moves with every format change (already 2 for the lazy inverted
+/// index) and would misclassify every v1 segment as legacy, re-fetching all
+/// their doc stores.
+///
+/// `manifest_format_version` comes from the manifest's cached footer, when
+/// it has one. It counts only when it is genuinely present, i.e. at least 1:
+/// `format_version` is `#[serde(default)]`, so a footer that never carried
+/// the field reads as 0, which here means "unknown", not a claim. Unknown
+/// falls through to the segment's own `footer.json` (`disk_format_version`,
+/// read only when needed), and with no answer there either, to legacy.
+/// Guessing legacy wrongly costs one `doc_store.bin` fetch; guessing Lazy
+/// wrongly used to cost the request.
+///
+/// This used to treat *the presence* of a manifest footer as proof of a
+/// sidecar. Manifests cache a footer for every segment they list, legacy
+/// ones included, so legacy segments were sent chasing a `doc_store.offsets`
+/// that was never written (#179, #184). Even when the manifest claims a
+/// sidecar and is wrong, `ensure_scoring_files_local` now falls back to
+/// `doc_store.bin` instead of failing.
+#[cfg(feature = "s3")]
+fn segment_is_lazy_capable(
+    manifest_format_version: Option<u32>,
+    disk_format_version: impl FnOnce() -> Option<u32>,
+) -> bool {
+    match manifest_format_version.filter(|&v| v >= 1) {
+        Some(_) => true,
+        None => disk_format_version().is_some_and(|v| v >= 1),
+    }
+}
+
+/// Why a segment classified Lazy cannot be scored from its sidecar alone.
+#[cfg(feature = "s3")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocStoreFallbackReason {
+    /// `doc_store.offsets` is not on local disk after hydration: absent
+    /// from S3, or the GET failed.
+    Missing,
+    /// `doc_store.offsets` is local but the reader would reject it.
+    Rejected,
+}
+
+#[cfg(feature = "s3")]
+impl DocStoreFallbackReason {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Missing => "doc_store.offsets could not be fetched from S3",
+            Self::Rejected => "doc_store.offsets failed the reader's sanity check",
+        }
+    }
+}
+
+/// Whether a segment that hydrated as Lazy must also fetch `doc_store.bin`
+/// before it can be opened, and why. `None` when `doc_store.bin` is already
+/// local or the reader will open the sidecar. See the fallback in
+/// `AppState::ensure_scoring_files_local`.
+#[cfg(feature = "s3")]
+fn doc_store_fallback_reason(
+    seg_path: &Path,
+    manifest_footer: Option<&kosha_core::Footer>,
+) -> Option<DocStoreFallbackReason> {
+    if file_present_nonempty(&seg_path.join("doc_store.bin")) {
+        return None;
+    }
+    if !file_present_nonempty(&seg_path.join("doc_store.offsets")) {
+        return Some(DocStoreFallbackReason::Missing);
+    }
+    if !kosha_segment::doc_store_opens_lazily(seg_path, manifest_footer) {
+        return Some(DocStoreFallbackReason::Rejected);
+    }
+    None
 }
 
 /// Redact the password portion of a Postgres URL for logs.
@@ -4578,6 +4767,12 @@ fn handle_stats(state: &AppState) -> String {
         .load(std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "s3"))]
     let segment_checksum_failures = 0u64;
+    #[cfg(feature = "s3")]
+    let doc_store_offsets_fallbacks = state
+        .doc_store_fallbacks
+        .load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "s3"))]
+    let doc_store_offsets_fallbacks = 0u64;
 
     json_ok(&serde_json::json!({
         "total_documents": total_docs,
@@ -4588,6 +4783,7 @@ fn handle_stats(state: &AppState) -> String {
         "cache_size_bytes": state.cache.total_size(),
         "s3_enabled": s3_enabled,
         "segment_checksum_failures": segment_checksum_failures,
+        "doc_store_offsets_fallbacks": doc_store_offsets_fallbacks,
         "s3_bucket": s3_bucket,
         "s3_prefix": s3_prefix,
     }))
@@ -7932,6 +8128,157 @@ mod tests {
         assert!(chunk_by_byte_budget(&[], 100).is_empty());
     }
 
+    fn test_footer(id: &str, docs: u32, format_version: u32) -> kosha_core::Footer {
+        kosha_core::Footer {
+            segment_id: kosha_core::SegmentId(id.into()),
+            doc_count: docs,
+            total_field_length: docs as u64 * 7,
+            avg_field_length: 7.0,
+            bm25_params: kosha_core::Bm25Params::default(),
+            created_at: "2026-08-11T00:00:00Z".into(),
+            filter_blooms: None,
+            term_bloom: None,
+            format_version,
+            text_filter_ignore_above: None,
+            doc_vectors: false,
+        }
+    }
+
+    /// #179/#184's misclassification. Manifests cache a footer for every
+    /// segment they list, legacy ones included, so "the manifest has a
+    /// footer" says nothing about whether a `doc_store.offsets` exists.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn manifest_footer_presence_alone_does_not_make_a_segment_lazy_capable() {
+        let disk = |v: Option<u32>| move || v;
+        assert!(
+            !segment_is_lazy_capable(Some(0), disk(None)),
+            "format_version 0 (or absent, which reads as 0) is no claim of a sidecar"
+        );
+        assert!(
+            segment_is_lazy_capable(Some(1), disk(None)),
+            "1 introduced it"
+        );
+        assert!(
+            segment_is_lazy_capable(Some(2), disk(None)),
+            "later versions keep it"
+        );
+        assert!(
+            segment_is_lazy_capable(Some(0), disk(Some(2))),
+            "an unknown manifest version defers to the segment's own footer.json"
+        );
+        assert!(
+            !segment_is_lazy_capable(Some(0), disk(Some(0))),
+            "both legacy: eager"
+        );
+        assert!(segment_is_lazy_capable(None, disk(Some(1))));
+        assert!(
+            !segment_is_lazy_capable(None, disk(None)),
+            "no footer anywhere: assume legacy and fetch doc_store.bin"
+        );
+        // The disk footer is not read when the manifest already answers.
+        assert!(segment_is_lazy_capable(Some(2), || -> Option<u32> {
+            panic!("footer.json must not be read")
+        }));
+    }
+
+    /// `format_version` is `#[serde(default)]`: a footer that never carried
+    /// it must deserialize as 0, which the classifier treats as unknown. A
+    /// legacy footer must never come back claiming the current version.
+    #[test]
+    fn legacy_footer_json_without_format_version_stays_unversioned() {
+        let legacy = r#"{"segment_id":"paragraph_index_hnsw-000958","doc_count":1,
+            "total_field_length":38,"avg_field_length":38.0,
+            "bm25_params":{"k1":1.2,"b":0.75},"created_at":"2026-07-31T11:17:57Z"}"#;
+        let footer: kosha_core::Footer = serde_json::from_str(legacy).unwrap();
+        assert_eq!(footer.format_version, 0);
+        // A manifest row written before #241 inlined footers the same way.
+        let manifest: kosha_core::Manifest = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "segments": [{"segment_id": "paragraph_index_hnsw-000958", "doc_count": 1}],
+            "segment_footers": {
+                "paragraph_index_hnsw-000958": serde_json::from_str::<serde_json::Value>(legacy).unwrap()
+            }
+        }))
+        .unwrap();
+        let cached = manifest
+            .segment_footer(&kosha_core::SegmentId("paragraph_index_hnsw-000958".into()))
+            .unwrap();
+        assert_eq!(cached.format_version, 0);
+        #[cfg(feature = "s3")]
+        assert!(!segment_is_lazy_capable(
+            Some(cached.format_version),
+            || None
+        ));
+    }
+
+    /// The fallback trigger: which Lazy segments must also fetch
+    /// `doc_store.bin`, and why.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn doc_store_fallback_reason_covers_missing_and_rejected_sidecars() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-fallback-reason-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut writer =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("seg".into()), dir.clone());
+        for i in 0..3 {
+            writer.add_document(
+                DocumentId(format!("d{i}")),
+                vec![Field::text("text", "hello")],
+            );
+        }
+        let footer = writer.finalize(kosha_core::Bm25Params::default()).unwrap();
+        let bin = fs::read(dir.join("doc_store.bin")).unwrap();
+        let offsets = fs::read(dir.join("doc_store.offsets")).unwrap();
+
+        fs::remove_file(dir.join("doc_store.bin")).unwrap();
+        assert_eq!(doc_store_fallback_reason(&dir, Some(&footer)), None);
+
+        let mut stale = footer.clone();
+        stale.doc_count = 6;
+        fs::remove_file(dir.join("footer.json")).unwrap();
+        assert_eq!(
+            doc_store_fallback_reason(&dir, Some(&stale)),
+            Some(DocStoreFallbackReason::Rejected),
+            "a stale manifest count with no footer.json to check against is rejected"
+        );
+        fs::write(
+            dir.join("footer.json"),
+            serde_json::to_vec(&footer).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc_store_fallback_reason(&dir, Some(&stale)),
+            None,
+            "the segment's own footer.json agrees with the sidecar: it is used"
+        );
+
+        let mut bad = offsets.clone();
+        bad.truncate(offsets.len() - 3);
+        fs::write(dir.join("doc_store.offsets"), &bad).unwrap();
+        assert_eq!(
+            doc_store_fallback_reason(&dir, Some(&footer)),
+            Some(DocStoreFallbackReason::Rejected),
+            "truncated mid-record"
+        );
+
+        fs::remove_file(dir.join("doc_store.offsets")).unwrap();
+        assert_eq!(
+            doc_store_fallback_reason(&dir, Some(&footer)),
+            Some(DocStoreFallbackReason::Missing)
+        );
+
+        fs::write(dir.join("doc_store.bin"), &bin).unwrap();
+        assert_eq!(
+            doc_store_fallback_reason(&dir, Some(&footer)),
+            None,
+            "doc_store.bin already local: nothing to fetch"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn segment_is_scoring_complete_offsets_sidecar_replaces_doc_store_bin() {
@@ -7943,45 +8290,51 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-scoring-complete");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        let footer = test_footer("kosha-test-scoring-complete", 1, 2);
 
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false, false, false),
+            !AppState::segment_is_scoring_complete(&dir, false, false, None),
             "empty dir must not be scoring-complete"
         );
 
-        for f in ["inverted.idx", "doc_store.offsets"] {
-            fs::write(dir.join(f), b"x").unwrap();
-        }
+        fs::write(dir.join("inverted.idx"), b"x").unwrap();
+        // The header is all the per-search check reads: one doc, matching
+        // the footer.
+        fs::write(dir.join("doc_store.offsets"), 1u32.to_le_bytes()).unwrap();
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false, false, false),
+            !AppState::segment_is_scoring_complete(&dir, false, false, None),
             "without a manifest footer, footer.json on disk is still required"
         );
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false, false, true),
+            AppState::segment_is_scoring_complete(&dir, false, false, Some(&footer)),
             "a manifest footer snapshot must stand in for a missing footer.json"
         );
-        fs::write(dir.join("footer.json"), b"x").unwrap();
+        fs::write(
+            dir.join("footer.json"),
+            serde_json::to_vec(&footer).unwrap(),
+        )
+        .unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false, false, false),
+            AppState::segment_is_scoring_complete(&dir, false, false, None),
             "offsets sidecar (no doc_store.bin, no filters.bin) must be broad lexical scoring-complete"
         );
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false, true, false),
+            !AppState::segment_is_scoring_complete(&dir, false, true, None),
             "queries using filters/sorts/aggs must still require filters.bin"
         );
         fs::write(dir.join("filters.bin"), b"x").unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false, true, false),
+            AppState::segment_is_scoring_complete(&dir, false, true, None),
             "filters.bin present must make filter/sort/agg queries scoring-complete"
         );
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, true, true, false),
+            !AppState::segment_is_scoring_complete(&dir, true, true, None),
             "kNN scoring-complete must require vector.idx (still missing)"
         );
 
         fs::write(dir.join("vector.idx"), b"x").unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, true, true, false),
+            AppState::segment_is_scoring_complete(&dir, true, true, None),
             "vector.idx present must make it kNN scoring-complete"
         );
         assert!(
@@ -7989,7 +8342,7 @@ mod tests {
             "sanity: this assertion must be exercising the no-sidecar case"
         );
         assert!(
-            AppState::segment_is_scoring_complete(&dir, true, true, false),
+            AppState::segment_is_scoring_complete(&dir, true, true, None),
             "vector.offsets (the v2 posting-index sidecar) must be optional for scoring \
              completeness — legacy v1 segments never have one, and the reader falls back to \
              an eager parse of vector.idx alone when it's absent, same as doc_store's own \
@@ -8011,12 +8364,12 @@ mod tests {
             fs::write(legacy.join(f), b"x").unwrap();
         }
         assert!(
-            AppState::segment_is_scoring_complete(&legacy, false, true, false),
+            AppState::segment_is_scoring_complete(&legacy, false, true, None),
             "legacy segment with doc_store.bin (no offsets) must be scoring-complete"
         );
         fs::remove_file(legacy.join("doc_store.bin")).unwrap();
         assert!(
-            !AppState::segment_is_scoring_complete(&legacy, false, true, false),
+            !AppState::segment_is_scoring_complete(&legacy, false, true, None),
             "legacy segment without offsets and without doc_store.bin is not scorable"
         );
         let _ = fs::remove_dir_all(&legacy);
