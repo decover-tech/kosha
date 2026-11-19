@@ -7282,6 +7282,74 @@ mod tests {
     }
 
     #[test]
+    fn metric_aggregations_over_http_and_unknown_types_are_400() {
+        // Issues #196 / #218 / #202: metric aggregations, top-level and
+        // nested under `terms`, over `/search`; an unknown or misspelled
+        // aggregation type is a 400 naming the valid types.
+        let state = test_state();
+        let ns = NamespaceId("metricns".into());
+        let doc = |id: &str, cat: &str, amount: f64| Document {
+            id: DocumentId(id.into()),
+            fields: vec![
+                Field::text("text", "invoice"),
+                Field::keyword("category", cat),
+                Field::float_val("amount", amount),
+            ],
+        };
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![doc("1", "a", 1.0), doc("2", "a", 2.5), doc("3", "b", 4.0)],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |aggs: &str| {
+            let body = format!(
+                r#"{{"namespace":"metricns","query_text":"invoice","max_results":0,"aggs":{aggs}}}"#
+            );
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let resp = post(
+            r#"{"avg_amount":{"avg":{"field":"amount"}},
+                "by_cat":{"terms":{"field":"category"},"aggs":{"total":{"sum":{"field":"amount"}}}}}"#,
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        let aggs = &v["aggregations"];
+        assert_eq!(aggs["avg_amount"]["value"], 2.5, "{v}");
+        let a = aggs["by_cat"]["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["key"] == "a")
+            .unwrap();
+        assert_eq!(a["total"]["value"], 3.5, "{v}");
+
+        for (bad, needle) in [
+            (
+                r#"{"x":{"averag":{"field":"amount"}}}"#,
+                "unknown aggregation type `averag`",
+            ),
+            (
+                r#"{"x":{"stats":{"field":"amount"}}}"#,
+                "unknown aggregation type `stats`",
+            ),
+            (
+                r#"{"x":{"terms":{"field":"category"},"aggs":{"y":{"terms":{"field":"category"}}}}}"#,
+                "only metric aggregations",
+            ),
+        ] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+            assert!(resp.contains(needle), "{bad}: {resp}");
+        }
+    }
+
+    #[test]
     fn hybrid_search_fuses_with_rrf_over_http() {
         // Issue #228: `rank.rrf` over HTTP — fused score plus per-retriever
         // ranks in the response, vector-only hits kept (#250), parameters
