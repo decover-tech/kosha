@@ -36,11 +36,11 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | `wildcard` | Per-field pattern match, case-insensitive by default |
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
 | Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
-| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `bool` (`must` / `must_not` / `should` / `minimum_should_match`), `match_all` |
+| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `exists`, `bool` (`must` / `must_not` / `should` / `minimum_should_match`), `match_all`. On a multi-valued field (a list, or a [nested path](#nested-attributes) with several values) a clause matches if ANY value does |
 | kNN-scoped filters | `knn.filter` restricts only the vector list; the top-level `filter` restricts both the lexical and the vector list |
-| Sorting | Multi-field `sort` over stored fields, plus `_id` |
+| Sorting | Multi-field `sort` over stored fields and [nested dotted paths](#nested-attributes), plus `_id`. A multi-valued field sorts by its smallest value for `asc` and its largest for `desc` (Elasticsearch's default `mode`) |
 | Pagination | `from` / `max_results`, and an OpenSearch-style `search_after` cursor |
-| Highlighting | Per-field, with configurable `pre_tags` / `post_tags` |
+| Highlighting | Per-field (including a nested dotted path such as `author.bio`), with configurable `pre_tags` / `post_tags` |
 | Aggregations | Buckets: `terms`, `composite`. Metrics: `cardinality`, `min`, `max`, `sum`, `avg`, `value_count`, top-level or nested under a `terms` / `composite` bucket via `aggs`. Computed over every document the query and filter match (not just the page), from the filter columns only — see [Aggregations](#aggregations) |
 | Total-hit accounting | Capped counting with an `eq` / `gte` relation (`track_total_hits`-style), overridable per query via `exact_total_hits` / `total_hits_cap` |
 | Degradation signal | `knn_degraded_segments` reports segments whose vector search failed, so a 200 with silently missing neighbors is visible to the caller |
@@ -91,6 +91,68 @@ request and response shapes:
   store.
 - Not supported yet: `stats`, `percentiles`, `histogram`, `date_histogram`,
   `range` buckets, `missing` / `script` / `format` options.
+
+### Nested attributes
+
+A `Keyword` field whose value is the JSON text of an object, or of an array
+of objects, is a nested container. Filters, `sort`, aggregations and
+`highlight` address its leaves by dotted path (`author.name`), and a hit
+returns the field exactly as it was sent. The Python client sends a `dict`
+this way automatically.
+
+```json
+{"id": "1", "fields": [
+  {"name": "author",  "field_type": "Keyword", "value": "{\"name\":\"Ada\",\"org\":\"acme\",\"age\":36}"},
+  {"name": "authors", "field_type": "Keyword", "value": "[{\"name\":\"Ada\",\"org\":\"acme\"},{\"name\":\"Bob\",\"org\":\"beta\"}]"},
+  {"name": "tags",    "field_type": "Keyword", "value": "[\"a\",\"b\"]"}]}
+```
+
+```json
+{"query_text": "", "filter": {"bool": {"must": [
+   {"term": {"author.org": "acme"}}, {"range": {"author.age": {"gte": "30"}}}]}},
+ "sort": [{"author.age": {"order": "desc"}}],
+ "aggs": {"by_author": {"terms": {"field": "authors.name"}}}}
+```
+
+**Semantics are flattened, like Elasticsearch's `object` type, not
+`nested`.** Each dotted path collects the leaves of every element of an
+array, and the link between leaves of the same element is lost. With the
+`authors` value above:
+
+| Filter | Matches? | Why |
+| --- | --- | --- |
+| `authors.name = Ada` | yes | `authors.name` is `[Ada, Bob]` |
+| `authors.name = Ada AND authors.org = acme` | yes | Ada is at acme |
+| `authors.name = Ada AND authors.org = beta` | **yes** | `authors.org` is `[acme, beta]`; no author is both Ada and at beta, but the paths are matched independently |
+| `authors.name = Cy` | no | no element has that name |
+
+True nested queries, where each array element is matched as a unit, are not
+supported. If you need "same element" matching, index each element as its
+own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`).
+
+- Each leaf is indexed under its full path. Objects inside arrays, and arrays
+  inside arrays, are flattened into the same path. `null`, `{}` and `[]` do
+  not add a value.
+- A path with several values is multi-valued. A filter matches if any value
+  matches. A `terms` bucket counts a document once per distinct value, so a
+  value repeated in one document still counts once. Metric aggregations
+  (`sum`, `avg`, `value_count`...) see every value.
+- Numbers go to the numeric (float) column, with one entry per value, so
+  `range`, numeric `sort` and metrics work on them. Strings and booleans go to
+  the keyword column. If several values are stored at one path, they are kept
+  as their JSON-list text, the same convention `tags` above uses. If a path
+  has both strings and numbers in one document, all of its values are stored
+  as strings, so keep each path to one JSON type.
+- Leaves are filter and sort values. They are not tokenized for full-text
+  `query_text` search.
+- Dotted paths are worked out each time a segment is built. A container
+  indexed before this release can be addressed by dotted path once its
+  segment is rebuilt by compaction or re-indexing. Flat documents are
+  unaffected.
+- The field names a query uses can be listed with
+  `SearchQuery::field_paths()`. `validate_field_paths()` rejects a path that
+  a namespace schema does not know. Until namespace schemas are enforced on
+  search, unknown paths are allowed and match nothing.
 
 ### Indexing and writes
 

@@ -970,6 +970,14 @@ class KoshaClient:
                         k, json.dumps(list(v), default=json_default), "Keyword"
                     )
                 )
+            elif isinstance(v, dict):
+                # A nested object (#206): sent whole as JSON text in a
+                # Keyword field. The server indexes its leaves under dotted
+                # paths (``author.name``) and returns it unchanged in
+                # ``_source``; decoded back to a dict by _decode_field_value.
+                fields.append(
+                    cls._field_to_kosha(k, json.dumps(v, default=json_default), "Keyword")
+                )
             # else: unsupported type — skip silently (matches prior behavior)
         return fields
 

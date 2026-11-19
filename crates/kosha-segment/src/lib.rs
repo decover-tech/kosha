@@ -196,6 +196,9 @@ impl SegmentWriter {
                         .entry(field.name.clone())
                         .or_default()
                         .push((doc_seq, field.value.clone()));
+                    if field.field_type == FieldType::Keyword {
+                        self.add_nested_columns(doc_seq, field);
+                    }
                 }
                 FieldType::Integer => {
                     if let Ok(v) = field.value.parse::<i64>() {
@@ -282,6 +285,29 @@ impl SegmentWriter {
         if self.inverted_bytes > self.build_memory_bytes {
             if let Err(e) = self.spill_run() {
                 self.io_error = Some(e);
+            }
+        }
+    }
+
+    /// Index a nested container's leaves under their dotted paths (#206).
+    ///
+    /// Filter columns only: the doc store keeps the container as sent, so
+    /// `_source` round-trips it, and the container's own column entry is
+    /// unchanged. Nothing is written for a value that is not a container.
+    /// See `kosha_core::nested` for the per-path encoding.
+    fn add_nested_columns(&mut self, doc_seq: u32, field: &Field) {
+        for (path, column) in kosha_core::nested::flatten_container(&field.name, &field.value) {
+            match column {
+                kosha_core::nested::NestedColumn::Text(value) => {
+                    self.filter_string
+                        .entry(path)
+                        .or_default()
+                        .push((doc_seq, value));
+                }
+                kosha_core::nested::NestedColumn::Numbers(values) => {
+                    let entries = self.filter_float.entry(path).or_default();
+                    entries.extend(values.into_iter().map(|v| (doc_seq, v)));
+                }
             }
         }
     }

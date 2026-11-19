@@ -167,8 +167,12 @@ pub fn evaluate_filter(clause: &FilterClause, store: &FilterStore, doc_count: u3
             let field = exists.field.as_str();
             if let Some(entries) = lookup_field(&store.string_fields, field) {
                 for (doc_seq, value) in entries {
-                    // An empty list is "no value", as in OpenSearch.
-                    if list_elements(value).is_none_or(|elements| !elements.is_empty()) {
+                    // An empty list is "no value", as in OpenSearch. A
+                    // list of objects (a nested container, see
+                    // `crate::nested`) has no plain elements but is a value.
+                    if list_elements(value).is_none_or(|elements| !elements.is_empty())
+                        || crate::nested::parse_container(value).is_some()
+                    {
                         set.insert(*doc_seq);
                     }
                 }
@@ -251,7 +255,17 @@ fn mark_in_range(set: &mut DocSet, store: &FilterStore, field: &str, bound: &Ran
         }
     } else if let Some(entries) = lookup_field(&store.string_fields, field) {
         for (doc_seq, value) in entries {
-            if in_range_str(value, bound) {
+            // A list value is in range when any element is (#206): the
+            // multi-valued semantics `term` already has.
+            let hit = match value
+                .starts_with('[')
+                .then(|| list_elements(value))
+                .flatten()
+            {
+                Some(elements) => elements.iter().any(|e| in_range_str(e, bound)),
+                None => in_range_str(value, bound),
+            };
+            if hit {
                 set.insert(*doc_seq);
             }
         }
@@ -489,6 +503,42 @@ mod tests {
         let blooms = crate::build_filter_blooms(&store.string_fields);
         assert!(blooms["tags"].may_contain("sealed"));
         assert!(blooms["tags"].may_contain("urgent"));
+    }
+
+    #[test]
+    fn multi_valued_columns_match_on_any_value() {
+        // What the segment writer stores for a flattened array of objects
+        // (#206): JSON-list text in the string column, one float entry per
+        // number, so a doc_seq can repeat.
+        let mut store = FilterStore::default();
+        store.string_fields.insert(
+            "authors.name".into(),
+            vec![(0, r#"["Ada","Bob"]"#.into()), (1, "Cy".into())],
+        );
+        store
+            .float_fields
+            .insert("authors.n".into(), vec![(0, 1.0), (0, 9.0), (1, 5.0)]);
+        store.string_fields.insert(
+            "authors".into(),
+            vec![(0, r#"[{"name":"Ada"},{"name":"Bob"}]"#.into())],
+        );
+        let eval = |json: &str| -> Vec<u32> {
+            let clause: FilterClause = serde_json::from_str(json).unwrap();
+            evaluate_filter(&clause, &store, 2).iter().collect()
+        };
+        assert_eq!(eval(r#"{"term": {"authors.name": "Bob"}}"#), vec![0]);
+        assert_eq!(eval(r#"{"term": {"authors.n": "9"}}"#), vec![0]);
+        assert_eq!(
+            eval(r#"{"range": {"authors.n": {"gte": "5"}}}"#),
+            vec![0, 1]
+        );
+        assert_eq!(eval(r#"{"range": {"authors.n": {"lt": "2"}}}"#), vec![0]);
+        assert_eq!(
+            eval(r#"{"range": {"authors.name": {"gte": "B", "lt": "C"}}}"#),
+            vec![0]
+        );
+        assert_eq!(eval(r#"{"exists": {"field": "authors"}}"#), vec![0]);
+        assert_eq!(eval(r#"{"exists": {"field": "authors.n"}}"#), vec![0, 1]);
     }
 
     #[test]

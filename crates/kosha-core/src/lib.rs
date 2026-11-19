@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod datetime;
 pub mod docset;
+pub mod nested;
 pub use docset::{evaluate_filter, DocSet};
 
 /// Pluggable namespace registry and manifest store.
