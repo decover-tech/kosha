@@ -92,6 +92,22 @@ service KoshaService {
     };
   }
 
+  // Set a namespace's schema (issue #220): per-field analyzers for segments
+  // written from now on. Existing segments keep the analysis recorded in
+  // their footers and stay searchable with it.
+  rpc PutNamespaceSchema(PutNamespaceSchemaRequest) returns (PutNamespaceSchemaResponse) {
+    option (google.api.http) = {
+      post: "/v1/namespaces/{namespace}/schema"
+      body: "*"
+    };
+  }
+
+  rpc GetNamespaceSchema(GetNamespaceSchemaRequest) returns (GetNamespaceSchemaResponse) {
+    option (google.api.http) = {
+      get: "/v1/namespaces/{namespace}/schema"
+    };
+  }
+
   // Delete a namespace and its segments.
   rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse) {
     option (google.api.http) = {
@@ -117,13 +133,42 @@ message CreateNamespaceRequest {
 
 message NamespaceSchema {
   map<string, FieldSchema> fields = 1;
+  // Analyzer for Text fields not listed in `fields`. Empty = "standard".
+  repeated string default_analyzer = 2;
+  // Stopword list for `default_analyzer`'s "stop" filter (built-in English list if empty).
+  repeated string default_stopwords = 3;
 }
 
 message FieldSchema {
   FieldType type = 1;
   bool indexed = 2;       // whether the field is full-text indexed
   bool stored = 3;        // whether the field value is stored and returned
-  repeated string analyzer = 4;  // tokenizer / analyzer choice
+  // Analyzer, then token filters. Analyzers: "standard" (legacy tokenizer),
+  // "standard@2" (Unicode UAX #29), "keyword", "lowercase", "whitespace".
+  // Filters: "lowercase", "stop", "stem" (English Snowball). Empty = "standard".
+  repeated string analyzer = 4;
+  // Stopword list for this field's "stop" filter (built-in English list if empty).
+  repeated string stopwords = 5;
+}
+
+message PutNamespaceSchemaRequest {
+  string namespace = 1;
+  NamespaceSchema schema = 2;
+}
+
+message PutNamespaceSchemaResponse {
+  string namespace = 1;
+  NamespaceSchema schema = 2;
+  bool changed = 3;  // false when the stored schema was already identical
+}
+
+message GetNamespaceSchemaRequest {
+  string namespace = 1;
+}
+
+message GetNamespaceSchemaResponse {
+  string namespace = 1;
+  NamespaceSchema schema = 2;
 }
 
 enum FieldType {
@@ -135,6 +180,8 @@ enum FieldType {
   FIELD_TYPE_DATE = 5;
   FIELD_TYPE_BOOLEAN = 6;
   FIELD_TYPE_VECTOR = 7;
+  // "lat,lon", {"lat": .., "lon": ..} or GeoJSON [lon, lat].
+  FIELD_TYPE_GEO_POINT = 8;
 }
 
 message CreateNamespaceResponse {
@@ -215,7 +262,8 @@ message SearchRequest {
   optional double bm25_k1 = 5;
   optional double bm25_b = 6;
 
-  // Filters — Kosha-native filter clause (term/terms/range/bool).
+  // Filters — Kosha-native filter clause (term/terms/range/bool/exists/
+  // geo_distance).
   // Same shape as the ES bool filter that KoshaClient already translates.
   google.protobuf.Struct filter = 7;
 
@@ -237,15 +285,61 @@ message SearchRequest {
   // kNN / ANN vector search (Phase 2).
   optional KnnQuery knn = 13;
 
-  // Mode — defaults to LEXICAL in Phase 1.
+  // Mode. UNSPECIFIED infers it from the clauses present; any other value
+  // is checked against them (HTTP: "mode": "lexical" | "semantic" | "hybrid").
   RetrievalMode mode = 14;
+
+  // How a hybrid request fuses its lexical and kNN lists.
+  // HTTP: "rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}.
+  optional Rank rank = 15;
+
+  // Restrict query_text to these Text fields, each optionally boosted:
+  // ["title^2", "content"]. Scores sum boost x per-field BM25. Empty = the
+  // combined index of every Text field; "_all" names it explicitly.
+  repeated string fields = 16;
+
+  // At most `max` hits per distinct value of a keyword field, applied while
+  // collecting results (the page stays full). HTTP:
+  // "limit_per": {"field": "author", "max": 2}. total_hits counts matches
+  // before the cap.
+  optional LimitPer limit_per = 17;
+
+  // Score modifiers, same shape as the HTTP "rank_by" object: field-value
+  // boosts and linear / exp / gauss decays over Integer, Float, Date and
+  // GeoPoint fields, applied to the best `window_size` hits by the query's
+  // own score. See README "Score modifiers".
+  google.protobuf.Struct rank_by = 18;
+
+  // Typo-tolerant term matching (HTTP "fuzzy"). A lexical query of its own:
+  // not combinable with query_text / fields / wildcard / match_phrase.
+  optional FuzzyQuery fuzzy = 19;
+}
+
+message LimitPer {
+  string field = 1;
+  int32 max = 2;  // >= 1
 }
 
 enum RetrievalMode {
   RETRIEVAL_MODE_UNSPECIFIED = 0;
-  RETRIEVAL_MODE_LEXICAL = 1;
-  RETRIEVAL_MODE_SEMANTIC = 2;  // Phase 2
-  RETRIEVAL_MODE_HYBRID = 3;    // Phase 2
+  RETRIEVAL_MODE_LEXICAL = 1;   // query_text / wildcard / match_phrase / fuzzy; no knn
+  RETRIEVAL_MODE_SEMANTIC = 2;  // knn only
+  // A lexical query plus knn, fused by Reciprocal Rank Fusion over
+  // namespace-wide ranks (see Rank). Every request with both is hybrid.
+  RETRIEVAL_MODE_HYBRID = 3;
+}
+
+message Rank {
+  optional RrfRank rrf = 1;
+}
+
+// score(d) = sum over retrievers r of 1 / (rank_constant + rank_r(d)).
+message RrfRank {
+  // Per-retriever list length and fused list length. Default: max_results;
+  // must be >= max_results.
+  optional int32 rank_window_size = 1;
+  // Default 60; must be >= 1.
+  optional int32 rank_constant = 2;
 }
 
 message SortSpec {
@@ -253,10 +347,46 @@ message SortSpec {
   string order = 2;  // "asc" or "desc"
 }
 
+// Highlighting (#195). Set `fields` to highlight any number of fields (HTTP:
+// "highlight": {"fields": {"title": {}, "body": {"pre_tags": ["<em>"]}}});
+// hits then carry the per-field ScoredDocument.highlight map. Each field's
+// tags fall back to the top-level pre_tags/post_tags, then to <b>/</b>.
+// `field` is the legacy single-field form (hits carry ScoredDocument.highlights);
+// setting both `field` and `fields` is an INVALID_ARGUMENT / HTTP 400.
 message HighlightConfig {
+  // Deprecated: use `fields`.
   string field = 1;
   repeated string pre_tags = 2;
   repeated string post_tags = 3;
+  // Fields to highlight, in request order.
+  repeated HighlightField fields = 4;
+}
+
+message HighlightField {
+  string name = 1;
+  // Unset/empty falls back to HighlightConfig.pre_tags / post_tags.
+  repeated string pre_tags = 2;
+  repeated string post_tags = 3;
+}
+
+// The fragments highlighted in one field of one hit.
+message HighlightFragments {
+  repeated string fragments = 1;
+}
+
+message FuzzyQuery {
+  // "", "_all" or "*" = every Text field.
+  string field = 1;
+  // Analyzed per segment; each token is expanded.
+  string value = 2;
+  // "0", "1", "2", "auto" (default) or "auto:low,high".
+  optional string fuzziness = 3;
+  // Leading characters that must match exactly (default 0).
+  optional int32 prefix_length = 4;
+  // Terms per token per segment, nearest first (default 50, max 1024).
+  optional int32 max_expansions = 5;
+  // An adjacent swap counts as one edit (default true).
+  optional bool transpositions = 6;
 }
 
 message WildcardQuery {
@@ -266,9 +396,12 @@ message WildcardQuery {
 }
 
 message MatchPhraseQuery {
+  // The field the phrase must occur in; "", "_all" or "*" = any one field.
   string field = 1;
   string phrase = 2;
   int32 slop = 3;
+  // Several fields, any one of them (overrides field when non-empty).
+  repeated string fields = 4;
 }
 
 message KnnQuery {
@@ -287,9 +420,28 @@ message SearchResponse {
 
 message ScoredDocument {
   string doc_id = 1;
-  double score = 2;
+  double score = 2;  // the fused RRF score for a hybrid request
   repeated Field fields = 3;
+  // Deprecated: set only for the legacy single-field HighlightConfig.field
+  // request; use `highlight`.
   repeated string highlights = 4;
+  // Hybrid requests only.
+  optional RankDetails rank_details = 5;
+  // Highlight fragments keyed by field name, for a HighlightConfig.fields
+  // request (ES "highlight" shape). Fields the hit lacks, or that are not
+  // text, are absent.
+  map<string, HighlightFragments> highlight = 6;
+}
+
+// 1-based ranks in each retriever's namespace-wide list; unset when the hit
+// was not in that retriever's window.
+message RankDetails {
+  optional int32 lexical_rank = 1;
+  optional double lexical_score = 2;
+  optional int32 knn_rank = 3;
+  optional double knn_score = 4;
+  // rank_by requests: the score before the modifiers.
+  optional double base_score = 5;
 }
 
 // ─── Stats ──────────────────────────────────────────────────────────────────

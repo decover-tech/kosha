@@ -1,6 +1,6 @@
 """Kosha client — a drop-in replacement for opensearchpy.OpenSearch.
 
-Usage (swap two lines in Sage's connection_factory.py)::
+Usage (swap two lines where you build your OpenSearch client)::
 
     # Before:
     # from opensearchpy import OpenSearch

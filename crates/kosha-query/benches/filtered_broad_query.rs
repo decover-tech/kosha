@@ -115,6 +115,7 @@ fn run(work: &std::path::Path, label: &str, version: u32, segs: usize, docs: usi
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        schema: None,
     };
     let query = bench_query();
 
@@ -214,6 +215,7 @@ fn bench_query() -> SearchQuery {
         highlight: None,
         aggs: Default::default(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         exact_total_hits: None,
@@ -221,7 +223,12 @@ fn bench_query() -> SearchQuery {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
+        rank: None,
+        mode: None,
+        fields: Vec::new(),
     }
 }

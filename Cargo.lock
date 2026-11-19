@@ -2056,8 +2056,10 @@ dependencies = [
  "kosha-core",
  "kosha-vector-spfresh",
  "roaring",
+ "rust-stemmers",
  "serde",
  "serde_json",
+ "unicode-segmentation",
  "zstd",
 ]
 
@@ -2100,6 +2102,7 @@ name = "kosha-write"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "criterion",
  "kosha-core",
  "kosha-segment",
  "serde",
@@ -2803,6 +2806,16 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rust-stemmers"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
+dependencies = [
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -3795,6 +3808,12 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "untrusted"

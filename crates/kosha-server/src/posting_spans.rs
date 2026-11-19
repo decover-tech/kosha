@@ -603,6 +603,7 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                schema: None,
             },
             segs: seg_dirs,
         }
@@ -679,10 +680,10 @@ mod tests {
         cache: &Cache,
         q: &SearchQuery,
     ) -> Result<(Vec<String>, PostingSpanOutcome), KoshaError> {
-        let mut terms: Vec<String> = kosha_segment::tokenize(&q.query_text);
-        if let Some(p) = &q.match_phrase {
-            terms.extend(kosha_segment::tokenize(&p.phrase));
-        }
+        // The terms the server's hydration asks for: every reading of the
+        // query (#220) plus per-field keys and norms (#249). The fixture's
+        // segments use the default analysis.
+        let terms = kosha_query::QueryAnalysis::new(q).union_terms([None]);
         let outcome = if terms.is_empty() {
             PostingSpanOutcome::default()
         } else {

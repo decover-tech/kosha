@@ -132,6 +132,7 @@ fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, dim: us
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        schema: None,
     }
 }
 
@@ -149,6 +150,7 @@ fn mk_query(text: &str, knn: Option<KnnQuery>) -> SearchQuery {
         highlight: None,
         aggs: HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn,
         exact_total_hits: None,
@@ -156,8 +158,13 @@ fn mk_query(text: &str, knn: Option<KnnQuery>) -> SearchQuery {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
+        rank: None,
+        mode: None,
+        fields: Vec::new(),
     }
 }
 

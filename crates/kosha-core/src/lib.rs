@@ -1,4 +1,8 @@
+pub mod analysis;
 pub mod deletes;
+pub mod fields;
+pub mod fuzzy;
+pub mod rank;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -7,7 +11,14 @@ use serde::{Deserialize, Serialize};
 // ─── Control store trait (in-memory or Postgres) ──────────────────────────
 
 pub mod docset;
+pub use analysis::{
+    AnalysisConfig, AnalyzerSpec, FieldSchema, NamespaceSchema, SegmentAnalysis, TokenFilterSpec,
+    TokenizerKind,
+};
 pub use docset::{evaluate_filter, DocSet};
+pub use fields::{FieldBoost, FieldIndex, FieldStats, ALL_FIELD};
+pub use fuzzy::{Fuzziness, FuzzyQuery};
+pub use rank::{CompiledRankBy, RankBySpec};
 
 /// Pluggable namespace registry and manifest store.
 ///
@@ -29,15 +40,44 @@ pub trait ControlStore: Send + Sync {
         self.manifest(id).cloned()
     }
 
-    /// The stored manifest's version, without its segment list.
+    /// Owned copy of the manifest, distinguishing "no such namespace"
+    /// (`Ok(None)`) from "the control store could not be read"
+    /// (`Err(KoshaError::ControlPlane)`).
     ///
-    /// A query replica asks this before every search to learn whether the
-    /// ingest node has published since it last looked, so it has to be
-    /// cheap: the manifest itself carries a footer for every segment and
-    /// runs to megabytes for a few hundred segments. The default reads the
-    /// whole manifest; stores that can do better override it.
-    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
-        self.manifest_cloned(id).map(|manifest| manifest.version)
+    /// Query replicas use this to follow published manifests: an
+    /// unreachable control plane must leave them serving their
+    /// last-known-good manifest (DESIGN.md §17), not report the namespace
+    /// missing. The default wraps `manifest_cloned`, which is infallible
+    /// for in-memory stores; stores that talk to a database override it.
+    fn try_manifest_cloned(&self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
+        Ok(self.manifest_cloned(id))
+    }
+
+    /// The stored manifest's version, without its segment list. `Ok(None)`
+    /// means the namespace has no manifest; `Err` means the store could not
+    /// be read and says nothing about the namespace.
+    ///
+    /// Has to be cheap: the manifest itself can run to megabytes for a few
+    /// hundred segments. The default reads the whole manifest; stores that
+    /// can do better override it.
+    fn manifest_version(&self, id: &NamespaceId) -> Result<Option<u64>, KoshaError> {
+        Ok(self
+            .try_manifest_cloned(id)?
+            .map(|manifest| manifest.version))
+    }
+
+    /// Every namespace's stored manifest version in one read: the query
+    /// replicas' manifest refresher polls this (`SELECT namespace_id,
+    /// version FROM kosha.manifests` on Postgres) instead of one round trip
+    /// per namespace per search. `Err` means the store could not be read.
+    fn manifest_versions(&self) -> Result<Vec<(NamespaceId, u64)>, KoshaError> {
+        let mut versions = Vec::new();
+        for id in self.list_namespaces() {
+            if let Some(version) = self.manifest_version(&id)? {
+                versions.push((id, version));
+            }
+        }
+        Ok(versions)
     }
 
     /// Persist a manifest for a namespace (upsert, last-write-wins).
@@ -80,6 +120,11 @@ pub enum FieldType {
     Date,
     Boolean,
     Vector,
+    /// A latitude/longitude pair (issue #212). Accepted as `"lat,lon"`,
+    /// `{"lat": .., "lon": ..}` or GeoJSON `[lon, lat]`; stored as given and
+    /// copied into the filter columns as the canonical `"lat,lon"` text,
+    /// where `geo_distance` filters and geo decays read it.
+    GeoPoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +175,13 @@ impl Field {
             name: n.into(),
             field_type: FieldType::Boolean,
             value: v.to_string(),
+        }
+    }
+    pub fn geo_point(n: impl Into<String>, lat: f64, lon: f64) -> Self {
+        Self {
+            name: n.into(),
+            field_type: FieldType::GeoPoint,
+            value: rank::canonical_geo(lat, lon),
         }
     }
     pub fn vector(n: impl Into<String>, v: Vec<f32>) -> Self {
@@ -191,6 +243,39 @@ pub struct Bm25Overrides {
     /// Length normalization. Must be finite and within `[0, 1]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub b: Option<f64>,
+    /// Where IDF and `avgdl` come from (issue #246). Omitted means the
+    /// engine default ([`Bm25StatsScope::Namespace`] unless the server
+    /// runs with `KOSHA_BM25_STATS=segment`). Not serialized when omitted,
+    /// so result-cache keys of requests that don't set it are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<Bm25StatsScope>,
+}
+
+/// Which corpus BM25's collection statistics (`N`, `df`, `avgdl`) are
+/// taken from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Bm25StatsScope {
+    /// Summed over every segment of the namespace's manifest, so a
+    /// document scores the same whichever segment it landed in and scores
+    /// from different segments can be merged by value.
+    #[default]
+    Namespace,
+    /// Each segment's own `N`, `df` and `avgdl` — the pre-#246 behavior,
+    /// kept as a debug / A-B switch. Scores from different segments are
+    /// not comparable under this scope.
+    Segment,
+}
+
+impl Bm25StatsScope {
+    /// Parse the wire / env spelling (`namespace` or `segment`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "namespace" => Some(Self::Namespace),
+            "segment" => Some(Self::Segment),
+            _ => None,
+        }
+    }
 }
 
 impl Bm25Overrides {
@@ -199,6 +284,7 @@ impl Bm25Overrides {
         Self {
             k1: Some(k1),
             b: Some(b),
+            stats: None,
         }
     }
 
@@ -264,6 +350,81 @@ pub enum FilterClause {
     Exists {
         exists: ExistsFilter,
     },
+    /// A `GeoPoint` field within `distance` of a point (issue #212).
+    GeoDistance {
+        geo_distance: GeoDistanceFilter,
+    },
+}
+
+/// Body of a `geo_distance` clause, in Elasticsearch's shape:
+/// `{"distance": "10km", "<field>": {"lat": .., "lon": ..}}`. The point may
+/// also be `"lat,lon"` or GeoJSON `[lon, lat]`; the distance a number of
+/// meters or a string with a unit (`m`, `km`, `mi`, ...).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeoDistanceFilter {
+    pub field: String,
+    pub lat: f64,
+    pub lon: f64,
+    /// Meters.
+    pub distance: f64,
+}
+
+impl Serialize for GeoDistanceFilter {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("distance", &self.distance)?;
+        map.serialize_entry(
+            &self.field,
+            &serde_json::json!({"lat": self.lat, "lon": self.lon}),
+        )?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for GeoDistanceFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut obj = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let distance = obj
+            .remove("distance")
+            .ok_or_else(|| D::Error::custom("geo_distance needs a \"distance\""))?;
+        let distance = rank::parse_distance_meters(&distance)
+            .filter(|d| d.is_finite() && *d >= 0.0)
+            .ok_or_else(|| {
+                D::Error::custom(format!(
+                    "geo_distance.distance {distance} is not a distance (e.g. \"10km\" or meters)"
+                ))
+            })?;
+        // Elasticsearch options that only change precision are accepted
+        // and ignored; everything else is the field.
+        obj.remove("distance_type");
+        obj.remove("validation_method");
+        let mut fields = obj.into_iter();
+        let (field, point) = fields
+            .next()
+            .ok_or_else(|| D::Error::custom("geo_distance needs a field and a point"))?;
+        if let Some((extra, _)) = fields.next() {
+            return Err(D::Error::custom(format!(
+                "geo_distance takes one field, found `{field}` and `{extra}`"
+            )));
+        }
+        let (lat, lon) = match &point {
+            serde_json::Value::String(s) => rank::parse_geo_str(s),
+            other => rank::parse_geo_json(other),
+        }
+        .ok_or_else(|| {
+            D::Error::custom(format!(
+                "geo_distance point for `{field}` must be {{\"lat\": .., \"lon\": ..}}, \"lat,lon\" or [lon, lat] within range"
+            ))
+        })?;
+        Ok(Self {
+            field,
+            lat,
+            lon,
+            distance,
+        })
+    }
 }
 
 impl FilterClause {
@@ -274,6 +435,7 @@ impl FilterClause {
             Self::Terms { terms } => terms.keys().for_each(|k| f(k)),
             Self::Range { range } => range.keys().for_each(|k| f(k)),
             Self::Exists { exists } => f(&exists.field),
+            Self::GeoDistance { geo_distance } => f(&geo_distance.field),
             Self::MatchAll { .. } => {}
             Self::Bool { bool } => {
                 for clause in bool.must.iter().chain(&bool.must_not).chain(&bool.should) {
@@ -292,7 +454,15 @@ pub struct ExistsFilter {
 }
 
 /// Clause keys `FilterClause` accepts, as reported in parse errors.
-const FILTER_CLAUSE_KEYS: [&str; 6] = ["term", "terms", "range", "bool", "match_all", "exists"];
+const FILTER_CLAUSE_KEYS: [&str; 7] = [
+    "term",
+    "terms",
+    "range",
+    "bool",
+    "match_all",
+    "exists",
+    "geo_distance",
+];
 
 /// Deserialized by dispatching on the clause's single key rather than with
 /// `#[serde(untagged)]`.
@@ -361,6 +531,9 @@ impl<'de> Deserialize<'de> for FilterClause {
             }),
             "exists" => Ok(FilterClause::Exists {
                 exists: body(inner)?,
+            }),
+            "geo_distance" => Ok(FilterClause::GeoDistance {
+                geo_distance: body(inner)?,
             }),
             other => {
                 let hint = match other {
@@ -464,19 +637,269 @@ pub struct SortSpec {
     pub fields: std::collections::HashMap<String, SortOrder>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A search request's `highlight` clause (#195).
+///
+/// Two JSON shapes are accepted and normalised into this one struct:
+///
+/// * the OpenSearch/Elasticsearch shape, any number of fields, each with
+///   optional tags that fall back to the top-level tags and then to the
+///   defaults (`<b>` / `</b>`):
+///   `{"pre_tags"?, "post_tags"?, "fields": {"title": {}, "body": {"pre_tags": ["<em>"]}}}`
+///   (`fields` may also be ES's ordered array form, `[{"title": {}}, {"body": {}}]`);
+/// * the legacy single-field shape, `{"field": "body", "pre_tags"?, "post_tags"?}`.
+///
+/// Giving both `field` and `fields` is an error. Highlighter options Kosha
+/// does not implement (`fragment_size`, `type`, ...) are ignored, as they
+/// were before. Hits answer a `fields` request with the per-field
+/// `ScoredDocument::highlight` map, and a legacy request with the flat
+/// `ScoredDocument::highlights` list, exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HighlightConfig {
-    pub field: String,
-    #[serde(default = "default_pre_tag")]
-    pub pre_tags: Vec<String>,
-    #[serde(default = "default_post_tag")]
-    pub post_tags: Vec<String>,
+    /// Fields to highlight, in request order.
+    pub fields: Vec<HighlightField>,
+    /// Top-level tags: the fallback for a field that sets none.
+    pub pre_tags: Option<Vec<String>>,
+    pub post_tags: Option<Vec<String>>,
+    /// Parsed from the legacy `{"field": ...}` form: hits report the flat
+    /// `highlights` list rather than the per-field `highlight` map.
+    pub legacy_single_field: bool,
 }
-fn default_pre_tag() -> Vec<String> {
-    vec!["<b>".into()]
+
+/// One entry of `HighlightConfig::fields`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighlightField {
+    pub name: String,
+    pub pre_tags: Option<Vec<String>>,
+    pub post_tags: Option<Vec<String>>,
 }
-fn default_post_tag() -> Vec<String> {
-    vec!["</b>".into()]
+
+const DEFAULT_PRE_TAG: &str = "<b>";
+const DEFAULT_POST_TAG: &str = "</b>";
+
+fn first_tag(tags: Option<&Vec<String>>) -> Option<&str> {
+    tags.and_then(|t| t.first()).map(String::as_str)
+}
+
+impl HighlightConfig {
+    /// The legacy single-field request, `{"field": name}`.
+    pub fn single_field(name: impl Into<String>) -> Self {
+        Self {
+            fields: vec![HighlightField::new(name)],
+            pre_tags: None,
+            post_tags: None,
+            legacy_single_field: true,
+        }
+    }
+
+    /// An ES-shaped request for `names`, each with the default tags.
+    pub fn for_fields<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            fields: names.into_iter().map(HighlightField::new).collect(),
+            pre_tags: None,
+            post_tags: None,
+            legacy_single_field: false,
+        }
+    }
+
+    /// The opening tag for `field`: its own first tag, else the top-level
+    /// one, else `<b>`. An empty list counts as unset.
+    pub fn pre_tag<'a>(&'a self, field: &'a HighlightField) -> &'a str {
+        first_tag(field.pre_tags.as_ref())
+            .or_else(|| first_tag(self.pre_tags.as_ref()))
+            .unwrap_or(DEFAULT_PRE_TAG)
+    }
+
+    /// The closing tag for `field`; see [`HighlightConfig::pre_tag`].
+    pub fn post_tag<'a>(&'a self, field: &'a HighlightField) -> &'a str {
+        first_tag(field.post_tags.as_ref())
+            .or_else(|| first_tag(self.post_tags.as_ref()))
+            .unwrap_or(DEFAULT_POST_TAG)
+    }
+}
+
+impl HighlightField {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            pre_tags: None,
+            post_tags: None,
+        }
+    }
+}
+
+/// Per-field options inside `highlight.fields`. Unknown keys are ignored.
+#[derive(Default, Serialize, Deserialize)]
+struct HighlightFieldOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pre_tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_tags: Option<Vec<String>>,
+}
+
+/// `highlight.fields`, kept in request order: either an object
+/// (`{"title": {}, "body": {}}`) or ES's ordered array of single-key
+/// objects (`[{"title": {}}, {"body": {}}]`).
+struct HighlightFieldList(Vec<HighlightField>);
+
+impl<'de> Deserialize<'de> for HighlightFieldList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor;
+
+        fn push_entries<'de, A: serde::de::MapAccess<'de>>(
+            mut map: A,
+            out: &mut Vec<HighlightField>,
+        ) -> Result<(), A::Error> {
+            while let Some(name) = map.next_key::<String>()? {
+                // `"title": null` is accepted as "default options".
+                let options: Option<HighlightFieldOptions> = map.next_value()?;
+                let options = options.unwrap_or_default();
+                if out.iter().any(|f| f.name == name) {
+                    return Err(serde::de::Error::custom(format!(
+                        "highlight field `{name}` listed more than once"
+                    )));
+                }
+                out.push(HighlightField {
+                    name,
+                    pre_tags: options.pre_tags,
+                    post_tags: options.post_tags,
+                });
+            }
+            Ok(())
+        }
+
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = HighlightFieldList;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object of field name to highlight options, or an array of them")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                push_entries(map, &mut out)?;
+                Ok(HighlightFieldList(out))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(entry) = seq.next_element::<HighlightFieldList>()? {
+                    for field in entry.0 {
+                        if out.iter().any(|f: &HighlightField| f.name == field.name) {
+                            return Err(serde::de::Error::custom(format!(
+                                "highlight field `{}` listed more than once",
+                                field.name
+                            )));
+                        }
+                        out.push(field);
+                    }
+                }
+                Ok(HighlightFieldList(out))
+            }
+        }
+
+        deserializer.deserialize_any(FieldsVisitor)
+    }
+}
+
+/// The wire form both request shapes deserialize through.
+#[derive(Deserialize)]
+struct HighlightWire {
+    #[serde(default)]
+    field: Option<String>,
+    #[serde(default)]
+    fields: Option<HighlightFieldList>,
+    #[serde(default)]
+    pre_tags: Option<Vec<String>>,
+    #[serde(default)]
+    post_tags: Option<Vec<String>>,
+}
+
+impl<'de> Deserialize<'de> for HighlightConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = HighlightWire::deserialize(deserializer)?;
+        match (wire.field, wire.fields) {
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                "highlight: give either `fields` (a map of field name to options) or the legacy \
+                 single `field`, not both",
+            )),
+            (Some(name), None) => Ok(HighlightConfig {
+                fields: vec![HighlightField::new(name)],
+                pre_tags: wire.pre_tags,
+                post_tags: wire.post_tags,
+                legacy_single_field: true,
+            }),
+            (None, Some(fields)) => Ok(HighlightConfig {
+                fields: fields.0,
+                pre_tags: wire.pre_tags,
+                post_tags: wire.post_tags,
+                legacy_single_field: false,
+            }),
+            (None, None) => Err(serde::de::Error::custom(
+                "highlight: `fields` is required (e.g. {\"fields\": {\"body\": {}}})",
+            )),
+        }
+    }
+}
+
+impl Serialize for HighlightConfig {
+    /// Re-emits the shape the request used, so a serialized query (the CLI
+    /// client, the result-cache key) deserializes back to the same value.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        if self.legacy_single_field && self.fields.len() == 1 {
+            let only = &self.fields[0];
+            map.serialize_entry("field", &only.name)?;
+            // The legacy form has no per-field tags; fold them into the top
+            // level so they survive the round trip.
+            let pre = only.pre_tags.as_ref().or(self.pre_tags.as_ref());
+            let post = only.post_tags.as_ref().or(self.post_tags.as_ref());
+            if let Some(pre) = pre {
+                map.serialize_entry("pre_tags", pre)?;
+            }
+            if let Some(post) = post {
+                map.serialize_entry("post_tags", post)?;
+            }
+        } else {
+            if let Some(ref pre) = self.pre_tags {
+                map.serialize_entry("pre_tags", pre)?;
+            }
+            if let Some(ref post) = self.post_tags {
+                map.serialize_entry("post_tags", post)?;
+            }
+            map.serialize_entry("fields", &HighlightFieldsSer(&self.fields))?;
+        }
+        map.end()
+    }
+}
+
+struct HighlightFieldsSer<'a>(&'a [HighlightField]);
+
+impl Serialize for HighlightFieldsSer<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for field in self.0 {
+            map.serialize_entry(
+                &field.name,
+                &HighlightFieldOptions {
+                    pre_tags: field.pre_tags.clone(),
+                    post_tags: field.post_tags.clone(),
+                },
+            )?;
+        }
+        map.end()
+    }
 }
 
 // ─── Wildcard query ────────────────────────────────────────────────────────
@@ -496,10 +919,42 @@ fn default_case_insensitive() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchPhraseQuery {
+    /// The field the phrase must occur in (#249). `_all`, `*` or empty
+    /// means any one `Text` field — never across two of them. Segments
+    /// written before #249 have no per-field index and match the phrase
+    /// in their combined index.
+    #[serde(default)]
     pub field: String,
     pub phrase: String,
     #[serde(default)]
     pub slop: u32,
+    /// Several fields the phrase may occur in (any one of them, scored
+    /// with the best). Overrides `field` when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
+impl MatchPhraseQuery {
+    /// The specific fields the phrase is restricted to, or `None` when it
+    /// may occur in any field (`_all`, `*`, or no field named).
+    pub fn restricted_fields(&self) -> Option<Vec<String>> {
+        let named: Vec<&str> = if self.fields.is_empty() {
+            vec![self.field.as_str()]
+        } else {
+            self.fields.iter().map(String::as_str).collect()
+        };
+        let mut out: Vec<String> = Vec::with_capacity(named.len());
+        for name in named {
+            let name = name.trim();
+            if name.is_empty() || name == "*" || name == fields::ALL_FIELD {
+                return None;
+            }
+            if !out.iter().any(|f| f == name) {
+                out.push(name.to_string());
+            }
+        }
+        Some(out)
+    }
 }
 
 // ─── Aggregation types ─────────────────────────────────────────────────────
@@ -833,6 +1288,30 @@ pub struct Footer {
     /// touches without first fetching `filters.toc` to learn file names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter_columns: Option<Vec<FilterColumnMeta>>,
+    /// The analysis chains this segment's `Text` fields were indexed with
+    /// (issues #220, #221). `None` — every segment written before
+    /// analyzers existed, and every segment written since with default
+    /// settings — means the legacy `standard@1` chain for every field.
+    /// Queries are analyzed per segment with these chains, so a segment
+    /// keeps matching the way it was written whatever the namespace's
+    /// current schema says. See [`analysis`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<SegmentAnalysis>,
+    /// Per-field postings and statistics (issue #249). `None` — every
+    /// segment written before per-field indexes existed, or with
+    /// `KOSHA_FIELD_INDEX=off` — means the segment has only the combined
+    /// index: a field-restricted query is answered from it (matching in
+    /// any field), never with zero hits. See [`fields`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_index: Option<FieldIndex>,
+    /// Bloom over the deletion neighbourhood of the combined-index terms
+    /// (each term and every string one character deletion away from it),
+    /// for pruning one-edit fuzzy queries (issue #201): see
+    /// [`fuzzy::build_fuzzy_bloom`]. `None` — segments written before
+    /// #201, and segments whose neighbourhood is too large for a useful
+    /// bloom — means fuzzy queries cannot prune the segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzzy_bloom: Option<BloomFilter>,
 }
 
 /// Value type of one filter column (#244). A field name can appear with
@@ -1029,12 +1508,18 @@ impl BloomFilter {
     /// A filter that cannot be read (empty, or a bit that falls outside the
     /// text) cannot prune: the answer is `true`.
     pub fn may_contain(&self, value: &str) -> bool {
+        self.may_contain_hashed(bloom_key_hashes(value))
+    }
+
+    /// [`Self::may_contain`] for a value already hashed with
+    /// [`bloom_key_hashes`]: the hashes do not depend on the filter, so a
+    /// caller probing many blooms with many values hashes each value once.
+    pub fn may_contain_hashed(&self, (h1, h2): (u64, u64)) -> bool {
         if self.num_bits == 0 || self.bits_b64.is_empty() {
             return true;
         }
         let text = self.bits_b64.as_bytes();
         let m = self.num_bits as u64;
-        let (h1, h2) = bloom_hashes(value);
         for i in 0..self.k {
             let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) % m;
             match base64_byte(text, (bit / 8) as usize) {
@@ -1153,9 +1638,12 @@ pub fn segment_may_contain_terms(
     let Some(bloom) = bloom else {
         return true; // legacy footer — cannot prune
     };
+    // A per-field key (#249) is checked as its plain term: the bloom
+    // holds only combined-index terms, and every field term is one.
+    let may_contain = |t: &String| bloom.may_contain(fields::bloom_term(t));
     match mode {
-        TermBloomMode::And => terms.iter().all(|t| bloom.may_contain(t)),
-        TermBloomMode::Or => terms.iter().any(|t| bloom.may_contain(t)),
+        TermBloomMode::And => terms.iter().all(may_contain),
+        TermBloomMode::Or => terms.iter().any(may_contain),
     }
 }
 
@@ -1175,7 +1663,12 @@ fn bloom_num_hashes(num_bits: usize, n: usize) -> usize {
     ((num_bits as f64 / n as f64) * 2f64.ln()).round() as usize
 }
 
-/// Stable FNV-1a based double hash (not `DefaultHasher`, which is not portable).
+/// The two hashes a [`BloomFilter`] probes `value` with (stable FNV-1a
+/// double hash; not `DefaultHasher`, which is not portable).
+pub fn bloom_key_hashes(value: &str) -> (u64, u64) {
+    bloom_hashes(value)
+}
+
 fn bloom_hashes(value: &str) -> (u64, u64) {
     let h1 = fnv1a64(value.as_bytes(), 0x9e3779b97f4a7c15);
     let h2 = fnv1a64(value.as_bytes(), 0xbf58476d1ce4e5b9) | 1; // odd → full period
@@ -1340,7 +1833,8 @@ pub fn segment_may_match(
         // absence of a bloom cannot prove the field is absent.
         FilterClause::Range { .. }
         | FilterClause::MatchAll { .. }
-        | FilterClause::Exists { .. } => true,
+        | FilterClause::Exists { .. }
+        | FilterClause::GeoDistance { .. } => true,
     }
 }
 
@@ -1399,9 +1893,32 @@ pub struct Manifest {
     /// readable for legacy manifests and is populated in memory by readers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub deletion_vectors: HashMap<SegmentId, deletes::DeletionVector>,
+    /// Namespace schema (`POST /v1/namespaces/{ns}/schema`). Read by the
+    /// segment writers (flush and compaction) for each field's analyzer.
+    /// Segments record the chains they actually used in their own footer,
+    /// so editing the schema never changes how an existing segment is
+    /// searched. `None` = no schema: every field uses `standard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<NamespaceSchema>,
 }
 
 impl Manifest {
+    /// The analysis settings new segments of this namespace are written
+    /// with. A schema this binary cannot resolve (one set by a newer
+    /// version naming an analyzer this one lacks) falls back to the
+    /// default chain: the segments written are then recorded as such in
+    /// their footers, so they stay searchable either way.
+    pub fn analysis_config(&self) -> AnalysisConfig {
+        match self.schema.as_ref().map(NamespaceSchema::resolve) {
+            Some(Ok(config)) => config,
+            Some(Err(e)) => {
+                eprintln!("kosha: namespace schema not resolvable ({e}); using default analysis");
+                AnalysisConfig::default()
+            }
+            None => AnalysisConfig::default(),
+        }
+    }
+
     /// Semantic equality, independent of hash-map serialization order.
     pub fn same_contents(&self, other: &Self) -> bool {
         if self.tombstones != other.tombstones {
@@ -1545,6 +2062,13 @@ pub struct SearchQuery {
     pub aggs: std::collections::HashMap<String, Aggregation>,
     #[serde(default)]
     pub wildcard: Option<WildcardQuery>,
+    /// Typo-tolerant term matching (issue #201): each token of
+    /// `fuzzy.value` matches the terms within `fuzziness` edits of it. A
+    /// lexical retriever of its own, so it cannot be combined with
+    /// `query_text`, `wildcard` or `match_phrase`; it can be the lexical
+    /// leg of a hybrid request. See [`fuzzy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzzy: Option<FuzzyQuery>,
     #[serde(default)]
     pub match_phrase: Option<MatchPhraseQuery>,
     #[serde(default)]
@@ -1590,6 +2114,24 @@ pub struct SearchQuery {
     /// `total_hits` still counts matching documents, not groups.
     #[serde(default)]
     pub collapse: Option<CollapseSpec>,
+    /// Result diversification (issue #211): at most `max` hits per distinct
+    /// value of `field`, applied while the result list is collected, so the
+    /// page is filled from the next-best groups rather than cut short.
+    /// `collapse` is the `max: 1` special case with one difference:
+    /// documents with no value for the field are never capped here.
+    ///
+    /// The cap is a function of the result order alone: a hit is kept when
+    /// fewer than `max` hits of its group rank above it. A `search_after`
+    /// cursor therefore needs no extra state: each page is the same capped
+    /// list resumed after the cursor, so a document appears at most once
+    /// and a group spent on earlier pages is never refilled.
+    ///
+    /// `total_hits` (and aggregations) count matching documents before the
+    /// cap, as with `collapse`. A pure kNN request is the exception it
+    /// already was: there `total_hits` is the size of the returned
+    /// neighbour set, which is the diversified one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_per: Option<LimitPerSpec>,
     /// Return only these stored fields with each hit (OpenSearch
     /// `_source.includes`). `None` returns every field.
     #[serde(default)]
@@ -1599,6 +2141,103 @@ pub struct SearchQuery {
     /// is by far the largest field and almost never read back.
     #[serde(default)]
     pub source_excludes: Option<Vec<String>>,
+    /// How a hybrid request (a lexical query plus `knn`) fuses its two
+    /// result lists. Elasticsearch's `"rank": {"rrf": {...}}` shape.
+    /// `None` on a hybrid request is RRF with the default parameters; on a
+    /// request that is not hybrid it must be `None` (see
+    /// [`SearchQuery::validate`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<RankSpec>,
+    /// Which retrievers the request intends to run (proto
+    /// `RetrievalMode`). `None` infers it from the clauses present. When
+    /// given it is checked against them, so a client that asks for
+    /// `hybrid` and forgot the vector gets a 400, not lexical-only hits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RetrievalMode>,
+    /// Restrict `query_text` to these `Text` fields, each optionally
+    /// boosted: `["title^2", "content"]` (issue #249; Elasticsearch
+    /// `multi_match` `most_fields`). A document's score is the sum over
+    /// fields of `boost × BM25` computed with that field's own length and
+    /// statistics. With the AND operator every query term has to match in
+    /// at least one of the fields. Empty (the default) searches the
+    /// combined index of every `Text` field, as before; `_all` names that
+    /// combined index and may be listed alongside real fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+    /// Score modifiers (issue #212): blend numeric, date and geo attributes
+    /// into the score with field-value boosts and linear / exp / gauss
+    /// decays. Applied in a rescore window: the query is ranked by its own
+    /// score first (BM25, fused RRF, or vector similarity, exactly as
+    /// without `rank_by`), the best `window_size` hits are rescored from
+    /// the filter columns and re-sorted, and only those are returned. See
+    /// [`rank::RankBySpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_by: Option<RankBySpec>,
+}
+
+/// Proto `RetrievalMode`, as the JSON API spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RetrievalMode {
+    /// `query_text` / `wildcard` / `match_phrase` (or a filter alone); no `knn`.
+    Lexical,
+    /// `knn` only.
+    Semantic,
+    /// A lexical query and `knn`, fused by Reciprocal Rank Fusion.
+    Hybrid,
+}
+
+/// See `SearchQuery.rank`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RankSpec {
+    #[serde(default)]
+    pub rrf: Option<RrfSpec>,
+}
+
+/// Reciprocal Rank Fusion parameters (Elasticsearch-compatible names and
+/// defaults): `score(d) = Σ_r 1 / (rank_constant + rank_r(d))` over the
+/// retrievers `r` whose top-`rank_window_size` list contains `d`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RrfSpec {
+    /// How many results each retriever contributes, and how long the fused
+    /// list is. Defaults to `max_results` (Elasticsearch: `size`). Must be
+    /// at least `max_results`.
+    #[serde(default)]
+    pub rank_window_size: Option<usize>,
+    /// Damps the advantage of the very top ranks. Default 60; must be ≥ 1.
+    #[serde(default)]
+    pub rank_constant: Option<u32>,
+}
+
+/// Default `rank_constant` (Elasticsearch and the original RRF paper).
+pub const DEFAULT_RRF_RANK_CONSTANT: u32 = 60;
+
+/// Resolved RRF parameters for one request; see [`SearchQuery::rrf`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RrfParams {
+    pub rank_window_size: usize,
+    pub rank_constant: u32,
+}
+
+/// Per-retriever ranks of a fused hit (`ScoredDocument.rank_details`).
+/// Ranks are 1-based positions in each retriever's namespace-wide list;
+/// `None` means the hit was not in that retriever's window.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RankDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knn_rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knn_score: Option<f64>,
+    /// `rank_by` requests only: the hit's score before the modifiers (BM25,
+    /// fused RRF or vector score); `score` is the modified one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_score: Option<f64>,
 }
 
 /// See `SearchQuery.collapse`.
@@ -1607,13 +2246,228 @@ pub struct CollapseSpec {
     pub field: String,
 }
 
+/// See `SearchQuery.limit_per`. JSON: `"limit_per": {"field": "author", "max": 2}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitPerSpec {
+    /// A keyword (or other filterable) field. Documents without a value
+    /// for it are not capped.
+    pub field: String,
+    /// Hits allowed per distinct value; must be >= 1.
+    pub max: usize,
+}
+
 impl SearchQuery {
     /// Request-level checks that do not need any segment: currently the
     /// BM25 parameter ranges. An `Err` is a client error (HTTP 400).
     pub fn validate(&self) -> Result<(), KoshaError> {
         self.bm25_params
             .validate()
+            .map_err(KoshaError::InvalidQuery)?;
+        if let Some(ref fuzzy) = self.fuzzy {
+            fuzzy.validate().map_err(KoshaError::InvalidQuery)?;
+            if !self.query_text.trim().is_empty()
+                || self.wildcard.is_some()
+                || self.match_phrase.is_some()
+                || !self.fields.is_empty()
+            {
+                return Err(KoshaError::InvalidQuery(
+                    "fuzzy is a lexical query of its own; it cannot be combined with \
+                     query_text, fields, wildcard or match_phrase (restrict it with \
+                     fuzzy.field)"
+                        .into(),
+                ));
+            }
+        }
+        if !self.fields.is_empty() {
+            fields::parse_field_boosts(&self.fields).map_err(KoshaError::InvalidQuery)?;
+            if self.match_phrase.is_some() || self.wildcard.is_some() {
+                return Err(KoshaError::InvalidQuery(
+                    "fields applies to query_text; restrict match_phrase with its own \
+                     field / fields, and wildcard with its field"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(ref phrase) = self.match_phrase {
+            for name in phrase.fields.iter().chain(std::iter::once(&phrase.field)) {
+                if name.contains('^') || (name.contains('*') && name.trim() != "*") {
+                    return Err(KoshaError::InvalidQuery(format!(
+                        "match_phrase field {name:?}: boosts and field patterns are not supported"
+                    )));
+                }
+            }
+        }
+        if let Some(ref limit) = self.limit_per {
+            if limit.max == 0 {
+                return Err(KoshaError::InvalidQuery(
+                    "limit_per.max must be >= 1".into(),
+                ));
+            }
+            let field = limit.field.trim();
+            if field.is_empty() || field == "_id" || field == "_score" {
+                return Err(KoshaError::InvalidQuery(format!(
+                    "limit_per.field must name a stored keyword field, not {:?}",
+                    limit.field
+                )));
+            }
+            if self.collapse.is_some() {
+                return Err(KoshaError::InvalidQuery(
+                    "collapse and limit_per cannot be combined; collapse is limit_per with max 1"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(ref rank_by) = self.rank_by {
+            rank_by
+                .compile(self.max_results, 0)
+                .map_err(KoshaError::InvalidQuery)?;
+            if !sort_is_by_score(&self.sort) {
+                return Err(KoshaError::InvalidQuery(
+                    "rank_by reorders by the modified score; it cannot be combined with a \
+                     sort other than [_score desc] / [_score desc, _id asc]"
+                        .into(),
+                ));
+            }
+            // The window is the best hits by the query's own score. A
+            // filter alone scores every document the same, so its "best"
+            // window would be an arbitrary cut that drops correct results.
+            if !self.has_lexical_query() && self.knn.is_none() {
+                return Err(KoshaError::InvalidQuery(
+                    "rank_by rescores the best hits of a query; it needs query_text, \
+                     wildcard, match_phrase, fuzzy or knn, not a filter alone"
+                        .into(),
+                ));
+            }
+        }
+        let has_lexical = self.has_lexical_query();
+        let has_knn = self.knn.is_some();
+        match self.mode {
+            Some(RetrievalMode::Hybrid) if !(has_lexical && has_knn) => {
+                return Err(KoshaError::InvalidQuery(
+                    "mode \"hybrid\" needs both a lexical query (query_text, wildcard, \
+                     match_phrase or fuzzy) and knn"
+                        .into(),
+                ));
+            }
+            Some(RetrievalMode::Lexical) if has_knn => {
+                return Err(KoshaError::InvalidQuery(
+                    "mode \"lexical\" cannot have a knn clause".into(),
+                ));
+            }
+            Some(RetrievalMode::Semantic) if !has_knn || has_lexical => {
+                return Err(KoshaError::InvalidQuery(
+                    "mode \"semantic\" needs knn and no lexical query".into(),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(ref rank) = self.rank {
+            let Some(ref rrf) = rank.rrf else {
+                return Err(KoshaError::InvalidQuery(
+                    "rank needs a method; only \"rrf\" is supported".into(),
+                ));
+            };
+            if !self.is_hybrid() {
+                return Err(KoshaError::InvalidQuery(
+                    "rank.rrf fuses a lexical query with knn; the request needs both \
+                     (query_text, wildcard, match_phrase or fuzzy, plus knn)"
+                        .into(),
+                ));
+            }
+            if rrf.rank_constant == Some(0) {
+                return Err(KoshaError::InvalidQuery(
+                    "rank.rrf.rank_constant must be >= 1".into(),
+                ));
+            }
+            if let Some(window) = rrf.rank_window_size {
+                if window == 0 || window < self.max_results {
+                    return Err(KoshaError::InvalidQuery(format!(
+                        "rank.rrf.rank_window_size ({window}) must be >= 1 and >= \
+                         max_results ({})",
+                        self.max_results
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The compiled `rank_by` for this request, `"now"` resolved to the
+    /// current time. `None` without `rank_by`; an invalid one is an error
+    /// ([`Self::validate`] reports it first).
+    pub fn compiled_rank_by(&self) -> Result<Option<CompiledRankBy>, KoshaError> {
+        let Some(ref rank_by) = self.rank_by else {
+            return Ok(None);
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        rank_by
+            .compile(self.max_results, now_ms)
+            .map(Some)
             .map_err(KoshaError::InvalidQuery)
+    }
+
+    /// How many hits each segment must hand back, best first by the
+    /// query's own score, for the page to be right: `from + max_results`,
+    /// widened to the rescore window under `rank_by` (0 stays 0: nothing
+    /// is returned, so nothing is rescored).
+    pub fn collect_depth(&self) -> usize {
+        let page = self.from.saturating_add(self.max_results);
+        match self.rank_by {
+            Some(ref rank_by) if page > 0 => page.max(rank_by.window(self.max_results)),
+            _ => page,
+        }
+    }
+
+    /// True when the request has a lexical retriever: query text, a
+    /// wildcard or a phrase. A filter alone is not one.
+    pub fn has_lexical_query(&self) -> bool {
+        !self.query_text.trim().is_empty()
+            || self.wildcard.is_some()
+            || self.match_phrase.is_some()
+            || self.fuzzy.is_some()
+    }
+
+    /// The parsed `fields` list, or `None` when `query_text` searches the
+    /// combined index (no `fields`, or only `_all` unboosted). An invalid
+    /// list is `None` too; [`Self::validate`] rejects it first.
+    pub fn field_boosts(&self) -> Option<Vec<FieldBoost>> {
+        if self.fields.is_empty() {
+            return None;
+        }
+        let parsed = fields::parse_field_boosts(&self.fields).ok()?;
+        if parsed.len() == 1 && parsed[0].is_all() && parsed[0].boost == 1.0 {
+            return None;
+        }
+        Some(parsed)
+    }
+
+    /// True when the request has both a lexical retriever and `knn`: its
+    /// two result lists are fused with Reciprocal Rank Fusion.
+    pub fn is_hybrid(&self) -> bool {
+        self.knn.is_some() && self.has_lexical_query()
+    }
+
+    /// The RRF parameters for a hybrid request (defaults filled in), or
+    /// `None` when the request is not hybrid.
+    pub fn rrf(&self) -> Option<RrfParams> {
+        if !self.is_hybrid() {
+            return None;
+        }
+        let spec = self.rank.as_ref().and_then(|r| r.rrf.as_ref());
+        Some(RrfParams {
+            rank_window_size: spec
+                .and_then(|s| s.rank_window_size)
+                .unwrap_or(self.max_results)
+                .max(1),
+            rank_constant: spec
+                .and_then(|s| s.rank_constant)
+                .unwrap_or(DEFAULT_RRF_RANK_CONSTANT)
+                .max(1),
+        })
     }
 
     /// True when the vector leg is the only thing that can produce a hit:
@@ -1623,6 +2477,7 @@ impl SearchQuery {
             && self.query_text.trim().is_empty()
             && self.wildcard.is_none()
             && self.match_phrase.is_none()
+            && self.fuzzy.is_none()
             && self.filter.is_none()
     }
 
@@ -1660,10 +2515,13 @@ impl SearchQuery {
     }
 
     /// Whether answering needs a segment's filter columns (`filters.bin`):
-    /// any filter, any aggregation, a collapse, or a sort on a stored field.
+    /// any filter, any aggregation, a collapse or `limit_per`, `rank_by`
+    /// (its modifiers read the columns), or a sort on a stored field.
     pub fn needs_filter_columns(&self) -> bool {
         self.filter.is_some()
             || self.collapse.is_some()
+            || self.limit_per.is_some()
+            || self.rank_by.is_some()
             || self.knn.as_ref().is_some_and(|k| k.filter.is_some())
             || !self.aggs.is_empty()
             || self.sort.iter().any(|spec| {
@@ -1675,7 +2533,7 @@ impl SearchQuery {
 
     /// The filter-column names answering this query can read (#244): every
     /// field named by the filter, the kNN filter, a field sort, the
-    /// collapse and the aggregations. Each `x.keyword`/`x.raw` name also
+    /// collapse, `limit_per`, `rank_by` and the aggregations. Each `x.keyword`/`x.raw` name also
     /// adds its base `x`, because lookups fall back to it (see
     /// [`lookup_field`]). Empty when [`Self::needs_filter_columns`] is
     /// false. The query node hydrates only these columns of a columnar
@@ -1697,6 +2555,14 @@ impl SearchQuery {
         }
         if let Some(collapse) = &self.collapse {
             add(&collapse.field);
+        }
+        // `limit_per` groups hits by a field's value and `rank_by` reads
+        // its modifiers' fields from the filter columns (#211, #212).
+        if let Some(limit_per) = &self.limit_per {
+            add(&limit_per.field);
+        }
+        if let Some(rank_by) = &self.rank_by {
+            rank_by.fields().for_each(&mut add);
         }
         for spec in &self.sort {
             for field in spec.fields.keys() {
@@ -1734,6 +2600,20 @@ impl SearchQuery {
     }
 }
 
+/// True when `sort` orders by score, best first (ties by `_id`): no sort,
+/// `[_score desc]` or `[_score desc, _id asc]`.
+pub fn sort_is_by_score(sort: &[SortSpec]) -> bool {
+    let keys: Vec<(&str, &str)> = sort
+        .iter()
+        .flat_map(|spec| spec.fields.iter())
+        .map(|(field, order)| (field.as_str(), order.order.as_str()))
+        .collect();
+    matches!(
+        keys.as_slice(),
+        [] | [("_score", "desc")] | [("_score", "desc"), ("_id", "asc")]
+    )
+}
+
 /// See `SearchQuery.operator`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1750,8 +2630,22 @@ pub struct ScoredDocument {
     pub doc_id: DocumentId,
     pub score: f64,
     pub fields: Vec<Field>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Legacy single-field highlight fragments: set only for a request
+    /// that used the legacy `{"highlight": {"field": ...}}` form.
+    /// Deprecated: request `highlight.fields` and read `highlight` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlights: Option<Vec<String>>,
+    /// Highlight fragments keyed by field name, ES-shaped
+    /// (`"highlight": {"title": ["..."], "body": ["..."]}`), for a request
+    /// that used `highlight.fields`. A requested field the hit lacks, or
+    /// that is not a text field, is left out; no matching field at all
+    /// leaves the map unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    /// Hybrid (RRF) requests only: where this hit ranked in each
+    /// retriever's list. `score` is then the fused RRF score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_details: Option<RankDetails>,
 }
 
 /// Whether `SearchResult.total_hits` is the exact match count or a capped
@@ -1829,6 +2723,11 @@ pub enum KoshaError {
     /// Transient by construction — callers should retry with backoff, which
     /// the Python `kosha_client` already does. Maps to HTTP 429.
     Overloaded(String),
+    /// The control store (Postgres) could not be reached or returned an
+    /// error. Says nothing about whether a namespace or manifest exists —
+    /// callers that can (query replicas) keep serving their last-known-good
+    /// manifest instead of failing (DESIGN.md §17).
+    ControlPlane(String),
     /// The request itself is malformed or out of range (e.g. BM25 `b`
     /// outside `[0, 1]`). A client error: maps to HTTP 400.
     InvalidQuery(String),
@@ -1847,6 +2746,7 @@ impl std::fmt::Display for KoshaError {
             Self::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
             Self::CorruptSegment(msg) => write!(f, "corrupt segment data: {msg}"),
             Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
+            Self::ControlPlane(msg) => write!(f, "control plane unavailable: {msg}"),
             Self::InvalidQuery(msg) => write!(f, "invalid query: {msg}"),
         }
     }
@@ -2052,6 +2952,75 @@ mod filter_clause_parsing {
 mod tests {
     use super::*;
 
+    fn highlight(json: serde_json::Value) -> Result<HighlightConfig, String> {
+        serde_json::from_value(json).map_err(|e| e.to_string())
+    }
+
+    /// #195: the ES `fields` map and the legacy `field` form normalise into
+    /// one struct; per-field tags fall back to the top level, then `<b>`.
+    #[test]
+    fn highlight_config_accepts_both_shapes_and_resolves_tags() {
+        // Parsed from text: `json!` would sort the keys.
+        let es: HighlightConfig = serde_json::from_str(
+            r#"{"pre_tags": ["<i>"], "fields": {
+                "title": {},
+                "body": {"pre_tags": ["<em>"], "post_tags": ["</em>"], "fragment_size": 150},
+                "summary": null}}"#,
+        )
+        .unwrap();
+        assert!(!es.legacy_single_field);
+        let names: Vec<_> = es.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["title", "body", "summary"], "request order kept");
+        let tags = |name: &str| {
+            let field = es.fields.iter().find(|f| f.name == name).unwrap();
+            (es.pre_tag(field), es.post_tag(field))
+        };
+        assert_eq!(tags("title"), ("<i>", "</b>"));
+        assert_eq!(tags("body"), ("<em>", "</em>"));
+
+        // ES's ordered array form.
+        let arr = highlight(serde_json::json!({"fields": [{"b": {}}, {"a": {}}]})).unwrap();
+        let names: Vec<_> = arr.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["b", "a"]);
+
+        let legacy = highlight(serde_json::json!({"field": "body", "pre_tags": []})).unwrap();
+        assert!(legacy.legacy_single_field);
+        assert_eq!(legacy.fields, vec![HighlightField::new("body")]);
+        // An empty tag list counts as unset, as it always did.
+        assert_eq!(legacy.pre_tag(&legacy.fields[0]), "<b>");
+
+        let err = highlight(serde_json::json!({"field": "a", "fields": {"b": {}}})).unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        assert!(highlight(serde_json::json!({})).is_err());
+        assert!(highlight(serde_json::json!({"fields": "body"})).is_err());
+        assert!(highlight(serde_json::json!({"fields": [{"a": {}}, {"a": {}}]})).is_err());
+    }
+
+    /// The serialized form deserializes back to the same value (the CLI
+    /// client and the result-cache key both serialize the query), and the
+    /// two shapes serialize differently since they answer differently.
+    #[test]
+    fn highlight_config_serde_round_trips() {
+        for json in [
+            serde_json::json!({"field": "body"}),
+            serde_json::json!({"field": "body", "pre_tags": ["<em>"], "post_tags": ["</em>"]}),
+            serde_json::json!({"fields": {"body": {}}}),
+            serde_json::json!({"pre_tags": ["<i>"], "fields": {"z": {"post_tags": ["]"]}, "a": {}}}),
+        ] {
+            let parsed = highlight(json.clone()).unwrap();
+            let again = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(
+                highlight(again.clone()).unwrap(),
+                parsed,
+                "{json} -> {again}"
+            );
+        }
+        assert_ne!(
+            serde_json::to_string(&HighlightConfig::single_field("body")).unwrap(),
+            serde_json::to_string(&HighlightConfig::for_fields(["body"])).unwrap()
+        );
+    }
+
     #[test]
     fn base64_byte_reads_any_byte_without_decoding_the_rest() {
         // Lengths 1..=8 cover every padding shape; 300 spans many groups.
@@ -2188,6 +3157,9 @@ mod tests {
             doc_vectors: false,
             posting_blobs_raw: false,
             filter_columns: None,
+            analysis: None,
+            field_index: None,
+            fuzzy_bloom: None,
         }
     }
 
@@ -2207,6 +3179,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         }
     }
 
@@ -2505,6 +3478,32 @@ mod bm25_overrides {
     }
 
     #[test]
+    fn stats_scope_parses_and_defaults() {
+        let q = query(r#"{"query_text": "x"}"#);
+        assert_eq!(q.bm25_params.stats, None);
+        let q = query(r#"{"query_text": "x", "bm25_params": {"stats": "segment"}}"#);
+        assert_eq!(q.bm25_params.stats, Some(Bm25StatsScope::Segment));
+        let q = query(r#"{"query_text": "x", "bm25_params": {"stats": "namespace", "b": 0.5}}"#);
+        assert_eq!(q.bm25_params.stats, Some(Bm25StatsScope::Namespace));
+        assert_eq!(q.bm25_params.b, Some(0.5));
+        assert!(serde_json::from_str::<SearchQuery>(
+            r#"{"query_text": "x", "bm25_params": {"stats": "shard"}}"#
+        )
+        .is_err());
+        assert_eq!(
+            Bm25StatsScope::parse(" Segment "),
+            Some(Bm25StatsScope::Segment)
+        );
+        assert_eq!(Bm25StatsScope::parse("bogus"), None);
+        let v = serde_json::to_value(Bm25Overrides {
+            stats: Some(Bm25StatsScope::Segment),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(v, serde_json::json!({"stats": "segment"}));
+    }
+
+    #[test]
     fn default_overrides_serialize_empty() {
         // Keeps result-cache keys and fan-out payloads small, and an older
         // node reading this falls back to its own 1.2 / 0.75 default.
@@ -2531,6 +3530,7 @@ mod bm25_overrides {
             Bm25Overrides {
                 k1: None,
                 b: Some(f64::NAN),
+                stats: None,
             },
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
@@ -2585,6 +3585,30 @@ mod filter_column_field_tests {
         let plain: SearchQuery =
             serde_json::from_value(serde_json::json!({"query_text": "x"})).unwrap();
         assert!(plain.filter_column_fields().is_empty());
+    }
+
+    /// `limit_per`, `rank_by` and `geo_distance` read filter columns too:
+    /// a query node that hydrated only the columns this set names must
+    /// still hold them, or they would silently read as absent.
+    #[test]
+    fn filter_column_fields_covers_limit_per_rank_by_and_geo() {
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "x",
+            "filter": {"geo_distance": {"distance": "10km", "loc": "0,0"}},
+            "limit_per": {"field": "author.keyword", "max": 1},
+            "rank_by": {"functions": [
+                {"field_value": {"field": "votes", "modifier": "log1p"}},
+                {"decay": {"field": "published", "function": "exp",
+                           "origin": "2026-01-01", "scale": "30d"}}
+            ]}
+        }))
+        .unwrap();
+        assert!(q.needs_filter_columns());
+        let got: Vec<String> = q.filter_column_fields().into_iter().collect();
+        assert_eq!(
+            got,
+            ["author", "author.keyword", "loc", "published", "votes"]
+        );
     }
 
     #[test]

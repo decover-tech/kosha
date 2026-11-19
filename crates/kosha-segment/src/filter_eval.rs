@@ -118,6 +118,30 @@ pub fn evaluate_filter_columns(
             }
             set
         }
+        FilterClause::GeoDistance { geo_distance: geo } => {
+            // `kosha_core::docset`'s rule over the dictionary: `GeoPoint`
+            // values are canonical "lat,lon" strings, so each distinct
+            // point is tested once and its documents taken from the
+            // term's bitmap. Terms that do not parse as a point never
+            // match.
+            let mut set = DocSet::empty(doc_count);
+            if let Some(column) = string_column(source, &geo.field)? {
+                if let FilterColumn::String(c) = &*column {
+                    for ord in 0..c.term_count() as u32 {
+                        let within = kosha_core::rank::parse_geo_str(c.term(ord)).is_some_and(
+                            |(lat, lon)| {
+                                kosha_core::rank::haversine_meters(geo.lat, geo.lon, lat, lon)
+                                    <= geo.distance
+                            },
+                        );
+                        if within {
+                            c.for_each_doc(ord, |doc| set.insert(doc));
+                        }
+                    }
+                }
+            }
+            set
+        }
     })
 }
 

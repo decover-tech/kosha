@@ -179,7 +179,9 @@ per-org/matter index in `IndexRegistry`. Each namespace has:
 
 - A **schema**: field definitions (text, keyword, date, vector\<dim\>, geo, etc.), which fields are
   lexically indexed, which carry vector indices, which are filter-only.
-- An **index profile**: tokenizer/analyzer choice, ANN index type + params (e.g. HNSW `M`/`efConstruction`,
+- An **index profile**: tokenizer/analyzer choice (implemented: the schema's per-field `analyzer`,
+  stored on the manifest and applied by the segment writers — see §6.2 and README "Analyzers"),
+  ANN index type + params (e.g. HNSW `M`/`efConstruction`,
   or IVF-PQ for very large namespaces), compaction policy, cache priority tier.
 - A **manifest**: an ordered, versioned list of segment references that make up the current
   readable state of the namespace (see 6.3).
@@ -256,6 +258,28 @@ then set it to `2`; compaction converts segments as it merges them. Rollback: se
 and compaction rewrites columnar segments as `filters.bin`, but a binary older than #244 cannot
 read columnar segments (their filters match nothing), so do not downgrade past this release
 while any remain.
+**Analysis is versioned per segment (#220, #221).** `inverted.idx` holds whatever terms the
+analyzer produced at write time, so a segment's `footer.json` records the exact analysis chains its
+`Text` fields went through (`analysis`: tokenizer + version + filters, with stopword lists copied
+in). A footer without `analysis` means the legacy `standard@1` chain — every segment written before
+analyzers existed, and every segment written since with default settings, which therefore stay
+byte-identical. Queries are analyzed **per segment** with that segment's chains; a segment whose
+fields used several chains reads the query once per chain and a document matches if it matches one
+reading in full (scored with its best). An analyzer change (schema edit, tokenizer upgrade) thus
+never makes older segments go dark: they keep answering with the analysis they were written with
+until compaction re-analyzes their stored documents under the current schema.
+
+**Per-field indexes (#249).** `inverted.idx` keeps the **combined** index (every `Text` field of a
+document in one postings list per term, one length per document) that every query without
+`fields` reads, and segments written since #249 add each field's own postings under the key
+`\0{field}\0{term}`, a per-field norms list (posting tf = the document's length in that field),
+and `field_index` in the footer (per-field `doc_count` / `total_length`, position gap). Field keys
+use the same posting blobs, caches and hydration as any term; the term bloom holds only combined
+terms (a field term is always also one), so bloom checks strip the field prefix. Consecutive `Text`
+values of a document are a 65,536-position gap apart in both indexes and the phrase slop is
+clamped below it, so a phrase never matches across fields. A segment without `field_index`
+(written before #249, or with `KOSHA_FIELD_INDEX=off`) answers field-restricted queries from its
+combined index rather than with zero hits, until compaction rewrites it.
 
 Segments are sized to a target (e.g. 128–512MB) so that a full segment fetch/cache-fill is a
 bounded, predictable operation. Small/continuous writes are buffered (§7) and flushed as a segment
@@ -285,7 +309,11 @@ Iceberg/Delta Lake use for tables, applied to a search index.
    `IndexDocuments` call.
 2. **Buffer**: the ingest node appends to an in-memory + local-SSD write buffer for that namespace,
    and synchronously appends to a WAL object in S3 (small, cheap PUTs) so the write survives node
-   loss before it's part of a segment.
+   loss before it's part of a segment. *Implemented today:* the WAL is on local disk behind a
+   `WalStore` trait (an S3 implementation is #236). Concurrent appends are group-committed: one
+   WAL file (one fsync) holds the records of every namespace that arrived during the previous
+   commit, each record carries its own LSN, and a file is deleted only once every namespace in it
+   has a published manifest checkpoint at or past its records there.
 3. **Flush**: when the buffer crosses a size/time threshold (default: 512MB or 60s, whichever
    first), the ingest node builds inverted + vector + filter indices for the buffered documents,
    writes a new segment to S3, and publishes an updated manifest that adds the new segment.
@@ -436,12 +464,121 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      otherwise HTTP 400). Nothing on disk bakes them in: postings keep raw term frequencies and
      block summaries keep `max_tf` / `min_field_length`, so block-max WAND ceilings are computed
      at query time with the same scorer as the hits and pruning stays exact for any valid values.
+     BM25's collection statistics are **namespace-level** (issue #246): `N = Σ doc_count` and
+     `avgdl = Σ total_field_length / N` over every manifest segment's footer, and
+     `df(term) = Σ` per-segment posting counts, computed lazily for query terms only (a segment
+     whose term bloom rules the term out contributes 0 without being opened) and cached per
+     `(namespace, manifest version, segment-list fingerprint, term)`. Every segment scores with
+     the same values, so a document's score does not depend on which segment it landed in and
+     the cross-segment merge compares like with like; the block-max ceilings take their `df`
+     from the same scorer. Deleted documents still count until compaction drops them, as they do
+     in Lucene. If any segment's footer or a term's postings can't be read locally, the search
+     falls back to per-segment statistics as a whole (reported as `segment_fallback`, and not result-cached) rather than
+     score with a partial `df`; the server therefore also hydrates the inverted index and posting
+     blob of segments the query's filter prunes but whose term bloom admits a query term.
+     `bm25_params.stats: "segment"` (or `KOSHA_BM25_STATS=segment` engine-wide) restores
+     per-segment statistics for A/B debugging. Wildcard queries keep per-segment statistics,
+     since their expansion is per segment.
+     **Fuzzy** (`fuzzy: {field, value, fuzziness, prefix_length, max_expansions,
+     transpositions}`, issue #201) analyzes the value with each segment's chains and expands each
+     token against that segment's term table. Every inverted-index format keeps the table sorted,
+     so it already is the leaf order of a trie: the expansion is a Levenshtein automaton in DP
+     form (optimal string alignment, so an adjacent swap is one edit) whose rows are shared across
+     consecutive terms' common prefix, and a prefix whose row minimum exceeds the budget skips its
+     whole range by binary search; `prefix_length` narrows the range up front. No sidecar is
+     needed, so segments already on S3 expand the same way. The best `max_expansions` terms per
+     token (fewest edits, then term order; the exact term first) are read like any term and
+     scored in edit-distance tiers, `(2 − edits) + tf_norm` with `tf_norm ∈ (0, 1]` the BM25 tf
+     saturation under the namespace `avgdl`, so an exact match outranks every one-edit match in
+     the namespace, whatever their tf or length. IDF is left out because the expansions (and so
+     any `df`) differ per segment; a per-segment IDF would let a rare typo in one segment outrank
+     an exact hit in another. Pruning: `footer.json` carries `fuzzy_bloom`, a bloom over the
+     vocabulary's one-deletion neighbourhood (SymSpell's observation: two strings are within one
+     edit only if their deletion neighbourhoods meet), so a one-edit token costs `len + 1` bloom
+     probes; zero-edit tokens use the term bloom; two-edit tokens, segments written before #201
+     and segments too large for a useful neighbourhood bloom are always opened. Every posting
+     blob shard is hydrated for a fuzzy query, as for a wildcard.
+     A `fields` query (`["title^2", "content"]`, issue #249) scores
+     `Σ_fields boost × BM25_field`, each field with its own postings, per-document lengths and
+     statistics (`N` = documents with the field, `avgdl` = its mean length, `df` from its own
+     postings — namespace-level, summed from the footers' `field_index` and the field keys'
+     posting counts). Each field reads the query with the analysis chain its segment indexed it
+     with; with AND, each query position must match in some listed field. It runs on an
+     exhaustive per-field path (per-field block summaries carry no lengths yet, so no WAND).
+     `match_phrase` with a `field` (or `fields`) is matched in that field's postings.
+     Block-max WAND prunes against a **namespace-wide top-k floor** (issue #248): segments of
+     one plain ranked lexical query (no kNN/hybrid, phrase, wildcard, `fields`, fuzzy, aggs,
+     collapse, `limit_per`, custom sort or `search_after`) share an `AtomicU64` holding the highest
+     k-th-best score any segment has reached (`k = from + max_results`, or the `rank_by` rescore
+     window when that is larger), and each prunes blocks and candidates strictly
+     below `max(local k-th-best, shared floor)`. A published value is the k-th score of `k` real,
+     accepted documents scored exactly as the merge ranks them, so the final page's k-th score
+     is at least that high and nothing that could reach the page is ever pruned; ties are still
+     scored. Before scoring, each segment's ceiling (Σ over query terms of its best block's
+     `block_max_score`) is computed and segments are handed out highest ceiling first from a
+     shared queue, so the strongest segments raise the floor early (the ceiling uses the terms
+     that segment's own analysis chains read the query as, #220; a mixed-analyzer segment gets an
+     infinite ceiling); a single-term segment whose
+     ceiling is already below the floor is skipped outright (its exact count is the term's
+     `df`). The ceiling inputs are cached per `(namespace, manifest version, segment-list
+     fingerprint, term)` like the `df` values: each segment's footer shape and the Pareto
+     frontier of the term's block `(max_tf, min_field_length)` skip summaries. BM25 rises with
+     tf and falls with length for every valid k1/b, so the best block under any request's
+     scorer lies on that frontier, and a warm query computes all ceilings from memory (~10 µs
+     for 200 segments); a new term costs one pass reading skip summaries, decoding no posting. Counts are unaffected:
+     exact counting still visits every match, and capped counting stops a segment only once its
+     own count reaches the cap. A legacy segment without stored summaries has an infinite
+     ceiling (visited first, never skipped). A segment that publishes and then abandons its WAND
+     walk for the general path (a corrupt block found mid-walk) poisons the floor and the search
+     is rescored with per-segment floors. Hybrid (RRF) requests are untouched: their lexical
+     list is a rank window, scored by the general path. `SearchPhaseStats` reports
+     `wand_docs_scored`, `wand_segments_skipped`, `wand_global_threshold` and `wand_bounds_ms`.
    - Semantic: ANN search over `vector.idx` (HNSW graph traversal or IVF-PQ probe), scored by
      cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
      query in `query_builder.py`.
 5. **Fusion**: candidate sets from lexical and semantic retrieval are merged via Reciprocal Rank
-   Fusion (configurable k), matching `ranking/rrf.py`'s existing behavior — ported in, not
-   reinvented.
+   Fusion, `score(d) = Σ_r 1/(rank_constant + rank_r(d))`, matching `ranking/rrf.py`'s existing
+   behavior — ported in, not reinvented. Request shape is Elasticsearch's
+   `"rank": {"rrf": {"rank_window_size", "rank_constant"}}` (defaults: `max_results`, 60); every
+   request with both a lexical query and `knn` is fused this way (implemented, issue #228). Ranks
+   are **global**: each segment returns its best `rank_window_size` BM25 hits and its nearest `k`
+   vectors, and only after every segment has answered are both lists ordered across the whole
+   namespace, cut to their windows, ranked and fused. Fusing per-segment ranks would make each
+   segment's best match rank 1 however weak it is namespace-wide; it is also why namespace-level
+   BM25 statistics (above) matter here — lexical scores have to be comparable across segments
+   before they can be ranked together. Wildcard queries keep per-segment statistics, so their
+   global lexical order is approximate. The top-level filter applies to both retrievers,
+   `knn.filter` to the vector one only. `total_hits` and aggregations cover the lexical matches
+   plus the vector window; `from`/`sort`/`collapse`/`search_after` apply within the fused list,
+   which is at most `rank_window_size` long. Each hit carries its per-retriever ranks.
+   **Diversification** (`limit_per: {field, max}`, issue #211) caps hits per distinct value of a
+   keyword field. Whether a hit survives depends only on the result order — fewer than `max`
+   hits of its group rank above it — so it is decided while collecting, not by post-filtering a
+   page, and a `search_after` cursor needs no cap state of its own: every page recomputes the
+   same capped list and resumes it after the cursor. Each segment caps its own ordered hits
+   first (a hit in the namespace's capped list always survives its segment's cap, since no more
+   of its group can rank above it inside one segment than across all of them), cuts to
+   `from + max_results` when there is no cursor, and the reduce step caps the merged list again.
+   Under a cursor a segment does not drop hits before it: those are what use up a group's cap
+   namespace-wide. Hybrid requests diversify each retriever's list before its window cut, so the
+   fused list holds at least `rank_window_size` capped hits; kNN segments probe up to
+   `num_candidates` instead of `k` so the cap has neighbours to choose from. `total_hits` counts
+   matches before the cap, as with `collapse` (which is the `max: 1` case and the same code).
+   **Score modifiers** (`rank_by`, issue #212) blend attributes into the score: field-value
+   boosts and linear / exp / gauss decays over numeric, date and geo fields, read from the
+   filter columns (no doc-store reads). An unbounded modifier would break the block-max WAND
+   ceilings, so modifiers are applied in a **rescore window** rather than folded into block
+   maxima: retrieval, WAND pruning and fusion run exactly as without `rank_by`, each segment
+   hands back its best `max(window_size, from + max_results)` hits by that score (WAND's top-k
+   is simply widened), the reduce step keeps the namespace's best `window_size`, rescores them
+   and re-sorts. The window is therefore the exact top-N by the unmodified score, and nothing
+   outside it is returned (`total_hits` still counts every match). Group caps and `search_after`
+   apply to the rescored order, so segments do not cap or cursor-filter under `rank_by`.
+   `origin: "now"` is resolved once per request, and such responses bypass the result cache.
+   **Geo**: a `GeoPoint` value is stored as given and copied into the string filter column as
+   canonical `"lat,lon"` text — an existing column type, so segments stay readable by older
+   binaries and no footer or manifest field changes. `geo_distance` filters parse that column
+   (haversine, mean Earth radius); geo decays read it the same way.
 6. **Rerank hook**: an optional, pluggable cross-encoder rerank stage (Cohere today) runs on the
    fused top-N before results return — same role as `ChunkGenerator.__re_rank`.
 7. **Cursor**: response includes per-mode (lexical/semantic) cursor state (last score + doc id) so
@@ -733,7 +870,11 @@ one-time batch job reading from the existing Postgres/S3 document store and repl
 - **Manifest store dependency**: the control-plane metadata store (namespace registry, manifest
   pointers) is a new stateful dependency (likely Postgres, reusing Callosum's existing database)
   and becomes a new availability-critical path for the *write* side; read-path availability should
-  degrade gracefully (serve last-known-good manifest) if it's briefly unavailable.
+  degrade gracefully (serve last-known-good manifest) if it's briefly unavailable. *Implemented
+  for query pods (#232):* a background refresher polls manifest versions every
+  `KOSHA_MANIFEST_REFRESH_MS`; on control-store errors it keeps the last-known-good manifests,
+  counts the errors and lets `manifest_lag_seconds` (in `/v1/stats`) grow. Searches fail only for
+  a namespace the pod has never loaded. The write side still requires the store.
 - **Compaction cost/scheduling**: ~~needs a concrete policy (size-tiered vs. leveled)~~
   **resolved for Phase 1 in §7.1** (size-tiered lite, per-namespace locks, need-based triggers,
   admin `full` mode as emergency-only). Still open: cost model / fair multi-tenant scheduling for

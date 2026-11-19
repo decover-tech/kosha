@@ -29,6 +29,12 @@ pub(crate) struct Warming {
     /// Namespaces the boot pass is warming (explicit plus usage), for
     /// `/readyz` while it runs.
     pub boot_namespaces: Mutex<Vec<String>>,
+    /// The manifest the warmer last saw per namespace: the re-warm tick's
+    /// baseline for "which segments are new". It cannot be the local
+    /// manifest before its own refresh, because the manifest refresher
+    /// (#232) installs new versions on its own schedule and would hide the
+    /// segments they added.
+    pub observed: Mutex<HashMap<String, Arc<kosha_core::Manifest>>>,
 }
 
 impl Warming {
@@ -41,6 +47,7 @@ impl Warming {
             rewarms: Mutex::new(VecDeque::new()),
             persist: Mutex::new(PersistStatus::default()),
             boot_namespaces: Mutex::new(Vec::new()),
+            observed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -134,34 +141,6 @@ pub(crate) fn local_class_sizes(ns_dir: &Path) -> HashMap<(String, FileClass), u
         }
     }
     group_class_sizes(objects)
-}
-
-/// The probe query the scoring-class warm hydrates for: empty text, so no
-/// bloom pruning and no posting shards — just the scaffolding every search
-/// needs (`footer.json` + `inverted.idx` + `doc_store.offsets`).
-#[cfg(feature = "s3")]
-fn scaffolding_probe_query() -> SearchQuery {
-    SearchQuery {
-        query_text: String::new(),
-        max_results: 0,
-        bm25_params: Default::default(),
-        from: 0,
-        filter: None,
-        sort: Vec::new(),
-        search_after: None,
-        highlight: None,
-        aggs: HashMap::new(),
-        wildcard: None,
-        match_phrase: None,
-        knn: None,
-        exact_total_hits: None,
-        total_hits_cap: None,
-        operator: None,
-        no_cache: None,
-        collapse: None,
-        source_includes: None,
-        source_excludes: None,
-    }
 }
 
 impl WarmStorage for AppState {
@@ -300,13 +279,10 @@ impl AppState {
                     wal_origin: None,
                     tombstones: HashMap::new(),
                     deletion_vectors: HashMap::new(),
+                    schema: None,
                 };
-                let o = self.hydrate_segments_for_search(
-                    ns,
-                    &subset,
-                    &scaffolding_probe_query(),
-                    &request,
-                );
+                let o =
+                    self.hydrate_segments_for_search(ns, &subset, &warmup_probe_query(), &request);
                 BatchOutcome {
                     files: o.files_fetched as u64,
                     bytes: o.bytes_fetched,
@@ -660,9 +636,16 @@ impl AppState {
         let mut specs = Vec::new();
         for (ns, source) in self.hot_specs() {
             // A query pod may not hold this namespace's manifest yet.
-            if let Err(e) = self.refresh_query_namespace(&ns) {
+            if let Err(e) = self.refresh_query_namespace(&ns, false) {
                 errors.push(format!("'{}' manifest refresh failed: {e}; skipped", ns.0));
                 continue;
+            }
+            if let Some(manifest) = self.indexer.manifest_shared(&ns) {
+                self.warming
+                    .observed
+                    .lock()
+                    .unwrap()
+                    .insert(ns.0.clone(), manifest);
             }
             specs.push(WarmSpec {
                 ns,
@@ -695,26 +678,48 @@ impl AppState {
         }
         let mut specs = Vec::new();
         for (ns, source) in self.hot_specs() {
-            let Some(before) = self.indexer.manifest_shared(&ns) else {
+            let Some(local) = self.indexer.manifest_shared(&ns) else {
                 // Never loaded here: the first search (or boot) loads it.
                 continue;
             };
-            let Some(stored) = self.controller.lock().unwrap().manifest_version(&ns) else {
-                continue;
+            // Baseline: what this poller last saw, else the local manifest
+            // (see `Warming::observed`).
+            let before = self
+                .warming
+                .observed
+                .lock()
+                .unwrap()
+                .get(&ns.0)
+                .cloned()
+                .unwrap_or_else(|| local.clone());
+            let stored = match self.controller.lock().unwrap().manifest_version(&ns) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!("warn: warmup[rewarm]: '{}' version check failed: {e}", ns.0);
+                    continue;
+                }
             };
-            if before.version >= stored {
-                continue;
-            }
-            if let Err(e) = self.refresh_query_namespace(&ns) {
-                eprintln!(
-                    "warn: warmup[rewarm]: '{}' manifest refresh failed: {e}",
-                    ns.0
-                );
-                continue;
+            if local.version < stored {
+                if let Err(e) = self.refresh_query_namespace(&ns, false) {
+                    eprintln!(
+                        "warn: warmup[rewarm]: '{}' manifest refresh failed: {e}",
+                        ns.0
+                    );
+                    continue;
+                }
             }
             let Some(after) = self.indexer.manifest_shared(&ns) else {
                 continue;
             };
+            self.warming
+                .observed
+                .lock()
+                .unwrap()
+                .insert(ns.0.clone(), after.clone());
+            if after.version <= before.version {
+                continue;
+            }
             let old: HashSet<&str> = before
                 .segments
                 .iter()
