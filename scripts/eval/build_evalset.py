@@ -259,6 +259,12 @@ def ids_or_none(ids):
     return {"ids": ids} if len(ids) <= ID_CAP else {}
 
 
+def top_buckets(counter, size=1000):
+    """What a terms aggregation of `size` must return: the largest buckets."""
+    top = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:size]
+    return {"counts": dict(top), "truncated": len(counter) > size}
+
+
 def counted(area, query, total):
     return case(area, {"size": 0, "track_total_hits": True, "query": query}, total=total)
 
@@ -268,17 +274,17 @@ case("matter", {"size": 0, "query": scoped(), "aggs": {"documents": {"cardinalit
      value={"agg": "documents", "value": len(all_docs)})
 for field in ("fileFormats", "system_tags"):
     case("matter", {"size": 0, "query": scoped(), "aggs": {"by": {"terms": {"field": field, "size": 1000}}}},
-         buckets={"agg": "by", "counts": dict(counts[field])})
+         buckets={"agg": "by", **top_buckets(counts[field])})
 for hot in (True, False):
     counted("matter", scoped({"term": {"isHot": hot}}), counts["isHot"][hot])
 
 for w in WORDS:
     ref = case("word", {"size": 20, "track_total_hits": True, "_source": ["documentId"], "query": scoped(must=match(w))},
                total=len(word_ids[w]), in_content_only=word_content[w], **ids_or_none(word_ids[w]))
-    top = dict(sorted(word_docs[w].items(), key=lambda kv: (-kv[1], kv[0]))[:1000])
+    top = top_buckets(word_docs[w])
     case("word_per_document", {"size": 0, "query": scoped(must=match(w)),
                                "aggs": {"per_document": {"terms": {"field": "documentId", "size": 1000}}}},
-         buckets={"agg": "per_document", "counts": top, "truncated": len(word_docs[w]) > 1000})
+         buckets={"agg": "per_document", **top})
     case("word_grouped", {"size": 20, "_source": ["documentId"], "collapse": {"field": "documentId"},
                           "query": scoped(must=match(w))},
          groups=min(20, len(word_docs[w])), **({"ids_ref": ref} if len(word_ids[w]) <= ID_CAP else {}))

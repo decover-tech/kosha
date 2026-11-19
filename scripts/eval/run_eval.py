@@ -210,12 +210,13 @@ for case in cases:
 failures.close()
 report["correctness"] = {a: dict(c) for a, c in correct.items()}
 report["passed"] = sum(c["passed"] for c in correct.values())
-report["failed"] = sum(c["failed"] for c in correct.values())
+report["unanswered"] = sum(c["errors"] for c in correct.values())  # the request itself failed
+report["failed"] = sum(c["failed"] for c in correct.values()) - report["unanswered"]  # answered wrongly
 if recalls:
     report["semantic"] = {"cases": len(recalls), "mean_recall_at_10": round(sum(recalls) / len(recalls), 3),
                           "top_hit_right": sum(top1)}
 report["latency_first_ms"] = {a: summary(v) for a, v in first.items()}
-print(f"correctness done: {report['passed']} passed, {report['failed']} failed", flush=True)
+print(f"correctness done: {report['passed']} passed, {report['failed']} wrong, {report['unanswered']} unanswered", flush=True)
 
 # ── 2. Latency: warm (answered from the index), then cached ────────────────
 for label, rounds, cached in (("warm", mode["warm"], False), ("cached", mode["cached"], True)):
@@ -256,12 +257,13 @@ def cell(now, before):
 
 out = [f"# Kosha eval: {args.mode}, matter {manifest['matter'][:8]}, set {manifest['version']}", "",
        f"{report['started']} to {report['ended']} UTC, {args.host}", "",
-       f"**Correctness: {report['passed']} of {report['passed'] + report['failed']} cases pass.**"]
+       f"**Correctness: {report['passed']} of {len(cases)} cases pass; {report['failed']} answered wrongly, "
+       f"{report['unanswered']} got no answer (request failed).**"]
 if recalls:
     s = report["semantic"]
     out.append(f"Semantic: mean recall@10 {s['mean_recall_at_10']}, top hit right in {s['top_hit_right']} of {s['cases']}.")
-out += ["", "| Area | Passed | Failed | Request errors |", "|---|---|---|---|"]
-out += [f"| {a} | {c.get('passed', 0)} | {c.get('failed', 0)} | {c.get('errors', 0)} |" for a, c in report["correctness"].items()]
+out += ["", "| Area | Passed | Wrong | No answer |", "|---|---|---|---|"]
+out += [f"| {a} | {c.get('passed', 0)} | {c.get('failed', 0) - c.get('errors', 0)} | {c.get('errors', 0)} |" for a, c in report["correctness"].items()]
 for key, title in (("latency_first_ms", "first request"), ("latency_warm_ms", "warm"), ("latency_cached_ms", "result cache allowed")):
     if key in report:
         out += ["", f"Latency, {title} (ms)", "", "| Area | n | p50 | p90 | p95 |", "|---|---|---|---|---|"]
