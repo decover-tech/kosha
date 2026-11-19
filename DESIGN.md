@@ -283,7 +283,7 @@ Indexer
 - Ingest / flush / exists / replace / delete take that namespace's `state` lock only.
 - Compaction takes `compact` for the whole operation (no concurrent compact on the same ns), but
   holds `state` only for (a) selecting merge inputs + cloning tombstones, and (b) CAS-publishing
-  the new manifest. Merge I/O (open + `iter_doc_records` + `SegmentWriter::finalize`) runs with
+  the new manifest. Merge I/O (open + `iter_doc_records_raw` + `SegmentWriter::finalize`) runs with
   `state` released so searches and writes against other work on that namespace can proceed against
   the pre-compact snapshot; concurrent mutations that remove a merge input cause publish to abort
   (or retry) rather than corrupt the manifest.
@@ -294,6 +294,27 @@ Indexer
   its inputs are still listed remotely with no new remote deletes. A remote compaction is accepted
   only if it removed no segment with unpublished local deletes. Otherwise the publish fails with
   409, and nothing is published that references a segment the remote manifest removed.
+
+**Merge memory (#242)**
+
+A merge feeds every live input document through one `SegmentWriter`, so its heap is the
+writer's heap:
+
+- Stored records stream to `.build/doc_store.bin`; sidecar vectors arrive as f32 from
+  `SegmentReader::iter_doc_records_raw` and go to `doc_vectors.bin` without a JSON round trip.
+- In-memory postings are capped by `KOSHA_SEGMENT_BUILD_MEMORY_BYTES`; past it they spill to
+  term-sorted runs.
+- `finalize` k-way merges the runs by term. Only each run's head term and posting count are
+  resident; a term's postings stream from the runs into a per-term encoder that writes the v5
+  skip-split (or v4) bytes incrementally and spills its sections to scratch files past
+  1/16 of the budget (4 KiB to 8 MiB). A term in every document costs no more memory than a rare
+  one. The output is byte-identical to the whole-list encoders.
+
+What remains O(input): the term table and string pool (O(vocabulary)), about 30 B per document
+for the doc-store offsets and 4 B for its field length, filter columns (short values only: `Text`
+is capped at 256 chars), and vectors plus k-means (#253). `crates/kosha-segment/tests/merge_memory.rs`
+asserts peak heap ≤ budget + 64 B/doc + 6 MiB for a merge where one term occurs 32 times in every
+document.
 
 **Merge selection (size-tiered lite)**
 
