@@ -17,6 +17,7 @@ fn candidate(segment: &str, version: u64) -> Manifest {
         wal_checkpoint: 1,
         wal_origin: Some(segment.into()),
         deletion_vectors: Default::default(),
+        schema: None,
         tombstones: [(SegmentId(segment.into()), (0..256).collect())]
             .into_iter()
             .collect(),
@@ -86,4 +87,22 @@ fn postgres_cas_race_and_ambiguous_commit_retry() {
         "an old retry cannot rewind a newer commit"
     );
     assert!(observer.manifest_cloned(&ns).unwrap().same_contents(&next));
+}
+
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_manifest_versions_poll_and_missing_namespace() {
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let mut store = PgStore::new(&url).unwrap();
+    let ns = NamespaceId(format!("versions-test-{}", uuid::Uuid::new_v4()));
+    store
+        .compare_and_swap_manifest(&ns, 0, candidate("versions", 3))
+        .unwrap();
+    let versions = store.manifest_versions().unwrap();
+    assert!(versions.contains(&(ns.clone(), 3)), "{versions:?}");
+    assert_eq!(store.manifest_version(&ns).unwrap(), Some(3));
+    let missing = NamespaceId(format!("missing-{}", uuid::Uuid::new_v4()));
+    assert_eq!(store.manifest_version(&missing).unwrap(), None);
+    assert!(store.try_manifest_cloned(&missing).unwrap().is_none());
+    assert_eq!(store.try_manifest_cloned(&ns).unwrap().unwrap().version, 3);
 }

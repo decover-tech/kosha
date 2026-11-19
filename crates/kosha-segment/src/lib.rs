@@ -1,4 +1,6 @@
-use std::collections::{HashMap, VecDeque};
+pub mod analysis;
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -10,6 +12,9 @@ use kosha_core::{
     AggregationResults, Bm25Params, DocRecord, DocumentId, Field, FieldType, FilterStore, Footer,
     KoshaError, LocalStorage, Posting, SegmentId, StorageBackend, VectorStore,
 };
+use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
+
+pub use analysis::Analyzer;
 
 /// A point in HNSW space using cosine distance.
 #[derive(Clone)]
@@ -91,6 +96,14 @@ pub struct SegmentWriter {
     /// `(doc_seq, field_idx, index into self.vectors)` for each vector moved
     /// to the sidecar, in doc_seq then field order.
     doc_vector_entries: Vec<(u32, u32, u32)>,
+    /// Chain for `Text` fields without their own (#220).
+    default_analyzer: Analyzer,
+    /// Per-field chains that differ from `default_analyzer`.
+    field_analyzers: HashMap<String, Analyzer>,
+    /// Fields indexed with a non-default chain, for the footer.
+    analyzed_fields: BTreeMap<String, AnalyzerSpec>,
+    /// Whether any `Text` value went through `default_analyzer`.
+    default_analyzer_used: bool,
 }
 
 impl SegmentWriter {
@@ -128,7 +141,40 @@ impl SegmentWriter {
             vector_store_mode: VectorStoreMode::from_env(),
             doc_vector_fields: Vec::new(),
             doc_vector_entries: Vec::new(),
+            default_analyzer: Analyzer::new(&AnalyzerSpec::legacy()),
+            field_analyzers: HashMap::new(),
+            analyzed_fields: BTreeMap::new(),
+            default_analyzer_used: false,
         }
+    }
+
+    /// Analyze `Text` fields with `config` (the namespace schema's
+    /// analyzers, #220) instead of the default `standard` chain. The chains
+    /// actually used are recorded in the footer, and queries are analyzed
+    /// with them, so this never affects how other segments are searched.
+    pub fn with_analysis(mut self, config: &AnalysisConfig) -> Self {
+        self.default_analyzer = Analyzer::new(&config.default);
+        self.field_analyzers = config
+            .fields
+            .iter()
+            .filter(|(_, spec)| **spec != config.default)
+            .map(|(name, spec)| (name.clone(), Analyzer::new(spec)))
+            .collect();
+        self
+    }
+
+    /// The footer's `analysis`: `None` when every `Text` value went
+    /// through the legacy chain, which keeps default segments
+    /// byte-identical to those written before analyzers existed.
+    fn segment_analysis(&self) -> Option<SegmentAnalysis> {
+        if self.default_analyzer.spec().is_legacy() && self.analyzed_fields.is_empty() {
+            return None;
+        }
+        Some(SegmentAnalysis {
+            default: self.default_analyzer.spec().clone(),
+            fields: self.analyzed_fields.clone(),
+            default_used: self.default_analyzer_used,
+        })
     }
 
     /// Override the in-memory postings budget before a sorted run is spilled
@@ -164,7 +210,20 @@ impl SegmentWriter {
 
         for (index, field) in fields.iter().enumerate() {
             if field.field_type == FieldType::Text {
-                let tokens = tokenize_with_positions(&field.value);
+                let analyzer = match self.field_analyzers.get(&field.name) {
+                    Some(analyzer) => {
+                        if !self.analyzed_fields.contains_key(&field.name) {
+                            self.analyzed_fields
+                                .insert(field.name.clone(), analyzer.spec().clone());
+                        }
+                        analyzer
+                    }
+                    None => {
+                        self.default_analyzer_used = true;
+                        &self.default_analyzer
+                    }
+                };
+                let tokens = analyzer.analyze_with_positions(&field.value);
                 field_length += tokens.len() as u32;
                 for (token, pos) in tokens {
                     let postings = match self.inverted_index.get_mut(&token) {
@@ -708,6 +767,7 @@ impl SegmentWriter {
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: self.text_filter_ignore_above,
             doc_vectors: !self.doc_vector_entries.is_empty(),
+            analysis: self.segment_analysis(),
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -854,6 +914,26 @@ fn encode_vector_index_v2(
     }
 
     (idx_buf, offsets_buf)
+}
+
+/// The first `VECTOR_IDX_HEADER_LEN` bytes of a `vector.idx` (fewer if the
+/// file is shorter); `None` if it can't be opened or read.
+fn read_vector_idx_header(idx_path: &Path) -> Option<Vec<u8>> {
+    let mut header = Vec::with_capacity(VECTOR_IDX_HEADER_LEN);
+    fs::File::open(idx_path)
+        .ok()?
+        .take(VECTOR_IDX_HEADER_LEN as u64)
+        .read_to_end(&mut header)
+        .ok()?;
+    Some(header)
+}
+
+/// Whether `segment_dir`'s `vector.idx` is the clustered format, which is
+/// always written together with a `vector.offsets` sidecar. Without the
+/// sidecar such a segment is still searchable, but only by exact scan.
+pub fn vector_index_needs_offsets(segment_dir: &Path) -> bool {
+    read_vector_idx_header(&segment_dir.join("vector.idx"))
+        .is_some_and(|header| parse_vector_idx_header(&header).is_some())
 }
 
 /// Parses a v2 `vector.idx`'s header only — `(dim, total_count, version)`.
@@ -3627,18 +3707,9 @@ impl SegmentReader {
         // the legacy fallback exactly as it did when this read the whole
         // file. A missing file (open error) is not an error either — matches
         // `read_vectors`'s existing missing-file handling.
-        let mut header_buf = Vec::with_capacity(VECTOR_IDX_HEADER_LEN);
-        let Ok(mut file) = fs::File::open(&idx_path) else {
+        let Some(header_buf) = read_vector_idx_header(&idx_path) else {
             return Ok((VectorStore::default(), None, None, false));
         };
-        if file
-            .by_ref()
-            .take(VECTOR_IDX_HEADER_LEN as u64)
-            .read_to_end(&mut header_buf)
-            .is_err()
-        {
-            return Ok((VectorStore::default(), None, None, false));
-        }
 
         let Some((dim, _total_count, version)) = parse_vector_idx_header(&header_buf) else {
             // Short (<HEADER_LEN) file, or no magic/an unrecognized version
@@ -3698,6 +3769,10 @@ impl SegmentReader {
             );
         }
 
+        eprintln!(
+            "WARN: no usable vector.offsets for {} — exact scan of the whole vector.idx",
+            segment_dir.display()
+        );
         // Sidecar missing or invalid — this is the one path that genuinely
         // needs the whole body, so read it now (not upfront, unlike the old
         // code). A read error here (e.g. a TOCTOU race — the file vanished
@@ -4803,6 +4878,10 @@ fn read_bytes<'a>(cursor: &mut &'a [u8], len: usize) -> &'a [u8] {
 
 // ─── Tokenizer ──────────────────────────────────────────────────────────────
 
+/// The legacy `standard@1` chain — what every segment without a footer
+/// `analysis` was written with. Prefer [`Analyzer`] (or
+/// [`analyze_query_for_segment`]) for anything that must match a specific
+/// segment's terms.
 pub fn tokenize(text: &str) -> Vec<String> {
     text.split_whitespace()
         .flat_map(|word| {
@@ -6171,6 +6250,7 @@ mod tests {
         );
         assert_eq!(r.vector_store.dimensions, 2);
         assert!(!r.vector_index_degraded());
+        assert!(!vector_index_needs_offsets(&dir), "legacy flat format");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -6185,6 +6265,7 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-vecidx-corrupt-body");
         write_v2_fixture(&dir, &[("d0", vec![1.0, 0.0]), ("d1", vec![0.0, 1.0])]);
         fs::remove_file(dir.join("vector.offsets")).unwrap();
+        assert!(vector_index_needs_offsets(&dir), "clustered format");
         // Truncate the real (valid-header) blob down to just past the
         // header — declares more records than the body actually has.
         let real = fs::read(dir.join("vector.idx")).unwrap();

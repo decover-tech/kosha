@@ -26,6 +26,7 @@ mod auth;
 mod compaction_sched;
 #[cfg(feature = "s3")]
 mod hydration_budget;
+mod manifest_follow;
 #[cfg(feature = "migrate")]
 mod migrate;
 #[cfg(feature = "s3")]
@@ -43,8 +44,6 @@ use kosha_core::{segment_may_contain_terms, TermBloomMode};
 use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::DocStoreHydrator;
 use kosha_query::Searcher;
-#[cfg(feature = "s3")]
-use kosha_segment::tokenize;
 use kosha_segment::SegmentReader;
 use kosha_write::Indexer;
 
@@ -334,6 +333,10 @@ struct AppState {
     /// the *caller's* own retry logic (kosha_client already has
     /// max_retries/retry_on_timeout), rather than retrying twice.
     write_http_client: Option<reqwest::blocking::Client>,
+    /// Query-role manifest following (#232): refresher cadence, per-namespace
+    /// last-confirmed-current times (lag) and control-plane error counters.
+    /// Unused on the ingest pod, whose manifests are authoritative.
+    manifest_follow: manifest_follow::ManifestFollow,
 }
 
 /// Per-segment single-flight completion signal used by
@@ -713,6 +716,33 @@ fn segments_needing_sync<'a>(
         .iter()
         .filter(|e| !synced.contains(&(ns.clone(), e.segment_id.clone())))
         .collect()
+}
+
+/// How many times one publish rebases onto a newer remote manifest before
+/// giving up with `ManifestConflict` (HTTP 409).
+const MANIFEST_REBASE_ATTEMPTS: u32 = 3;
+
+/// Pause before rebase attempt `attempt` (2..): a few milliseconds, growing,
+/// with jitter so two writers that keep colliding fall out of step.
+fn rebase_backoff(attempt: u32) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let base_ms = 5u64 << attempt.min(6);
+    Duration::from_millis(base_ms + u64::from(nanos) % base_ms)
+}
+
+/// HTTP response for a failed manifest publication: a conflict another
+/// writer caused (and a rebase could not resolve) is a 409 the client can
+/// retry; anything else is a server error.
+fn publication_error(context: &str, error: &KoshaError) -> String {
+    let status = if matches!(error, KoshaError::ManifestConflict { .. }) {
+        409
+    } else {
+        500
+    };
+    json_error(status, &format!("{context}: {error}"))
 }
 
 /// Upload a segment directory to S3 and commit it: every data file first,
@@ -1316,6 +1346,9 @@ impl AppState {
             warmup_hydrate_segment_cache,
             ingest_host,
             write_http_client,
+            manifest_follow: manifest_follow::ManifestFollow::new(
+                manifest_follow::refresh_interval_from_env(),
+            ),
         }
     }
 
@@ -1467,29 +1500,7 @@ impl AppState {
             // (footer.json + inverted.idx + doc_store.offsets) for every
             // segment in the manifest. The first real query then pays
             // only for its term shards + page doc spans.
-            let query = kosha_core::SearchQuery {
-                query_text: String::new(),
-                max_results: 0,
-                bm25_params: Default::default(),
-                from: 0,
-                filter: None,
-                sort: Vec::new(),
-                search_after: None,
-                highlight: None,
-                aggs: std::collections::HashMap::new(),
-                wildcard: None,
-                match_phrase: None,
-                knn: None,
-                exact_total_hits: None,
-                total_hits_cap: None,
-                operator: None,
-                no_cache: None,
-                collapse: None,
-                source_includes: None,
-                source_excludes: None,
-                rank: None,
-                mode: None,
-            };
+            let query = warmup_probe_query();
             let needs_filters = query_needs_filter_store(&query);
             let needs_vectors = query.knn.is_some();
             let t_ns = std::time::Instant::now();
@@ -1734,63 +1745,308 @@ impl AppState {
         );
     }
 
-    /// Persist the indexer's current manifest for a namespace into the
-    /// control store, so the segment list survives restarts.
-    fn refresh_query_namespace(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
-        if self.ingest_host.is_some() {
-            // Ask for the version first. This runs before every search on a
-            // query replica, and it used to read and parse the namespace's
-            // whole manifest row each time (megabytes for a few hundred
-            // segments) while holding the control-store lock every other
-            // search was waiting on, then clone the local manifest to
-            // compare one integer. The manifest is only fetched when the
-            // stored version is ahead.
-            let stored = self
-                .controller
-                .lock()
-                .unwrap()
-                .manifest_version(ns)
-                .ok_or_else(|| KoshaError::NamespaceNotFound(ns.clone()))?;
-            if self
-                .indexer
-                .manifest_version(ns)
-                .is_some_and(|local| local >= stored)
-            {
-                return Ok(());
-            }
-            let mut manifest = self
-                .controller
-                .lock()
-                .unwrap()
-                .manifest_cloned(ns)
-                .ok_or_else(|| KoshaError::NamespaceNotFound(ns.clone()))?;
-            if self
-                .indexer
-                .manifest_version(ns)
-                .is_none_or(|local| local < manifest.version)
-            {
-                kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
-                    let path = vector.path(ns, segment)?;
-                    #[cfg(feature = "s3")]
-                    if let Some(ref s3) = self.s3_storage {
-                        return s3.read(&path);
-                    }
-                    Ok(std::fs::read(self.data_dir.join(path))?)
-                })?;
-                self.indexer.restore_manifest(ns.clone(), manifest);
-            }
+    /// Make sure a query replica's manifest for `ns` is fresh enough for a
+    /// search (#232). No-op on the ingest pod.
+    ///
+    /// The background refresher (`spawn_manifest_refresher`) keeps followed
+    /// namespaces within about one `KOSHA_MANIFEST_REFRESH_MS` of the
+    /// control store, so by default a search touches neither the control
+    /// store nor its lock. It refreshes synchronously only when
+    /// - the namespace was never loaded or never confirmed current here,
+    /// - the request's `max_staleness_seconds` is below the current lag, or
+    /// - the refresher is disabled (`KOSHA_MANIFEST_REFRESH_MS=0`), the
+    ///   pre-#232 check-before-every-search behavior.
+    ///
+    /// A control-plane error never fails a search for a namespace this pod
+    /// has loaded: it keeps serving the last-known-good manifest (DESIGN.md
+    /// §17) and the lag keeps growing. Other errors (an unreadable
+    /// deletion vector for the new version) still fail the request.
+    fn ensure_query_manifest_fresh(
+        &self,
+        ns: &NamespaceId,
+        max_staleness: Option<Duration>,
+    ) -> Result<(), KoshaError> {
+        if self.ingest_host.is_none() {
+            return Ok(());
         }
+        let now = Instant::now();
+        let loaded = self.indexer.manifest_version(ns).is_some();
+        let lag = self.manifest_follow.lag(ns, now);
+        let max_staleness = max_staleness.or(match self.manifest_follow.interval {
+            Some(_) => None,
+            None => Some(Duration::ZERO),
+        });
+        let refresh = match (loaded, lag, max_staleness) {
+            (false, _, _) | (true, None, _) => true,
+            (true, Some(lag), Some(max)) => lag > max,
+            (true, Some(_), None) => false,
+        };
+        if !refresh {
+            return Ok(());
+        }
+        // While the control store is failing, don't make every search wait
+        // out its timeout under the controller lock: serve last-known-good
+        // and let the refresher find out when it is back.
+        let window = self
+            .manifest_follow
+            .interval
+            .unwrap_or(Duration::from_secs(1))
+            .max(Duration::from_millis(100));
+        if loaded && self.manifest_follow.failing_recently(now, window) {
+            return Ok(());
+        }
+        match self.refresh_query_namespace(ns, false) {
+            Ok(()) => {
+                self.manifest_follow.record_poll_ok();
+                Ok(())
+            }
+            Err(error @ KoshaError::ControlPlane(_)) => {
+                self.manifest_follow
+                    .record_error(&format!("search refresh of '{}'", ns.0), &error);
+                if loaded {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Bring a query replica's manifest for `ns` up to the stored version:
+    /// one cheap version read, then the manifest itself only if it moved.
+    fn refresh_query_namespace(&self, ns: &NamespaceId, warm: bool) -> Result<(), KoshaError> {
+        let observed_at = Instant::now();
+        let stored = self.controller.lock().unwrap().manifest_version(ns)?;
+        match stored {
+            Some(stored) => self.follow_stored_version(ns, stored, observed_at, warm),
+            None => Ok(()),
+        }
+    }
+
+    /// Install the stored manifest for `ns` if `stored` (read at
+    /// `observed_at`) is ahead of the local one. Shared by the per-search
+    /// path and the background refresher.
+    ///
+    /// The swap is `Indexer::restore_manifest`; a search already running
+    /// holds its own `Arc` from `Indexer::manifest_shared` and finishes on
+    /// the manifest it started with. When `warm` and the namespace is in
+    /// `KOSHA_WARMUP_NAMESPACES`, the new version's footers and scoring set
+    /// are fetched before the swap, so the first search on it is not cold.
+    fn follow_stored_version(
+        &self,
+        ns: &NamespaceId,
+        stored: u64,
+        observed_at: Instant,
+        warm: bool,
+    ) -> Result<(), KoshaError> {
+        if self
+            .indexer
+            .manifest_version(ns)
+            .is_some_and(|local| local >= stored)
+        {
+            self.manifest_follow.confirm(ns, stored, observed_at);
+            return Ok(());
+        }
+        self.manifest_follow.note_stored_version(ns, stored);
+        let Some(mut manifest) = self.controller.lock().unwrap().try_manifest_cloned(ns)? else {
+            return Ok(());
+        };
+        let version = manifest.version;
+        if self
+            .indexer
+            .manifest_version(ns)
+            .is_none_or(|local| local < version)
+        {
+            kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
+                let path = vector.path(ns, segment)?;
+                #[cfg(feature = "s3")]
+                if let Some(ref s3) = self.s3_storage {
+                    return s3.read(&path);
+                }
+                Ok(std::fs::read(self.data_dir.join(path))?)
+            })?;
+            if warm {
+                self.prewarm_followed_manifest(ns, &manifest);
+            }
+            println!(
+                "manifest refreshed: ns={} version={} segments={}",
+                ns.0,
+                manifest.version,
+                manifest.segments.len()
+            );
+            self.indexer.restore_manifest(ns.clone(), manifest);
+        }
+        self.manifest_follow.confirm(ns, version, observed_at);
         Ok(())
     }
 
-    fn persist_manifest(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
-        if let Some(manifest) = self.indexer.manifest_cloned(ns) {
-            self.controller
-                .lock()
-                .unwrap()
-                .save_manifest(ns, &manifest)?;
+    /// Fetch the scoring set of a manifest about to be installed, for
+    /// namespaces listed in `KOSHA_WARMUP_NAMESPACES` (same probe as boot
+    /// warmup's first phase). Fail-open: a miss only costs the first search
+    /// on the new version some latency.
+    fn prewarm_followed_manifest(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) {
+        #[cfg(feature = "s3")]
+        {
+            if self.s3_storage.is_none() || !self.warmup_namespaces.contains(&ns.0) {
+                return;
+            }
+            let query = warmup_probe_query();
+            let outcome = self.hydrate_segments_for_search(
+                ns,
+                manifest,
+                &query,
+                &RequestHydration::unlimited(),
+            );
+            if outcome.missing.is_empty() && !outcome.bloom_pruned {
+                self.completed_hydrations
+                    .lock()
+                    .unwrap()
+                    .entry((ns.0.clone(), manifest.version))
+                    .or_default()
+                    .merge(false, false);
+            } else {
+                eprintln!(
+                    "warn: manifest refresh: prewarm of '{}' v{} left {} segment(s) cold",
+                    ns.0,
+                    manifest.version,
+                    outcome.missing.len()
+                );
+            }
         }
+        #[cfg(not(feature = "s3"))]
+        let _ = (ns, manifest);
+    }
+
+    /// Start the query-role manifest refresher (#232). Every
+    /// `KOSHA_MANIFEST_REFRESH_MS` (default 500; `0` disables) it reads every
+    /// namespace's stored version in one query and installs the ones that
+    /// advanced (`follow_stored_version`). The ingest pod never starts it.
+    /// The thread holds only a `Weak` and exits when the state is dropped.
+    fn spawn_manifest_refresher(self: &Arc<Self>) {
+        if self.ingest_host.is_none() {
+            return;
+        }
+        let Some(interval) = self.manifest_follow.interval else {
+            println!(
+                "manifest refresher disabled (KOSHA_MANIFEST_REFRESH_MS=0); \
+                 query pods check the control store before every search"
+            );
+            return;
+        };
+        println!("manifest refresher: every {} ms", interval.as_millis());
+        let weak = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("kosha-manifest-refresher".into())
+            .spawn(move || loop {
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                state.run_manifest_refresh_tick();
+                drop(state);
+                std::thread::sleep(interval);
+            })
+            .expect("failed to spawn manifest refresher thread");
+    }
+
+    /// One refresher pass: a single batched version read, then fetch and
+    /// swap only namespaces whose version moved. Errors leave the
+    /// last-known-good manifests in place.
+    fn run_manifest_refresh_tick(&self) {
+        let observed_at = Instant::now();
+        let versions = self.controller.lock().unwrap().manifest_versions();
+        let versions = match versions {
+            Ok(versions) => versions,
+            Err(error) => {
+                self.manifest_follow.record_error("version poll", &error);
+                return;
+            }
+        };
+        let mut control_plane_ok = true;
+        for (ns, stored) in versions {
+            match self.follow_stored_version(&ns, stored, observed_at, true) {
+                Ok(()) => {}
+                Err(error @ KoshaError::ControlPlane(_)) => {
+                    control_plane_ok = false;
+                    self.manifest_follow
+                        .record_error(&format!("fetch of '{}'", ns.0), &error);
+                }
+                Err(error) => eprintln!(
+                    "warn: manifest refresh: cannot install '{}' v{stored}: {error} — \
+                     serving the previous version",
+                    ns.0
+                ),
+            }
+        }
+        if control_plane_ok {
+            self.manifest_follow.record_poll_ok();
+        }
+    }
+
+    /// Read the namespace's committed manifest with its deletion vectors
+    /// resolved, the way a query replica installs one.
+    fn hydrated_remote_manifest(
+        &self,
+        ns: &NamespaceId,
+    ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
+        let Some(mut manifest) = self.controller.lock().unwrap().manifest_cloned(ns) else {
+            return Ok(None);
+        };
+        kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
+            let path = vector.path(ns, segment)?;
+            #[cfg(feature = "s3")]
+            if let Some(ref s3) = self.s3_storage {
+                return s3.read(&path);
+            }
+            Ok(std::fs::read(self.data_dir.join(path))?)
+        })?;
+        Ok(Some(manifest))
+    }
+
+    /// Install a manifest built outside the write path (admin import) by
+    /// CAS against the version the control store holds right now. Never
+    /// rebases: a concurrent publish wins and this fails with
+    /// `ManifestConflict`, leaving both the store and the indexer alone.
+    fn import_manifest(
+        &self,
+        ns: &NamespaceId,
+        mut manifest: kosha_core::Manifest,
+    ) -> Result<(), KoshaError> {
+        let lock = self.publication_lock(ns);
+        let _guard = lock.lock().unwrap();
+        let expected = self
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_version(ns)?
+            .unwrap_or(0);
+        let local = self.indexer.manifest_version(ns).unwrap_or(0);
+        manifest.version = manifest.version.max(expected.max(local) + 1);
+        self.controller.lock().unwrap().compare_and_swap_manifest(
+            ns,
+            expected,
+            manifest.clone(),
+        )?;
+        #[cfg(feature = "s3")]
+        {
+            // Imported segments are read from S3; there is nothing local to
+            // upload for them.
+            let mut synced = self.synced_segments.lock().unwrap();
+            for entry in &manifest.segments {
+                synced.insert((ns.clone(), entry.segment_id.clone()));
+            }
+        }
+        self.indexer.restore_manifest(ns.clone(), manifest);
         Ok(())
+    }
+
+    fn publication_lock(&self, ns: &NamespaceId) -> Arc<Mutex<()>> {
+        self.publication_locks
+            .lock()
+            .unwrap()
+            .entry(ns.clone())
+            .or_default()
+            .clone()
     }
 
     fn publish_namespace(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
@@ -1807,30 +2063,78 @@ impl AppState {
     /// Serialize publications per namespace and use the same immutable
     /// snapshot for object upload and manifest commit. Failed uploads never
     /// expose a manifest; failed commits remain retryable.
+    ///
+    /// A `ManifestConflict` means another writer committed since this
+    /// writer's last publish. The remote manifest is read back, this
+    /// writer's unpublished delta is rebased onto it
+    /// ([`Indexer::rebase_onto`]), and the CAS is retried, up to
+    /// [`MANIFEST_REBASE_ATTEMPTS`] times with a short jittered pause. A
+    /// conflict the rebase cannot resolve (see `rebase_onto`) is returned
+    /// as `ManifestConflict`, which the HTTP layer maps to 409.
     fn publish_namespace_with(
         &self,
         ns: &NamespaceId,
-        upload: impl FnOnce(&kosha_core::Manifest) -> Result<(), KoshaError>,
+        upload: impl Fn(&kosha_core::Manifest) -> Result<(), KoshaError>,
     ) -> Result<(), KoshaError> {
-        let lock = self
-            .publication_locks
-            .lock()
-            .unwrap()
-            .entry(ns.clone())
-            .or_default()
-            .clone();
+        let lock = self.publication_lock(ns);
         let _guard = lock.lock().unwrap();
-        let Some((expected_version, manifest)) = self.indexer.prepare_publication(ns)? else {
-            return Ok(());
-        };
-        upload(&manifest)?;
-        self.controller.lock().unwrap().compare_and_swap_manifest(
-            ns,
-            expected_version,
-            manifest.clone(),
-        )?;
-        self.indexer.acknowledge_manifest(ns, &manifest)?;
-        Ok(())
+        let mut rebases = 0;
+        loop {
+            let Some((expected_version, manifest)) = self.indexer.prepare_publication(ns)? else {
+                return Ok(());
+            };
+            let started = Instant::now();
+            upload(&manifest)?;
+            let committed = self.controller.lock().unwrap().compare_and_swap_manifest(
+                ns,
+                expected_version,
+                manifest.clone(),
+            );
+            match committed {
+                Ok(()) => {
+                    self.indexer.acknowledge_manifest(ns, &manifest)?;
+                    println!(
+                        "manifest published: ns={} version={} segments={} ms={:.1}",
+                        ns.0,
+                        manifest.version,
+                        manifest.segments.len(),
+                        started.elapsed().as_secs_f64() * 1e3
+                    );
+                    return Ok(());
+                }
+                Err(conflict @ KoshaError::ManifestConflict { .. })
+                    if rebases < MANIFEST_REBASE_ATTEMPTS =>
+                {
+                    rebases += 1;
+                    let Some(remote) = self.hydrated_remote_manifest(ns)? else {
+                        return Err(conflict);
+                    };
+                    eprintln!(
+                        "manifest conflict on namespace {} (expected version {expected_version}, \
+                         found {}): rebasing, attempt {rebases}/{MANIFEST_REBASE_ATTEMPTS}",
+                        ns.0, remote.version
+                    );
+                    #[cfg(feature = "s3")]
+                    {
+                        // The committed manifest's segments are durable by
+                        // the publish protocol; the other writer uploaded
+                        // them and this node has nothing local to send.
+                        let mut synced = self.synced_segments.lock().unwrap();
+                        for entry in &remote.segments {
+                            synced.insert((ns.clone(), entry.segment_id.clone()));
+                        }
+                    }
+                    if self.indexer.rebase_onto(ns, remote)? == kosha_write::RebaseOutcome::Adopted
+                    {
+                        return Ok(());
+                    }
+                    if rebases > 1 {
+                        std::thread::sleep(rebase_backoff(rebases));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Upload every segment in `ns`'s current manifest that this process
@@ -2470,11 +2774,14 @@ impl AppState {
         query: &SearchQuery,
         request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
-        let term_prune = term_bloom_prune_for_query(query);
+        let term_prune = kosha_query::term_bloom_prune_mode(query);
+        // The query is analyzed per segment with the chains its footer
+        // records (#220), so which terms (and posting-blob shards) a
+        // segment needs depends on its footer.
+        let query_analysis = kosha_query::QueryAnalysis::new(query);
         let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
         let needs_vectors = query.knn.is_some();
         let needs_filters = query_needs_filter_store(query);
-        let posting_files = posting_blob_files_for_query(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
@@ -2557,20 +2864,31 @@ impl AppState {
                 .remember_segment_footers(ns, fetched_footers.values().cloned());
         }
 
-        let stats_terms = kosha_query::namespace_stats_terms(query).filter(|t| !t.is_empty());
+        let segment_footer = |entry: &kosha_core::ManifestEntry| {
+            manifest
+                .segment_footer(&entry.segment_id)
+                .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref))
+        };
+        let analyses: Vec<Option<&kosha_core::SegmentAnalysis>> = manifest
+            .segments
+            .iter()
+            .map(|entry| segment_footer(entry).and_then(|f| f.analysis.as_ref()))
+            .collect();
+        let posting_files =
+            posting_blob_files_for_query(query, &query_analysis, analyses.iter().copied());
+        let stats_terms = kosha_query::namespace_stats_terms(query, analyses.iter().copied())
+            .filter(|t| !t.is_empty());
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         let mut stats_only: Vec<PathBuf> = Vec::new();
         for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
             // Borrowed, never cloned: footers hold every bloom. A segment
             // with no cached footer was already read (once) into
             // `fetched_footers` above.
-            let footer = manifest
-                .segment_footer(&entry.segment_id)
-                .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
+            let footer = segment_footer(entry);
             match segment_search_hydration(
                 query,
                 needs_bloom_check,
-                term_prune.as_ref(),
+                term_prune.map(|mode| (&query_analysis, mode)),
                 stats_terms.as_deref(),
                 footer,
             ) {
@@ -2667,17 +2985,19 @@ impl AppState {
         if !doc_access_ok {
             return false;
         }
-        // Deliberately does NOT also require vector.offsets: it's an
-        // optional sidecar (legacy v1 segments never have one; the reader
-        // falls back to an eager parse of vector.idx alone when it's
-        // absent — same tolerance doc_access_ok above gives
-        // doc_store.offsets vs. doc_store.bin). `ensure_scoring_files_local`
-        // still proactively *attempts* to fetch it when present on S3 (see
-        // its comment) — this predicate just doesn't block "can we score"
-        // on that attempt having succeeded, since scoring is correct
-        // either way.
-        if needs_vectors && !file_present_nonempty(&seg_path.join("vector.idx")) {
-            return false;
+        // `vector.offsets` is required only where it exists: legacy flat
+        // segments never have one. A clustered segment without it is served
+        // by exact scan of every vector (seconds on a large segment), so it
+        // is not complete until the sidecar has been fetched.
+        if needs_vectors {
+            if !file_present_nonempty(&seg_path.join("vector.idx")) {
+                return false;
+            }
+            if !file_present_nonempty(&seg_path.join("vector.offsets"))
+                && kosha_segment::vector_index_needs_offsets(seg_path)
+            {
+                return false;
+            }
         }
         true
     }
@@ -2866,7 +3186,25 @@ impl AppState {
         query: &SearchQuery,
         request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
-        let posting_files = posting_blob_files_for_query(query);
+        // Footers are local whenever the namespace verdict is cached (it
+        // means every segment's scoring set is present).
+        let analyses: Vec<Option<kosha_core::SegmentAnalysis>> = manifest
+            .segments
+            .iter()
+            .map(|entry| {
+                let dir = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                manifest
+                    .footer_or_read(&entry.segment_id, || {
+                        kosha_segment::SegmentReader::read_footer(&dir).ok()
+                    })
+                    .and_then(|footer| footer.analysis.clone())
+            })
+            .collect();
+        let posting_files = posting_blob_files_for_query(
+            query,
+            &kosha_query::QueryAnalysis::new(query),
+            analyses.iter().map(Option::as_ref),
+        );
         if posting_files.is_empty() {
             return HydrationOutcome::default();
         }
@@ -3332,6 +3670,36 @@ fn redact_database_url(url: &str) -> String {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+/// The empty probe query boot warmup and the manifest refresher hydrate
+/// with: no terms, filters or kNN, so only the scoring scaffolding
+/// (`footer.json`, `inverted.idx`, `doc_store.offsets`) is fetched.
+#[cfg(any(feature = "s3", test))]
+fn warmup_probe_query() -> kosha_core::SearchQuery {
+    kosha_core::SearchQuery {
+        query_text: String::new(),
+        max_results: 0,
+        bm25_params: Default::default(),
+        from: 0,
+        filter: None,
+        sort: Vec::new(),
+        search_after: None,
+        highlight: None,
+        aggs: std::collections::HashMap::new(),
+        wildcard: None,
+        match_phrase: None,
+        knn: None,
+        exact_total_hits: None,
+        total_hits_cap: None,
+        operator: None,
+        no_cache: None,
+        collapse: None,
+        source_includes: None,
+        source_excludes: None,
+        rank: None,
+        mode: None,
+    }
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         #[cfg(feature = "migrate")]
@@ -3387,6 +3755,7 @@ fn main() {
     state.spawn_warmup();
     state.spawn_idle_flush_timer();
     state.spawn_compaction_scheduler();
+    state.spawn_manifest_refresher();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     println!("kosha-server role={role} listening on {addr} data_dir={data_dir}");
 
@@ -3420,6 +3789,7 @@ fn serve(listener: TcpListener, state: Arc<AppState>, io_timeout: Duration) {
 // ─── Request handling ───────────────────────────────────────────────────────
 
 fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
+    let started = Instant::now();
     let mut reader = BufReader::new(
         stream
             .try_clone()
@@ -3521,28 +3891,56 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
     } else {
         authenticate(&headers)
     };
-    let tenant = match authentication {
-        Ok(t) => t,
-        Err(resp) => {
-            stream.write_all(resp.as_bytes()).ok();
-            return Ok(());
-        }
-    };
-
     // ── Query/ingest role routing ────────────────────────────────────────
     // A query-role pod (KOSHA_INGEST_HOST set) forwards write-path requests
     // to the single ingest pod instead of executing them locally — see
     // is_write_path/forward_to_ingest. Every other request (all reads, and
     // everything on the ingest pod itself, which never forwards) is handled
     // locally exactly as before this existed.
-    let response = match (&state.ingest_host, &state.write_http_client) {
-        (Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
+    let response = match (
+        &authentication,
+        &state.ingest_host,
+        &state.write_http_client,
+    ) {
+        (Err(resp), _, _) => resp.clone(),
+        (Ok(_), Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
             forward_to_ingest(client, ingest_host, &request_line, &headers, &body)
         }
-        _ => route(&request_line, &headers, &body, &tenant, state),
+        (Ok(tenant), _, _) => route(&request_line, &headers, &body, tenant, state),
     };
+    log_request(
+        &request_line,
+        authentication.as_deref().unwrap_or("-"),
+        body.len(),
+        &response,
+        started,
+    );
     stream.write_all(response.as_bytes()).ok();
     Ok(())
+}
+
+/// One line per API request: who asked for what, the status returned and how
+/// long it took. A successful search is skipped because it already prints
+/// the more detailed `search timing:` line; probes never reach here.
+fn log_request(
+    request_line: &str,
+    tenant: &str,
+    body_bytes: usize,
+    response: &str,
+    started: Instant,
+) {
+    let status = response.get(9..12).unwrap_or("???");
+    let mut parts = request_line.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or("-"), parts.next().unwrap_or("-"));
+    let path = target.split('?').next().unwrap_or(target);
+    if status == "200" && path.ends_with("/search") {
+        return;
+    }
+    println!(
+        "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}",
+        started.elapsed().as_secs_f64() * 1e3,
+        response.len()
+    );
 }
 
 /// Extract and validate the API key from request headers.
@@ -3604,6 +4002,9 @@ fn is_write_path(request_line: &str) -> bool {
         return true;
     }
     if extract_namespace(request_line, "POST /v1/namespaces/", "/delete").is_some() {
+        return true;
+    }
+    if extract_namespace(request_line, "POST /v1/namespaces/", "/schema").is_some() {
         return true;
     }
     // v1 admin routes — all mutate segment/manifest state.
@@ -3860,6 +4261,14 @@ fn route_inner(
         return handle_exists_with_ns(&ns, tenant, body, state);
     }
 
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/schema") {
+        return handle_put_schema_with_ns(&ns, tenant, body, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/schema") {
+        return handle_get_schema_with_ns(&ns, tenant, state);
+    }
+
     if request_line.starts_with("GET /v1/stats") {
         return handle_stats(state);
     }
@@ -4041,7 +4450,7 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     // write survives restarts (explicit flushes go through publish_namespace too).
     if manifest_changed || state.indexer.manifest_cloned(&ns).is_some() {
         if let Err(e) = state.publish_namespace(&ns) {
-            return json_error(500, &format!("publication failed: {e}"));
+            return publication_error("publication failed", &e);
         }
     }
 
@@ -4174,7 +4583,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
         controller.ensure_namespace(namespace.clone());
     }
     if let Err(e) = state.publish_namespace(&namespace) {
-        return json_error(500, &format!("publication failed: {e}"));
+        return publication_error("publication failed", &e);
     }
 
     json_ok(&IndexResponse {
@@ -4212,7 +4621,7 @@ fn flush_and_publish_namespace(state: &AppState, namespace: &NamespaceId) -> Res
         .map_err(|e| json_error(500, &format!("flush error: {e}")))?;
     state
         .publish_namespace(namespace)
-        .map_err(|e| json_error(500, &format!("publication failed: {e}")))
+        .map_err(|e| publication_error("publication failed", &e))
 }
 
 fn handle_flush(body: &[u8], state: &AppState) -> String {
@@ -4251,7 +4660,7 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
     // Publish manifest(s) to the control store and upload segments to S3.
     for ns_id in &state.indexer.namespaces() {
         if let Err(e) = state.publish_namespace(ns_id) {
-            return json_error(500, &format!("publication failed: {e}"));
+            return publication_error("publication failed", &e);
         }
     }
 
@@ -4377,7 +4786,7 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
     };
 
     if let Err(e) = state.publish_namespace(&ns) {
-        return json_error(500, &format!("deletion publication failed: {e}"));
+        return publication_error("deletion publication failed", &e);
     }
 
     json_ok(&serde_json::json!({
@@ -4407,12 +4816,17 @@ fn handle_stats(state: &AppState) -> String {
             total_docs += ns_docs;
             total_segments += manifest.segments.len();
 
-            namespaces.push(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "namespace": ns.0,
                 "documents": ns_docs,
                 "segments": manifest.segments.len(),
                 "version": manifest.version,
-            }));
+                "manifest_version": manifest.version,
+            });
+            if state.ingest_host.is_some() {
+                add_manifest_follow_stats(state, &ns, &mut entry);
+            }
+            namespaces.push(entry);
         }
         (namespaces, total_docs, total_segments)
     };
@@ -4447,7 +4861,25 @@ fn handle_stats(state: &AppState) -> String {
         "segment_checksum_failures": segment_checksum_failures,
         "s3_bucket": s3_bucket,
         "s3_prefix": s3_prefix,
+        "manifest_refresh": state
+            .ingest_host
+            .is_some()
+            .then(|| state.manifest_follow.summary_json(Instant::now())),
     }))
+}
+
+/// Per-namespace manifest-following fields for a query replica's stats
+/// (#232): the stored version last seen, when the local manifest was last
+/// confirmed current, and how long ago that was (`manifest_lag_seconds`,
+/// `null` if never — e.g. the control plane has been down since boot).
+fn add_manifest_follow_stats(state: &AppState, ns: &NamespaceId, entry: &mut serde_json::Value) {
+    let status = state.manifest_follow.status(ns);
+    let lag = state.manifest_follow.lag(ns, Instant::now());
+    entry["stored_manifest_version"] = serde_json::json!(status.as_ref().map(|s| s.stored_version));
+    entry["last_refresh_at"] = serde_json::json!(status
+        .as_ref()
+        .map(|s| manifest_follow::unix_seconds(s.last_refresh_at)));
+    entry["manifest_lag_seconds"] = serde_json::json!(lag.map(|d| d.as_secs_f64()));
 }
 
 // ─── POST /search (JSON body, supports filters) ─────────────────────────────
@@ -4464,6 +4896,13 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         None => return json_error(400, "missing 'namespace' in search body"),
     };
 
+    // Query replicas only (#232): how stale a manifest this search accepts.
+    let max_staleness =
+        match manifest_follow::parse_max_staleness(body_val.get("max_staleness_seconds")) {
+            Ok(v) => v,
+            Err(e) => return json_error(400, &e),
+        };
+
     let query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
         Ok(q) => q,
         Err(e) => return json_error(400, &format!("invalid search query: {e}")),
@@ -4474,7 +4913,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         return search_error_response(&e);
     }
 
-    if let Err(e) = state.refresh_query_namespace(&ns) {
+    if let Err(e) = state.ensure_query_manifest_fresh(&ns, max_staleness) {
         return search_error_response(&e);
     }
 
@@ -4665,8 +5104,14 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             );
             let resp = json_ok(&result);
             // Only successful responses enter the cache, after the search
-            // proved every needed file readable.
-            if let Some(key) = cache_key {
+            // proved every needed file readable. A search that fell back to
+            // per-segment BM25 statistics (issue #246) because some
+            // segment's footer or postings weren't local isn't cached
+            // either: the miss is usually transient (best-effort stats
+            // hydration), and caching it would pin the degraded scores for
+            // the rest of this manifest version.
+            let cacheable = phases.bm25_stats != kosha_query::Bm25StatsUsed::SegmentFallback;
+            if let Some(key) = cache_key.filter(|_| cacheable) {
                 state.result_cache.lock().unwrap().insert(key, &resp);
             }
             resp
@@ -4933,7 +5378,16 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         return search_error_response(&e);
     }
 
-    if let Err(e) = state.refresh_query_namespace(&ns) {
+    let max_staleness = match manifest_follow::parse_max_staleness(
+        params
+            .get("max_staleness_seconds")
+            .map(|v| serde_json::Value::String(v.clone()))
+            .as_ref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &e),
+    };
+    if let Err(e) = state.ensure_query_manifest_fresh(&ns, max_staleness) {
         return search_error_response(&e);
     }
 
@@ -5089,6 +5543,65 @@ fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppS
     handle_index(&modified_body, state)
 }
 
+/// `POST /v1/namespaces/{ns}/schema` — set the namespace schema (#220).
+/// The body is a proto `NamespaceSchema` (`{"fields": {...}}`), or one
+/// wrapped as `{"schema": {...}}` like `CreateNamespaceRequest`. Only the
+/// analysis settings are honored. New segments use it; existing segments
+/// keep the analysis their footer records and stay searchable with it, so
+/// the change reaches old documents when compaction rewrites them.
+fn handle_put_schema_with_ns(
+    namespace: &str,
+    tenant: &str,
+    body: &[u8],
+    state: &AppState,
+) -> String {
+    let ns = NamespaceId(tenant_namespace(tenant, namespace));
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return json_error(400, "invalid JSON"),
+    };
+    let value = match value.get("schema") {
+        Some(inner) => inner.clone(),
+        None => value,
+    };
+    let schema: kosha_core::NamespaceSchema = match serde_json::from_value(value) {
+        Ok(schema) => schema,
+        Err(e) => return json_error(400, &format!("invalid schema: {e}")),
+    };
+    let changed = match state.indexer.set_schema(&ns, schema.clone()) {
+        Ok(changed) => changed,
+        Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
+        Err(e) => return json_error(500, &format!("schema update failed: {e}")),
+    };
+    if changed {
+        if let Err(e) = state.publish_namespace(&ns) {
+            return json_error(500, &format!("publication failed: {e}"));
+        }
+    }
+    json_ok(&serde_json::json!({
+        "namespace": namespace,
+        "schema": schema,
+        "changed": changed,
+    }))
+}
+
+/// `GET /v1/namespaces/{ns}/schema` — the namespace schema, `{}` if none.
+fn handle_get_schema_with_ns(namespace: &str, tenant: &str, state: &AppState) -> String {
+    let ns = NamespaceId(tenant_namespace(tenant, namespace));
+    // An admin read: always confirm against the control store on a query
+    // replica (no-op on the ingest pod).
+    if let Err(e) = state.ensure_query_manifest_fresh(&ns, Some(Duration::ZERO)) {
+        return json_error(404, &format!("{e}"));
+    }
+    match state.indexer.manifest_shared(&ns) {
+        Some(manifest) => json_ok(&serde_json::json!({
+            "namespace": namespace,
+            "schema": manifest.schema.clone().unwrap_or_default(),
+        })),
+        None => json_error(404, "namespace not found"),
+    }
+}
+
 fn handle_search_post_with_ns(
     namespace: &str,
     tenant: &str,
@@ -5154,12 +5667,17 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
         None => return json_error(404, &format!("namespace '{namespace}' not found")),
     };
     let ns_docs: u64 = manifest.segments.iter().map(|s| s.doc_count as u64).sum();
-    json_ok(&serde_json::json!({
+    let mut body = serde_json::json!({
         "namespace": namespace,
         "documents": ns_docs,
         "segments": manifest.segments.len(),
         "version": manifest.version,
-    }))
+        "manifest_version": manifest.version,
+    });
+    if state.ingest_host.is_some() {
+        add_manifest_follow_stats(state, &NamespaceId(scoped_ns), &mut body);
+    }
+    json_ok(&body)
 }
 
 /// POST /v1/admin/rebuild-filter-blooms — rewrite footer blooms from segment files.
@@ -5823,6 +6341,7 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        schema: None,
     }
 }
 
@@ -5862,7 +6381,8 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
         let ns = NamespaceId(ns_raw.to_string());
 
         if !overwrite {
-            if let Some(m) = state.indexer.manifest_cloned(&ns) {
+            let published = state.controller.lock().unwrap().manifest_cloned(&ns);
+            if let Some(m) = published.or_else(|| state.indexer.manifest_cloned(&ns)) {
                 if !m.segments.is_empty() {
                     return json_error(
                         409,
@@ -5929,16 +6449,21 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
             );
         }
 
-        let manifest = manifest_from_footers(footers);
+        let mut manifest = manifest_from_footers(footers);
+        // Footers carry each segment's analysis, so search needs nothing
+        // else; keep a schema this node already knows for future writes.
+        manifest.schema = state
+            .indexer
+            .manifest_cloned(&ns)
+            .and_then(|existing| existing.schema);
         let segments = manifest.segments.len();
         let documents: u64 = manifest.segments.iter().map(|e| e.doc_count as u64).sum();
-        state.indexer.restore_manifest(ns.clone(), manifest);
         {
             let mut ctrl = state.controller.lock().unwrap();
             ctrl.ensure_namespace(ns.clone());
         }
-        if let Err(e) = state.persist_manifest(&ns) {
-            return json_error(500, &format!("publication failed: {e}"));
+        if let Err(e) = state.import_manifest(&ns, manifest) {
+            return publication_error("publication failed", &e);
         }
 
         json_ok(&serde_json::json!({
@@ -6043,7 +6568,7 @@ enum SegmentHydration {
 fn segment_search_hydration(
     query: &SearchQuery,
     needs_bloom_check: bool,
-    term_prune: Option<&(Vec<String>, TermBloomMode)>,
+    term_prune: Option<(&kosha_query::QueryAnalysis, TermBloomMode)>,
     stats_terms: Option<&[String]>,
     footer: Option<&kosha_core::Footer>,
 ) -> SegmentHydration {
@@ -6051,8 +6576,8 @@ fn segment_search_hydration(
         return SegmentHydration::Scoring;
     };
     let admitted = query.segment_may_match_filters(footer.filter_blooms.as_ref())
-        && term_prune.is_none_or(|(terms, mode)| {
-            segment_may_contain_terms(terms, *mode, footer.term_bloom.as_ref())
+        && term_prune.is_none_or(|(analysis, mode)| {
+            kosha_query::segment_may_match_query_terms(analysis, mode, footer)
         });
     if admitted {
         SegmentHydration::Scoring
@@ -6065,15 +6590,6 @@ fn segment_search_hydration(
     }
 }
 
-/// Lexical terms used for footer term-bloom prune before hydrate/open.
-///
-/// Wildcard queries cannot be pruned here — expansion needs the segment
-/// vocabulary. Phrase and multi-term BM25 use AND semantics.
-#[cfg(feature = "s3")]
-fn term_bloom_prune_for_query(query: &SearchQuery) -> Option<(Vec<String>, TermBloomMode)> {
-    kosha_query::term_bloom_prune_for_query(query)
-}
-
 /// Whether scoring/materialization needs `filters.bin`. Broad lexical
 /// queries with default score/_id ranking do not: they use only postings,
 /// doc metadata, and page doc stores.
@@ -6083,19 +6599,19 @@ fn query_needs_filter_store(query: &SearchQuery) -> bool {
 }
 
 #[cfg(feature = "s3")]
-fn posting_blob_files_for_query(query: &SearchQuery) -> Vec<String> {
+fn posting_blob_files_for_query<'a>(
+    query: &SearchQuery,
+    analysis: &kosha_query::QueryAnalysis,
+    analyses: impl IntoIterator<Item = Option<&'a kosha_core::SegmentAnalysis>>,
+) -> Vec<String> {
     if query.wildcard.is_some() {
         return kosha_segment::all_posting_blob_files();
     }
 
+    // Every term any segment's reading of the query holds (#220).
     let mut files = std::collections::HashSet::new();
-    for term in tokenize(&query.query_text) {
+    for term in analysis.union_terms(analyses) {
         files.insert(kosha_segment::posting_blob_file_for_term(&term));
-    }
-    if let Some(ref phrase) = query.match_phrase {
-        for term in tokenize(&phrase.phrase) {
-            files.insert(kosha_segment::posting_blob_file_for_term(&term));
-        }
     }
     let mut files: Vec<String> = files.into_iter().collect();
     files.sort();
@@ -6262,10 +6778,13 @@ fn log_search_timing(
 
 /// Map a search failure onto the right HTTP status: load-shedding
 /// (`KoshaError::Overloaded`, see `kosha_query::MemoryLedger`) is a
-/// transient 429 the client should retry with backoff, not a 500.
+/// transient 429 the client should retry with backoff, not a 500; a
+/// control-store outage on a never-loaded namespace is a 503; an
+/// out-of-range request is a 400.
 fn search_error_response(e: &KoshaError) -> String {
     match e {
         KoshaError::Overloaded(_) => json_error(429, &format!("search overloaded: {e}")),
+        KoshaError::ControlPlane(_) => json_error(503, &format!("search unavailable: {e}")),
         KoshaError::InvalidQuery(_) => json_error(400, &e.to_string()),
         _ => json_error(500, &format!("search error: {e}")),
     }
@@ -6281,6 +6800,8 @@ fn json_accepted<T: serde::Serialize>(value: &T) -> String {
 }
 
 fn json_error(status_code: u16, message: &str) -> String {
+    // The reason for an error response; `request:` carries the rest.
+    eprintln!("WARN: request failed: status={status_code} {message}");
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",
@@ -6382,6 +6903,9 @@ mod tests {
     struct SharedManifestStore {
         inner: Arc<Mutex<kosha_control::Controller>>,
         lose_next_commit_reply: Arc<std::sync::atomic::AtomicBool>,
+        /// Commit this manifest (over the stored version) right after the
+        /// next `manifest_version` read: a writer racing the reader.
+        commit_on_next_version_read: Arc<Mutex<Option<kosha_core::Manifest>>>,
     }
     impl ControlStore for SharedManifestStore {
         fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
@@ -6401,6 +6925,16 @@ mod tests {
         }
         fn manifest_cloned(&self, id: &NamespaceId) -> Option<kosha_core::Manifest> {
             self.inner.lock().unwrap().manifest(id).cloned()
+        }
+        fn manifest_version(&self, id: &NamespaceId) -> Result<Option<u64>, KoshaError> {
+            let mut inner = self.inner.lock().unwrap();
+            let version = inner.manifest(id).map(|manifest| manifest.version);
+            if let Some(racing) = self.commit_on_next_version_read.lock().unwrap().take() {
+                inner
+                    .compare_and_swap_manifest(id, version.unwrap_or(0), racing)
+                    .unwrap();
+            }
+            Ok(version)
         }
         fn save_manifest(
             &mut self,
@@ -6567,10 +7101,10 @@ mod tests {
 
     #[test]
     fn lost_commit_reply_is_retryable_without_losing_the_next_flush() {
-        let shared = SharedManifestStore {
-            inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
-            lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        };
+        let shared = shared_store();
+        shared
+            .lose_next_commit_reply
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let state = test_state();
         *state.controller.lock().unwrap() = Box::new(shared.clone());
         let ns = NamespaceId("retry".into());
@@ -6608,89 +7142,553 @@ mod tests {
         );
     }
 
-    #[test]
-    fn competing_writers_cannot_overwrite_a_published_manifest() {
-        let shared = SharedManifestStore {
+    fn shared_store() -> SharedManifestStore {
+        SharedManifestStore {
             inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
             lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            commit_on_next_version_read: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A control store that can be taken down: version reads, the batched
+    /// poll and manifest fetches fail with `ControlPlane` while `down`, the
+    /// way `PgStore` reports an unreachable Postgres (#232).
+    #[derive(Clone)]
+    struct OutageStore {
+        inner: SharedManifestStore,
+        down: Arc<std::sync::atomic::AtomicBool>,
+        reads: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl OutageStore {
+        fn check(&self) -> Result<(), KoshaError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(KoshaError::ControlPlane("injected outage".into()));
+            }
+            Ok(())
+        }
+    }
+    impl ControlStore for OutageStore {
+        fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
+            self.inner.create_namespace(id)
+        }
+        fn ensure_namespace(&mut self, id: NamespaceId) {
+            self.inner.ensure_namespace(id);
+        }
+        fn has_namespace(&self, id: &NamespaceId) -> bool {
+            self.inner.has_namespace(id)
+        }
+        fn manifest(&self, _: &NamespaceId) -> Option<&kosha_core::Manifest> {
+            None
+        }
+        fn manifest_mut(&mut self, _: &NamespaceId) -> Option<&mut kosha_core::Manifest> {
+            None
+        }
+        fn manifest_cloned(&self, id: &NamespaceId) -> Option<kosha_core::Manifest> {
+            self.try_manifest_cloned(id).ok().flatten()
+        }
+        fn try_manifest_cloned(
+            &self,
+            id: &NamespaceId,
+        ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
+            self.check()?;
+            Ok(self.inner.manifest_cloned(id))
+        }
+        fn manifest_version(&self, id: &NamespaceId) -> Result<Option<u64>, KoshaError> {
+            self.check()?;
+            self.inner.manifest_version(id)
+        }
+        fn manifest_versions(&self) -> Result<Vec<(NamespaceId, u64)>, KoshaError> {
+            self.check()?;
+            self.inner.inner.lock().unwrap().manifest_versions()
+        }
+        fn save_manifest(
+            &mut self,
+            id: &NamespaceId,
+            manifest: &kosha_core::Manifest,
+        ) -> Result<(), KoshaError> {
+            self.inner.save_manifest(id, manifest)
+        }
+        fn compare_and_swap_manifest(
+            &mut self,
+            id: &NamespaceId,
+            expected: u64,
+            manifest: kosha_core::Manifest,
+        ) -> Result<(), KoshaError> {
+            self.inner.compare_and_swap_manifest(id, expected, manifest)
+        }
+        fn list_namespaces(&self) -> Vec<NamespaceId> {
+            self.inner.list_namespaces()
+        }
+        fn namespace_count(&self) -> usize {
+            self.inner.namespace_count()
+        }
+    }
+
+    fn outage_store() -> OutageStore {
+        OutageStore {
+            inner: shared_store(),
+            down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// An ingest state and a separate query-role state over one shared
+    /// control store and data directory (standing in for S3).
+    fn ingest_and_query(store: &OutageStore, refresh: Option<Duration>) -> (AppState, AppState) {
+        let ingest = test_state();
+        *ingest.controller.lock().unwrap() = Box::new(store.clone());
+        let mut query = AppState::new(ingest.data_dir.clone());
+        query.ingest_host = Some("http://ingest.invalid".into());
+        query.manifest_follow = manifest_follow::ManifestFollow::new(refresh);
+        *query.controller.lock().unwrap() = Box::new(store.clone());
+        (ingest, query)
+    }
+
+    fn index_text_and_publish(state: &AppState, ns: &NamespaceId, ids: &[&str]) {
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                ids.iter()
+                    .map(|id| Document {
+                        id: DocumentId((*id).into()),
+                        fields: vec![Field::text("text", "hello follower")],
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        state.indexer.flush_namespace(ns).unwrap();
+        state.publish_namespace(ns).unwrap();
+    }
+
+    fn total_hits(response: &str) -> u64 {
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = &response[response.find("\r\n\r\n").unwrap() + 4..];
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        value["total_hits"].as_u64().unwrap()
+    }
+
+    fn stats_json(state: &AppState) -> serde_json::Value {
+        let response = handle_stats(state);
+        serde_json::from_str(&response[response.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+    }
+
+    /// #232 acceptance (a): docs indexed and flushed through the ingest pod
+    /// become searchable on a separate query-role pod within the refresh
+    /// interval — no restart, and no control-store read on the search path.
+    #[test]
+    fn query_replica_follows_ingest_publishes_without_restart() {
+        let store = outage_store();
+        let ns = NamespaceId("tenant/follow".into());
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_millis(20)));
+        index_text_and_publish(&ingest, &ns, &["a"]);
+        let query = Arc::new(query);
+        query.spawn_manifest_refresher();
+        let search = br#"{"namespace":"tenant/follow","query_text":"hello"}"#;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while query.indexer.manifest_version(&ns).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "refresher never loaded the namespace"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+
+        index_text_and_publish(&ingest, &ns, &["b", "c"]);
+        let published = ingest.indexer.manifest_version(&ns).unwrap();
+        let start = Instant::now();
+        while query.indexer.manifest_version(&ns) != Some(published) {
+            assert!(Instant::now() < deadline, "refresher never caught up");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Generous bound for CI noise; the cadence is 20 ms.
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let reads = store.reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 3);
+        // Searches inside the staleness bound do not touch the control store
+        // (the refresher may have polled meanwhile, hence `<=` on the delta).
+        let polls_meanwhile = store.reads.load(std::sync::atomic::Ordering::SeqCst) - reads;
+        assert!(polls_meanwhile <= 3, "{polls_meanwhile}");
+
+        let stats = stats_json(&query);
+        let entry = stats["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["namespace"] == "tenant/follow")
+            .unwrap()
+            .clone();
+        assert_eq!(entry["manifest_version"], published);
+        assert!(entry["last_refresh_at"].as_f64().unwrap() > 0.0);
+        assert!(entry["manifest_lag_seconds"].as_f64().unwrap() < 5.0);
+        assert_eq!(stats["manifest_refresh"]["enabled"], true);
+        assert_eq!(stats["manifest_refresh"]["interval_ms"], 20);
+        // The ingest pod's stats carry no follower block.
+        assert!(stats_json(&ingest)["manifest_refresh"].is_null());
+    }
+
+    /// #232: `max_staleness_seconds` forces a synchronous refresh when the
+    /// last confirmation is older than the bound; without it a search on a
+    /// confirmed namespace serves the local manifest (the refresher's job).
+    #[test]
+    fn max_staleness_knob_refreshes_synchronously() {
+        let store = outage_store();
+        let ns = NamespaceId("tenant/knob".into());
+        // A refresher is configured but not running: only searches refresh.
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_secs(3600)));
+        index_text_and_publish(&ingest, &ns, &["a"]);
+        let search = br#"{"namespace":"tenant/knob","query_text":"hello"}"#;
+        // Never loaded → synchronous load.
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+        index_text_and_publish(&ingest, &ns, &["b"]);
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+        let loose =
+            br#"{"namespace":"tenant/knob","query_text":"hello","max_staleness_seconds":3600}"#;
+        assert_eq!(total_hits(&handle_search_post(loose, &query)), 1);
+        let strict =
+            br#"{"namespace":"tenant/knob","query_text":"hello","max_staleness_seconds":0}"#;
+        assert_eq!(total_hits(&handle_search_post(strict, &query)), 2);
+        let bad = br#"{"namespace":"tenant/knob","query_text":"hello","max_staleness_seconds":-1}"#;
+        assert!(handle_search_post(bad, &query).starts_with("HTTP/1.1 400"));
+        // The GET route takes it as a query parameter.
+        index_text_and_publish(&ingest, &ns, &["c"]);
+        let get = handle_search_get(
+            "GET /search?ns=tenant/knob&q=hello&max_staleness_seconds=0 HTTP/1.1",
+            &query,
+        );
+        assert_eq!(total_hits(&get), 3);
+    }
+
+    /// #232 acceptance (b): a search that took its manifest snapshot before
+    /// a swap completes against that snapshot.
+    #[test]
+    fn snapshot_taken_before_swap_survives_it() {
+        let store = outage_store();
+        let ns = NamespaceId("tenant/snap".into());
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_millis(20)));
+        index_text_and_publish(&ingest, &ns, &["a"]);
+        query.run_manifest_refresh_tick();
+        let snapshot = query.indexer.manifest_shared(&ns).unwrap();
+        let before = snapshot.version;
+
+        index_text_and_publish(&ingest, &ns, &["b", "c"]);
+        query.run_manifest_refresh_tick();
+        let current = query.indexer.manifest_shared(&ns).unwrap();
+        assert!(current.version > before);
+        assert_eq!(snapshot.version, before, "the held snapshot never changes");
+        assert_eq!(snapshot.segments.len(), 1);
+
+        let mut probe = warmup_probe_query();
+        probe.query_text = "hello".into();
+        probe.max_results = 10;
+        let old = query
+            .searcher
+            .search(&ns, &snapshot, &probe, Some(&snapshot.tombstones))
+            .unwrap();
+        assert_eq!(old.total_hits, 1, "in-flight search sees its own snapshot");
+        let new = query
+            .searcher
+            .search(&ns, &current, &probe, Some(&current.tombstones))
+            .unwrap();
+        assert_eq!(new.total_hits, 3);
+    }
+
+    /// #232 acceptance (c): with the control plane down, searches keep
+    /// succeeding on the last-known-good manifest (even ones asking for
+    /// strict freshness), the lag metric grows and errors are counted; the
+    /// pod catches up once the store is back. A namespace never loaded
+    /// still fails, with 503.
+    #[test]
+    fn control_plane_outage_serves_last_known_good_and_lag_grows() {
+        let store = outage_store();
+        let ns = NamespaceId("tenant/outage".into());
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_millis(20)));
+        index_text_and_publish(&ingest, &ns, &["a"]);
+        query.run_manifest_refresh_tick();
+        let search = br#"{"namespace":"tenant/outage","query_text":"hello"}"#;
+        let strict =
+            br#"{"namespace":"tenant/outage","query_text":"hello","max_staleness_seconds":0}"#;
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+
+        store.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        index_text_and_publish(&ingest, &ns, &["b"]);
+        query.run_manifest_refresh_tick();
+        let lag_of = |state: &AppState| {
+            stats_json(state)["namespaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["namespace"] == "tenant/outage")
+                .unwrap()["manifest_lag_seconds"]
+                .as_f64()
+                .unwrap()
         };
+        let lag_early = lag_of(&query);
+        std::thread::sleep(Duration::from_millis(60));
+        query.run_manifest_refresh_tick();
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+        assert_eq!(total_hits(&handle_search_post(strict, &query)), 1);
+        let lag_late = lag_of(&query);
+        assert!(lag_late >= lag_early + 0.05, "{lag_early} -> {lag_late}");
+        let summary = stats_json(&query)["manifest_refresh"].clone();
+        assert!(summary["control_plane_errors_total"].as_u64().unwrap() >= 2);
+        assert!(summary["consecutive_errors"].as_u64().unwrap() >= 2);
+        assert!(summary["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("injected outage"));
+        assert!(summary["max_manifest_lag_seconds"].as_f64().unwrap() >= lag_late);
+
+        // Never loaded here: nothing to fall back on.
+        let unknown = br#"{"namespace":"tenant/never","query_text":"hello"}"#;
+        let failed = handle_search_post(unknown, &query);
+        assert!(failed.starts_with("HTTP/1.1 503"), "{failed}");
+
+        store.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        query.run_manifest_refresh_tick();
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 2);
+        assert!(lag_of(&query) < lag_late);
+        assert_eq!(
+            stats_json(&query)["manifest_refresh"]["consecutive_errors"],
+            0
+        );
+    }
+
+    /// `KOSHA_MANIFEST_REFRESH_MS=0`: no refresher, so every search checks
+    /// the control store (the pre-#232 behavior) — and an outage still
+    /// serves last-known-good.
+    #[test]
+    fn disabled_refresher_checks_before_every_search() {
+        let store = outage_store();
+        let ns = NamespaceId("tenant/sync".into());
+        let (ingest, query) = ingest_and_query(&store, None);
+        index_text_and_publish(&ingest, &ns, &["a"]);
+        let search = br#"{"namespace":"tenant/sync","query_text":"hello"}"#;
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 1);
+        index_text_and_publish(&ingest, &ns, &["b"]);
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 2);
+        store.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(total_hits(&handle_search_post(search, &query)), 2);
+        // Spawning is a no-op when disabled.
+        Arc::new(query).spawn_manifest_refresher();
+    }
+
+    fn write_and_flush(state: &AppState, ns: &NamespaceId, id: &str) {
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId(id.into()),
+                    fields: vec![Field::keyword("id", id)],
+                }],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(ns).unwrap();
+    }
+
+    fn wal_is_empty(state: &AppState) -> bool {
+        kosha_write::wal::WalWriter::recover(&state.data_dir.join("_wal"))
+            .unwrap()
+            .is_empty()
+    }
+
+    fn segment_set(manifest: &kosha_core::Manifest) -> std::collections::HashSet<String> {
+        manifest
+            .segments
+            .iter()
+            .map(|entry| entry.segment_id.0.clone())
+            .collect()
+    }
+
+    /// #230: two independent writers publish to one namespace at the same
+    /// time. The loser of the CAS rebases onto the winner's manifest and
+    /// publishes too — no restart, no lost segment, and each writer's WAL
+    /// is reclaimed through its own checkpoint.
+    #[test]
+    fn competing_writers_both_publish_by_rebasing_without_losing_segments() {
+        let shared = shared_store();
         let ns = NamespaceId("competing".into());
         shared.inner.lock().unwrap().ensure_namespace(ns.clone());
         let first = test_state();
         let second = test_state();
         for (state, id) in [(&first, "first"), (&second, "second")] {
             *state.controller.lock().unwrap() = Box::new(shared.clone());
-            state
-                .indexer
-                .index_documents(
-                    ns.clone(),
-                    vec![Document {
-                        id: DocumentId(id.into()),
-                        fields: vec![Field::text("text", id)],
-                    }],
-                )
-                .unwrap();
-            state.indexer.flush_namespace(&ns).unwrap();
+            write_and_flush(state, &ns, id);
         }
+        let flushed: std::collections::HashSet<String> = [&first, &second]
+            .iter()
+            .flat_map(|state| segment_set(&state.indexer.manifest(&ns).unwrap()))
+            .collect();
+        // Both writers prepare against version 0 before either commits.
         let barrier = std::sync::Barrier::new(2);
+        let publish = |state: &AppState| {
+            let first_upload = std::sync::atomic::AtomicBool::new(true);
+            state.publish_namespace_with(&ns, |_| {
+                if first_upload.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    barrier.wait();
+                }
+                Ok(())
+            })
+        };
         let outcomes = std::thread::scope(|scope| {
-            let a = scope.spawn(|| {
-                first.publish_namespace_with(&ns, |_| {
-                    barrier.wait();
-                    Ok(())
-                })
-            });
-            let b = scope.spawn(|| {
-                second.publish_namespace_with(&ns, |_| {
-                    barrier.wait();
-                    Ok(())
-                })
-            });
+            let a = scope.spawn(|| publish(&first));
+            let b = scope.spawn(|| publish(&second));
             (a.join().unwrap(), b.join().unwrap())
         });
-        assert_eq!(
-            usize::from(outcomes.0.is_ok()) + usize::from(outcomes.1.is_ok()),
-            1,
-            "exactly one independent writer may publish the initial version"
-        );
-        let (winner, loser) = if outcomes.0.is_ok() {
-            (&first, &second)
-        } else {
-            (&second, &first)
-        };
+        outcomes.0.unwrap();
+        outcomes.1.unwrap();
+
         let committed = shared.manifest_cloned(&ns).unwrap();
-        assert_eq!(
-            committed.segments[0].segment_id,
-            winner.indexer.manifest(&ns).unwrap().segments[0].segment_id
-        );
-        let rejected_doc = if outcomes.0.is_ok() {
-            "second"
-        } else {
-            "first"
+        assert_eq!(segment_set(&committed), flushed, "no segment may be lost");
+        assert_eq!(committed.version, 2);
+        assert!(wal_is_empty(&first) && wal_is_empty(&second));
+
+        // Whichever writer is now stale keeps publishing without a restart.
+        // (Writes need every listed segment local; S3 hydration would fetch
+        // the other writer's, here a copy stands in for it.)
+        let share_segments = || {
+            for (from, to) in [(&first, &second), (&second, &first)] {
+                copy_dir(&from.data_dir.join(&ns.0), &to.data_dir.join(&ns.0));
+            }
         };
-        let restarted_loser = Indexer::new(loser.data_dir.clone());
-        restarted_loser.restore_manifest(ns.clone(), committed.clone());
-        assert!(
-            restarted_loser
-                .existing_ids(&ns, &[DocumentId(rejected_doc.into())])
-                .unwrap()
-                .contains(&DocumentId(rejected_doc.into())),
-            "the winner's WAL checkpoint must not discard the loser's unrelated recovery records"
+        for (round, state) in [&first, &second, &first].into_iter().enumerate() {
+            share_segments();
+            write_and_flush(state, &ns, &format!("later-{round}"));
+            let response = handle_flush(br#"{"namespace":"competing"}"#, state);
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(wal_is_empty(state));
+        }
+        let committed = shared.manifest_cloned(&ns).unwrap();
+        assert_eq!(committed.segments.len(), 5);
+        assert!(flushed.is_subset(&segment_set(&committed)));
+        for state in [&first, &second] {
+            assert!(segment_set(&state.indexer.manifest(&ns).unwrap())
+                .is_subset(&segment_set(&committed)));
+        }
+
+        // A restart replays nothing that is already published.
+        let restarted = Indexer::new(first.data_dir.clone());
+        restarted.restore_manifest(ns.clone(), committed);
+        assert_eq!(restarted.pending_doc_count(&ns), 0);
+    }
+
+    /// #230: a remote compaction removed the segment a local, unpublished
+    /// delete targets. The rebase must abort (publishing the delete against
+    /// a segment that no longer exists would drop it), surface as 409, and
+    /// keep the delete in the WAL.
+    #[test]
+    fn remote_compaction_of_a_locally_deleted_segment_aborts_the_rebase_with_409() {
+        let shared = shared_store();
+        let ns = NamespaceId("compacted".into());
+        let compactor = test_state();
+        let deleter = test_state();
+        for state in [&compactor, &deleter] {
+            *state.controller.lock().unwrap() = Box::new(shared.clone());
+        }
+        write_and_flush(&compactor, &ns, "a");
+        write_and_flush(&compactor, &ns, "b");
+        compactor.publish_namespace(&ns).unwrap();
+        let v1 = shared.manifest_cloned(&ns).unwrap();
+
+        // The deleter starts from v1, with v1's segments local (as if
+        // hydrated from S3).
+        copy_dir(
+            &compactor.data_dir.join(&ns.0),
+            &deleter.data_dir.join(&ns.0),
         );
-        let retry = handle_flush(br#"{"namespace":"competing"}"#, loser);
+        deleter.indexer.restore_manifest(ns.clone(), v1.clone());
+
         assert!(
-            retry.starts_with("HTTP/1.1 500"),
-            "stale writer must still fail: {retry}"
+            compactor
+                .indexer
+                .compact_namespace_with_options(&ns, kosha_write::CompactOptions::full())
+                .unwrap()
+                .merged
+        );
+        compactor.publish_namespace(&ns).unwrap();
+        let v2 = shared.manifest_cloned(&ns).unwrap();
+        assert_ne!(segment_set(&v1), segment_set(&v2));
+
+        let response = handle_delete(
+            br#"{"namespace":"compacted","filter":{"term":{"id":"a"}}}"#,
+            &deleter,
+        );
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(
+            shared.manifest_cloned(&ns).unwrap().same_contents(&v2),
+            "an aborted rebase must not publish"
         );
         assert!(
-            !kosha_write::wal::WalWriter::recover(&loser.data_dir.join("_wal"))
+            kosha_write::wal::WalWriter::recover(&deleter.data_dir.join("_wal"))
                 .unwrap()
-                .is_empty()
+                .iter()
+                .any(|record| !record.deleted_ids.is_empty()),
+            "the delete stays durable for a later recovery"
+        );
+        let flush = handle_flush(br#"{"namespace":"compacted"}"#, &deleter);
+        assert!(flush.starts_with("HTTP/1.1 409"), "{flush}");
+    }
+
+    /// #230: admin import CASes against the version it read and never
+    /// overwrites a manifest another writer committed in between.
+    #[test]
+    fn import_refuses_to_clobber_a_concurrently_published_manifest() {
+        let shared = shared_store();
+        let ns = NamespaceId("imported".into());
+        let state = test_state();
+        *state.controller.lock().unwrap() = Box::new(shared.clone());
+        let manifest = |version: u64, segment: &str| kosha_core::Manifest {
+            version,
+            segments: vec![kosha_core::ManifestEntry {
+                segment_id: kosha_core::SegmentId(segment.into()),
+                doc_count: 1,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+        };
+        state.import_manifest(&ns, manifest(1, "seed")).unwrap();
+        assert_eq!(shared.manifest_cloned(&ns).unwrap().version, 1);
+
+        // Another writer commits v2 right after the import reads v1.
+        *shared.commit_on_next_version_read.lock().unwrap() = Some(manifest(2, "ingest"));
+        let err = state
+            .import_manifest(&ns, manifest(1, "imported"))
+            .unwrap_err();
+        assert!(matches!(err, KoshaError::ManifestConflict { .. }), "{err}");
+        let stored = shared.manifest_cloned(&ns).unwrap();
+        assert_eq!(
+            (stored.version, stored.segments[0].segment_id.0.as_str()),
+            (2, "ingest")
         );
         assert_eq!(
-            shared.manifest_cloned(&ns).unwrap().segments[0].segment_id,
-            committed.segments[0].segment_id
+            state.indexer.manifest(&ns).unwrap().segments[0]
+                .segment_id
+                .0,
+            "seed",
+            "a refused import must not change the indexer either"
         );
+        assert!(publication_error("publication failed", &err).starts_with("HTTP/1.1 409"));
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
     }
 
     struct FailingManifestStore(kosha_control::Controller);
@@ -6838,7 +7836,9 @@ mod tests {
             .unwrap()
             .save_manifest(&ns, &copy_manifest())
             .unwrap();
-        let search = br#"{"namespace":"tenant/ns","query_text":"hello"}"#;
+        // Strict freshness: no refresher runs in this test, so every search
+        // must re-check the control store (#232's `max_staleness_seconds`).
+        let search = br#"{"namespace":"tenant/ns","query_text":"hello","max_staleness_seconds":0}"#;
         assert!(handle_search_post(search, &query).contains("\"total_hits\":1"));
         let response = handle_delete(
             br#"{"namespace":"tenant/ns","filter":{"match_all":{}}}"#,
@@ -7054,19 +8054,21 @@ mod tests {
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: None,
             doc_vectors: false,
+            analysis: None,
         };
         let mut query: SearchQuery = serde_json::from_str(
             r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
         )
         .unwrap();
         let decide = |query: &SearchQuery, f: &kosha_core::Footer| {
-            let term_prune = term_bloom_prune_for_query(query);
+            let term_prune = kosha_query::term_bloom_prune_mode(query);
+            let analysis = kosha_query::QueryAnalysis::new(query);
             let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
-            let stats_terms = kosha_query::namespace_stats_terms(query);
+            let stats_terms = kosha_query::namespace_stats_terms(query, [None]);
             segment_search_hydration(
                 query,
                 needs_bloom_check,
-                term_prune.as_ref(),
+                term_prune.map(|mode| (&analysis, mode)),
                 stats_terms.as_deref(),
                 Some(f),
             )
@@ -7096,6 +8098,74 @@ mod tests {
             decide(&query, &same_matter_one_term),
             SegmentHydration::Skip
         );
+    }
+
+    #[test]
+    fn segment_fallback_bm25_results_are_not_result_cached() {
+        // Issue #246: when a segment the query's filter prunes can't be read
+        // for `df`, the search scores with per-segment statistics. That
+        // degraded answer must not be result-cached, or it would outlive
+        // the (usually transient) miss for the whole manifest version.
+        let state = test_state();
+        let ns = NamespaceId("fallbackns".into());
+        let doc = |id: &str, text: &str, matter: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text), Field::keyword("matter", matter)],
+        };
+        state
+            .indexer
+            .index_documents(ns.clone(), vec![doc("r", "rare common", "m1")])
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                (0..9)
+                    .map(|i| doc(&format!("c{i}"), "rare filler", "m2"))
+                    .collect(),
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        // The m2 segment: pruned by the filter, but holds `rare`.
+        let pruned = fs::read_dir(state.data_dir.join(&ns.0))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                SegmentReader::read_footer(p).is_ok_and(|f| {
+                    f.filter_blooms
+                        .as_ref()
+                        .and_then(|b| b.get("matter"))
+                        .is_some_and(|b| b.may_contain("m2"))
+                })
+            })
+            .expect("m2 segment");
+        let inverted = pruned.join("inverted.idx");
+        let hidden = pruned.join("inverted.idx.hidden");
+
+        let search = || {
+            let resp = handle_search_post(
+                br#"{"namespace":"fallbackns","query_text":"rare","filter":{"term":{"matter":"m1"}}}"#,
+                &state,
+            );
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(v["results"][0]["doc_id"], "r");
+            v["results"][0]["score"].as_f64().unwrap()
+        };
+        // dl = 2. Namespace: N = 10, df = 10, avgdl = 2. Segment: N = 1, df = 1.
+        let namespace_expected = (1.0f64 + 0.5 / 10.5).ln();
+        let segment_expected = (1.0f64 + 0.5 / 1.5).ln();
+
+        fs::rename(&inverted, &hidden).unwrap();
+        assert!((search() - segment_expected).abs() < 1e-9);
+        fs::rename(&hidden, &inverted).unwrap();
+        assert!((search() - namespace_expected).abs() < 1e-9);
+        // The namespace-stats answer is cached as usual.
+        assert!((search() - namespace_expected).abs() < 1e-9);
     }
 
     #[test]
@@ -7565,6 +8635,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         // Simulate: an earlier publish call already confirmed seg-2
         // synced (e.g. it was "last" at the time it ran), but seg-1 and
@@ -8058,6 +9129,7 @@ mod tests {
             "POST /v1/namespaces/foo/documents HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/flush HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/delete HTTP/1.1\r\n",
+            "POST /v1/namespaces/foo/schema HTTP/1.1\r\n",
             "POST /v1/admin/api-keys HTTP/1.1\r\n",
             "POST /v1/admin/rebuild-filter-blooms HTTP/1.1\r\n",
             "POST /v1/admin/backfill-offset-tables HTTP/1.1\r\n",
@@ -8082,6 +9154,7 @@ mod tests {
             "POST /v1/namespaces/foo/exists HTTP/1.1\r\n",
             "GET /v1/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/stats HTTP/1.1\r\n",
+            "GET /v1/namespaces/foo/schema HTTP/1.1\r\n",
             "GET /search?ns=foo&q=bar HTTP/1.1\r\n",
             "POST /search HTTP/1.1\r\n",
             "POST /exists HTTP/1.1\r\n",
@@ -8286,6 +9359,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
@@ -8425,6 +9499,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
@@ -9144,6 +10219,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let policy = kosha_write::CompactionPolicy::default();
         assert_eq!(policy.max_mergeable_docs, 50_000);
@@ -9332,6 +10408,98 @@ mod tests {
             "search response: {search_resp}"
         );
         assert!(search_resp.contains("\"total_hits\":1"));
+    }
+
+    #[test]
+    fn namespace_schema_analyzers_apply_to_new_segments_and_compaction() {
+        // Issue #220: the schema's analyzer reaches the write path through
+        // the manifest, segments written before the change keep matching
+        // with the analysis they were written with, and compaction
+        // re-analyzes them under the current schema.
+        let state = test_state();
+        let ns = NamespaceId("acme/shop".into());
+        let call = |line: &str, body: serde_json::Value| {
+            let resp = route(
+                line,
+                &HashMap::new(),
+                &serde_json::to_vec(&body).unwrap(),
+                "acme",
+                &state,
+            );
+            let status: u16 = resp[9..12].parse().unwrap();
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            (
+                status,
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            )
+        };
+        let index = |id: &str, text: &str| {
+            let (status, _) = call(
+                "POST /v1/namespaces/shop/documents HTTP/1.1\r\n",
+                serde_json::json!({"documents": [{"id": id, "fields": [
+                    {"name": "body", "field_type": "Text", "value": text}]}]}),
+            );
+            assert_eq!(status, 200);
+            state.indexer.flush_namespace(&ns).unwrap();
+            state.publish_namespace(&ns).unwrap();
+        };
+        let search = |text: &str| -> Vec<String> {
+            let (status, body) = call(
+                "POST /v1/namespaces/shop/search HTTP/1.1\r\n",
+                serde_json::json!({"query_text": text, "no_cache": true}),
+            );
+            assert_eq!(status, 200, "{body}");
+            let mut ids: Vec<String> = body["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["doc_id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        index("before", "Running shoes");
+
+        let (status, body) = call(
+            "POST /v1/namespaces/shop/schema HTTP/1.1\r\n",
+            serde_json::json!({"fields": {"body": {"analyzer": ["standard", "soundex"]}}}),
+        );
+        assert_eq!(status, 400, "unknown filter is rejected: {body}");
+        let schema = serde_json::json!({"schema": {"fields": {
+            "body": {"type": "FIELD_TYPE_TEXT", "analyzer": ["standard", "stem"]}}}});
+        let (status, body) = call(
+            "POST /v1/namespaces/shop/schema HTTP/1.1\r\n",
+            schema.clone(),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["changed"], true);
+        let (_, body) = call("POST /v1/namespaces/shop/schema HTTP/1.1\r\n", schema);
+        assert_eq!(body["changed"], false, "same schema again is a no-op");
+        let (status, body) = call(
+            "GET /v1/namespaces/shop/schema HTTP/1.1\r\n",
+            serde_json::json!({}),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["schema"]["fields"]["body"]["analyzer"][1], "stem");
+
+        index("after", "they run daily");
+
+        // The old segment is still read with the legacy chain: "running"
+        // finds it, "run" does not (it never stemmed anything) — but it
+        // does not go dark either.
+        assert_eq!(search("running"), ["after", "before"]);
+        assert_eq!(search("run"), ["after"]);
+
+        // Compaction re-analyzes the old document under the new schema.
+        let result = state
+            .indexer
+            .compact_namespace_with_options(&ns, kosha_write::CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
+        state.publish_namespace(&ns).unwrap();
+        assert_eq!(search("run"), ["after", "before"]);
+        assert_eq!(search("running"), ["after", "before"]);
     }
 
     #[test]
@@ -9656,6 +10824,7 @@ mod tests {
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: None,
             doc_vectors: false,
+            analysis: None,
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.

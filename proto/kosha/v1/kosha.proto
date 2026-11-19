@@ -92,6 +92,22 @@ service KoshaService {
     };
   }
 
+  // Set a namespace's schema (issue #220): per-field analyzers for segments
+  // written from now on. Existing segments keep the analysis recorded in
+  // their footers and stay searchable with it.
+  rpc PutNamespaceSchema(PutNamespaceSchemaRequest) returns (PutNamespaceSchemaResponse) {
+    option (google.api.http) = {
+      post: "/v1/namespaces/{namespace}/schema"
+      body: "*"
+    };
+  }
+
+  rpc GetNamespaceSchema(GetNamespaceSchemaRequest) returns (GetNamespaceSchemaResponse) {
+    option (google.api.http) = {
+      get: "/v1/namespaces/{namespace}/schema"
+    };
+  }
+
   // Delete a namespace and its segments.
   rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceResponse) {
     option (google.api.http) = {
@@ -117,13 +133,42 @@ message CreateNamespaceRequest {
 
 message NamespaceSchema {
   map<string, FieldSchema> fields = 1;
+  // Analyzer for Text fields not listed in `fields`. Empty = "standard".
+  repeated string default_analyzer = 2;
+  // Stopword list for `default_analyzer`'s "stop" filter (built-in English list if empty).
+  repeated string default_stopwords = 3;
 }
 
 message FieldSchema {
   FieldType type = 1;
   bool indexed = 2;       // whether the field is full-text indexed
   bool stored = 3;        // whether the field value is stored and returned
-  repeated string analyzer = 4;  // tokenizer / analyzer choice
+  // Analyzer, then token filters. Analyzers: "standard" (legacy tokenizer),
+  // "standard@2" (Unicode UAX #29), "keyword", "lowercase", "whitespace".
+  // Filters: "lowercase", "stop", "stem" (English Snowball). Empty = "standard".
+  repeated string analyzer = 4;
+  // Stopword list for this field's "stop" filter (built-in English list if empty).
+  repeated string stopwords = 5;
+}
+
+message PutNamespaceSchemaRequest {
+  string namespace = 1;
+  NamespaceSchema schema = 2;
+}
+
+message PutNamespaceSchemaResponse {
+  string namespace = 1;
+  NamespaceSchema schema = 2;
+  bool changed = 3;  // false when the stored schema was already identical
+}
+
+message GetNamespaceSchemaRequest {
+  string namespace = 1;
+}
+
+message GetNamespaceSchemaResponse {
+  string namespace = 1;
+  NamespaceSchema schema = 2;
 }
 
 enum FieldType {

@@ -32,7 +32,8 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | BM25 lexical search | `k1` / `b` tunable per request: `bm25_params: {"k1": 2.0, "b": 0.3}` on `POST /search`, `k1=` / `b=` on `GET /search`. Either may be omitted and falls back to the segment's build-time value (1.2 / 0.75 unless built otherwise). `k1` must be ≥ 0 and `b` in [0, 1]; anything else (or non-numeric) is a 400. WAND pruning bounds are recomputed for the request's values, so results match exhaustive scoring. `k3` is not supported. IDF and `avgdl` are namespace-level (summed over all segments), so a document scores the same whichever segment holds it; `bm25_params: {"stats": "segment"}` / `bm25_stats=segment` (or `KOSHA_BM25_STATS=segment` server-wide) switches back to per-segment statistics for debugging. Wildcard queries use per-segment statistics |
 | `operator: and` / `or` | AND (default) requires every query term; OR scores the union |
 | Block-max WAND | Skip-list postings, rarest-first probe ordering, leapfrog AND join; one top-k floor shared across segments, visited highest score ceiling first, with segments that cannot reach the page skipped |
-| `match_phrase` | Positional postings, configurable `slop` |
+| `match_phrase` | Positional postings, configurable `slop`. A word a `stop` filter removed still counts as a position, so `"state of the art"` matches across the removed stopwords and `"state art"` does not |
+| Configurable analyzers | Per-field `analyzer` in the namespace schema: `standard`, `standard@2` (Unicode), `keyword`, `lowercase`, `whitespace`, plus `lowercase` / `stop` / `stem` filters. See [Analyzers](#analyzers) |
 | `wildcard` | Per-field pattern match, case-insensitive by default |
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
 | Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
@@ -72,7 +73,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 - Namespace registry and manifest store, in-memory by default or Postgres-backed (`postgres` feature + `DATABASE_URL`), with compare-and-swap manifest publishes.
 - Multi-tenancy: every API key maps to a tenant prefix that scopes all namespace access.
-- Read/write split: query pods forward every mutating route to `KOSHA_INGEST_HOST` and serve reads locally.
+- Read/write split: query pods forward every mutating route to `KOSHA_INGEST_HOST` and serve reads locally. A background refresher on each query pod polls every namespace's manifest version in one control-store query every `KOSHA_MANIFEST_REFRESH_MS` (default 500; `0` disables it and the pod checks before every search instead) and swaps in manifests that advanced; searches already running finish on the snapshot they started with, and namespaces in `KOSHA_WARMUP_NAMESPACES` have the new version's scoring set fetched before the swap. Searches don't touch the control store unless they pass `max_staleness_seconds` (body field or query parameter) and the namespace was last confirmed current longer ago than that. If the control store is unreachable, query pods keep serving their last-known-good manifests and only a namespace the pod never loaded fails (503). `GET /v1/stats` on a query pod reports per-namespace `manifest_version`, `stored_manifest_version`, `last_refresh_at` (Unix seconds) and `manifest_lag_seconds`, plus a `manifest_refresh` block with error counters and the maximum lag.
 - Backpressure controls: max concurrent searches, search queue depth and timeout, hydration concurrency, admission timeout.
 - `GET /healthz` (liveness), `GET /readyz` (readiness), `GET /v1/stats` and per-namespace stats.
 - Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, import a namespace.
@@ -88,9 +89,66 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 ### Not supported yet
 
 - Reranking (Phase 2, DESIGN.md §3.1). Per-retriever weights for RRF.
-- Configurable analyzers — tokenization is fixed (whitespace split, ASCII-punctuation trim, lowercase). The `analyzer` field exists in the schema proto but is not honored.
+- Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
 - `kosha-vector-spfresh` (SPFresh/SPANN with LIRE rebalancing) is a standalone, benchmarked prototype; it is not wired into the segment format or the query path.
+
+## Analyzers
+
+A namespace schema chooses how each `Text` field is analyzed (issues #220, #221). Set it with
+`POST /v1/namespaces/{ns}/schema` (read it back with `GET`); the body is a proto `NamespaceSchema`:
+
+```json
+{"fields": {
+   "title": {"analyzer": ["standard@2", "stop", "stem"]},
+   "sku":   {"analyzer": ["keyword"]},
+   "body":  {"analyzer": ["standard", "stop"], "stopwords": ["the", "a"]}},
+ "default_analyzer": ["standard@2"]}
+```
+
+The first name picks the analyzer, every later name appends a filter:
+
+| Analyzer | Tokens |
+| --- | --- |
+| `standard` (default) | Legacy tokenizer: split on whitespace, trim ASCII punctuation from each word's edges, lowercase. `hello,world` is one token |
+| `standard@2` | Unicode: UAX #29 word boundaries (`unicode-segmentation`), also split at `.`/`:` between letters, lowercase. `hello,world` → `hello` `world`; `naïve.café` → `naïve` `café`; `3.14` stays whole; Han ideographs are one token each |
+| `keyword` | The whole value, untouched — one token, case-sensitive |
+| `lowercase` | The whole value, lowercased — one token |
+| `whitespace` | Split on whitespace; case and punctuation kept |
+
+| Filter | Effect |
+| --- | --- |
+| `lowercase` | Unicode lowercase |
+| `stop` | Drop stopwords: Lucene's 33-word English list, or the field's `stopwords` (`default_stopwords` for `default_analyzer`). Applied to the query too; a query of only stopwords matches nothing |
+| `stem` | English Snowball stemmer (`rust-stemmers`): `running`, `runs` and `run` all match each other |
+
+`default_analyzer` covers every `Text` field the schema does not list (clients send every JSON
+string as `Text`). All text fields share one term space, so a query matches a document if it
+matches one analysis of the query across its fields — e.g. a stemmed `title` term and an unstemmed
+`body` term together.
+
+**Compatibility.** Each segment records the chains it was written with in its footer, and every
+query is analyzed per segment with those chains, so changing the schema (or the tokenizer version)
+never makes existing segments return zero hits: they answer as they were written until compaction
+rewrites them, re-analyzing their stored documents under the current schema. An invalid schema is
+rejected with a 400 and changes nothing.
+
+**Why `standard` still means the legacy tokenizer.** The Unicode tokenizer is opt-in
+(`standard@2`), not the new default, for three reasons: segments written with no schema stay
+byte-identical to every earlier release; old segments' terms (`hello,world`) are only reachable
+by the legacy reading anyway; and rollback stays safe. A binary older than this change ignores the
+footer `analysis` field and analyzes every query the legacy way, so after **rolling back** it,
+segments written with any non-default analyzer return wrong or missing hits for affected terms
+until they are rewritten. Before rolling back past this change, remove the schema (`POST` one with
+no analyzers) and run a full compaction (`POST /v1/admin/compact-namespace`) so every segment is
+legacy again. Flipping the default to `standard@2` later only needs a new default here: old
+segments keep their recorded version.
+
+Throughput on the repository's Markdown (16 MB, ~2 KB documents; `cargo bench -p kosha-segment
+--bench tokenizer`, Apple M5): `standard` 249 MB/s, `standard@2` 147 MB/s (0.59x),
+`standard@2` + `stop` + `stem` 41 MB/s; whole segment build 61 / 50 / 28 MB/s (`standard@2`
+costs 0.82x of a legacy build; the Snowball stemmer is most of the rest). All-ASCII words take a
+hand-written UAX #29 fast path checked against `unicode-segmentation` by a differential test.
 
 ## Authorization and durability
 
@@ -116,17 +174,38 @@ existing data automatically.
 A successful flush uploads its segment snapshot before publishing its manifest.
 Upload and manifest-store failures return errors and remain retryable. Buffered
 writes use a local, fsynced WAL; they are not S3-durable until a successful flush.
-WAL records are reclaimed only through the published namespace checkpoint,
-without removing later writes or another namespace's records. Partial parallel
-flush failures restore the entire snapshot for retry.
+Concurrent appends are group-committed: one WAL file and one fsync cover every
+record queued while the previous commit ran, and each caller is acknowledged
+only after the fsync covering its own record. Once the previous group held more
+than one record, the committer waits up to `KOSHA_WAL_GROUP_COMMIT_MS` (default
+2; `0` disables the wait) for more, and cuts a group at
+`KOSHA_WAL_GROUP_COMMIT_BYTES` (default 4 MiB). A lone writer never waits.
+Every record has its own log sequence number. WAL records are reclaimed only
+through the published namespace checkpoint: a file shared by several namespaces
+is deleted once each of them has a published checkpoint past its records there,
+so a flush never removes later writes or another namespace's records. Partial
+parallel flush failures restore the entire snapshot for retry.
 
 Publication uses compare-and-swap against the writer's last committed manifest
-version. Concurrent writers cannot replace each other's snapshots: a stale
-writer returns an error and retains its WAL. Automatic conflict rebasing is not
-implemented; restart the stale writer with its existing data directory to load
-the published manifest and replay its pending writes. Retrying an identical
-committed snapshot is safe after a lost commit response. Segment object keys
-include a random writer identifier to avoid collisions before publication.
+version. Concurrent writers cannot replace each other's snapshots. A stale
+writer reads the newer manifest back (resolving its deletion sidecars), rebases
+its unpublished delta onto it and retries the CAS, up to 3 times with jittered
+backoff. The delta is the segments it added, the segments it compacted away and
+its new deletes; deletes on a segment both sides list are merged, and the
+published WAL checkpoint stays the rebasing writer's own. A writer with nothing
+unpublished just adopts the newer manifest. The rebase aborts, leaving local
+state and the WAL untouched, when merging would lose data: both writers
+compacted the same segment, the other writer deleted documents in a segment this
+writer compacted away, or the other writer compacted away a segment that carries
+this writer's unpublished deletes. An unresolved conflict returns HTTP 409.
+Restarting the writer with its existing data directory loads the published
+manifest and replays its pending writes from the WAL. Retrying an identical
+committed snapshot is safe after a lost commit response, and a rebase
+recognizes such a commit as its own. Segment object keys include a random
+writer identifier to avoid collisions before publication. Migration
+(`kosha-server migrate`) and `POST /v1/admin/import-namespace` also publish by
+CAS against the version they read. They never rebase, and they fail instead of
+overwriting a manifest another writer committed (409 for import).
 
 Each WAL directory has a persistent origin identifier. New manifest checkpoints
 apply only to that origin, so another writer's checkpoint cannot discard local
@@ -135,8 +214,11 @@ its `origin` file, across restarts. Legacy checkpoints without an origin retain
 their previous recovery behavior; upgrade all writers before concurrent use.
 
 Deletes include buffered documents and WAL-log resolved document IDs before
-applying them. New WAL files use checksummed v2 frames; recovery discards an
-incomplete final file and rejects corrupt records. Legacy v1 files remain readable.
+applying them. New WAL files hold one or more checksummed v3 frames (the CRC
+covers the record's sequence number and payload); vectors are stored as binary
+f32 rather than JSON text. Recovery keeps every complete frame of a torn final
+file, discards only the incomplete tail, and rejects corrupt records. v1 and v2
+files remain readable.
 Deletes and writes replay in order, so reinserting a deleted ID remains valid.
 
 Deletion sets are immutable `deletes-{sha256}.roaring` sidecars referenced by the
@@ -158,8 +240,8 @@ object, including tombstones and checkpoints. New servers can read the old entry
 arrays. Old servers cannot read the new object format: upgrade ingest and query
 roles together before resuming writes, and do not roll back readers without a
 manifest-format migration. Servers predating deletion-vector support ignore
-those references, and older WAL readers cannot replay v2 frames: upgrade all
-roles together before accepting writes and preserve the WAL directory. Rolling
+those references, and older WAL readers cannot replay v2 or v3 frames: upgrade
+all roles together before accepting writes and preserve the WAL directory. Rolling
 back requires converting both formats. The SQL column needs no schema change.
 
 ## Repository layout
