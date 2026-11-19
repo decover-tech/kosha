@@ -100,6 +100,7 @@ fn main() {
         no_cache: None,
         collapse: None,
         limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
         rank: None,

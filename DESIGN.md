@@ -425,6 +425,21 @@ true in practice since ES refresh intervals are already tuned up for indexing th
    fused list holds at least `rank_window_size` capped hits; kNN segments probe up to
    `num_candidates` instead of `k` so the cap has neighbours to choose from. `total_hits` counts
    matches before the cap, as with `collapse` (which is the `max: 1` case and the same code).
+   **Score modifiers** (`rank_by`, issue #212) blend attributes into the score: field-value
+   boosts and linear / exp / gauss decays over numeric, date and geo fields, read from the
+   filter columns (no doc-store reads). An unbounded modifier would break the block-max WAND
+   ceilings, so modifiers are applied in a **rescore window** rather than folded into block
+   maxima: retrieval, WAND pruning and fusion run exactly as without `rank_by`, each segment
+   hands back its best `max(window_size, from + max_results)` hits by that score (WAND's top-k
+   is simply widened), the reduce step keeps the namespace's best `window_size`, rescores them
+   and re-sorts. The window is therefore the exact top-N by the unmodified score, and nothing
+   outside it is returned (`total_hits` still counts every match). Group caps and `search_after`
+   apply to the rescored order, so segments do not cap or cursor-filter under `rank_by`.
+   `origin: "now"` is resolved once per request, and such responses bypass the result cache.
+   **Geo**: a `GeoPoint` value is stored as given and copied into the string filter column as
+   canonical `"lat,lon"` text — an existing column type, so segments stay readable by older
+   binaries and no footer or manifest field changes. `geo_distance` filters parse that column
+   (haversine, mean Earth radius); geo decays read it the same way.
 6. **Rerank hook**: an optional, pluggable cross-encoder rerank stage (Cohere today) runs on the
    fused top-N before results return — same role as `ChunkGenerator.__re_rank`.
 7. **Cursor**: response includes per-mode (lexical/semantic) cursor state (last score + doc id) so

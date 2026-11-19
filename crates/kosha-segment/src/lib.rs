@@ -354,6 +354,19 @@ impl SegmentWriter {
                         .or_default()
                         .push((doc_seq, field.value.clone()));
                 }
+                FieldType::GeoPoint => {
+                    // One canonical "lat,lon" entry per point (#212): what
+                    // `geo_distance` and geo decays read. The stored value
+                    // keeps whatever form the client sent. A value that is
+                    // not a valid point is not indexed, as an unparseable
+                    // Integer is not.
+                    if let Some((lat, lon)) = kosha_core::rank::parse_geo_str(&field.value) {
+                        self.filter_string
+                            .entry(field.name.clone())
+                            .or_default()
+                            .push((doc_seq, kosha_core::rank::canonical_geo(lat, lon)));
+                    }
+                }
                 FieldType::Integer => {
                     if let Ok(v) = field.value.parse::<i64>() {
                         self.filter_integer
@@ -4880,6 +4893,7 @@ fn parse_one_doc_record(cursor: &mut &[u8], doc_seq: u32) -> DocRecord {
             4 => FieldType::Date,
             5 => FieldType::Boolean,
             6 => FieldType::Vector,
+            7 => FieldType::GeoPoint,
             _ => FieldType::Text,
         };
         *cursor = &cursor[1..];

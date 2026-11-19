@@ -365,6 +365,7 @@ fn decode_file(data: &[u8]) -> Result<Vec<WalRecord>, KoshaError> {
                             4 => FieldType::Date,
                             5 => FieldType::Boolean,
                             6 => FieldType::Vector,
+                            7 => FieldType::GeoPoint,
                             _ => return Err(invalid("unknown WAL field type")),
                         };
                         let len = usize::try_from(u64_value(&mut input)?)

@@ -181,6 +181,25 @@ pub fn evaluate_filter(clause: &FilterClause, store: &FilterStore, doc_count: u3
             }
             set
         }
+        FilterClause::GeoDistance { geo_distance: geo } => {
+            // `GeoPoint` values sit in the string column as canonical
+            // "lat,lon" text, one entry per value (a document with several
+            // points has several entries; any one within the distance
+            // matches). Anything else in the column does not parse as a
+            // point and never matches.
+            let mut set = DocSet::empty(doc_count);
+            if let Some(entries) = lookup_field(&store.string_fields, &geo.field) {
+                for (doc_seq, value) in entries {
+                    let within = crate::rank::parse_geo_str(value).is_some_and(|(lat, lon)| {
+                        crate::rank::haversine_meters(geo.lat, geo.lon, lat, lon) <= geo.distance
+                    });
+                    if within {
+                        set.insert(*doc_seq);
+                    }
+                }
+            }
+            set
+        }
     }
 }
 

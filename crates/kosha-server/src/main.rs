@@ -1484,6 +1484,7 @@ impl AppState {
                 no_cache: None,
                 collapse: None,
                 limit_per: None,
+                rank_by: None,
                 source_includes: None,
                 source_excludes: None,
                 rank: None,
@@ -4028,6 +4029,24 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
         Ok(r) => r,
         Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
     };
+    // A GeoPoint that is not a point would be stored but never indexed, so
+    // `geo_distance` and geo decays could never see it: refuse it (#212).
+    for doc in &request.documents {
+        for field in &doc.fields {
+            if field.field_type == kosha_core::FieldType::GeoPoint
+                && kosha_core::rank::parse_geo_str(&field.value).is_none()
+            {
+                return json_error(
+                    400,
+                    &format!(
+                        "document {:?}: GeoPoint field {:?} must be \"lat,lon\", \
+                         {{\"lat\": .., \"lon\": ..}} or [lon, lat] within range, got {:?}",
+                        doc.id.0, field.name, field.value
+                    ),
+                );
+            }
+        }
+    }
 
     let ns = request.namespace;
 
@@ -4539,20 +4558,27 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // inlined (see `canonical_query_for_cache`): a 1024-dim vector is
     // ~14KB of JSON. Deletions are part of a versioned snapshot; immutable
     // generation references also participate in cache identity.
-    let cache_key = if result_cache_budget() > 0 && !query.no_cache.unwrap_or(false) {
-        canonical_query_for_cache(&query).map(|mut canonical| {
-            let mut generations: Vec<_> = manifest
-                .deletion_vectors
-                .iter()
-                .map(|(segment, vector)| (&segment.0, &vector.generation))
-                .collect();
-            generations.sort_unstable();
-            canonical.push_str(&serde_json::to_string(&generations).unwrap());
-            (ns.0.clone(), manifest.version, canonical)
-        })
-    } else {
-        None
-    };
+    // A `rank_by` decaying from `"now"` (#212) answers differently a moment
+    // later on an unchanged manifest, so it is never cached.
+    let time_dependent = query
+        .rank_by
+        .as_ref()
+        .is_some_and(|rank_by| rank_by.is_time_dependent());
+    let cache_key =
+        if result_cache_budget() > 0 && !query.no_cache.unwrap_or(false) && !time_dependent {
+            canonical_query_for_cache(&query).map(|mut canonical| {
+                let mut generations: Vec<_> = manifest
+                    .deletion_vectors
+                    .iter()
+                    .map(|(segment, vector)| (&segment.0, &vector.generation))
+                    .collect();
+                generations.sort_unstable();
+                canonical.push_str(&serde_json::to_string(&generations).unwrap());
+                (ns.0.clone(), manifest.version, canonical)
+            })
+        } else {
+            None
+        };
     if let Some(ref key) = cache_key {
         if let Some(resp) = state.result_cache.lock().unwrap().lookup(key) {
             return resp;
@@ -4968,6 +4994,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         no_cache: None,
         collapse: None,
         limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
         rank: None,
@@ -7197,6 +7224,93 @@ mod tests {
     }
 
     #[test]
+    fn rank_by_and_geo_over_http() {
+        // Issue #212: GeoPoint ingest, a geo_distance filter, a recency
+        // decay and a distance decay over HTTP, rank_by in the cache key,
+        // and "now" never served from the cache.
+        let state = test_state();
+        let index = |docs: serde_json::Value| {
+            let body = serde_json::json!({"namespace": "rankns", "documents": docs});
+            handle_index(body.to_string().as_bytes(), &state)
+        };
+        let bad = index(serde_json::json!([{"id": "x", "fields": [
+            {"name": "loc", "field_type": "GeoPoint", "value": "somewhere"}
+        ]}]));
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        let ok = index(serde_json::json!([
+            {"id": "old", "fields": [
+                {"name": "text", "field_type": "Text", "value": "breach breach breach"},
+                {"name": "published", "field_type": "Date", "value": "2025-11-19"},
+                {"name": "loc", "field_type": "GeoPoint", "value": "{\"lat\": 52.52, \"lon\": 13.405}"}
+            ]},
+            {"id": "recent", "fields": [
+                {"name": "text", "field_type": "Text", "value": "breach of the supply contract"},
+                {"name": "published", "field_type": "Date", "value": "2026-11-12"},
+                {"name": "loc", "field_type": "GeoPoint", "value": "48.8566,2.3522"}
+            ]}
+        ]));
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        let ns = NamespaceId("rankns".into());
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |extra: &str| -> serde_json::Value {
+            let body = format!(r#"{{"namespace":"rankns","query_text":"breach"{extra}}}"#);
+            let resp = handle_search_post(body.as_bytes(), &state);
+            assert!(resp.starts_with("HTTP/1.1 200"), "{extra}: {resp}");
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+        };
+        let order = |v: &serde_json::Value| -> Vec<String> {
+            v["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // Plain first, so a cache keyed without rank_by would serve it.
+        assert_eq!(order(&post("")), ["old", "recent"]);
+        let recency = r#","rank_by":{"functions":[{"decay":{"field":"published","function":"exp","origin":"2026-11-19","scale":"30d"}}]}"#;
+        let v = post(recency);
+        assert_eq!(order(&v), ["recent", "old"]);
+        assert!(
+            v["results"][0]["rank_details"]["base_score"].is_number(),
+            "{v}"
+        );
+        assert_eq!(order(&post(recency)), ["recent", "old"]);
+
+        // Within 500 km of Paris: only "recent".
+        let near_paris =
+            r#","filter":{"geo_distance":{"distance":"500km","loc":{"lat":48.85,"lon":2.35}}}"#;
+        assert_eq!(order(&post(near_paris)), ["recent"]);
+        // Nearest to Berlin first.
+        let berlin = r#","rank_by":{"functions":[{"decay":{"field":"loc","function":"gauss","origin":{"lat":52.5,"lon":13.4},"scale":"200km"}}],"boost_mode":"replace"}"#;
+        assert_eq!(order(&post(berlin)), ["old", "recent"]);
+
+        // A fixed origin is cacheable; "now" is computed per request and
+        // never cached.
+        let hits_before = state.result_cache.lock().unwrap().hits;
+        post(recency);
+        assert_eq!(state.result_cache.lock().unwrap().hits, hits_before + 1);
+        let hits_before = hits_before + 1;
+        let now = r#","rank_by":{"functions":[{"decay":{"field":"published","function":"linear","origin":"now","scale":"3650d"}}]}"#;
+        post(now);
+        post(now);
+        assert_eq!(state.result_cache.lock().unwrap().hits, hits_before);
+
+        for bad in [
+            r#","rank_by":{"functions":[]}"#,
+            r#","rank_by":{"functions":[{"field_value":{"field":"votes"}}],"bogus":1}"#,
+            r#","rank_by":{"functions":[{"field_value":{"field":"votes"}}]},"sort":[{"published":{"order":"desc"}}]"#,
+            r#","filter":{"geo_distance":{"distance":"far","loc":"0,0"}}"#,
+        ] {
+            let body = format!(r#"{{"namespace":"rankns","query_text":"breach"{bad}}}"#);
+            let resp = handle_search_post(body.as_bytes(), &state);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+    }
+
+    #[test]
     fn hybrid_search_fuses_with_rrf_over_http() {
         // Issue #228: `rank.rrf` over HTTP — fused score plus per-retriever
         // ranks in the response, vector-only hits kept (#250), parameters
@@ -8555,6 +8669,7 @@ mod tests {
             no_cache: None,
             collapse: None,
             limit_per: None,
+            rank_by: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
@@ -8697,6 +8812,7 @@ mod tests {
             no_cache: None,
             collapse: None,
             limit_per: None,
+            rank_by: None,
             source_includes: None,
             source_excludes: None,
             rank: None,
@@ -9924,6 +10040,7 @@ mod tests {
             no_cache: None,
             collapse: None,
             limit_per: None,
+            rank_by: None,
             source_includes: None,
             source_excludes: None,
             rank: None,

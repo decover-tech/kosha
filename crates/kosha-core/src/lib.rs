@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod deletes;
 pub mod fields;
+pub mod rank;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ pub use analysis::{
 };
 pub use docset::{evaluate_filter, DocSet};
 pub use fields::{FieldBoost, FieldIndex, FieldStats, ALL_FIELD};
+pub use rank::{CompiledRankBy, RankBySpec};
 
 /// Pluggable namespace registry and manifest store.
 ///
@@ -87,6 +89,11 @@ pub enum FieldType {
     Date,
     Boolean,
     Vector,
+    /// A latitude/longitude pair (issue #212). Accepted as `"lat,lon"`,
+    /// `{"lat": .., "lon": ..}` or GeoJSON `[lon, lat]`; stored as given and
+    /// copied into the filter columns as the canonical `"lat,lon"` text,
+    /// where `geo_distance` filters and geo decays read it.
+    GeoPoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +144,13 @@ impl Field {
             name: n.into(),
             field_type: FieldType::Boolean,
             value: v.to_string(),
+        }
+    }
+    pub fn geo_point(n: impl Into<String>, lat: f64, lon: f64) -> Self {
+        Self {
+            name: n.into(),
+            field_type: FieldType::GeoPoint,
+            value: rank::canonical_geo(lat, lon),
         }
     }
     pub fn vector(n: impl Into<String>, v: Vec<f32>) -> Self {
@@ -305,6 +319,81 @@ pub enum FilterClause {
     Exists {
         exists: ExistsFilter,
     },
+    /// A `GeoPoint` field within `distance` of a point (issue #212).
+    GeoDistance {
+        geo_distance: GeoDistanceFilter,
+    },
+}
+
+/// Body of a `geo_distance` clause, in Elasticsearch's shape:
+/// `{"distance": "10km", "<field>": {"lat": .., "lon": ..}}`. The point may
+/// also be `"lat,lon"` or GeoJSON `[lon, lat]`; the distance a number of
+/// meters or a string with a unit (`m`, `km`, `mi`, ...).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeoDistanceFilter {
+    pub field: String,
+    pub lat: f64,
+    pub lon: f64,
+    /// Meters.
+    pub distance: f64,
+}
+
+impl Serialize for GeoDistanceFilter {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("distance", &self.distance)?;
+        map.serialize_entry(
+            &self.field,
+            &serde_json::json!({"lat": self.lat, "lon": self.lon}),
+        )?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for GeoDistanceFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut obj = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let distance = obj
+            .remove("distance")
+            .ok_or_else(|| D::Error::custom("geo_distance needs a \"distance\""))?;
+        let distance = rank::parse_distance_meters(&distance)
+            .filter(|d| d.is_finite() && *d >= 0.0)
+            .ok_or_else(|| {
+                D::Error::custom(format!(
+                    "geo_distance.distance {distance} is not a distance (e.g. \"10km\" or meters)"
+                ))
+            })?;
+        // Elasticsearch options that only change precision are accepted
+        // and ignored; everything else is the field.
+        obj.remove("distance_type");
+        obj.remove("validation_method");
+        let mut fields = obj.into_iter();
+        let (field, point) = fields
+            .next()
+            .ok_or_else(|| D::Error::custom("geo_distance needs a field and a point"))?;
+        if let Some((extra, _)) = fields.next() {
+            return Err(D::Error::custom(format!(
+                "geo_distance takes one field, found `{field}` and `{extra}`"
+            )));
+        }
+        let (lat, lon) = match &point {
+            serde_json::Value::String(s) => rank::parse_geo_str(s),
+            other => rank::parse_geo_json(other),
+        }
+        .ok_or_else(|| {
+            D::Error::custom(format!(
+                "geo_distance point for `{field}` must be {{\"lat\": .., \"lon\": ..}}, \"lat,lon\" or [lon, lat] within range"
+            ))
+        })?;
+        Ok(Self {
+            field,
+            lat,
+            lon,
+            distance,
+        })
+    }
 }
 
 /// Body of an `exists` clause.
@@ -315,7 +404,15 @@ pub struct ExistsFilter {
 }
 
 /// Clause keys `FilterClause` accepts, as reported in parse errors.
-const FILTER_CLAUSE_KEYS: [&str; 6] = ["term", "terms", "range", "bool", "match_all", "exists"];
+const FILTER_CLAUSE_KEYS: [&str; 7] = [
+    "term",
+    "terms",
+    "range",
+    "bool",
+    "match_all",
+    "exists",
+    "geo_distance",
+];
 
 /// Deserialized by dispatching on the clause's single key rather than with
 /// `#[serde(untagged)]`.
@@ -384,6 +481,9 @@ impl<'de> Deserialize<'de> for FilterClause {
             }),
             "exists" => Ok(FilterClause::Exists {
                 exists: body(inner)?,
+            }),
+            "geo_distance" => Ok(FilterClause::GeoDistance {
+                geo_distance: body(inner)?,
             }),
             other => {
                 let hint = match other {
@@ -1267,7 +1367,8 @@ pub fn segment_may_match(
         // absence of a bloom cannot prove the field is absent.
         FilterClause::Range { .. }
         | FilterClause::MatchAll { .. }
-        | FilterClause::Exists { .. } => true,
+        | FilterClause::Exists { .. }
+        | FilterClause::GeoDistance { .. } => true,
     }
 }
 
@@ -1590,6 +1691,15 @@ pub struct SearchQuery {
     /// combined index and may be listed alongside real fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    /// Score modifiers (issue #212): blend numeric, date and geo attributes
+    /// into the score with field-value boosts and linear / exp / gauss
+    /// decays. Applied in a rescore window: the query is ranked by its own
+    /// score first (BM25, fused RRF, or vector similarity, exactly as
+    /// without `rank_by`), the best `window_size` hits are rescored from
+    /// the filter columns and re-sorted, and only those are returned. See
+    /// [`rank::RankBySpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_by: Option<RankBySpec>,
 }
 
 /// Proto `RetrievalMode`, as the JSON API spells it.
@@ -1651,6 +1761,10 @@ pub struct RankDetails {
     pub knn_rank: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub knn_score: Option<f64>,
+    /// `rank_by` requests only: the hit's score before the modifiers (BM25,
+    /// fused RRF or vector score); `score` is the modified one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_score: Option<f64>,
 }
 
 /// See `SearchQuery.collapse`.
@@ -1716,6 +1830,28 @@ impl SearchQuery {
                 ));
             }
         }
+        if let Some(ref rank_by) = self.rank_by {
+            rank_by
+                .compile(self.max_results, 0)
+                .map_err(KoshaError::InvalidQuery)?;
+            if !sort_is_by_score(&self.sort) {
+                return Err(KoshaError::InvalidQuery(
+                    "rank_by reorders by the modified score; it cannot be combined with a \
+                     sort other than [_score desc] / [_score desc, _id asc]"
+                        .into(),
+                ));
+            }
+            // The window is the best hits by the query's own score. A
+            // filter alone scores every document the same, so its "best"
+            // window would be an arbitrary cut that drops correct results.
+            if !self.has_lexical_query() && self.knn.is_none() {
+                return Err(KoshaError::InvalidQuery(
+                    "rank_by rescores the best hits of a query; it needs query_text, \
+                     wildcard, match_phrase or knn, not a filter alone"
+                        .into(),
+                ));
+            }
+        }
         let has_lexical = self.has_lexical_query();
         let has_knn = self.knn.is_some();
         match self.mode {
@@ -1767,6 +1903,35 @@ impl SearchQuery {
             }
         }
         Ok(())
+    }
+
+    /// The compiled `rank_by` for this request, `"now"` resolved to the
+    /// current time. `None` without `rank_by`; an invalid one is an error
+    /// ([`Self::validate`] reports it first).
+    pub fn compiled_rank_by(&self) -> Result<Option<CompiledRankBy>, KoshaError> {
+        let Some(ref rank_by) = self.rank_by else {
+            return Ok(None);
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        rank_by
+            .compile(self.max_results, now_ms)
+            .map(Some)
+            .map_err(KoshaError::InvalidQuery)
+    }
+
+    /// How many hits each segment must hand back, best first by the
+    /// query's own score, for the page to be right: `from + max_results`,
+    /// widened to the rescore window under `rank_by` (0 stays 0: nothing
+    /// is returned, so nothing is rescored).
+    pub fn collect_depth(&self) -> usize {
+        let page = self.from.saturating_add(self.max_results);
+        match self.rank_by {
+            Some(ref rank_by) if page > 0 => page.max(rank_by.window(self.max_results)),
+            _ => page,
+        }
     }
 
     /// True when the request has a lexical retriever: query text, a
@@ -1858,12 +2023,13 @@ impl SearchQuery {
     }
 
     /// Whether answering needs a segment's filter columns (`filters.bin`):
-    /// any filter, any aggregation, a collapse or `limit_per`, or a sort on a
-    /// stored field.
+    /// any filter, any aggregation, a collapse or `limit_per`, `rank_by`
+    /// (its modifiers read the columns), or a sort on a stored field.
     pub fn needs_filter_columns(&self) -> bool {
         self.filter.is_some()
             || self.collapse.is_some()
             || self.limit_per.is_some()
+            || self.rank_by.is_some()
             || self.knn.as_ref().is_some_and(|k| k.filter.is_some())
             || !self.aggs.is_empty()
             || self.sort.iter().any(|spec| {
@@ -1884,6 +2050,20 @@ impl SearchQuery {
                 .as_ref()
                 .is_some_and(|unwanted| unwanted.iter().any(|f| f == field))
     }
+}
+
+/// True when `sort` orders by score, best first (ties by `_id`): no sort,
+/// `[_score desc]` or `[_score desc, _id asc]`.
+pub fn sort_is_by_score(sort: &[SortSpec]) -> bool {
+    let keys: Vec<(&str, &str)> = sort
+        .iter()
+        .flat_map(|spec| spec.fields.iter())
+        .map(|(field, order)| (field.as_str(), order.order.as_str()))
+        .collect();
+    matches!(
+        keys.as_slice(),
+        [] | [("_score", "desc")] | [("_score", "desc"), ("_id", "asc")]
+    )
 }
 
 /// See `SearchQuery.operator`.
