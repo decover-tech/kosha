@@ -856,6 +856,26 @@ fn encode_vector_index_v2(
     (idx_buf, offsets_buf)
 }
 
+/// The first `VECTOR_IDX_HEADER_LEN` bytes of a `vector.idx` (fewer if the
+/// file is shorter); `None` if it can't be opened or read.
+fn read_vector_idx_header(idx_path: &Path) -> Option<Vec<u8>> {
+    let mut header = Vec::with_capacity(VECTOR_IDX_HEADER_LEN);
+    fs::File::open(idx_path)
+        .ok()?
+        .take(VECTOR_IDX_HEADER_LEN as u64)
+        .read_to_end(&mut header)
+        .ok()?;
+    Some(header)
+}
+
+/// Whether `segment_dir`'s `vector.idx` is the clustered format, which is
+/// always written together with a `vector.offsets` sidecar. Without the
+/// sidecar such a segment is still searchable, but only by exact scan.
+pub fn vector_index_needs_offsets(segment_dir: &Path) -> bool {
+    read_vector_idx_header(&segment_dir.join("vector.idx"))
+        .is_some_and(|header| parse_vector_idx_header(&header).is_some())
+}
+
 /// Parses a v2 `vector.idx`'s header only — `(dim, total_count, version)`.
 /// `None` for anything that isn't a valid, recognized-version v2 header
 /// (legacy file, truncated, corrupt, unknown version) — callers fall back
@@ -2383,6 +2403,17 @@ pub enum ScoringPostingsRef<'a> {
     Decoded(PostingsRef<'a>),
 }
 
+impl ScoringPostingsRef<'_> {
+    /// The term's document frequency in this segment (number of postings,
+    /// deleted documents included — the same `df` BM25 scores with).
+    pub fn doc_count(&self) -> usize {
+        match self {
+            Self::Blocked(b) => b.doc_count(),
+            Self::Decoded(p) => p.len(),
+        }
+    }
+}
+
 impl std::ops::Deref for PostingsRef<'_> {
     type Target = [Posting];
     fn deref(&self) -> &[Posting] {
@@ -3616,18 +3647,9 @@ impl SegmentReader {
         // the legacy fallback exactly as it did when this read the whole
         // file. A missing file (open error) is not an error either — matches
         // `read_vectors`'s existing missing-file handling.
-        let mut header_buf = Vec::with_capacity(VECTOR_IDX_HEADER_LEN);
-        let Ok(mut file) = fs::File::open(&idx_path) else {
+        let Some(header_buf) = read_vector_idx_header(&idx_path) else {
             return Ok((VectorStore::default(), None, None, false));
         };
-        if file
-            .by_ref()
-            .take(VECTOR_IDX_HEADER_LEN as u64)
-            .read_to_end(&mut header_buf)
-            .is_err()
-        {
-            return Ok((VectorStore::default(), None, None, false));
-        }
 
         let Some((dim, _total_count, version)) = parse_vector_idx_header(&header_buf) else {
             // Short (<HEADER_LEN) file, or no magic/an unrecognized version
@@ -3687,6 +3709,10 @@ impl SegmentReader {
             );
         }
 
+        eprintln!(
+            "WARN: no usable vector.offsets for {} — exact scan of the whole vector.idx",
+            segment_dir.display()
+        );
         // Sidecar missing or invalid — this is the one path that genuinely
         // needs the whole body, so read it now (not upfront, unlike the old
         // code). A read error here (e.g. a TOCTOU race — the file vanished
@@ -4104,6 +4130,30 @@ impl SegmentReader {
             .into_iter()
             .map(|(t, p)| (t, ScoringPostingsRef::Decoded(p)))
             .collect()
+    }
+
+    /// Document frequency of each of `terms` that this segment contains,
+    /// for namespace-level BM25 statistics (issue #246). Goes through the
+    /// same scoring-postings fetch the scoring pass uses, so on v5 segments
+    /// only the term's span header is decoded and on older formats the
+    /// decode lands in the postings cache the scoring pass then hits.
+    /// `None` when a TOC-present term's posting blob could not be read —
+    /// a partial answer would silently understate `df`.
+    pub fn doc_frequencies(&self, terms: &[String]) -> Option<Vec<(String, u32)>> {
+        let dfs: Vec<(String, u32)> = self
+            .scoring_postings_for_terms(terms)
+            .into_iter()
+            .map(|(term, postings)| {
+                (
+                    term.to_string(),
+                    u32::try_from(postings.doc_count()).unwrap_or(u32::MAX),
+                )
+            })
+            .collect();
+        if self.take_blob_read_failure() {
+            return None;
+        }
+        Some(dfs)
     }
 
     /// Zero-I/O: `doc_id` + `field_length` for one document, without
@@ -6136,6 +6186,7 @@ mod tests {
         );
         assert_eq!(r.vector_store.dimensions, 2);
         assert!(!r.vector_index_degraded());
+        assert!(!vector_index_needs_offsets(&dir), "legacy flat format");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -6150,6 +6201,7 @@ mod tests {
         let dir = std::env::temp_dir().join("kosha-test-vecidx-corrupt-body");
         write_v2_fixture(&dir, &[("d0", vec![1.0, 0.0]), ("d1", vec![0.0, 1.0])]);
         fs::remove_file(dir.join("vector.offsets")).unwrap();
+        assert!(vector_index_needs_offsets(&dir), "clustered format");
         // Truncate the real (valid-header) blob down to just past the
         // header — declares more records than the body actually has.
         let real = fs::read(dir.join("vector.idx")).unwrap();

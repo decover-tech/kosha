@@ -126,7 +126,7 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         query_text: text.into(),
         max_results: topk,
         from: 0,
-        bm25_params: Bm25Params::default(),
+        bm25_params: Default::default(),
         filter: None,
         sort: vec![],
         search_after: None,

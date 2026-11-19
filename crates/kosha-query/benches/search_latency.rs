@@ -92,7 +92,7 @@ fn mk_query(text: &str) -> SearchQuery {
         query_text: text.into(),
         max_results: PAGE_SIZE,
         from: 0,
-        bm25_params: Bm25Params::default(),
+        bm25_params: Default::default(),
         filter: None,
         sort: vec![],
         search_after: None,
