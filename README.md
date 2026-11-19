@@ -124,7 +124,10 @@ Until then a namespace with both kinds scores them with different statistics.
 
 **Cost.** On a two-field corpus (`title` ~6 words, `content` ~60) per-field indexes make the
 inverted index 2.3x larger on disk and segment builds 1.5x slower (`cargo bench -p kosha-query
---bench field_bm25`). `KOSHA_FIELD_INDEX=off` writes segments exactly as before (no field
+--bench field_bm25`). An open segment's term dictionary holds the field keys too: on the
+one-field `segment_memory` corpus resident memory while open goes from 6.9 to 13.1 MiB and a cold
+broad query from ~2 to ~5.6 ms (`cargo bench -p kosha-query --bench segment_memory`, with and
+without `KOSHA_FIELD_INDEX=off`); warm queries are unchanged. `KOSHA_FIELD_INDEX=off` writes segments exactly as before (no field
 postings, no position gap). **Before rolling back** to a binary older than this change, set it and
 compact: an older binary ignores `field_index` but lists field keys among a segment's terms, so a
 leading-`*` wildcard could match them.
