@@ -2677,17 +2677,19 @@ impl AppState {
         if !doc_access_ok {
             return false;
         }
-        // Deliberately does NOT also require vector.offsets: it's an
-        // optional sidecar (legacy v1 segments never have one; the reader
-        // falls back to an eager parse of vector.idx alone when it's
-        // absent — same tolerance doc_access_ok above gives
-        // doc_store.offsets vs. doc_store.bin). `ensure_scoring_files_local`
-        // still proactively *attempts* to fetch it when present on S3 (see
-        // its comment) — this predicate just doesn't block "can we score"
-        // on that attempt having succeeded, since scoring is correct
-        // either way.
-        if needs_vectors && !file_present_nonempty(&seg_path.join("vector.idx")) {
-            return false;
+        // `vector.offsets` is required only where it exists: legacy flat
+        // segments never have one. A clustered segment without it is served
+        // by exact scan of every vector (seconds on a large segment), so it
+        // is not complete until the sidecar has been fetched.
+        if needs_vectors {
+            if !file_present_nonempty(&seg_path.join("vector.idx")) {
+                return false;
+            }
+            if !file_present_nonempty(&seg_path.join("vector.offsets"))
+                && kosha_segment::vector_index_needs_offsets(seg_path)
+            {
+                return false;
+            }
         }
         true
     }
