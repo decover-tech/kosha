@@ -89,7 +89,9 @@ The suite only works if the server's segment layout is predictable.
 `KOSHA_MAX_CONCURRENT_FLUSH_WRITERS=1` and a large `KOSHA_FLUSH_THRESHOLD`
 make one flush produce exactly one segment, and `KOSHA_FLUSH_MAX_AGE_MS=0`
 turns off the idle-buffer flush timer so buffered docs stay invisible until an
-explicit flush. `--spawn` and the compose overlay set all three. The `stats` check fails loudly if the layout ever diverges from the
+explicit flush. `KOSHA_COMPACTION_INTERVAL_MS=0` turns off the background
+compaction scheduler (#242), which would otherwise merge the suite's segments
+mid-run. `--spawn` and the compose overlay set all four. The `stats` check fails loudly if the layout ever diverges from the
 model.
 
 Where Kosha's current behavior looks like a bug rather than a design choice,

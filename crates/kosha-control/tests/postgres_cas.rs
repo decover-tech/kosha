@@ -13,6 +13,7 @@ fn candidate(segment: &str, version: u64) -> Manifest {
             doc_count: 1,
         }],
         segment_footers: Default::default(),
+        footer_crc32: Default::default(),
         wal_checkpoint: 1,
         wal_origin: Some(segment.into()),
         deletion_vectors: Default::default(),

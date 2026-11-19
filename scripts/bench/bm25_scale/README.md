@@ -27,7 +27,10 @@ scale-feasibility test of unproven code, not a rerun of this harness.
    entry to `k8s/base/deployment.yaml` or an overlay patch). Also set
    `KOSHA_FLUSH_MAX_AGE_MS=0`: the idle-buffer flush timer (#241, default
    1 s) would otherwise cut a segment from whatever arrived in the last
-   second instead of waiting for the threshold.
+   second instead of waiting for the threshold. And set
+   `KOSHA_COMPACTION_INTERVAL_MS=0`: the background compaction scheduler
+   (#242) would otherwise merge segments mid-load and collide (`409`) with
+   `load_corpus.py`'s own `--compact-mode` passes.
 2. **Segment cache sized for the corpus.** Set `KOSHA_SEGMENT_CACHE_MAX_BYTES`
    comfortably above ~9GB (e.g. `12884901888` for 12GiB) so the "warm" run
    can actually hold the whole corpus resident. Staging's kosha pod already

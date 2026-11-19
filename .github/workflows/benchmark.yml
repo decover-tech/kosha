@@ -149,7 +149,7 @@ jobs:
               -e DATABASE_URL=postgresql://postgres:bench@127.0.0.1:5432/kosha \
               -e KOSHA_API_KEY=sk-bench \
               -e KOSHA_S3_BUCKET=decoverai-bench-kosha-segments -e KOSHA_S3_PREFIX=segments/ \
-              -e AWS_DEFAULT_REGION=us-east-1 -e KOSHA_FLUSH_THRESHOLD=50000 -e KOSHA_FLUSH_MAX_AGE_MS=0 \
+              -e AWS_DEFAULT_REGION=us-east-1 -e KOSHA_FLUSH_THRESHOLD=50000 -e KOSHA_FLUSH_MAX_AGE_MS=0 -e KOSHA_COMPACTION_INTERVAL_MS=0 \
               -e KOSHA_HTTP_IO_TIMEOUT_SECS=1800 \
               -e KOSHA_CACHE_DIR=/var/cache/kosha -e KOSHA_DATA_DIR=/var/cache/kosha/data \
               -e KOSHA_CACHE_MAX_BYTES=644245094400 -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \

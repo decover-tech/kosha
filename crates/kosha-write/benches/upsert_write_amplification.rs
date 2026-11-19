@@ -46,6 +46,7 @@ fn main() {
             doc_count: footer.doc_count,
         }],
         segment_footers: Default::default(),
+        footer_crc32: Default::default(),
         wal_checkpoint: 0,
         wal_origin: None,
         tombstones: Default::default(),
