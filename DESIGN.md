@@ -231,7 +231,11 @@ Iceberg/Delta Lake use for tables, applied to a search index.
    `IndexDocuments` call.
 2. **Buffer**: the ingest node appends to an in-memory + local-SSD write buffer for that namespace,
    and synchronously appends to a WAL object in S3 (small, cheap PUTs) so the write survives node
-   loss before it's part of a segment.
+   loss before it's part of a segment. *Implemented today:* the WAL is on local disk behind a
+   `WalStore` trait (an S3 implementation is #236). Concurrent appends are group-committed: one
+   WAL file (one fsync) holds the records of every namespace that arrived during the previous
+   commit, each record carries its own LSN, and a file is deleted only once every namespace in it
+   has a published manifest checkpoint at or past its records there.
 3. **Flush**: when the buffer crosses a size/time threshold (default: 512MB or 60s, whichever
    first), the ingest node builds inverted + vector + filter indices for the buffered documents,
    writes a new segment to S3, and publishes an updated manifest that adds the new segment.

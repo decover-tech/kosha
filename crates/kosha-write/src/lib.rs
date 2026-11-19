@@ -295,7 +295,7 @@ pub struct Indexer {
     flush_threshold: usize,
     bm25_params: Bm25Params,
     /// Write-Ahead Log for durability
-    wal: Mutex<crate::wal::WalWriter>,
+    wal: crate::wal::WalWriter,
     /// Whether WAL is enabled
     wal_enabled: bool,
     namespaces: Mutex<HashMap<NamespaceId, Arc<NamespaceHandle>>>,
@@ -316,14 +316,13 @@ impl Indexer {
     pub fn new(data_dir: PathBuf) -> Self {
         let wal_dir = data_dir.join("_wal");
         std::fs::create_dir_all(&wal_dir).ok();
-        let backend = Box::new(kosha_core::LocalStorage::new(wal_dir.clone()));
-        let wal = crate::wal::WalWriter::new(backend, wal_dir.clone());
+        let wal = crate::wal::WalWriter::new(wal_dir.clone());
 
         let idx = Self {
             data_dir,
             flush_threshold: 1000,
             bm25_params: Bm25Params::default(),
-            wal: Mutex::new(wal),
+            wal,
             wal_enabled: true,
             namespaces: Mutex::new(HashMap::new()),
             compaction_policy: CompactionPolicy::default(),
@@ -504,11 +503,12 @@ impl Indexer {
         }
         let total = changes.iter().map(|(_, ids)| ids.len()).sum();
         if total > 0 && self.wal_enabled {
-            let mut wal = self.wal.lock().unwrap();
-            wal.append_delete(namespace, deleted_ids.into_iter().collect())?;
-            state.wal_sequence = wal.last_sequence();
+            let lsn = self
+                .wal
+                .append_delete(namespace, deleted_ids.into_iter().collect())?;
+            state.wal_sequence = state.wal_sequence.max(lsn);
             state.manifest.wal_checkpoint = state.wal_sequence;
-            state.manifest.wal_origin = Some(wal.origin().to_owned());
+            state.manifest.wal_origin = Some(self.wal.origin().to_owned());
         }
         for (segment, matching) in changes {
             if !matching.is_empty() {
@@ -702,9 +702,8 @@ impl Indexer {
             }
 
             if self.wal_enabled {
-                let mut wal = self.wal.lock().unwrap();
-                wal.append(&namespace, &documents)?;
-                state.wal_sequence = wal.last_sequence();
+                let lsn = self.wal.append(&namespace, &documents)?;
+                state.wal_sequence = state.wal_sequence.max(lsn);
             }
 
             if let Some(buf) = state.buffer.as_mut() {
@@ -827,9 +826,7 @@ impl Indexer {
         // WAL fsync and segment I/O happen with state unlocked. The operation
         // lock orders writes; compaction cannot move the old doc locations.
         let sequence = if self.wal_enabled {
-            let mut wal = self.wal.lock().unwrap();
-            wal.append(&namespace, &replacements)?;
-            wal.last_sequence()
+            self.wal.append(&namespace, &replacements)?
         } else {
             snapshot.wal_sequence
         };
@@ -851,7 +848,7 @@ impl Indexer {
             .map(|b| b.bm25_params.clone())
             .unwrap_or_else(|| self.bm25_params.clone());
         let footer = writer.finalize(params)?;
-        let origin = self.wal.lock().unwrap().origin().to_owned();
+        let origin = self.wal.origin().to_owned();
         let mut state = handle.state.lock().unwrap();
         let ids: HashSet<_> = replacements.iter().map(|doc| &doc.id).collect();
         if let Some(buffer) = state.buffer.as_mut() {
@@ -868,7 +865,7 @@ impl Indexer {
         state.manifest.remember_segment_footer(footer);
         state.manifest.version += 1;
         state.manifest.tombstones = state.tombstones.clone();
-        state.wal_sequence = sequence;
+        state.wal_sequence = state.wal_sequence.max(sequence);
         // Other buffered records must remain recoverable after publication.
         if state.buffer.as_ref().is_none_or(|b| b.documents.is_empty()) {
             state.manifest.wal_checkpoint = sequence;
@@ -1053,7 +1050,7 @@ impl Indexer {
         };
         let _mutation = handle.mutation.lock().unwrap();
         let recovery = self.prepare_recovery(namespace, handle)?;
-        let origin = self.wal.lock().unwrap().origin().to_owned();
+        let origin = self.wal.origin().to_owned();
         // Phase 1 (state locked, cheap): snapshot whatever's buffered and
         // split it into chunks, each with its own reserved SegmentId.
         // Released immediately after — concurrent index_documents calls for
@@ -1287,7 +1284,7 @@ impl Indexer {
         namespace: &NamespaceId,
         data_dir: &Path,
         wal_enabled: bool,
-        wal: &Mutex<crate::wal::WalWriter>,
+        wal: &crate::wal::WalWriter,
     ) -> Result<(), KoshaError> {
         let (docs, seg_id, bm25_params) = {
             let Some(buf) = state.buffer.as_mut() else {
@@ -1322,7 +1319,7 @@ impl Indexer {
         // WAL reclamation waits for durable manifest publication.
         let _ = (wal_enabled, wal);
         state.manifest.wal_checkpoint = state.wal_sequence;
-        state.manifest.wal_origin = Some(wal.lock().unwrap().origin().to_owned());
+        state.manifest.wal_origin = Some(wal.origin().to_owned());
 
         Self::remember_flushed_ids_in(state, &seg_id, &docs);
 
@@ -1601,11 +1598,14 @@ impl Indexer {
         let checkpoint_applies = manifest
             .wal_origin
             .as_deref()
-            .is_none_or(|origin| origin == self.wal.lock().unwrap().origin());
-        self.wal
-            .lock()
-            .unwrap()
-            .advance_past(manifest.wal_checkpoint);
+            .is_none_or(|origin| origin == self.wal.origin());
+        self.wal.advance_past(manifest.wal_checkpoint);
+        if checkpoint_applies {
+            // Lets a later reclamation of another namespace delete group
+            // files this namespace shares with it.
+            self.wal
+                .note_checkpoint(&namespace, manifest.wal_checkpoint);
+        }
         state.wal_sequence = state.wal_sequence.max(manifest.wal_checkpoint);
         let max_counter = manifest
             .segments
@@ -1903,15 +1903,13 @@ impl Indexer {
             state.manifest.deletion_vectors = manifest.deletion_vectors.clone();
         }
         drop(state);
-        if self.wal_enabled {
-            let mut wal = self.wal.lock().unwrap();
-            if manifest
+        if self.wal_enabled
+            && manifest
                 .wal_origin
                 .as_deref()
-                .is_none_or(|origin| origin == wal.origin())
-            {
-                wal.clear_through(namespace, manifest.wal_checkpoint)?;
-            }
+                .is_none_or(|origin| origin == self.wal.origin())
+        {
+            self.wal.clear_through(namespace, manifest.wal_checkpoint)?;
         }
         Ok(())
     }
@@ -1946,7 +1944,7 @@ impl Indexer {
         namespace: &NamespaceId,
         mut remote: Manifest,
     ) -> Result<RebaseOutcome, KoshaError> {
-        let own_origin = self.wal.lock().unwrap().origin().to_owned();
+        let own_origin = self.wal.origin().to_owned();
         let handle = self.ns_handle(namespace);
         // Upserts and compactions hold `compact` across their I/O and
         // commit doc locations / merge inputs read before it; swapping the
@@ -2102,7 +2100,7 @@ impl Indexer {
         manifest.carry_segment_footers_from(&state.manifest);
         manifest.carry_segment_footers_from(&remote);
         if remote.wal_origin.as_deref() == Some(own_origin.as_str()) {
-            self.wal.lock().unwrap().advance_past(remote.wal_checkpoint);
+            self.wal.advance_past(remote.wal_checkpoint);
             state.wal_sequence = state.wal_sequence.max(remote.wal_checkpoint);
         }
         let max_counter = manifest
@@ -2468,7 +2466,7 @@ mod tests {
         let committed = idx.manifest(&ns).unwrap();
         idx.acknowledge_manifest(&ns, &committed).unwrap();
         // Crash after a new upsert's WAL append, before its segment commit.
-        idx.wal.lock().unwrap().append(&ns, &[doc("new")]).unwrap();
+        idx.wal.append(&ns, &[doc("new")]).unwrap();
         let restart = Indexer::new(dir.clone());
         restart.restore_manifest(ns.clone(), committed);
         restart.flush_namespace(&ns).unwrap();
@@ -2683,6 +2681,63 @@ mod tests {
         idx.flush_namespace(&NamespaceId("a".into())).unwrap();
         let recovered = wal::WalWriter::recover(&dir.join("_wal")).unwrap();
         assert!(recovered.iter().any(|r| r.namespace.0 == "b"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn flush_of_one_namespace_keeps_a_shared_group_file_until_both_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("kosha-wal-shared-{}", uuid::Uuid::new_v4()));
+        let (a, b) = (NamespaceId("a".into()), NamespaceId("b".into()));
+        let doc = |id: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", id)],
+        };
+        let wal_files = || {
+            std::fs::read_dir(dir.join("_wal"))
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|x| x == "wal")
+                })
+                .count()
+        };
+        // One group commit holding both namespaces' records, then a crash.
+        wal::WalWriter::new(dir.join("_wal"))
+            .append_records(&[
+                kosha_core::WalRecord::new(a.clone(), vec![doc("a1")]),
+                kosha_core::WalRecord::new(b.clone(), vec![doc("b1")]),
+            ])
+            .unwrap();
+        assert_eq!(wal_files(), 1);
+
+        let idx = Indexer::new(dir.clone());
+        idx.flush_namespace(&a).unwrap();
+        let published_a = idx.manifest(&a).unwrap();
+        idx.acknowledge_manifest(&a, &published_a).unwrap();
+        assert_eq!(wal_files(), 1, "B's record still needs the shared file");
+        drop(idx);
+
+        let restart = Indexer::new(dir.clone());
+        restart.restore_manifest(a.clone(), published_a);
+        restart.flush_namespace(&a).unwrap();
+        restart.flush_namespace(&b).unwrap();
+        let count = |ns: &NamespaceId| {
+            restart
+                .manifest(ns)
+                .unwrap()
+                .segments
+                .iter()
+                .map(|e| e.doc_count)
+                .sum::<u32>()
+        };
+        assert_eq!(count(&a), 1, "A's checkpointed record is not replayed");
+        assert_eq!(count(&b), 1, "B is recovered after A's flush");
+        let published_b = restart.manifest(&b).unwrap();
+        restart.acknowledge_manifest(&b, &published_b).unwrap();
+        assert_eq!(wal_files(), 0, "reclaimed once both namespaces checkpoint");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
