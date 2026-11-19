@@ -68,7 +68,9 @@ another and let the SSD cache warm."
   Decover's products need (see §8), not an open-ended query language.
 - General-purpose analytics / aggregations (`terms`, `date_histogram`, etc.) beyond simple
   faceting needed for filters. If a real analytics need emerges, it's a separate consumer of the
-  same S3 data, not a feature of the query path.
+  same S3 data, not a feature of the query path. (Since then a bounded set computed from the
+  filter columns has been added — metrics, `histogram` and fixed-interval `date_histogram`; see
+  the README's Aggregations section.)
 - Real-time (sub-second) durability of every write. Writes are durable to S3 within a bounded
   flush interval (see §7); we accept a small, tunable visibility lag in exchange for not fusing
   compute and storage.

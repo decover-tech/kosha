@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 // ─── Control store trait (in-memory or Postgres) ──────────────────────────
 
 pub mod datetime;
+pub mod histogram;
+pub use histogram::{AggDateHistogram, AggHistogram, DurationValue};
 pub mod docset;
 pub use docset::{evaluate_filter, DocSet};
 
@@ -566,6 +568,20 @@ pub enum Aggregation {
     ValueCount {
         value_count: AggMetric,
     },
+    /// Fixed-width numeric buckets (issue #219).
+    Histogram {
+        histogram: AggHistogram,
+        /// Metric sub-aggregations computed per bucket (ES `aggs`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aggs: Option<std::collections::HashMap<String, Aggregation>>,
+    },
+    /// Fixed-width date buckets over epoch milliseconds (issue #219).
+    DateHistogram {
+        date_histogram: AggDateHistogram,
+        /// Metric sub-aggregations computed per bucket (ES `aggs`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aggs: Option<std::collections::HashMap<String, Aggregation>>,
+    },
 }
 
 /// The single-value metric aggregations.
@@ -600,10 +616,12 @@ pub struct AggMetric {
 }
 
 /// Aggregation type keys `Aggregation` accepts, as reported in parse errors.
-const AGGREGATION_KEYS: [&str; 8] = [
+const AGGREGATION_KEYS: [&str; 10] = [
     "terms",
     "cardinality",
     "composite",
+    "histogram",
+    "date_histogram",
     "min",
     "max",
     "sum",
@@ -630,6 +648,8 @@ impl Aggregation {
             Aggregation::Terms { .. } => "terms",
             Aggregation::Cardinality { .. } => "cardinality",
             Aggregation::Composite { .. } => "composite",
+            Aggregation::Histogram { .. } => "histogram",
+            Aggregation::DateHistogram { .. } => "date_histogram",
             other => other.metric().map(|(kind, _)| kind.name()).unwrap_or(""),
         }
     }
@@ -637,7 +657,10 @@ impl Aggregation {
     /// Sub-aggregations of a bucket aggregation, if any.
     pub fn sub_aggregations(&self) -> Option<&std::collections::HashMap<String, Aggregation>> {
         match self {
-            Aggregation::Terms { aggs, .. } | Aggregation::Composite { aggs, .. } => aggs.as_ref(),
+            Aggregation::Terms { aggs, .. }
+            | Aggregation::Composite { aggs, .. }
+            | Aggregation::Histogram { aggs, .. }
+            | Aggregation::DateHistogram { aggs, .. } => aggs.as_ref(),
             _ => None,
         }
     }
@@ -646,6 +669,14 @@ impl Aggregation {
     /// metric aggregations may be nested, and only under a bucket
     /// aggregation.
     pub fn validate(&self, name: &str) -> Result<(), String> {
+        let in_agg = |e: String| format!("in aggregation `{name}`: {e}");
+        match self {
+            Aggregation::Histogram { histogram, .. } => histogram.validate().map_err(in_agg)?,
+            Aggregation::DateHistogram { date_histogram, .. } => {
+                date_histogram.validate().map_err(in_agg)?
+            }
+            _ => {}
+        }
         if let Some(subs) = self.sub_aggregations() {
             for (sub_name, sub) in subs {
                 if sub.metric().is_none() {
@@ -655,6 +686,47 @@ impl Aggregation {
         }
         Ok(())
     }
+}
+
+/// Aggregation types that produce buckets and so may carry `aggs`.
+const BUCKET_AGGREGATION_KEYS: [&str; 4] = ["terms", "composite", "histogram", "date_histogram"];
+
+/// Elasticsearch histogram options Kosha does not implement yet. They get
+/// a specific message instead of serde's generic unknown-field one, so a
+/// caller knows the option is recognised but unsupported rather than
+/// misspelled.
+fn reject_unsupported_histogram_options(
+    kind: &str,
+    body: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(obj) = body.as_object() else {
+        return Ok(());
+    };
+    for option in [
+        "time_zone",
+        "extended_bounds",
+        "hard_bounds",
+        "keyed",
+        "order",
+        "missing",
+        "format",
+    ] {
+        if obj.contains_key(option) {
+            return Err(format!(
+                "in `{kind}` aggregation: `{option}` is not supported yet (bucket boundaries \
+                 are UTC, buckets are sorted by key ascending, and gaps are filled between \
+                 the lowest and highest non-empty bucket)"
+            ));
+        }
+    }
+    if kind == "date_histogram" && obj.contains_key("interval") {
+        return Err(
+            "in `date_histogram` aggregation: `interval` is deprecated in Elasticsearch and not \
+             accepted; use `fixed_interval` (e.g. \"1h\", \"7d\")"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn nested_bucket_error(parent: &str, name: &str, kind: &str) -> String {
@@ -672,8 +744,9 @@ fn nested_bucket_error(parent: &str, name: &str, kind: &str) -> String {
 /// unhelpful "did not match any variant", and a new variant whose body
 /// happened to fit would silently capture another type's JSON.
 ///
-/// The object holds exactly one type key, plus — for `terms` and
-/// `composite` only — an optional `aggs` (or `aggregations`) map of metric
+/// The object holds exactly one type key, plus — for the bucket
+/// aggregations `terms`, `composite`, `histogram` and `date_histogram`
+/// only — an optional `aggs` (or `aggregations`) map of metric
 /// sub-aggregations, as in Elasticsearch.
 impl<'de> Deserialize<'de> for Aggregation {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -729,10 +802,11 @@ impl<'de> Deserialize<'de> for Aggregation {
         let subs: Option<std::collections::HashMap<String, Aggregation>> = match subs {
             None => None,
             Some(v) => {
-                if key != "terms" && key != "composite" {
+                if !BUCKET_AGGREGATION_KEYS.contains(&key.as_str()) {
                     return Err(D::Error::custom(format!(
-                        "`{key}` aggregation cannot have sub-aggregations; only `terms` and \
-                         `composite` buckets take `aggs`"
+                        "`{key}` aggregation cannot have sub-aggregations; only the bucket \
+                         aggregations ({}) take `aggs`",
+                        BUCKET_AGGREGATION_KEYS.join(", ")
                     )));
                 }
                 let map: std::collections::HashMap<String, Aggregation> =
@@ -777,10 +851,39 @@ impl<'de> Deserialize<'de> for Aggregation {
             "value_count" => Ok(Aggregation::ValueCount {
                 value_count: body(&key, inner)?,
             }),
+            "histogram" => {
+                reject_unsupported_histogram_options(&key, &inner).map_err(D::Error::custom)?;
+                let histogram: AggHistogram = body(&key, inner)?;
+                histogram
+                    .validate()
+                    .map_err(|e| D::Error::custom(format!("in `histogram` aggregation: {e}")))?;
+                Ok(Aggregation::Histogram {
+                    histogram,
+                    aggs: subs,
+                })
+            }
+            "date_histogram" => {
+                reject_unsupported_histogram_options(&key, &inner).map_err(D::Error::custom)?;
+                let date_histogram: AggDateHistogram = body(&key, inner)?;
+                date_histogram.validate().map_err(|e| {
+                    D::Error::custom(format!("in `date_histogram` aggregation: {e}"))
+                })?;
+                Ok(Aggregation::DateHistogram {
+                    date_histogram,
+                    aggs: subs,
+                })
+            }
             other => {
                 let hint = match other {
-                    "stats" | "extended_stats" | "percentiles" | "histogram" | "date_histogram"
-                    | "range" | "top_hits" | "filter" | "filters" => " (not supported yet)",
+                    "stats"
+                    | "extended_stats"
+                    | "percentiles"
+                    | "auto_date_histogram"
+                    | "variable_width_histogram"
+                    | "range"
+                    | "top_hits"
+                    | "filter"
+                    | "filters" => " (not supported yet)",
                     "count" => " — use `value_count`, or `total_hits` for the number of matches",
                     "average" | "mean" => " — did you mean `avg`?",
                     "minimum" => " — did you mean `min`?",
@@ -2978,6 +3081,123 @@ mod aggregation_parsing {
             },
         );
         assert!(query.validate().is_err());
+    }
+
+    #[test]
+    fn histogram_aggregations_parse_round_trip_and_take_metric_sub_aggs() {
+        for json in [
+            r#"{"histogram":{"field":"bytes","interval":1024.0}}"#,
+            r#"{"histogram":{"field":"bytes","interval":0.5,"offset":-3.0,"min_doc_count":1}}"#,
+            r#"{"date_histogram":{"field":"sentAt","fixed_interval":"1h"}}"#,
+            r#"{"date_histogram":{"field":"sentAt","calendar_interval":"1w","offset":"+6h","min_doc_count":2}}"#,
+            r#"{"date_histogram":{"field":"sentAt","fixed_interval":"30s","offset":1500}}"#,
+        ] {
+            let agg = parse(json).unwrap();
+            assert_eq!(serde_json::to_string(&agg).unwrap(), json);
+            assert!(agg.validate("x").is_ok());
+        }
+        let agg = parse(r#"{"histogram":{"field":"bytes","interval":1024}}"#).unwrap();
+        assert_eq!(agg.type_name(), "histogram");
+        let Aggregation::Histogram { histogram, .. } = &agg else {
+            panic!("expected histogram");
+        };
+        assert_eq!((histogram.offset, histogram.min_doc_count), (0.0, 0));
+
+        let agg = parse(
+            r#"{"date_histogram":{"field":"sentAt","fixed_interval":"1d"},
+                "aggs":{"total":{"sum":{"field":"amount"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(agg.type_name(), "date_histogram");
+        assert!(agg.sub_aggregations().unwrap().contains_key("total"));
+        let err = parse(
+            r#"{"histogram":{"field":"b","interval":1},"aggs":{"x":{"histogram":{"field":"b","interval":1}}}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only metric aggregations"), "{err}");
+    }
+
+    #[test]
+    fn histogram_aggregations_reject_garbage() {
+        for (json, needle) in [
+            (
+                r#"{"histogram":{"field":"b","interval":0}}"#,
+                "greater than 0",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":-5}}"#,
+                "greater than 0",
+            ),
+            (r#"{"histogram":{"field":"b"}}"#, "missing field `interval`"),
+            (
+                r#"{"histogram":{"field":"b","interval":"1h"}}"#,
+                "in `histogram` aggregation",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"min_doc_count":-1}}"#,
+                "in `histogram` aggregation",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"extended_bounds":{"min":0,"max":9}}}"#,
+                "`extended_bounds` is not supported yet",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"hard_bounds":{"min":0,"max":9}}}"#,
+                "`hard_bounds` is not supported yet",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"bogus":1}}"#,
+                "unknown field `bogus`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1 banana"}}"#,
+                "invalid `fixed_interval` \"1 banana\"",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"0h"}}"#,
+                "greater than 0",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"-1h"}}"#,
+                "fixed_interval",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":0}}"#,
+                "in `date_histogram` aggregation",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","calendar_interval":"1M"}}"#,
+                "use `fixed_interval`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","calendar_interval":"1y"}}"#,
+                "use `fixed_interval`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","calendar_interval":"1q"}}"#,
+                "use `fixed_interval`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t"}}"#,
+                "needs `fixed_interval`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","interval":"1h"}}"#,
+                "use `fixed_interval`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","time_zone":"Europe/Paris"}}"#,
+                "`time_zone` is not supported yet",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","offset":"soon"}}"#,
+                "invalid `date_histogram` `offset`",
+            ),
+        ] {
+            let err = parse(json).unwrap_err().to_string();
+            assert!(err.contains(needle), "{json}: {err}");
+        }
     }
 
     #[test]
