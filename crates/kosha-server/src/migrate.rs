@@ -818,6 +818,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         commit_manifest(&mut store, &ns, 0, &manifest(1, "run-1")).unwrap();
         // An ingest writer publishes on top while the run is uploading.

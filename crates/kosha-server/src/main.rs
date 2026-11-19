@@ -5588,7 +5588,9 @@ fn handle_put_schema_with_ns(
 /// `GET /v1/namespaces/{ns}/schema` — the namespace schema, `{}` if none.
 fn handle_get_schema_with_ns(namespace: &str, tenant: &str, state: &AppState) -> String {
     let ns = NamespaceId(tenant_namespace(tenant, namespace));
-    if let Err(e) = state.refresh_query_namespace(&ns) {
+    // An admin read: always confirm against the control store on a query
+    // replica (no-op on the ingest pod).
+    if let Err(e) = state.ensure_query_manifest_fresh(&ns, Some(Duration::ZERO)) {
         return json_error(404, &format!("{e}"));
     }
     match state.indexer.manifest_shared(&ns) {
@@ -7650,6 +7652,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         state.import_manifest(&ns, manifest(1, "seed")).unwrap();
         assert_eq!(shared.manifest_cloned(&ns).unwrap().version, 1);

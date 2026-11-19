@@ -67,6 +67,9 @@ const MAX_PENDING_BASES: usize = 4;
 struct PublishedBase {
     segments: HashSet<SegmentId>,
     tombstones: HashMap<SegmentId, HashSet<u32>>,
+    /// The namespace schema as published (#220), so a rebase can tell a
+    /// local, unpublished schema change from the remote's.
+    schema: Option<kosha_core::NamespaceSchema>,
 }
 
 impl PublishedBase {
@@ -84,6 +87,7 @@ impl PublishedBase {
         Self {
             segments,
             tombstones,
+            schema: manifest.schema.clone(),
         }
     }
 
@@ -2136,6 +2140,14 @@ impl Indexer {
                 tombstones: tombstones.clone(),
                 // Rebuilt from `tombstones` by `prepare_publication`.
                 deletion_vectors: Default::default(),
+                // A schema set on this writer since its last publication
+                // wins (it is the newer admin action); otherwise keep the
+                // remote's, which may carry another writer's change.
+                schema: if state.manifest.schema != base.schema {
+                    state.manifest.schema.clone()
+                } else {
+                    remote.schema.clone()
+                },
             };
             (manifest, tombstones, RebaseOutcome::Rebased)
         } else {
@@ -4058,6 +4070,49 @@ mod tests {
             (remote.version, remote.version)
         );
         assert_eq!(segment_ids(&adopted), segment_ids(&remote));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebase_keeps_a_local_schema_change_and_otherwise_the_remote_schema() {
+        let schema = |analyzer: &str| kosha_core::NamespaceSchema {
+            default_analyzer: vec![analyzer.to_owned()],
+            ..Default::default()
+        };
+        let dir = rebase_dir("schema");
+        let ns = NamespaceId("ns".into());
+        let idx = Indexer::new(dir.clone());
+        write_docs(&idx, &ns, &["a"]);
+        let base = commit(&idx, &ns);
+
+        // Unpublished local data, while another writer set a schema: the
+        // rebase must not drop the remote's schema.
+        write_docs(&idx, &ns, &["b"]);
+        let mut remote = base.clone();
+        remote.version = base.version + 1;
+        remote.schema = Some(schema("standard@2"));
+        remote.wal_origin = Some("other-writer".into());
+        assert_eq!(
+            idx.rebase_onto(&ns, remote.clone()).unwrap(),
+            RebaseOutcome::Rebased
+        );
+        let rebased = idx.publication_snapshot(&ns).unwrap().1;
+        assert_eq!(rebased.schema, Some(schema("standard@2")));
+        let published = commit(&idx, &ns);
+
+        // A schema set locally since the last publication wins over the
+        // remote's (it is the newer admin action).
+        assert!(idx.set_schema(&ns, schema("whitespace")).unwrap());
+        let mut remote = published.clone();
+        remote.version = published.version + 1;
+        remote.schema = Some(schema("keyword"));
+        remote.wal_origin = Some("other-writer".into());
+        assert_eq!(
+            idx.rebase_onto(&ns, remote).unwrap(),
+            RebaseOutcome::Rebased
+        );
+        let rebased = idx.publication_snapshot(&ns).unwrap().1;
+        assert_eq!(rebased.schema, Some(schema("whitespace")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
