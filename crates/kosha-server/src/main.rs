@@ -3430,6 +3430,7 @@ fn serve(listener: TcpListener, state: Arc<AppState>, io_timeout: Duration) {
 // ─── Request handling ───────────────────────────────────────────────────────
 
 fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
+    let started = Instant::now();
     let mut reader = BufReader::new(
         stream
             .try_clone()
@@ -3531,28 +3532,56 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
     } else {
         authenticate(&headers)
     };
-    let tenant = match authentication {
-        Ok(t) => t,
-        Err(resp) => {
-            stream.write_all(resp.as_bytes()).ok();
-            return Ok(());
-        }
-    };
-
     // ── Query/ingest role routing ────────────────────────────────────────
     // A query-role pod (KOSHA_INGEST_HOST set) forwards write-path requests
     // to the single ingest pod instead of executing them locally — see
     // is_write_path/forward_to_ingest. Every other request (all reads, and
     // everything on the ingest pod itself, which never forwards) is handled
     // locally exactly as before this existed.
-    let response = match (&state.ingest_host, &state.write_http_client) {
-        (Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
+    let response = match (
+        &authentication,
+        &state.ingest_host,
+        &state.write_http_client,
+    ) {
+        (Err(resp), _, _) => resp.clone(),
+        (Ok(_), Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
             forward_to_ingest(client, ingest_host, &request_line, &headers, &body)
         }
-        _ => route(&request_line, &headers, &body, &tenant, state),
+        (Ok(tenant), _, _) => route(&request_line, &headers, &body, tenant, state),
     };
+    log_request(
+        &request_line,
+        authentication.as_deref().unwrap_or("-"),
+        body.len(),
+        &response,
+        started,
+    );
     stream.write_all(response.as_bytes()).ok();
     Ok(())
+}
+
+/// One line per API request: who asked for what, the status returned and how
+/// long it took. A successful search is skipped because it already prints
+/// the more detailed `search timing:` line; probes never reach here.
+fn log_request(
+    request_line: &str,
+    tenant: &str,
+    body_bytes: usize,
+    response: &str,
+    started: Instant,
+) {
+    let status = response.get(9..12).unwrap_or("???");
+    let mut parts = request_line.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or("-"), parts.next().unwrap_or("-"));
+    let path = target.split('?').next().unwrap_or(target);
+    if status == "200" && path.ends_with("/search") {
+        return;
+    }
+    println!(
+        "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}",
+        started.elapsed().as_secs_f64() * 1e3,
+        response.len()
+    );
 }
 
 /// Extract and validate the API key from request headers.
@@ -6338,10 +6367,8 @@ fn json_accepted<T: serde::Serialize>(value: &T) -> String {
 }
 
 fn json_error(status_code: u16, message: &str) -> String {
-    // Rejections and server faults were invisible in the pod log.
-    if status_code >= 429 {
-        eprintln!("WARN: request failed: status={status_code} {message}");
-    }
+    // The reason for an error response; `request:` carries the rest.
+    eprintln!("WARN: request failed: status={status_code} {message}");
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",
