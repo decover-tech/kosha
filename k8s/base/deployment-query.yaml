@@ -24,6 +24,10 @@ spec:
       labels:
         app: kosha
         role: query
+      annotations:
+        # A replaced pod starts with an empty cache; Karpenter consolidation
+        # was replacing idle warm pods several times a day.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: kosha
       # Deliberately NOT on the dedicated NVMe/Karpenter pool — that pool is

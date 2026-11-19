@@ -82,7 +82,7 @@ fn main() {
         query_text: "the".into(),
         max_results: 10,
         from: 0,
-        bm25_params: Bm25Params::default(),
+        bm25_params: Default::default(),
         filter: Some(FilterClause::Term {
             term: std::collections::HashMap::from([("custodian".into(), "alice".into())]),
         }),
@@ -100,6 +100,8 @@ fn main() {
         collapse: None,
         source_includes: None,
         source_excludes: None,
+        rank: None,
+        mode: None,
     };
 
     // Warm the segment cache.

@@ -576,6 +576,8 @@ fn build_search_query(
         collapse: None,
         source_includes: None,
         source_excludes: None,
+        rank: None,
+        mode: None,
     }
 }
 

@@ -11,7 +11,7 @@ Checkpoints, in order:
 
   buffered       docs indexed but not flushed  -> nothing may be visible
   one-segment    first flush
-  many-segments  several more flushes          -> per-segment BM25 statistics
+  many-segments  several more flushes          -> namespace-level BM25 statistics
   upserts        re-index flushed and buffered ids (mark-deleted + append path)
   deletes        delete-by-query, delete vs. unflushed docs, re-index of a
                  deleted id
@@ -33,7 +33,7 @@ Usage:
 The server must run with KOSHA_MAX_CONCURRENT_FLUSH_WRITERS=1, a large
 KOSHA_FLUSH_THRESHOLD, KOSHA_FLUSH_MAX_AGE_MS=0 (no idle-buffer flush timer)
 and KOSHA_COMPACTION_INTERVAL_MS=0 (no background compaction) so segments
-come only from explicit flushes, one per flush; otherwise the per-segment
+come only from explicit flushes, one per flush; otherwise the layout-dependent
 score checks cannot be predicted (``--spawn`` sets all four).
 
 Exit status: 0 when every check passed or failed only as listed in

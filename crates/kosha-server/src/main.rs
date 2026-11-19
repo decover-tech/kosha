@@ -1871,6 +1871,12 @@ impl AppState {
             if warm {
                 self.prewarm_followed_manifest(ns, &manifest);
             }
+            println!(
+                "manifest refreshed: ns={} version={} segments={}",
+                ns.0,
+                manifest.version,
+                manifest.segments.len()
+            );
             self.indexer.restore_manifest(ns.clone(), manifest);
         }
         self.manifest_follow.confirm(ns, version, observed_at);
@@ -2079,6 +2085,7 @@ impl AppState {
             let Some((expected_version, manifest)) = self.indexer.prepare_publication(ns)? else {
                 return Ok(());
             };
+            let started = Instant::now();
             upload(&manifest)?;
             let committed = self.controller.lock().unwrap().compare_and_swap_manifest(
                 ns,
@@ -2088,6 +2095,13 @@ impl AppState {
             match committed {
                 Ok(()) => {
                     self.indexer.acknowledge_manifest(ns, &manifest)?;
+                    println!(
+                        "manifest published: ns={} version={} segments={} ms={:.1}",
+                        ns.0,
+                        manifest.version,
+                        manifest.segments.len(),
+                        started.elapsed().as_secs_f64() * 1e3
+                    );
                     return Ok(());
                 }
                 Err(conflict @ KoshaError::ManifestConflict { .. })
@@ -2849,27 +2863,27 @@ impl AppState {
                 .remember_segment_footers(ns, fetched_footers.values().cloned());
         }
 
+        let stats_terms = kosha_query::namespace_stats_terms(query).filter(|t| !t.is_empty());
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
+        let mut stats_only: Vec<PathBuf> = Vec::new();
         for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
-            if needs_bloom_check {
-                // Borrowed, never cloned: footers hold every bloom. A
-                // segment with no cached footer was already read (once)
-                // into `fetched_footers` above.
-                let footer = manifest
-                    .segment_footer(&entry.segment_id)
-                    .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
-                if let Some(footer) = footer {
-                    if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
-                        continue;
-                    }
-                    if let Some((ref terms, mode)) = term_prune {
-                        if !segment_may_contain_terms(terms, mode, footer.term_bloom.as_ref()) {
-                            continue;
-                        }
-                    }
-                }
+            // Borrowed, never cloned: footers hold every bloom. A segment
+            // with no cached footer was already read (once) into
+            // `fetched_footers` above.
+            let footer = manifest
+                .segment_footer(&entry.segment_id)
+                .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
+            match segment_search_hydration(
+                query,
+                needs_bloom_check,
+                term_prune.as_ref(),
+                stats_terms.as_deref(),
+                footer,
+            ) {
+                SegmentHydration::Scoring => to_hydrate.push(seg_path),
+                SegmentHydration::StatsOnly => stats_only.push(seg_path),
+                SegmentHydration::Skip => {}
             }
-            to_hydrate.push(seg_path);
         }
         let mut outcome = self.ensure_scoring_files_local(
             &to_hydrate,
@@ -2888,6 +2902,29 @@ impl AppState {
         outcome.files_fetched += postings_outcome.files_fetched;
         outcome.bytes_fetched += postings_outcome.bytes_fetched;
         outcome.missing.extend(postings_outcome.missing);
+        if !stats_only.is_empty() {
+            // Best effort: whatever is still missing afterwards doesn't fail
+            // the search. The searcher then can't read that segment's `df`
+            // and scores the whole search with per-segment statistics
+            // (`bm25_stats: segment_fallback`) — the pre-#246 behavior —
+            // rather than with a `df` that leaves the segment out.
+            let stats_files = self.ensure_scoring_files_local(
+                &stats_only,
+                false,
+                false,
+                &paths_with_manifest_footer,
+                request,
+            );
+            let stats_postings = self.ensure_posting_blobs_local(
+                ns,
+                manifest.version,
+                &stats_only,
+                &posting_files,
+                request,
+            );
+            outcome.files_fetched += stats_files.files_fetched + stats_postings.files_fetched;
+            outcome.bytes_fetched += stats_files.bytes_fetched + stats_postings.bytes_fetched;
+        }
         outcome.files_fetched += footer_files;
         outcome.bytes_fetched += footer_bytes;
         // `to_hydrate` only covers every manifest segment when the bloom
@@ -2936,17 +2973,19 @@ impl AppState {
         if !doc_access_ok {
             return false;
         }
-        // Deliberately does NOT also require vector.offsets: it's an
-        // optional sidecar (legacy v1 segments never have one; the reader
-        // falls back to an eager parse of vector.idx alone when it's
-        // absent — same tolerance doc_access_ok above gives
-        // doc_store.offsets vs. doc_store.bin). `ensure_scoring_files_local`
-        // still proactively *attempts* to fetch it when present on S3 (see
-        // its comment) — this predicate just doesn't block "can we score"
-        // on that attempt having succeeded, since scoring is correct
-        // either way.
-        if needs_vectors && !file_present_nonempty(&seg_path.join("vector.idx")) {
-            return false;
+        // `vector.offsets` is required only where it exists: legacy flat
+        // segments never have one. A clustered segment without it is served
+        // by exact scan of every vector (seconds on a large segment), so it
+        // is not complete until the sidecar has been fetched.
+        if needs_vectors {
+            if !file_present_nonempty(&seg_path.join("vector.idx")) {
+                return false;
+            }
+            if !file_present_nonempty(&seg_path.join("vector.offsets"))
+                && kosha_segment::vector_index_needs_offsets(seg_path)
+            {
+                return false;
+            }
         }
         true
     }
@@ -3609,7 +3648,7 @@ fn warmup_probe_query() -> kosha_core::SearchQuery {
     kosha_core::SearchQuery {
         query_text: String::new(),
         max_results: 0,
-        bm25_params: kosha_core::Bm25Params { k1: 1.2, b: 0.75 },
+        bm25_params: Default::default(),
         from: 0,
         filter: None,
         sort: Vec::new(),
@@ -3626,6 +3665,8 @@ fn warmup_probe_query() -> kosha_core::SearchQuery {
         collapse: None,
         source_includes: None,
         source_excludes: None,
+        rank: None,
+        mode: None,
     }
 }
 
@@ -3718,6 +3759,7 @@ fn serve(listener: TcpListener, state: Arc<AppState>, io_timeout: Duration) {
 // ─── Request handling ───────────────────────────────────────────────────────
 
 fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
+    let started = Instant::now();
     let mut reader = BufReader::new(
         stream
             .try_clone()
@@ -3819,28 +3861,56 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
     } else {
         authenticate(&headers)
     };
-    let tenant = match authentication {
-        Ok(t) => t,
-        Err(resp) => {
-            stream.write_all(resp.as_bytes()).ok();
-            return Ok(());
-        }
-    };
-
     // ── Query/ingest role routing ────────────────────────────────────────
     // A query-role pod (KOSHA_INGEST_HOST set) forwards write-path requests
     // to the single ingest pod instead of executing them locally — see
     // is_write_path/forward_to_ingest. Every other request (all reads, and
     // everything on the ingest pod itself, which never forwards) is handled
     // locally exactly as before this existed.
-    let response = match (&state.ingest_host, &state.write_http_client) {
-        (Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
+    let response = match (
+        &authentication,
+        &state.ingest_host,
+        &state.write_http_client,
+    ) {
+        (Err(resp), _, _) => resp.clone(),
+        (Ok(_), Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
             forward_to_ingest(client, ingest_host, &request_line, &headers, &body)
         }
-        _ => route(&request_line, &headers, &body, &tenant, state),
+        (Ok(tenant), _, _) => route(&request_line, &headers, &body, tenant, state),
     };
+    log_request(
+        &request_line,
+        authentication.as_deref().unwrap_or("-"),
+        body.len(),
+        &response,
+        started,
+    );
     stream.write_all(response.as_bytes()).ok();
     Ok(())
+}
+
+/// One line per API request: who asked for what, the status returned and how
+/// long it took. A successful search is skipped because it already prints
+/// the more detailed `search timing:` line; probes never reach here.
+fn log_request(
+    request_line: &str,
+    tenant: &str,
+    body_bytes: usize,
+    response: &str,
+    started: Instant,
+) {
+    let status = response.get(9..12).unwrap_or("???");
+    let mut parts = request_line.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or("-"), parts.next().unwrap_or("-"));
+    let path = target.split('?').next().unwrap_or(target);
+    if status == "200" && path.ends_with("/search") {
+        return;
+    }
+    println!(
+        "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}",
+        started.elapsed().as_secs_f64() * 1e3,
+        response.len()
+    );
 }
 
 /// Extract and validate the API key from request headers.
@@ -4796,6 +4866,11 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         Ok(q) => q,
         Err(e) => return json_error(400, &format!("invalid search query: {e}")),
     };
+    // Reject out-of-range parameters before touching storage or the
+    // result cache (the searcher checks again for non-HTTP callers).
+    if let Err(e) = query.validate() {
+        return search_error_response(&e);
+    }
 
     if let Err(e) = state.ensure_query_manifest_fresh(&ns, max_staleness) {
         return search_error_response(&e);
@@ -4988,8 +5063,14 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             );
             let resp = json_ok(&result);
             // Only successful responses enter the cache, after the search
-            // proved every needed file readable.
-            if let Some(key) = cache_key {
+            // proved every needed file readable. A search that fell back to
+            // per-segment BM25 statistics (issue #246) because some
+            // segment's footer or postings weren't local isn't cached
+            // either: the miss is usually transient (best-effort stats
+            // hydration), and caching it would pin the degraded scores for
+            // the rest of this manifest version.
+            let cacheable = phases.bm25_stats != kosha_query::Bm25StatsUsed::SegmentFallback;
+            if let Some(key) = cache_key.filter(|_| cacheable) {
                 state.result_cache.lock().unwrap().insert(key, &resp);
             }
             resp
@@ -5198,13 +5279,41 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
 
-    let k1: f64 = params.get("k1").and_then(|v| v.parse().ok()).unwrap_or(1.2);
-    let b: f64 = params.get("b").and_then(|v| v.parse().ok()).unwrap_or(0.75);
+    // `k1` / `b` are optional; an absent one uses the segment's build-time
+    // value. A present but unparsable one is a 400 — it used to fall back
+    // to the default silently, so a typo looked like it had no effect.
+    let parse_param = |name: &str| -> Result<Option<f64>, String> {
+        match params.get(name) {
+            None => Ok(None),
+            Some(v) => v
+                .parse::<f64>()
+                .map(Some)
+                .map_err(|_| format!("'{name}' must be a number, got '{v}'")),
+        }
+    };
+    // `bm25_stats=segment|namespace` (issue #246): where IDF / avgdl come
+    // from. Absent means the engine default.
+    let stats = match params.get("bm25_stats") {
+        None => None,
+        Some(v) => match kosha_core::Bm25StatsScope::parse(v) {
+            Some(scope) => Some(scope),
+            None => {
+                return json_error(
+                    400,
+                    &format!("'bm25_stats' must be 'namespace' or 'segment', got '{v}'"),
+                )
+            }
+        },
+    };
+    let bm25_params = match (parse_param("k1"), parse_param("b")) {
+        (Ok(k1), Ok(b)) => kosha_core::Bm25Overrides { k1, b, stats },
+        (Err(e), _) | (_, Err(e)) => return json_error(400, &e),
+    };
 
     let query = SearchQuery {
         query_text,
         max_results,
-        bm25_params: kosha_core::Bm25Params { k1, b },
+        bm25_params,
         from: 0,
         filter: None,
         sort: vec![],
@@ -5221,7 +5330,12 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         collapse: None,
         source_includes: None,
         source_excludes: None,
+        rank: None,
+        mode: None,
     };
+    if let Err(e) = query.validate() {
+        return search_error_response(&e);
+    }
 
     let max_staleness = match manifest_follow::parse_max_staleness(
         params
@@ -6321,6 +6435,54 @@ fn body_val_fallback(body: &[u8]) -> serde_json::Value {
     serde_json::json!({})
 }
 
+/// What one segment needs hydrated for a search — see
+/// [`segment_search_hydration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "s3")]
+enum SegmentHydration {
+    /// The full scoring set: the segment may hold a hit.
+    Scoring,
+    /// Only the inverted index and the query terms' posting blobs: the
+    /// segment can't hold a hit (its filter or AND-term bloom rules it
+    /// out), but it may contain a query term, and namespace-level BM25
+    /// statistics (issue #246) count its documents in that term's `df`.
+    StatsOnly,
+    /// Nothing.
+    Skip,
+}
+
+/// Decide what a segment needs hydrated for `query` from its footer's
+/// blooms. `stats_terms` is [`kosha_query::namespace_stats_terms`]: when
+/// set, a segment the query's own pruning skips is still hydrated for
+/// `df` if its term bloom admits any one of them (OR — a segment holding
+/// only some terms of an AND query still contributes to their `df`).
+/// No footer means it can't be pruned, so it gets the full scoring set.
+#[cfg(feature = "s3")]
+fn segment_search_hydration(
+    query: &SearchQuery,
+    needs_bloom_check: bool,
+    term_prune: Option<&(Vec<String>, TermBloomMode)>,
+    stats_terms: Option<&[String]>,
+    footer: Option<&kosha_core::Footer>,
+) -> SegmentHydration {
+    let Some(footer) = footer.filter(|_| needs_bloom_check) else {
+        return SegmentHydration::Scoring;
+    };
+    let admitted = query.segment_may_match_filters(footer.filter_blooms.as_ref())
+        && term_prune.is_none_or(|(terms, mode)| {
+            segment_may_contain_terms(terms, *mode, footer.term_bloom.as_ref())
+        });
+    if admitted {
+        SegmentHydration::Scoring
+    } else if stats_terms.is_some_and(|terms| {
+        segment_may_contain_terms(terms, TermBloomMode::Or, footer.term_bloom.as_ref())
+    }) {
+        SegmentHydration::StatsOnly
+    } else {
+        SegmentHydration::Skip
+    }
+}
+
 /// Lexical terms used for footer term-bloom prune before hydrate/open.
 ///
 /// Wildcard queries cannot be pruned here — expansion needs the segment
@@ -6488,13 +6650,14 @@ fn log_search_timing(
     let total_ms = hydrate_ms
         + queue_ms
         + phases.admit_wall_ms
+        + phases.bm25_stats_ms
         + phases.score_wall_ms
         + phases.materialize_wall_ms;
     println!(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
-         hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} score_ms={:.1} \
-         materialize_ms={:.1} opens_cold={} opens_cached={} open_total_ms={:.1} \
-         knn_postings={} knn_degraded={} hits={}",
+         hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
+         score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
+         open_total_ms={:.1} knn_postings={} knn_degraded={} hits={}",
         ns.0,
         total_ms,
         hydrate_ms,
@@ -6502,6 +6665,8 @@ fn log_search_timing(
         hydration.bytes_fetched as f64 / (1024.0 * 1024.0),
         queue_ms,
         phases.admit_wall_ms,
+        phases.bm25_stats.as_str(),
+        phases.bm25_stats_ms,
         phases.score_wall_ms,
         phases.materialize_wall_ms,
         phases.open_cold,
@@ -6515,11 +6680,14 @@ fn log_search_timing(
 
 /// Map a search failure onto the right HTTP status: load-shedding
 /// (`KoshaError::Overloaded`, see `kosha_query::MemoryLedger`) is a
-/// transient 429 the client should retry with backoff, not a 500.
+/// transient 429 the client should retry with backoff, not a 500; a
+/// control-store outage on a never-loaded namespace is a 503; an
+/// out-of-range request is a 400.
 fn search_error_response(e: &KoshaError) -> String {
     match e {
         KoshaError::Overloaded(_) => json_error(429, &format!("search overloaded: {e}")),
         KoshaError::ControlPlane(_) => json_error(503, &format!("search unavailable: {e}")),
+        KoshaError::InvalidQuery(_) => json_error(400, &e.to_string()),
         _ => json_error(500, &format!("search error: {e}")),
     }
 }
@@ -6534,6 +6702,8 @@ fn json_accepted<T: serde::Serialize>(value: &T) -> String {
 }
 
 fn json_error(status_code: u16, message: &str) -> String {
+    // The reason for an error response; `request:` carries the rest.
+    eprintln!("WARN: request failed: status={status_code} {message}");
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",
@@ -7606,6 +7776,361 @@ mod tests {
             hits + 1,
             "deletes must not disable result caching"
         );
+    }
+
+    #[test]
+    fn search_honors_and_validates_bm25_params() {
+        // Issue #247: per-request k1/b reach the scorer over HTTP (both
+        // POST and GET), are part of the result-cache key, and out-of-range
+        // or unparsable values are a 400 rather than a silent default.
+        let state = test_state();
+        let ns = NamespaceId("bm25ns".into());
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    Document {
+                        id: DocumentId("long".into()),
+                        fields: vec![Field::text(
+                            "text",
+                            format!("alpha alpha alpha{}", " filler".repeat(60)),
+                        )],
+                    },
+                    Document {
+                        id: DocumentId("short".into()),
+                        fields: vec![Field::text("text", "alpha")],
+                    },
+                    Document {
+                        id: DocumentId("other".into()),
+                        fields: vec![Field::text("text", "unrelated words")],
+                    },
+                ],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |params: &str| {
+            let body =
+                format!(r#"{{"namespace":"bm25ns","query_text":"alpha","bm25_params":{params}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let first_hit = |resp: &str| -> String {
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            v["results"][0]["doc_id"].as_str().unwrap().to_string()
+        };
+        // Run each twice so the second answer comes from the result cache:
+        // the cache must key on the parameters, not just the query text.
+        for _ in 0..2 {
+            let b0 = post(r#"{"k1":1.2,"b":0.0}"#);
+            assert!(b0.starts_with("HTTP/1.1 200"), "{b0}");
+            assert_eq!(first_hit(&b0), "long", "b=0 ignores length");
+            let b1 = post(r#"{"k1":1.2,"b":1.0}"#);
+            assert_eq!(first_hit(&b1), "short", "b=1 penalizes length");
+        }
+        let get = |qs: &str| {
+            handle_search_get(
+                &format!("GET /search?ns=bm25ns&q=alpha{qs} HTTP/1.1"),
+                &state,
+            )
+        };
+        assert_eq!(first_hit(&get("&b=0")), "long");
+        assert_eq!(first_hit(&get("&k1=1.2&b=1")), "short");
+
+        for bad in [
+            r#"{"k1":-1}"#,
+            r#"{"b":1.5}"#,
+            r#"{"b":-0.5}"#,
+            r#"{"k1":1.2,"b":2}"#,
+        ] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+            assert!(resp.contains("bm25_params"), "{bad}: {resp}");
+        }
+        for bad in ["&k1=-0.5", "&b=1.01", "&b=NaN", "&k1=abc", "&b="] {
+            let resp = get(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+    }
+
+    #[test]
+    fn hybrid_search_fuses_with_rrf_over_http() {
+        // Issue #228: `rank.rrf` over HTTP — fused score plus per-retriever
+        // ranks in the response, vector-only hits kept (#250), parameters
+        // validated, and the result cache keyed on them.
+        let state = test_state();
+        let ns = NamespaceId("hybridns".into());
+        let doc = |id: &str, text: &str, v: [f32; 2]| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text), Field::vector("emb", v.to_vec())],
+        };
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    doc("lex_top", "breach breach breach breach", [-1.0, 0.1]),
+                    doc("both", "breach breach notice", [0.99, 0.05]),
+                    doc("vec_top", "unrelated", [1.0, 0.0]),
+                    doc("weak", "breach and many other words here", [0.0, 1.0]),
+                ],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |rank: &str| {
+            let body = format!(
+                r#"{{"namespace":"hybridns","query_text":"breach","max_results":3,
+                    "knn":{{"field":"emb","vector":[1.0,0.0],"k":2,"num_candidates":1000}}{rank}}}"#
+            );
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let parse = |resp: &str| -> serde_json::Value {
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            serde_json::from_str(body).unwrap()
+        };
+        for _ in 0..2 {
+            let resp = post(r#","rank":{"rrf":{"rank_window_size":3,"rank_constant":60}}"#);
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let v = parse(&resp);
+            let hits = v["results"].as_array().unwrap();
+            assert_eq!(hits[0]["doc_id"], "both", "{v}");
+            assert_eq!(hits[0]["rank_details"]["lexical_rank"], 2, "{v}");
+            assert_eq!(hits[0]["rank_details"]["knn_rank"], 2, "{v}");
+            let fused = hits[0]["score"].as_f64().unwrap();
+            assert!((fused - 2.0 / 62.0).abs() < 1e-12, "{v}");
+            assert!(
+                hits.iter()
+                    .any(|h| h["doc_id"] == "vec_top"
+                        && h["rank_details"].get("lexical_rank").is_none()),
+                "vector-only hit kept: {v}"
+            );
+            // 3 lexical matches + vec_top from the vector window.
+            assert_eq!(v["total_hits"], 4, "{v}");
+
+            // Same request, different rank_constant: different scores, so
+            // the cache cannot have served the first response.
+            let v1 = parse(&post(
+                r#","rank":{"rrf":{"rank_window_size":3,"rank_constant":1}}"#,
+            ));
+            let fused1 = v1["results"][0]["score"].as_f64().unwrap();
+            assert!((fused1 - 2.0 / 3.0).abs() < 1e-12, "{v1}");
+        }
+        for bad in [
+            r#","rank":{"rrf":{"rank_window_size":2}}"#,
+            r#","rank":{"rrf":{"rank_constant":0}}"#,
+            r#","rank":{"rrf":{"bogus":1}}"#,
+            r#","mode":"lexical""#,
+        ] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+        let resp = post(r#","mode":"hybrid""#);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn filter_pruned_segments_still_hydrate_for_namespace_bm25_stats() {
+        // Issue #246: a segment the filter rules out holds no hit, but its
+        // documents count toward a query term's `df`, so it needs its
+        // inverted index + posting blob (never filters/vectors) — unless
+        // its term bloom says no query term is there, or the request
+        // asked for per-segment statistics.
+        let footer = |matter: &str, terms: &[&str]| kosha_core::Footer {
+            segment_id: kosha_core::SegmentId("s".into()),
+            doc_count: 1,
+            total_field_length: 1,
+            avg_field_length: 1.0,
+            bm25_params: Default::default(),
+            created_at: String::new(),
+            filter_blooms: Some(HashMap::from([(
+                "matter".to_string(),
+                kosha_core::BloomFilter::build([matter]),
+            )])),
+            term_bloom: Some(kosha_core::build_term_bloom(terms.iter().copied())),
+            format_version: kosha_core::SEGMENT_FORMAT_VERSION,
+            text_filter_ignore_above: None,
+            doc_vectors: false,
+        };
+        let mut query: SearchQuery = serde_json::from_str(
+            r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
+        )
+        .unwrap();
+        let decide = |query: &SearchQuery, f: &kosha_core::Footer| {
+            let term_prune = term_bloom_prune_for_query(query);
+            let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
+            let stats_terms = kosha_query::namespace_stats_terms(query);
+            segment_search_hydration(
+                query,
+                needs_bloom_check,
+                term_prune.as_ref(),
+                stats_terms.as_deref(),
+                Some(f),
+            )
+        };
+        let same_matter = footer("m1", &["contract", "breach"]);
+        let other_matter = footer("m2", &["contract", "breach"]);
+        let other_matter_one_term = footer("m2", &["contract"]);
+        let same_matter_one_term = footer("m1", &["breach"]);
+        let no_terms = footer("m2", &["unrelated"]);
+        assert_eq!(decide(&query, &same_matter), SegmentHydration::Scoring);
+        assert_eq!(decide(&query, &other_matter), SegmentHydration::StatsOnly);
+        assert_eq!(
+            decide(&query, &other_matter_one_term),
+            SegmentHydration::StatsOnly
+        );
+        // AND term pruning skips it for scoring, not for `df(breach)`.
+        assert_eq!(
+            decide(&query, &same_matter_one_term),
+            SegmentHydration::StatsOnly
+        );
+        assert_eq!(decide(&query, &no_terms), SegmentHydration::Skip);
+
+        query.bm25_params.stats = Some(kosha_core::Bm25StatsScope::Segment);
+        assert_eq!(decide(&query, &same_matter), SegmentHydration::Scoring);
+        assert_eq!(decide(&query, &other_matter), SegmentHydration::Skip);
+        assert_eq!(
+            decide(&query, &same_matter_one_term),
+            SegmentHydration::Skip
+        );
+    }
+
+    #[test]
+    fn segment_fallback_bm25_results_are_not_result_cached() {
+        // Issue #246: when a segment the query's filter prunes can't be read
+        // for `df`, the search scores with per-segment statistics. That
+        // degraded answer must not be result-cached, or it would outlive
+        // the (usually transient) miss for the whole manifest version.
+        let state = test_state();
+        let ns = NamespaceId("fallbackns".into());
+        let doc = |id: &str, text: &str, matter: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text), Field::keyword("matter", matter)],
+        };
+        state
+            .indexer
+            .index_documents(ns.clone(), vec![doc("r", "rare common", "m1")])
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                (0..9)
+                    .map(|i| doc(&format!("c{i}"), "rare filler", "m2"))
+                    .collect(),
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        // The m2 segment: pruned by the filter, but holds `rare`.
+        let pruned = fs::read_dir(state.data_dir.join(&ns.0))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                SegmentReader::read_footer(p).is_ok_and(|f| {
+                    f.filter_blooms
+                        .as_ref()
+                        .and_then(|b| b.get("matter"))
+                        .is_some_and(|b| b.may_contain("m2"))
+                })
+            })
+            .expect("m2 segment");
+        let inverted = pruned.join("inverted.idx");
+        let hidden = pruned.join("inverted.idx.hidden");
+
+        let search = || {
+            let resp = handle_search_post(
+                br#"{"namespace":"fallbackns","query_text":"rare","filter":{"term":{"matter":"m1"}}}"#,
+                &state,
+            );
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(v["results"][0]["doc_id"], "r");
+            v["results"][0]["score"].as_f64().unwrap()
+        };
+        // dl = 2. Namespace: N = 10, df = 10, avgdl = 2. Segment: N = 1, df = 1.
+        let namespace_expected = (1.0f64 + 0.5 / 10.5).ln();
+        let segment_expected = (1.0f64 + 0.5 / 1.5).ln();
+
+        fs::rename(&inverted, &hidden).unwrap();
+        assert!((search() - segment_expected).abs() < 1e-9);
+        fs::rename(&hidden, &inverted).unwrap();
+        assert!((search() - namespace_expected).abs() < 1e-9);
+        // The namespace-stats answer is cached as usual.
+        assert!((search() - namespace_expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn search_uses_namespace_bm25_stats_with_segment_switch() {
+        // Issue #246: IDF comes from the whole namespace by default, so a
+        // document scores the same however the namespace is split into
+        // segments; `bm25_params.stats` / `bm25_stats=` switch back to
+        // per-segment statistics, keyed separately in the result cache.
+        let state = test_state();
+        let ns = NamespaceId("statsns".into());
+        let doc = |id: &str, text: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text)],
+        };
+        // Segment 1: the only "rare" doc. Segment 2: many docs without it.
+        state
+            .indexer
+            .index_documents(ns.clone(), vec![doc("r", "rare common")])
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                (0..9)
+                    .map(|i| doc(&format!("c{i}"), "common filler"))
+                    .collect(),
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let score = |resp: &str| -> f64 {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(v["results"][0]["doc_id"], "r");
+            v["results"][0]["score"].as_f64().unwrap()
+        };
+        let post = |params: &str| {
+            let body =
+                format!(r#"{{"namespace":"statsns","query_text":"rare","bm25_params":{params}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let get = |qs: &str| {
+            handle_search_get(
+                &format!("GET /search?ns=statsns&q=rare{qs} HTTP/1.1"),
+                &state,
+            )
+        };
+        // N = 10 docs, df = 1, avgdl = 2, dl = 2.
+        let namespace_expected = (1.0f64 + (10.0 - 1.0 + 0.5) / 1.5).ln();
+        // Segment-local: N = 1, df = 1.
+        let segment_expected = (1.0f64 + 0.5 / 1.5).ln();
+        for _ in 0..2 {
+            assert!((score(&post("{}")) - namespace_expected).abs() < 1e-9);
+            assert!((score(&post(r#"{"stats":"segment"}"#)) - segment_expected).abs() < 1e-9);
+            assert!((score(&get("")) - namespace_expected).abs() < 1e-9);
+            assert!((score(&get("&bm25_stats=segment")) - segment_expected).abs() < 1e-9);
+            assert!((score(&get("&bm25_stats=namespace")) - namespace_expected).abs() < 1e-9);
+        }
+        let resp = post(r#"{"stats":"shard"}"#);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        let resp = get("&bm25_stats=shard");
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("bm25_stats"), "{resp}");
     }
 
     #[test]
@@ -8734,7 +9259,7 @@ mod tests {
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
             max_results: 10,
-            bm25_params: kosha_core::Bm25Params::default(),
+            bm25_params: Default::default(),
             from: 0,
             filter: None,
             sort: Vec::new(),
@@ -8751,6 +9276,8 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            rank: None,
+            mode: None,
         };
 
         let unfiltered = state.hydrate_segments_for_search(
@@ -8871,7 +9398,7 @@ mod tests {
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
             max_results: 10,
-            bm25_params: kosha_core::Bm25Params::default(),
+            bm25_params: Default::default(),
             from: 0,
             filter: None,
             sort: Vec::new(),
@@ -8888,6 +9415,8 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            rank: None,
+            mode: None,
         };
         let verdict_key = (ns.0.clone(), manifest.version);
 
@@ -10001,7 +10530,7 @@ mod tests {
         let base = kosha_core::SearchQuery {
             query_text: String::new(),
             max_results: 10,
-            bm25_params: kosha_core::Bm25Params::default(),
+            bm25_params: Default::default(),
             from: 0,
             filter: None,
             sort: Vec::new(),
@@ -10018,6 +10547,8 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            rank: None,
+            mode: None,
         };
         let with_vec = |v: Vec<f32>, k: usize| {
             let mut q = base.clone();
@@ -10050,6 +10581,27 @@ mod tests {
         // Non-vector knn params still flow through the canonical JSON.
         let c = canonical_query_for_cache(&with_vec(vec![0.1_f32; 1024], 20)).unwrap();
         assert_ne!(a, c, "k must remain part of the key");
+
+        // Hybrid fusion parameters change the response, so they must
+        // change the key (issue #228): the whole-response cache must never
+        // serve a response fused with another request's `rank`.
+        let hybrid = |rank: serde_json::Value| {
+            let mut q = with_vec(vec![0.1_f32; 1024], 10);
+            q.query_text = "breach".into();
+            q.rank = serde_json::from_value(rank).unwrap();
+            canonical_query_for_cache(&q).unwrap()
+        };
+        let default_rrf = hybrid(serde_json::Value::Null);
+        let c60 = hybrid(serde_json::json!({"rrf": {"rank_constant": 60}}));
+        let c1 = hybrid(serde_json::json!({"rrf": {"rank_constant": 1}}));
+        let w50 = hybrid(serde_json::json!({"rrf": {"rank_window_size": 50}}));
+        assert_ne!(c60, c1, "rank_constant must be part of the key");
+        assert_ne!(c60, w50, "rank_window_size must be part of the key");
+        assert_ne!(default_rrf, c1);
+        let mut moded = with_vec(vec![0.1_f32; 1024], 10);
+        moded.query_text = "breach".into();
+        moded.mode = Some(kosha_core::RetrievalMode::Hybrid);
+        assert_ne!(canonical_query_for_cache(&moded).unwrap(), default_rrf);
 
         // The whole point: no raw embedding in the key.
         assert!(

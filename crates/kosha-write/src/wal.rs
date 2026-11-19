@@ -230,6 +230,8 @@ pub struct WalWriter {
     config: GroupCommitConfig,
     state: Mutex<WriterState>,
     wake: Condvar,
+    /// Serializes reclamation (`clear_through`, `clear`).
+    reclaim: Mutex<()>,
 }
 
 impl WalWriter {
@@ -301,6 +303,7 @@ impl WalWriter {
                 files_written: 0,
             }),
             wake: Condvar::new(),
+            reclaim: Mutex::new(()),
         }
     }
 
@@ -347,7 +350,11 @@ impl WalWriter {
         namespace: &NamespaceId,
         checkpoint: u64,
     ) -> Result<(), KoshaError> {
-        let (eligible, persist) = {
+        // Reclamations run one at a time so the `sequence` high-water mark
+        // is written in order (it never regresses) and concurrent meta
+        // writes never share a temporary file.
+        let _reclaim = self.reclaim.lock().unwrap();
+        let (eligible, high) = {
             let mut state = self.state.lock().unwrap();
             let known = state.checkpoints.entry(namespace.clone()).or_insert(0);
             *known = (*known).max(checkpoint);
@@ -365,23 +372,30 @@ impl WalWriter {
             if eligible.is_empty() {
                 return Ok(());
             }
-            for file in &eligible {
-                state.files.remove(file);
-            }
-            // Deleted files no longer witness their LSNs: persist the high
-            // water mark first so a restart never reuses a checkpointed LSN.
-            let high = state.next_lsn - 1;
-            let persist = (high > state.persisted_high).then_some(high);
-            if let Some(high) = persist {
-                state.persisted_high = high;
-            }
-            (eligible, persist)
+            (eligible, state.next_lsn - 1)
         };
-        if let Some(high) = persist {
-            self.store
-                .write_meta("sequence", high.to_string().as_bytes())?;
+        // Deleted files no longer witness their LSNs: persist the high
+        // water mark first so a restart never reuses a checkpointed LSN.
+        self.persist_high(high)?;
+        self.store.delete(&eligible)?;
+        let mut state = self.state.lock().unwrap();
+        for file in &eligible {
+            state.files.remove(file);
         }
-        self.store.delete(&eligible)
+        Ok(())
+    }
+
+    /// Durably record `high` in the `sequence` meta file unless an equal or
+    /// higher value is already there. Callers hold `reclaim`.
+    fn persist_high(&self, high: u64) -> Result<(), KoshaError> {
+        if high <= self.state.lock().unwrap().persisted_high {
+            return Ok(());
+        }
+        self.store
+            .write_meta("sequence", high.to_string().as_bytes())?;
+        let mut state = self.state.lock().unwrap();
+        state.persisted_high = state.persisted_high.max(high);
+        Ok(())
     }
 
     /// Append a batch of documents; returns the record's LSN once it is
@@ -545,18 +559,17 @@ impl WalWriter {
     /// Explicit administrative reset. Normal flushes use `clear_through`
     /// only after durable publication.
     pub fn clear(&self) -> Result<(), KoshaError> {
-        let high = {
-            let mut state = self.state.lock().unwrap();
-            state.files.clear();
-            state.checkpoints.clear();
-            let high = state.next_lsn - 1;
-            state.persisted_high = state.persisted_high.max(high);
-            high
-        };
-        self.store
-            .write_meta("sequence", high.to_string().as_bytes())?;
+        let _reclaim = self.reclaim.lock().unwrap();
+        let high = self.state.lock().unwrap().next_lsn - 1;
+        self.persist_high(high)?;
         let files = self.store.list()?;
-        self.store.delete(&files)
+        self.store.delete(&files)?;
+        let mut state = self.state.lock().unwrap();
+        for file in &files {
+            state.files.remove(file);
+        }
+        state.checkpoints.clear();
+        Ok(())
     }
 
     /// Read all records from all WAL files for recovery.
@@ -1433,6 +1446,120 @@ mod tests {
             WalWriter::recover_sequenced(&dir).unwrap()[0].0,
             lsn,
             "a later group still commits"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Fails `write_meta("sequence")` while `fail_meta` is set.
+    #[derive(Debug)]
+    struct MetaFailStore {
+        inner: LocalWalStore,
+        fail_meta: std::sync::atomic::AtomicBool,
+    }
+
+    impl WalStore for MetaFailStore {
+        fn append_batch(&self, first_lsn: u64, bytes: &[u8]) -> Result<(), KoshaError> {
+            self.inner.append_batch(first_lsn, bytes)
+        }
+        fn list(&self) -> Result<Vec<u64>, KoshaError> {
+            self.inner.list()
+        }
+        fn read(&self, first_lsn: u64) -> Result<Vec<u8>, KoshaError> {
+            self.inner.read(first_lsn)
+        }
+        fn delete(&self, first_lsns: &[u64]) -> Result<(), KoshaError> {
+            self.inner.delete(first_lsns)
+        }
+        fn truncate_torn_tail(&self, first_lsn: u64, len: usize) -> Result<(), KoshaError> {
+            self.inner.truncate_torn_tail(first_lsn, len)
+        }
+        fn read_meta(&self, name: &str) -> Result<Option<Vec<u8>>, KoshaError> {
+            self.inner.read_meta(name)
+        }
+        fn write_meta(&self, name: &str, bytes: &[u8]) -> Result<(), KoshaError> {
+            if name == "sequence" && self.fail_meta.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("sequence write failed").into());
+            }
+            self.inner.write_meta(name, bytes)
+        }
+    }
+
+    fn persisted_sequence(dir: &Path) -> u64 {
+        std::fs::read_to_string(dir.join("sequence"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn failed_sequence_write_keeps_files_and_a_retry_reclaims_them() {
+        let dir = temp_dir("meta-fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(MetaFailStore {
+            inner: LocalWalStore::new(dir.clone()),
+            fail_meta: std::sync::atomic::AtomicBool::new(true),
+        });
+        let wal = WalWriter::with_store(store.clone(), GroupCommitConfig::default());
+        let ns = NamespaceId("a".into());
+        let lsn = wal.append(&ns, &[doc("x")]).unwrap();
+        assert!(wal.clear_through(&ns, lsn).is_err());
+        assert_eq!(wal_files(&dir), vec![lsn], "nothing deleted unpersisted");
+        store
+            .fail_meta
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // No new appends: the retry must still persist the high-water mark
+        // before deleting the file that witnessed it.
+        wal.clear_through(&ns, lsn).unwrap();
+        assert!(wal_files(&dir).is_empty());
+        assert_eq!(persisted_sequence(&dir), lsn);
+        drop(wal);
+        assert!(
+            WalWriter::new(dir.clone())
+                .append(&ns, &[doc("y")])
+                .unwrap()
+                > lsn
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_reclamation_never_regresses_the_sequence() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 25;
+        let dir = temp_dir("reclaim-race");
+        let wal = Arc::new(WalWriter::with_config(
+            dir.clone(),
+            GroupCommitConfig {
+                max_delay: Duration::ZERO,
+                ..GroupCommitConfig::default()
+            },
+        ));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let wal = wal.clone();
+                std::thread::spawn(move || {
+                    let ns = NamespaceId(format!("ns{t}"));
+                    for i in 0..ROUNDS {
+                        let lsn = wal.append(&ns, &[doc(&format!("{t}-{i}"))]).unwrap();
+                        wal.clear_through(&ns, lsn).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let high = wal.last_sequence();
+        assert!(wal_files(&dir).is_empty());
+        assert_eq!(persisted_sequence(&dir), high);
+        drop(wal);
+        let ns = NamespaceId("ns0".into());
+        assert!(
+            WalWriter::new(dir.clone())
+                .append(&ns, &[doc("z")])
+                .unwrap()
+                > high
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

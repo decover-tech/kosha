@@ -351,12 +351,44 @@ true in practice since ES refresh intervals are already tuned up for indexing th
 4. **Per-segment retrieval** (fanned out across the query node's worker pool, segments read
    through the SSD cache, see §9):
    - Lexical: postings-list intersection/union + BM25 scoring over `inverted.idx`.
+     BM25 `k1` / `b` come from the request (`SearchQuery.bm25_params`), each falling back to the
+     segment footer's build-time value when omitted, and are validated (`k1` ≥ 0, 0 ≤ `b` ≤ 1;
+     otherwise HTTP 400). Nothing on disk bakes them in: postings keep raw term frequencies and
+     block summaries keep `max_tf` / `min_field_length`, so block-max WAND ceilings are computed
+     at query time with the same scorer as the hits and pruning stays exact for any valid values.
+     BM25's collection statistics are **namespace-level** (issue #246): `N = Σ doc_count` and
+     `avgdl = Σ total_field_length / N` over every manifest segment's footer, and
+     `df(term) = Σ` per-segment posting counts, computed lazily for query terms only (a segment
+     whose term bloom rules the term out contributes 0 without being opened) and cached per
+     `(namespace, manifest version, segment-list fingerprint, term)`. Every segment scores with
+     the same values, so a document's score does not depend on which segment it landed in and
+     the cross-segment merge compares like with like; the block-max ceilings take their `df`
+     from the same scorer. Deleted documents still count until compaction drops them, as they do
+     in Lucene. If any segment's footer or a term's postings can't be read locally, the search
+     falls back to per-segment statistics as a whole (reported as `segment_fallback`, and not result-cached) rather than
+     score with a partial `df`; the server therefore also hydrates the inverted index and posting
+     blob of segments the query's filter prunes but whose term bloom admits a query term.
+     `bm25_params.stats: "segment"` (or `KOSHA_BM25_STATS=segment` engine-wide) restores
+     per-segment statistics for A/B debugging. Wildcard queries keep per-segment statistics,
+     since their expansion is per segment.
    - Semantic: ANN search over `vector.idx` (HNSW graph traversal or IVF-PQ probe), scored by
      cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
      query in `query_builder.py`.
 5. **Fusion**: candidate sets from lexical and semantic retrieval are merged via Reciprocal Rank
-   Fusion (configurable k), matching `ranking/rrf.py`'s existing behavior — ported in, not
-   reinvented.
+   Fusion, `score(d) = Σ_r 1/(rank_constant + rank_r(d))`, matching `ranking/rrf.py`'s existing
+   behavior — ported in, not reinvented. Request shape is Elasticsearch's
+   `"rank": {"rrf": {"rank_window_size", "rank_constant"}}` (defaults: `max_results`, 60); every
+   request with both a lexical query and `knn` is fused this way (implemented, issue #228). Ranks
+   are **global**: each segment returns its best `rank_window_size` BM25 hits and its nearest `k`
+   vectors, and only after every segment has answered are both lists ordered across the whole
+   namespace, cut to their windows, ranked and fused. Fusing per-segment ranks would make each
+   segment's best match rank 1 however weak it is namespace-wide; it is also why namespace-level
+   BM25 statistics (above) matter here — lexical scores have to be comparable across segments
+   before they can be ranked together. Wildcard queries keep per-segment statistics, so their
+   global lexical order is approximate. The top-level filter applies to both retrievers,
+   `knn.filter` to the vector one only. `total_hits` and aggregations cover the lexical matches
+   plus the vector window; `from`/`sort`/`collapse`/`search_after` apply within the fused list,
+   which is at most `rank_window_size` long. Each hit carries its per-retriever ranks.
 6. **Rerank hook**: an optional, pluggable cross-encoder rerank stage (Cohere today) runs on the
    fused top-N before results return — same role as `ChunkGenerator.__re_rank`.
 7. **Cursor**: response includes per-mode (lexical/semantic) cursor state (last score + doc id) so
