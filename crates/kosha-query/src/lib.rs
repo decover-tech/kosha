@@ -3406,17 +3406,6 @@ impl Searcher {
             }
         }
 
-        // ── total_hits capping (OpenSearch-style, opt out per query) ──
-        // Every segment above counted its intersection exactly (see the
-        // `can_block_max_wand` doc comment) — this is the one place that
-        // number is turned into what callers actually see. Default: capped
-        // at `total_hits_cap` with `relation: gte` beyond it, because exact
-        // AND total_hits forces the join to visit every intersection member
-        // even long after the top-k page is settled — for a broad query
-        // intersecting millions of docs that's the difference between
-        // walking ~10⁶ candidates and reporting "at least 10,000" for free.
-        // `exact_total_hits: true` (per query, or `KOSHA_EXACT_TOTAL_HITS`
-        // engine-wide) restores the old unconditional-exact behavior.
         // ── Hybrid: Reciprocal Rank Fusion over namespace-wide lists ──
         // Each segment handed back its best `rank_window_size` lexical hits
         // and its nearest vector hits. Only now, with every segment's
@@ -3443,6 +3432,17 @@ impl Searcher {
             }
         }
 
+        // ── total_hits capping (OpenSearch-style, opt out per query) ──
+        // Every segment above counted its intersection exactly (see the
+        // `can_block_max_wand` doc comment) — this is the one place that
+        // number is turned into what callers actually see. Default: capped
+        // at `total_hits_cap` with `relation: gte` beyond it, because exact
+        // AND total_hits forces the join to visit every intersection member
+        // even long after the top-k page is settled — for a broad query
+        // intersecting millions of docs that's the difference between
+        // walking ~10⁶ candidates and reporting "at least 10,000" for free.
+        // `exact_total_hits: true` (per query, or `KOSHA_EXACT_TOTAL_HITS`
+        // engine-wide) restores the old unconditional-exact behavior.
         let (mut total_hits, total_hits_relation) =
             resolve_total_hits(total_hits, exact, cap, any_capped);
 
