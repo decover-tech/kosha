@@ -4831,8 +4831,14 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             );
             let resp = json_ok(&result);
             // Only successful responses enter the cache, after the search
-            // proved every needed file readable.
-            if let Some(key) = cache_key {
+            // proved every needed file readable. A search that fell back to
+            // per-segment BM25 statistics (issue #246) because some
+            // segment's footer or postings weren't local isn't cached
+            // either: the miss is usually transient (best-effort stats
+            // hydration), and caching it would pin the degraded scores for
+            // the rest of this manifest version.
+            let cacheable = phases.bm25_stats != kosha_query::Bm25StatsUsed::SegmentFallback;
+            if let Some(key) = cache_key.filter(|_| cacheable) {
                 state.result_cache.lock().unwrap().insert(key, &resp);
             }
             resp
@@ -7336,6 +7342,74 @@ mod tests {
             decide(&query, &same_matter_one_term),
             SegmentHydration::Skip
         );
+    }
+
+    #[test]
+    fn segment_fallback_bm25_results_are_not_result_cached() {
+        // Issue #246: when a segment the query's filter prunes can't be read
+        // for `df`, the search scores with per-segment statistics. That
+        // degraded answer must not be result-cached, or it would outlive
+        // the (usually transient) miss for the whole manifest version.
+        let state = test_state();
+        let ns = NamespaceId("fallbackns".into());
+        let doc = |id: &str, text: &str, matter: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text), Field::keyword("matter", matter)],
+        };
+        state
+            .indexer
+            .index_documents(ns.clone(), vec![doc("r", "rare common", "m1")])
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                (0..9)
+                    .map(|i| doc(&format!("c{i}"), "rare filler", "m2"))
+                    .collect(),
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        // The m2 segment: pruned by the filter, but holds `rare`.
+        let pruned = fs::read_dir(state.data_dir.join(&ns.0))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                SegmentReader::read_footer(p).is_ok_and(|f| {
+                    f.filter_blooms
+                        .as_ref()
+                        .and_then(|b| b.get("matter"))
+                        .is_some_and(|b| b.may_contain("m2"))
+                })
+            })
+            .expect("m2 segment");
+        let inverted = pruned.join("inverted.idx");
+        let hidden = pruned.join("inverted.idx.hidden");
+
+        let search = || {
+            let resp = handle_search_post(
+                br#"{"namespace":"fallbackns","query_text":"rare","filter":{"term":{"matter":"m1"}}}"#,
+                &state,
+            );
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(v["results"][0]["doc_id"], "r");
+            v["results"][0]["score"].as_f64().unwrap()
+        };
+        // dl = 2. Namespace: N = 10, df = 10, avgdl = 2. Segment: N = 1, df = 1.
+        let namespace_expected = (1.0f64 + 0.5 / 10.5).ln();
+        let segment_expected = (1.0f64 + 0.5 / 1.5).ln();
+
+        fs::rename(&inverted, &hidden).unwrap();
+        assert!((search() - segment_expected).abs() < 1e-9);
+        fs::rename(&hidden, &inverted).unwrap();
+        assert!((search() - namespace_expected).abs() < 1e-9);
+        // The namespace-stats answer is cached as usual.
+        assert!((search() - namespace_expected).abs() < 1e-9);
     }
 
     #[test]

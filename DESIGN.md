@@ -361,7 +361,7 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      the cross-segment merge compares like with like; the block-max ceilings take their `df`
      from the same scorer. Deleted documents still count until compaction drops them, as they do
      in Lucene. If any segment's footer or a term's postings can't be read locally, the search
-     falls back to per-segment statistics as a whole (reported as `segment_fallback`) rather than
+     falls back to per-segment statistics as a whole (reported as `segment_fallback`, and not result-cached) rather than
      score with a partial `df`; the server therefore also hydrates the inverted index and posting
      blob of segments the query's filter prunes but whose term bloom admits a query term.
      `bm25_params.stats: "segment"` (or `KOSHA_BM25_STATS=segment` engine-wide) restores
