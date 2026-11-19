@@ -514,19 +514,269 @@ pub struct SortSpec {
     pub fields: std::collections::HashMap<String, SortOrder>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A search request's `highlight` clause (#195).
+///
+/// Two JSON shapes are accepted and normalised into this one struct:
+///
+/// * the OpenSearch/Elasticsearch shape, any number of fields, each with
+///   optional tags that fall back to the top-level tags and then to the
+///   defaults (`<b>` / `</b>`):
+///   `{"pre_tags"?, "post_tags"?, "fields": {"title": {}, "body": {"pre_tags": ["<em>"]}}}`
+///   (`fields` may also be ES's ordered array form, `[{"title": {}}, {"body": {}}]`);
+/// * the legacy single-field shape, `{"field": "body", "pre_tags"?, "post_tags"?}`.
+///
+/// Giving both `field` and `fields` is an error. Highlighter options Kosha
+/// does not implement (`fragment_size`, `type`, ...) are ignored, as they
+/// were before. Hits answer a `fields` request with the per-field
+/// `ScoredDocument::highlight` map, and a legacy request with the flat
+/// `ScoredDocument::highlights` list, exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HighlightConfig {
-    pub field: String,
-    #[serde(default = "default_pre_tag")]
-    pub pre_tags: Vec<String>,
-    #[serde(default = "default_post_tag")]
-    pub post_tags: Vec<String>,
+    /// Fields to highlight, in request order.
+    pub fields: Vec<HighlightField>,
+    /// Top-level tags: the fallback for a field that sets none.
+    pub pre_tags: Option<Vec<String>>,
+    pub post_tags: Option<Vec<String>>,
+    /// Parsed from the legacy `{"field": ...}` form: hits report the flat
+    /// `highlights` list rather than the per-field `highlight` map.
+    pub legacy_single_field: bool,
 }
-fn default_pre_tag() -> Vec<String> {
-    vec!["<b>".into()]
+
+/// One entry of `HighlightConfig::fields`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighlightField {
+    pub name: String,
+    pub pre_tags: Option<Vec<String>>,
+    pub post_tags: Option<Vec<String>>,
 }
-fn default_post_tag() -> Vec<String> {
-    vec!["</b>".into()]
+
+const DEFAULT_PRE_TAG: &str = "<b>";
+const DEFAULT_POST_TAG: &str = "</b>";
+
+fn first_tag(tags: Option<&Vec<String>>) -> Option<&str> {
+    tags.and_then(|t| t.first()).map(String::as_str)
+}
+
+impl HighlightConfig {
+    /// The legacy single-field request, `{"field": name}`.
+    pub fn single_field(name: impl Into<String>) -> Self {
+        Self {
+            fields: vec![HighlightField::new(name)],
+            pre_tags: None,
+            post_tags: None,
+            legacy_single_field: true,
+        }
+    }
+
+    /// An ES-shaped request for `names`, each with the default tags.
+    pub fn for_fields<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            fields: names.into_iter().map(HighlightField::new).collect(),
+            pre_tags: None,
+            post_tags: None,
+            legacy_single_field: false,
+        }
+    }
+
+    /// The opening tag for `field`: its own first tag, else the top-level
+    /// one, else `<b>`. An empty list counts as unset.
+    pub fn pre_tag<'a>(&'a self, field: &'a HighlightField) -> &'a str {
+        first_tag(field.pre_tags.as_ref())
+            .or_else(|| first_tag(self.pre_tags.as_ref()))
+            .unwrap_or(DEFAULT_PRE_TAG)
+    }
+
+    /// The closing tag for `field`; see [`HighlightConfig::pre_tag`].
+    pub fn post_tag<'a>(&'a self, field: &'a HighlightField) -> &'a str {
+        first_tag(field.post_tags.as_ref())
+            .or_else(|| first_tag(self.post_tags.as_ref()))
+            .unwrap_or(DEFAULT_POST_TAG)
+    }
+}
+
+impl HighlightField {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            pre_tags: None,
+            post_tags: None,
+        }
+    }
+}
+
+/// Per-field options inside `highlight.fields`. Unknown keys are ignored.
+#[derive(Default, Serialize, Deserialize)]
+struct HighlightFieldOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pre_tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_tags: Option<Vec<String>>,
+}
+
+/// `highlight.fields`, kept in request order: either an object
+/// (`{"title": {}, "body": {}}`) or ES's ordered array of single-key
+/// objects (`[{"title": {}}, {"body": {}}]`).
+struct HighlightFieldList(Vec<HighlightField>);
+
+impl<'de> Deserialize<'de> for HighlightFieldList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor;
+
+        fn push_entries<'de, A: serde::de::MapAccess<'de>>(
+            mut map: A,
+            out: &mut Vec<HighlightField>,
+        ) -> Result<(), A::Error> {
+            while let Some(name) = map.next_key::<String>()? {
+                // `"title": null` is accepted as "default options".
+                let options: Option<HighlightFieldOptions> = map.next_value()?;
+                let options = options.unwrap_or_default();
+                if out.iter().any(|f| f.name == name) {
+                    return Err(serde::de::Error::custom(format!(
+                        "highlight field `{name}` listed more than once"
+                    )));
+                }
+                out.push(HighlightField {
+                    name,
+                    pre_tags: options.pre_tags,
+                    post_tags: options.post_tags,
+                });
+            }
+            Ok(())
+        }
+
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = HighlightFieldList;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object of field name to highlight options, or an array of them")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                push_entries(map, &mut out)?;
+                Ok(HighlightFieldList(out))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(entry) = seq.next_element::<HighlightFieldList>()? {
+                    for field in entry.0 {
+                        if out.iter().any(|f: &HighlightField| f.name == field.name) {
+                            return Err(serde::de::Error::custom(format!(
+                                "highlight field `{}` listed more than once",
+                                field.name
+                            )));
+                        }
+                        out.push(field);
+                    }
+                }
+                Ok(HighlightFieldList(out))
+            }
+        }
+
+        deserializer.deserialize_any(FieldsVisitor)
+    }
+}
+
+/// The wire form both request shapes deserialize through.
+#[derive(Deserialize)]
+struct HighlightWire {
+    #[serde(default)]
+    field: Option<String>,
+    #[serde(default)]
+    fields: Option<HighlightFieldList>,
+    #[serde(default)]
+    pre_tags: Option<Vec<String>>,
+    #[serde(default)]
+    post_tags: Option<Vec<String>>,
+}
+
+impl<'de> Deserialize<'de> for HighlightConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = HighlightWire::deserialize(deserializer)?;
+        match (wire.field, wire.fields) {
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                "highlight: give either `fields` (a map of field name to options) or the legacy \
+                 single `field`, not both",
+            )),
+            (Some(name), None) => Ok(HighlightConfig {
+                fields: vec![HighlightField::new(name)],
+                pre_tags: wire.pre_tags,
+                post_tags: wire.post_tags,
+                legacy_single_field: true,
+            }),
+            (None, Some(fields)) => Ok(HighlightConfig {
+                fields: fields.0,
+                pre_tags: wire.pre_tags,
+                post_tags: wire.post_tags,
+                legacy_single_field: false,
+            }),
+            (None, None) => Err(serde::de::Error::custom(
+                "highlight: `fields` is required (e.g. {\"fields\": {\"body\": {}}})",
+            )),
+        }
+    }
+}
+
+impl Serialize for HighlightConfig {
+    /// Re-emits the shape the request used, so a serialized query (the CLI
+    /// client, the result-cache key) deserializes back to the same value.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        if self.legacy_single_field && self.fields.len() == 1 {
+            let only = &self.fields[0];
+            map.serialize_entry("field", &only.name)?;
+            // The legacy form has no per-field tags; fold them into the top
+            // level so they survive the round trip.
+            let pre = only.pre_tags.as_ref().or(self.pre_tags.as_ref());
+            let post = only.post_tags.as_ref().or(self.post_tags.as_ref());
+            if let Some(pre) = pre {
+                map.serialize_entry("pre_tags", pre)?;
+            }
+            if let Some(post) = post {
+                map.serialize_entry("post_tags", post)?;
+            }
+        } else {
+            if let Some(ref pre) = self.pre_tags {
+                map.serialize_entry("pre_tags", pre)?;
+            }
+            if let Some(ref post) = self.post_tags {
+                map.serialize_entry("post_tags", post)?;
+            }
+            map.serialize_entry("fields", &HighlightFieldsSer(&self.fields))?;
+        }
+        map.end()
+    }
+}
+
+struct HighlightFieldsSer<'a>(&'a [HighlightField]);
+
+impl Serialize for HighlightFieldsSer<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for field in self.0 {
+            map.serialize_entry(
+                &field.name,
+                &HighlightFieldOptions {
+                    pre_tags: field.pre_tags.clone(),
+                    post_tags: field.post_tags.clone(),
+                },
+            )?;
+        }
+        map.end()
+    }
 }
 
 // ─── Wildcard query ────────────────────────────────────────────────────────
@@ -1793,8 +2043,18 @@ pub struct ScoredDocument {
     pub doc_id: DocumentId,
     pub score: f64,
     pub fields: Vec<Field>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Legacy single-field highlight fragments: set only for a request
+    /// that used the legacy `{"highlight": {"field": ...}}` form.
+    /// Deprecated: request `highlight.fields` and read `highlight` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlights: Option<Vec<String>>,
+    /// Highlight fragments keyed by field name, ES-shaped
+    /// (`"highlight": {"title": ["..."], "body": ["..."]}`), for a request
+    /// that used `highlight.fields`. A requested field the hit lacks, or
+    /// that is not a text field, is left out; no matching field at all
+    /// leaves the map unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// Hybrid (RRF) requests only: where this hit ranked in each
     /// retriever's list. `score` is then the fused RRF score.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2104,6 +2364,75 @@ mod filter_clause_parsing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn highlight(json: serde_json::Value) -> Result<HighlightConfig, String> {
+        serde_json::from_value(json).map_err(|e| e.to_string())
+    }
+
+    /// #195: the ES `fields` map and the legacy `field` form normalise into
+    /// one struct; per-field tags fall back to the top level, then `<b>`.
+    #[test]
+    fn highlight_config_accepts_both_shapes_and_resolves_tags() {
+        // Parsed from text: `json!` would sort the keys.
+        let es: HighlightConfig = serde_json::from_str(
+            r#"{"pre_tags": ["<i>"], "fields": {
+                "title": {},
+                "body": {"pre_tags": ["<em>"], "post_tags": ["</em>"], "fragment_size": 150},
+                "summary": null}}"#,
+        )
+        .unwrap();
+        assert!(!es.legacy_single_field);
+        let names: Vec<_> = es.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["title", "body", "summary"], "request order kept");
+        let tags = |name: &str| {
+            let field = es.fields.iter().find(|f| f.name == name).unwrap();
+            (es.pre_tag(field), es.post_tag(field))
+        };
+        assert_eq!(tags("title"), ("<i>", "</b>"));
+        assert_eq!(tags("body"), ("<em>", "</em>"));
+
+        // ES's ordered array form.
+        let arr = highlight(serde_json::json!({"fields": [{"b": {}}, {"a": {}}]})).unwrap();
+        let names: Vec<_> = arr.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["b", "a"]);
+
+        let legacy = highlight(serde_json::json!({"field": "body", "pre_tags": []})).unwrap();
+        assert!(legacy.legacy_single_field);
+        assert_eq!(legacy.fields, vec![HighlightField::new("body")]);
+        // An empty tag list counts as unset, as it always did.
+        assert_eq!(legacy.pre_tag(&legacy.fields[0]), "<b>");
+
+        let err = highlight(serde_json::json!({"field": "a", "fields": {"b": {}}})).unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        assert!(highlight(serde_json::json!({})).is_err());
+        assert!(highlight(serde_json::json!({"fields": "body"})).is_err());
+        assert!(highlight(serde_json::json!({"fields": [{"a": {}}, {"a": {}}]})).is_err());
+    }
+
+    /// The serialized form deserializes back to the same value (the CLI
+    /// client and the result-cache key both serialize the query), and the
+    /// two shapes serialize differently since they answer differently.
+    #[test]
+    fn highlight_config_serde_round_trips() {
+        for json in [
+            serde_json::json!({"field": "body"}),
+            serde_json::json!({"field": "body", "pre_tags": ["<em>"], "post_tags": ["</em>"]}),
+            serde_json::json!({"fields": {"body": {}}}),
+            serde_json::json!({"pre_tags": ["<i>"], "fields": {"z": {"post_tags": ["]"]}, "a": {}}}),
+        ] {
+            let parsed = highlight(json.clone()).unwrap();
+            let again = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(
+                highlight(again.clone()).unwrap(),
+                parsed,
+                "{json} -> {again}"
+            );
+        }
+        assert_ne!(
+            serde_json::to_string(&HighlightConfig::single_field("body")).unwrap(),
+            serde_json::to_string(&HighlightConfig::for_fields(["body"])).unwrap()
+        );
+    }
 
     #[test]
     fn base64_byte_reads_any_byte_without_decoding_the_rest() {

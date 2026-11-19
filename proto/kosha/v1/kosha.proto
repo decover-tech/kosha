@@ -318,10 +318,31 @@ message SortSpec {
   string order = 2;  // "asc" or "desc"
 }
 
+// Highlighting (#195). Set `fields` to highlight any number of fields (HTTP:
+// "highlight": {"fields": {"title": {}, "body": {"pre_tags": ["<em>"]}}});
+// hits then carry the per-field ScoredDocument.highlight map. Each field's
+// tags fall back to the top-level pre_tags/post_tags, then to <b>/</b>.
+// `field` is the legacy single-field form (hits carry ScoredDocument.highlights);
+// setting both `field` and `fields` is an INVALID_ARGUMENT / HTTP 400.
 message HighlightConfig {
+  // Deprecated: use `fields`.
   string field = 1;
   repeated string pre_tags = 2;
   repeated string post_tags = 3;
+  // Fields to highlight, in request order.
+  repeated HighlightField fields = 4;
+}
+
+message HighlightField {
+  string name = 1;
+  // Unset/empty falls back to HighlightConfig.pre_tags / post_tags.
+  repeated string pre_tags = 2;
+  repeated string post_tags = 3;
+}
+
+// The fragments highlighted in one field of one hit.
+message HighlightFragments {
+  repeated string fragments = 1;
 }
 
 message WildcardQuery {
@@ -354,9 +375,15 @@ message ScoredDocument {
   string doc_id = 1;
   double score = 2;  // the fused RRF score for a hybrid request
   repeated Field fields = 3;
+  // Deprecated: set only for the legacy single-field HighlightConfig.field
+  // request; use `highlight`.
   repeated string highlights = 4;
   // Hybrid requests only.
   optional RankDetails rank_details = 5;
+  // Highlight fragments keyed by field name, for a HighlightConfig.fields
+  // request (ES "highlight" shape). Fields the hit lacks, or that are not
+  // text, are absent.
+  map<string, HighlightFragments> highlight = 6;
 }
 
 // 1-based ranks in each retriever's namespace-wide list; unset when the hit
