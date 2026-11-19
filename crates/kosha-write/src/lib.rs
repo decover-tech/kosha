@@ -91,6 +91,7 @@ impl NamespaceState {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                schema: None,
             },
             published_version: 0,
             tombstones: HashMap::new(),
@@ -775,7 +776,8 @@ impl Indexer {
         let mut writer = SegmentWriter::new(
             seg_id.clone(),
             self.data_dir.join(&namespace.0).join(&seg_id.0),
-        );
+        )
+        .with_analysis(&snapshot.manifest.analysis_config());
         for doc in &replacements {
             writer.add_document(doc.id.clone(), doc.fields.clone());
         }
@@ -996,9 +998,10 @@ impl Indexer {
         // what keeps concurrent segment IDs collision-free: by the time
         // phase 2 spawns writer threads, every chunk already owns a
         // distinct, already-incremented counter value.
-        let (chunks, checkpoint) = {
+        let (chunks, checkpoint, analysis) = {
             let mut state = handle.state.lock().unwrap();
             let checkpoint = state.wal_sequence;
+            let analysis = state.manifest.analysis_config();
             state.flushing_ids = state
                 .buffer
                 .as_ref()
@@ -1009,7 +1012,7 @@ impl Indexer {
                 self.max_concurrent_flush_writers,
                 self.min_docs_per_flush_writer,
             );
-            (chunks, checkpoint)
+            (chunks, checkpoint, analysis)
         };
         if chunks.is_empty() {
             if recovery.is_some() {
@@ -1045,6 +1048,7 @@ impl Indexer {
                 docs,
                 seg_id,
                 bm25_params,
+                &analysis,
             )]
         } else {
             std::thread::scope(|scope| {
@@ -1052,8 +1056,16 @@ impl Indexer {
                     .into_iter()
                     .map(|(docs, seg_id, bm25_params)| {
                         let ns_dir = &ns_dir;
+                        let analysis = &analysis;
                         scope.spawn(move || {
-                            Self::write_flush_chunk(ns_dir, handle, docs, seg_id, bm25_params)
+                            Self::write_flush_chunk(
+                                ns_dir,
+                                handle,
+                                docs,
+                                seg_id,
+                                bm25_params,
+                                analysis,
+                            )
                         })
                     })
                     .collect();
@@ -1154,6 +1166,7 @@ impl Indexer {
         docs: Vec<Document>,
         seg_id: SegmentId,
         bm25_params: Bm25Params,
+        analysis: &kosha_core::AnalysisConfig,
     ) -> (
         SegmentId,
         Vec<Document>,
@@ -1161,7 +1174,7 @@ impl Indexer {
     ) {
         let _permit = handle.writer_slots.acquire();
         let seg_dir = ns_dir.join(seg_id.0.as_str());
-        let mut writer = SegmentWriter::new(seg_id.clone(), seg_dir);
+        let mut writer = SegmentWriter::new(seg_id.clone(), seg_dir).with_analysis(analysis);
         for doc in &docs {
             writer.add_document(doc.id.clone(), doc.fields.clone());
         }
@@ -1241,7 +1254,8 @@ impl Indexer {
         };
 
         let seg_dir = data_dir.join(&namespace.0).join(seg_id.0.as_str());
-        let mut writer = SegmentWriter::new(seg_id.clone(), seg_dir);
+        let mut writer = SegmentWriter::new(seg_id.clone(), seg_dir)
+            .with_analysis(&state.manifest.analysis_config());
         for doc in &docs {
             writer.add_document(doc.id.clone(), doc.fields.clone());
         }
@@ -1308,7 +1322,7 @@ impl Indexer {
         let handle = self.ns_handle(namespace);
         let _compact_guard = handle.compact.lock().unwrap();
 
-        let (plan, tombstones, bm25_params, segments_before) = {
+        let (plan, tombstones, bm25_params, segments_before, analysis) = {
             let mut state = handle.state.lock().unwrap();
             if !state.known {
                 return Ok(CompactResult {
@@ -1354,7 +1368,11 @@ impl Indexer {
                 &self.data_dir,
                 &self.bm25_params,
             );
-            (plan, tombstones, bm25_params, segments_before)
+            // Merged documents are re-analyzed under the namespace's
+            // *current* schema (#220): compaction is how segments written
+            // with an older analyzer converge on the new one.
+            let analysis = state.manifest.analysis_config();
+            (plan, tombstones, bm25_params, segments_before, analysis)
         };
 
         after_plan();
@@ -1367,7 +1385,8 @@ impl Indexer {
             uuid::Uuid::new_v4().simple()
         ));
         let seg_dir = ns_dir.join(seg_id.0.as_str());
-        let mut writer = kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir);
+        let mut writer =
+            kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir).with_analysis(&analysis);
         let mut any_docs = false;
         let old_segment_ids = plan.input_ids();
         // (old segment_id, old doc_seq) → the doc's doc_seq in the merged
@@ -1581,6 +1600,35 @@ impl Indexer {
         state.manifest = manifest;
         state.shared_manifest = None;
         state.known = true;
+    }
+
+    /// Set the namespace schema (#220), creating the namespace if needed.
+    /// Every analyzer is resolved first, so an invalid schema is rejected
+    /// with nothing changed. Only segments written from now on (flushes,
+    /// and compaction outputs) use it; existing segments keep the chains
+    /// recorded in their footers and are searched with those. The caller
+    /// publishes the manifest.
+    ///
+    /// Returns whether anything changed (setting the same schema again is
+    /// a no-op that does not bump the manifest version).
+    pub fn set_schema(
+        &self,
+        namespace: &NamespaceId,
+        schema: kosha_core::NamespaceSchema,
+    ) -> Result<bool, KoshaError> {
+        schema
+            .resolve()
+            .map_err(|e| KoshaError::InvalidQuery(format!("invalid schema: {e}")))?;
+        let handle = self.ns_handle(namespace);
+        let _mutation = handle.mutation.lock().unwrap();
+        let mut state = handle.state.lock().unwrap();
+        if state.known && state.manifest.schema.as_ref() == Some(&schema) {
+            return Ok(false);
+        }
+        state.manifest.schema = Some(schema);
+        state.manifest.version += 1;
+        state.known = true;
+        Ok(true)
     }
 
     pub fn manifest(&self, namespace: &NamespaceId) -> Option<Manifest> {

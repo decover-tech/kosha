@@ -179,7 +179,9 @@ per-org/matter index in `IndexRegistry`. Each namespace has:
 
 - A **schema**: field definitions (text, keyword, date, vector\<dim\>, geo, etc.), which fields are
   lexically indexed, which carry vector indices, which are filter-only.
-- An **index profile**: tokenizer/analyzer choice, ANN index type + params (e.g. HNSW `M`/`efConstruction`,
+- An **index profile**: tokenizer/analyzer choice (implemented: the schema's per-field `analyzer`,
+  stored on the manifest and applied by the segment writers — see §6.2 and README "Analyzers"),
+  ANN index type + params (e.g. HNSW `M`/`efConstruction`,
   or IVF-PQ for very large namespaces), compaction policy, cache priority tier.
 - A **manifest**: an ordered, versioned list of segment references that make up the current
   readable state of the namespace (see 6.3).
@@ -202,6 +204,17 @@ s3://kosha-{env}/{namespace_id}/segments/{segment_id}/
     filters.bin          # columnar filter fields (dates, ids, tags) for fast predicate eval
     footer.json          # offsets, counts, schema version, checksum (reserves a vector.idx slot even in Phase 1)
 ```
+
+**Analysis is versioned per segment (#220, #221).** `inverted.idx` holds whatever terms the
+analyzer produced at write time, so a segment's `footer.json` records the exact analysis chains its
+`Text` fields went through (`analysis`: tokenizer + version + filters, with stopword lists copied
+in). A footer without `analysis` means the legacy `standard@1` chain — every segment written before
+analyzers existed, and every segment written since with default settings, which therefore stay
+byte-identical. Queries are analyzed **per segment** with that segment's chains; a segment whose
+fields used several chains reads the query once per chain and a document matches if it matches one
+reading in full (scored with its best). An analyzer change (schema edit, tokenizer upgrade) thus
+never makes older segments go dark: they keep answering with the analysis they were written with
+until compaction re-analyzes their stored documents under the current schema.
 
 Segments are sized to a target (e.g. 128–512MB) so that a full segment fetch/cache-fill is a
 bounded, predictable operation. Small/continuous writes are buffered (§7) and flushed as a segment

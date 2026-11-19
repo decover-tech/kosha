@@ -535,6 +535,8 @@ impl Publisher {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                // The rebuilt segments were analyzed with this schema.
+                schema: existing.schema.clone(),
             },
             PublishMode::Append => existing.clone(),
         };
@@ -642,6 +644,7 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         });
         // Restore to advance segment IDs beyond an existing/partial run.
         // Replace mode: Publisher publishes only this run's segments.

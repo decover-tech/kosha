@@ -43,8 +43,6 @@ use kosha_core::{segment_may_contain_terms, TermBloomMode};
 use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
 use kosha_query::DocStoreHydrator;
 use kosha_query::Searcher;
-#[cfg(feature = "s3")]
-use kosha_segment::tokenize;
 use kosha_segment::SegmentReader;
 use kosha_write::Indexer;
 
@@ -2470,11 +2468,14 @@ impl AppState {
         query: &SearchQuery,
         request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
-        let term_prune = term_bloom_prune_for_query(query);
+        let term_prune = kosha_query::term_bloom_prune_mode(query);
+        // The query is analyzed per segment with the chains its footer
+        // records (#220), so which terms (and posting-blob shards) a
+        // segment needs depends on its footer.
+        let query_analysis = kosha_query::QueryAnalysis::new(query);
         let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
         let needs_vectors = query.knn.is_some();
         let needs_filters = query_needs_filter_store(query);
-        let posting_files = posting_blob_files_for_query(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
@@ -2557,20 +2558,31 @@ impl AppState {
                 .remember_segment_footers(ns, fetched_footers.values().cloned());
         }
 
-        let stats_terms = kosha_query::namespace_stats_terms(query).filter(|t| !t.is_empty());
+        let segment_footer = |entry: &kosha_core::ManifestEntry| {
+            manifest
+                .segment_footer(&entry.segment_id)
+                .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref))
+        };
+        let analyses: Vec<Option<&kosha_core::SegmentAnalysis>> = manifest
+            .segments
+            .iter()
+            .map(|entry| segment_footer(entry).and_then(|f| f.analysis.as_ref()))
+            .collect();
+        let posting_files =
+            posting_blob_files_for_query(query, &query_analysis, analyses.iter().copied());
+        let stats_terms = kosha_query::namespace_stats_terms(query, analyses.iter().copied())
+            .filter(|t| !t.is_empty());
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         let mut stats_only: Vec<PathBuf> = Vec::new();
         for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
             // Borrowed, never cloned: footers hold every bloom. A segment
             // with no cached footer was already read (once) into
             // `fetched_footers` above.
-            let footer = manifest
-                .segment_footer(&entry.segment_id)
-                .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
+            let footer = segment_footer(entry);
             match segment_search_hydration(
                 query,
                 needs_bloom_check,
-                term_prune.as_ref(),
+                term_prune.map(|mode| (&query_analysis, mode)),
                 stats_terms.as_deref(),
                 footer,
             ) {
@@ -2866,7 +2878,25 @@ impl AppState {
         query: &SearchQuery,
         request: &Arc<RequestHydration>,
     ) -> HydrationOutcome {
-        let posting_files = posting_blob_files_for_query(query);
+        // Footers are local whenever the namespace verdict is cached (it
+        // means every segment's scoring set is present).
+        let analyses: Vec<Option<kosha_core::SegmentAnalysis>> = manifest
+            .segments
+            .iter()
+            .map(|entry| {
+                let dir = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                manifest
+                    .footer_or_read(&entry.segment_id, || {
+                        kosha_segment::SegmentReader::read_footer(&dir).ok()
+                    })
+                    .and_then(|footer| footer.analysis.clone())
+            })
+            .collect();
+        let posting_files = posting_blob_files_for_query(
+            query,
+            &kosha_query::QueryAnalysis::new(query),
+            analyses.iter().map(Option::as_ref),
+        );
         if posting_files.is_empty() {
             return HydrationOutcome::default();
         }
@@ -3606,6 +3636,9 @@ fn is_write_path(request_line: &str) -> bool {
     if extract_namespace(request_line, "POST /v1/namespaces/", "/delete").is_some() {
         return true;
     }
+    if extract_namespace(request_line, "POST /v1/namespaces/", "/schema").is_some() {
+        return true;
+    }
     // v1 admin routes — all mutate segment/manifest state.
     if request_line.starts_with("POST /v1/admin/") {
         return true;
@@ -3858,6 +3891,14 @@ fn route_inner(
 
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/exists") {
         return handle_exists_with_ns(&ns, tenant, body, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/schema") {
+        return handle_put_schema_with_ns(&ns, tenant, body, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/schema") {
+        return handle_get_schema_with_ns(&ns, tenant, state);
     }
 
     if request_line.starts_with("GET /v1/stats") {
@@ -5089,6 +5130,63 @@ fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppS
     handle_index(&modified_body, state)
 }
 
+/// `POST /v1/namespaces/{ns}/schema` — set the namespace schema (#220).
+/// The body is a proto `NamespaceSchema` (`{"fields": {...}}`), or one
+/// wrapped as `{"schema": {...}}` like `CreateNamespaceRequest`. Only the
+/// analysis settings are honored. New segments use it; existing segments
+/// keep the analysis their footer records and stay searchable with it, so
+/// the change reaches old documents when compaction rewrites them.
+fn handle_put_schema_with_ns(
+    namespace: &str,
+    tenant: &str,
+    body: &[u8],
+    state: &AppState,
+) -> String {
+    let ns = NamespaceId(tenant_namespace(tenant, namespace));
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return json_error(400, "invalid JSON"),
+    };
+    let value = match value.get("schema") {
+        Some(inner) => inner.clone(),
+        None => value,
+    };
+    let schema: kosha_core::NamespaceSchema = match serde_json::from_value(value) {
+        Ok(schema) => schema,
+        Err(e) => return json_error(400, &format!("invalid schema: {e}")),
+    };
+    let changed = match state.indexer.set_schema(&ns, schema.clone()) {
+        Ok(changed) => changed,
+        Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
+        Err(e) => return json_error(500, &format!("schema update failed: {e}")),
+    };
+    if changed {
+        if let Err(e) = state.publish_namespace(&ns) {
+            return json_error(500, &format!("publication failed: {e}"));
+        }
+    }
+    json_ok(&serde_json::json!({
+        "namespace": namespace,
+        "schema": schema,
+        "changed": changed,
+    }))
+}
+
+/// `GET /v1/namespaces/{ns}/schema` — the namespace schema, `{}` if none.
+fn handle_get_schema_with_ns(namespace: &str, tenant: &str, state: &AppState) -> String {
+    let ns = NamespaceId(tenant_namespace(tenant, namespace));
+    if let Err(e) = state.refresh_query_namespace(&ns) {
+        return json_error(404, &format!("{e}"));
+    }
+    match state.indexer.manifest_shared(&ns) {
+        Some(manifest) => json_ok(&serde_json::json!({
+            "namespace": namespace,
+            "schema": manifest.schema.clone().unwrap_or_default(),
+        })),
+        None => json_error(404, "namespace not found"),
+    }
+}
+
 fn handle_search_post_with_ns(
     namespace: &str,
     tenant: &str,
@@ -5823,6 +5921,7 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        schema: None,
     }
 }
 
@@ -5929,7 +6028,13 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
             );
         }
 
-        let manifest = manifest_from_footers(footers);
+        let mut manifest = manifest_from_footers(footers);
+        // Footers carry each segment's analysis, so search needs nothing
+        // else; keep a schema this node already knows for future writes.
+        manifest.schema = state
+            .indexer
+            .manifest_cloned(&ns)
+            .and_then(|existing| existing.schema);
         let segments = manifest.segments.len();
         let documents: u64 = manifest.segments.iter().map(|e| e.doc_count as u64).sum();
         state.indexer.restore_manifest(ns.clone(), manifest);
@@ -6043,7 +6148,7 @@ enum SegmentHydration {
 fn segment_search_hydration(
     query: &SearchQuery,
     needs_bloom_check: bool,
-    term_prune: Option<&(Vec<String>, TermBloomMode)>,
+    term_prune: Option<(&kosha_query::QueryAnalysis, TermBloomMode)>,
     stats_terms: Option<&[String]>,
     footer: Option<&kosha_core::Footer>,
 ) -> SegmentHydration {
@@ -6051,8 +6156,8 @@ fn segment_search_hydration(
         return SegmentHydration::Scoring;
     };
     let admitted = query.segment_may_match_filters(footer.filter_blooms.as_ref())
-        && term_prune.is_none_or(|(terms, mode)| {
-            segment_may_contain_terms(terms, *mode, footer.term_bloom.as_ref())
+        && term_prune.is_none_or(|(analysis, mode)| {
+            kosha_query::segment_may_match_query_terms(analysis, mode, footer)
         });
     if admitted {
         SegmentHydration::Scoring
@@ -6065,15 +6170,6 @@ fn segment_search_hydration(
     }
 }
 
-/// Lexical terms used for footer term-bloom prune before hydrate/open.
-///
-/// Wildcard queries cannot be pruned here — expansion needs the segment
-/// vocabulary. Phrase and multi-term BM25 use AND semantics.
-#[cfg(feature = "s3")]
-fn term_bloom_prune_for_query(query: &SearchQuery) -> Option<(Vec<String>, TermBloomMode)> {
-    kosha_query::term_bloom_prune_for_query(query)
-}
-
 /// Whether scoring/materialization needs `filters.bin`. Broad lexical
 /// queries with default score/_id ranking do not: they use only postings,
 /// doc metadata, and page doc stores.
@@ -6083,19 +6179,19 @@ fn query_needs_filter_store(query: &SearchQuery) -> bool {
 }
 
 #[cfg(feature = "s3")]
-fn posting_blob_files_for_query(query: &SearchQuery) -> Vec<String> {
+fn posting_blob_files_for_query<'a>(
+    query: &SearchQuery,
+    analysis: &kosha_query::QueryAnalysis,
+    analyses: impl IntoIterator<Item = Option<&'a kosha_core::SegmentAnalysis>>,
+) -> Vec<String> {
     if query.wildcard.is_some() {
         return kosha_segment::all_posting_blob_files();
     }
 
+    // Every term any segment's reading of the query holds (#220).
     let mut files = std::collections::HashSet::new();
-    for term in tokenize(&query.query_text) {
+    for term in analysis.union_terms(analyses) {
         files.insert(kosha_segment::posting_blob_file_for_term(&term));
-    }
-    if let Some(ref phrase) = query.match_phrase {
-        for term in tokenize(&phrase.phrase) {
-            files.insert(kosha_segment::posting_blob_file_for_term(&term));
-        }
     }
     let mut files: Vec<String> = files.into_iter().collect();
     files.sort();
@@ -7054,19 +7150,21 @@ mod tests {
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: None,
             doc_vectors: false,
+            analysis: None,
         };
         let mut query: SearchQuery = serde_json::from_str(
             r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
         )
         .unwrap();
         let decide = |query: &SearchQuery, f: &kosha_core::Footer| {
-            let term_prune = term_bloom_prune_for_query(query);
+            let term_prune = kosha_query::term_bloom_prune_mode(query);
+            let analysis = kosha_query::QueryAnalysis::new(query);
             let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
-            let stats_terms = kosha_query::namespace_stats_terms(query);
+            let stats_terms = kosha_query::namespace_stats_terms(query, [None]);
             segment_search_hydration(
                 query,
                 needs_bloom_check,
-                term_prune.as_ref(),
+                term_prune.map(|mode| (&analysis, mode)),
                 stats_terms.as_deref(),
                 Some(f),
             )
@@ -7565,6 +7663,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         // Simulate: an earlier publish call already confirmed seg-2
         // synced (e.g. it was "last" at the time it ran), but seg-1 and
@@ -8058,6 +8157,7 @@ mod tests {
             "POST /v1/namespaces/foo/documents HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/flush HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/delete HTTP/1.1\r\n",
+            "POST /v1/namespaces/foo/schema HTTP/1.1\r\n",
             "POST /v1/admin/api-keys HTTP/1.1\r\n",
             "POST /v1/admin/rebuild-filter-blooms HTTP/1.1\r\n",
             "POST /v1/admin/backfill-offset-tables HTTP/1.1\r\n",
@@ -8082,6 +8182,7 @@ mod tests {
             "POST /v1/namespaces/foo/exists HTTP/1.1\r\n",
             "GET /v1/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/stats HTTP/1.1\r\n",
+            "GET /v1/namespaces/foo/schema HTTP/1.1\r\n",
             "GET /search?ns=foo&q=bar HTTP/1.1\r\n",
             "POST /search HTTP/1.1\r\n",
             "POST /exists HTTP/1.1\r\n",
@@ -8286,6 +8387,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
@@ -8425,6 +8527,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
@@ -9144,6 +9247,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            schema: None,
         };
         let policy = kosha_write::CompactionPolicy::default();
         assert_eq!(policy.max_mergeable_docs, 50_000);
@@ -9332,6 +9436,98 @@ mod tests {
             "search response: {search_resp}"
         );
         assert!(search_resp.contains("\"total_hits\":1"));
+    }
+
+    #[test]
+    fn namespace_schema_analyzers_apply_to_new_segments_and_compaction() {
+        // Issue #220: the schema's analyzer reaches the write path through
+        // the manifest, segments written before the change keep matching
+        // with the analysis they were written with, and compaction
+        // re-analyzes them under the current schema.
+        let state = test_state();
+        let ns = NamespaceId("acme/shop".into());
+        let call = |line: &str, body: serde_json::Value| {
+            let resp = route(
+                line,
+                &HashMap::new(),
+                &serde_json::to_vec(&body).unwrap(),
+                "acme",
+                &state,
+            );
+            let status: u16 = resp[9..12].parse().unwrap();
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            (
+                status,
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            )
+        };
+        let index = |id: &str, text: &str| {
+            let (status, _) = call(
+                "POST /v1/namespaces/shop/documents HTTP/1.1\r\n",
+                serde_json::json!({"documents": [{"id": id, "fields": [
+                    {"name": "body", "field_type": "Text", "value": text}]}]}),
+            );
+            assert_eq!(status, 200);
+            state.indexer.flush_namespace(&ns).unwrap();
+            state.publish_namespace(&ns).unwrap();
+        };
+        let search = |text: &str| -> Vec<String> {
+            let (status, body) = call(
+                "POST /v1/namespaces/shop/search HTTP/1.1\r\n",
+                serde_json::json!({"query_text": text, "no_cache": true}),
+            );
+            assert_eq!(status, 200, "{body}");
+            let mut ids: Vec<String> = body["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["doc_id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        index("before", "Running shoes");
+
+        let (status, body) = call(
+            "POST /v1/namespaces/shop/schema HTTP/1.1\r\n",
+            serde_json::json!({"fields": {"body": {"analyzer": ["standard", "soundex"]}}}),
+        );
+        assert_eq!(status, 400, "unknown filter is rejected: {body}");
+        let schema = serde_json::json!({"schema": {"fields": {
+            "body": {"type": "FIELD_TYPE_TEXT", "analyzer": ["standard", "stem"]}}}});
+        let (status, body) = call(
+            "POST /v1/namespaces/shop/schema HTTP/1.1\r\n",
+            schema.clone(),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["changed"], true);
+        let (_, body) = call("POST /v1/namespaces/shop/schema HTTP/1.1\r\n", schema);
+        assert_eq!(body["changed"], false, "same schema again is a no-op");
+        let (status, body) = call(
+            "GET /v1/namespaces/shop/schema HTTP/1.1\r\n",
+            serde_json::json!({}),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["schema"]["fields"]["body"]["analyzer"][1], "stem");
+
+        index("after", "they run daily");
+
+        // The old segment is still read with the legacy chain: "running"
+        // finds it, "run" does not (it never stemmed anything) — but it
+        // does not go dark either.
+        assert_eq!(search("running"), ["after", "before"]);
+        assert_eq!(search("run"), ["after"]);
+
+        // Compaction re-analyzes the old document under the new schema.
+        let result = state
+            .indexer
+            .compact_namespace_with_options(&ns, kosha_write::CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
+        state.publish_namespace(&ns).unwrap();
+        assert_eq!(search("run"), ["after", "before"]);
+        assert_eq!(search("running"), ["after", "before"]);
     }
 
     #[test]
@@ -9656,6 +9852,7 @@ mod tests {
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: None,
             doc_vectors: false,
+            analysis: None,
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.
