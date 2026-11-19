@@ -655,6 +655,11 @@ class KoshaClient:
         elif isinstance(track, int) and not isinstance(track, bool) and track > 0:
             kosha["total_hits_cap"] = track
 
+        # OpenSearch's `request_cache=false`: answer from the index, not from
+        # a stored response.
+        if body.get("request_cache", params.get("request_cache")) is False:
+            kosha["no_cache"] = True
+
         collapse = body.get("collapse")
         if collapse:
             unknown = set(collapse) - {"field"}
