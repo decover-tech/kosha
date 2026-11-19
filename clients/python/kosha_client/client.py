@@ -167,7 +167,11 @@ class KoshaClient:
         return str(ns)
 
     def search(
-        self, index: str | None = None, body: dict | None = None, **params: Any
+        self,
+        index: str | None = None,
+        body: dict | None = None,
+        rerank: dict | None = None,
+        **params: Any,
     ) -> dict:
         """Run an OpenSearch search body against Kosha.
 
@@ -175,9 +179,14 @@ class KoshaClient:
         ``_translate_search``). A clause Kosha cannot express raises
         ``KoshaRequestError(400)`` naming it. It is never dropped: dropping
         a filter silently returns documents the caller excluded.
+
+        ``rerank`` (or a ``"rerank"`` key in the body) asks the server to
+        rerank the top hits with an external model; see ``rerank_spec``.
         """
         ns = self._resolve_ns(index)
         body = body or {}
+        if rerank is not None:
+            body = {**body, "rerank": rerank}
         kosha_body, context = self._translate_search(body, params)
         kosha_body["namespace"] = ns
 
@@ -192,6 +201,64 @@ class KoshaClient:
                 raise
         took_ms = int((time.monotonic() - start) * 1000)
         return self._build_search_response(result, took_ms, context)
+
+    # ── Rerank ─────────────────────────────────────────────────────────────
+
+    _RERANK_KEYS = frozenset({"provider", "model", "field", "top_n", "timeout_ms", "query"})
+
+    @staticmethod
+    def rerank_spec(
+        field: str,
+        *,
+        model: str | None = "rerank-v3.5",
+        top_n: int | None = None,
+        provider: str = "cohere",
+        timeout_ms: int | None = None,
+        query: str | None = None,
+    ) -> dict:
+        """The ``rerank`` clause equivalent to a Cohere rerank call.
+
+        ``co.rerank(model=m, query=q, documents=[hit[field] ...], top_n=n)``
+        over the top ``n`` search hits becomes
+        ``client.search(index, body, rerank=KoshaClient.rerank_spec(field,
+        model=m, top_n=n))``. The server sends the same request to the
+        provider it has configured under ``provider`` (the API key stays on
+        the server). ``query`` defaults to the search's query text; set it
+        for a kNN-only search. ``top_n`` defaults to ``from + size`` and
+        must be at least that. If the provider times out or fails, hits
+        come back in search order and the response has
+        ``rerank.degraded = True``.
+        """
+        spec: dict = {"provider": provider, "field": field}
+        for key, value in (
+            ("model", model),
+            ("top_n", top_n),
+            ("timeout_ms", timeout_ms),
+            ("query", query),
+        ):
+            if value is not None:
+                spec[key] = value
+        return spec
+
+    @classmethod
+    def _rerank(cls, spec: Any) -> dict:
+        """Validate a ``rerank`` clause; Cohere's ``rank_fields`` is accepted
+        for ``field`` (one field only)."""
+        if not isinstance(spec, dict):
+            raise cls._unsupported(f"rerank {spec!r}")
+        spec = dict(spec)
+        rank_fields = spec.pop("rank_fields", None)
+        if rank_fields is not None:
+            fields = cls._as_list(rank_fields)
+            if len(fields) != 1 or "field" in spec:
+                raise cls._unsupported("rerank over more than one field")
+            spec["field"] = fields[0]
+        unknown = set(spec) - cls._RERANK_KEYS
+        if unknown:
+            raise cls._unsupported(f"rerank option(s) {sorted(unknown)}")
+        if not spec.get("provider") or not spec.get("field"):
+            raise cls._unsupported("rerank without provider and field")
+        return spec
 
     # ── Query translation ──────────────────────────────────────────────────
 
@@ -655,6 +722,9 @@ class KoshaClient:
         elif isinstance(track, int) and not isinstance(track, bool) and track > 0:
             kosha["total_hits_cap"] = track
 
+        if body.get("rerank") is not None:
+            kosha["rerank"] = cls._rerank(body["rerank"])
+
         collapse = body.get("collapse")
         if collapse:
             unknown = set(collapse) - {"field"}
@@ -786,6 +856,13 @@ class KoshaClient:
                 "_score": score,
                 "_source": source,
             }
+            # Reranked requests: the search-stage score (RRF for hybrid)
+            # and the reranker's score; ``_score`` is the latter unless
+            # the rerank degraded.
+            if "fused_score" in k_hit:
+                hit["_fused_score"] = k_hit["fused_score"]
+            if "rerank_score" in k_hit:
+                hit["_rerank_score"] = k_hit["rerank_score"]
             if highlight_field and k_hit.get("highlights"):
                 hit["highlight"] = {highlight_field: k_hit["highlights"]}
             if sort:
@@ -827,6 +904,10 @@ class KoshaClient:
         }
         if result.get("aggregations") is not None:
             response["aggregations"] = result["aggregations"]
+        if "rerank_degraded" in result:
+            response["rerank"] = {"degraded": bool(result["rerank_degraded"])}
+            if result.get("rerank_degraded_reason"):
+                response["rerank"]["reason"] = result["rerank_degraded_reason"]
         return response
 
     # ── Older helper names, kept for callers and tests that use them ──────

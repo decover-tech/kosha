@@ -12,8 +12,8 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 > **Status: Phase 1 complete — BM25 lexical + kNN/ANN search implemented.**
 > All seven crates have functional BM25 indexing, query, filtering,
-> aggregation, HNSW vector search, and RRF hybrid fusion. Rerank is Phase 2
-> (DESIGN.md §3.1).
+> aggregation, HNSW vector search, RRF hybrid fusion and a pluggable rerank
+> hook.
 
 ## Install
 
@@ -43,6 +43,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | Highlighting | Per-field, with configurable `pre_tags` / `post_tags` |
 | Aggregations | `terms`, `cardinality`, `composite` |
 | Total-hit accounting | Capped counting with an `eq` / `gte` relation (`track_total_hits`-style), overridable per query via `exact_total_hits` / `total_hits_cap` |
+| Rerank | `"rerank": {"provider": "cohere", "model": "rerank-v3.5", "field": "content", "top_n": 50, "timeout_ms": 2000}` sends the top `top_n` hits (the fused list for a hybrid request) to an external reranker and pages the reordered list. `top_n` defaults to `from + max_results` and must be ≥ it (≤ 1000; ≤ `rank_window_size` when that is set); `timeout_ms` defaults to 2000. Each hit then has `score` = `rerank_score` (the provider's) and `fused_score` (the search-stage score). On timeout or provider error the hits keep search order and the response has `rerank_degraded: true` and `rerank_degraded_reason`; such responses are not cached. Not combinable with `sort` / `search_after`. Providers are configured on the server from the environment (`KOSHA_RERANK_PROVIDERS`, `KOSHA_RERANK_<NAME>_URL` / `_API_KEY` / `_MODEL`; `cohere` reads `COHERE_API_KEY`); any Cohere-style `POST /rerank` API works. Per-provider calls, outcomes, documents, billed units and a latency histogram are under `rerank` in admin `/stats` |
 | Degradation signal | `knn_degraded_segments` reports segments whose vector search failed, so a 200 with silently missing neighbors is visible to the caller |
 
 ### Indexing and writes
@@ -87,7 +88,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 ### Not supported yet
 
-- Reranking (Phase 2, DESIGN.md §3.1). Per-retriever weights for RRF.
+- Per-retriever weights for RRF. Reranking over more than one field, and ES `text_similarity_reranker` retrievers in the Python client.
 - Configurable analyzers — tokenization is fixed (whitespace split, ASCII-punctuation trim, lowercase). The `analyzer` field exists in the schema proto but is not honored.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
 - `kosha-vector-spfresh` (SPFresh/SPANN with LIRE rebalancing) is a standalone, benchmarked prototype; it is not wired into the segment format or the query path.

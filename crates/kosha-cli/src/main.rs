@@ -578,6 +578,7 @@ fn build_search_query(
         source_excludes: None,
         rank: None,
         mode: None,
+        rerank: None,
     }
 }
 
@@ -599,6 +600,8 @@ mod tests {
             total_hits_relation: relation,
             aggregations: None,
             knn_degraded_segments: None,
+            rerank_degraded: None,
+            rerank_degraded_reason: None,
         };
         assert_eq!(
             format_total_hits_line(&mk(3, kosha_core::TotalHitsRelation::Eq)),

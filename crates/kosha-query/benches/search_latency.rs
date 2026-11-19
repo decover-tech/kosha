@@ -113,6 +113,7 @@ fn mk_query(text: &str) -> SearchQuery {
         source_excludes: None,
         rank: None,
         mode: None,
+        rerank: None,
     }
 }
 

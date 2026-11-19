@@ -102,6 +102,7 @@ fn main() {
         source_excludes: None,
         rank: None,
         mode: None,
+        rerank: None,
     };
 
     // Warm the segment cache.

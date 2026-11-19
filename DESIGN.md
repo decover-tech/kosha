@@ -379,8 +379,18 @@ true in practice since ES refresh intervals are already tuned up for indexing th
    `knn.filter` to the vector one only. `total_hits` and aggregations cover the lexical matches
    plus the vector window; `from`/`sort`/`collapse`/`search_after` apply within the fused list,
    which is at most `rank_window_size` long. Each hit carries its per-retriever ranks.
-6. **Rerank hook**: an optional, pluggable cross-encoder rerank stage (Cohere today) runs on the
-   fused top-N before results return — same role as `ChunkGenerator.__re_rank`.
+6. **Rerank hook** (implemented, issue #251): an optional, pluggable cross-encoder rerank stage
+   runs on the fused top-N before results return — same role as `ChunkGenerator.__re_rank`.
+   Request: `"rerank": {"provider", "model", "field", "top_n", "timeout_ms"}`. The searcher runs
+   a first-stage query (top `top_n` from offset 0, the rerank field always returned), the server
+   releases its scoring slot, sends the query text and each hit's `field` text to the named
+   provider (`kosha_query::rerank::RerankProvider`; the server's HTTP implementation speaks the
+   Cohere `POST /rerank` shape, keys from the environment), orders by the provider score and
+   then applies `from` / `max_results` and the source filter. Hits carry `fused_score` and
+   `rerank_score`. A timeout or provider error falls back to the fused order with
+   `rerank_degraded: true` (cf. `knn_degraded_segments`) and is not result-cached; totals and
+   aggregations are the first stage's. Rerank params are part of the result-cache key.
+   Per-provider latency / outcome / cost counters are in admin `/stats`.
 7. **Cursor**: response includes per-mode (lexical/semantic) cursor state (last score + doc id) so
    pagination works identically to `SearchCursor` today.
 8. **Highlighting**: computed from the matched postings' term offsets stored in `inverted.idx`,
@@ -556,9 +566,9 @@ config, not code:
    supplies — same contract as today (`query_embedding` computed by Sage/Pandora, not by
    OpenSearch).
 3. **Pluggable rerank/fusion**: fusion strategy (RRF vs. simple concat-dedupe, matching the
-   existing `ENABLE_RRF_FUSION` flag) and whether a rerank hook is invoked are namespace/profile
-   config, exposed as a webhook-style callback or left to the caller (per §12 recommendation, Sage
-   owns rerank).
+   existing `ENABLE_RRF_FUSION` flag) and whether a rerank hook is invoked. Rerank is per request
+   (`rerank`, §8 step 6) against server-configured providers; a caller can still rerank itself
+   (per §12 recommendation, Sage may keep owning rerank).
 
 ## 14. Migration from OpenSearch
 
