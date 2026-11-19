@@ -393,7 +393,9 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      is at least that high and nothing that could reach the page is ever pruned; ties are still
      scored. Before scoring, each segment's ceiling (Σ over query terms of its best block's
      `block_max_score`) is computed and segments are handed out highest ceiling first from a
-     shared queue, so the strongest segments raise the floor early; a single-term segment whose
+     shared queue, so the strongest segments raise the floor early (the ceiling uses the terms
+     that segment's own analysis chains read the query as, #220; a mixed-analyzer segment gets an
+     infinite ceiling); a single-term segment whose
      ceiling is already below the floor is skipped outright (its exact count is the term's
      `df`). The ceiling inputs are cached per `(namespace, manifest version, segment-list
      fingerprint, term)` like the `df` values: each segment's footer shape and the Pareto
@@ -407,7 +409,7 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      walk for the general path (a corrupt block found mid-walk) poisons the floor and the search
      is rescored with per-segment floors. Hybrid (RRF) requests are untouched: their lexical
      list is a rank window, scored by the general path. `SearchPhaseStats` reports
-     `wand_docs_scored`, `wand_segments_skipped` and `wand_global_threshold`.
+     `wand_docs_scored`, `wand_segments_skipped`, `wand_global_threshold` and `wand_bounds_ms`.
    - Semantic: ANN search over `vector.idx` (HNSW graph traversal or IVF-PQ probe), scored by
      cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
      query in `query_builder.py`.
