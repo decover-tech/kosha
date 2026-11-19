@@ -1468,6 +1468,80 @@ pub struct SearchQuery {
     /// is by far the largest field and almost never read back.
     #[serde(default)]
     pub source_excludes: Option<Vec<String>>,
+    /// How a hybrid request (a lexical query plus `knn`) fuses its two
+    /// result lists. Elasticsearch's `"rank": {"rrf": {...}}` shape.
+    /// `None` on a hybrid request is RRF with the default parameters; on a
+    /// request that is not hybrid it must be `None` (see
+    /// [`SearchQuery::validate`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<RankSpec>,
+    /// Which retrievers the request intends to run (proto
+    /// `RetrievalMode`). `None` infers it from the clauses present. When
+    /// given it is checked against them, so a client that asks for
+    /// `hybrid` and forgot the vector gets a 400, not lexical-only hits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RetrievalMode>,
+}
+
+/// Proto `RetrievalMode`, as the JSON API spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RetrievalMode {
+    /// `query_text` / `wildcard` / `match_phrase` (or a filter alone); no `knn`.
+    Lexical,
+    /// `knn` only.
+    Semantic,
+    /// A lexical query and `knn`, fused by Reciprocal Rank Fusion.
+    Hybrid,
+}
+
+/// See `SearchQuery.rank`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RankSpec {
+    #[serde(default)]
+    pub rrf: Option<RrfSpec>,
+}
+
+/// Reciprocal Rank Fusion parameters (Elasticsearch-compatible names and
+/// defaults): `score(d) = Σ_r 1 / (rank_constant + rank_r(d))` over the
+/// retrievers `r` whose top-`rank_window_size` list contains `d`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RrfSpec {
+    /// How many results each retriever contributes, and how long the fused
+    /// list is. Defaults to `max_results` (Elasticsearch: `size`). Must be
+    /// at least `max_results`.
+    #[serde(default)]
+    pub rank_window_size: Option<usize>,
+    /// Damps the advantage of the very top ranks. Default 60; must be ≥ 1.
+    #[serde(default)]
+    pub rank_constant: Option<u32>,
+}
+
+/// Default `rank_constant` (Elasticsearch and the original RRF paper).
+pub const DEFAULT_RRF_RANK_CONSTANT: u32 = 60;
+
+/// Resolved RRF parameters for one request; see [`SearchQuery::rrf`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RrfParams {
+    pub rank_window_size: usize,
+    pub rank_constant: u32,
+}
+
+/// Per-retriever ranks of a fused hit (`ScoredDocument.rank_details`).
+/// Ranks are 1-based positions in each retriever's namespace-wide list;
+/// `None` means the hit was not in that retriever's window.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RankDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knn_rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knn_score: Option<f64>,
 }
 
 /// See `SearchQuery.collapse`.
@@ -1482,7 +1556,89 @@ impl SearchQuery {
     pub fn validate(&self) -> Result<(), KoshaError> {
         self.bm25_params
             .validate()
-            .map_err(KoshaError::InvalidQuery)
+            .map_err(KoshaError::InvalidQuery)?;
+        let has_lexical = self.has_lexical_query();
+        let has_knn = self.knn.is_some();
+        match self.mode {
+            Some(RetrievalMode::Hybrid) if !(has_lexical && has_knn) => {
+                return Err(KoshaError::InvalidQuery(
+                    "mode \"hybrid\" needs both a lexical query (query_text, wildcard or \
+                     match_phrase) and knn"
+                        .into(),
+                ));
+            }
+            Some(RetrievalMode::Lexical) if has_knn => {
+                return Err(KoshaError::InvalidQuery(
+                    "mode \"lexical\" cannot have a knn clause".into(),
+                ));
+            }
+            Some(RetrievalMode::Semantic) if !has_knn || has_lexical => {
+                return Err(KoshaError::InvalidQuery(
+                    "mode \"semantic\" needs knn and no lexical query".into(),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(ref rank) = self.rank {
+            let Some(ref rrf) = rank.rrf else {
+                return Err(KoshaError::InvalidQuery(
+                    "rank needs a method; only \"rrf\" is supported".into(),
+                ));
+            };
+            if !self.is_hybrid() {
+                return Err(KoshaError::InvalidQuery(
+                    "rank.rrf fuses a lexical query with knn; the request needs both \
+                     (query_text, wildcard or match_phrase, plus knn)"
+                        .into(),
+                ));
+            }
+            if rrf.rank_constant == Some(0) {
+                return Err(KoshaError::InvalidQuery(
+                    "rank.rrf.rank_constant must be >= 1".into(),
+                ));
+            }
+            if let Some(window) = rrf.rank_window_size {
+                if window == 0 || window < self.max_results {
+                    return Err(KoshaError::InvalidQuery(format!(
+                        "rank.rrf.rank_window_size ({window}) must be >= 1 and >= \
+                         max_results ({})",
+                        self.max_results
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// True when the request has a lexical retriever: query text, a
+    /// wildcard or a phrase. A filter alone is not one.
+    pub fn has_lexical_query(&self) -> bool {
+        !self.query_text.trim().is_empty() || self.wildcard.is_some() || self.match_phrase.is_some()
+    }
+
+    /// True when the request has both a lexical retriever and `knn`: its
+    /// two result lists are fused with Reciprocal Rank Fusion.
+    pub fn is_hybrid(&self) -> bool {
+        self.knn.is_some() && self.has_lexical_query()
+    }
+
+    /// The RRF parameters for a hybrid request (defaults filled in), or
+    /// `None` when the request is not hybrid.
+    pub fn rrf(&self) -> Option<RrfParams> {
+        if !self.is_hybrid() {
+            return None;
+        }
+        let spec = self.rank.as_ref().and_then(|r| r.rrf.as_ref());
+        Some(RrfParams {
+            rank_window_size: spec
+                .and_then(|s| s.rank_window_size)
+                .unwrap_or(self.max_results)
+                .max(1),
+            rank_constant: spec
+                .and_then(|s| s.rank_constant)
+                .unwrap_or(DEFAULT_RRF_RANK_CONSTANT)
+                .max(1),
+        })
     }
 
     /// True when the vector leg is the only thing that can produce a hit:
@@ -1573,6 +1729,10 @@ pub struct ScoredDocument {
     pub fields: Vec<Field>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlights: Option<Vec<String>>,
+    /// Hybrid (RRF) requests only: where this hit ranked in each
+    /// retriever's list. `score` is then the fused RRF score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_details: Option<RankDetails>,
 }
 
 /// Whether `SearchResult.total_hits` is the exact match count or a capped

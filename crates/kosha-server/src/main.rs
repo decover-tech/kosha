@@ -1514,6 +1514,8 @@ impl AppState {
                 collapse: None,
                 source_includes: None,
                 source_excludes: None,
+                rank: None,
+                mode: None,
             };
             let needs_filters = query_needs_filter_store(&query);
             let needs_vectors = query.knn.is_some();
@@ -5098,6 +5100,8 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         collapse: None,
         source_includes: None,
         source_excludes: None,
+        rank: None,
+        mode: None,
     };
     if let Err(e) = query.validate() {
         return search_error_response(&e);
@@ -7277,6 +7281,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hybrid_search_fuses_with_rrf_over_http() {
+        // Issue #228: `rank.rrf` over HTTP — fused score plus per-retriever
+        // ranks in the response, vector-only hits kept (#250), parameters
+        // validated, and the result cache keyed on them.
+        let state = test_state();
+        let ns = NamespaceId("hybridns".into());
+        let doc = |id: &str, text: &str, v: [f32; 2]| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text), Field::vector("emb", v.to_vec())],
+        };
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    doc("lex_top", "breach breach breach breach", [-1.0, 0.1]),
+                    doc("both", "breach breach notice", [0.99, 0.05]),
+                    doc("vec_top", "unrelated", [1.0, 0.0]),
+                    doc("weak", "breach and many other words here", [0.0, 1.0]),
+                ],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |rank: &str| {
+            let body = format!(
+                r#"{{"namespace":"hybridns","query_text":"breach","max_results":3,
+                    "knn":{{"field":"emb","vector":[1.0,0.0],"k":2,"num_candidates":1000}}{rank}}}"#
+            );
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let parse = |resp: &str| -> serde_json::Value {
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            serde_json::from_str(body).unwrap()
+        };
+        for _ in 0..2 {
+            let resp = post(r#","rank":{"rrf":{"rank_window_size":3,"rank_constant":60}}"#);
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let v = parse(&resp);
+            let hits = v["results"].as_array().unwrap();
+            assert_eq!(hits[0]["doc_id"], "both", "{v}");
+            assert_eq!(hits[0]["rank_details"]["lexical_rank"], 2, "{v}");
+            assert_eq!(hits[0]["rank_details"]["knn_rank"], 2, "{v}");
+            let fused = hits[0]["score"].as_f64().unwrap();
+            assert!((fused - 2.0 / 62.0).abs() < 1e-12, "{v}");
+            assert!(
+                hits.iter()
+                    .any(|h| h["doc_id"] == "vec_top"
+                        && h["rank_details"].get("lexical_rank").is_none()),
+                "vector-only hit kept: {v}"
+            );
+            // 3 lexical matches + vec_top from the vector window.
+            assert_eq!(v["total_hits"], 4, "{v}");
+
+            // Same request, different rank_constant: different scores, so
+            // the cache cannot have served the first response.
+            let v1 = parse(&post(
+                r#","rank":{"rrf":{"rank_window_size":3,"rank_constant":1}}"#,
+            ));
+            let fused1 = v1["results"][0]["score"].as_f64().unwrap();
+            assert!((fused1 - 2.0 / 3.0).abs() < 1e-12, "{v1}");
+        }
+        for bad in [
+            r#","rank":{"rrf":{"rank_window_size":2}}"#,
+            r#","rank":{"rrf":{"rank_constant":0}}"#,
+            r#","rank":{"rrf":{"bogus":1}}"#,
+            r#","mode":"lexical""#,
+        ] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+        let resp = post(r#","mode":"hybrid""#);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn filter_pruned_segments_still_hydrate_for_namespace_bm25_stats() {
@@ -8621,6 +8702,8 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            rank: None,
+            mode: None,
         };
 
         let unfiltered = state.hydrate_segments_for_search(
@@ -8758,6 +8841,8 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            rank: None,
+            mode: None,
         };
         let verdict_key = (ns.0.clone(), manifest.version);
 
@@ -9888,6 +9973,8 @@ mod tests {
             collapse: None,
             source_includes: None,
             source_excludes: None,
+            rank: None,
+            mode: None,
         };
         let with_vec = |v: Vec<f32>, k: usize| {
             let mut q = base.clone();
@@ -9920,6 +10007,27 @@ mod tests {
         // Non-vector knn params still flow through the canonical JSON.
         let c = canonical_query_for_cache(&with_vec(vec![0.1_f32; 1024], 20)).unwrap();
         assert_ne!(a, c, "k must remain part of the key");
+
+        // Hybrid fusion parameters change the response, so they must
+        // change the key (issue #228): the whole-response cache must never
+        // serve a response fused with another request's `rank`.
+        let hybrid = |rank: serde_json::Value| {
+            let mut q = with_vec(vec![0.1_f32; 1024], 10);
+            q.query_text = "breach".into();
+            q.rank = serde_json::from_value(rank).unwrap();
+            canonical_query_for_cache(&q).unwrap()
+        };
+        let default_rrf = hybrid(serde_json::Value::Null);
+        let c60 = hybrid(serde_json::json!({"rrf": {"rank_constant": 60}}));
+        let c1 = hybrid(serde_json::json!({"rrf": {"rank_constant": 1}}));
+        let w50 = hybrid(serde_json::json!({"rrf": {"rank_window_size": 50}}));
+        assert_ne!(c60, c1, "rank_constant must be part of the key");
+        assert_ne!(c60, w50, "rank_window_size must be part of the key");
+        assert_ne!(default_rrf, c1);
+        let mut moded = with_vec(vec![0.1_f32; 1024], 10);
+        moded.query_text = "breach".into();
+        moded.mode = Some(kosha_core::RetrievalMode::Hybrid);
+        assert_ne!(canonical_query_for_cache(&moded).unwrap(), default_rrf);
 
         // The whole point: no raw embedding in the key.
         assert!(

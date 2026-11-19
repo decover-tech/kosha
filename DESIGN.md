@@ -375,8 +375,20 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
      query in `query_builder.py`.
 5. **Fusion**: candidate sets from lexical and semantic retrieval are merged via Reciprocal Rank
-   Fusion (configurable k), matching `ranking/rrf.py`'s existing behavior — ported in, not
-   reinvented.
+   Fusion, `score(d) = Σ_r 1/(rank_constant + rank_r(d))`, matching `ranking/rrf.py`'s existing
+   behavior — ported in, not reinvented. Request shape is Elasticsearch's
+   `"rank": {"rrf": {"rank_window_size", "rank_constant"}}` (defaults: `max_results`, 60); every
+   request with both a lexical query and `knn` is fused this way (implemented, issue #228). Ranks
+   are **global**: each segment returns its best `rank_window_size` BM25 hits and its nearest `k`
+   vectors, and only after every segment has answered are both lists ordered across the whole
+   namespace, cut to their windows, ranked and fused. Fusing per-segment ranks would make each
+   segment's best match rank 1 however weak it is namespace-wide; it is also why namespace-level
+   BM25 statistics (above) matter here — lexical scores have to be comparable across segments
+   before they can be ranked together. Wildcard queries keep per-segment statistics, so their
+   global lexical order is approximate. The top-level filter applies to both retrievers,
+   `knn.filter` to the vector one only. `total_hits` and aggregations cover the lexical matches
+   plus the vector window; `from`/`sort`/`collapse`/`search_after` apply within the fused list,
+   which is at most `rank_window_size` long. Each hit carries its per-retriever ranks.
 6. **Rerank hook**: an optional, pluggable cross-encoder rerank stage (Cohere today) runs on the
    fused top-N before results return — same role as `ChunkGenerator.__re_rank`.
 7. **Cursor**: response includes per-mode (lexical/semantic) cursor state (last score + doc id) so
