@@ -2128,6 +2128,88 @@ impl DocVectors {
         Ok(out)
     }
 
+    /// Whether the sidecar holds any vector of `field`.
+    pub fn has_field(&self, field: &str) -> bool {
+        self.fields.iter().any(|name| name == field)
+    }
+
+    /// Calls `visit(doc_seq, vector)` for `field`'s vector of every
+    /// document in `doc_seqs` (ascending) that has one, in `doc_seq` order,
+    /// and returns how many were visited.
+    ///
+    /// Built for exact kNN over a filtered set (#252): vectors that sit
+    /// close together in the file (gaps up to [`Self::COALESCE_GAP`]) are
+    /// read with one read, so a dense set costs a few large sequential
+    /// reads and a sparse one a seek per document, never a file open per
+    /// document as [`Self::vectors_for`] does.
+    pub fn visit_field_vectors(
+        &self,
+        field: &str,
+        doc_seqs: &[u32],
+        mut visit: impl FnMut(u32, &[f32]),
+    ) -> Result<usize, KoshaError> {
+        let Some(field_idx) = self.fields.iter().position(|name| name == field) else {
+            return Ok(0);
+        };
+        let field_idx = field_idx as u32;
+        // Entry indices of the wanted vectors, ascending (entries are
+        // sorted by doc_seq, and so is `doc_seqs`).
+        let mut wanted: Vec<usize> = Vec::with_capacity(doc_seqs.len());
+        let mut from = 0usize;
+        for &doc_seq in doc_seqs {
+            let start = from + self.entries[from..].partition_point(|e| e.0 < doc_seq);
+            let mut i = start;
+            while i < self.entries.len() && self.entries[i].0 == doc_seq {
+                if self.entries[i].1 == field_idx {
+                    wanted.push(i);
+                }
+                i += 1;
+            }
+            from = i;
+        }
+        if wanted.is_empty() {
+            return Ok(0);
+        }
+        let end_of = |i: usize| self.offsets[i] + self.entries[i].2 as u64 * 4;
+        let mut file = fs::File::open(&self.path)?;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut vector: Vec<f32> = Vec::new();
+        let mut run_start = 0usize;
+        while run_start < wanted.len() {
+            let mut run_end = run_start + 1;
+            while run_end < wanted.len()
+                && self.offsets[wanted[run_end]] <= end_of(wanted[run_end - 1]) + Self::COALESCE_GAP
+            {
+                run_end += 1;
+            }
+            let span_start = self.offsets[wanted[run_start]];
+            let span_end = end_of(wanted[run_end - 1]);
+            buf.resize((span_end - span_start) as usize, 0);
+            file.seek(SeekFrom::Start(span_start))?;
+            file.read_exact(&mut buf)?;
+            for &i in &wanted[run_start..run_end] {
+                let at = (self.offsets[i] - span_start) as usize;
+                let dim = self.entries[i].2 as usize;
+                vector.clear();
+                vector.extend(
+                    buf[at..at + dim * 4]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f32::from_le_bytes(*b)),
+                );
+                visit(self.entries[i].0, &vector);
+            }
+            run_start = run_end;
+        }
+        Ok(wanted.len())
+    }
+
+    /// Largest gap between two wanted vectors that
+    /// [`Self::visit_field_vectors`] reads through rather than seeking
+    /// over: reading 64 KiB costs about what one more seek does.
+    pub const COALESCE_GAP: u64 = 64 * 1024;
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -3781,6 +3863,48 @@ pub fn footer_vector_field_status(footer: &Footer, field: &str) -> Option<Vector
 /// lazy v2 vector index.
 pub type BudgetedKnnResult = Option<Result<(Vec<(u32, f64)>, usize), KoshaError>>;
 
+/// The `k` highest-scoring of `scored`, best first (ties keep no
+/// particular order, as on the probe path).
+fn top_k_by_score(mut scored: Vec<(u32, f64)>, k: usize) -> Vec<(u32, f64)> {
+    let by_score_desc =
+        |a: &(u32, f64), b: &(u32, f64)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+    if k == 0 {
+        return Vec::new();
+    }
+    if scored.len() > k {
+        scored.select_nth_unstable_by(k - 1, by_score_desc);
+        scored.truncate(k);
+    }
+    scored.sort_by(by_score_desc);
+    scored
+}
+
+/// Where [`SegmentReader::knn_exact_filtered`] read the candidates'
+/// vectors from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactKnnSource {
+    /// `doc_vectors.bin` (#243): one read per run of nearby candidates.
+    Sidecar,
+    /// Every posting of the column's `vector.idx`, because the segment has
+    /// no local sidecar holding the field (inline-vector segments, a
+    /// legacy index the sidecar does not bind, or a sidecar not hydrated
+    /// locally).
+    Postings,
+}
+
+/// Outcome of an exact, filtered kNN over one segment (#252).
+#[derive(Debug, Clone)]
+pub struct ExactKnnResult {
+    /// The `k` nearest candidates, nearest first, scored by cosine
+    /// similarity exactly as the posting probe scores them.
+    pub hits: Vec<(u32, f64)>,
+    /// Candidate vectors scored.
+    pub vectors_scored: usize,
+    /// Postings hydrated (zero when served from the sidecar).
+    pub postings_hydrated: usize,
+    pub source: ExactKnnSource,
+}
+
 pub struct SegmentReader {
     segment_dir: PathBuf,
     footer: Footer,
@@ -4416,6 +4540,111 @@ impl SegmentReader {
         Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, accept))
     }
 
+    /// Exact kNN over `field`'s column (#204), restricted to `candidates`:
+    /// the ascending `doc_seq`s a filter lets through, with deleted
+    /// documents already removed (#252).
+    ///
+    /// Every candidate's vector is scored, so the result is the true top
+    /// `k` of the filtered set — no centroid is consulted. Worth it when
+    /// the filter passes few documents: probing would otherwise hydrate
+    /// postings full of documents the filter throws away, and keep going
+    /// outward until it has found `k` that pass.
+    ///
+    /// Vectors are read from `doc_vectors.bin` (#243) when the segment has
+    /// it locally and it holds `field`; otherwise every posting of the
+    /// column is hydrated and filtered (the only way to see every vector
+    /// of a segment that stores them inline). Scores are the posting
+    /// probe's: cosine similarity, which on the sidecar's raw vectors is
+    /// the same number the index's unit-normalized copies give.
+    ///
+    /// `None` when the column has no lazy index here (a legacy flat index
+    /// is already scanned exactly by the caller).
+    pub fn knn_exact_filtered(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        candidates: &[u32],
+    ) -> Option<Result<ExactKnnResult, KoshaError>> {
+        let index = match self.vector_field(field) {
+            Ok(index) => index?,
+            Err(e) => return Some(Err(e)),
+        };
+        let vi = index.lazy.as_ref()?;
+        if let Err(e) = Self::check_query_dim(vi, field, query) {
+            return Some(Err(e));
+        }
+        if candidates.is_empty() || k == 0 {
+            return Some(Ok(ExactKnnResult {
+                hits: Vec::new(),
+                vectors_scored: 0,
+                postings_hydrated: 0,
+                source: ExactKnnSource::Sidecar,
+            }));
+        }
+        if self.footer.doc_vectors && self.segment_dir.join(DOC_VECTORS_FILE).exists() {
+            match self.doc_vectors() {
+                Ok(dv) if dv.has_field(field) => {
+                    let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
+                    let visited = dv.visit_field_vectors(field, candidates, |doc_seq, v| {
+                        // A stray vector of another dimension was never
+                        // indexed (see `SegmentWriter::unindexed_vectors`),
+                        // so it is not a candidate on the probe path either.
+                        if v.len() == query.len() {
+                            scored.push((
+                                doc_seq,
+                                kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                            ));
+                        }
+                    });
+                    match visited {
+                        Ok(_) => {
+                            let vectors_scored = scored.len();
+                            return Some(Ok(ExactKnnResult {
+                                hits: top_k_by_score(scored, k),
+                                vectors_scored,
+                                postings_hydrated: 0,
+                                source: ExactKnnSource::Sidecar,
+                            }));
+                        }
+                        Err(e) => eprintln!(
+                            "WARN: exact kNN could not read {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
+                            self.segment_dir.display()
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "WARN: exact kNN could not open {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
+                    self.segment_dir.display()
+                ),
+            }
+        }
+        // No usable sidecar: every posting, filtered while it is scored.
+        let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
+        for range_idx in 0..vi.ranges.len() {
+            let posting = match self.hydrate_posting(vi, range_idx) {
+                Ok(posting) => posting,
+                Err(e) => return Some(Err(e)),
+            };
+            for (id, v) in posting.iter() {
+                if candidates.binary_search(id).is_ok() {
+                    scored.push((
+                        *id,
+                        kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                    ));
+                }
+            }
+        }
+        let vectors_scored = scored.len();
+        Some(Ok(ExactKnnResult {
+            hits: top_k_by_score(scored, k),
+            vectors_scored,
+            postings_hydrated: vi.ranges.len(),
+            source: ExactKnnSource::Postings,
+        }))
+    }
+
     fn knn_search_within_lazy(
         &self,
         vi: &LazyVectorIndex,
@@ -4430,7 +4659,7 @@ impl SegmentReader {
         // so the `max_probes` cap keeps the *best* candidates when it
         // bites. `max_distance` is itself a lower-bound cutoff (computed
         // from the same bound across all segments — see
-        // `Searcher::global_probe_cutoff`), so both sides of this
+        // `Searcher::knn_plan`), so both sides of this
         // comparison are in the same units.
         let mut ranked: Vec<(usize, f32)> = vi
             .centroids
@@ -7669,6 +7898,50 @@ mod doc_vectors_tests {
         assert!(reader.has_local_doc_store());
         let rec = reader.doc_record_full(0).unwrap().unwrap();
         assert_eq!(parsed(&rec.fields[0].value), vec![1.0, 2.0]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The batch reader behind exact filtered kNN (#252): only the named
+    /// field, only the asked-for documents, in order — across both
+    /// coalesced runs and gaps wide enough to seek over.
+    #[test]
+    fn visit_field_vectors_reads_one_field_of_the_wanted_documents() {
+        let dir = scratch("visit");
+        // 3000 docs x 2 fields x 8 dims x 4 B = 192 KB: a gap of 100
+        // documents is 6.4 KB (read through), one of 2000 is 128 KB (seek).
+        let docs: Vec<(String, Vec<Field>)> = (0..3000)
+            .map(|i| {
+                let a: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
+                let b: Vec<f32> = a.iter().map(|x| -x).collect();
+                (
+                    format!("d{i}"),
+                    vec![vector_field("a", &a), vector_field("b", &b)],
+                )
+            })
+            .collect();
+        write(
+            &dir,
+            VectorStoreMode::Sidecar,
+            docs.iter()
+                .map(|(id, f)| (id.as_str(), f.clone()))
+                .collect(),
+        );
+        let dv = DocVectors::open(dir.join(DOC_VECTORS_FILE)).unwrap();
+        assert!(dv.has_field("b"));
+        assert!(!dv.has_field("c"));
+        let wanted = [0u32, 1, 100, 200, 2200, 2999, 5000];
+        let mut seen = Vec::new();
+        let n = dv
+            .visit_field_vectors("b", &wanted, |doc_seq, v| seen.push((doc_seq, v.to_vec())))
+            .unwrap();
+        assert_eq!(n, 6, "doc_seq 5000 has no vector");
+        let expected: Vec<(u32, Vec<f32>)> = wanted[..6]
+            .iter()
+            .map(|&i| (i, (0..8).map(|d| -((i * 8 + d) as f32)).collect()))
+            .collect();
+        assert_eq!(seen, expected);
+        assert_eq!(dv.visit_field_vectors("c", &wanted, |_, _| {}).unwrap(), 0);
+        assert_eq!(dv.visit_field_vectors("a", &[], |_, _| {}).unwrap(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 

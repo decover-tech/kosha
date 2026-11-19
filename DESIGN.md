@@ -405,7 +405,16 @@ true in practice since ES refresh intervals are already tuned up for indexing th
    - Semantic: ANN search over the `knn.field` column's index (cluster centroids probed under a
      global budget, then the closest posting lists), scored by
      cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
-     query in `query_builder.py`.
+     query in `query_builder.py`. Filters (top-level, `knn.filter`) and tombstones are resolved
+     to a per-segment document set first and applied while postings are scored; a segment keeps
+     probing outward until `k` passing documents are found. Before any segment is scored, one
+     planning pass over the segments counts the passing documents (#252). At or below
+     `KOSHA_KNN_EXACT_THRESHOLD` (default 50,000) namespace-wide, every segment skips the probe
+     and scores each passing document's vector exactly, read from `doc_vectors.bin` (or from
+     every posting when the segment has no local sidecar); a segment where at most
+     `KOSHA_KNN_EXACT_FRACTION` (1%) of documents pass does too. The remaining segments share a
+     probe budget widened by `1 / selectivity` (capped at 8x). The response's `knn_mode` says
+     which happened: `ann`, `exact` or `mixed`.
 5. **Fusion**: candidate sets from lexical and semantic retrieval are merged via Reciprocal Rank
    Fusion, `score(d) = Σ_r 1/(rank_constant + rank_r(d))`, matching `ranking/rrf.py`'s existing
    behavior — ported in, not reinvented. Request shape is Elasticsearch's

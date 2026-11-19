@@ -1912,6 +1912,18 @@ pub struct SearchResult {
     /// told a degraded response from a healthy one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knn_degraded_segments: Option<u32>,
+    /// How a kNN query that carries a filter searched (#252): `"ann"` when
+    /// every segment probed its vector postings, `"exact"` when every
+    /// segment scored each filter-passing document's vector (recall 1.0
+    /// over the filtered set), `"mixed"` when some did each. `None` for a
+    /// query without kNN; `"ann"` for an unfiltered kNN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn_mode: Option<String>,
+    /// For a filtered kNN query, how many documents passed the filter (and
+    /// were not deleted) across the segments searched — the set kNN chose
+    /// from. `None` when the query has no kNN or no filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn_filtered_candidates: Option<u64>,
 }
 
 // ─── Indexing types ────────────────────────────────────────────────────────
