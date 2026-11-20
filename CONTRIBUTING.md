@@ -176,7 +176,7 @@ Microbenchmarks are ordinary `cargo bench` targets:
 
 | Location | Benches |
 | --- | --- |
-| `crates/kosha-query/benches/` | `search_latency`, `scoring_profile`, `topk_blockmax`, `filtered_broad_query`, `segment_memory`, `warm_materialize`, `clone_vs_sort`, `knn_open_search`, `vector_segment_open`, `vector_segment_accounting` |
+| `crates/kosha-query/benches/` | `search_latency`, `scoring_profile`, `topk_blockmax`, `filtered_broad_query`, `segment_memory`, `warm_materialize`, `clone_vs_sort`, `knn_open_search`, `vector_segment_open`, `vector_segment_accounting`, `relevance` |
 | `crates/kosha-write/benches/` | `upsert_write_amplification`, `sustained_concurrent_flush`, `wal_group_commit` |
 | `crates/kosha-segment/benches/` | `tokenizer` |
 | `crates/kosha-vector-spfresh/benches/` | `build_query_cost` |
@@ -202,6 +202,14 @@ include before/after numbers from the relevant bench in the PR description: the 
 the machine, and the result. Correctness fixes and docs do not need them. For same-repo
 branches, the `bench-compare` workflow also posts a `segment_memory` before/after comment on
 every PR to `main`. Use it as a smoke signal, not as proof.
+
+**Relevance and recall.** `cargo bench -p kosha-query --bench relevance` measures nDCG@10 and
+recall@100 (lexical, vector, hybrid) against judged qrels, and filtered-kNN recall@10 against
+brute force at 100% to 0.1% selectivity. It is deterministic. PRs touching `kosha-query`,
+`kosha-segment`, `kosha-vector-spfresh`, `kosha-core` or `kosha-write` get a
+`relevance-compare` comment and fail when a metric drops by more than its threshold; a PR
+that moves the numbers on purpose regenerates `scripts/relevance/baseline.json`. See
+[scripts/relevance/README.md](scripts/relevance/README.md).
 
 ## The `---kosha-bench---` commit section
 

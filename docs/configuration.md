@@ -335,6 +335,9 @@ bench's header comment documents its own knobs. The common ones:
 | `KOSHA_BENCH_DIM`, `KOSHA_BENCH_K`, `KOSHA_BENCH_TOPK` | Vector and top-k query shape |
 | `KOSHA_BENCH_COLD_ITERS`, `KOSHA_BENCH_WARM_ITERS`, `KOSHA_BENCH_DURATION_SECS`, `KOSHA_BENCH_THREADS`, `KOSHA_BENCH_TIMEOUT_MS` | Run length and concurrency |
 | `KOSHA_BENCH_S3_MS` | Simulated S3 latency |
+| `KOSHA_RELEVANCE_JSON` | Write the `relevance` bench's report (used by the `relevance-compare` CI job and for `scripts/relevance/baseline.json`) |
+| `KOSHA_RELEVANCE_FIXTURE` | Fixture directory for the `relevance` bench when no argument is given (default `scripts/relevance/fixtures/synthetic`) |
+| `KOSHA_RELEVANCE_NUM_CANDIDATES` | kNN `num_candidates` in the `relevance` bench (default 1: the engine's `KOSHA_KNN_BUDGET_FRACTION` floor sets the probe budget) |
 | `KOSHA_BENCH_BATCH_SIZE`, `KOSHA_BENCH_BACKLOG_DOCS`, `KOSHA_BENCH_FLUSH_THRESHOLD`, `KOSHA_BENCH_MAX_CONCURRENT_FLUSH_WRITERS`, `KOSHA_BENCH_MIN_DOCS_PER_FLUSH_WRITER`, `KOSHA_BENCH_WAL_APPENDS`, `KOSHA_BENCH_WAL_ENABLED` | Write-path benches (`kosha-write`) |
 
 ## Other environment variables
