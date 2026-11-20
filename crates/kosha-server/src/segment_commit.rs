@@ -214,6 +214,19 @@ pub fn assess_listing(
     }
 }
 
+/// Write the commit marker for `files`, already uploaded, through `put`.
+/// The marker always goes last, alone: every writer of a segment (the S3
+/// sync and the crash-point harness's in-memory bucket) commits through
+/// here, so the failpoint between the data files and the marker covers
+/// both (#257).
+pub fn commit_uploaded_files<E>(
+    files: Vec<CommitFile>,
+    put: impl FnOnce(Vec<u8>) -> Result<(), E>,
+) -> Result<(), E> {
+    fail::fail_point!("flush.after_upload_before_commit_marker");
+    put(SegmentCommit::new(files).to_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

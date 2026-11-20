@@ -1,0 +1,66 @@
+[package]
+name = "kosha-fuzz"
+version = "0.0.0"
+description = "cargo-fuzz targets for the WAL, segment, footer, filter-column, vector-index and late-interaction decoders (#257)"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: outside `crates/*`, built only by `cargo fuzz` (nightly)
+# or `cargo check --manifest-path fuzz/Cargo.toml`.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kosha-core = { path = "../crates/kosha-core" }
+kosha-segment = { path = "../crates/kosha-segment" }
+kosha-write = { path = "../crates/kosha-write" }
+serde_json = "1"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "wal_decode"
+path = "fuzz_targets/wal_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_open"
+path = "fuzz_targets/segment_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "footer_json"
+path = "fuzz_targets/footer_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_column_decode"
+path = "fuzz_targets/filter_column_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vector_idx_parse"
+path = "fuzz_targets/vector_idx_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multivec_bag"
+path = "fuzz_targets/multivec_bag.rs"
+test = false
+doc = false
+bench = false

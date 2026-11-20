@@ -2445,6 +2445,12 @@ pub struct WarmSegmentsOutcome {
 }
 
 impl Searcher {
+    /// Approximate bytes held by the parsed-segment cache (the
+    /// `KOSHA_SEGMENT_CACHE_MAX_BYTES` ledger), for `kosha_cache_bytes`.
+    pub fn segment_cache_bytes(&self) -> u64 {
+        self.segment_cache.total_bytes.load(Ordering::Relaxed)
+    }
+
     pub fn new(data_dir: PathBuf) -> Self {
         Self::with_segment_cache_limits(
             data_dir,

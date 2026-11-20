@@ -162,9 +162,21 @@ The control plane is in memory unless `DATABASE_URL` is set in a binary built wi
 | `KOSHA_ADMIN_API_KEY` | Key for `/v1/admin/*` and global `/stats`. Unset disables those routes | unset | string |
 | `KOSHA_INTERNAL_API_KEY` | Key peers use for `GET /internal/segment/...` hydration. Unset disables peer-file access | unset | string |
 | `KOSHA_LEGACY_ROUTES` | `off` (or `disabled`, `false`, `0`, `none`) makes the unversioned Phase 1 routes return 410 | on | flag |
+| `KOSHA_DASHBOARD` | `on` (or `true`, `1`, `yes`, `enabled`) serves the read-only web UI at `/dashboard`, adds `recent_queries` to `GET /v1/namespaces/{ns}/stats`, and honors `"timings": true` on searches. See [dashboard.md](dashboard.md). `dashboard.rs`, `Dashboard::from_env` | off | flag |
 
 The server refuses to start when no credential is configured (no env key, no admin or internal
 key, no Postgres keys) unless `KOSHA_AUTH=disabled`.
+
+## Metrics
+
+`GET /metrics` serves Prometheus text format. The metric set is listed in
+[`metrics.md`](metrics.md). Read once at startup in `metrics::MetricsConfig::from_env`.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_METRICS` | `off` (or `false`, `0`) makes `GET /metrics` return 404 | on | flag |
+| `KOSHA_METRICS_AUTH` | `admin` requires the `KOSHA_ADMIN_API_KEY` credential on `GET /metrics` (403 without it). `none` (or unset) leaves it open, like `/healthz`. Any other value is treated as `admin` | `none` | `none` \| `admin` |
+| `KOSHA_METRICS_NAMESPACE_LABELS` | `on` (or `true`, `1`) adds a `namespace` label to `kosha_search_requests_total`. One series per namespace and outcome, and it publishes tenant namespace names to whoever can scrape. See `metrics.md` | off | flag |
 
 ## Roles
 
@@ -322,6 +334,7 @@ Read by `kosha` (`crates/kosha-cli`). The Python client (`clients/python`) reads
 | `KOSHA_TEST_DATABASE_URL` | Disposable Postgres for the ignored `postgres_cas` test in `kosha-control` | unset (test ignored) | URL |
 | `KOSHA_STATS_BENCH_SEGMENTS` | Segment count for an `#[ignore]`d stats timing test in `kosha-query` | test default | segments |
 | `KOSHA_RRF_BENCH_BACKGROUND` | Background document count for an `#[ignore]`d RRF timing test in `kosha-query` | test default | documents |
+| `KOSHA_INTERLEAVING_SCHEDULES` | Randomized schedules per scenario in `kosha-write`'s `interleavings` test (needs `--features failpoints`; see `docs/testing.md`). The nightly fuzz workflow runs 2500 | `250` | schedules |
 
 ## Benchmark harness (`KOSHA_BENCH_*`)
 

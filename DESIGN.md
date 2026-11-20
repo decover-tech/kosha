@@ -934,9 +934,15 @@ POST /v1/namespaces/{namespace}/search
 # Health
 GET /v1/healthz
 
+# Prometheus metrics (docs/metrics.md)
+GET /metrics
+
 # Stats
 GET /v1/stats
 GET /v1/namespaces/{namespace}/stats
+
+# The caller's namespaces
+GET /v1/namespaces
 
 # Flush
 POST /v1/namespaces/{namespace}/flush

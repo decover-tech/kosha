@@ -4,6 +4,7 @@
 //! `query`, `ingest`, `indexer` and `standalone`.
 //! Phase 1 HTTP/JSON API:
 //!   - `GET  /healthz`           → 200 OK (liveness probe)
+//!   - `GET  /metrics`           → Prometheus text format (docs/metrics.md)
 //!   - `POST /index              ` → upsert documents by id into a namespace
 //!   - `POST /exists             ` → batch doc_id existence check
 //!   - `POST /replace            ` → partial field merge by id (OpenSearch `_update`)
@@ -26,6 +27,7 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 mod auth;
 mod branching;
 mod compaction_sched;
+mod dashboard;
 mod doc_spans;
 #[cfg(all(test, feature = "s3"))]
 mod doc_store_fallback_tests;
@@ -35,6 +37,7 @@ mod embedding_server_tests;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 mod manifest_follow;
+mod metrics;
 #[cfg(feature = "migrate")]
 mod migrate;
 mod posting_spans;
@@ -44,7 +47,12 @@ mod role;
 mod s3_storage;
 #[cfg(feature = "s3")]
 mod s3_wal;
-#[cfg(feature = "s3")]
+// The crash-point harness uploads to an in-memory bucket through the same
+// commit-marker sequence as S3, so it needs this module without `s3`.
+#[cfg(all(test, feature = "failpoints"))]
+mod crash_points_tests;
+#[cfg(any(feature = "s3", all(test, feature = "failpoints")))]
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 mod segment_commit;
 mod segment_gc;
 mod unindexed;
@@ -88,6 +96,8 @@ struct AppState {
     /// deletion's reference set cannot miss a branch being created from
     /// the namespace it deletes.
     branch_lock: Mutex<()>,
+    /// Prometheus metrics served at `GET /metrics` (#223).
+    metrics: metrics::Metrics,
     /// Hydrated segment files that failed their `_COMMIT` size/CRC check
     /// (#231), counting refetch failures again. Reported in `/stats`.
     #[cfg(feature = "s3")]
@@ -431,6 +441,8 @@ struct AppState {
     unindexed_cap: unindexed::UnindexedCap,
     /// Strong-consistency search state: built tails, the tail HTTP client.
     unindexed: unindexed::UnindexedState,
+    /// `KOSHA_DASHBOARD` and the per-namespace recent-query rings (#214).
+    dashboard: dashboard::Dashboard,
 }
 
 /// One cached merged manifest over a sharded namespace (#207).
@@ -546,16 +558,23 @@ impl Semaphore {
     /// server stops accepting work it has no capacity to finish. A queue
     /// deeper than the service rate can drain is not throughput, it is
     /// latency nobody asked for.
+    #[cfg(test)]
     fn acquire_or_shed(&self) -> Option<SemaphorePermit<'_>> {
+        self.try_acquire().ok()
+    }
+
+    /// `acquire_or_shed` (see its doc above), saying why a shed request was
+    /// shed (`kosha_search_requests_total{outcome="rejected"|"timeout"}`).
+    fn try_acquire(&self) -> Result<SemaphorePermit<'_>, metrics::QueueShed> {
         let mut st = self.state.lock().unwrap();
         if st.permits > 0 {
             st.permits -= 1;
-            return Some(SemaphorePermit { sem: self });
+            return Ok(SemaphorePermit { sem: self });
         }
         // Fast-fail on a queue that is already saturated — waiting only to
         // time out later would burn the client's deadline for nothing.
         if self.max_waiters > 0 && st.waiters >= self.max_waiters {
-            return None;
+            return Err(metrics::QueueShed::Full);
         }
         let deadline = self.wait_timeout.map(|t| Instant::now() + t);
         st.waiters += 1;
@@ -577,10 +596,14 @@ impl Semaphore {
             }
         };
         st.waiters -= 1;
-        outcome.then(|| SemaphorePermit { sem: self })
+        if outcome {
+            Ok(SemaphorePermit { sem: self })
+        } else {
+            Err(metrics::QueueShed::Timeout)
+        }
     }
 
-    #[cfg(test)]
+    /// Requests waiting for a permit right now (`kosha_search_queue_depth`).
     fn waiters(&self) -> usize {
         self.state.lock().unwrap().waiters
     }
@@ -1687,6 +1710,7 @@ impl AppState {
                 .filter(|k| !k.is_empty()),
             publication_locks: Mutex::new(HashMap::new()),
             branch_lock: Mutex::new(()),
+            metrics: metrics::Metrics::from_env(),
             #[cfg(feature = "s3")]
             segment_checksum_failures: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "s3")]
@@ -1820,6 +1844,7 @@ impl AppState {
             default_consistency: unindexed::Consistency::from_env(),
             unindexed_cap: unindexed::UnindexedCap::from_env(),
             unindexed: unindexed::UnindexedState::new(query_role),
+            dashboard: dashboard::Dashboard::from_env(),
         }
     }
 
@@ -2577,10 +2602,7 @@ impl AppState {
     /// advanced (`follow_stored_version`). The ingest pod never starts it.
     /// The thread holds only a `Weak` and exits when the state is dropped.
     fn spawn_manifest_refresher(self: &Arc<Self>) {
-        // DELIBERATELY BROKEN (#256 acceptance): no refresher, so a query
-        // pod never sees versions published after it loaded a namespace.
-        // Reverted in the next commit.
-        if self.ingest_host.is_none() || std::env::var("KOSHA_ROLE").is_ok() {
+        if self.ingest_host.is_none() {
             return;
         }
         let Some(interval) = self.manifest_follow.interval else {
@@ -2766,6 +2788,10 @@ impl AppState {
             if self.s3_storage.is_some() {
                 self.sync_manifest_to_s3(ns, manifest)?;
             }
+            // The crash-point harness's in-memory bucket, when one is
+            // installed on this thread; never compiled into a server.
+            #[cfg(all(test, feature = "failpoints"))]
+            crash_points_tests::upload_hook(&self.data_dir, ns, manifest)?;
             let _ = manifest;
             Ok(())
         })
@@ -2864,7 +2890,11 @@ impl AppState {
                 }
                 Err(error) => return Err(error),
             };
+            // Crash-point seams (#257): segment files are local only; then
+            // uploaded, but no manifest references them.
+            fail::fail_point!("flush.before_upload");
             upload(&manifest)?;
+            fail::fail_point!("publish.before_cas");
             let committed = self
                 .controller
                 .lock()
@@ -2872,6 +2902,9 @@ impl AppState {
                 .compare_and_swap_manifest_fenced(ns, expected_version, manifest.clone(), token);
             match committed {
                 Ok(()) => {
+                    // Crash-point seam (#257): committed remotely, not yet
+                    // acknowledged locally (WAL not reclaimed).
+                    fail::fail_point!("publish.after_cas_before_ack");
                     self.indexer.acknowledge_manifest(ns, &manifest)?;
                     println!(
                         "manifest published: ns={} version={} segments={} ms={:.1}",
@@ -3253,6 +3286,10 @@ impl AppState {
                     }
                 }
             }
+            self.metrics
+                .record_hydrations(metrics::HydrationSource::S3, fetched);
+            self.metrics
+                .record_hydrations(metrics::HydrationSource::Local, cached);
             let wall_ms = t_chunk.elapsed().as_secs_f64() * 1e3;
             println!(
                 "hydrate_files timing: chunk={}/{} fetched={} cached={} failed={} shed={} \
@@ -3548,12 +3585,17 @@ impl AppState {
         for (path, size) in files {
             match leases.try_claim(path, own_addr, LEASE_TTL) {
                 kosha_control::HydrationLease::Owner => {
+                    self.metrics.record_lease(metrics::LeaseOutcome::Won);
                     owned_leases.push(path.clone());
                     fetch_from_s3.push((path.clone(), *size));
                 }
                 kosha_control::HydrationLease::OwnedBy(peer_addr) => {
                     match self.fetch_from_peer(&peer_addr, path) {
                         Ok(bytes) => {
+                            self.metrics
+                                .record_lease(metrics::LeaseOutcome::StreamedFromPeer);
+                            self.metrics
+                                .record_hydrations(metrics::HydrationSource::Peer, 1);
                             // Peer-fetched bytes are hydration too — charge
                             // them so a request can't route around its
                             // ceiling just because another replica happened
@@ -3570,6 +3612,7 @@ impl AppState {
                             }
                         }
                         Err(e) => {
+                            self.metrics.record_lease(metrics::LeaseOutcome::Timeout);
                             eprintln!(
                                 "WARN: peer fetch of {path} from {peer_addr} failed ({e}); \
                                  falling back to S3"
@@ -5468,6 +5511,8 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         }
     }
 
+    set_request_id(headers.get("x-request-id").map(String::as_str));
+
     // Reject oversized bodies from the declared length, before reading (or
     // allocating) any of it.
     let max_body = auth::max_body_bytes();
@@ -5528,6 +5573,23 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         return Ok(());
     }
 
+    // `/metrics` (#223): Prometheus scrapes, unauthenticated by default like
+    // the probes above. Never forwarded to the ingest pod (see
+    // `is_write_path`): each pod reports its own process.
+    if request_line.starts_with("GET /metrics ") || request_line.starts_with("GET /metrics?") {
+        let resp = handle_metrics(state, &headers);
+        stream.write_all(resp.as_bytes()).ok();
+        return Ok(());
+    }
+
+    // Built-in dashboard (#214): its static assets hold no data and are
+    // served without a key; every data call the page makes comes back
+    // through the authenticated API below. 404 unless KOSHA_DASHBOARD is on.
+    if let Some(resp) = dashboard::static_response(&request_line, state.dashboard.enabled()) {
+        stream.write_all(resp.as_bytes()).ok();
+        return Ok(());
+    }
+
     // ── API key authentication ──────────────────────────────────────────
     // Per proto/kosha/v1/kosha.proto: Authorization: Bearer <key> or X-Api-Key.
     let authentication = if service_authorized(&headers, state.admin_auth_key.as_deref())
@@ -5575,6 +5637,113 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
     Ok(())
 }
 
+thread_local! {
+    /// " rid=<id>" for the request this connection thread is serving, or
+    /// empty. A caller's `X-Request-Id` on every log line of its request
+    /// lets one slow or failed request be found in the pod log.
+    static REQUEST_ID: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn set_request_id(header: Option<&str>) {
+    let id: String = header
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(64)
+        .collect();
+    REQUEST_ID.with(|r| {
+        *r.borrow_mut() = if id.is_empty() {
+            id
+        } else {
+            format!(" rid={id}")
+        }
+    });
+}
+
+fn request_id() -> String {
+    REQUEST_ID.with(|r| r.borrow().clone())
+}
+
+/// `GET /metrics`: the Prometheus text exposition of [`metrics::Metrics`],
+/// with the gauges and counters the server already keeps elsewhere read at
+/// scrape time. `KOSHA_METRICS=off` hides the route (404);
+/// `KOSHA_METRICS_AUTH=admin` requires the admin credential (403 without).
+fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String {
+    match state.metrics.config.exposure {
+        metrics::Exposure::Off => return json_error(404, "not found"),
+        metrics::Exposure::Admin
+            if !service_authorized(headers, state.admin_auth_key.as_deref()) =>
+        {
+            return json_error(403, "admin credential required");
+        }
+        _ => {}
+    }
+    #[cfg(feature = "s3")]
+    let segment_checksum_failures = state
+        .segment_checksum_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "s3"))]
+    let segment_checksum_failures = 0u64;
+    let body = state.metrics.render(&metrics::Scrape {
+        search_queue_depth: state.search_semaphore.waiters() as u64,
+        nvme_cache_bytes: state.cache.total_size(),
+        segment_cache_bytes: state.searcher.segment_cache_bytes(),
+        nvme_evictions: state.cache.eviction_generation(),
+        segment_checksum_failures,
+    });
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {}\r\n\
+         connection: close\r\n\r\n{body}",
+        body.len(),
+        metrics::CONTENT_TYPE,
+    )
+}
+
+/// Per-request search bookkeeping for `kosha_search_requests_total`, filled
+/// in by the search handlers.
+#[derive(Default)]
+struct SearchObservation {
+    /// Set when the scoring queue shed the request.
+    shed: std::cell::Cell<Option<metrics::QueueShed>>,
+    /// The searched namespace, recorded only with
+    /// `KOSHA_METRICS_NAMESPACE_LABELS=on`.
+    namespace: std::cell::RefCell<Option<String>>,
+}
+
+impl SearchObservation {
+    fn namespace(&self, state: &AppState, ns: &NamespaceId) {
+        if state.metrics.config.namespace_labels {
+            *self.namespace.borrow_mut() = Some(ns.0.clone());
+        }
+    }
+
+    /// Acquire a scoring slot, recording a shed.
+    fn scoring_slot<'a>(&self, state: &'a AppState) -> Option<SemaphorePermit<'a>> {
+        match state.search_semaphore.try_acquire() {
+            Ok(slot) => Some(slot),
+            Err(why) => {
+                self.shed.set(Some(why));
+                state.metrics.record_queue_shed();
+                None
+            }
+        }
+    }
+}
+
+/// Run one search handler and record its outcome and latency.
+fn observe_search(state: &AppState, run: impl FnOnce(&SearchObservation) -> String) -> String {
+    let started = Instant::now();
+    let observation = SearchObservation::default();
+    let response = run(&observation);
+    let outcome = metrics::SearchOutcome::classify(&response, observation.shed.get());
+    state.metrics.record_search(
+        outcome,
+        started.elapsed().as_secs_f64(),
+        observation.namespace.borrow().as_deref(),
+    );
+    response
+}
+
 /// One line per API request: who asked for what, the status returned and how
 /// long it took. A successful search is skipped because it already prints
 /// the more detailed `search timing:` line; probes never reach here.
@@ -5593,9 +5762,10 @@ fn log_request(
         return;
     }
     println!(
-        "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}",
+        "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}{}",
         started.elapsed().as_secs_f64() * 1e3,
-        response.len()
+        response.len(),
+        request_id()
     );
 }
 
@@ -5923,6 +6093,10 @@ fn route_inner(
         return handle_delete_namespace(&ns, tenant, state);
     }
 
+    if is_list_namespaces_route(request_line) {
+        return handle_list_namespaces(tenant, state);
+    }
+
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/documents") {
         return handle_index_with_ns(&ns, tenant, body, state);
     }
@@ -6113,6 +6287,13 @@ fn extract_namespace(request_line: &str, prefix: &str, suffix: &str) -> Option<S
 fn is_create_namespace_route(request_line: &str) -> bool {
     parse_method_and_path(request_line).is_some_and(|(method, path)| {
         method == "POST" && path.split('?').next() == Some("/v1/namespaces")
+    })
+}
+
+/// `GET /v1/namespaces` (optionally with a query string).
+fn is_list_namespaces_route(request_line: &str) -> bool {
+    parse_method_and_path(request_line).is_some_and(|(method, path)| {
+        method == "GET" && path.split('?').next() == Some("/v1/namespaces")
     })
 }
 
@@ -6616,10 +6797,13 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
         return response;
     }
     match write_routed(state, &ns, documents, index_into) {
-        Ok(count) => json_ok(&IndexResponse {
-            indexed_count: count,
-            namespace: ns,
-        }),
+        Ok(count) => {
+            state.metrics.record_indexed(count as u64);
+            json_ok(&IndexResponse {
+                indexed_count: count,
+                namespace: ns,
+            })
+        }
         Err(response) => response,
     }
 }
@@ -6978,10 +7162,13 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
         return response;
     }
     match write_routed(state, &namespace, documents, replace_into) {
-        Ok(count) => json_ok(&IndexResponse {
-            indexed_count: count,
-            namespace,
-        }),
+        Ok(count) => {
+            state.metrics.record_indexed(count as u64);
+            json_ok(&IndexResponse {
+                indexed_count: count,
+                namespace,
+            })
+        }
         Err(response) => response,
     }
 }
@@ -7096,7 +7283,10 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
 
     if let Some(name) = ns {
         return match flush_and_publish_namespace(state, &NamespaceId(name)) {
-            Ok(()) => json_ok(&serde_json::json!({"status": "flushed"})),
+            Ok(()) => {
+                state.metrics.record_flush();
+                json_ok(&serde_json::json!({"status": "flushed"}))
+            }
             Err(error) => error,
         };
     }
@@ -7129,6 +7319,7 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
         }
     }
 
+    state.metrics.record_flush();
     json_ok(&serde_json::json!({"status": "flushed"}))
 }
 
@@ -7404,16 +7595,26 @@ fn add_manifest_follow_stats(state: &AppState, ns: &NamespaceId, entry: &mut ser
 // ─── POST /search (JSON body, supports filters) ─────────────────────────────
 
 fn handle_search_post(body: &[u8], state: &AppState) -> String {
+    observe_search(state, |obs| search_post(body, state, obs))
+}
+
+fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String {
+    let t_request = Instant::now();
     // Parse the full JSON body that includes namespace alongside SearchQuery fields.
     let body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
     };
+    // `"timings": true` asks for the phase breakdown in the response, while
+    // the dashboard is on (#214). Otherwise ignored, like any unknown key.
+    let want_timings = state.dashboard.enabled()
+        && body_val.get("timings") == Some(&serde_json::Value::Bool(true));
 
     let ns = match body_val.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => NamespaceId(n.to_string()),
         None => return json_error(400, "missing 'namespace' in search body"),
     };
+    obs.namespace(state, &ns);
 
     // Query replicas only (#232): how stale a manifest this search accepts.
     let max_staleness =
@@ -7530,6 +7731,22 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                 &kosha_query::SearchPhaseStats::default(),
                 &HydrationOutcome::default(),
             );
+            if state.dashboard.enabled() {
+                let timings = dashboard::SearchTimings {
+                    total_ms: t_request.elapsed().as_secs_f64() * 1e3,
+                    cached: true,
+                    ..Default::default()
+                };
+                let body = response_body_json(&resp);
+                let hits = body["results"].as_array().map_or(0, Vec::len);
+                let degraded = body["knn_degraded_segments"].as_u64().unwrap_or(0) > 0;
+                state
+                    .dashboard
+                    .record(&ns.0, dashboard::QuerySample::new(&timings, hits, degraded));
+                if want_timings {
+                    return with_search_timings(body, &timings);
+                }
+            }
             return resp;
         }
     }
@@ -7630,7 +7847,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // Acquired after hydration (which has its own ceiling) so a search
     // waiting on S3 doesn't also hold a scoring slot.
     let t_queue = Instant::now();
-    let Some(slot) = state.search_semaphore.acquire_or_shed() else {
+    let Some(slot) = obs.scoring_slot(state) else {
         // Shed rather than queue: see `Semaphore::acquire_or_shed`.
         return json_error(
             429,
@@ -7701,6 +7918,12 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                 result.total_hits,
                 result.knn_degraded_segments,
             );
+            state.metrics.record_search_phases(
+                hydrate_ms,
+                queue_ms,
+                phases.score_wall_ms,
+                result.knn_degraded_segments.unwrap_or(0),
+            );
             state.record_search_access(&ns, manifest, search_query, &phases, &hydration);
             if let Some(ref provider) = reranker {
                 let (reranked, call) = kosha_query::rerank::apply(&query, result, provider);
@@ -7710,6 +7933,24 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                     state.rerankers.record(&call);
                 }
             }
+            let timings = dashboard::SearchTimings {
+                total_ms: t_request.elapsed().as_secs_f64() * 1e3,
+                hydrate_ms,
+                queue_ms,
+                admit_ms: phases.admit_wall_ms,
+                bm25_stats_ms: phases.bm25_stats_ms,
+                score_ms: phases.score_wall_ms,
+                materialize_ms: phases.materialize_wall_ms,
+                cached: false,
+            };
+            state.dashboard.record(
+                &ns.0,
+                dashboard::QuerySample::new(
+                    &timings,
+                    result.results.len(),
+                    result.knn_degraded_segments.unwrap_or(0) > 0,
+                ),
+            );
             let resp = json_ok(&result);
             // Only successful responses enter the cache, after the search
             // proved every needed file readable. A search that fell back to
@@ -7724,6 +7965,9 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                 && result.rerank_degraded != Some(true);
             if let Some(key) = cache_key.filter(|_| cacheable) {
                 state.result_cache.lock().unwrap().insert(key, &resp);
+            }
+            if want_timings {
+                return with_search_timings(response_body_json(&resp), &timings);
             }
             resp
         }
@@ -7759,6 +8003,23 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             search_error_response(&e)
         }
     }
+}
+
+/// The JSON body of a response this process built (`Null` if none).
+fn response_body_json(response: &str) -> serde_json::Value {
+    response
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str(body).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// A search response with `timings` added (#214). Built per request, after
+/// the result cache stored the plain response.
+fn with_search_timings(mut body: serde_json::Value, timings: &dashboard::SearchTimings) -> String {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("timings".into(), serde_json::json!(timings));
+    }
+    json_ok(&body)
 }
 
 /// Whole-response cache for `POST /search` — see the cache block in
@@ -7927,6 +8188,10 @@ fn result_cache_budget() -> usize {
 // ─── GET /search (query params, simple queries) ─────────────────────────────
 
 fn handle_search_get(request_line: &str, state: &AppState) -> String {
+    observe_search(state, |obs| search_get(request_line, state, obs))
+}
+
+fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> String {
     // Parse query string from the request line.
     // request_line looks like: "GET /search?ns=...&q=...&max_results=... HTTP/1.1"
     let query_string = request_line
@@ -7945,6 +8210,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         Some(ns) => NamespaceId(ns.clone()),
         None => return json_error(400, "missing 'ns' query parameter"),
     };
+    obs.namespace(state, &ns);
 
     let query_text = match params.get("q") {
         Some(q) => q.clone(),
@@ -8122,7 +8388,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     // Acquired after hydration (which has its own ceiling) so a search
     // waiting on S3 doesn't also hold a scoring slot.
     let t_queue = Instant::now();
-    let Some(_slot) = state.search_semaphore.acquire_or_shed() else {
+    let Some(_slot) = obs.scoring_slot(state) else {
         // Shed rather than queue: see `Semaphore::acquire_or_shed`.
         return json_error(
             429,
@@ -8185,6 +8451,12 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
                 &phases,
                 result.total_hits,
                 result.knn_degraded_segments,
+            );
+            state.metrics.record_search_phases(
+                hydrate_ms,
+                queue_ms,
+                phases.score_wall_ms,
+                result.knn_degraded_segments.unwrap_or(0),
             );
             state.record_search_access(&ns, manifest, &query, &phases, &hydration);
             json_ok(&result)
@@ -8426,6 +8698,20 @@ fn handle_search_post_with_ns(
     body: &[u8],
     state: &AppState,
 ) -> String {
+    // Observed here rather than through `handle_search_post`, so a body
+    // rejected before it reaches the search is still counted.
+    observe_search(state, |obs| {
+        search_post_with_ns(namespace, tenant, body, state, obs)
+    })
+}
+
+fn search_post_with_ns(
+    namespace: &str,
+    tenant: &str,
+    body: &[u8],
+    state: &AppState,
+    obs: &SearchObservation,
+) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
     let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -8435,7 +8721,7 @@ fn handle_search_post_with_ns(
         obj.insert("namespace".into(), serde_json::json!(scoped_ns));
     }
     let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
-    handle_search_post(&modified_body, state)
+    search_post(&modified_body, state, obs)
 }
 
 fn handle_flush_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
@@ -8475,6 +8761,54 @@ fn handle_exists_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &App
     }
     let modified = serde_json::to_vec(&req).unwrap_or_else(|_| body.to_vec());
     handle_exists(&modified, state)
+}
+
+/// `GET /v1/namespaces` (#214): the caller's namespaces, from the control
+/// store, with the `{tenant}/` prefix stripped. Shard namespaces
+/// (`{ns}/_shard-XXXX`) and anything else nested under a namespace are
+/// internal and left out; a sharded namespace reports totals over its
+/// shards, as its stats do. Counts are `null` for a namespace whose
+/// manifest this pod cannot load right now.
+fn handle_list_namespaces(tenant: &str, state: &AppState) -> String {
+    let prefix = format!("{tenant}/");
+    let all = state.controller.lock().unwrap().list_namespaces();
+    let mut names: Vec<String> = all
+        .into_iter()
+        .filter_map(|ns| ns.0.strip_prefix(&prefix).map(str::to_string))
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let namespaces: Vec<serde_json::Value> = names
+        .into_iter()
+        .map(|name| {
+            let id = NamespaceId(tenant_namespace(tenant, &name));
+            // A query replica loads a namespace it has not served yet.
+            let manifest = state
+                .ensure_query_manifest_fresh(&id, None)
+                .ok()
+                .and_then(|()| state.indexer.manifest_shared(&id))
+                .map(|m| match state.indexer.shard_count(&id) {
+                    Some(_) => state.sharded_view(&id, m),
+                    None => m,
+                });
+            match manifest {
+                Some(m) => serde_json::json!({
+                    "name": name,
+                    "documents": m.segments.iter().map(|s| s.doc_count as u64).sum::<u64>(),
+                    "segments": m.segments.len(),
+                    "manifest_version": m.version,
+                }),
+                None => serde_json::json!({
+                    "name": name,
+                    "documents": null,
+                    "segments": null,
+                    "manifest_version": null,
+                }),
+            }
+        })
+        .collect();
+    json_ok(&serde_json::json!({ "namespaces": namespaces }))
 }
 
 fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> String {
@@ -8546,6 +8880,10 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
             "parent_version": branch.parent_version,
             "shared_segments": shared,
         });
+    }
+    // Only while the dashboard is on (#214), so default output is unchanged.
+    if let Some(recent) = state.dashboard.recent_queries_json(&scoped_ns) {
+        body["recent_queries"] = recent;
     }
     if state.ingest_host.is_some() {
         add_manifest_follow_stats(state, &NamespaceId(scoped_ns), &mut body);
@@ -9431,6 +9769,7 @@ fn compaction_pass_with(
 
         // Persist the merged manifest and upload the new segment to S3,
         // the same path a normal flush uses.
+        fail::fail_point!("compaction.before_publish");
         state
             .publish_namespace(ns)
             .map_err(|e| format!("publication failed: {e}"))?;
@@ -10078,7 +10417,7 @@ fn log_search_timing(
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
          postings_whole_mb={:.1} vector_gets={} vector_ranged_kb={:.1} \
-         vector_whole_files={}",
+         vector_whole_files={}{}",
         ns.0,
         total_ms,
         hydrate_ms,
@@ -10118,6 +10457,7 @@ fn log_search_timing(
         hydration.vectors.ranged_gets,
         hydration.vectors.ranged_bytes as f64 / 1024.0,
         hydration.vectors.whole_files,
+        request_id(),
     );
 }
 
@@ -10167,7 +10507,10 @@ fn json_accepted<T: serde::Serialize>(value: &T) -> String {
 
 fn json_error(status_code: u16, message: &str) -> String {
     // The reason for an error response; `request:` carries the rest.
-    eprintln!("WARN: request failed: status={status_code} {message}");
+    eprintln!(
+        "WARN: request failed: status={status_code} {message}{}",
+        request_id()
+    );
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",
@@ -10267,7 +10610,7 @@ mod tests {
     use std::fs;
 
     #[derive(Clone)]
-    struct SharedManifestStore {
+    pub(crate) struct SharedManifestStore {
         inner: Arc<Mutex<kosha_control::Controller>>,
         lose_next_commit_reply: Arc<std::sync::atomic::AtomicBool>,
         /// Commit this manifest (over the stored version) right after the
@@ -10706,7 +11049,7 @@ mod tests {
             ("DELETE /v1/namespaces/", 400),
             ("DELETE /v1/namespaces/%2F", 400),
             ("GET /v1/namespaces/docs", 404),
-            ("GET /v1/namespaces", 404),
+            // `GET /v1/namespaces` lists the tenant's namespaces (#214).
             ("DELETE /v1/namespaces", 404),
             ("DELETE /v1/namespaces/missing", 404),
         ] {
@@ -11139,7 +11482,7 @@ mod tests {
         fs::remove_dir_all(&node.data_dir).ok();
     }
 
-    fn shared_store() -> SharedManifestStore {
+    pub(crate) fn shared_store() -> SharedManifestStore {
         SharedManifestStore {
             inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
             lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -14347,6 +14690,231 @@ mod tests {
         }
     }
 
+    /// `/metrics` (#223) is per-pod: a query pod must answer it itself,
+    /// never forward it to the ingest pod.
+    #[test]
+    fn metrics_is_not_a_write_path() {
+        assert!(!is_write_path("GET /metrics HTTP/1.1\r\n"));
+        assert!(!is_write_path("GET /metrics?x=1 HTTP/1.1\r\n"));
+    }
+
+    /// Send one raw HTTP request to a live `serve` and return the response.
+    fn http(addr: std::net::SocketAddr, request: &str) -> String {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        s.write_all(request.as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        resp
+    }
+
+    fn http_json(addr: std::net::SocketAddr, line: &str, body: &serde_json::Value) -> String {
+        let body = body.to_string();
+        http(
+            addr,
+            &format!(
+                "{line} HTTP/1.1\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+
+    fn serve_state(state: AppState) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(state);
+        std::thread::spawn(move || serve(listener, state, Duration::from_secs(30)));
+        addr
+    }
+
+    fn scrape(addr: std::net::SocketAddr, auth: &str) -> String {
+        http(
+            addr,
+            &format!("GET /metrics HTTP/1.1\r\nhost: x\r\n{auth}\r\n"),
+        )
+    }
+
+    fn scrape_samples(addr: std::net::SocketAddr) -> Vec<metrics::tests::Sample> {
+        let resp = scrape(addr, "");
+        let (status, headers, body) = parse(&resp);
+        assert_eq!(status, "HTTP/1.1 200 OK", "{resp}");
+        assert!(
+            headers.contains("content-type: text/plain; version=0.0.4; charset=utf-8"),
+            "{headers}"
+        );
+        metrics::tests::parse_exposition(body).unwrap_or_else(|e| panic!("{e}\n{body}"))
+    }
+
+    /// #223 acceptance: searches through the real HTTP server move the
+    /// counters, and every counter only ever goes up between scrapes.
+    #[test]
+    fn metrics_counters_increase_monotonically_across_searches() {
+        let addr = serve_state(test_state());
+        let search = || {
+            let resp = http_json(
+                addr,
+                "POST /v1/namespaces/docs/search",
+                &serde_json::json!({"query_text": "quick", "max_results": 5}),
+            );
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        };
+        let indexed = http_json(
+            addr,
+            "POST /v1/namespaces/docs/documents",
+            &serde_json::json!({"documents": [
+                {"id": "a", "fields": [{"name": "title", "field_type": "Text", "value": "quick fox"}]},
+                {"id": "b", "fields": [{"name": "title", "field_type": "Text", "value": "quick dog"}]}
+            ]}),
+        );
+        assert!(indexed.starts_with("HTTP/1.1 200"), "{indexed}");
+        let flushed = http_json(
+            addr,
+            "POST /v1/namespaces/docs/flush",
+            &serde_json::json!({}),
+        );
+        assert!(flushed.starts_with("HTTP/1.1 200"), "{flushed}");
+        for _ in 0..3 {
+            search();
+        }
+        let bad = http_json(
+            addr,
+            "POST /v1/namespaces/docs/search",
+            &serde_json::json!({"query_text": "quick", "max_results": -1}),
+        );
+        assert!(!bad.starts_with("HTTP/1.1 200"), "{bad}");
+        // A body that is not JSON at all is rejected before the search
+        // handler proper, and still counts.
+        let garbled = http(
+            addr,
+            "POST /v1/namespaces/docs/search HTTP/1.1\r\ncontent-length: 4\r\n\r\n{bad",
+        );
+        assert!(garbled.starts_with("HTTP/1.1 400"), "{garbled}");
+
+        let first = scrape_samples(addr);
+        let ok = |s: &[metrics::tests::Sample]| {
+            metrics::tests::value(s, "kosha_search_requests_total", &[("outcome", "ok")]).unwrap()
+        };
+        assert_eq!(ok(&first), 3.0);
+        assert_eq!(
+            metrics::tests::value(
+                &first,
+                "kosha_search_requests_total",
+                &[("outcome", "error")]
+            ),
+            Some(2.0)
+        );
+        assert_eq!(
+            metrics::tests::value(&first, "kosha_index_documents_total", &[]),
+            Some(2.0)
+        );
+        assert_eq!(
+            metrics::tests::value(&first, "kosha_flush_total", &[]),
+            Some(1.0)
+        );
+        assert_eq!(
+            metrics::tests::value(&first, "kosha_search_duration_seconds_count", &[]),
+            Some(3.0)
+        );
+
+        for _ in 0..2 {
+            search();
+        }
+        let second = scrape_samples(addr);
+        assert_eq!(ok(&second), 5.0);
+        // Counters and histogram series never decrease between scrapes.
+        let key = |s: &metrics::tests::Sample| format!("{}{:?}", s.name, s.labels);
+        let before: HashMap<String, f64> = first.iter().map(|s| (key(s), s.value)).collect();
+        let cumulative = |name: &str| {
+            name.ends_with("_total")
+                || name.ends_with("_bucket")
+                || name.ends_with("_count")
+                || name.ends_with("_sum")
+        };
+        for s in second.iter().filter(|s| cumulative(&s.name)) {
+            let was = before[&key(s)];
+            assert!(s.value >= was, "{} went from {was} to {}", key(s), s.value);
+        }
+        assert!(
+            metrics::tests::value(&second, "kosha_search_duration_seconds_count", &[]).unwrap()
+                > metrics::tests::value(&first, "kosha_search_duration_seconds_count", &[])
+                    .unwrap()
+        );
+    }
+
+    /// #223: `/metrics` needs no API key by default, needs the admin key
+    /// under `KOSHA_METRICS_AUTH=admin`, and is gone under `KOSHA_METRICS=off`.
+    #[test]
+    fn metrics_route_access_modes() {
+        let open = serve_state(test_state());
+        assert!(scrape(open, "").starts_with("HTTP/1.1 200 OK"));
+
+        let mut state = test_state();
+        state.admin_auth_key = Some("admin-secret".into());
+        state.metrics = metrics::Metrics::new(metrics::MetricsConfig {
+            exposure: metrics::Exposure::Admin,
+            ..metrics::MetricsConfig::default()
+        });
+        let admin = serve_state(state);
+        let denied = scrape(admin, "");
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+        let wrong = scrape(admin, "authorization: Bearer tenant-key\r\n");
+        assert!(wrong.starts_with("HTTP/1.1 403"), "{wrong}");
+        let allowed = scrape(admin, "authorization: Bearer admin-secret\r\n");
+        assert!(allowed.starts_with("HTTP/1.1 200 OK"), "{allowed}");
+        assert!(allowed.contains("kosha_search_requests_total"), "{allowed}");
+
+        let mut state = test_state();
+        state.metrics = metrics::Metrics::new(metrics::MetricsConfig {
+            exposure: metrics::Exposure::Off,
+            ..metrics::MetricsConfig::default()
+        });
+        let off = serve_state(state);
+        let gone = scrape(off, "");
+        assert!(gone.starts_with("HTTP/1.1 404"), "{gone}");
+    }
+
+    /// A search the scoring queue sheds after waiting is counted as
+    /// `timeout` and in `kosha_search_queue_rejections_total`.
+    #[test]
+    fn queue_timeout_search_is_counted() {
+        let mut state = test_state();
+        // No permits and no queue: every scored search is shed at once.
+        state.search_semaphore = Semaphore::with_queue_limits(0, 1, Some(Duration::from_millis(1)));
+        let ns = NamespaceId("t/docs".into());
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId("d1".into()),
+                    fields: vec![Field::text("title", "quick fox")],
+                }],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+        let resp = handle_search_post(
+            br#"{"namespace":"t/docs","query_text":"quick","max_results":5}"#,
+            &state,
+        );
+        assert!(resp.starts_with("HTTP/1.1 429"), "{resp}");
+        let text = state.metrics.render(&metrics::Scrape::default());
+        let samples = metrics::tests::parse_exposition(&text).unwrap();
+        assert_eq!(
+            metrics::tests::value(
+                &samples,
+                "kosha_search_requests_total",
+                &[("outcome", "timeout")]
+            ),
+            Some(1.0),
+            "one waiter allowed, so the search waited 1ms and timed out"
+        );
+        assert_eq!(
+            metrics::tests::value(&samples, "kosha_search_queue_rejections_total", &[]),
+            Some(1.0)
+        );
+    }
+
     #[test]
     fn is_write_path_excludes_every_read_route() {
         for line in [
@@ -14365,6 +14933,8 @@ mod tests {
             "GET /v1/namespaces/foo HTTP/1.1\r\n",
             "POST /v1/namespaces/foo HTTP/1.1\r\n",
             "DELETE /v1/namespaces/foo/documents HTTP/1.1\r\n",
+            "GET /v1/namespaces HTTP/1.1\r\n",
+            "GET /v1/namespaces?x=1 HTTP/1.1\r\n",
         ] {
             assert!(!is_write_path(line), "expected read-path: {line:?}");
         }
@@ -16766,7 +17336,7 @@ mod tests {
         AppState::new(test_dir())
     }
 
-    fn test_dir() -> PathBuf {
+    pub(crate) fn test_dir() -> PathBuf {
         // A per-process counter, not just the clock: macOS `SystemTime` has
         // microsecond resolution, so tests running in parallel could get the
         // same nanos, share a data dir, and race on its WAL `origin` file.
@@ -18644,5 +19214,240 @@ mod tests {
             serde_json::json!({"query_text": "contract"}),
         );
         assert!(result["total_hits"].as_u64().unwrap() > 0);
+    }
+
+    // ─── Dashboard (#214) ────────────────────────────────────────────────
+
+    fn dashboard_state(enabled: bool) -> AppState {
+        let mut state = test_state();
+        state.dashboard = dashboard::Dashboard::new(enabled);
+        state
+    }
+
+    /// One request through `handle`, the socket entry point, with no
+    /// credentials at all.
+    fn raw_request(state: &AppState, request: &str) -> String {
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request = request.to_string();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut out = String::new();
+            stream.read_to_string(&mut out).unwrap();
+            out
+        });
+        let (stream, _) = listener.accept().unwrap();
+        handle(state, stream).unwrap();
+        client.join().unwrap()
+    }
+
+    fn header_value<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+        let head = response.split("\r\n\r\n").next()?;
+        head.lines().skip(1).find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+
+    #[test]
+    fn dashboard_is_404_when_off_and_served_without_a_key_when_on() {
+        let off = dashboard_state(false);
+        let resp = raw_request(&off, "GET /dashboard HTTP/1.1\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+
+        let on = dashboard_state(true);
+        let resp = raw_request(&on, "GET /dashboard HTTP/1.1\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(header_value(&resp, "content-type")
+            .unwrap()
+            .starts_with("text/html"));
+        assert!(resp.contains("<title>Kosha dashboard</title>"));
+        for asset in ["/dashboard/app.js", "/dashboard/style.css"] {
+            let resp = raw_request(&on, &format!("GET {asset} HTTP/1.1\r\n\r\n"));
+            assert!(resp.starts_with("HTTP/1.1 200"), "{asset}: {resp}");
+            let csp = header_value(&resp, "content-security-policy").unwrap();
+            assert!(csp.starts_with("default-src 'self'"), "{csp}");
+            assert_eq!(header_value(&resp, "x-frame-options"), Some("DENY"));
+        }
+    }
+
+    #[test]
+    fn list_namespaces_is_tenant_scoped_and_hides_shards() {
+        let state = test_state();
+        for (tenant, ns) in [("acme", "docs"), ("acme", "logs"), ("globex", "secret")] {
+            let resp = v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces",
+                serde_json::json!({ "namespace": ns }),
+            );
+            assert_eq!(status_of(&resp), 200, "{resp}");
+        }
+        v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d1", "breach of contract"),
+        );
+        v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        );
+        // A sharded namespace: its shards are internal namespaces.
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/sharded/shards",
+            serde_json::json!({"shards": 2}),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/sharded/documents",
+            sharding_corpus(0..20),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/sharded/flush",
+            serde_json::json!({}),
+        );
+        assert!(state
+            .controller
+            .lock()
+            .unwrap()
+            .list_namespaces()
+            .iter()
+            .any(|ns| ns.0.starts_with("acme/sharded/_shard-")));
+
+        let resp = v1(
+            &state,
+            "acme",
+            "GET /v1/namespaces",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&resp), 200, "{resp}");
+        let listed = body_of(&resp)["namespaces"].as_array().unwrap().clone();
+        let names: Vec<&str> = listed.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["docs", "logs", "sharded"], "{resp}");
+        let docs = &listed[0];
+        assert_eq!(docs["documents"], 1);
+        assert_eq!(docs["segments"], 1);
+        assert!(docs["manifest_version"].as_u64().unwrap() > 0);
+        assert_eq!(listed[1]["documents"], 0);
+        // A sharded namespace reports totals over its shards.
+        assert_eq!(listed[2]["documents"], 20, "{resp}");
+        assert!(!resp.contains("_shard-"), "{resp}");
+
+        let resp = v1(
+            &state,
+            "globex",
+            "GET /v1/namespaces",
+            serde_json::Value::Null,
+        );
+        let listed = body_of(&resp)["namespaces"].clone();
+        assert_eq!(
+            listed,
+            serde_json::json!([{
+                "name": "secret", "documents": 0, "segments": 0,
+                "manifest_version": listed[0]["manifest_version"],
+            }])
+        );
+        assert!(!resp.contains("docs") && !resp.contains("acme"), "{resp}");
+
+        let resp = v1(
+            &state,
+            "initech",
+            "GET /v1/namespaces",
+            serde_json::Value::Null,
+        );
+        assert_eq!(body_of(&resp)["namespaces"], serde_json::json!([]));
+        // The bare per-namespace path is still not a route.
+        let resp = v1(
+            &state,
+            "acme",
+            "GET /v1/namespaces/docs",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&resp), 404, "{resp}");
+    }
+
+    fn searched_state(enabled: bool) -> AppState {
+        let state = dashboard_state(enabled);
+        v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d1", "breach of contract"),
+        );
+        v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        );
+        state
+    }
+
+    fn search_with_timings(state: &AppState) -> serde_json::Value {
+        let resp = v1(
+            state,
+            "acme",
+            "POST /v1/namespaces/docs/search",
+            serde_json::json!({"query_text": "contract", "timings": true}),
+        );
+        assert_eq!(status_of(&resp), 200, "{resp}");
+        body_of(&resp)
+    }
+
+    #[test]
+    fn recent_queries_and_timings_appear_only_when_the_dashboard_is_on() {
+        let state = searched_state(true);
+        let first = search_with_timings(&state);
+        assert_eq!(first["total_hits"], 1);
+        let timings = &first["timings"];
+        assert_eq!(timings["cached"], false, "{first}");
+        for phase in ["total_ms", "hydrate_ms", "score_ms", "admit_ms", "queue_ms"] {
+            assert!(timings[phase].as_f64().unwrap() >= 0.0, "{phase}: {first}");
+        }
+        // The identical repeat is a result-cache hit: still recorded.
+        let second = search_with_timings(&state);
+        assert_eq!(second["timings"]["cached"], true, "{second}");
+        assert_eq!(second["results"], first["results"]);
+        // Without the opt-in the response is the plain one.
+        let plain = v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/search",
+            serde_json::json!({"query_text": "contract"}),
+        );
+        assert!(body_of(&plain).get("timings").is_none(), "{plain}");
+
+        let stats = body_of(&handle_namespace_stats("docs", "acme", &state));
+        let recent = &stats["recent_queries"];
+        assert_eq!(recent["count"], 3, "{stats}");
+        assert_eq!(recent["capacity"], dashboard::RING_CAPACITY);
+        assert_eq!(recent["degraded"], 0);
+        let samples = recent["samples"].as_array().unwrap();
+        assert_eq!(samples[0]["hits"], 1);
+        assert_eq!(samples[0]["cached"], false);
+        assert_eq!(samples[1]["cached"], true);
+        // Another tenant's namespace of the same name has its own ring.
+        v1(
+            &state,
+            "globex",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "docs"}),
+        );
+        let other = body_of(&handle_namespace_stats("docs", "globex", &state));
+        assert_eq!(other["recent_queries"]["count"], 0, "{other}");
+
+        let state = searched_state(false);
+        let result = search_with_timings(&state);
+        assert_eq!(result["total_hits"], 1);
+        assert!(result.get("timings").is_none(), "{result}");
+        let stats = body_of(&handle_namespace_stats("docs", "acme", &state));
+        assert!(stats.get("recent_queries").is_none(), "{stats}");
     }
 }

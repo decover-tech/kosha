@@ -285,13 +285,14 @@ impl S3Storage {
                 None => Ok(files),
             }
         })?;
-        let commit = segment_commit::SegmentCommit::new(files).to_bytes();
         let commit_path = logical_dir
             .join(segment_commit::COMMIT_FILE)
             .to_string_lossy()
             .into_owned();
-        self.local.write(&commit_path, &commit)?;
-        self.upload_bytes(commit, &self.s3_key(&commit_path))
+        segment_commit::commit_uploaded_files(files, |commit| {
+            self.local.write(&commit_path, &commit)?;
+            self.upload_bytes(commit, &self.s3_key(&commit_path))
+        })
     }
 
     /// Upload a local file to S3. See `upload_bytes`.

@@ -20,6 +20,9 @@ migrate = [
     "dep:aws-smithy-runtime-api",
     "dep:http",
 ]
+# Named failpoints on the write/publish path (#257), for the crash-point
+# harness. Off by default: the `fail_point!` macros compile to nothing.
+failpoints = ["fail/failpoints", "kosha-write/failpoints"]
 
 [dependencies]
 kosha-core = { path = "../kosha-core" }
@@ -53,3 +56,7 @@ http = { version = "1.5.0", optional = true }
 base64 = "0.22"
 # Per-file checksums in the segment `_COMMIT` marker (segment_commit.rs).
 crc32fast = "1"
+# `GET /metrics` (#223): Prometheus text exposition. Forbids unsafe code
+# itself, like this workspace.
+prometheus-client = "0.26"
+fail = "0.5"

@@ -132,13 +132,15 @@ class KoshaClient:
 
     # ── Low-level request helpers ──────────────────────────────────────────
 
-    def _request(self, method: str, path: str, body: Any = None) -> Any:
+    def _request(
+        self, method: str, path: str, body: Any = None, headers: dict | None = None
+    ) -> Any:
         """Legacy request helper — delegates to the Transport layer.
 
         Paths here are relative (no ``/v1/namespaces/...`` prefix); they are
         appended directly to the base URL.  Used by the legacy Phase 1 routes.
         """
-        return self._transport.request(method, path, body)
+        return self._transport.request(method, path, body, headers)
 
     def _v1_request(
         self, method: str, namespace: str, action: str, body: Any = None
@@ -204,6 +206,9 @@ class KoshaClient:
         """
         ns = self._resolve_ns(index)
         body = body or {}
+        # Extra HTTP headers, as in opensearch-py; `X-Request-Id` is echoed
+        # on the server's log lines for this request.
+        headers = params.pop("headers", None)
         if rerank is not None:
             body = {**body, "rerank": rerank}
         kosha_body, context = self._translate_search(body, params)
@@ -213,7 +218,8 @@ class KoshaClient:
 
         start = time.monotonic()
         try:
-            result = self._request("POST", "search", body=kosha_body)
+            extra = {"headers": headers} if headers else {}
+            result = self._request("POST", "search", body=kosha_body, **extra)
         except KoshaRequestError as e:
             if e.status_code == 404:
                 # An index nothing has been written to yet: no hits.
@@ -892,6 +898,11 @@ class KoshaClient:
 
         if body.get("rerank") is not None:
             kosha["rerank"] = cls._rerank(body["rerank"])
+
+        # OpenSearch's `request_cache=false`: answer from the index, not from
+        # a stored response.
+        if body.get("request_cache", params.get("request_cache")) is False:
+            kosha["no_cache"] = True
 
         collapse = body.get("collapse")
         if collapse:

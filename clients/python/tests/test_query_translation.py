@@ -356,6 +356,7 @@ def test_phrase_inside_a_bool_is_kept():
         {
             "size": 20,
             "track_total_hits": True,
+            "request_cache": False,
             "query": {
                 "bool": {
                     "filter": [scope_filter()],
@@ -372,6 +373,7 @@ def test_phrase_inside_a_bool_is_kept():
     assert kosha["query_text"] == ""
     assert kosha["filter"] == SCOPE_KOSHA
     assert kosha["exact_total_hits"] is True
+    assert kosha["no_cache"] is True
 
 
 @pytest.mark.parametrize(
