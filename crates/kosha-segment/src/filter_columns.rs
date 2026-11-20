@@ -228,6 +228,10 @@ pub struct ListIndex {
     /// Ordinals of terms that parse as a list with no usable element
     /// (`[]`, `[null]`, ` []`): `exists` treats them as no value.
     pub empty: Vec<u32>,
+    /// Ordinals of every term starting with `[` that parses as a list,
+    /// including nested containers (lists of objects) with no plain
+    /// element, ascending. A range never compares their own JSON text.
+    pub lists: Vec<u32>,
 }
 
 /// A `OnceLock<ListIndex>` that is invisible to `Clone`/`PartialEq`: it is
@@ -393,6 +397,7 @@ impl StringColumn {
                 // Element matching only applies to text that starts with
                 // `[` itself, as in `kosha_core::evaluate_filter`.
                 if term.starts_with('[') {
+                    index.lists.push(ord);
                     for element in elements {
                         let ords = index.elements.entry(element).or_default();
                         if ords.last() != Some(&ord) {

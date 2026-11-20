@@ -251,6 +251,47 @@ struct WriterState {
     /// Set when another writer won a key this writer needed: every later
     /// append fails until the process restarts and re-reads the stream.
     fenced: Option<String>,
+    /// Deleted namespace -> highest LSN of its records that recovery must
+    /// skip (the durable `discarded` meta entry, see
+    /// [`WalWriter::discard_namespace`]).
+    discarded: BTreeMap<String, u64>,
+}
+
+/// Meta entry listing deleted namespaces whose records still sit in group
+/// files shared with other namespaces: `{"namespace": through_lsn}` (JSON).
+/// Recovery skips every record of such a namespace at or below its LSN, so
+/// a restart cannot resurrect it. An entry is dropped once no file that
+/// could hold those records is left.
+const DISCARDED_META: &str = "discarded";
+
+pub(crate) fn read_discarded(store: &dyn WalStore) -> Result<BTreeMap<String, u64>, KoshaError> {
+    match store.read_meta(DISCARDED_META)? {
+        None => Ok(BTreeMap::new()),
+        Some(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|_| invalid("invalid WAL discard list"))
+        }
+    }
+}
+
+pub(crate) fn write_discarded(
+    store: &dyn WalStore,
+    discarded: &BTreeMap<String, u64>,
+) -> Result<(), KoshaError> {
+    let bytes = serde_json::to_vec(discarded).map_err(|e| invalid(&e.to_string()))?;
+    store.write_meta(DISCARDED_META, &bytes)
+}
+
+/// Keep only entries that can still match a record: some file whose key
+/// (no greater than its first LSN) is at or below the entry's LSN.
+fn live_discards(
+    discarded: &BTreeMap<String, u64>,
+    files: impl Iterator<Item = u64> + Clone,
+) -> BTreeMap<String, u64> {
+    discarded
+        .iter()
+        .filter(|(_, through)| files.clone().any(|file| file <= **through))
+        .map(|(ns, through)| (ns.clone(), *through))
+        .collect()
 }
 
 /// Failed puts remembered for `next_key`; older ones are forgotten, which
@@ -317,7 +358,7 @@ impl WalWriter {
             .ok_or_else(|| invalid("WAL origin missing after creation"))?;
         let origin = String::from_utf8(origin).map_err(|_| invalid("invalid WAL origin"))?;
         uuid::Uuid::parse_str(&origin).map_err(|_| invalid("invalid WAL origin"))?;
-        let recovered = recover_from(store.as_ref())?;
+        let mut recovered = recover_from(store.as_ref())?;
         if let Some((file, complete_len)) = recovered.torn_tail {
             // A discarded tail must not become a corrupt middle record after
             // subsequent writes.
@@ -328,7 +369,31 @@ impl WalWriter {
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0);
-        let high = persisted.max(recovered.high_lsn);
+        let mut high = persisted.max(recovered.high_lsn);
+        let mut persisted = persisted;
+        // Files that held nothing but records of deleted namespaces (a
+        // crash between recording the discard and deleting them).
+        let fully_discarded: Vec<u64> = recovered
+            .discarded_files
+            .iter()
+            .copied()
+            .filter(|file| !recovered.locations.iter().any(|(f, _, _)| f == file))
+            .collect();
+        if !fully_discarded.is_empty() {
+            if high > persisted {
+                store.write_meta("sequence", high.to_string().as_bytes())?;
+                persisted = high;
+            }
+            store.delete(&fully_discarded)?;
+            recovered
+                .files
+                .retain(|file| !fully_discarded.contains(file));
+        }
+        let discarded = live_discards(&recovered.discarded, recovered.files.iter().copied());
+        if discarded != recovered.discarded {
+            write_discarded(store.as_ref(), &discarded)?;
+        }
+        high = high.max(persisted);
         let mut files: BTreeMap<u64, HashMap<NamespaceId, u64>> = BTreeMap::new();
         for (file, lsn, namespace) in &recovered.locations {
             let max = files
@@ -357,6 +422,7 @@ impl WalWriter {
                 next_key: high + 1,
                 ambiguous: Vec::new(),
                 fenced: None,
+                discarded,
             }),
             wake: Condvar::new(),
             reclaim: Mutex::new(()),
@@ -439,6 +505,26 @@ impl WalWriter {
         for file in &eligible {
             state.files.remove(file);
         }
+        drop(state);
+        self.prune_discarded()
+    }
+
+    /// Drop `discarded` entries no remaining file can match. Callers hold
+    /// `reclaim`.
+    fn prune_discarded(&self) -> Result<(), KoshaError> {
+        let pruned = {
+            let state = self.state.lock().unwrap();
+            if state.discarded.is_empty() {
+                return Ok(());
+            }
+            let pruned = live_discards(&state.discarded, state.files.keys().copied());
+            if pruned == state.discarded {
+                return Ok(());
+            }
+            pruned
+        };
+        write_discarded(self.store.as_ref(), &pruned)?;
+        self.state.lock().unwrap().discarded = pruned;
         Ok(())
     }
 
@@ -459,18 +545,23 @@ impl WalWriter {
     /// so a restart cannot replay them and resurrect the namespace. A
     /// group-commit file that holds only this namespace's records is
     /// deleted now. A file shared with other namespaces' records is kept
-    /// (those records are still needed) and counted in the returned number;
-    /// the namespace is marked checkpointed through its records there, so
-    /// the file is reclaimed as soon as the other namespaces in it are
-    /// checkpointed. Until then a restart would replay the deleted
-    /// namespace's records from it.
+    /// (those records are still needed) and counted in the returned number.
+    /// For those, the namespace and the highest LSN it has in them are
+    /// durably recorded (the `discarded` meta entry) before this returns,
+    /// and recovery skips its records at or below that LSN; the namespace
+    /// is also marked checkpointed through them, so the file is reclaimed
+    /// as soon as the other namespaces in it are checkpointed.
+    ///
+    /// The caller must keep new records of `namespace` from being appended
+    /// until this returns.
     pub fn discard_namespace(&self, namespace: &NamespaceId) -> Result<usize, KoshaError> {
         let _reclaim = self.reclaim.lock().unwrap();
-        let (eligible, shared, high) = {
+        let (eligible, shared, high, shared_through) = {
             let mut state = self.state.lock().unwrap();
             let mut eligible = Vec::new();
             let mut shared = 0usize;
             let mut through = 0u64;
+            let mut shared_through = 0u64;
             for (file, namespaces) in &state.files {
                 let Some(max) = namespaces.get(namespace) else {
                     continue;
@@ -480,14 +571,24 @@ impl WalWriter {
                     eligible.push(*file);
                 } else {
                     shared += 1;
+                    shared_through = shared_through.max(*max);
                 }
             }
             if through > 0 {
                 let known = state.checkpoints.entry(namespace.clone()).or_insert(0);
                 *known = (*known).max(through);
             }
-            (eligible, shared, state.next_lsn - 1)
+            (eligible, shared, state.next_lsn - 1, shared_through)
         };
+        if shared > 0 {
+            // Durable before the delete is acknowledged: a restart must not
+            // replay this namespace's records from the shared files.
+            let mut discarded = self.state.lock().unwrap().discarded.clone();
+            let entry = discarded.entry(namespace.0.clone()).or_insert(0);
+            *entry = (*entry).max(shared_through);
+            write_discarded(self.store.as_ref(), &discarded)?;
+            self.state.lock().unwrap().discarded = discarded;
+        }
         if !eligible.is_empty() {
             // Deleted files no longer witness their LSNs (as in
             // `clear_through`).
@@ -499,6 +600,12 @@ impl WalWriter {
             }
         }
         Ok(shared)
+    }
+
+    /// Deleted namespaces whose records recovery skips, with the highest
+    /// LSN skipped (see [`Self::discard_namespace`]).
+    pub fn discarded_namespaces(&self) -> BTreeMap<String, u64> {
+        self.state.lock().unwrap().discarded.clone()
     }
 
     /// Append a batch of documents; returns the record's LSN once it is
@@ -714,48 +821,45 @@ impl WalWriter {
         state
     }
 
-    /// Create the group at `key`. A conflict is this writer's own earlier
-    /// put whose reply was lost when the stored bytes equal a remembered
-    /// failed attempt: that file is adopted and the group retries at the
-    /// key after it. Any other conflict means another writer owns the key.
+    /// Create the group at `key`. On a conflict the stored object decides:
+    /// - the bytes being written now: this put landed although its reply
+    ///   said otherwise (an SDK retry of a put whose first reply was lost
+    ///   gets 412). The group is persisted.
+    /// - a remembered failed attempt: this writer's own earlier put whose
+    ///   reply was lost. That file is adopted and the group retries at the
+    ///   key after it.
+    /// - nothing, or unreadable: the outcome is unknown (an earlier put may
+    ///   still be in flight). The group fails and the key is retried.
+    /// - anything else: another writer owns the key; fence this one.
     fn persist_conditional(
         &self,
         key: u64,
         bytes: &[u8],
         ambiguous: &[Arc<Vec<u8>>],
     ) -> GroupOutcome {
+        let outcome = |key, adopted, result| GroupOutcome {
+            key,
+            adopted,
+            result,
+        };
         let error = match self.store.append_batch(key, bytes) {
-            Ok(()) => {
-                return GroupOutcome {
-                    key,
-                    adopted: None,
-                    result: Ok(()),
-                }
-            }
+            Ok(()) => return outcome(key, None, Ok(())),
             Err(error) if is_conflict(&error) => error,
-            Err(error) => {
-                return GroupOutcome {
-                    key,
-                    adopted: None,
-                    result: Err(GroupFailure::Failed(error)),
-                }
-            }
+            Err(error) => return outcome(key, None, Err(GroupFailure::Failed(error))),
         };
-        let stored = if ambiguous.is_empty() {
-            None
-        } else {
-            self.store.read(key).ok()
+        let stored = match self.read_conflicting(key) {
+            Ok(Some(stored)) => stored,
+            Ok(None) | Err(_) => return outcome(key, None, Err(GroupFailure::Failed(error))),
         };
-        let decoded = stored
+        if stored == bytes {
+            return outcome(key, None, Ok(()));
+        }
+        let decoded = Some(stored)
             .filter(|stored| ambiguous.iter().any(|attempt| **attempt == *stored))
             .and_then(|stored| decode_frames(&stored, key).ok())
             .filter(|decoded| !decoded.torn);
         let Some(decoded) = decoded else {
-            return GroupOutcome {
-                key,
-                adopted: None,
-                result: Err(GroupFailure::Lost(error)),
-            };
+            return outcome(key, None, Err(GroupFailure::Lost(error)));
         };
         let high = decoded.records.last().map_or(key, |(lsn, _)| *lsn);
         let locations = decoded
@@ -766,13 +870,24 @@ impl WalWriter {
         let retry = high + 1;
         let result = match self.store.append_batch(retry, bytes) {
             Ok(()) => Ok(()),
-            Err(error) if is_conflict(&error) => Err(GroupFailure::Lost(error)),
+            Err(error) if is_conflict(&error) => match self.read_conflicting(retry) {
+                Ok(Some(stored)) if stored == bytes => Ok(()),
+                Ok(Some(_)) => Err(GroupFailure::Lost(error)),
+                Ok(None) | Err(_) => Err(GroupFailure::Failed(error)),
+            },
             Err(error) => Err(GroupFailure::Failed(error)),
         };
-        GroupOutcome {
-            key: retry,
-            adopted: Some((key, high, locations)),
-            result,
+        outcome(retry, Some((key, high, locations)), result)
+    }
+
+    /// The object at `key` after a conflicting put; `None` when there is
+    /// none (yet).
+    fn read_conflicting(&self, key: u64) -> Result<Option<Vec<u8>>, KoshaError> {
+        match self.store.read(key) {
+            Ok(stored) => Ok(Some(stored)),
+            Err(KoshaError::NotFound(_)) => Ok(None),
+            Err(KoshaError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -789,7 +904,8 @@ impl WalWriter {
             state.files.remove(file);
         }
         state.checkpoints.clear();
-        Ok(())
+        drop(state);
+        self.prune_discarded()
     }
 
     /// Read all records from all WAL files for recovery.
@@ -846,6 +962,13 @@ fn fenced_error(reason: &str) -> KoshaError {
 
 struct Recovered {
     records: Vec<(u64, WalRecord)>,
+    /// Every file listed, ascending.
+    files: Vec<u64>,
+    /// The `discarded` meta entry as read.
+    discarded: BTreeMap<String, u64>,
+    /// Files with at least one record skipped because its namespace was
+    /// discarded.
+    discarded_files: Vec<u64>,
     /// (file, lsn, namespace) for every recovered record.
     locations: Vec<(u64, u64, NamespaceId)>,
     /// Highest LSN or file name seen, including a torn file's.
@@ -856,7 +979,11 @@ struct Recovered {
 
 fn recover_from(store: &dyn WalStore) -> Result<Recovered, KoshaError> {
     let files = store.list()?;
+    let discarded = read_discarded(store)?;
     let mut recovered = Recovered {
+        files: files.clone(),
+        discarded,
+        discarded_files: Vec::new(),
         records: Vec::new(),
         locations: Vec::new(),
         high_lsn: files.last().copied().unwrap_or(0),
@@ -878,6 +1005,17 @@ fn recover_from(store: &dyn WalStore) -> Result<Recovered, KoshaError> {
             }
             previous = lsn;
             recovered.high_lsn = recovered.high_lsn.max(lsn);
+            if recovered
+                .discarded
+                .get(&record.namespace.0)
+                .is_some_and(|through| lsn <= *through)
+            {
+                // A deleted namespace's record (see `discard_namespace`).
+                if recovered.discarded_files.last() != Some(file) {
+                    recovered.discarded_files.push(*file);
+                }
+                continue;
+            }
             recovered
                 .locations
                 .push((*file, lsn, record.namespace.clone()));
@@ -1606,6 +1744,65 @@ mod tests {
         drop(restarted);
         let reopened = WalWriter::new(dir.clone());
         assert!(reopened.append(&a, &[doc("a3")]).unwrap() > a1.max(a2).max(b1));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn discarded_namespace_in_a_shared_file_is_not_replayed_after_restart() {
+        let dir = temp_dir("discard-shared");
+        let wal = WalWriter::new(dir.clone());
+        let (a, b) = (NamespaceId("a".into()), NamespaceId("b".into()));
+        let lsns = wal
+            .append_records(&[record("a", "a1"), record("b", "b1"), record("a", "a2")])
+            .unwrap();
+        assert_eq!(wal_files(&dir).len(), 1, "one shared group file");
+        assert_eq!(wal.discard_namespace(&a).unwrap(), 1);
+        assert_eq!(wal_files(&dir).len(), 1, "B still needs the file");
+        drop(wal);
+
+        // Restart before B flushes: only B's record comes back.
+        let (reopened, recovered) = WalWriter::open(
+            Arc::new(LocalWalStore::new(dir.clone())),
+            GroupCommitConfig::default(),
+        )
+        .unwrap();
+        let recovered: Vec<WalRecord> = recovered.into_iter().map(|(_, r)| r).collect();
+        assert_eq!(ids(&recovered), vec!["b1"]);
+        assert_eq!(ids(&WalWriter::recover(&dir).unwrap()), vec!["b1"]);
+        // A re-created A is replayed: its new records are above the floor.
+        let a3 = reopened.append(&a, &[doc("a3")]).unwrap();
+        assert!(a3 > lsns[2]);
+        assert_eq!(ids(&WalWriter::recover(&dir).unwrap()), vec!["b1", "a3"]);
+        // B's flush reclaims the shared file and retires the discard.
+        reopened.clear_through(&b, lsns[1]).unwrap();
+        reopened.clear_through(&a, a3).unwrap();
+        assert!(wal_files(&dir).is_empty());
+        assert!(reopened.discarded_namespaces().is_empty());
+        drop(reopened);
+        assert!(WalWriter::new(dir.clone())
+            .discarded_namespaces()
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn file_left_with_only_discarded_records_is_reclaimed_on_open() {
+        let dir = temp_dir("discard-crash");
+        let wal = WalWriter::new(dir.clone());
+        let lsn = wal.append(&NamespaceId("a".into()), &[doc("a1")]).unwrap();
+        drop(wal);
+        // Crash after the discard was recorded, before the file went.
+        let store = LocalWalStore::new(dir.clone());
+        write_discarded(&store, &BTreeMap::from([("a".to_string(), lsn)])).unwrap();
+        let reopened = WalWriter::new(dir.clone());
+        assert!(wal_files(&dir).is_empty());
+        assert!(reopened.discarded_namespaces().is_empty());
+        assert!(
+            reopened
+                .append(&NamespaceId("a".into()), &[doc("x")])
+                .unwrap()
+                > lsn
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

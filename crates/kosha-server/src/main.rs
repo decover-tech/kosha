@@ -2068,6 +2068,11 @@ impl AppState {
     /// One refresher pass: a single batched version read, then fetch and
     /// swap only namespaces whose version moved. Errors leave the
     /// last-known-good manifests in place.
+    ///
+    /// A namespace loaded here that the poll no longer lists was deleted
+    /// (`DELETE /v1/namespaces/{ns}` on the ingest pod): it is forgotten,
+    /// with its caches, so the next search on it loads afresh and answers
+    /// 404 instead of serving the deleted documents.
     fn run_manifest_refresh_tick(&self) {
         let observed_at = Instant::now();
         let versions = self.controller.lock().unwrap().manifest_versions();
@@ -2078,6 +2083,32 @@ impl AppState {
                 return;
             }
         };
+        let listed: std::collections::HashSet<&NamespaceId> =
+            versions.iter().map(|(ns, _)| ns).collect();
+        for ns in self.indexer.namespaces() {
+            if listed.contains(&ns) {
+                continue;
+            }
+            // Re-check alone: the namespace may have been created (and
+            // loaded by a search) after the batched poll.
+            match self.controller.lock().unwrap().manifest_version(&ns) {
+                Ok(None) => {}
+                Ok(Some(_)) => continue,
+                Err(error) => {
+                    self.manifest_follow
+                        .record_error(&format!("deletion check of '{}'", ns.0), &error);
+                    continue;
+                }
+            }
+            if self.indexer.forget_namespace(&ns) {
+                println!(
+                    "manifest refresh: ns={} deleted from the control store; forgotten",
+                    ns.0
+                );
+            }
+            self.manifest_follow.forget(&ns);
+            self.forget_namespace_caches(&ns);
+        }
         let mut control_plane_ok = true;
         for (ns, stored) in versions {
             match self.follow_stored_version(&ns, stored, observed_at, true) {
@@ -5532,8 +5563,9 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
 ///    reuses their keys (segment ids carry a random writer id).
 ///
 /// Query replicas keep their own disk cache of the deleted segments until
-/// LRU eviction (`KOSHA_CACHE_MAX_BYTES`); they answer 404 as soon as the
-/// control store has no manifest.
+/// LRU eviction (`KOSHA_CACHE_MAX_BYTES`); they answer 404 once they see
+/// the control store has no manifest (the next refresher tick, see
+/// `run_manifest_refresh_tick`, or a search with `max_staleness_seconds: 0`).
 fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String {
     let id = NamespaceId(tenant_namespace(tenant, name));
     let lock = state.publication_lock(&id);
@@ -5570,10 +5602,9 @@ fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String
     });
     match dropped {
         Ok(0) => {}
-        Ok(shared) => eprintln!(
-            "WARN: namespace {} deleted, but {shared} legacy WAL file(s) also hold other \
-             namespaces' records and were kept; a restart replays this namespace's records \
-             from them",
+        Ok(shared) => println!(
+            "namespace {} deleted: {shared} WAL file(s) shared with other namespaces are kept \
+             until those flush; recovery skips this namespace's records in them",
             id.0
         ),
         Err(e) => {
@@ -9644,6 +9675,13 @@ mod tests {
         fn namespace_count(&self) -> usize {
             self.inner.namespace_count()
         }
+        fn delete_namespace(
+            &mut self,
+            id: &NamespaceId,
+            retire_at_least: u64,
+        ) -> Result<(kosha_core::Manifest, u64), KoshaError> {
+            self.inner.delete_namespace(id, retire_at_least)
+        }
     }
 
     fn outage_store() -> OutageStore {
@@ -9780,6 +9818,40 @@ mod tests {
             &query,
         );
         assert_eq!(total_hits(&get), 3);
+    }
+
+    /// A namespace deleted on the ingest pod stops answering on a query
+    /// replica within one refresher tick, for searches that leave
+    /// `max_staleness_seconds` at its default (the refresher never lists a
+    /// deleted namespace, so nothing else would invalidate it).
+    #[test]
+    fn query_replica_forgets_a_deleted_namespace_on_the_next_tick() {
+        let store = outage_store();
+        let ns = NamespaceId("tenant/gone".into());
+        let kept = NamespaceId("tenant/kept".into());
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_secs(3600)));
+        index_text_and_publish(&ingest, &ns, &["a"]);
+        index_text_and_publish(&ingest, &kept, &["k"]);
+        query.run_manifest_refresh_tick();
+        let loose = br#"{"namespace":"tenant/gone","query_text":"hello"}"#;
+        assert_eq!(total_hits(&handle_search_post(loose, &query)), 1);
+        // Twice, so the second is a result-cache hit keyed by the version.
+        assert_eq!(total_hits(&handle_search_post(loose, &query)), 1);
+
+        let resp = handle_delete_namespace("gone", "tenant", &ingest);
+        assert_eq!(status_of(&resp), 200, "{resp}");
+        query.run_manifest_refresh_tick();
+        assert!(query.indexer.manifest_version(&ns).is_none());
+        let resp = handle_search_post(loose, &query);
+        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+        // Other namespaces are untouched.
+        let other = br#"{"namespace":"tenant/kept","query_text":"hello"}"#;
+        assert_eq!(total_hits(&handle_search_post(other, &query)), 1);
+
+        // Re-created: the replica loads the new, empty incarnation.
+        index_text_and_publish(&ingest, &ns, &["b", "c"]);
+        query.run_manifest_refresh_tick();
+        assert_eq!(total_hits(&handle_search_post(loose, &query)), 2);
     }
 
     /// #232 acceptance (b): a search that took its manifest snapshot before

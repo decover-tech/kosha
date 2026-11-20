@@ -229,6 +229,16 @@ pub fn migrate_local_wal(local_dir: &Path, remote: &dyn WalStore) -> Result<usiz
     if local_sequence > sequence(remote)? {
         remote.write_meta("sequence", local_sequence.to_string().as_bytes())?;
     }
+    // Deleted namespaces whose records the copied files still hold.
+    let local_discarded = crate::wal::read_discarded(&local)?;
+    if !local_discarded.is_empty() {
+        let mut discarded = crate::wal::read_discarded(remote)?;
+        for (namespace, through) in local_discarded {
+            let entry = discarded.entry(namespace).or_insert(0);
+            *entry = (*entry).max(through);
+        }
+        crate::wal::write_discarded(remote, &discarded)?;
+    }
     for file in &files {
         let bytes = local.read(*file)?;
         match remote.append_batch(*file, &bytes) {
@@ -274,6 +284,12 @@ struct MemoryInner {
     /// The next N puts store the object and then report a failure, like a
     /// timeout whose request still landed.
     lose_put_replies: AtomicUsize,
+    /// The next N conditional puts store the object and then report a
+    /// conflict, like an SDK retry of a landed put that gets HTTP 412.
+    conflict_put_replies: AtomicUsize,
+    /// The next N conditional puts store nothing and report a conflict,
+    /// like S3's 409 while an earlier put of the key is still in flight.
+    phantom_conflicts: AtomicUsize,
     /// Simulated put latency: fixed part, and nanoseconds per byte.
     latency: Mutex<(Duration, u64)>,
     puts: AtomicU64,
@@ -292,6 +308,16 @@ impl MemoryObjectBackend {
     /// Store the next `n` puts but report them as failed.
     pub fn lose_next_put_replies(&self, n: usize) {
         self.inner.lose_put_replies.store(n, Ordering::SeqCst);
+    }
+
+    /// Store the next `n` conditional puts but report a conflict.
+    pub fn conflict_next_put_replies(&self, n: usize) {
+        self.inner.conflict_put_replies.store(n, Ordering::SeqCst);
+    }
+
+    /// Report a conflict for the next `n` conditional puts without storing.
+    pub fn phantom_conflict_next_puts(&self, n: usize) {
+        self.inner.phantom_conflicts.store(n, Ordering::SeqCst);
     }
 
     /// Every put sleeps `fixed + bytes * nanos_per_byte`.
@@ -330,6 +356,13 @@ impl MemoryObjectBackend {
         if Self::take(&self.inner.fail_puts) {
             return Err(std::io::Error::other("injected object store put failure").into());
         }
+        if conditional && Self::take(&self.inner.phantom_conflicts) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("conditional request conflict: {key}"),
+            )
+            .into());
+        }
         {
             let mut objects = self.inner.objects.lock().unwrap();
             if conditional && objects.contains_key(key) {
@@ -342,6 +375,13 @@ impl MemoryObjectBackend {
             objects.insert(key.to_owned(), bytes.to_vec());
         }
         self.inner.puts.fetch_add(1, Ordering::SeqCst);
+        if conditional && Self::take(&self.inner.conflict_put_replies) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("precondition failed: {key} exists"),
+            )
+            .into());
+        }
         if Self::take(&self.inner.lose_put_replies) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -535,6 +575,60 @@ mod tests {
         drop(writer);
         // Unacknowledged but durable records replay (at-least-once).
         assert_eq!(open(&backend).1, vec!["landed", "next", "after"]);
+    }
+
+    #[test]
+    fn a_retried_put_that_conflicts_with_its_own_landed_bytes_succeeds() {
+        let backend = MemoryObjectBackend::new();
+        let (writer, _) = open(&backend);
+        writer.append(&ns(), &[doc("a")]).unwrap();
+        // The first attempt landed, its reply was lost and the SDK retry
+        // got 412: the stored object is exactly what this put wrote.
+        backend.conflict_next_put_replies(1);
+        writer.append(&ns(), &[doc("b")]).unwrap();
+        writer.append(&ns(), &[doc("c")]).unwrap();
+        drop(writer);
+        assert_eq!(open(&backend).1, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_conflict_with_no_stored_object_is_retried_not_fenced() {
+        let backend = MemoryObjectBackend::new();
+        let (writer, _) = open(&backend);
+        writer.append(&ns(), &[doc("a")]).unwrap();
+        // S3 409: an earlier put of the key is still in flight; nothing is
+        // readable yet. The outcome is unknown, so the group fails but the
+        // writer is not fenced.
+        backend.phantom_conflict_next_puts(1);
+        let err = writer.append(&ns(), &[doc("unknown")]).unwrap_err();
+        assert!(!err.to_string().contains("fenced"), "{err}");
+        writer.append(&ns(), &[doc("b")]).unwrap();
+        drop(writer);
+        assert_eq!(open(&backend).1, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_discarded_namespace_in_a_shared_object_does_not_come_back() {
+        let backend = MemoryObjectBackend::new();
+        let (writer, _) = open(&backend);
+        let other = NamespaceId("t/other".into());
+        writer
+            .append_records(&[
+                kosha_core::WalRecord::new(ns(), vec![doc("deleted")]),
+                kosha_core::WalRecord::new(other.clone(), vec![doc("kept")]),
+            ])
+            .unwrap();
+        assert_eq!(writer.discard_namespace(&ns()).unwrap(), 1);
+        drop(writer);
+        // Node lost before `other` flushed: a new process replays only it.
+        let (restarted, recovered) = open(&backend);
+        assert_eq!(recovered, vec!["kept"]);
+        // Once `other` is checkpointed the object and the discard go.
+        let last = restarted.last_sequence();
+        restarted.clear_through(&other, last).unwrap();
+        assert!(restarted.discarded_namespaces().is_empty());
+        assert!(!backend.keys().iter().any(|k| k.ends_with(".bin")));
+        assert!(open(&backend).0.discarded_namespaces().is_empty());
     }
 
     #[test]

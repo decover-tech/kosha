@@ -135,6 +135,12 @@ impl ManifestFollow {
         }
     }
 
+    /// Stop following a namespace (deleted from the control store): the
+    /// next search on it is a cold load.
+    pub fn forget(&self, ns: &NamespaceId) {
+        self.namespaces.lock().unwrap().remove(ns);
+    }
+
     /// Time since the namespace was last confirmed current; `None` if never.
     pub fn lag(&self, ns: &NamespaceId, now: Instant) -> Option<Duration> {
         self.namespaces

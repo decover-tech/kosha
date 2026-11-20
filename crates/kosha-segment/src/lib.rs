@@ -5412,6 +5412,13 @@ impl SegmentReader {
         self.filters.store_for(Some(fields))
     }
 
+    /// How many columns of a columnar segment have been merged into the
+    /// row-shaped compatibility store ([`Self::filter_store_for`]); `0` for
+    /// a legacy segment. Diagnostics and tests.
+    pub fn merged_filter_store_columns(&self) -> usize {
+        self.filters.state.lock().unwrap().merged_ids.len()
+    }
+
     /// One filter column, decoded on first use and cached (#244). Works on
     /// both formats: a legacy segment builds it from `filters.bin`.
     /// `Ok(None)` when the segment has no such column or its file is not
@@ -5436,6 +5443,7 @@ impl SegmentReader {
     /// column fails the call instead of matching nothing.
     pub fn evaluate_filter(&self, clause: &FilterClause) -> Result<DocSet, KoshaError> {
         if self.has_filter_columns() {
+            filter_eval::check_filter_columns(clause, self)?;
             return filter_eval::evaluate_filter_columns(clause, self, self.doc_count());
         }
         let mut fields = std::collections::BTreeSet::new();
