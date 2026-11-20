@@ -263,6 +263,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - Namespace sharding with a fixed shard count set at creation (`POST /v1/namespaces/{ns}/shards`): documents route by id to N shard namespaces, each with its own manifest, segments, flushes and compaction; searches read all shards as one namespace. See [Namespace sharding](#namespace-sharding).
 - Backpressure controls: max concurrent searches, search queue depth and timeout, hydration concurrency, admission timeout.
 - `GET /healthz` (liveness), `GET /readyz` (readiness), `GET /v1/stats` and per-namespace stats.
+- `GET /metrics` in Prometheus text format: search outcomes and latency histograms, queue depth, cache bytes, hydrations and lease outcomes, degraded kNN segments. Unauthenticated by default (`KOSHA_METRICS_AUTH=admin` to require the admin key, `KOSHA_METRICS=off` to disable). See [docs/metrics.md](docs/metrics.md).
 - Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, warmup status, import a namespace.
 - Schema migrations via `kosha-server migrate`.
 - Namespace branching (copy-on-write). `POST /v1/namespaces/{ns}/branch` with `{"name": "<branch>"}` creates a new namespace whose manifest lists the parent's segments and deletion bitmaps where they already are, so it takes the same time for 1M documents as for 10 and copies nothing. Writes, deletes, upserts and compactions on the branch go to the branch's own prefix; the parent's files and query results do not change. `GET /v1/namespaces/{ns}/branches` lists a namespace's branches (`GET .../stats` on a branch shows its parent and how many segments it still shares). `DELETE /v1/namespaces/{ns}/branch` deletes a branch and removes only the objects in its own prefix that no remaining manifest lists: segments a branch of the branch still uses are kept. Only branches can be deleted this way. Admin rewrites (`rebuild-filter-blooms`, `backfill-offset-tables`) on a branch skip the segments it shares with its parent. Segment GC never deletes an object a branch still lists, and `DELETE /v1/namespaces/{ns}` refuses (409) a namespace whose segments a branch still shares: delete the branches first. A sharded namespace cannot be branched yet.
@@ -408,6 +409,7 @@ the routes marked *write* to the ingest pod.
 | `POST /v1/namespaces/{ns}/exists` | ids → per-id existence | |
 | `GET /v1/namespaces/{ns}/stats` | → `NamespaceStats` | 404 for a missing namespace. |
 | `GET /v1/healthz`, `GET /healthz`, `GET /readyz` | | Unauthenticated probes. |
+| `GET /metrics` | → Prometheus text format | Unauthenticated unless `KOSHA_METRICS_AUTH=admin`; see [docs/metrics.md](docs/metrics.md). |
 | `GET /v1/stats` | | Admin key only. |
 | `/v1/admin/*` | | Admin key only; see the operations list above. |
 

@@ -3,6 +3,7 @@
 //! One binary, three roles (DESIGN.md §5): `ingest`, `query`, `compaction`.
 //! Phase 1 HTTP/JSON API:
 //!   - `GET  /healthz`           → 200 OK (liveness probe)
+//!   - `GET  /metrics`           → Prometheus text format (docs/metrics.md)
 //!   - `POST /index              ` → upsert documents by id into a namespace
 //!   - `POST /exists             ` → batch doc_id existence check
 //!   - `POST /replace            ` → partial field merge by id (OpenSearch `_update`)
@@ -31,6 +32,7 @@ mod doc_store_fallback_tests;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 mod manifest_follow;
+mod metrics;
 #[cfg(feature = "migrate")]
 mod migrate;
 mod posting_spans;
@@ -71,6 +73,8 @@ struct AppState {
     /// deletion's reference set cannot miss a branch being created from
     /// the namespace it deletes.
     branch_lock: Mutex<()>,
+    /// Prometheus metrics served at `GET /metrics` (#223).
+    metrics: metrics::Metrics,
     /// Hydrated segment files that failed their `_COMMIT` size/CRC check
     /// (#231), counting refetch failures again. Reported in `/stats`.
     #[cfg(feature = "s3")]
@@ -526,16 +530,23 @@ impl Semaphore {
     /// server stops accepting work it has no capacity to finish. A queue
     /// deeper than the service rate can drain is not throughput, it is
     /// latency nobody asked for.
+    #[cfg(test)]
     fn acquire_or_shed(&self) -> Option<SemaphorePermit<'_>> {
+        self.try_acquire().ok()
+    }
+
+    /// `acquire_or_shed` (see its doc above), saying why a shed request was
+    /// shed (`kosha_search_requests_total{outcome="rejected"|"timeout"}`).
+    fn try_acquire(&self) -> Result<SemaphorePermit<'_>, metrics::QueueShed> {
         let mut st = self.state.lock().unwrap();
         if st.permits > 0 {
             st.permits -= 1;
-            return Some(SemaphorePermit { sem: self });
+            return Ok(SemaphorePermit { sem: self });
         }
         // Fast-fail on a queue that is already saturated — waiting only to
         // time out later would burn the client's deadline for nothing.
         if self.max_waiters > 0 && st.waiters >= self.max_waiters {
-            return None;
+            return Err(metrics::QueueShed::Full);
         }
         let deadline = self.wait_timeout.map(|t| Instant::now() + t);
         st.waiters += 1;
@@ -557,10 +568,14 @@ impl Semaphore {
             }
         };
         st.waiters -= 1;
-        outcome.then(|| SemaphorePermit { sem: self })
+        if outcome {
+            Ok(SemaphorePermit { sem: self })
+        } else {
+            Err(metrics::QueueShed::Timeout)
+        }
     }
 
-    #[cfg(test)]
+    /// Requests waiting for a permit right now (`kosha_search_queue_depth`).
     fn waiters(&self) -> usize {
         self.state.lock().unwrap().waiters
     }
@@ -1583,6 +1598,7 @@ impl AppState {
                 .filter(|k| !k.is_empty()),
             publication_locks: Mutex::new(HashMap::new()),
             branch_lock: Mutex::new(()),
+            metrics: metrics::Metrics::from_env(),
             #[cfg(feature = "s3")]
             segment_checksum_failures: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "s3")]
@@ -2880,6 +2896,10 @@ impl AppState {
                     }
                 }
             }
+            self.metrics
+                .record_hydrations(metrics::HydrationSource::S3, fetched);
+            self.metrics
+                .record_hydrations(metrics::HydrationSource::Local, cached);
             let wall_ms = t_chunk.elapsed().as_secs_f64() * 1e3;
             println!(
                 "hydrate_files timing: chunk={}/{} fetched={} cached={} failed={} shed={} \
@@ -3175,12 +3195,17 @@ impl AppState {
         for (path, size) in files {
             match leases.try_claim(path, own_addr, LEASE_TTL) {
                 kosha_control::HydrationLease::Owner => {
+                    self.metrics.record_lease(metrics::LeaseOutcome::Won);
                     owned_leases.push(path.clone());
                     fetch_from_s3.push((path.clone(), *size));
                 }
                 kosha_control::HydrationLease::OwnedBy(peer_addr) => {
                     match self.fetch_from_peer(&peer_addr, path) {
                         Ok(bytes) => {
+                            self.metrics
+                                .record_lease(metrics::LeaseOutcome::StreamedFromPeer);
+                            self.metrics
+                                .record_hydrations(metrics::HydrationSource::Peer, 1);
                             // Peer-fetched bytes are hydration too — charge
                             // them so a request can't route around its
                             // ceiling just because another replica happened
@@ -3197,6 +3222,7 @@ impl AppState {
                             }
                         }
                         Err(e) => {
+                            self.metrics.record_lease(metrics::LeaseOutcome::Timeout);
                             eprintln!(
                                 "WARN: peer fetch of {path} from {peer_addr} failed ({e}); \
                                  falling back to S3"
@@ -5099,6 +5125,15 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         return Ok(());
     }
 
+    // `/metrics` (#223): Prometheus scrapes, unauthenticated by default like
+    // the probes above. Never forwarded to the ingest pod (see
+    // `is_write_path`): each pod reports its own process.
+    if request_line.starts_with("GET /metrics ") || request_line.starts_with("GET /metrics?") {
+        let resp = handle_metrics(state, &headers);
+        stream.write_all(resp.as_bytes()).ok();
+        return Ok(());
+    }
+
     // ── API key authentication ──────────────────────────────────────────
     // Per proto/kosha/v1/kosha.proto: Authorization: Bearer <key> or X-Api-Key.
     let authentication = if service_authorized(&headers, state.admin_auth_key.as_deref())
@@ -5134,6 +5169,86 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
     );
     stream.write_all(response.as_bytes()).ok();
     Ok(())
+}
+
+/// `GET /metrics`: the Prometheus text exposition of [`metrics::Metrics`],
+/// with the gauges and counters the server already keeps elsewhere read at
+/// scrape time. `KOSHA_METRICS=off` hides the route (404);
+/// `KOSHA_METRICS_AUTH=admin` requires the admin credential (403 without).
+fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String {
+    match state.metrics.config.exposure {
+        metrics::Exposure::Off => return json_error(404, "not found"),
+        metrics::Exposure::Admin
+            if !service_authorized(headers, state.admin_auth_key.as_deref()) =>
+        {
+            return json_error(403, "admin credential required");
+        }
+        _ => {}
+    }
+    #[cfg(feature = "s3")]
+    let segment_checksum_failures = state
+        .segment_checksum_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "s3"))]
+    let segment_checksum_failures = 0u64;
+    let body = state.metrics.render(&metrics::Scrape {
+        search_queue_depth: state.search_semaphore.waiters() as u64,
+        nvme_cache_bytes: state.cache.total_size(),
+        segment_cache_bytes: state.searcher.segment_cache_bytes(),
+        nvme_evictions: state.cache.eviction_generation(),
+        segment_checksum_failures,
+    });
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {}\r\n\
+         connection: close\r\n\r\n{body}",
+        body.len(),
+        metrics::CONTENT_TYPE,
+    )
+}
+
+/// Per-request search bookkeeping for `kosha_search_requests_total`, filled
+/// in by the search handlers.
+#[derive(Default)]
+struct SearchObservation {
+    /// Set when the scoring queue shed the request.
+    shed: std::cell::Cell<Option<metrics::QueueShed>>,
+    /// The searched namespace, recorded only with
+    /// `KOSHA_METRICS_NAMESPACE_LABELS=on`.
+    namespace: std::cell::RefCell<Option<String>>,
+}
+
+impl SearchObservation {
+    fn namespace(&self, state: &AppState, ns: &NamespaceId) {
+        if state.metrics.config.namespace_labels {
+            *self.namespace.borrow_mut() = Some(ns.0.clone());
+        }
+    }
+
+    /// Acquire a scoring slot, recording a shed.
+    fn scoring_slot<'a>(&self, state: &'a AppState) -> Option<SemaphorePermit<'a>> {
+        match state.search_semaphore.try_acquire() {
+            Ok(slot) => Some(slot),
+            Err(why) => {
+                self.shed.set(Some(why));
+                state.metrics.record_queue_shed();
+                None
+            }
+        }
+    }
+}
+
+/// Run one search handler and record its outcome and latency.
+fn observe_search(state: &AppState, run: impl FnOnce(&SearchObservation) -> String) -> String {
+    let started = Instant::now();
+    let observation = SearchObservation::default();
+    let response = run(&observation);
+    let outcome = metrics::SearchOutcome::classify(&response, observation.shed.get());
+    state.metrics.record_search(
+        outcome,
+        started.elapsed().as_secs_f64(),
+        observation.namespace.borrow().as_deref(),
+    );
+    response
 }
 
 /// One line per API request: who asked for what, the status returned and how
@@ -6157,10 +6272,13 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
 
     let ns = request.namespace;
     match write_routed(state, &ns, request.documents, index_into) {
-        Ok(count) => json_ok(&IndexResponse {
-            indexed_count: count,
-            namespace: ns,
-        }),
+        Ok(count) => {
+            state.metrics.record_indexed(count as u64);
+            json_ok(&IndexResponse {
+                indexed_count: count,
+                namespace: ns,
+            })
+        }
         Err(response) => response,
     }
 }
@@ -6390,10 +6508,13 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
     };
     let namespace = request.namespace;
     match write_routed(state, &namespace, request.documents, replace_into) {
-        Ok(count) => json_ok(&IndexResponse {
-            indexed_count: count,
-            namespace,
-        }),
+        Ok(count) => {
+            state.metrics.record_indexed(count as u64);
+            json_ok(&IndexResponse {
+                indexed_count: count,
+                namespace,
+            })
+        }
         Err(response) => response,
     }
 }
@@ -6507,7 +6628,10 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
 
     if let Some(name) = ns {
         return match flush_and_publish_namespace(state, &NamespaceId(name)) {
-            Ok(()) => json_ok(&serde_json::json!({"status": "flushed"})),
+            Ok(()) => {
+                state.metrics.record_flush();
+                json_ok(&serde_json::json!({"status": "flushed"}))
+            }
             Err(error) => error,
         };
     }
@@ -6540,6 +6664,7 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
         }
     }
 
+    state.metrics.record_flush();
     json_ok(&serde_json::json!({"status": "flushed"}))
 }
 
@@ -6813,6 +6938,10 @@ fn add_manifest_follow_stats(state: &AppState, ns: &NamespaceId, entry: &mut ser
 // ─── POST /search (JSON body, supports filters) ─────────────────────────────
 
 fn handle_search_post(body: &[u8], state: &AppState) -> String {
+    observe_search(state, |obs| search_post(body, state, obs))
+}
+
+fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String {
     // Parse the full JSON body that includes namespace alongside SearchQuery fields.
     let body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -6823,6 +6952,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         Some(n) => NamespaceId(n.to_string()),
         None => return json_error(400, "missing 'namespace' in search body"),
     };
+    obs.namespace(state, &ns);
 
     // Query replicas only (#232): how stale a manifest this search accepts.
     let max_staleness =
@@ -7033,7 +7163,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // Acquired after hydration (which has its own ceiling) so a search
     // waiting on S3 doesn't also hold a scoring slot.
     let t_queue = Instant::now();
-    let Some(slot) = state.search_semaphore.acquire_or_shed() else {
+    let Some(slot) = obs.scoring_slot(state) else {
         // Shed rather than queue: see `Semaphore::acquire_or_shed`.
         return json_error(
             429,
@@ -7102,6 +7232,12 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                 &phases,
                 result.total_hits,
                 result.knn_degraded_segments,
+            );
+            state.metrics.record_search_phases(
+                hydrate_ms,
+                queue_ms,
+                phases.score_wall_ms,
+                result.knn_degraded_segments.unwrap_or(0),
             );
             state.record_search_access(&ns, manifest, search_query, &phases, &hydration);
             if let Some(ref provider) = reranker {
@@ -7329,6 +7465,10 @@ fn result_cache_budget() -> usize {
 // ─── GET /search (query params, simple queries) ─────────────────────────────
 
 fn handle_search_get(request_line: &str, state: &AppState) -> String {
+    observe_search(state, |obs| search_get(request_line, state, obs))
+}
+
+fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> String {
     // Parse query string from the request line.
     // request_line looks like: "GET /search?ns=...&q=...&max_results=... HTTP/1.1"
     let query_string = request_line
@@ -7347,6 +7487,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         Some(ns) => NamespaceId(ns.clone()),
         None => return json_error(400, "missing 'ns' query parameter"),
     };
+    obs.namespace(state, &ns);
 
     let query_text = match params.get("q") {
         Some(q) => q.clone(),
@@ -7524,7 +7665,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     // Acquired after hydration (which has its own ceiling) so a search
     // waiting on S3 doesn't also hold a scoring slot.
     let t_queue = Instant::now();
-    let Some(_slot) = state.search_semaphore.acquire_or_shed() else {
+    let Some(_slot) = obs.scoring_slot(state) else {
         // Shed rather than queue: see `Semaphore::acquire_or_shed`.
         return json_error(
             429,
@@ -7586,6 +7727,12 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
                 &phases,
                 result.total_hits,
                 result.knn_degraded_segments,
+            );
+            state.metrics.record_search_phases(
+                hydrate_ms,
+                queue_ms,
+                phases.score_wall_ms,
+                result.knn_degraded_segments.unwrap_or(0),
             );
             state.record_search_access(&ns, manifest, &query, &phases, &hydration);
             json_ok(&result)
@@ -7809,6 +7956,20 @@ fn handle_search_post_with_ns(
     body: &[u8],
     state: &AppState,
 ) -> String {
+    // Observed here rather than through `handle_search_post`, so a body
+    // rejected before it reaches the search is still counted.
+    observe_search(state, |obs| {
+        search_post_with_ns(namespace, tenant, body, state, obs)
+    })
+}
+
+fn search_post_with_ns(
+    namespace: &str,
+    tenant: &str,
+    body: &[u8],
+    state: &AppState,
+    obs: &SearchObservation,
+) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
     let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -7818,7 +7979,7 @@ fn handle_search_post_with_ns(
         obj.insert("namespace".into(), serde_json::json!(scoped_ns));
     }
     let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
-    handle_search_post(&modified_body, state)
+    search_post(&modified_body, state, obs)
 }
 
 fn handle_flush_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
@@ -13704,6 +13865,231 @@ mod tests {
         ] {
             assert!(is_write_path(line), "expected write-path: {line:?}");
         }
+    }
+
+    /// `/metrics` (#223) is per-pod: a query pod must answer it itself,
+    /// never forward it to the ingest pod.
+    #[test]
+    fn metrics_is_not_a_write_path() {
+        assert!(!is_write_path("GET /metrics HTTP/1.1\r\n"));
+        assert!(!is_write_path("GET /metrics?x=1 HTTP/1.1\r\n"));
+    }
+
+    /// Send one raw HTTP request to a live `serve` and return the response.
+    fn http(addr: std::net::SocketAddr, request: &str) -> String {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        s.write_all(request.as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        resp
+    }
+
+    fn http_json(addr: std::net::SocketAddr, line: &str, body: &serde_json::Value) -> String {
+        let body = body.to_string();
+        http(
+            addr,
+            &format!(
+                "{line} HTTP/1.1\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+
+    fn serve_state(state: AppState) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(state);
+        std::thread::spawn(move || serve(listener, state, Duration::from_secs(30)));
+        addr
+    }
+
+    fn scrape(addr: std::net::SocketAddr, auth: &str) -> String {
+        http(
+            addr,
+            &format!("GET /metrics HTTP/1.1\r\nhost: x\r\n{auth}\r\n"),
+        )
+    }
+
+    fn scrape_samples(addr: std::net::SocketAddr) -> Vec<metrics::tests::Sample> {
+        let resp = scrape(addr, "");
+        let (status, headers, body) = parse(&resp);
+        assert_eq!(status, "HTTP/1.1 200 OK", "{resp}");
+        assert!(
+            headers.contains("content-type: text/plain; version=0.0.4; charset=utf-8"),
+            "{headers}"
+        );
+        metrics::tests::parse_exposition(body).unwrap_or_else(|e| panic!("{e}\n{body}"))
+    }
+
+    /// #223 acceptance: searches through the real HTTP server move the
+    /// counters, and every counter only ever goes up between scrapes.
+    #[test]
+    fn metrics_counters_increase_monotonically_across_searches() {
+        let addr = serve_state(test_state());
+        let search = || {
+            let resp = http_json(
+                addr,
+                "POST /v1/namespaces/docs/search",
+                &serde_json::json!({"query_text": "quick", "max_results": 5}),
+            );
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        };
+        let indexed = http_json(
+            addr,
+            "POST /v1/namespaces/docs/documents",
+            &serde_json::json!({"documents": [
+                {"id": "a", "fields": [{"name": "title", "field_type": "Text", "value": "quick fox"}]},
+                {"id": "b", "fields": [{"name": "title", "field_type": "Text", "value": "quick dog"}]}
+            ]}),
+        );
+        assert!(indexed.starts_with("HTTP/1.1 200"), "{indexed}");
+        let flushed = http_json(
+            addr,
+            "POST /v1/namespaces/docs/flush",
+            &serde_json::json!({}),
+        );
+        assert!(flushed.starts_with("HTTP/1.1 200"), "{flushed}");
+        for _ in 0..3 {
+            search();
+        }
+        let bad = http_json(
+            addr,
+            "POST /v1/namespaces/docs/search",
+            &serde_json::json!({"query_text": "quick", "max_results": -1}),
+        );
+        assert!(!bad.starts_with("HTTP/1.1 200"), "{bad}");
+        // A body that is not JSON at all is rejected before the search
+        // handler proper, and still counts.
+        let garbled = http(
+            addr,
+            "POST /v1/namespaces/docs/search HTTP/1.1\r\ncontent-length: 4\r\n\r\n{bad",
+        );
+        assert!(garbled.starts_with("HTTP/1.1 400"), "{garbled}");
+
+        let first = scrape_samples(addr);
+        let ok = |s: &[metrics::tests::Sample]| {
+            metrics::tests::value(s, "kosha_search_requests_total", &[("outcome", "ok")]).unwrap()
+        };
+        assert_eq!(ok(&first), 3.0);
+        assert_eq!(
+            metrics::tests::value(
+                &first,
+                "kosha_search_requests_total",
+                &[("outcome", "error")]
+            ),
+            Some(2.0)
+        );
+        assert_eq!(
+            metrics::tests::value(&first, "kosha_index_documents_total", &[]),
+            Some(2.0)
+        );
+        assert_eq!(
+            metrics::tests::value(&first, "kosha_flush_total", &[]),
+            Some(1.0)
+        );
+        assert_eq!(
+            metrics::tests::value(&first, "kosha_search_duration_seconds_count", &[]),
+            Some(3.0)
+        );
+
+        for _ in 0..2 {
+            search();
+        }
+        let second = scrape_samples(addr);
+        assert_eq!(ok(&second), 5.0);
+        // Counters and histogram series never decrease between scrapes.
+        let key = |s: &metrics::tests::Sample| format!("{}{:?}", s.name, s.labels);
+        let before: HashMap<String, f64> = first.iter().map(|s| (key(s), s.value)).collect();
+        let cumulative = |name: &str| {
+            name.ends_with("_total")
+                || name.ends_with("_bucket")
+                || name.ends_with("_count")
+                || name.ends_with("_sum")
+        };
+        for s in second.iter().filter(|s| cumulative(&s.name)) {
+            let was = before[&key(s)];
+            assert!(s.value >= was, "{} went from {was} to {}", key(s), s.value);
+        }
+        assert!(
+            metrics::tests::value(&second, "kosha_search_duration_seconds_count", &[]).unwrap()
+                > metrics::tests::value(&first, "kosha_search_duration_seconds_count", &[])
+                    .unwrap()
+        );
+    }
+
+    /// #223: `/metrics` needs no API key by default, needs the admin key
+    /// under `KOSHA_METRICS_AUTH=admin`, and is gone under `KOSHA_METRICS=off`.
+    #[test]
+    fn metrics_route_access_modes() {
+        let open = serve_state(test_state());
+        assert!(scrape(open, "").starts_with("HTTP/1.1 200 OK"));
+
+        let mut state = test_state();
+        state.admin_auth_key = Some("admin-secret".into());
+        state.metrics = metrics::Metrics::new(metrics::MetricsConfig {
+            exposure: metrics::Exposure::Admin,
+            ..metrics::MetricsConfig::default()
+        });
+        let admin = serve_state(state);
+        let denied = scrape(admin, "");
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+        let wrong = scrape(admin, "authorization: Bearer tenant-key\r\n");
+        assert!(wrong.starts_with("HTTP/1.1 403"), "{wrong}");
+        let allowed = scrape(admin, "authorization: Bearer admin-secret\r\n");
+        assert!(allowed.starts_with("HTTP/1.1 200 OK"), "{allowed}");
+        assert!(allowed.contains("kosha_search_requests_total"), "{allowed}");
+
+        let mut state = test_state();
+        state.metrics = metrics::Metrics::new(metrics::MetricsConfig {
+            exposure: metrics::Exposure::Off,
+            ..metrics::MetricsConfig::default()
+        });
+        let off = serve_state(state);
+        let gone = scrape(off, "");
+        assert!(gone.starts_with("HTTP/1.1 404"), "{gone}");
+    }
+
+    /// A search the scoring queue sheds after waiting is counted as
+    /// `timeout` and in `kosha_search_queue_rejections_total`.
+    #[test]
+    fn queue_timeout_search_is_counted() {
+        let mut state = test_state();
+        // No permits and no queue: every scored search is shed at once.
+        state.search_semaphore = Semaphore::with_queue_limits(0, 1, Some(Duration::from_millis(1)));
+        let ns = NamespaceId("t/docs".into());
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId("d1".into()),
+                    fields: vec![Field::text("title", "quick fox")],
+                }],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+        let resp = handle_search_post(
+            br#"{"namespace":"t/docs","query_text":"quick","max_results":5}"#,
+            &state,
+        );
+        assert!(resp.starts_with("HTTP/1.1 429"), "{resp}");
+        let text = state.metrics.render(&metrics::Scrape::default());
+        let samples = metrics::tests::parse_exposition(&text).unwrap();
+        assert_eq!(
+            metrics::tests::value(
+                &samples,
+                "kosha_search_requests_total",
+                &[("outcome", "timeout")]
+            ),
+            Some(1.0),
+            "one waiter allowed, so the search waited 1ms and timed out"
+        );
+        assert_eq!(
+            metrics::tests::value(&samples, "kosha_search_queue_rejections_total", &[]),
+            Some(1.0)
+        );
     }
 
     #[test]

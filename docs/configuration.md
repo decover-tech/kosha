@@ -166,6 +166,17 @@ The control plane is in memory unless `DATABASE_URL` is set in a binary built wi
 The server refuses to start when no credential is configured (no env key, no admin or internal
 key, no Postgres keys) unless `KOSHA_AUTH=disabled`.
 
+## Metrics
+
+`GET /metrics` serves Prometheus text format. The metric set is listed in
+[`metrics.md`](metrics.md). Read once at startup in `metrics::MetricsConfig::from_env`.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_METRICS` | `off` (or `false`, `0`) makes `GET /metrics` return 404 | on | flag |
+| `KOSHA_METRICS_AUTH` | `admin` requires the `KOSHA_ADMIN_API_KEY` credential on `GET /metrics` (403 without it). `none` (or unset) leaves it open, like `/healthz`. Any other value is treated as `admin` | `none` | `none` \| `admin` |
+| `KOSHA_METRICS_NAMESPACE_LABELS` | `on` (or `true`, `1`) adds a `namespace` label to `kosha_search_requests_total`. One series per namespace and outcome, and it publishes tenant namespace names to whoever can scrape. See `metrics.md` | off | flag |
+
 ## Roles
 
 There is no role switch. A pod forwards writes when `KOSHA_INGEST_HOST` is set.

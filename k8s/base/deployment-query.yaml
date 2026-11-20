@@ -28,6 +28,11 @@ spec:
         # A replaced pod starts with an empty cache; Karpenter consolidation
         # was replacing idle warm pods several times a day.
         karpenter.sh/do-not-disrupt: "true"
+        # Scraped by annotation-based Prometheus pod discovery (#223). See
+        # docs/metrics.md.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: kosha
       # Deliberately NOT on the dedicated NVMe/Karpenter pool — that pool is
