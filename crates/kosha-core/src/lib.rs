@@ -106,6 +106,73 @@ pub trait ControlStore: Send + Sync {
     fn list_namespaces(&self) -> Vec<NamespaceId>;
     fn namespace_count(&self) -> usize;
 
+    // ── Writer lease and fencing (#254) ───────────────────────────────────
+    //
+    // One writer process owns a namespace at a time. It takes the lease
+    // before it publishes, renews it in the background, and presents the
+    // lease's fencing token on every manifest CAS. A takeover after expiry
+    // raises the token, so a writer that lost its lease (a long pause, a
+    // partition, a second writer pod started by mistake) cannot commit
+    // over its successor. The defaults keep a store without lease support
+    // working exactly as before: every writer is granted token 0 and the
+    // fenced CAS is the plain CAS.
+
+    /// Take the writer lease on `id` for `holder`, valid for `ttl`, and
+    /// return its fencing token. Succeeds when there is no lease, the
+    /// lease expired, or `holder` already holds it (same token, extended).
+    /// A takeover sets the token one above the previous one. `Ok(None)`:
+    /// another holder's lease is live.
+    fn acquire_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        ttl: std::time::Duration,
+    ) -> Result<Option<u64>, KoshaError> {
+        let _ = (id, holder, ttl);
+        Ok(Some(0))
+    }
+
+    /// Extend `holder`'s lease on `id` to `ttl` from now. `Ok(false)` when
+    /// the lease is no longer `holder`'s under `token` (taken over).
+    fn renew_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        token: u64,
+        ttl: std::time::Duration,
+    ) -> Result<bool, KoshaError> {
+        let _ = (id, holder, token, ttl);
+        Ok(true)
+    }
+
+    /// Expire `holder`'s lease now so a successor need not wait out the
+    /// TTL. Keeps the row, and so the token. A no-op when the lease is no
+    /// longer `holder`'s under `token`.
+    fn release_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        token: u64,
+    ) -> Result<(), KoshaError> {
+        let _ = (id, holder, token);
+        Ok(())
+    }
+
+    /// [`ControlStore::compare_and_swap_manifest`] that also checks the
+    /// writer's fencing token, atomically with the swap: when a lease row
+    /// exists for `id` with a different token, nothing is written and the
+    /// result is [`KoshaError::Fenced`]. `token: None` is the plain CAS.
+    fn compare_and_swap_manifest_fenced(
+        &mut self,
+        id: &NamespaceId,
+        expected_version: u64,
+        new_manifest: Manifest,
+        token: Option<u64>,
+    ) -> Result<(), KoshaError> {
+        let _ = token;
+        self.compare_and_swap_manifest(id, expected_version, new_manifest)
+    }
+
     /// Remove a namespace and its manifest (`DELETE /v1/namespaces/{ns}`).
     ///
     /// Returns the manifest the namespace last committed (so the caller can
@@ -3900,6 +3967,18 @@ pub enum KoshaError {
     /// The request itself is malformed or out of range (e.g. BM25 `b`
     /// outside `[0, 1]`). A client error: maps to HTTP 400.
     InvalidQuery(String),
+    /// This writer no longer owns the namespace (#254): another writer
+    /// holds its writer lease under a newer fencing token. Nothing was
+    /// published. The fenced writer stops accepting writes for the
+    /// namespace. Maps to HTTP 503 with `Retry-After`, so a client retries
+    /// against whichever pod owns the namespace now.
+    Fenced {
+        namespace: NamespaceId,
+        /// The token this writer presented (0: it held none).
+        token: u64,
+        /// The lease's current token (0: unknown).
+        current: u64,
+    },
 }
 
 impl std::fmt::Display for KoshaError {
@@ -3918,6 +3997,9 @@ impl std::fmt::Display for KoshaError {
             Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
             Self::ControlPlane(msg) => write!(f, "control plane unavailable: {msg}"),
             Self::InvalidQuery(msg) => write!(f, "invalid query: {msg}"),
+            Self::Fenced { namespace, token, current } => write!(f,
+                "writer fenced for {}: presented fencing token {token}, current token {current}; \
+                 another writer owns this namespace", namespace.0),
         }
     }
 }

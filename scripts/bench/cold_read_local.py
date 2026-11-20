@@ -98,6 +98,9 @@ def wait_healthy(port, proc, timeout=30):
 
 
 def spawn_server(role, data_dir, port, extra_env=None, log_path=None):
+    # KOSHA_ROLE is validated since #254: `query` needs KOSHA_INGEST_HOST, so
+    # the read-only cold server here runs as `standalone`, which is what an
+    # unforwarded "query" pod always was.
     env = {**os.environ, **S3_ENV, **(extra_env or {})}
     env.update(
         KOSHA_ROLE=role,
@@ -235,7 +238,7 @@ def cold_queries(args):
         extra = {}
         if args.budget is not None:
             extra["KOSHA_CACHE_MAX_BYTES"] = str(args.budget)
-        proc = spawn_server("query", data_dir, QUERY_PORT, extra, log_path)
+        proc = spawn_server("standalone", data_dir, QUERY_PORT, extra, log_path)
         try:
             wall, attempts = search_until_ok(QUERY_PORT, args.max_attempts, text)
             warm_wall, _ = search_until_ok(QUERY_PORT, 3, text) if wall else (None, 0)
@@ -275,7 +278,7 @@ def cold_run(run_idx, args):
     extra = {}
     if args.budget is not None:
         extra["KOSHA_CACHE_MAX_BYTES"] = str(args.budget)
-    proc = spawn_server("query", data_dir, QUERY_PORT, extra, log_path)
+    proc = spawn_server("standalone", data_dir, QUERY_PORT, extra, log_path)
     try:
         cold_wall, cold_attempts = search_until_ok(QUERY_PORT, args.max_attempts)
         warm_wall = warm_attempts = None

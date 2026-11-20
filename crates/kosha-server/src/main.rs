@@ -1,6 +1,7 @@
 //! Kosha node binary.
 //!
-//! One binary, three roles (DESIGN.md §5): `ingest`, `query`, `compaction`.
+//! One binary, four roles (`KOSHA_ROLE`, see `role.rs` and DESIGN.md §5):
+//! `query`, `ingest`, `indexer` and `standalone`.
 //! Phase 1 HTTP/JSON API:
 //!   - `GET  /healthz`           → 200 OK (liveness probe)
 //!   - `POST /index              ` → upsert documents by id into a namespace
@@ -35,6 +36,7 @@ mod manifest_follow;
 mod migrate;
 mod posting_spans;
 mod rerank;
+mod role;
 #[cfg(feature = "s3")]
 mod s3_storage;
 #[cfg(feature = "s3")]
@@ -45,6 +47,9 @@ mod segment_gc;
 mod unindexed;
 mod warm;
 mod warm_run;
+mod writer_lease;
+#[cfg(test)]
+mod writer_lease_tests;
 
 #[cfg(feature = "s3")]
 use hydration_budget::{HydrationBudget, RequestHydration};
@@ -64,6 +69,15 @@ use kosha_write::Indexer;
 
 struct AppState {
     controller: Mutex<Box<dyn ControlStore>>,
+    /// `KOSHA_ROLE`, resolved and validated (#254, `role.rs`).
+    role: role::Role,
+    /// Writer leases this process holds and namespaces it was fenced from
+    /// (#254). Disabled on query and indexer pods and with
+    /// `KOSHA_WRITER_LEASE=off`.
+    writer_leases: writer_lease::WriterLeases,
+    /// `KOSHA_COMPACTION_ON_INGEST` (#254): whether a writer pod also runs
+    /// the compaction scheduler.
+    compaction_on_ingest: bool,
     admin_auth_key: Option<String>,
     internal_service_key: Option<String>,
     publication_locks: Mutex<HashMap<NamespaceId, Arc<Mutex<()>>>>,
@@ -953,12 +967,30 @@ fn rebase_backoff(attempt: u32) -> Duration {
 /// writer caused (and a rebase could not resolve) is a 409 the client can
 /// retry; anything else is a server error.
 fn publication_error(context: &str, error: &KoshaError) -> String {
-    let status = if matches!(error, KoshaError::ManifestConflict { .. }) {
-        409
-    } else {
-        500
+    let status = match error {
+        KoshaError::ManifestConflict { .. } => 409,
+        // Another writer owns the namespace (#254): retry, by when its
+        // lease would have lapsed, against whichever pod owns it now.
+        KoshaError::Fenced { .. } => {
+            let ttl =
+                writer_lease::ttl_from(std::env::var("KOSHA_WRITER_LEASE_TTL_MS").ok().as_deref());
+            return retry_after(
+                json_error(503, &format!("{context}: {error}")),
+                ttl.as_secs().max(1),
+            );
+        }
+        _ => 500,
     };
     json_error(status, &format!("{context}: {error}"))
+}
+
+/// Add a `Retry-After` header to a ready-made response.
+fn retry_after(response: String, secs: u64) -> String {
+    response.replacen(
+        "\r\nconnection: close\r\n",
+        &format!("\r\nretry-after: {secs}\r\nconnection: close\r\n"),
+        1,
+    )
 }
 
 /// Upload a segment directory to S3 and commit it: every data file first,
@@ -1024,6 +1056,13 @@ struct StateOptions {
     wal_store: Option<Arc<dyn kosha_write::wal::WalStore>>,
     /// Control store instead of `DATABASE_URL`.
     control_store: Option<Box<dyn ControlStore>>,
+    /// Role instead of `KOSHA_ROLE`.
+    role: Option<role::Role>,
+    /// Writer lease TTL instead of `KOSHA_WRITER_LEASE_TTL_MS`.
+    writer_lease_ttl: Option<Duration>,
+    /// Writer leases on or off instead of `KOSHA_WRITER_LEASE` (still off
+    /// on a role that accepts no writes).
+    writer_lease: Option<bool>,
 }
 
 fn fatal(message: &str) -> ! {
@@ -1037,6 +1076,7 @@ fn fatal(message: &str) -> ! {
 /// acknowledged write survives losing the node. Only a node that accepts
 /// writes uses it: a query pod forwards writes to ingest.
 fn wal_store_from_env(
+    role: role::Role,
     #[cfg(feature = "s3")] s3: Option<&s3_storage::S3Storage>,
 ) -> Option<Arc<dyn kosha_write::wal::WalStore>> {
     let mode = std::env::var("KOSHA_WAL_MODE")
@@ -1051,8 +1091,15 @@ fn wal_store_from_env(
             None
         }
         "s3" => {
-            if std::env::var("KOSHA_INGEST_HOST").is_ok_and(|h| !h.is_empty()) {
+            if role == role::Role::Query {
                 println!("WAL: writes are forwarded to ingest; KOSHA_WAL_MODE=s3 applies there");
+                return None;
+            }
+            // An indexer accepts no writes. Opening the S3 WAL would recover
+            // (and could flush) the ingest writer's records if both shared
+            // a KOSHA_WAL_WRITER_ID, so it keeps an empty local WAL.
+            if role == role::Role::Indexer {
+                println!("WAL: indexer role accepts no writes; KOSHA_WAL_MODE=s3 ignored");
                 return None;
             }
             #[cfg(feature = "s3")]
@@ -1100,6 +1147,11 @@ impl AppState {
     }
 
     fn with_options(data_dir: PathBuf, options: StateOptions) -> Self {
+        let role = options.role.unwrap_or_else(|| {
+            role::resolve_role(&role::RoleEnv::from_process())
+                .unwrap_or_else(|e| fatal(&e))
+                .role
+        });
         std::fs::create_dir_all(&data_dir).ok();
         // Before the disk cache scans `data_dir`: transient tail segments of
         // an earlier process are never reused (#255).
@@ -1205,6 +1257,7 @@ impl AppState {
 
         let wal_store = options.wal_store.or_else(|| {
             wal_store_from_env(
+                role,
                 #[cfg(feature = "s3")]
                 s3_storage.as_ref(),
             )
@@ -1348,10 +1401,7 @@ impl AppState {
         // would work directly against the "gate readiness on actual
         // warmth" goal.
         #[cfg(feature = "s3")]
-        let is_ingest_role = std::env::var("KOSHA_INGEST_HOST")
-            .ok()
-            .filter(|h| !h.is_empty())
-            .is_none();
+        let is_ingest_role = role.accepts_writes();
         #[cfg(feature = "s3")]
         let mut synced_segments = std::collections::HashSet::new();
         let mut restored = 0usize;
@@ -1372,6 +1422,16 @@ impl AppState {
                     // ground-truth S3 check here rather than waiting for
                     // this namespace's *next* flush to notice — which, for
                     // an otherwise-idle namespace, might be never.
+                    // An indexer publishes compactions over manifests the
+                    // ingest writer committed: their segments are durable
+                    // by the publish protocol, and reconciling them is the
+                    // ingest pod's job.
+                    #[cfg(feature = "s3")]
+                    if role == role::Role::Indexer {
+                        for entry in &manifest.segments {
+                            synced_segments.insert(synced_key(&manifest, &ns, &entry.segment_id));
+                        }
+                    }
                     #[cfg(feature = "s3")]
                     if is_ingest_role {
                         if let Some(ref s3) = s3_storage {
@@ -1434,10 +1494,45 @@ impl AppState {
             );
         }
 
+        // The forwarding target. `resolve_role` guarantees it is set
+        // exactly when the role is `query`.
         let ingest_host = std::env::var("KOSHA_INGEST_HOST")
             .ok()
-            .filter(|h| !h.is_empty());
-        let query_role = ingest_host.is_some();
+            .filter(|h| !h.is_empty() && role == role::Role::Query);
+        let query_role = role == role::Role::Query;
+
+        // ── Writer lease (#254) ───────────────────────────────────────────
+        let lease_ttl = options.writer_lease_ttl.unwrap_or_else(|| {
+            writer_lease::ttl_from(std::env::var("KOSHA_WRITER_LEASE_TTL_MS").ok().as_deref())
+        });
+        let lease_enabled = role.accepts_writes()
+            && options.writer_lease.unwrap_or_else(|| {
+                writer_lease::enabled_from(std::env::var("KOSHA_WRITER_LEASE").ok().as_deref())
+            });
+        #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+        let mut lease_backend = writer_lease::LeaseBackend::ControlStore;
+        #[cfg(feature = "postgres")]
+        if lease_enabled && control_plane_kind == "postgres" {
+            if let Ok(db_url) = std::env::var("DATABASE_URL") {
+                match kosha_control::PgWriterLeaseStore::new(&db_url) {
+                    Ok(store) => lease_backend = writer_lease::LeaseBackend::Postgres(store),
+                    Err(e) => fatal(&format!("cannot connect the writer lease pool: {e}")),
+                }
+            }
+        }
+        let writer_leases =
+            writer_lease::WriterLeases::new(lease_enabled, lease_ttl, lease_backend);
+        if lease_enabled {
+            println!(
+                "writer lease: on (holder {}, ttl {} ms)",
+                writer_leases.holder(),
+                lease_ttl.as_millis()
+            );
+        } else if role.accepts_writes() {
+            println!("writer lease: off (KOSHA_WRITER_LEASE=off); manifest CAS is unfenced");
+        }
+        let compaction_on_ingest =
+            role::compaction_on_ingest(std::env::var("KOSHA_COMPACTION_ON_INGEST").ok().as_deref());
         let write_http_client = ingest_host.as_ref().map(|h| {
             println!("write-path requests will be forwarded to ingest at {h}");
             reqwest::blocking::Client::builder()
@@ -1575,6 +1670,9 @@ impl AppState {
 
         Self {
             controller: Mutex::new(control_store),
+            role,
+            writer_leases,
+            compaction_on_ingest,
             admin_auth_key: std::env::var("KOSHA_ADMIN_API_KEY")
                 .ok()
                 .filter(|k| !k.is_empty()),
@@ -1720,9 +1818,25 @@ impl AppState {
 
     /// Construct inside an `Arc` with `self_ref` wired up — the constructor
     /// `main` uses so handlers can spawn background jobs that own the state.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new_shared(data_dir: PathBuf) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
             let mut state = Self::new(data_dir);
+            state.self_ref = weak.clone();
+            state
+        })
+    }
+
+    /// [`Self::new_shared`] with the role `main` already resolved.
+    fn new_shared_as(data_dir: PathBuf, role: role::Role) -> Arc<Self> {
+        Arc::new_cyclic(|weak| {
+            let mut state = Self::with_options(
+                data_dir,
+                StateOptions {
+                    role: Some(role),
+                    ..Default::default()
+                },
+            );
             state.self_ref = weak.clone();
             state
         })
@@ -1789,10 +1903,7 @@ impl AppState {
     /// buffers, so they never start it. An explicit `/flush` stays an
     /// immediate visibility barrier.
     fn spawn_idle_flush_timer(self: &Arc<Self>) {
-        let forwards_writes = std::env::var("KOSHA_INGEST_HOST")
-            .ok()
-            .is_some_and(|h| !h.is_empty());
-        if forwards_writes {
+        if !self.role.accepts_writes() {
             return;
         }
         let Some(max_age) = flush_max_age_from_env() else {
@@ -1820,12 +1931,17 @@ impl AppState {
     /// cuts a segment per interval for slowly written namespaces; this is
     /// what keeps their segment count bounded without anyone calling
     /// `/v1/admin/compact-namespace`. Selection, fairness and backoff are in
-    /// `compaction_sched`. Query-role pods own no segments and never start it.
+    /// `compaction_sched`. Runs on `indexer` and `standalone` pods, and on
+    /// `ingest` unless `KOSHA_COMPACTION_ON_INGEST=false` (#254); query
+    /// pods own no segments and never start it.
     fn spawn_compaction_scheduler(self: &Arc<Self>) {
-        let forwards_writes = std::env::var("KOSHA_INGEST_HOST")
-            .ok()
-            .is_some_and(|h| !h.is_empty());
-        if forwards_writes {
+        if !self.runs_compaction_scheduler() {
+            if self.role == role::Role::Ingest {
+                println!(
+                    "compaction scheduler: off on ingest (KOSHA_COMPACTION_ON_INGEST=false); \
+                     an indexer pod compacts"
+                );
+            }
             return;
         }
         let Some(interval) = self.compaction.config().interval else {
@@ -1845,6 +1961,170 @@ impl AppState {
                 run_compaction_scheduler_tick(&state, Instant::now());
             })
             .expect("failed to spawn compaction scheduler thread");
+    }
+
+    /// Whether this pod runs the background compaction scheduler (#254).
+    fn runs_compaction_scheduler(&self) -> bool {
+        self.role
+            .runs_compaction_scheduler(self.compaction_on_ingest)
+    }
+
+    /// Renew this writer's leases every TTL/3 (#254). A lease another
+    /// writer took over fences its namespace (see [`Self::fence_namespace`]).
+    fn spawn_writer_lease_renewer(self: &Arc<Self>) {
+        if !self.writer_leases.enabled() {
+            return;
+        }
+        let every = (self.writer_leases.ttl() / 3).max(Duration::from_millis(100));
+        let weak = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("kosha-writer-lease".into())
+            .spawn(move || loop {
+                std::thread::sleep(every);
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                state.renew_writer_leases();
+            })
+            .expect("failed to spawn writer lease thread");
+    }
+
+    /// One renewal pass over every held writer lease.
+    fn renew_writer_leases(&self) {
+        for ns in self.writer_leases.renew_all(&self.controller) {
+            let lock = self.publication_lock(&ns);
+            let _guard = lock.lock().unwrap();
+            self.fence_namespace(&ns, "its writer lease was taken over");
+        }
+    }
+
+    /// The fencing token this writer presents for `ns` (#254), taking the
+    /// lease if it holds none. `Ok(None)` when leases are off. A refused
+    /// acquire of a lease this writer held before means another writer
+    /// took it over: the namespace is fenced.
+    fn writer_token(&self, ns: &NamespaceId) -> Result<Option<u64>, KoshaError> {
+        let held_before = self.writer_leases.held_before(ns);
+        match self.writer_leases.token(ns, &self.controller) {
+            Err(fenced @ KoshaError::Fenced { .. }) => {
+                if held_before {
+                    let lock = self.publication_lock(ns);
+                    let _guard = lock.lock().unwrap();
+                    self.fence_namespace(ns, "another writer took its lease over");
+                }
+                Err(fenced)
+            }
+            other => other,
+        }
+    }
+
+    /// Refuse a write to `ns` this writer does not own (#254): `Err` is a
+    /// ready-to-send 503 + `Retry-After`. Takes the lease when it is free,
+    /// so the first write to a namespace claims it.
+    fn ensure_writable(&self, ns: &NamespaceId) -> Result<(), String> {
+        match self.writer_token(ns) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.write_refusal(&error)),
+        }
+    }
+
+    /// 503 + `Retry-After` for a write this writer may not make.
+    fn write_refusal(&self, error: &KoshaError) -> String {
+        retry_after(
+            json_error(503, &format!("write refused: {error}")),
+            self.writer_leases.retry_after_secs(),
+        )
+    }
+
+    /// Another writer owns `ns` (#254). Stop accepting writes for it and
+    /// drop this writer's unpublished local state the way a query replica
+    /// installs a manifest: forget the namespace, then restore the
+    /// committed one. Writes this writer acknowledged but never published
+    /// stay in its WAL (they are not replayed while the namespace's WAL
+    /// checkpoint belongs to the other writer). The caller holds `ns`'s
+    /// publication lock.
+    fn fence_namespace(&self, ns: &NamespaceId, why: &str) {
+        if self.writer_leases.lost(ns) {
+            eprintln!(
+                "WARN: writer lease: ns={} fenced ({why}); refusing writes for it and dropping \
+                 unpublished local state",
+                ns.0
+            );
+        }
+        self.indexer.forget_namespace(ns);
+        self.forget_namespace_caches(ns);
+        match self.hydrated_remote_manifest(ns) {
+            Ok(Some(remote)) => {
+                #[cfg(feature = "s3")]
+                {
+                    let mut synced = self.synced_segments.lock().unwrap();
+                    for entry in &remote.segments {
+                        synced.insert(synced_key(&remote, ns, &entry.segment_id));
+                    }
+                }
+                self.indexer.restore_manifest(ns.clone(), remote);
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "WARN: writer lease: cannot reload ns={} after fencing: {error}; it reloads on \
+                 the next successful write",
+                ns.0
+            ),
+        }
+    }
+
+    /// Indexer role (#254): bring `ns` up to the committed manifest before
+    /// planning a compaction. A namespace with nothing unpublished here
+    /// installs the committed version the way a query replica does; one
+    /// with an unpublished compaction keeps it, and its publish rebases.
+    fn indexer_follow_namespace(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
+        let lock = self.publication_lock(ns);
+        let _guard = lock.lock().unwrap();
+        let clean = self
+            .indexer
+            .publication_snapshot(ns)
+            .is_none_or(|(published, local)| published == local.version);
+        let local = self.indexer.manifest_version(ns);
+        let Some(remote) = self.hydrated_remote_manifest(ns)? else {
+            if local.is_some() && clean {
+                self.indexer.forget_namespace(ns);
+                self.forget_namespace_caches(ns);
+            }
+            return Ok(());
+        };
+        if !clean || local.is_some_and(|v| v >= remote.version) {
+            return Ok(());
+        }
+        #[cfg(feature = "s3")]
+        {
+            let mut synced = self.synced_segments.lock().unwrap();
+            for entry in &remote.segments {
+                synced.insert(synced_key(&remote, ns, &entry.segment_id));
+            }
+        }
+        self.indexer.restore_manifest(ns.clone(), remote);
+        Ok(())
+    }
+
+    /// Indexer role: learn every namespace the control store lists (and
+    /// newer versions of the known ones), skipping namespaces a pass is
+    /// compacting right now. Runs before each scheduler tick.
+    fn indexer_follow_all(&self) {
+        let versions = match self.controller.lock().unwrap().manifest_versions() {
+            Ok(versions) => versions,
+            Err(error) => {
+                eprintln!("WARN: indexer: control store version poll failed: {error}");
+                return;
+            }
+        };
+        let running = self.compaction.running_namespaces();
+        for (ns, stored) in versions {
+            if running.contains(&ns) || self.indexer.manifest_version(&ns) == Some(stored) {
+                continue;
+            }
+            if let Err(error) = self.indexer_follow_namespace(&ns) {
+                eprintln!("WARN: indexer: cannot follow ns={}: {error}", ns.0);
+            }
+        }
     }
 
     /// Start local segment reclamation (#239) on every pod. Every
@@ -2482,6 +2762,10 @@ impl AppState {
     /// [`MANIFEST_REBASE_ATTEMPTS`] times with a short jittered pause. A
     /// conflict the rebase cannot resolve (see `rebase_onto`) is returned
     /// as `ManifestConflict`, which the HTTP layer maps to 409.
+    ///
+    /// A writer pod presents its writer-lease token on the CAS (#254). A
+    /// `Fenced` rejection is never rebased: the namespace is fenced
+    /// ([`Self::fence_namespace`]) and the error returned (HTTP 503).
     fn publish_namespace_with(
         &self,
         ns: &NamespaceId,
@@ -2495,12 +2779,25 @@ impl AppState {
                 return Ok(());
             };
             let started = Instant::now();
+            // Before the upload: a writer that cannot own the namespace
+            // uploads nothing.
+            let held_before = self.writer_leases.held_before(ns);
+            let token = match self.writer_leases.token(ns, &self.controller) {
+                Ok(token) => token,
+                Err(fenced @ KoshaError::Fenced { .. }) => {
+                    if held_before {
+                        self.fence_namespace(ns, "another writer took its lease over");
+                    }
+                    return Err(fenced);
+                }
+                Err(error) => return Err(error),
+            };
             upload(&manifest)?;
-            let committed = self.controller.lock().unwrap().compare_and_swap_manifest(
-                ns,
-                expected_version,
-                manifest.clone(),
-            );
+            let committed = self
+                .controller
+                .lock()
+                .unwrap()
+                .compare_and_swap_manifest_fenced(ns, expected_version, manifest.clone(), token);
             match committed {
                 Ok(()) => {
                     self.indexer.acknowledge_manifest(ns, &manifest)?;
@@ -2542,6 +2839,10 @@ impl AppState {
                     if rebases > 1 {
                         std::thread::sleep(rebase_backoff(rebases));
                     }
+                }
+                Err(fenced @ KoshaError::Fenced { .. }) => {
+                    self.fence_namespace(ns, "a manifest commit was fenced");
+                    return Err(fenced);
                 }
                 Err(e) => return Err(e),
             }
@@ -4932,7 +5233,17 @@ fn main() {
     // pod exits instead of serving unauthenticated traffic.
     auth::init_global();
 
-    let role = std::env::var("KOSHA_ROLE").unwrap_or_else(|_| "query".into());
+    // Before anything else reads the environment: a pod whose KOSHA_ROLE
+    // contradicts the rest of its configuration exits here (#254).
+    let role = match role::resolve_role(&role::RoleEnv::from_process()) {
+        Ok(resolved) => {
+            if let Some(warning) = resolved.warning {
+                eprintln!("WARN: {warning}");
+            }
+            resolved.role
+        }
+        Err(message) => fatal(&message),
+    };
     let port = std::env::var("KOSHA_HTTP_PORT").unwrap_or_else(|_| "8080".into());
     let data_dir = std::env::var("KOSHA_DATA_DIR").unwrap_or_else(|_| "/var/lib/kosha/data".into());
     // `set_read_timeout`/`set_write_timeout` (see `serve`) are per-syscall,
@@ -4959,7 +5270,7 @@ fn main() {
         .unwrap_or(300);
     let addr = format!("0.0.0.0:{port}");
 
-    let state = AppState::new_shared(PathBuf::from(data_dir.clone()));
+    let state = AppState::new_shared_as(PathBuf::from(data_dir.clone()), role);
     // Bind the listener first so a slow warmup doesn't delay the port;
     // `/readyz` keeps HPA/kube endpoints from sending traffic while it
     // runs (Tier 1 O2). Liveness (`/healthz`) is unaffected.
@@ -4970,6 +5281,7 @@ fn main() {
     state.spawn_posting_promoter();
     state.spawn_idle_flush_timer();
     state.spawn_compaction_scheduler();
+    state.spawn_writer_lease_renewer();
     state.spawn_manifest_refresher();
     state.spawn_local_gc();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
@@ -5120,6 +5432,16 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         &state.write_http_client,
     ) {
         (Err(resp), _, _) => resp.clone(),
+        // An indexer (#254) serves only the compaction admin API.
+        (Ok(_), _, _)
+            if state.role == role::Role::Indexer && !role::Role::indexer_serves(&request_line) =>
+        {
+            json_error(
+                404,
+                "not served by an indexer pod (KOSHA_ROLE=indexer): it serves only \
+                 /v1/admin/compact* and /v1/admin/compaction-*",
+            )
+        }
         (Ok(_), Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
             forward_to_ingest(client, ingest_host, &request_line, &headers, &body)
         }
@@ -6213,6 +6535,8 @@ fn index_into(
     documents: Vec<kosha_core::Document>,
 ) -> Result<usize, String> {
     let ns = ns.clone();
+    // Only the namespace's writer-lease holder accepts writes (#254).
+    state.ensure_writable(&ns)?;
     // Unindexed backlog at its cap (#255): refuse before buffering more.
     // Per written namespace, so a sharded namespace caps each shard.
     if let Some(response) = state.unindexed_backpressure(&ns) {
@@ -6406,6 +6730,7 @@ fn replace_into(
     documents: Vec<kosha_core::Document>,
 ) -> Result<usize, String> {
     let namespace = namespace.clone();
+    state.ensure_writable(&namespace)?;
     if let Some(response) = state.unindexed_backpressure(&namespace) {
         return Err(response);
     }
@@ -6661,6 +6986,7 @@ fn delete_in(
     ns: &NamespaceId,
     filter: &kosha_core::FilterClause,
 ) -> Result<usize, String> {
+    state.ensure_writable(ns)?;
     #[cfg(feature = "s3")]
     if let Some(manifest) = state.indexer.manifest_cloned(ns) {
         let paths: Vec<PathBuf> = manifest
@@ -8343,6 +8669,10 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
         }
     };
     let run_async = req.get("async").and_then(|v| v.as_bool()).unwrap_or(false);
+    // An indexer (#254) may not have seen the namespace yet.
+    if state.role == role::Role::Indexer {
+        state.indexer_follow_all();
+    }
     // Prefer the name as given (migration uses bare index names); fall back
     // to tenant-scoped lookup used by v1 routes.
     let ns = {
@@ -8503,8 +8833,7 @@ fn handle_compaction_status(state: &AppState) -> String {
             ))
         })
         .collect();
-    let forwards_writes = state.ingest_host.is_some();
-    let enabled = !forwards_writes && state.compaction.config().interval.is_some();
+    let enabled = state.runs_compaction_scheduler() && state.compaction.config().interval.is_some();
     json_ok(&state.compaction.status_json(enabled, &live))
 }
 
@@ -8731,6 +9060,13 @@ fn compaction_pass_with(
     opts: kosha_write::CompactOptions,
     mut on_group: impl FnMut(&compaction_sched::PassOutcome),
 ) -> Result<compaction_sched::PassOutcome, String> {
+    // An indexer plans on the latest committed manifest (#254); its
+    // publish still rebases onto anything committed during the merge.
+    if state.role == role::Role::Indexer {
+        state
+            .indexer_follow_namespace(ns)
+            .map_err(|e| format!("cannot read the committed manifest: {e}"))?;
+    }
     let segments_before = state
         .indexer
         .manifest_cloned(ns)
@@ -8894,6 +9230,11 @@ fn evict_superseded_inputs(
 /// registry pick the due ones under the global budget, and start a tiered
 /// pass on a background thread for each. Never blocks on a merge.
 fn run_compaction_scheduler_tick(state: &Arc<AppState>, now: Instant) -> Vec<NamespaceId> {
+    // An indexer (#254) learns namespaces and their new segments from the
+    // control store, not from writes.
+    if state.role == role::Role::Indexer {
+        state.indexer_follow_all();
+    }
     let policy = state.indexer.compaction_policy().clone();
     let candidates: Vec<compaction_sched::Candidate> = state
         .indexer
@@ -10407,6 +10748,7 @@ mod tests {
             StateOptions {
                 wal_store: Some(Arc::new(store)),
                 control_store: Some(Box::new(control.clone())),
+                ..Default::default()
             },
         )
     }
