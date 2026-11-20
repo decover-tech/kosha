@@ -1,0 +1,78 @@
+name: integration
+
+# Read/write split end to end (#256): an ingest pod and a query pod built
+# from this commit, over MinIO + Postgres, driven over HTTP by
+# scripts/integration/run.py (S3 upload + CAS publish, manifest refresher,
+# write forwarding, deletes, concurrent loaders, tenant isolation,
+# compaction, ingest restart with a wiped disk, cold query restart). Then the
+# Postgres CAS tests that `cargo test` skips without a database. Known bugs
+# are listed in scripts/integration/expected_failures.json; anything else
+# fails the job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  COMPOSE: docker compose -f docker-compose.yml -f scripts/integration/docker-compose.integration.yml
+
+jobs:
+  integration:
+    name: ingest + query over MinIO + Postgres
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stack
+        run: $COMPOSE up --build -d
+
+      - name: Wait for both pods
+        run: |
+          for port in 8080 8081; do
+            for i in $(seq 1 90); do
+              curl -fsS "http://localhost:$port/readyz" >/dev/null && break
+              [ "$i" = 90 ] && { echo "pod on :$port not ready"; exit 1; }
+              sleep 2
+            done
+          done
+
+      - name: Self-test the runner
+        run: python3 scripts/integration/run.py --self-test
+
+      - name: Run integration scenarios
+        run: |
+          python3 scripts/integration/run.py \
+            --ingest http://localhost:8080 --query http://localhost:8081 \
+            --restart-cmd scripts/integration/compose_restart.sh \
+            --out integration-report.json
+
+      - uses: dtolnay/rust-toolchain@v1
+        if: ${{ !cancelled() }}
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !cancelled() }}
+        with:
+          key: postgres-cas
+
+      - name: Postgres CAS tests
+        if: ${{ !cancelled() }}
+        run: |
+          $COMPOSE exec -T postgres createdb -U kosha kosha_cas_test
+          KOSHA_TEST_DATABASE_URL=postgres://kosha:kosha-dev@localhost:5432/kosha_cas_test \
+            cargo test --locked -p kosha-control --features postgres --test postgres_cas -- --ignored
+
+      - name: Server logs
+        if: failure()
+        run: $COMPOSE logs --no-color --tail 500 kosha-ingest kosha-query
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-report
+          path: integration-report.json
+          if-no-files-found: ignore

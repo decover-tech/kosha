@@ -89,6 +89,7 @@ Outside `crates/`:
   here (`make proto-lint`), then goes into `kosha-core` and `kosha-server`.
 - `clients/python/` is the OpenSearch-compatible Python client (`kosha-client` on PyPI).
 - `scripts/conformance/` is the end-to-end BM25 and filter correctness suite;
+  `scripts/integration/` runs an ingest pod and a query pod over MinIO + Postgres;
   `scripts/bench/` holds the large-scale benchmark harness.
 - `docs/` has the configuration reference and integration guides.
 
@@ -146,7 +147,8 @@ What needs the stack:
 | `cargo test --all-features` | nothing |
 | Conformance suite, `scripts/conformance/run.py --spawn target/release/kosha-server` | nothing (in-memory control plane; the restart checkpoint is skipped) |
 | Conformance suite as CI runs it (with a cold restart) | `docker compose -f docker-compose.yml -f scripts/conformance/docker-compose.conformance.yml up --build -d`; see [scripts/conformance/README.md](scripts/conformance/README.md) |
-| `postgres_cas` integration test (`#[ignore]`d) | a **disposable** Postgres: `KOSHA_TEST_DATABASE_URL=postgres://... cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored` |
+| Integration suite (ingest + query pods, restarts, tenants) | `docker compose -f docker-compose.yml -f scripts/integration/docker-compose.integration.yml up --build -d`; see [scripts/integration/README.md](scripts/integration/README.md). `run.py --spawn` runs the single-process subset without Docker |
+| `postgres_cas` integration test (`#[ignore]`d; CI runs it in the integration job) | a **disposable** Postgres: `KOSHA_TEST_DATABASE_URL=postgres://... cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored` |
 | Quickstart (`kosha` CLI or `make quickstart`) | `docker compose up --build` |
 
 The conformance suite and the `scripts/bench/` harness set `KOSHA_COMPACTION_INTERVAL_MS=0`
@@ -164,7 +166,9 @@ All of these are CI gates. Run them locally first:
     docker build -t kosha:ci .   # if you touched the Dockerfile or build config
 
 CI also runs `buf lint` on `proto/` (`make proto-lint`), the bench-hook script tests
-(`make bench-hook-test`) and the conformance suite against the Docker Compose stack.
+(`make bench-hook-test`), the conformance suite against the Docker Compose stack, and the
+integration suite (`.github/workflows/integration.yml`: ingest + query pods, then the
+`postgres_cas` tests).
 
 ## Benchmarks
 

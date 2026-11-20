@@ -713,6 +713,7 @@ back requires converting both formats. The SQL column needs no schema change.
     gen/                    generated stubs + OpenAPI spec (git-ignored)
     tools/codegen/          code generation scripts and docs
     scripts/conformance/    end-to-end BM25 + filter correctness suite
+    scripts/integration/    ingest + query pods over MinIO + Postgres (CI job)
     scripts/bench/          large-scale benchmark harness
     docs/                   configuration reference, development guides
     DESIGN.md               architecture document
