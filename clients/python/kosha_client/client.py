@@ -37,6 +37,9 @@ class KoshaClient:
     * ``index()``   — single-document index
     * ``bulk()``    — multi-document index via ``opensearchpy.helpers.bulk``
     * ``count()``   — document count
+    * ``get()`` / ``mget()`` — fetch by id (one search per document; sees
+                      what search sees, no realtime GET)
+    * ``msearch()`` — several searches, run as N sequential requests
     * ``update()``  — update by id
     * ``update_by_query()`` — synchronous or task-polled scripted updates
     * ``delete_by_query()``  — delete matching documents
@@ -51,6 +54,7 @@ class KoshaClient:
         max_retries: int = 3,
         retry_on_timeout: bool = True,
         pool_maxsize: int = 20,
+        consistency: str | None = None,
         **kwargs: Any,
     ) -> None:
         # Normalise the Kosha base URL.  Resolution order:
@@ -96,6 +100,15 @@ class KoshaClient:
             retry_on_timeout=retry_on_timeout,
         )
 
+        # Read-your-writes (#255): ``"strong"`` searches also scan writes the
+        # server has acknowledged but not indexed yet, so a write is
+        # searchable as soon as it returns, with no ``/flush``. ``None``
+        # (the default) leaves the choice to the server
+        # (``KOSHA_DEFAULT_CONSISTENCY``, itself ``strong`` by default).
+        if consistency is not None and consistency not in ("strong", "eventual"):
+            raise ValueError("consistency must be 'strong', 'eventual' or None")
+        self._consistency = consistency
+
         self._kosha_url = kosha_url
         self._auth = http_auth
         self._timeout = timeout
@@ -139,8 +152,7 @@ class KoshaClient:
 
     # ── Search ─────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _wants_refresh(params: dict) -> bool:
+    def _wants_refresh(self, params: dict) -> bool:
         """Whether a write asked to be visible on return (ES ``refresh``).
 
         ``True``/``"true"``/``""`` (bare ``?refresh``) and ``"wait_for"`` all
@@ -148,11 +160,18 @@ class KoshaClient:
         refresh to wait on, so both are an explicit ``/flush``. Anything else
         (the default) leaves visibility to the server's idle-buffer flush
         (``KOSHA_FLUSH_MAX_AGE_MS``, ~1 s), like ES's ``refresh_interval``.
+        With ``consistency="strong"`` a write is searchable on return
+        without one (#255), so ``"wait_for"`` needs no flush.
         """
         refresh = params.get("refresh", False)
         if isinstance(refresh, bool):
             return refresh
-        return str(refresh).strip().lower() in ("", "true", "wait_for")
+        refresh = str(refresh).strip().lower()
+        if refresh == "wait_for" and self._consistency == "strong":
+            # ``wait_for`` only asks for the write to be searchable on
+            # return, which strong searches already guarantee (#255).
+            return False
+        return refresh in ("", "true", "wait_for")
 
     def _flush(self, namespace: str) -> None:
         self._request("POST", "flush", {"namespace": namespace})
@@ -167,7 +186,11 @@ class KoshaClient:
         return str(ns)
 
     def search(
-        self, index: str | None = None, body: dict | None = None, **params: Any
+        self,
+        index: str | None = None,
+        body: dict | None = None,
+        rerank: dict | None = None,
+        **params: Any,
     ) -> dict:
         """Run an OpenSearch search body against Kosha.
 
@@ -175,11 +198,18 @@ class KoshaClient:
         ``_translate_search``). A clause Kosha cannot express raises
         ``KoshaRequestError(400)`` naming it. It is never dropped: dropping
         a filter silently returns documents the caller excluded.
+
+        ``rerank`` (or a ``"rerank"`` key in the body) asks the server to
+        rerank the top hits with an external model; see ``rerank_spec``.
         """
         ns = self._resolve_ns(index)
         body = body or {}
+        if rerank is not None:
+            body = {**body, "rerank": rerank}
         kosha_body, context = self._translate_search(body, params)
         kosha_body["namespace"] = ns
+        if self._consistency is not None:
+            kosha_body["consistency"] = self._consistency
 
         start = time.monotonic()
         try:
@@ -192,6 +222,64 @@ class KoshaClient:
                 raise
         took_ms = int((time.monotonic() - start) * 1000)
         return self._build_search_response(result, took_ms, context)
+
+    # ── Rerank ─────────────────────────────────────────────────────────────
+
+    _RERANK_KEYS = frozenset({"provider", "model", "field", "top_n", "timeout_ms", "query"})
+
+    @staticmethod
+    def rerank_spec(
+        field: str,
+        *,
+        model: str | None = "rerank-v3.5",
+        top_n: int | None = None,
+        provider: str = "cohere",
+        timeout_ms: int | None = None,
+        query: str | None = None,
+    ) -> dict:
+        """The ``rerank`` clause equivalent to a Cohere rerank call.
+
+        ``co.rerank(model=m, query=q, documents=[hit[field] ...], top_n=n)``
+        over the top ``n`` search hits becomes
+        ``client.search(index, body, rerank=KoshaClient.rerank_spec(field,
+        model=m, top_n=n))``. The server sends the same request to the
+        provider it has configured under ``provider`` (the API key stays on
+        the server). ``query`` defaults to the search's query text; set it
+        for a kNN-only search. ``top_n`` defaults to ``from + size`` and
+        must be at least that. If the provider times out or fails, hits
+        come back in search order and the response has
+        ``rerank.degraded = True``.
+        """
+        spec: dict = {"provider": provider, "field": field}
+        for key, value in (
+            ("model", model),
+            ("top_n", top_n),
+            ("timeout_ms", timeout_ms),
+            ("query", query),
+        ):
+            if value is not None:
+                spec[key] = value
+        return spec
+
+    @classmethod
+    def _rerank(cls, spec: Any) -> dict:
+        """Validate a ``rerank`` clause; Cohere's ``rank_fields`` is accepted
+        for ``field`` (one field only)."""
+        if not isinstance(spec, dict):
+            raise cls._unsupported(f"rerank {spec!r}")
+        spec = dict(spec)
+        rank_fields = spec.pop("rank_fields", None)
+        if rank_fields is not None:
+            fields = cls._as_list(rank_fields)
+            if len(fields) != 1 or "field" in spec:
+                raise cls._unsupported("rerank over more than one field")
+            spec["field"] = fields[0]
+        unknown = set(spec) - cls._RERANK_KEYS
+        if unknown:
+            raise cls._unsupported(f"rerank option(s) {sorted(unknown)}")
+        if not spec.get("provider") or not spec.get("field"):
+            raise cls._unsupported("rerank without provider and field")
+        return spec
 
     # ── Query translation ──────────────────────────────────────────────────
 
@@ -214,6 +302,44 @@ class KoshaClient:
             return []
         return list(value) if isinstance(value, (list, tuple)) else [value]
 
+    @classmethod
+    def _translate_highlight(cls, highlight: dict) -> dict:
+        """ES ``highlight`` → Kosha's: every field, with its tags.
+
+        ``fields`` is either a map of field name to options or ES's ordered
+        list of single-key maps. Each field keeps its own ``pre_tags`` /
+        ``post_tags``; top-level tags pass through as the fallback. Other
+        highlighter options (``number_of_fragments``, ``type``, ...) change
+        only how a hit is marked up, never which documents match, so they
+        are dropped.
+        """
+        if not isinstance(highlight, dict):
+            raise cls._unsupported("highlight that is not an object")
+        raw = highlight.get("fields")
+        entries: list = []
+        if isinstance(raw, dict):
+            entries = list(raw.items())
+        elif isinstance(raw, (list, tuple)) and all(isinstance(e, dict) for e in raw):
+            entries = [item for entry in raw for item in entry.items()]
+        else:
+            raise cls._unsupported("highlight without a `fields` object")
+        spec: dict = {}
+        for key in ("pre_tags", "post_tags"):
+            tags = cls._as_list(highlight.get(key))
+            if tags:
+                spec[key] = tags
+        fields: dict = {}
+        for name, options in entries:
+            options = options or {}
+            field_spec = {}
+            for key in ("pre_tags", "post_tags"):
+                tags = cls._as_list(options.get(key))
+                if tags:
+                    field_spec[key] = tags
+            fields[name] = field_spec
+        spec["fields"] = fields
+        return spec
+
     @staticmethod
     def _scalar(value: Any) -> str:
         """A filter value as Kosha compares it: always a string.
@@ -233,8 +359,8 @@ class KoshaClient:
     def _to_filter(cls, clause: Any) -> dict:
         """Translate an OpenSearch filter clause into a Kosha filter.
 
-        Handles ``term``, ``terms``, ``range``, ``exists``, ``match_all``
-        and ``bool`` at any depth. Anything else raises.
+        Handles ``term``, ``terms``, ``range``, ``exists``, ``prefix``,
+        ``match_all`` and ``bool`` at any depth. Anything else raises.
 
         ``bool`` follows OpenSearch's rules for ``should``: with no
         ``minimum_should_match``, the clauses are required (at least one)
@@ -297,6 +423,9 @@ class KoshaClient:
                 raise cls._unsupported(f"exists clause {clause!r}")
             return {"exists": {"field": field}}
 
+        if kind == "prefix":
+            return cls._prefix_filter(clause, spec)
+
         if kind == "bool":
             spec = spec or {}
             unknown = set(spec) - {
@@ -326,6 +455,39 @@ class KoshaClient:
 
         raise cls._unsupported(f"'{kind}' as a filter")
 
+    # Options of OpenSearch's long-form ``prefix`` that only affect scoring
+    # or query rewriting, never which documents match.
+    _IGNORED_PREFIX_KEYS = frozenset({"boost", "rewrite"})
+
+    @classmethod
+    def _prefix_filter(cls, clause: dict, spec: Any) -> dict:
+        """OpenSearch ``prefix`` (short or long form) → Kosha's ``prefix``.
+
+        Kosha's ``prefix`` is case-sensitive by default, as OpenSearch's is,
+        so ``case_insensitive`` is only sent when the caller set it.
+        """
+        fields = {f: v for f, v in (spec or {}).items() if f != "boost"}
+        if len(fields) != 1:
+            raise cls._unsupported(f"prefix clause {clause!r}")
+        field, value = next(iter(fields.items()))
+        if field == "_id":
+            raise cls._unsupported("a prefix filter on _id")
+        if isinstance(value, dict):
+            unknown = set(value) - {"value", "case_insensitive"} - cls._IGNORED_PREFIX_KEYS
+            if unknown:
+                raise cls._unsupported(f"prefix option(s) {sorted(unknown)}")
+            prefix = value.get("value")
+            case_insensitive = value.get("case_insensitive", False)
+            if not isinstance(case_insensitive, bool):
+                raise cls._unsupported(f"prefix case_insensitive={case_insensitive!r}")
+        else:
+            prefix, case_insensitive = value, False
+        if not isinstance(prefix, str):
+            raise cls._unsupported(f"a non-string prefix {prefix!r}")
+        if case_insensitive:
+            return {"prefix": {field: {"value": prefix, "case_insensitive": True}}}
+        return {"prefix": {field: prefix}}
+
     @classmethod
     def _should_need(cls, bool_spec: dict, has_required: bool) -> int:
         """How many ``should`` clauses must match (OpenSearch's default)."""
@@ -349,33 +511,39 @@ class KoshaClient:
     def _text_leaf(cls, clause: dict) -> tuple[str, Any] | None:
         """``("text"|"phrase"|"wildcard", payload)`` for a full-text leaf.
 
-        Kosha has one text index covering every text field of a document,
-        so the field a clause names selects nothing: ``match`` on ``title``
-        and on ``content`` are the same query.
+        A text payload is ``(text, operator, fields)``: ``fields`` are the
+        Kosha field specs (``"title^2"``) the clause searches, ``()`` for
+        every text field. Kosha scores a multi-field query as the sum of
+        each field's boosted BM25 (``multi_match`` ``most_fields``);
+        ``best_fields`` and ``cross_fields`` are mapped to the same sum.
         """
         if not isinstance(clause, dict) or len(clause) != 1:
             return None
         kind, spec = next(iter(clause.items()))
         if kind == "match":
-            for _field, value in (spec or {}).items():
+            for field, value in (spec or {}).items():
+                boost = 1
                 if isinstance(value, dict):
                     extra = set(value) - {"query", "operator", "boost"}
                     if extra:
                         raise cls._unsupported(f"match option(s) {sorted(extra)}")
                     text = str(value.get("query", ""))
                     operator = str(value.get("operator", "or")).lower()
+                    boost = value.get("boost", 1)
                 else:
                     text, operator = str(value), "or"
-                return "text", (text, operator)
+                return "text", (text, operator, (cls._field_spec(field, boost),))
             return None
         if kind == "multi_match":
             spec = spec or {}
             kind_of = spec.get("type", "best_fields")
             if kind_of not in ("best_fields", "most_fields", "cross_fields"):
                 raise cls._unsupported(f"multi_match type {kind_of!r}")
+            fields = tuple(str(f) for f in cls._as_list(spec.get("fields")))
             return "text", (
                 str(spec.get("query", "")),
                 str(spec.get("operator", "or")).lower(),
+                () if any(cls._is_all_fields(f) for f in fields) else fields,
             )
         if kind == "match_phrase":
             for field, value in (spec or {}).items():
@@ -401,6 +569,49 @@ class KoshaClient:
             return None
         return None
 
+    @staticmethod
+    def _is_all_fields(spec: str) -> bool:
+        name = spec.split("^", 1)[0].strip()
+        return name in ("", "*", "_all")
+
+    @classmethod
+    def _field_spec(cls, field: str, boost: Any = 1) -> str:
+        """``field`` or ``field^boost``; ``""`` when it names every field."""
+        if cls._is_all_fields(field):
+            return ""
+        try:
+            boost = float(boost)
+        except (TypeError, ValueError):
+            raise cls._unsupported(f"boost {boost!r}") from None
+        if boost == 1:
+            return field
+        return f"{field}^{boost:g}"
+
+    @classmethod
+    def _merge_fields(cls, groups) -> tuple:
+        """The union of several clauses' field lists: ``()`` (every field)
+        if any clause searches every field, else each field once, with its
+        highest boost."""
+        best: "dict[str, float]" = {}
+        for fields in groups:
+            if not fields or any(not f for f in fields):
+                return ()
+            for spec in fields:
+                name, _, boost = spec.partition("^")
+                value = float(boost) if boost else 1.0
+                best[name] = max(best.get(name, 0.0), value)
+        return tuple(cls._field_spec(name, boost) for name, boost in best.items())
+
+    @classmethod
+    def _merge_text(cls, payloads) -> list:
+        """Clauses with the same text and operator are one clause over the
+        union of their fields (the keyword compiler repeats a term per
+        field)."""
+        merged: "dict[tuple, list]" = {}
+        for text, operator, fields in payloads:
+            merged.setdefault((text, operator), []).append(fields)
+        return [(text, op, cls._merge_fields(groups)) for (text, op), groups in merged.items()]
+
     @classmethod
     def _plan_query(cls, query: dict | None) -> dict:
         """Split an OpenSearch query into the parts Kosha's query has.
@@ -413,8 +624,8 @@ class KoshaClient:
         type Kosha does not have).
         """
         plan: dict = {
-            "required_text": [],   # [(text, operator)] every one must match
-            "any_text": [],        # [(text, operator)] at least one must match
+            "required_text": [],   # [(text, operator, fields)] every one must match
+            "any_text": [],        # [(text, operator, fields)] at least one must match
             "phrase": None,
             "wildcard": None,
             "knn": None,
@@ -509,9 +720,10 @@ class KoshaClient:
             )
             return
 
-        # At least one of several text clauses. The keyword compiler emits
-        # this shape for one term searched across several fields: the same
-        # clause repeated per field, which is a single clause here.
+        # At least one of several text clauses. A typical keyword query
+        # builder emits this shape for one term searched across several
+        # fields: the same clause repeated per field, which is a single
+        # clause here.
         leaves = []
         for child in should:
             leaf = cls._text_leaf(child)
@@ -525,7 +737,7 @@ class KoshaClient:
             raise cls._unsupported("a should group mixing text, phrase and wildcard")
         what = kinds.pop()
         if what == "text":
-            distinct = list(dict.fromkeys(payload for _, payload in leaves))
+            distinct = cls._merge_text(payload for _, payload in leaves)
             if len(distinct) == 1:
                 plan["required_text"].append(distinct[0])
             else:
@@ -536,15 +748,21 @@ class KoshaClient:
             }
             if len(same) > 1:
                 raise cls._unsupported(f"a should group of different {what} clauses")
-            cls._set_once(plan, what, leaves[0][1])
+            chosen = dict(leaves[0][1])
+            if what == "phrase":
+                # The same phrase in several fields: any one of them.
+                fields = list(dict.fromkeys(p["field"] for _, p in leaves))
+                if len(fields) > 1:
+                    chosen["fields"] = fields
+            cls._set_once(plan, what, chosen)
 
     @classmethod
     def _knn(cls, spec: dict) -> dict:
         """``{"knn": {field: {vector, k, filter}}}`` → Kosha's kNN.
 
         The filter is carried into the vector search itself. It used to be
-        dropped here, so a matter-scoped semantic search returned the
-        nearest chunks of every matter in the index.
+        dropped here, so a project-scoped semantic search returned the
+        nearest chunks of every project in the index.
         """
         for field, options in (spec or {}).items():
             if not isinstance(options, dict):
@@ -569,28 +787,34 @@ class KoshaClient:
         raise cls._unsupported(f"knn clause {spec!r}")
 
     @classmethod
-    def _resolve_text(cls, plan: dict) -> tuple[str, str | None]:
-        """The plan's text clauses as one ``(query_text, operator)``."""
-        required = list(dict.fromkeys(plan["required_text"]))
-        any_of = list(dict.fromkeys(plan["any_text"]))
+    def _resolve_text(cls, plan: dict) -> tuple[str, str | None, tuple]:
+        """The plan's text clauses as one ``(query_text, operator, fields)``.
+
+        Kosha's query has one field list for all of its text. Clauses on
+        different fields are searched over the union of those fields: a
+        superset of the matches, never fewer.
+        """
+        required = cls._merge_text(plan["required_text"])
+        any_of = cls._merge_text(plan["any_text"])
         if required and any_of:
             raise cls._unsupported("text that must match combined with an OR group of text")
         if any_of:
-            if any(op == "and" and len(text.split()) > 1 for text, op in any_of):
+            if any(op == "and" and len(text.split()) > 1 for text, op, _ in any_of):
                 raise cls._unsupported("an OR group of multi-word AND clauses")
-            return " ".join(text for text, _ in any_of), "or"
+            fields = cls._merge_fields(f for _, _, f in any_of)
+            return " ".join(text for text, _, _ in any_of), "or", fields
         if not required:
-            return "", None
+            return "", None, ()
         if len(required) == 1:
-            text, operator = required[0]
-            return text, operator
+            return required[0]
         # Several clauses, all required: every term of every clause, which
         # is only the same thing if no clause is itself an OR of words.
-        if any(op != "and" and len(text.split()) > 1 for text, op in required):
+        if any(op != "and" and len(text.split()) > 1 for text, op, _ in required):
             raise cls._unsupported(
                 "several required text clauses where one is a multi-word OR"
             )
-        return " ".join(text for text, _ in required), "and"
+        fields = cls._merge_fields(f for _, _, f in required)
+        return " ".join(text for text, _, _ in required), "and", fields
 
     @classmethod
     def _translate_search(cls, body: dict, params: dict | None = None) -> tuple[dict, dict]:
@@ -607,7 +831,7 @@ class KoshaClient:
         if body.get("post_filter"):
             plan["must"].append(cls._to_filter(body["post_filter"]))
 
-        text, operator = cls._resolve_text(plan)
+        text, operator, fields = cls._resolve_text(plan)
         if plan["phrase"] and text:
             raise cls._unsupported("a phrase and separate query text in one query")
 
@@ -619,6 +843,8 @@ class KoshaClient:
         }
         if operator and text:
             kosha["operator"] = operator
+        if fields and text:
+            kosha["fields"] = list(fields)
 
         must, must_not = plan["must"], plan["must_not"]
         if must_not or len(must) > 1:
@@ -659,6 +885,8 @@ class KoshaClient:
         # a stored response.
         if body.get("request_cache", params.get("request_cache")) is False:
             kosha["no_cache"] = True
+        if body.get("rerank") is not None:
+            kosha["rerank"] = cls._rerank(body["rerank"])
 
         collapse = body.get("collapse")
         if collapse:
@@ -682,29 +910,23 @@ class KoshaClient:
             if excludes:
                 kosha["source_excludes"] = excludes
 
-        highlight_field = None
         highlight = body.get("highlight")
-        if highlight and isinstance(highlight.get("fields"), dict):
-            highlight_field, options = next(iter(highlight["fields"].items()))
-            options = options or {}
-            spec = {"field": highlight_field}
-            for key in ("pre_tags", "post_tags"):
-                tags = options.get(key, highlight.get(key))
-                if tags:
-                    spec[key] = cls._as_list(tags)
-            kosha["highlight"] = spec
+        if highlight:
+            kosha["highlight"] = cls._translate_highlight(highlight)
 
         context = {
             "size": size,
             "sort": sort or [],
             "collapse_field": (collapse or {}).get("field"),
-            "highlight_field": highlight_field,
         }
         return kosha, context
 
-    # Aggregation types Kosha computes. A sub-aggregation is refused rather
-    # than ignored: the caller would read buckets that are not there.
-    _AGG_TYPES = ("terms", "cardinality", "composite")
+    # Aggregation types Kosha computes. Metric aggregations can be nested
+    # under a bucket aggregation; any other sub-aggregation is refused
+    # rather than ignored: the caller would read buckets that are not there.
+    _BUCKET_AGG_TYPES = ("terms", "composite", "histogram", "date_histogram")
+    _METRIC_AGG_TYPES = ("min", "max", "sum", "avg", "value_count")
+    _AGG_TYPES = ("cardinality", *_BUCKET_AGG_TYPES, *_METRIC_AGG_TYPES)
 
     @classmethod
     def _extract_aggs(cls, body: dict | None) -> dict | None:
@@ -714,16 +936,30 @@ class KoshaClient:
         aggs = body.get("aggs") or body.get("aggregations")
         if not aggs:
             return None
+        return cls._translate_aggs(aggs, parent=None)
+
+    @classmethod
+    def _translate_aggs(cls, aggs: dict, parent: str | None) -> dict:
         out = {}
         for name, spec in aggs.items():
             if not isinstance(spec, dict):
                 raise cls._unsupported(f"aggregation {name!r}: {spec!r}")
-            if "aggs" in spec or "aggregations" in spec:
-                raise cls._unsupported(f"sub-aggregations (in {name!r})")
-            kinds = [k for k in spec if k != "meta"]
+            subs = spec.get("aggs") or spec.get("aggregations")
+            kinds = [k for k in spec if k not in ("meta", "aggs", "aggregations")]
             if len(kinds) != 1 or kinds[0] not in cls._AGG_TYPES:
                 raise cls._unsupported(f"aggregation type(s) {kinds} (in {name!r})")
-            out[name] = {kinds[0]: spec[kinds[0]]}
+            kind = kinds[0]
+            if parent is not None and kind not in cls._METRIC_AGG_TYPES:
+                raise cls._unsupported(
+                    f"sub-aggregations other than {', '.join(cls._METRIC_AGG_TYPES)} "
+                    f"(in {parent!r}: {name!r} is {kind!r})"
+                )
+            translated = {kind: spec[kind]}
+            if subs:
+                if kind not in cls._BUCKET_AGG_TYPES:
+                    raise cls._unsupported(f"sub-aggregations under {kind!r} (in {name!r})")
+                translated["aggs"] = cls._translate_aggs(subs, parent=name)
+            out[name] = translated
         return out
 
     @staticmethod
@@ -771,7 +1007,6 @@ class KoshaClient:
         context = context or {}
         sort = context.get("sort") or []
         collapse_field = context.get("collapse_field")
-        highlight_field = context.get("highlight_field")
 
         hits = []
         for k_hit in result.get("results", []):
@@ -791,8 +1026,16 @@ class KoshaClient:
                 "_score": score,
                 "_source": source,
             }
-            if highlight_field and k_hit.get("highlights"):
-                hit["highlight"] = {highlight_field: k_hit["highlights"]}
+            # Reranked requests: the search-stage score (RRF for hybrid)
+            # and the reranker's score; ``_score`` is the latter unless
+            # the rerank degraded.
+            if "fused_score" in k_hit:
+                hit["_fused_score"] = k_hit["fused_score"]
+            if "rerank_score" in k_hit:
+                hit["_rerank_score"] = k_hit["rerank_score"]
+            if k_hit.get("highlight"):
+                # Per-field fragments, already ES-shaped.
+                hit["highlight"] = dict(k_hit["highlight"])
             if sort:
                 # The values this hit sorted by, in sort-key order: what a
                 # caller passes back as ``search_after`` for the next page.
@@ -832,6 +1075,10 @@ class KoshaClient:
         }
         if result.get("aggregations") is not None:
             response["aggregations"] = result["aggregations"]
+        if "rerank_degraded" in result:
+            response["rerank"] = {"degraded": bool(result["rerank_degraded"])}
+            if result.get("rerank_degraded_reason"):
+                response["rerank"]["reason"] = result["rerank_degraded_reason"]
         return response
 
     # ── Older helper names, kept for callers and tests that use them ──────
@@ -892,7 +1139,7 @@ class KoshaClient:
         Kosha always returns field values as strings on the wire
         (server-side ``Field.value: String``), regardless of field_type.
         Callers index straight into these (``hit.bottom_left[0]``,
-        ``if hit.isHot``), so they must come back as the original Python
+        ``if hit.isFeatured``), so they must come back as the original Python
         type, not the raw string. ``Keyword`` is used exclusively (by this
         client) for JSON-encoded lists that aren't Vector-worthy, so it
         decodes the same way as Vector.
@@ -948,7 +1195,7 @@ class KoshaClient:
                 fields.append(cls._field_to_kosha(k, json.dumps(list(v)), "Vector"))
             elif isinstance(v, (list, tuple)):
                 # Everything else list-shaped: short numeric tuples (below
-                # _MIN_VECTOR_DIM), empty lists, string lists (recipients),
+                # _MIN_VECTOR_DIM), empty lists, string lists (labels),
                 # mixed content. JSON-encode as Keyword — stored verbatim
                 # and filterable by exact match, but never tokenized and
                 # never inserted into the shared Vector store. Decoded back
@@ -957,6 +1204,14 @@ class KoshaClient:
                     cls._field_to_kosha(
                         k, json.dumps(list(v), default=json_default), "Keyword"
                     )
+                )
+            elif isinstance(v, dict):
+                # A nested object (#206): sent whole as JSON text in a
+                # Keyword field. The server indexes its leaves under dotted
+                # paths (``author.name``) and returns it unchanged in
+                # ``_source``; decoded back to a dict by _decode_field_value.
+                fields.append(
+                    cls._field_to_kosha(k, json.dumps(v, default=json_default), "Keyword")
                 )
             # else: unsupported type — skip silently (matches prior behavior)
         return fields
@@ -1131,6 +1386,272 @@ class KoshaClient:
             "count": result["hits"]["total"]["value"],
             "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
         }
+
+    # ── Get / mget / msearch ───────────────────────────────────────────────
+
+    @classmethod
+    def _source_param(
+        cls, source: Any = None, includes: Any = None, excludes: Any = None
+    ) -> Any:
+        """ES ``_source`` / ``_source_includes`` / ``_source_excludes`` →
+        the ``_source`` value of a search body (``None``: all fields).
+
+        Accepts what opensearch-py accepts for each: a bool, a field name,
+        a comma-separated string of names, or a list of names.
+        """
+
+        def names(value: Any) -> list[str]:
+            if value is None or isinstance(value, bool):
+                return []
+            if isinstance(value, str):
+                return [n.strip() for n in value.split(",") if n.strip()]
+            return [str(n) for n in cls._as_list(value)]
+
+        if isinstance(source, str) and source.strip().lower() in ("true", "false"):
+            source = source.strip().lower() == "true"
+        if source is False:
+            return False
+        if isinstance(source, dict):
+            inc = names(source.get("includes", source.get("include")))
+            exc = names(source.get("excludes", source.get("exclude")))
+        else:
+            inc = names(source)
+            exc = []
+        inc += names(includes)
+        exc += names(excludes)
+        if not inc and not exc:
+            return None
+        return {"includes": inc, "excludes": exc}
+
+    def _lookup_id(self, ns: str, doc_id: str, source: Any = None) -> dict | None:
+        """The hit for document ``doc_id`` in ``ns``, or ``None`` if absent.
+
+        Kosha has no fetch-by-id route and its filters cannot match ``_id``
+        (a ``term`` on ``_id`` matches nothing), so this is a one-hit search
+        that seeks to the id: sort by ``_id`` descending, starting strictly
+        below ``doc_id + "\\0"``. ``doc_id + "\\0"`` is the very next string
+        after ``doc_id``, so the first hit is the largest id ``<= doc_id``,
+        which is ``doc_id`` itself when the document exists. Any other id
+        means it does not.
+
+        It sees what search sees: a document still in the server's unflushed
+        write buffer is not found (no realtime GET).
+        """
+        body: dict = {
+            "size": 1,
+            "sort": [{"_id": {"order": "desc"}}],
+            "search_after": [doc_id + "\x00"],
+        }
+        if source is not None:
+            body["_source"] = source
+        kosha_body, _ = self._translate_search(body)
+        # Every document is a candidate; the cursor does the selecting. An
+        # empty query with no filter matches nothing on the server.
+        kosha_body["filter"] = {"match_all": {}}
+        kosha_body["namespace"] = ns
+        if self._consistency is not None:
+            kosha_body["consistency"] = self._consistency
+        try:
+            result = self._request("POST", "search", body=kosha_body)
+        except KoshaRequestError as e:
+            if e.status_code == 404:
+                return None  # an index nothing has been written to yet
+            raise
+        for hit in self._build_search_response(result)["hits"]["hits"]:
+            if hit["_id"] == doc_id:
+                return hit
+        return None
+
+    @staticmethod
+    def _get_response(ns: str, doc_id: str, hit: dict | None, source: Any) -> dict:
+        if hit is None:
+            return {"_index": ns, "_id": doc_id, "found": False}
+        doc = {"_index": ns, "_id": doc_id, "_version": 1, "found": True}
+        if source is not False:
+            doc["_source"] = hit["_source"]
+        return doc
+
+    def get(
+        self,
+        index: str | None = None,
+        id: str | None = None,
+        _source: Any = None,
+        **params: Any,
+    ) -> dict:
+        """Fetch one document by id: ``{_index, _id, _version, found, _source}``.
+
+        A missing document returns ``{"found": false}``; it does **not**
+        raise. opensearch-py raises ``NotFoundError`` here, but this client
+        has no exception hierarchy to raise it from, and a missing index is
+        "no hits" for ``search`` too. Check ``found``.
+
+        ``_source`` (bool, field name, comma list or list),
+        ``_source_includes`` and ``_source_excludes`` filter the returned
+        fields as in ``search``, and field values decode exactly as in
+        ``search``. ``refresh=True`` flushes the index first.
+
+        Kosha has no fetch-by-id endpoint: this is a one-hit search (see
+        ``_lookup_id``), so it sees what search sees: with the server's
+        default ``strong`` consistency (#255) that includes documents still
+        in its write buffer; under ``eventual`` they are not found until
+        flushed (~1 s, ``KOSHA_FLUSH_MAX_AGE_MS``).
+        """
+        if id is None or str(id) == "":
+            raise KoshaRequestError(400, "get requires a document id")
+        ns = self._resolve_ns(index)
+        doc_id = str(id)
+        source = self._source_param(
+            _source, params.get("_source_includes"), params.get("_source_excludes")
+        )
+        if self._wants_refresh(params):
+            self._flush(ns)
+        return self._get_response(ns, doc_id, self._lookup_id(ns, doc_id, source), source)
+
+    def mget(
+        self, body: dict | None = None, index: str | None = None, **params: Any
+    ) -> dict:
+        """Fetch several documents by id: ``{"docs": [...]}`` in request order.
+
+        ``body`` is ``{"docs": [{"_index"?, "_id", "_source"?}, ...]}`` or
+        ``{"ids": [...]}`` (both against ``index`` when a doc names none).
+        Each entry is shaped like ``get``'s response; a missing document is
+        ``{"found": false}``, and a lookup the server rejects is
+        ``{"_index", "_id", "error": {...}}`` rather than failing the call.
+        ``_source`` / ``_source_includes`` / ``_source_excludes`` apply to
+        every doc that does not set its own ``_source``.
+
+        One search per distinct document (Kosha filters cannot match
+        ``_id``, so ids cannot be fetched in one query): ``N`` round trips,
+        with the same visibility as ``get``.
+        """
+        body = body or {}
+        default_source = self._source_param(
+            params.get("_source"),
+            params.get("_source_includes"),
+            params.get("_source_excludes"),
+        )
+        requests: list[tuple[str, str, Any]] = []
+        if "docs" in body:
+            for entry in self._as_list(body["docs"]):
+                if not isinstance(entry, dict) or entry.get("_id") in (None, ""):
+                    raise KoshaRequestError(
+                        400, f"mget doc {entry!r} has no _id"
+                    )
+                source = default_source
+                if "_source" in entry:
+                    source = self._source_param(entry["_source"])
+                ns = self._resolve_ns(entry.get("_index") or index)
+                requests.append((ns, str(entry["_id"]), source))
+        elif "ids" in body:
+            ns = self._resolve_ns(index)
+            for doc_id in self._as_list(body["ids"]):
+                requests.append((ns, str(doc_id), default_source))
+        else:
+            raise KoshaRequestError(400, "mget body needs 'docs' or 'ids'")
+
+        if self._wants_refresh(params):
+            for ns in dict.fromkeys(ns for ns, _, _ in requests):
+                self._flush(ns)
+
+        seen: dict[tuple[str, str, str], dict] = {}
+        docs = []
+        for ns, doc_id, source in requests:
+            key = (ns, doc_id, json.dumps(source, sort_keys=True))
+            if key not in seen:
+                try:
+                    hit = self._lookup_id(ns, doc_id, source)
+                    seen[key] = self._get_response(ns, doc_id, hit, source)
+                except KoshaRequestError as e:
+                    seen[key] = {
+                        "_index": ns,
+                        "_id": doc_id,
+                        "error": self._error_body(e),
+                    }
+            docs.append(dict(seen[key]))
+        return {"docs": docs}
+
+    @staticmethod
+    def _error_body(error: Exception) -> dict:
+        """An exception as an ES error object."""
+        if isinstance(error, KoshaRequestError):
+            kind = "kosha_request_error"
+            reason = str(error.error)
+        else:
+            kind = "illegal_argument_exception"
+            reason = str(error)
+        return {"root_cause": [{"type": kind, "reason": reason}], "type": kind, "reason": reason}
+
+    @classmethod
+    def _msearch_pairs(cls, body: Any) -> list[tuple[dict, dict]]:
+        """An msearch body (NDJSON str/bytes, or a list) → (header, body) pairs."""
+        if isinstance(body, (bytes, bytearray)):
+            body = body.decode("utf-8")
+        if isinstance(body, str):
+            items: list = [line for line in body.split("\n") if line.strip()]
+        elif isinstance(body, (list, tuple)):
+            items = list(body)
+        else:
+            raise KoshaRequestError(
+                400, "msearch body must be NDJSON (str or bytes) or a list"
+            )
+        parsed = []
+        for n, item in enumerate(items, start=1):
+            if isinstance(item, (bytes, bytearray)):
+                item = item.decode("utf-8")
+            if isinstance(item, str):
+                try:
+                    item = json.loads(item)
+                except json.JSONDecodeError as e:
+                    raise KoshaRequestError(
+                        400, f"msearch line {n} is not JSON: {e}"
+                    ) from None
+            if not isinstance(item, dict):
+                raise KoshaRequestError(
+                    400, f"msearch line {n} is not a JSON object: {item!r}"
+                )
+            parsed.append(item)
+        if len(parsed) % 2:
+            raise KoshaRequestError(
+                400, "msearch body must alternate header and search lines; "
+                "the last header has no search body"
+            )
+        return list(zip(parsed[0::2], parsed[1::2]))
+
+    def msearch(
+        self, body: Any = None, index: str | None = None, **params: Any
+    ) -> dict:
+        """Run several searches: ``{"took", "responses": [...]}``.
+
+        ``body`` is the ES multi-search body: NDJSON (``str`` or ``bytes``)
+        or a list, alternating a header (``{}`` or ``{"index": ...}``) and
+        a search body, as dicts or JSON strings. A header without an index
+        searches ``index``.
+
+        **This is N sequential round trips, not one batched request**:
+        Kosha has no multi-search endpoint, so each search is sent on its
+        own through ``search()`` (``POST /search``), with the same
+        translation. A search that fails (a clause Kosha cannot express, a
+        server error) becomes ``{"error": {...}, "status": <code>}`` in its
+        slot; the others still run, and successful items carry
+        ``"status": 200``. A malformed body raises before anything runs.
+        """
+        pairs = self._msearch_pairs(body)
+        start = time.monotonic()
+        responses = []
+        for header, search_body in pairs:
+            target = header.get("index", index)
+            try:
+                response = self.search(index=target, body=search_body)
+                response["status"] = 200
+            except KoshaRequestError as e:
+                status = e.status_code if e.status_code >= 400 else 500
+                response = {"error": self._error_body(e), "status": status}
+            except (TypeError, ValueError, KeyError, AttributeError) as e:
+                # A malformed search body (e.g. a non-numeric size).
+                response = {"error": self._error_body(e), "status": 400}
+            responses.append(response)
+        took_ms = int((time.monotonic() - start) * 1000)
+        return {"took": took_ms, "responses": responses}
 
     # ── Update ─────────────────────────────────────────────────────────────
 
@@ -1387,29 +1908,143 @@ class TasksOps:
 class IndexOps:
     """Mimics ``opensearchpy.client.IndicesClient`` for compatibility.
 
-    Phase 1 is schema-less — Kosha creates namespaces on first write, so
-    ``create()`` and ``exists()`` are mostly no-ops.
+    ``create`` and ``delete`` are real: ``POST /v1/namespaces`` and
+    ``DELETE /v1/namespaces/{ns}``. Kosha still creates a namespace on its
+    first write, so calling ``create`` first is optional.
     """
 
     def __init__(self, client: KoshaClient) -> None:
         self._client = client
 
+    # Elasticsearch mapping type -> proto ``FieldType`` name. Types not
+    # listed here (object, nested, geo_point, ...) have no Kosha equivalent
+    # and are left out of the schema rather than guessed.
+    _FIELD_TYPES_FROM_ES = {
+        "text": "FIELD_TYPE_TEXT",
+        "match_only_text": "FIELD_TYPE_TEXT",
+        "keyword": "FIELD_TYPE_KEYWORD",
+        "constant_keyword": "FIELD_TYPE_KEYWORD",
+        "long": "FIELD_TYPE_INTEGER",
+        "integer": "FIELD_TYPE_INTEGER",
+        "short": "FIELD_TYPE_INTEGER",
+        "byte": "FIELD_TYPE_INTEGER",
+        "double": "FIELD_TYPE_FLOAT",
+        "float": "FIELD_TYPE_FLOAT",
+        "half_float": "FIELD_TYPE_FLOAT",
+        "scaled_float": "FIELD_TYPE_FLOAT",
+        "date": "FIELD_TYPE_DATE",
+        "date_nanos": "FIELD_TYPE_DATE",
+        "boolean": "FIELD_TYPE_BOOLEAN",
+        "knn_vector": "FIELD_TYPE_VECTOR",
+        "dense_vector": "FIELD_TYPE_VECTOR",
+    }
+
+    @staticmethod
+    def _ignored(params: dict) -> set[int]:
+        """Status codes the caller asked to ignore (opensearchpy ``ignore``)."""
+        ignore = params.get("ignore", ())
+        if isinstance(ignore, int):
+            ignore = (ignore,)
+        return {int(code) for code in ignore}
+
+    @classmethod
+    def _schema_from_mappings(cls, mappings: Any) -> dict | None:
+        """``NamespaceSchema`` for the plain fields of an ES ``mappings``.
+
+        Each top-level property with a type Kosha has (see
+        ``_FIELD_TYPES_FROM_ES``) becomes a ``FieldSchema``: ``index: false``
+        maps to ``indexed: false``, a text field's ``analyzer`` is passed
+        through. Object/nested properties, multi-fields and unknown types
+        are skipped. ``None`` when nothing translates.
+        """
+        if not isinstance(mappings, dict):
+            return None
+        properties = mappings.get("properties")
+        if not isinstance(properties, dict):
+            return None
+        fields: dict[str, dict] = {}
+        for name, spec in properties.items():
+            if not isinstance(spec, dict):
+                continue
+            field_type = cls._FIELD_TYPES_FROM_ES.get(str(spec.get("type", "")))
+            if field_type is None:
+                logger.info(
+                    "IndexOps.create: mapping for %r (type %r) has no Kosha "
+                    "equivalent; left out of the schema",
+                    name,
+                    spec.get("type", "object"),
+                )
+                continue
+            field = {
+                "type": field_type,
+                "indexed": spec.get("index", True) is not False,
+                "stored": True,
+            }
+            analyzer = spec.get("analyzer")
+            if field_type == "FIELD_TYPE_TEXT" and isinstance(analyzer, str):
+                field["analyzer"] = [analyzer]
+            fields[name] = field
+        return {"fields": fields} if fields else None
+
     def create(self, index: str, body: dict | None = None, **params: Any) -> dict:
-        logger.info("IndexOps.create(%s) — no-op (Kosha is schema-less)", index)
-        return {"acknowledged": True, "shards_acknowledged": True, "index": index}
+        """Create the namespace (``POST /v1/namespaces``).
+
+        ``body["mappings"]`` is translated to a ``NamespaceSchema`` where
+        the mapping is straightforward; ``settings`` are ignored (Kosha has
+        no shards, replicas or refresh interval). An existing namespace
+        raises ``KoshaRequestError`` with status 409; ``ignore=400`` (what
+        ES callers pass for ``resource_already_exists_exception``) or
+        ``ignore=409`` returns the error body instead.
+        """
+        ns = self._client._resolve_ns(index)
+        request: dict[str, Any] = {"namespace": ns}
+        schema = self._schema_from_mappings((body or {}).get("mappings"))
+        if schema is not None:
+            request["schema"] = schema
+        if (body or {}).get("settings"):
+            logger.debug("IndexOps.create(%s): settings ignored", ns)
+        try:
+            self._client._transport.request("POST", "v1/namespaces", request)
+        except KoshaRequestError as e:
+            ignored = self._ignored(params)
+            if e.status_code in ignored or (e.status_code == 409 and 400 in ignored):
+                return e.info or {"error": e.error, "status": e.status_code}
+            raise
+        return {"acknowledged": True, "shards_acknowledged": True, "index": ns}
 
     def exists(self, index: str, **params: Any) -> bool:
-        try:
-            self._client.count(index=index)
-            return True
-        except KoshaRequestError:
-            return False
+        """Whether every named namespace exists (``GET .../stats``)."""
+        for name in self._index_names(index):
+            ns = urllib.parse.quote(name, safe="")
+            try:
+                self._client._v1_request("GET", ns, "stats")
+            except KoshaRequestError as e:
+                if e.status_code == 404:
+                    return False
+                raise
+        return True
 
     def delete(self, index: str, **params: Any) -> dict:
-        logger.info(
-            "IndexOps.delete(%s) — no-op (Kosha does not support index deletion yet)",
-            index,
+        """Delete each named namespace (``DELETE /v1/namespaces/{ns}``).
+
+        Deleting removes the namespace's documents and segments for good. A
+        missing namespace raises ``KoshaRequestError`` with status 404 (ES
+        ``NotFoundError``) unless ``ignore_unavailable=True`` or
+        ``ignore=404`` is passed.
+        """
+        if index is None or index == "" or index == []:
+            raise ValueError("indices.delete needs an index name")
+        skip_missing = bool(params.get("ignore_unavailable")) or 404 in self._ignored(
+            params
         )
+        for name in self._index_names(index):
+            path = f"v1/namespaces/{urllib.parse.quote(name, safe='')}"
+            try:
+                self._client._transport.request("DELETE", path)
+            except KoshaRequestError as e:
+                if e.status_code == 404 and skip_missing:
+                    continue
+                raise
         return {"acknowledged": True}
 
     def put_mapping(self, index: str, body: dict, **params: Any) -> dict:
@@ -1425,41 +2060,131 @@ class IndexOps:
         self._client._flush(self._client._resolve_ns(index))
         return {"_shards": {"total": 1, "successful": 1, "failed": 0}}
 
-    def get(self, index: str, **params: Any) -> dict:
-        return {index: {"aliases": {}, "mappings": {}, "settings": {}}}
+    # Proto ``FieldType`` (proto/kosha/v1/kosha.proto) -> Elasticsearch
+    # mapping type. Keyed by the bare type name; ``_es_field_type`` also
+    # accepts the ``FIELD_TYPE_*`` enum spelling and the enum number.
+    _ES_FIELD_TYPES = {
+        "TEXT": "text",
+        "KEYWORD": "keyword",
+        "INTEGER": "long",
+        "FLOAT": "double",
+        "DATE": "date",
+        "BOOLEAN": "boolean",
+        "VECTOR": "knn_vector",
+        "GEO_POINT": "geo_point",
+        "GEOPOINT": "geo_point",  # the server's serde spelling, `GeoPoint`
+    }
+    _FIELD_TYPE_NUMBERS = {
+        1: "TEXT",
+        2: "KEYWORD",
+        3: "INTEGER",
+        4: "FLOAT",
+        5: "DATE",
+        6: "BOOLEAN",
+        7: "VECTOR",
+        8: "GEO_POINT",
+    }
 
-    def get_mapping(self, index: str | None = None, **params: Any) -> dict:
-        idx = index or "default"
+    def _index_names(self, index: Any) -> list[str]:
+        """Expand an ES ``index`` argument (str, comma list, list) to names."""
+        if index is None or index == "" or index == []:
+            return [self._client._resolve_ns(None)]
+        if isinstance(index, (list, tuple)):
+            names = [str(i) for i in index]
+        else:
+            names = str(index).split(",")
+        names = [n.strip() for n in names if n and n.strip()]
+        return names or [self._client._resolve_ns(None)]
+
+    @classmethod
+    def _es_field_type(cls, field: dict) -> str | None:
+        """ES type for one ``FieldSchema``, or None when it has no type."""
+        raw = field.get("type", field.get("field_type"))
+        if isinstance(raw, bool):
+            raw = None
+        if isinstance(raw, int):
+            raw = cls._FIELD_TYPE_NUMBERS.get(raw)
+        if isinstance(raw, str):
+            name = raw.strip().upper()
+            if name.startswith("FIELD_TYPE_"):
+                name = name[len("FIELD_TYPE_") :]
+            if name in cls._ES_FIELD_TYPES:
+                return cls._ES_FIELD_TYPES[name]
+        # Only Text fields are analyzed, so a field that names an analyzer
+        # but no type is a text field.
+        if field.get("analyzer"):
+            return "text"
+        return None
+
+    def _namespace_schema(self, namespace: str) -> dict:
+        """The namespace's stored ``NamespaceSchema`` (``{}`` if none).
+
+        ``GET /v1/namespaces/{ns}/schema`` returns the schema bare or
+        wrapped as ``{"schema": ...}``. A server without that route, or a
+        namespace that does not exist yet, answers 404 (405 from a proxy
+        that knows the path but not the method): both mean "no schema",
+        not an error. Anything else (auth, 5xx, unreachable) is raised.
+        """
+        ns = urllib.parse.quote(namespace, safe="")
+        try:
+            body = self._client._v1_request("GET", ns, "schema")
+        except KoshaRequestError as e:
+            if e.status_code in (404, 405, 501) or "not found" in str(
+                e.error
+            ).lower():
+                return {}
+            raise
+        if not isinstance(body, dict):
+            return {}
+        schema = body.get("schema", body)
+        return schema if isinstance(schema, dict) else {}
+
+    def _properties(self, namespace: str) -> dict:
+        """ES ``properties`` for exactly the fields the schema declares."""
+        fields = self._namespace_schema(namespace).get("fields") or {}
+        properties: dict[str, dict] = {}
+        if not isinstance(fields, dict):
+            return properties
+        for name, field in fields.items():
+            es_type = self._es_field_type(field if isinstance(field, dict) else {})
+            properties[name] = {"type": es_type} if es_type else {}
+        return properties
+
+    def get(self, index: str, **params: Any) -> dict:
         return {
-            idx: {
-                "mappings": {
-                    "properties": {
-                        "documentId": {"type": "keyword"},
-                        "content": {"type": "text"},
-                        "title": {"type": "text"},
-                        "sender": {"type": "keyword"},
-                        "recipients": {"type": "keyword"},
-                        "sentAt": {"type": "date"},
-                        "matterId": {"type": "keyword"},
-                        "orgId": {"type": "keyword"},
-                    }
-                }
+            name: {
+                "aliases": {},
+                "mappings": {"properties": self._properties(name)},
+                "settings": self._settings(name),
             }
+            for name in self._index_names(index)
         }
 
-    def get_settings(self, index: str | None = None, **params: Any) -> dict:
-        idx = index or "default"
+    def get_mapping(self, index: str | None = None, **params: Any) -> dict:
+        """The namespace's real field mapping, in Elasticsearch shape.
+
+        Fields come from the namespace schema (``GET
+        /v1/namespaces/{ns}/schema``), with proto ``FieldType`` translated
+        to ES types. Kosha is schemaless, so a namespace without a schema,
+        or a server too old to serve one, has ``"properties": {}``. Fields
+        are never guessed.
+        """
         return {
-            idx: {
-                "settings": {
-                    "index": {
-                        "knn": "true",
-                        "refresh_interval": "-1",
-                        "number_of_shards": "1",
-                        "number_of_replicas": "0",
-                    }
-                }
-            }
+            name: {"mappings": {"properties": self._properties(name)}}
+            for name in self._index_names(index)
+        }
+
+    @staticmethod
+    def _settings(name: str) -> dict:
+        # Only what is actually known: Kosha has no shards, replicas or
+        # refresh interval to report per namespace.
+        return {"index": {"provided_name": name}}
+
+    def get_settings(self, index: str | None = None, **params: Any) -> dict:
+        """Index settings: only the index name. Nothing else is invented."""
+        return {
+            name: {"settings": self._settings(name)}
+            for name in self._index_names(index)
         }
 
     def flush(self, index: str | None = None, **params: Any) -> dict:

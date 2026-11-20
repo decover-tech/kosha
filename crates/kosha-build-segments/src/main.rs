@@ -24,9 +24,7 @@ use std::sync::mpsc;
 
 use clap::Parser;
 use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
-use kosha_segment::SegmentWriter;
-
-const EMB_DIM: usize = 1024;
+use kosha_segment::{SegmentWriter, VectorQuantizationConfig};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,6 +57,14 @@ struct Args {
     /// Vector field name attached to each doc when embeddings are provided
     #[arg(long, default_value = "text_emb")]
     vector_field: String,
+    /// Dimension of the embedding shards (msmarco embeddings are 1024)
+    #[arg(long, default_value_t = 1024)]
+    emb_dim: usize,
+    /// Store vector postings as `f32` or `i8` (#210). Unset follows
+    /// KOSHA_VECTOR_QUANTIZATION / KOSHA_VECTOR_QUANTIZATION_FIELDS, as the
+    /// server's writers do.
+    #[arg(long)]
+    vector_quantization: Option<String>,
     #[arg(long, default_value_t = 1.2)]
     bm25_k1: f64,
     #[arg(long, default_value_t = 0.75)]
@@ -88,6 +94,7 @@ fn sorted_files(dir: &Path, prefix: &str, suffix: &str) -> Vec<PathBuf> {
 
 /// Iterator over (doc_id, vector) pairs across embedding shard pairs.
 struct EmbReader {
+    dim: usize,
     shards: Vec<(PathBuf, PathBuf)>, // (.f32, .ids)
     shard_idx: usize,
     reader: Option<std::io::BufReader<std::fs::File>>,
@@ -96,7 +103,7 @@ struct EmbReader {
 }
 
 impl EmbReader {
-    fn new(dir: &Path) -> Self {
+    fn new(dir: &Path, dim: usize) -> Self {
         let f32s = sorted_files(dir, "emb-", ".f32");
         assert!(
             !f32s.is_empty(),
@@ -112,6 +119,7 @@ impl EmbReader {
             })
             .collect();
         Self {
+            dim,
             shards,
             shard_idx: 0,
             reader: None,
@@ -130,7 +138,7 @@ impl EmbReader {
                     .map(str::to_string)
                     .collect();
                 self.id_idx = 0;
-                let expected = self.ids.len() as u64 * (EMB_DIM as u64) * 4;
+                let expected = self.ids.len() as u64 * (self.dim as u64) * 4;
                 let actual = std::fs::metadata(f32_path).map(|m| m.len()).unwrap_or(0);
                 assert!(
                     actual == expected,
@@ -149,7 +157,7 @@ impl EmbReader {
                 self.shard_idx += 1;
                 continue;
             }
-            let mut buf = [0u8; EMB_DIM * 4];
+            let mut buf = vec![0u8; self.dim * 4];
             self.reader
                 .as_mut()
                 .unwrap()
@@ -183,6 +191,11 @@ fn main() {
         k1: args.bm25_k1,
         b: args.bm25_b,
     };
+    let quantization = args.vector_quantization.as_deref().map(|raw| {
+        let q = kosha_core::VectorQuantization::parse(raw)
+            .unwrap_or_else(|| panic!("--vector-quantization {raw:?}: expected f32 or i8"));
+        VectorQuantizationConfig::all(q)
+    });
     let ns_out = args.out_dir.join(&args.namespace);
     std::fs::create_dir_all(&ns_out).expect("create out dir");
 
@@ -198,6 +211,7 @@ fn main() {
             let ns_out = ns_out.clone();
             let ns = args.namespace.clone();
             let bm25 = bm25.clone();
+            let quantization = quantization.clone();
             std::thread::spawn(move || {
                 let mut built = 0usize;
                 loop {
@@ -208,6 +222,9 @@ fn main() {
                     let n = docs.len();
                     let t = std::time::Instant::now();
                     let mut w = SegmentWriter::new(seg_id.clone(), seg_dir);
+                    if let Some(q) = &quantization {
+                        w = w.with_vector_quantization(q.clone());
+                    }
                     for (id, fields) in docs {
                         w.add_document(id, fields);
                     }
@@ -226,7 +243,10 @@ fn main() {
         .collect();
 
     // ── stream shards, verify embedding alignment, dispatch batches ──────
-    let mut emb = args.embeddings_dir.as_deref().map(EmbReader::new);
+    let mut emb = args
+        .embeddings_dir
+        .as_deref()
+        .map(|dir| EmbReader::new(dir, args.emb_dim));
     let mut batch: Vec<(DocumentId, Vec<Field>)> = Vec::with_capacity(args.docs_per_segment);
     let mut seg_idx = 0usize;
     let mut total = 0usize;

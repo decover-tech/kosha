@@ -109,7 +109,10 @@ Consequences worth knowing:
   Sizing the cache means choosing instance types in the `NodePool`.
 - **The cache survives pod restarts, not node replacement.** Contents are
   rebuildable from the Postgres manifest + S3 segments, so a Karpenter node
-  swap costs a cold hydration, not data.
+  swap costs a cold hydration, not data. The exception is the default local
+  WAL (`data_dir/_wal`): acknowledged but unflushed writes are lost with the
+  node. Set `KOSHA_WAL_MODE=s3` on the ingest Deployment to keep the WAL in
+  the bucket instead (see the root README, "S3 WAL").
 - **Prod needs the same pool before it deploys.** These constraints live in
   `base/`, so `k8s/prod` inherits them; without the label and taint on the
   prod cluster, the pod sits `Pending` forever.
@@ -132,8 +135,9 @@ Consequences worth knowing:
 |--------|---------|
 | `AWS_GITHUB_ROLE_ARN` | OIDC deploy role |
 | `KOSHA_DATABASE_URL` | Postgres URL for control plane. Staging points at the in-cluster Postgres StatefulSet in `decoverai-services` (`postgres-service.decoverai-services.svc.cluster.local:5432/kosha`, not the old RDS instance) — see backend's `deployments/k8s/base/postgres.yaml`. Cross-namespace, so the FQDN is required; the bare `postgres-service` short name won't resolve from the `kosha` namespace. |
-| `KOSHA_API_KEY` | Bootstrap tenant API key (tenant `default`). Admin and peer access use the separate `KOSHA_ADMIN_API_KEY` / `KOSHA_INTERNAL_API_KEY`. The server refuses to start when no credential is configured at all. |
+| `KOSHA_API_KEY` | Bootstrap tenant API key (tenant `default`). Admin and peer access use the separate `KOSHA_ADMIN_API_KEY` / `KOSHA_INTERNAL_API_KEY`. The base Deployments read `KOSHA_INTERNAL_API_KEY` from the optional `kosha-secret` key `internal-api-key`; until it is set, query pods serve searches with `eventual` consistency (#255). The server refuses to start when no credential is configured at all. |
 | `KOSHA_S3_BUCKET` | Segment bucket name |
+| `KOSHA_GC_GRACE` / `KOSHA_GC_ORPHAN_GRACE` | Segment GC (#239): how long a retired segment (default `1h`) or a never-referenced orphan (default `24h`) stays in S3 before `POST /v1/admin/gc` deletes it. `KOSHA_LOCAL_GC_GRACE` (default `5m`) is the same for local disk. |
 | `KOSHA_S3_PREFIX` | Key prefix (e.g. `segments/`) |
 | `KOSHA_IRSA_ROLE_ARN` | `eks.amazonaws.com/role-arn` value |
 | `EKS_CLUSTER_NAME` | Target EKS cluster |
@@ -150,7 +154,6 @@ is deployed:
 
     kubectl apply -f k8s/stage/es-to-kosha-migration-job.yaml
     kubectl logs -n kosha -f job/es-to-kosha-migration
-    kubectl rollout restart deployment/kosha -n kosha
 
 Notes:
 
@@ -169,9 +172,15 @@ Notes:
   `kosha-config`. No Kosha API key is needed because this bypasses HTTP.
 - A full run **replaces** the namespace manifest with newly-built segments
   (segment IDs continue past any prior/partial run). Old S3 segments become
-  unreferenced; they can be garbage-collected later. During migration, the
+  unreferenced; segment GC (`POST /v1/admin/gc`, or the suspended
+  `kosha-segment-gc` CronJob) deletes them once they are older than
+  `KOSHA_GC_ORPHAN_GRACE` (default 24h). Run it with `"dry_run": true`
+  first to see what it would delete. During migration, the
   namespace is only partially populated, so keep Sage reads on OpenSearch
-  until the Job completes and Kosha is restarted.
+  until the Job completes. No restart is needed afterwards: query pods pick
+  up the published manifest within `KOSHA_MANIFEST_REFRESH_MS` (default
+  500 ms); check `manifest_version` / `manifest_lag_seconds` for the
+  namespace in `GET /v1/stats` on a query pod to confirm.
 - **Delta catch-up** (missing ids only): pass `--ids-file /path/ids.txt`
   (one OpenSearch `_id` per line). This implies `--append` — new segments are
   added to the existing manifest without wiping prior data. Prefer this over

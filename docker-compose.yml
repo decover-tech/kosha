@@ -61,6 +61,9 @@ services:
         condition: service_healthy
     environment:
       KOSHA_API_KEY: sk-kosha-dev  # matches quickstart script
+      # Admin credential for /v1/admin/* (kosha compact / import / admin
+      # create-api-key). Dev-only value; never reuse it outside this stack.
+      KOSHA_ADMIN_API_KEY: sk-kosha-admin-dev
       KOSHA_ROLE: query
       KOSHA_HTTP_PORT: "8080"
       KOSHA_DATA_DIR: /var/lib/kosha/data

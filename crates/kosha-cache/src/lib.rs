@@ -92,7 +92,14 @@ impl Cache {
                 let Ok(meta) = entry.metadata() else {
                     continue;
                 };
-                if path == root.join("_wal") {
+                // The WAL and a local WAL kept after moving it to S3
+                // (`_wal.migrated-*`) are not cache content.
+                if dir == root
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name == "_wal" || name.starts_with("_wal.migrated-"))
+                {
                     continue;
                 }
                 if meta.is_dir() {
@@ -194,9 +201,11 @@ impl Cache {
         let Some(max) = self.max_bytes else {
             return;
         };
+        let before = self.total_bytes.load(Ordering::Relaxed);
+        let mut files = 0u32;
         loop {
             if self.total_bytes.load(Ordering::Relaxed) <= max {
-                return;
+                break;
             }
             let victim = {
                 let recency = self.recency.lock().unwrap();
@@ -207,9 +216,19 @@ impl Cache {
                     .cloned()
             };
             let Some(key) = victim else {
-                return;
+                break;
             };
             let _ = self.evict(&key);
+            files += 1;
+        }
+        if files > 0 {
+            let now = self.total_bytes.load(Ordering::Relaxed);
+            println!(
+                "disk cache evicted: files={files} freed_mb={:.1} size_mb={:.1} max_mb={:.1}",
+                before.saturating_sub(now) as f64 / 1048576.0,
+                now as f64 / 1048576.0,
+                max as f64 / 1048576.0
+            );
         }
     }
 
@@ -283,24 +302,150 @@ impl Cache {
         self.account(key, 0, new_len);
     }
 
-    /// Remove a file from the cache.
-    pub fn evict(&self, key: &str) -> Result<(), KoshaError> {
+    /// Remove a file, or a whole directory such as a segment, from the
+    /// cache. Returns the bytes removed.
+    pub fn evict(&self, key: &str) -> Result<u64, KoshaError> {
         let path = self.path_for(key)?;
+        let nested = format!("{}/", key.trim_end_matches('/'));
+        // Only bytes the cache counted leave the total: a directory can
+        // hold files written by something that never reported them (an
+        // ingest pod's own flushes), and subtracting those would drive the
+        // total below real usage, so `KOSHA_CACHE_MAX_BYTES` stops binding.
+        let tracked: u64 = self
+            .recency
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| *k == key || k.starts_with(&nested))
+            .filter_map(|k| self.path_for(k).ok())
+            .map(|p| p.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum();
+        let mut removed = 0;
         if path.is_file() {
-            let len = path.metadata().map(|m| m.len()).unwrap_or(0);
+            removed = path.metadata().map(|m| m.len()).unwrap_or(0);
             std::fs::remove_file(&path)?;
-            self.total_bytes.fetch_sub(len, Ordering::Relaxed);
             self.eviction_generation.fetch_add(1, Ordering::Relaxed);
         } else if path.is_dir() {
-            let len = dir_size(&path);
+            removed = dir_size(&path);
             std::fs::remove_dir_all(&path)?;
-            self.total_bytes.fetch_sub(len, Ordering::Relaxed);
             self.eviction_generation.fetch_add(1, Ordering::Relaxed);
         }
-        let mut recency = self.recency.lock().unwrap();
-        if let Some(pos) = recency.iter().position(|k| k == key) {
-            recency.remove(pos);
+        let mut total = self.total_bytes.load(Ordering::Relaxed);
+        while let Err(actual) = self.total_bytes.compare_exchange_weak(
+            total,
+            total.saturating_sub(tracked),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            total = actual;
         }
+        let mut recency = self.recency.lock().unwrap();
+        recency.retain(|k| k != key && !k.starts_with(&nested));
+        Ok(removed)
+    }
+
+    /// Remove a whole directory (a superseded segment) and every file under
+    /// it, unless any key at or under `key` is pinned. Returns
+    /// `Ok(None)` when a pin blocked the eviction (nothing was removed), or
+    /// `Ok(Some(bytes))` with the bytes actually freed on disk (`0` when the
+    /// directory was already gone).
+    ///
+    /// Unlike `evict` on a directory key, this keeps the LRU list and the
+    /// running total exact: every file key under the directory leaves the
+    /// recency list, and the total drops only by the files the cache was
+    /// tracking (files written straight to disk by the indexer were never
+    /// counted, so subtracting them would wrap the counter).
+    ///
+    /// The recency and pin locks are held, in `enforce_limit`'s order,
+    /// across the check and the removal, so a hydration batch cannot pin a
+    /// file in between and then lose it.
+    pub fn evict_dir_unless_pinned(&self, key: &str) -> Result<Option<u64>, KoshaError> {
+        let path = self.path_for(key)?;
+        let key = key
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string();
+        let prefix = format!("{key}/");
+        let mut recency = self.recency.lock().unwrap();
+        let pinned = self.pinned.lock().unwrap();
+        if pinned.keys().any(|k| {
+            k.trim_start_matches('/') == key || k.trim_start_matches('/').starts_with(&prefix)
+        }) {
+            return Ok(None);
+        }
+        if !path.is_dir() {
+            return Ok(Some(0));
+        }
+        let mut files = Vec::new();
+        collect_files(&path, &mut files);
+        let on_disk: u64 = files.iter().map(|(_, len)| len).sum();
+        std::fs::remove_dir_all(&path)?;
+        let mut tracked = 0u64;
+        for (file, len) in &files {
+            let Ok(rel) = file.strip_prefix(&self.cache_dir) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if let Some(pos) = recency.iter().position(|k| *k == rel) {
+                recency.remove(pos);
+                tracked += len;
+            }
+        }
+        drop(pinned);
+        drop(recency);
+        let mut current = self.total_bytes.load(Ordering::Relaxed);
+        while let Err(actual) = self.total_bytes.compare_exchange_weak(
+            current,
+            current.saturating_sub(tracked),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            current = actual;
+        }
+        self.eviction_generation.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(on_disk))
+    }
+
+    /// Remove everything under the directory `prefix` (a deleted
+    /// namespace's segments), tracked or not, and drop the tracked keys
+    /// below it from the size accounting and LRU order. Only the bytes the
+    /// cache had accounted for are subtracted, so files written straight to
+    /// disk by the indexer cannot underflow the total.
+    pub fn evict_prefix(&self, prefix: &str) -> Result<(), KoshaError> {
+        let prefix = prefix.trim_matches('/');
+        if prefix.is_empty() {
+            return Err(KoshaError::NotFound(
+                "refusing to evict the cache root".into(),
+            ));
+        }
+        let dir = self.path_for(prefix)?;
+        let below = format!("{prefix}/");
+        let mut freed = 0u64;
+        {
+            let mut recency = self.recency.lock().unwrap();
+            recency.retain(|key| {
+                if !key.starts_with(&below) {
+                    return true;
+                }
+                if let Ok(path) = self.path_for(key) {
+                    freed += path.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+                false
+            });
+        }
+        if dir.is_dir() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        let mut total = self.total_bytes.load(Ordering::Relaxed);
+        while let Err(actual) = self.total_bytes.compare_exchange_weak(
+            total,
+            total.saturating_sub(freed),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            total = actual;
+        }
+        self.eviction_generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -338,6 +483,22 @@ impl Cache {
     }
 }
 
+fn collect_files(dir: &Path, out: &mut Vec<(PathBuf, u64)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            collect_files(&entry.path(), out);
+        } else {
+            out.push((entry.path(), meta.len()));
+        }
+    }
+}
+
 fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
@@ -360,6 +521,30 @@ fn dir_size(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn evict_prefix_removes_one_namespace_and_keeps_its_neighbours() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-evict-prefix-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
+        cache.put_bytes("t/gone/seg-1/a.bin", &[0; 100]).unwrap();
+        cache.put_bytes("t/gone2/seg-1/a.bin", &[0; 10]).unwrap();
+        // Written behind the cache's back (the indexer does this).
+        fs::create_dir_all(dir.join("t/gone/seg-2")).unwrap();
+        fs::write(dir.join("t/gone/seg-2/b.bin"), [0; 1000]).unwrap();
+        let generation = cache.eviction_generation();
+
+        cache.evict_prefix("t/gone").unwrap();
+        assert!(!dir.join("t/gone").exists());
+        assert!(cache.contains("t/gone2/seg-1/a.bin"));
+        assert_eq!(cache.total_size(), 10, "only tracked bytes are released");
+        assert!(cache.eviction_generation() > generation);
+        assert!(cache.evict_prefix("/").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn cache_miss_returns_none() {
@@ -416,6 +601,29 @@ mod tests {
 
         cache.evict("key.bin").unwrap();
         assert!(cache.get("key.bin").is_none());
+
+        // A whole segment directory, including bytes the cache never saw.
+        cache.put("ns/seg/a.bin", &src).unwrap();
+        fs::write(dir.join("ns/seg/unreported.bin"), b"0123456789").unwrap();
+        let before = cache.eviction_generation();
+        assert_eq!(cache.evict("ns/seg").unwrap(), 14);
+        assert!(!dir.join("ns/seg").exists());
+        assert_eq!(cache.eviction_generation(), before + 1);
+        assert_eq!(cache.total_size(), 0, "never underflows");
+        // Untracked bytes in an evicted directory never offset tracked
+        // bytes elsewhere: the total stays what the cache holds.
+        cache.put_bytes("other/x.bin", &[0u8; 100]).unwrap();
+        cache.put("ns/seg2/a.bin", &src).unwrap();
+        fs::write(dir.join("ns/seg2/flushed.bin"), [0u8; 1000]).unwrap();
+        assert_eq!(cache.total_size(), 104);
+        assert_eq!(cache.evict("ns/seg2").unwrap(), 1004);
+        assert_eq!(cache.total_size(), 100);
+        assert!(cache
+            .recency
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|k| !k.starts_with("ns/seg")));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -547,6 +755,57 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #242: compaction evicts a superseded segment directory. A pin on any
+    /// file under it must block the eviction; otherwise the directory goes,
+    /// its file keys leave the LRU list, and the running total drops only
+    /// by the bytes the cache was tracking (an untracked file written by the
+    /// indexer must not wrap the counter).
+    #[test]
+    fn evict_dir_unless_pinned_respects_pins_and_keeps_accounting_exact() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-cache-evict-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
+        cache
+            .put_bytes("ns/seg-a/doc_store.bin", &[0u8; 40])
+            .unwrap();
+        cache
+            .put_bytes("ns/seg-a/inverted.idx", &[0u8; 10])
+            .unwrap();
+        cache
+            .put_bytes("ns/seg-a2/doc_store.bin", &[0u8; 7])
+            .unwrap();
+        // Written straight to disk, never accounted (an indexer flush).
+        fs::write(dir.join("ns/seg-a/filters.bin"), [0u8; 5]).unwrap();
+        assert_eq!(cache.total_size(), 57);
+
+        cache.pin("ns/seg-a/inverted.idx");
+        assert_eq!(cache.evict_dir_unless_pinned("ns/seg-a").unwrap(), None);
+        assert!(dir.join("ns/seg-a/doc_store.bin").exists(), "pinned: kept");
+        cache.unpin("ns/seg-a/inverted.idx");
+
+        let gen = cache.eviction_generation();
+        assert_eq!(
+            cache.evict_dir_unless_pinned("ns/seg-a").unwrap(),
+            Some(55),
+            "all bytes on disk, tracked or not"
+        );
+        assert!(!dir.join("ns/seg-a").exists());
+        assert_eq!(cache.total_size(), 7, "only tracked bytes subtracted");
+        assert!(cache.eviction_generation() > gen);
+        assert!(!cache
+            .recency
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|k| k.starts_with("ns/seg-a/")));
+        // A sibling whose name shares the prefix is untouched, and an
+        // already-gone directory is a no-op.
+        assert!(cache.get("ns/seg-a2/doc_store.bin").is_some());
+        assert_eq!(cache.evict_dir_unless_pinned("ns/seg-a").unwrap(), Some(0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// When *everything* remaining is pinned, eviction must give up rather
     /// than evict a pinned key — the same "nothing safe left to evict"
     /// fallback as a single file bigger than the whole bound.
@@ -607,8 +866,11 @@ mod tests {
         fs::create_dir_all(dir.join("_wal")).unwrap();
         fs::write(dir.join("_wal/sequence"), b"100").unwrap();
         fs::write(dir.join("_wal/record.wal"), [1u8; 100]).unwrap();
+        fs::create_dir_all(dir.join("_wal.migrated-1")).unwrap();
+        fs::write(dir.join("_wal.migrated-1/record.wal"), [2u8; 100]).unwrap();
         let cache = Cache::with_max_bytes(dir.clone(), Some(1));
         cache.put_bytes("ns/seg/large.bin", &[0u8; 10]).unwrap();
+        assert!(dir.join("_wal.migrated-1/record.wal").exists());
         assert_eq!(fs::read(dir.join("_wal/sequence")).unwrap(), b"100");
         assert_eq!(
             fs::read(dir.join("_wal/record.wal")).unwrap(),

@@ -1,98 +1,170 @@
 # kosha-vector-spfresh
 
-A standalone, in-memory implementation of the algorithmic core of
-[SPFresh](https://arxiv.org/abs/2410.14452) (SOSP '23) — a cluster/posting-based
+An in-memory implementation of the algorithmic core of
+[SPFresh](https://arxiv.org/abs/2410.14452) (SOSP '23): a cluster/posting-based
 ANN index kept balanced by **LIRE** (**L**ightweight **I**ncremental
-**RE**-balancing: Split, Merge, and a bounded Reassign, on top of Insert/Delete).
+**RE**-balancing: Split, Merge and a bounded Reassign, on top of Insert/Delete).
 
-**This crate is not wired into kosha's on-disk segment format or query path.**
-It exists to answer a question `DESIGN.md` already flags as open: kosha's
-current per-segment vector index (`crates/kosha-segment/src/lib.rs`) reads a
-flat, uncompressed `vector.idx` and rebuilds an `instant-distance` HNSW graph
-**from scratch, in memory, on every segment open** — nothing about the graph
-is ever persisted, and periodic compaction triggers the same rebuild again.
-`DESIGN.md` reserves a "vector.idx v2 — HNSW graph OR IVF-PQ codebook +
-posting lists" slot for exactly this tradeoff and calls it unresolved. This
-crate is a benchmarked, tested answer to that question — not yet a decision
-to ship it.
+kosha uses it to build every segment's vector index. The crate itself has no
+I/O and no dependency on the rest of the workspace; `kosha-segment` turns its
+postings into files and `kosha-query` probes them.
 
-See `benches/build_query_cost.rs` for a direct comparison against kosha's real
-`build_hnsw`/`flat_knn`, and `tests/churn_ablation.rs` for a re-run of the
-paper's own Figure 10 ablation using kosha's own numbers.
+## What is wired into kosha
 
-## Concept → code map
+### Segment files (`kosha-segment`)
+
+Each `Vector` field of a segment gets one index (#204): `vector.idx` +
+`vector.offsets` for the first column, `vector.<n>.idx` + `vector.<n>.offsets`
+for column `n`.
+
+- `vector.idx`: a header (`KVE2` magic, version, dim, count), then every
+  posting's entries back to back: `[doc_seq:u32][f32 x dim]`, or
+  `[doc_seq:u32][scale:f32][i8 x dim]` for an i8 column (version 4, #210).
+- `vector.offsets`: per posting, its centroid (f32), the byte range of its
+  entries in `vector.idx` and, from version 3, its radius: the largest cosine
+  distance from the centroid to any member.
+
+Vectors and centroids are unit-normalized at write time (version 2 and up), so
+scoring is a dot product. A reader keeps `vector.offsets` resident and reads a
+posting's entries from `vector.idx` only when a query probes it (with an LRU
+cache of decoded postings). Legacy flat `vector.idx` files (no magic) and
+indexes whose sidecar is missing are served by exact scan. Nothing builds an
+ANN structure when a segment is opened.
+
+### Building an index
+
+- **Flush** clusters the segment's vectors from scratch with
+  [`ClusterIndex::build`]: recursive balanced 2-means until every posting holds
+  at most `max_posting_size` (128) vectors, then undersized postings are merged
+  away.
+- **Compaction** (#253) does not re-cluster. Per vector column:
+  1. The largest input whose column has at least 1,024 vectors and a clustered
+     index has its postings adopted with [`ClusterIndex::from_postings`]:
+     centroid and members as stored, members remapped to the merged segment's
+     doc_seqs, tombstoned or deleted members dropped, and the centroid
+     recomputed for a posting that lost members.
+  2. Every other input's postings are folded in with
+     [`ClusterIndex::absorb_postings`]: an absorbed posting's centroid picks its
+     8 nearest adopted postings, and each member moves to the nearest of them.
+     The inputs each partitioned the same space on their own, so keeping their
+     postings side by side would split a query's neighbours across overlapping
+     postings. Vectors of inputs too small to adopt are absorbed one by one.
+  3. [`ClusterIndex::rebalance`] runs LIRE: Split every posting over
+     `max_posting_size` (repeatedly, until none is), Merge every posting under
+     `min_posting_size` (16) into its nearest neighbour, and after each event a
+     Reassign over the touched postings and their `reassign_radius` (8)
+     neighbours.
+
+  Postings that nothing touched keep their centroid and members, so the work
+  follows the number of changed postings rather than the column size. Entries
+  are re-encoded from the exact f32 vectors in `doc_vectors.bin` (or the doc
+  store), so an i8 column is requantized from full precision, and radii are
+  computed from exact vectors as on flush. The output is the same on-disk
+  format. A column is clustered from scratch instead when no input qualifies,
+  when fewer than half of its vectors come from seeded postings, or on a
+  dimension mismatch. `KOSHA_VECTOR_COMPACTION=rebuild` switches the whole path
+  off (default `lire`).
+
+### Querying (`kosha-query`)
+
+- **Global probe budget.** A kNN does not probe a fixed `nprobe` per segment.
+  It ranks the centroids of every segment it searches together and hydrates
+  the best `num_candidates` postings across all of them, with the budget
+  floored at `KOSHA_KNN_BUDGET_FRACTION` (5%) of the namespace's centroids and
+  capped by `KOSHA_KNN_BUDGET_MAX_CAP`. Filtered kNN widens it by the filter's
+  selectivity, or scores passing documents exactly when few pass (#252).
+- **Radius-aware ranking.** Postings are ranked by the triangle-inequality
+  lower bound `max(0, distance(query, centroid) - radius)` instead of raw
+  centroid distance, so a posting with an unremarkable centroid but a close
+  member still gets probed.
+- **i8 rescoring.** An i8 column scores with an i8 dot product, then rescores
+  its best `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates with the f32 vectors in
+  `doc_vectors.bin`.
+
+### Not wired yet
+
+- A namespace- or shard-level centroid index whose postings are shared across
+  segments and updated from the WAL (#253 step 2, after the indexer role in
+  #254). Today every segment carries its own postings, so the number of
+  centroids a query ranks grows with segment count; compaction only reduces it
+  by producing fewer, larger segments.
+- LIRE on flush: a flush still clusters from scratch.
+- `insert` / `delete` on a live index. Segments are immutable; deletes are
+  document tombstones filtered at query time, and LIRE runs only inside
+  compaction.
+
+## Concept to code
 
 | Paper concept | This crate |
 |---|---|
 | A posting (partition): centroid + assigned vectors | `posting::Posting` |
-| NPA (nearest partition assignment) — the invariant LIRE maintains | doc comment on `posting::Posting` |
-| SPTAG (centroid index for probing) | `centroid_probe.rs` — flat linear scan, see below |
-| "Multi-constraint balanced clustering" (build + Split's clusterer) | `kmeans::balanced_bisect` |
+| NPA (nearest partition assignment), the invariant LIRE maintains | doc comment on `posting::Posting` |
+| SPTAG (centroid index for probing) | `centroid_probe.rs`, a flat linear scan (see below) |
+| Multi-constraint balanced clustering (build + Split's clusterer) | `kmeans::balanced_bisect` |
 | LIRE: Insert | `ops::insert::insert` |
 | LIRE: Delete (tombstone) | `ops::delete::delete` |
 | LIRE: Split | `ops::split::split_posting` |
 | LIRE: Merge | `ops::merge::merge_posting` |
 | LIRE: Reassign, Eq. 1 / Eq. 2 necessary conditions | `ops::reassign::run_reassign` |
+| Bulk Insert of another partition's postings (not in the paper) | `ops::absorb::absorb` |
 | Version byte (tombstone + version) | `posting::PostingEntry::{deleted, version}` |
-| Split→Reassign convergence proof (posting count monotonically bounded above by vector count) | the `postings: Vec<Option<Posting>>` slab's monotonic-growth property (`ClusterIndex::alloc_slot`) + `MAX_CASCADE_DEPTH` guard in `ops/split.rs` + `tests/invariants.rs` (empirical check) |
-| Local Rebuilder (background job queue) | not implemented — see below |
-| Block Controller (SPDK, append-only disk blocks) | not implemented — see below |
+| Split/Reassign convergence (posting count bounded by vector count) | the `postings: Vec<Option<Posting>>` slab's monotonic growth (`ClusterIndex::alloc_slot`), the `MAX_CASCADE_DEPTH` guard in `ops/split.rs`, and `tests/invariants.rs` |
+| Local Rebuilder (background job queue) | not implemented (see below) |
+| Block Controller (SPDK, append-only disk blocks) | not implemented: postings are persisted by `kosha-segment` |
 
-## Simplifications versus the full paper
+## Simplifications versus the paper
 
-This is a single-node, single-threaded, in-memory prototype sized for
-kosha's actual segment scale (hundreds to ~50,000 vectors per segment), not
-the paper's billion-scale, disk-backed target. Every deviation below is
-deliberate:
+The paper targets a billion-vector, disk-backed, concurrently updated index.
+kosha's postings live in immutable segments of up to a few hundred thousand
+vectors, rewritten by compaction, which shapes these choices:
 
-- **In-memory only, no disk backing.** No SPDK, no raw block I/O, no
-  crash recovery/WAL/snapshotting. Kosha's segments are small enough that an
-  in-memory structure is the right scale; a future "wire into production"
-  pass would need to design a persisted format for this (see `DESIGN.md`'s
-  reserved `vector.idx` v2 slot).
-- **Synchronous, inline rebalancing — no background job queue.** The paper's
-  Local Rebuilder is a concurrent thread pool because it amortizes cost
-  across a billion-vector index. Here, a rebalance event touches one posting
-  plus at most `reassign_radius` (default 8) neighbors, so running it
-  synchronously at the end of `insert`/`delete` is cheap enough that the
-  thread-pool machinery isn't justified. See `ClusterIndex`'s doc comment.
-- **Flat linear-scan centroid probing, not SPTAG.** SPANN uses a graph index
-  over centroids because it has thousands-to-millions of postings. A kosha
-  segment has, realistically, tens to a few hundred postings — a linear scan
-  + partial sort (`centroid_probe.rs`) is simpler, easier to reason about,
-  and not the bottleneck at this scale.
-- **`balanced_bisect` stands in for "multi-constraint balanced clustering."**
-  The SPANN/SPFresh papers cite this algorithm by reference without
-  detailing it in the sections consulted for this implementation. This
-  crate's version — farthest-pair seeding, Lloyd iterations, then a
-  rebalance pass that moves the larger cluster's furthest-from-centroid
-  members into the smaller one — is a concrete, from-scratch substitute, not
-  a port of SPANN's actual algorithm. `tests/churn_ablation.rs` found one
-  real consequence of this: a from-scratch rebuild doesn't reliably
-  outperform incrementally-maintained full LIRE in this implementation
-  (unlike the paper's Figure 10), most likely because re-clustering the
-  *entire* live set every cycle re-applies this clusterer's own
-  approximation noise everywhere, whereas incremental LIRE only touches the
-  small region a Split/Merge actually changed. See the comment above that
-  test's assertions for detail — this is reported, not hidden behind a
-  tuned threshold.
-- **Plain `deleted: bool` + informational `version: u8`, no CAS.** The
-  paper's version byte exists to detect a vector being concurrently
-  reassigned by two racing threads. There's exactly one thread here, so
-  there's nothing to race with — the version field is kept (and bumped on
-  every tombstone) mainly so a future concurrent version has a natural place
-  to add real CAS-based conflict detection.
-- **No product quantization / vector compression.** Vectors are stored raw
-  (`Vec<f32>`), matching kosha's current `vector.idx` format. PQ (see the
-  other paper this crate's design drew on, Jégou et al. 2011) would reduce
-  memory/disk footprint at some recall cost — worth revisiting only if
-  segment vector storage size (not update cost) becomes the bottleneck.
+- **In memory, persisted by the caller.** The index exists only while a
+  segment is being written; `kosha-segment` serializes `snapshot()` and reads
+  postings back with `vector_posting_layout()`. No SPDK, raw block I/O or
+  crash recovery here.
+- **Synchronous rebalancing, no background job queue.** A Split or Merge
+  touches one posting plus at most `reassign_radius` neighbours and runs
+  inline. The paper's Local Rebuilder thread pool amortizes cost across an
+  index that never stops taking writes; compaction is already a batch job.
+- **Flat centroid probing, not SPTAG.** A segment has tens to a few thousand
+  postings, so a linear scan plus a partial sort is cheap.
+- **`balanced_bisect` stands in for multi-constraint balanced clustering.**
+  Farthest-pair seeding, Lloyd iterations, then a pass that moves the larger
+  side's farthest members to the smaller side until the size ratio is within
+  `max_cluster_size_ratio`. That last pass can leave a far member in a
+  posting, which inflates its radius. Absorb plus Reassign tends to produce
+  tighter postings than a from-scratch build, which is why
+  `tests/compaction_merge.rs` and `tests/churn_ablation.rs` both see merged or
+  incrementally maintained indexes match or beat a fresh build.
+- **`deleted: bool` plus an informational `version: u8`, no CAS.** There is
+  one writer thread, so nothing races. The version is bumped on every
+  tombstone so a concurrent design has somewhere to put real conflict
+  detection.
+- **i8 scalar quantization, not PQ.** Quantization (#210) happens in
+  `kosha-segment` at encode time with `quantize_i8`; the index itself holds
+  f32 vectors.
 
 ## Configuration defaults
 
-`ClusterIndexConfig::new(dim)` defaults (`target_posting_size: 64`,
+`ClusterIndexConfig::new(dim)`: `target_posting_size: 64`,
 `max_posting_size: 128`, `min_posting_size: 16`, `reassign_radius: 8`,
-`nprobe: 16`) are scaled for kosha's segment sizes, not the paper's
-billion-scale defaults (e.g. the paper found `reassign_radius = 64` — its
-"R nearest postings" — sufficient; this crate defaults to 8 since a whole
-kosha segment has far fewer total postings to begin with).
+`nprobe: 16`. These are scaled to kosha segments, not to the paper's
+billion-scale defaults (it uses `reassign_radius = 64`). `nprobe` applies only
+to this crate's own `search`; kosha-query uses the global budget above.
+
+## Tests and benchmarks
+
+- `tests/compaction_merge.rs`: compaction-shaped merges (one big input plus
+  flush-sized updates, four equal inputs, six churn cycles) compared against a
+  from-scratch build at the same relative probe budget. Recall@10 must not be
+  more than 0.5 points below the build's. The ignored `compaction_cost_report`
+  prints wall-clock rebuild vs lire times
+  (`cargo test --release -p kosha-vector-spfresh --test compaction_merge -- --ignored --nocapture`).
+- `tests/churn_ablation.rs`: the paper's Figure 10 ablation on one
+  insert/delete/drift sequence.
+- `tests/invariants.rs`, `tests/recall.rs`: structural invariants and recall
+  floors.
+- `benches/build_query_cost.rs`: build, incremental update and query cost, and
+  (`compaction_vector_index`) compaction's index step, `rebuild` against
+  `lire`. Run with
+  `cargo bench -p kosha-vector-spfresh --bench build_query_cost -- compaction_vector_index`.

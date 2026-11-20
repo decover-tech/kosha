@@ -30,6 +30,14 @@ pub struct Controller {
     manifests: HashMap<NamespaceId, Manifest>,
     /// Track which namespaces have been created.
     namespaces: Vec<NamespaceId>,
+    /// Deleted namespaces → the highest manifest version they reached. A
+    /// re-created namespace continues above it (see
+    /// [`ControlStore::delete_namespace`]).
+    retired: HashMap<NamespaceId, u64>,
+}
+
+fn empty_manifest(version: u64) -> Manifest {
+    Manifest::empty(version)
 }
 
 impl Controller {
@@ -37,49 +45,57 @@ impl Controller {
         Self {
             manifests: HashMap::new(),
             namespaces: Vec::new(),
+            retired: HashMap::new(),
         }
     }
 
-    /// Create a new namespace. Returns an error if it already exists.
+    /// The version a new incarnation of `id` starts at.
+    fn initial_version(&self, id: &NamespaceId) -> u64 {
+        kosha_core::initial_manifest_version(self.retired.get(id).copied())
+    }
+
+    /// Create a new namespace. `NamespaceExists` if it already exists.
     pub fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
         if self.namespaces.contains(&id) {
-            return Err(KoshaError::NamespaceNotFound(id));
+            return Err(KoshaError::NamespaceExists(id));
         }
-        self.namespaces.push(id.clone());
-        self.manifests.insert(
-            id,
-            Manifest {
-                version: 0,
-                segments: Vec::new(),
-                segment_footers: Default::default(),
-                footer_crc32: Default::default(),
-                wal_checkpoint: 0,
-                wal_origin: None,
-                tombstones: Default::default(),
-                deletion_vectors: Default::default(),
-            },
-        );
+        self.ensure_namespace(id);
         Ok(())
     }
 
     /// Ensure a namespace exists, creating it if necessary.
     pub fn ensure_namespace(&mut self, id: NamespaceId) {
         if !self.namespaces.contains(&id) {
+            let version = self.initial_version(&id);
             self.namespaces.push(id.clone());
-            self.manifests.insert(
-                id,
-                Manifest {
-                    version: 0,
-                    segments: Vec::new(),
-                    segment_footers: Default::default(),
-                    footer_crc32: Default::default(),
-                    wal_checkpoint: 0,
-                    wal_origin: None,
-                    tombstones: Default::default(),
-                    deletion_vectors: Default::default(),
-                },
-            );
+            self.manifests.insert(id, empty_manifest(version));
         }
+    }
+
+    /// Delete a namespace, keeping its retired version. See
+    /// [`ControlStore::delete_namespace`].
+    pub fn delete_namespace(
+        &mut self,
+        id: &NamespaceId,
+        retire_at_least: u64,
+    ) -> Result<(Manifest, u64), KoshaError> {
+        let Some(at) = self.namespaces.iter().position(|ns| ns == id) else {
+            return Err(KoshaError::NamespaceNotFound(id.clone()));
+        };
+        self.namespaces.remove(at);
+        let manifest = self
+            .manifests
+            .remove(id)
+            .unwrap_or_else(|| empty_manifest(0));
+        let retired = self
+            .retired
+            .get(id)
+            .copied()
+            .unwrap_or(0)
+            .max(manifest.version)
+            .max(retire_at_least);
+        self.retired.insert(id.clone(), retired);
+        Ok((manifest, retired))
     }
 
     /// Check if a namespace exists.
@@ -121,7 +137,14 @@ impl Controller {
         expected_version: u64,
         new_manifest: Manifest,
     ) -> Result<(), KoshaError> {
-        if !self.manifests.contains_key(id) && expected_version == 0 {
+        // A missing namespace is bootstrapped by a writer that knows
+        // nothing (expected 0) or one that knows the version a re-created
+        // namespace starts at. A bootstrap at a retired namespace's initial
+        // version with expected 0 then conflicts, and the writer rebases
+        // onto the empty manifest.
+        if !self.manifests.contains_key(id)
+            && (expected_version == 0 || expected_version == self.initial_version(id))
+        {
             self.ensure_namespace(id.clone());
         }
         let current = self
@@ -145,6 +168,26 @@ impl Controller {
 
         *current = new_manifest;
         Ok(())
+    }
+
+    /// Remove a namespace and its manifest; `None` if it did not exist.
+    pub fn remove_namespace(&mut self, id: &NamespaceId) -> Option<Manifest> {
+        let at = self.namespaces.iter().position(|ns| ns == id)?;
+        self.namespaces.remove(at);
+        Some(self.manifests.remove(id).unwrap_or_else(|| Manifest {
+            version: 0,
+            segments: Vec::new(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            branch: None,
+            retired: Default::default(),
+            shards: Default::default(),
+        }))
     }
 
     /// List all registered namespaces.
@@ -180,8 +223,15 @@ impl ControlStore for Controller {
     fn manifest_mut(&mut self, id: &NamespaceId) -> Option<&mut Manifest> {
         self.manifest_mut(id)
     }
-    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
-        self.manifest(id).map(|manifest| manifest.version)
+    fn manifest_version(&self, id: &NamespaceId) -> Result<Option<u64>, KoshaError> {
+        Ok(self.manifest(id).map(|manifest| manifest.version))
+    }
+    fn manifest_versions(&self) -> Result<Vec<(NamespaceId, u64)>, KoshaError> {
+        Ok(self
+            .manifests
+            .iter()
+            .map(|(id, manifest)| (id.clone(), manifest.version))
+            .collect())
     }
     fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError> {
         self.save_manifest(id, manifest)
@@ -199,6 +249,16 @@ impl ControlStore for Controller {
     }
     fn namespace_count(&self) -> usize {
         self.namespace_count()
+    }
+    fn delete_namespace(
+        &mut self,
+        id: &NamespaceId,
+        retire_at_least: u64,
+    ) -> Result<(Manifest, u64), KoshaError> {
+        self.delete_namespace(id, retire_at_least)
+    }
+    fn remove_namespace(&mut self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
+        Ok(self.remove_namespace(id))
     }
 }
 
@@ -220,6 +280,10 @@ mod tests {
             wal_origin: Some("writer-a".into()),
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
         };
         ctrl.compare_and_swap_manifest(&ns, 0, candidate.clone())
             .unwrap();
@@ -238,6 +302,50 @@ mod tests {
     }
 
     #[test]
+    fn manifest_versions_lists_every_namespace_and_distinguishes_missing() {
+        let mut ctrl = Controller::new();
+        let a = NamespaceId("a".into());
+        let b = NamespaceId("b".into());
+        ctrl.ensure_namespace(a.clone());
+        let mut manifest = ctrl.manifest(&a).unwrap().clone();
+        manifest.version = 7;
+        ctrl.save_manifest(&b, &manifest).unwrap();
+        let mut versions = ControlStore::manifest_versions(&ctrl).unwrap();
+        versions.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+        assert_eq!(versions, vec![(a.clone(), 0), (b.clone(), 7)]);
+        assert_eq!(ControlStore::manifest_version(&ctrl, &b).unwrap(), Some(7));
+        assert_eq!(
+            ControlStore::manifest_version(&ctrl, &NamespaceId("missing".into())).unwrap(),
+            None
+        );
+        assert!(
+            ControlStore::try_manifest_cloned(&ctrl, &NamespaceId("missing".into()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remove_namespace_forgets_it_and_reports_what_it_held() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("t/branch".into());
+        assert!(ControlStore::remove_namespace(&mut ctrl, &ns)
+            .unwrap()
+            .is_none());
+        ctrl.ensure_namespace(ns.clone());
+        let mut manifest = ctrl.manifest(&ns).unwrap().clone();
+        manifest.version = 3;
+        ctrl.compare_and_swap_manifest(&ns, 0, manifest).unwrap();
+        let removed = ControlStore::remove_namespace(&mut ctrl, &ns)
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.version, 3);
+        assert!(!ctrl.has_namespace(&ns));
+        assert!(ctrl.manifest(&ns).is_none());
+        assert!(ControlStore::manifest_versions(&ctrl).unwrap().is_empty());
+    }
+
+    #[test]
     fn create_and_list_namespaces() {
         let mut ctrl = Controller::new();
         let ns = NamespaceId("org1/matter42".into());
@@ -246,8 +354,67 @@ mod tests {
         assert!(ctrl.has_namespace(&ns));
         assert_eq!(ctrl.namespace_count(), 1);
 
-        // Duplicate creation should fail.
-        assert!(ctrl.create_namespace(ns).is_err());
+        // Duplicate creation should fail with a conflict, not "not found".
+        assert!(matches!(
+            ctrl.create_namespace(ns),
+            Err(KoshaError::NamespaceExists(_))
+        ));
+    }
+
+    #[test]
+    fn delete_namespace_retires_its_version_and_recreate_continues_above_it() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("t/docs".into());
+        assert!(matches!(
+            ctrl.delete_namespace(&ns, 0),
+            Err(KoshaError::NamespaceNotFound(_))
+        ));
+        ctrl.create_namespace(ns.clone()).unwrap();
+        let mut published = ctrl.manifest(&ns).unwrap().clone();
+        published.version = 4;
+        ctrl.compare_and_swap_manifest(&ns, 0, published).unwrap();
+
+        let (last, retired) = ctrl.delete_namespace(&ns, 0).unwrap();
+        assert_eq!((last.version, retired), (4, 4));
+        assert!(!ctrl.has_namespace(&ns));
+        assert!(ctrl.manifest(&ns).is_none());
+        assert!(ctrl.list_namespaces().is_empty());
+
+        // Explicit re-create starts above every version the old one used.
+        ctrl.create_namespace(ns.clone()).unwrap();
+        assert_eq!(ctrl.manifest(&ns).unwrap().version, 5);
+        assert!(ctrl.manifest(&ns).unwrap().segments.is_empty());
+
+        // A writer that remembers the deleted incarnation (published 4) can
+        // never commit over the new one.
+        let (_, retired) = ctrl.delete_namespace(&ns, 9).unwrap();
+        assert_eq!(retired, 9, "retire_at_least raises the floor");
+        let mut stale = empty_manifest(5);
+        stale.wal_checkpoint = 1;
+        assert!(matches!(
+            ctrl.compare_and_swap_manifest(&ns, 4, stale),
+            Err(KoshaError::ManifestConflict { actual: None, .. })
+        ));
+        assert!(
+            !ctrl.has_namespace(&ns),
+            "a stale writer must not resurrect it"
+        );
+
+        // Auto-create by a fresh writer (expected 0) bootstraps at 10 and
+        // conflicts, so the writer rebases instead of publishing version 1.
+        assert!(matches!(
+            ctrl.compare_and_swap_manifest(&ns, 0, empty_manifest(1)),
+            Err(KoshaError::ManifestConflict {
+                actual: Some(10),
+                ..
+            })
+        ));
+        assert_eq!(ctrl.manifest(&ns).unwrap().version, 10);
+        // A writer seeded with the initial version commits directly.
+        ctrl.delete_namespace(&ns, 0).unwrap();
+        ctrl.compare_and_swap_manifest(&ns, 11, empty_manifest(12))
+            .unwrap();
+        assert_eq!(ctrl.manifest(&ns).unwrap().version, 12);
     }
 
     #[test]
@@ -283,6 +450,10 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
+                schema: None,
+                retired: Default::default(),
+                shards: None,
             },
         )
         .unwrap();
@@ -302,6 +473,10 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
+                schema: None,
+                retired: Default::default(),
+                shards: None,
             },
         )
         .unwrap();
@@ -330,6 +505,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
         };
 
         // CAS with version 0 → should succeed (initial version is 0).
@@ -350,6 +529,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
         };
         assert!(ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2).is_err());
     }

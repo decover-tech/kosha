@@ -132,6 +132,10 @@ fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, dim: us
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        branch: None,
+        schema: None,
+        retired: Default::default(),
+        shards: None,
     }
 }
 
@@ -149,6 +153,7 @@ fn mk_query(text: &str, knn: Option<KnnQuery>) -> SearchQuery {
         highlight: None,
         aggs: HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn,
         exact_total_hits: None,
@@ -156,8 +161,14 @@ fn mk_query(text: &str, knn: Option<KnnQuery>) -> SearchQuery {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
+        rank: None,
+        mode: None,
+        fields: Vec::new(),
+        rerank: None,
     }
 }
 
@@ -171,6 +182,8 @@ fn mk_knn(dim: usize, k: usize) -> KnnQuery {
         k,
         num_candidates: 10 * k,
         filter: None,
+        vectors: None,
+        scoring: None,
     }
 }
 
@@ -257,9 +270,7 @@ fn main() {
             // v2 segments carry the lazy posting index; legacy/flat ones
             // carry a populated vector_store (served by exact flat_knn).
             assert!(
-                r.has_lazy_vector_index()
-                    || r.hnsw_map.is_some()
-                    || !r.vector_store.vectors.is_empty(),
+                r.has_lazy_vector_index() || !r.vector_store().vectors.is_empty(),
                 "vector segment opened without any vector index"
             );
         }

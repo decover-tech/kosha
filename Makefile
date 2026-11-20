@@ -8,6 +8,7 @@
 #   make gen              — generate everything
 #   make rust-test        — run Rust tests
 #   make rust-build       — build Rust binary
+#   make cli-assets       — kosha shell completions + man pages into target/cli-assets
 #   make client-python-test — run Python client unit tests
 #   make bench-hook-test   — run commit_bench_section.sh regression tests
 #   make migration-job-manifest — regen the ES→Kosha staging backfill Job YAML
@@ -34,6 +35,26 @@ gen: proto-gen
 gen/python: proto-gen  # for now, proto-gen includes python; isolate later
 
 gen/go: proto-gen      # for now, proto-gen includes go; isolate later
+
+# ── CLI completions + man pages ───────────────────────────────────────────
+# Packaging input for the `kosha` CLI: completion scripts for every shell clap
+# supports and one man page per command. Install, e.g.:
+#   cp target/cli-assets/completions/_kosha "${fpath[1]}/"
+#   cp target/cli-assets/man/*.1 /usr/local/share/man/man1/
+
+.PHONY: cli-assets
+
+CLI_ASSETS := target/cli-assets
+
+cli-assets:
+	cargo build --release --locked -p kosha-cli
+	mkdir -p $(CLI_ASSETS)/completions $(CLI_ASSETS)/man
+	target/release/kosha completions bash > $(CLI_ASSETS)/completions/kosha.bash
+	target/release/kosha completions zsh > $(CLI_ASSETS)/completions/_kosha
+	target/release/kosha completions fish > $(CLI_ASSETS)/completions/kosha.fish
+	target/release/kosha completions powershell > $(CLI_ASSETS)/completions/_kosha.ps1
+	target/release/kosha completions elvish > $(CLI_ASSETS)/completions/kosha.elv
+	target/release/kosha man --out-dir $(CLI_ASSETS)/man
 
 # ── Quickstart ────────────────────────────────────────────────────────────
 

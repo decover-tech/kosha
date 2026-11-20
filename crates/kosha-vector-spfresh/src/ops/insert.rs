@@ -48,7 +48,7 @@ pub(crate) fn insert(
     if index.config.enable_split {
         let live = index.postings[target].as_ref().unwrap().live_count();
         if live > index.config.max_posting_size {
-            split_posting(index, target, 0);
+            let _ = split_posting(index, target, 0);
         }
     }
 

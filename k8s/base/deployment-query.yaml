@@ -24,6 +24,10 @@ spec:
       labels:
         app: kosha
         role: query
+      annotations:
+        # A replaced pod starts with an empty cache; Karpenter consolidation
+        # was replacing idle warm pods several times a day.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: kosha
       # Deliberately NOT on the dedicated NVMe/Karpenter pool — that pool is
@@ -79,6 +83,16 @@ spec:
                 secretKeyRef:
                   name: kosha-secret
                   key: bootstrap-api-key
+            # Pod-to-pod credential for /internal/* routes. Query pods use it
+            # to read the ingest pod's unindexed writes for strong-consistency
+            # searches (#255); without it they default to eventual
+            # consistency. Optional so clusters without the key still start.
+            - name: KOSHA_INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: internal-api-key
+                  optional: true
           readinessProbe:
             httpGet:
               path: /readyz

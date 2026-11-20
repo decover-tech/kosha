@@ -25,6 +25,13 @@ Usage:
   python3 scripts/bench/cold_read_local.py --segs 16 --docs 4000
   # Reproduce staging's non-convergence (budget < working set):
   python3 scripts/bench/cold_read_local.py --budget 2000000
+  # Cold-query mode (#245): N cold nodes, each running one *different*
+  # multi-term query, reporting cold p50/p99 and S3 round trips / bytes
+  # from the `search timing:` line (`s3_rounds`, `s3_bytes`, `postings_*`):
+  python3 scripts/bench/cold_read_local.py --cold-queries 20
+  # Compare against whole-shard postings / whole doc stores:
+  KOSHA_POSTINGS_READ_MODE=whole KOSHA_DOC_STORE_READ_MODE=whole \
+    python3 scripts/bench/cold_read_local.py --cold-queries 20 --skip-build
 """
 
 import argparse
@@ -169,7 +176,7 @@ def ensure_corpus(args):
 # ─── Cold/warm measurement ──────────────────────────────────────────────────
 
 
-def search_until_ok(port, max_attempts):
+def search_until_ok(port, max_attempts, query_text="the"):
     """Retry 503s like the real kosha_client. Returns (wall_s, attempts)."""
     t0 = time.time()
     for attempt in range(1, max_attempts + 1):
@@ -178,7 +185,7 @@ def search_until_ok(port, max_attempts):
                 "POST",
                 port,
                 "search",
-                {"namespace": NAMESPACE, "query_text": "the", "max_results": 10},
+                {"namespace": NAMESPACE, "query_text": query_text, "max_results": 10},
             )
             return time.time() - t0, attempt
         except urllib.error.HTTPError as e:
@@ -190,6 +197,73 @@ def search_until_ok(port, max_attempts):
 
 def timing_lines(log_path):
     return TIMING_RE.findall(Path(log_path).read_text())
+
+
+TIMING_FIELD_RE = re.compile(r"(\w+)=([0-9.]+)")
+
+
+def timing_fields(line):
+    return {k: float(v) for k, v in TIMING_FIELD_RE.findall(line)}
+
+
+def percentile(values, p):
+    values = sorted(values)
+    if not values:
+        return None
+    return values[min(len(values) - 1, int(round(p / 100.0 * (len(values) - 1))))]
+
+
+def cold_query_texts(n, vocab):
+    """`n` distinct three-term queries over mid-frequency words, so each
+    one touches different posting spans (and usually different shards)."""
+    texts = []
+    for i in range(n):
+        base = 50 + (i * 7919) % max(1, vocab // 4)
+        texts.append(f"w{base} w{base + 13} w{base + 101}")
+    return texts
+
+
+def cold_queries(args):
+    """#245 cold-query mode: one fresh, empty query node per query."""
+    rows = []
+    for i, text in enumerate(cold_query_texts(args.cold_queries, args.vocab)):
+        data_dir = WORK / "query-data"
+        if data_dir.exists():
+            shutil.rmtree(data_dir)
+        data_dir.mkdir(parents=True)
+        log_path = WORK / f"cold-query{i}.log"
+        extra = {}
+        if args.budget is not None:
+            extra["KOSHA_CACHE_MAX_BYTES"] = str(args.budget)
+        proc = spawn_server("query", data_dir, QUERY_PORT, extra, log_path)
+        try:
+            wall, attempts = search_until_ok(QUERY_PORT, args.max_attempts, text)
+            warm_wall, _ = search_until_ok(QUERY_PORT, 3, text) if wall else (None, 0)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+        lines = timing_lines(log_path)
+        cold = timing_fields(lines[0]) if lines else {}
+        warm = timing_fields(lines[-1]) if len(lines) > 1 else {}
+        rows.append((text, wall, attempts, cold, warm_wall, warm))
+        print(
+            f"  q{i:02d} {text!r}: cold {wall * 1e3 if wall else float('nan'):7.0f} ms "
+            f"({attempts} attempt(s)) rounds={cold.get('s3_rounds', float('nan')):.0f} "
+            f"bytes={cold.get('s3_bytes', 0) / 1e6:.2f} MB "
+            f"postings={cold.get('postings_ranged_kb', 0):.1f} KB ranged / "
+            f"{cold.get('postings_whole_mb', 0):.2f} MB whole; "
+            f"warm s3_bytes={warm.get('s3_bytes', float('nan')):.0f}"
+        )
+    walls = [r[1] * 1e3 for r in rows if r[1]]
+    byts = [r[3].get("s3_bytes", 0) for r in rows]
+    rounds = [r[3].get("s3_rounds", 0) for r in rows]
+    if walls:
+        print(
+            f"\ncold p50 {percentile(walls, 50):.0f} ms, p99 {percentile(walls, 99):.0f} ms; "
+            f"bytes p50 {percentile(byts, 50) / 1e6:.2f} MB, max {max(byts) / 1e6:.2f} MB; "
+            f"S3 round trips max {max(rounds):.0f} ({len(walls)} queries)"
+        )
+    return rows
 
 
 def cold_run(run_idx, args):
@@ -235,6 +309,14 @@ def main():
         "the corpus size to reproduce staging's non-convergence locally.",
     )
     ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument(
+        "--cold-queries",
+        type=int,
+        default=0,
+        help="#245 cold-query mode: run this many distinct multi-term queries, "
+        "each on a fresh empty query node, and report cold p50/p99 latency, S3 "
+        "round trips and bytes fetched (instead of the cold-read loop).",
+    )
     args = ap.parse_args()
 
     WORK.mkdir(parents=True, exist_ok=True)
@@ -251,6 +333,11 @@ def main():
 
     print("── corpus ──")
     ensure_corpus(args)
+
+    if args.cold_queries:
+        print(f"── cold-query mode ({args.cold_queries} queries) ──")
+        rows = cold_queries(args)
+        sys.exit(0 if any(r[1] for r in rows) else 2)
 
     print(f"── cold-read loop ({args.runs} runs, budget={args.budget or 'default'}) ──")
     results = []

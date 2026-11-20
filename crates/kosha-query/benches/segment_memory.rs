@@ -138,6 +138,10 @@ fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, vocab: 
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        branch: None,
+        schema: None,
+        retired: Default::default(),
+        shards: None,
     }
 }
 
@@ -183,6 +187,15 @@ fn build_v1_twin(v2_root: &Path, v1_root: &Path, ns: &NamespaceId, manifest: &Ma
         ] {
             std::fs::copy(src.join(f), dst.join(f)).unwrap();
         }
+        // A v1 `inverted.idx` predates per-field indexes (#249): drop
+        // `field_index` so field-restricted queries read the combined index,
+        // as they do on a real v1 segment, instead of field postings this
+        // twin doesn't carry.
+        let footer_path = dst.join("footer.json");
+        let mut footer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&footer_path).unwrap()).unwrap();
+        footer.as_object_mut().unwrap().remove("field_index");
+        std::fs::write(&footer_path, serde_json::to_vec(&footer).unwrap()).unwrap();
         // Re-express the postings in v1 by reading them back out of v2.
         let reader = SegmentReader::open_with_options(src.clone(), false).unwrap();
         let index: HashMap<String, Vec<Posting>> = reader
@@ -208,6 +221,7 @@ fn mk_query(text: &str) -> SearchQuery {
         highlight: None,
         aggs: HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         exact_total_hits: None,
@@ -215,8 +229,14 @@ fn mk_query(text: &str) -> SearchQuery {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
+        rank: None,
+        mode: None,
+        fields: Vec::new(),
+        rerank: None,
     }
 }
 
@@ -306,6 +326,7 @@ fn measure_format(root: &Path, ns: &NamespaceId, manifest: &Manifest) -> FormatR
         field: "t".into(),
         phrase: "breach warranty".into(),
         slop: 0,
+        fields: Vec::new(),
     });
     let mut wildcard = mk_query("");
     wildcard.wildcard = Some(WildcardQuery {

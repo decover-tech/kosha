@@ -1,0 +1,35 @@
+{
+  "segment_id": "legacy-seg",
+  "doc_count": 3,
+  "total_field_length": 16,
+  "avg_field_length": 5.333333333333333,
+  "bm25_params": {
+    "k1": 1.2,
+    "b": 0.75
+  },
+  "created_at": "2026-11-19T18:49:19Z",
+  "filter_blooms": {
+    "kind": {
+      "bits_b64": "JDZJbdhasoE=",
+      "num_bits": 64,
+      "k": 16
+    },
+    "title": {
+      "bits_b64": "oKoKAFBVBQA=",
+      "num_bits": 64,
+      "k": 16
+    },
+    "body": {
+      "bits_b64": "XoPT8CQ36U0=",
+      "num_bits": 64,
+      "k": 15
+    }
+  },
+  "term_bloom": {
+    "bits_b64": "F46Ev8eLNV1zR6E09Yrn5E0=",
+    "num_bits": 135,
+    "k": 7
+  },
+  "format_version": 2,
+  "text_filter_ignore_above": 256
+}

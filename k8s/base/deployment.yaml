@@ -66,10 +66,20 @@ spec:
                 secretKeyRef:
                   name: kosha-secret
                   key: bootstrap-api-key
+            # Pod-to-pod credential for /internal/* routes. Query pods use it
+            # to read the ingest pod's unindexed writes for strong-consistency
+            # searches (#255); without it they default to eventual
+            # consistency. Optional so clusters without the key still start.
+            - name: KOSHA_INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: internal-api-key
+                  optional: true
             # Admin routes on this pod are synchronous and long:
-            # /v1/admin/compact-namespace hydrates the entire namespace
-            # (22.35GiB for staging's paragraph_index_hnsw, vectors
-            # included) and merges it inside the request. The default is
+            # /v1/admin/compact-namespace (without "async": true) hydrates
+            # and merges capped groups of staging's 22.35GiB
+            # paragraph_index_hnsw inside the request. The default is
             # 300s, so such a call answers into a dead socket while the
             # work continues server-side, leaving the caller with no way to
             # tell success from failure. This is a per-syscall read/write
