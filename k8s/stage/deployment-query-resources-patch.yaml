@@ -107,25 +107,21 @@ spec:
             # raising it for every query on the pod.
             - name: KOSHA_WARMUP_NAMESPACES
               value: "default/paragraph_index_hnsw"
-            # Posting blobs OFF, against the code default.
-            #
-            # Bytes are not the reason — measured against the live manifest,
-            # the static scaffolding is 0.19 GiB over 4,587 files and adding
-            # posting blobs only reaches 0.33 GiB, both far inside the
-            # 24 GiB KOSHA_CACHE_MAX_BYTES above. File *count* is: those
-            # blobs are 206,756 objects, and warmup is readiness-gated, so
-            # fetching them holds /readyz at 503 for the whole pass. The
-            # comparable 214,558-file hydration on the ingest pod took ~25
-            # minutes; paying that on every rollout and every HPA scale-up
-            # (min 2 / max 6) is a bad trade for a prefetch whose stated
-            # purpose is avoiding a first-query convoy.
-            #
-            # Nothing needed here wants them: warmup's own probe query is
-            # empty, and the scan this exists for is match_all with no query
-            # text, so no term shards are read. Leave this on only if a
-            # future workload on these pods is BM25-heavy from cold.
+            # Posting blobs on (the code default). They were switched off when
+            # the namespace had 206,756 of them and warming held /readyz for
+            # ~25 minutes; compaction has since left 256 per segment (1,536
+            # files, 36 MB for a 489K-chunk matter), and without them the
+            # first keyword and phrase searches on a new pod fetch them one
+            # request at a time.
             - name: KOSHA_WARMUP_POSTING_BLOBS
-              value: "0"
+              value: "1"
+            # One search may hydrate up to 8 GiB (default 2 GiB). A compacted
+            # segment's vector.idx alone is 1.6 GB and the matter's vector
+            # indexes total 2.7 GB, so under the default a semantic search on
+            # a cold pod was shed with a 429 every time and could never warm
+            # the pod. Still under the 24 GiB disk cache budget above.
+            - name: KOSHA_HYDRATE_REQUEST_MAX_BYTES
+              value: "8589934592"
           resources:
             requests:
               cpu: "2"
