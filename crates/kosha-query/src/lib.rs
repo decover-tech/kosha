@@ -1325,8 +1325,41 @@ impl QueryAnalysis {
 /// natural key, but nothing stops two different manifests sharing a
 /// version (tests, a namespace recreated from scratch), and a stale `df`
 /// would quietly skew every score — the fingerprint costs one hash pass
-/// over the segment ids.
-type CorpusKey = (String, u64, u64);
+/// over the segment ids. The last field says whether the segment set
+/// includes a transient unindexed-tail segment (#255).
+type CorpusKey = (String, u64, u64, bool);
+
+/// The key of a cached manifest-level entry for `manifest` of `namespace`.
+fn corpus_key(namespace: &NamespaceId, manifest: &Manifest) -> CorpusKey {
+    (
+        namespace.0.clone(),
+        manifest.version,
+        manifest_segments_fingerprint(manifest),
+        manifest
+            .segments
+            .iter()
+            .any(|entry| kosha_core::is_tail_segment_id(&entry.segment_id.0)),
+    )
+}
+
+/// Whether a cached entry under `existing` stays when `inserted` goes in:
+/// older versions of the same namespace are dead once a newer one is
+/// being queried. Other segment sets at the same version are not: a
+/// strong-consistency search (#255) adds the unindexed tail's transient
+/// segment to the manifest it searches, and must not evict the plain
+/// version's entry (nor the other way around). But each new tail is a new
+/// segment set at the same version, so only the newest tail-bearing set
+/// is kept: under steady writes they would otherwise pile up and trip the
+/// cache's global bound, clearing every namespace's entries.
+fn corpus_entry_survives(existing: &CorpusKey, inserted: &CorpusKey) -> bool {
+    if existing.0 != inserted.0 {
+        return true;
+    }
+    if existing.1 != inserted.1 {
+        return existing.1 > inserted.1;
+    }
+    !(existing.3 && inserted.3 && existing.2 != inserted.2)
+}
 
 /// Per-manifest corpus totals plus a lazily filled `term → df` map.
 struct CorpusEntry {
@@ -1361,12 +1394,7 @@ impl CorpusStatsCache {
 
     fn insert(&self, key: CorpusKey, entry: Arc<CorpusEntry>) -> Arc<CorpusEntry> {
         let mut entries = self.entries.lock().unwrap();
-        // Older versions of the same namespace are dead once a newer one is
-        // being queried. Other segment sets at the same version are not: a
-        // strong-consistency search (#255) adds the unindexed tail's
-        // transient segment to the manifest it searches, and must not evict
-        // the plain version's entry (nor the other way around).
-        entries.retain(|k, _| k.0 != key.0 || k.1 >= key.1);
+        entries.retain(|k, _| corpus_entry_survives(k, &key));
         if entries.len() >= CORPUS_STATS_MAX_ENTRIES {
             entries.clear();
         }
@@ -1476,7 +1504,7 @@ impl CeilingCache {
 
     fn insert(&self, key: CorpusKey, entry: Arc<CeilingEntry>) -> Arc<CeilingEntry> {
         let mut entries = self.entries.lock().unwrap();
-        entries.retain(|k, _| k.0 != key.0 || k.1 >= key.1);
+        entries.retain(|k, _| corpus_entry_survives(k, &key));
         if entries.len() >= CEILING_CACHE_MAX_ENTRIES {
             entries.clear();
         }
@@ -2046,6 +2074,23 @@ fn late_interaction_nprobe() -> usize {
             .filter(|&v| v > 0)
             .unwrap_or(16)
     })
+}
+
+/// Whether `footer`'s column for `knn.field` was embedded with a model
+/// other than the one `knn.vector` came from (#209). Only a query whose
+/// model is known (the server embedded its `query_text`) and a column that
+/// records one can mismatch.
+pub fn segment_embedding_model_mismatch(footer: &Footer, knn: &kosha_core::KnnQuery) -> bool {
+    let Some(ref model) = knn.embedding_model else {
+        return false;
+    };
+    footer
+        .vector_fields
+        .iter()
+        .flatten()
+        .filter(|meta| meta.name == knn.field)
+        .filter_map(|meta| meta.embedding_model.as_ref())
+        .any(|recorded| recorded != model)
 }
 
 fn late_interaction_params(knn: &kosha_core::KnnQuery) -> kosha_segment::LateInteractionParams {
@@ -2804,25 +2849,30 @@ impl Searcher {
                 // a namespace shared by many matters they otherwise soaked
                 // up most of `num_candidates`, leaving the matter actually
                 // being searched with a fraction of the probes asked for.
-                // Its footer still says whether it indexes `knn.field`
-                // (a legacy footer cannot, so that segment is opened).
+                // Its footer still says whether it indexes `knn.field`. A
+                // legacy footer cannot tell, and such a segment is NOT
+                // opened to find out: its vector files are never hydrated
+                // for a pruned segment, so opening it would load (and
+                // cache) an empty index and report the field absent. It
+                // counts as a legacy segment of unknown dimension, which
+                // never makes the query invalid — as before #313, when
+                // pruned segments were not looked at at all.
                 if prunable {
                     let footer = manifest.footer_or_read(&entry.segment_id, || {
                         SegmentReader::read_footer(&seg_dir).ok()
                     });
                     if let Some(footer) = footer.as_deref() {
                         if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
-                            if let Some(status) =
+                            let status =
                                 kosha_segment::footer_vector_field_status(footer, &knn.field)
-                            {
-                                return Some(SegmentInfo {
-                                    segment_id: &entry.segment_id,
-                                    status,
-                                    distances: None,
-                                    probeable: false,
-                                    passing: Some((0, footer.doc_count)),
-                                });
-                            }
+                                    .unwrap_or(VectorFieldStatus::Legacy { dim: None });
+                            return Some(SegmentInfo {
+                                segment_id: &entry.segment_id,
+                                status,
+                                distances: None,
+                                probeable: false,
+                                passing: Some((0, footer.doc_count)),
+                            });
                         }
                     }
                 }
@@ -3030,11 +3080,7 @@ impl Searcher {
         let seg_dir = |entry: &ManifestEntry| {
             manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id)
         };
-        let key = (
-            namespace.0.clone(),
-            manifest.version,
-            manifest_segments_fingerprint(manifest),
-        );
+        let key = corpus_key(namespace, manifest);
         let corpus = match self.corpus_stats.get(&key) {
             Some(corpus) => corpus,
             None => {
@@ -3297,11 +3343,7 @@ impl Searcher {
         let seg_dir = |entry: &ManifestEntry| {
             manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id)
         };
-        let key = (
-            namespace.0.clone(),
-            manifest.version,
-            manifest_segments_fingerprint(manifest),
-        );
+        let key = corpus_key(namespace, manifest);
         let ceilings = match self.ceilings.get(&key) {
             Some(entry) => entry,
             None => {
@@ -4960,7 +5002,15 @@ impl Searcher {
                     }
                 }
             }
-            let field_index = if nothing_passes || late_interaction {
+            // Native embedding (#209): a column written under another
+            // embedding model holds vectors of another space. It
+            // contributes nothing, and the segment is reported degraded,
+            // instead of being compared against this query's vector.
+            let model_mismatch = segment_embedding_model_mismatch(reader.footer(), knn);
+            if model_mismatch {
+                knn_segment_degraded = true;
+            }
+            let field_index = if nothing_passes || late_interaction || model_mismatch {
                 Ok(None)
             } else {
                 reader.vector_field(&knn.field)
@@ -5538,6 +5588,7 @@ impl Searcher {
                     knn_mode: None,
                     knn_filtered_candidates: None,
                     exhaustive_search_count: 0,
+                    consistency_fallback: None,
                 },
                 phase_stats,
             ));
@@ -6074,6 +6125,7 @@ impl Searcher {
                 knn_mode: phase_stats.knn_mode.map(|mode| mode.as_str().to_string()),
                 knn_filtered_candidates: phase_stats.knn_filtered_candidates,
                 exhaustive_search_count: 0,
+                consistency_fallback: None,
             },
             phase_stats,
         ))
@@ -9612,6 +9664,8 @@ mod tests {
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0],
             k: 10,
@@ -9658,6 +9712,8 @@ mod tests {
         let query_vector = vec![1.0, 0.0, 0.0, 0.0];
         let mut q = mk_query("", 5);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: query_vector.clone(),
             k: 5,
@@ -9929,6 +9985,8 @@ mod tests {
 
         let mut knn_q = mk_query("", 10);
         knn_q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![1.0, 0.0, 0.0],
             k: 10,
@@ -10172,6 +10230,8 @@ mod tests {
 
         let mut knn_q = mk_query("", 10);
         knn_q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![1.0, 0.0, 0.0],
             k: 10,
@@ -10485,6 +10545,8 @@ mod tests {
         // nearest chunks are all m1's.
         let mut query = mk_query("", 3);
         query.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             k: 3,
@@ -10983,6 +11045,8 @@ mod tests {
 
         let mut q = mk_query("", 1);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0],
             k: 1,
@@ -11130,6 +11194,8 @@ mod tests {
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0],
             k: 1,
@@ -11192,6 +11258,8 @@ mod tests {
         let query_vector = vec![1.0, 0.0, 0.0, 0.0]; // exact match for d0 (angle 0)
         let mut q = mk_query("", 5);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: query_vector.clone(),
             k: 5,
@@ -11368,6 +11436,8 @@ mod tests {
         let mk_knn_q = |num_candidates: usize| {
             let mut q = mk_query("", 1);
             q.knn = Some(kosha_core::KnnQuery {
+                query_text: None,
+                embedding_model: None,
                 field: "emb".into(),
                 vector: unit(0.0),
                 k: 1,
@@ -11505,6 +11575,8 @@ mod tests {
             let query = vector(900_000 + q_seed);
             let mut q = mk_query("", 10);
             q.knn = Some(kosha_core::KnnQuery {
+                query_text: None,
+                embedding_model: None,
                 field: "emb".into(),
                 vector: query.clone(),
                 k: 10,
@@ -11615,6 +11687,8 @@ mod tests {
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 1);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![1.0, 0.0],
             k: 1,
@@ -11692,6 +11766,8 @@ mod tests {
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0],
             k: 5,
@@ -11764,6 +11840,8 @@ mod tests {
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0],
             k: 5,
@@ -11844,6 +11922,8 @@ mod tests {
     fn mk_knn_circle_query(k: usize, filter: Option<kosha_core::FilterClause>) -> SearchQuery {
         let mut q = mk_query("", k);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0], // exact match for d0
             k,
@@ -15232,6 +15312,70 @@ mod corpus_stats_tests {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
+    /// #255: every rebuilt unindexed tail is a new segment set at the same
+    /// manifest version. Only the newest one is kept beside the plain
+    /// set, so steady strong searches never fill the cache and clear
+    /// every other namespace's statistics.
+    #[test]
+    fn tail_segment_sets_replace_each_other_not_the_plain_set() {
+        let cache = CorpusStatsCache::default();
+        let entry = || {
+            Arc::new(CorpusEntry {
+                num_docs: 1,
+                total_field_length: 1,
+                analyses: Vec::new(),
+                fields: HashMap::new(),
+                doc_frequencies: Mutex::new(HashMap::new()),
+            })
+        };
+        let mut manifest = Manifest {
+            version: 7,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 1,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+            branch: None,
+        };
+        let ns = NamespaceId("ns".into());
+        let other = NamespaceId("other".into());
+        cache.insert(corpus_key(&other, &manifest), entry());
+        let plain = corpus_key(&ns, &manifest);
+        assert!(!plain.3);
+        cache.insert(plain.clone(), entry());
+        let mut last = None;
+        for i in 0..(CORPUS_STATS_MAX_ENTRIES * 2) {
+            let mut with_tail = manifest.clone();
+            with_tail.segments.push(ManifestEntry {
+                segment_id: SegmentId(format!(
+                    "_shard-0001/{}x-{i}",
+                    kosha_core::TAIL_SEGMENT_PREFIX
+                )),
+                doc_count: 1,
+            });
+            let key = corpus_key(&ns, &with_tail);
+            assert!(key.3);
+            cache.insert(key.clone(), entry());
+            last = Some(key);
+        }
+        assert_eq!(cache.entries.lock().unwrap().len(), 3);
+        assert!(cache.get(&plain).is_some());
+        assert!(cache.get(&last.unwrap()).is_some());
+        assert!(cache.get(&corpus_key(&other, &manifest)).is_some());
+        // A newer version still retires all of them.
+        manifest.version = 8;
+        cache.insert(corpus_key(&ns, &manifest), entry());
+        assert!(cache.get(&plain).is_none());
+    }
+
     /// Deterministic xorshift — the property test must be reproducible.
     struct Rng(u64);
     impl Rng {
@@ -16440,6 +16584,8 @@ mod rrf_tests {
             serde_json::from_value(serde_json::json!({"query_text": text, "max_results": max}))
                 .unwrap();
         q.knn = Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: unit(0.0),
             k,
@@ -17071,6 +17217,8 @@ mod rrf_tests {
             q
         };
         let knn = |qv: &[f32], k: usize| KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: qv.to_vec(),
             k,
@@ -18257,6 +18405,8 @@ mod field_tests {
         );
         let mut q = query("rust", &["title"]);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![0.0, 1.0],
             k: 1,
@@ -18460,6 +18610,8 @@ mod limit_per_tests {
 
     fn knn(k: usize) -> Option<KnnQuery> {
         Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: unit(0.0),
             k,
@@ -19338,6 +19490,8 @@ mod rank_by_tests {
         let (manifest, _) = write(&dir, &docs, 3);
         let searcher = Searcher::new(dir.clone());
         let knn = KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: unit(0.0),
             k: 15,
@@ -20642,6 +20796,8 @@ mod prefix_filter_tests {
         let mut q = query("", r#"{"match_all": {}}"#);
         q.filter = None;
         q.knn = Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0],
             k: 8,
@@ -21762,6 +21918,8 @@ mod vector_column_tests {
         }))
         .unwrap();
         q.knn = Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: field.into(),
             vector,
             k,
@@ -21939,6 +22097,69 @@ mod vector_column_tests {
             searcher.search(&ns, &manifest, &filtered, None),
             Err(KoshaError::InvalidQuery(_))
         ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A legacy segment the filter prunes is not opened by the kNN plan:
+    /// on a query pod its vector files are not hydrated, and opening it
+    /// would load and cache an empty index, reporting the field absent (a
+    /// 400) and hiding the vectors once they are hydrated.
+    #[test]
+    fn a_filter_pruned_legacy_segment_is_not_opened_by_the_knn_plan() {
+        let dir = temp_dir("legacy-pruned");
+        let ns = NamespaceId("ns".into());
+        let seg_dir = dir.join("ns/legacy-vec");
+        copy_dir(&legacy_fixture("legacy-vector-seg"), &seg_dir);
+        let parked = dir.join("parked");
+        std::fs::create_dir_all(&parked).unwrap();
+        for file in ["vector.idx", "vector.offsets"] {
+            std::fs::rename(seg_dir.join(file), parked.join(file)).unwrap();
+        }
+        let manifest = manifest(&[("legacy-vec", 24)]);
+        let searcher = Searcher::new(dir.clone());
+        let query = vec![0.3, 0.9, -0.2, 0.1];
+
+        let mut filtered = knn_query("emb", query.clone(), 5);
+        filtered.filter = Some(
+            serde_json::from_value(serde_json::json!({"term": {"body": "zz-no-such-doc"}}))
+                .unwrap(),
+        );
+        let r = searcher.search(&ns, &manifest, &filtered, None).unwrap();
+        assert!(r.results.is_empty());
+
+        // The vector files arrive (hydrated for an unfiltered kNN): the
+        // segment answers with its vectors, not a cached empty index.
+        for file in ["vector.idx", "vector.offsets"] {
+            std::fs::rename(parked.join(file), seg_dir.join(file)).unwrap();
+        }
+        let r = searcher
+            .search(&ns, &manifest, &knn_query("emb", query.clone(), 5), None)
+            .unwrap();
+        assert_eq!(hit_ids(&r), brute_force(&legacy_vectors(), &query, 5));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The segment layer's half: a legacy slot with neither vector file
+    /// local loads empty without being cached.
+    #[test]
+    fn an_unhydrated_legacy_vector_slot_is_not_cached_as_empty() {
+        let dir = temp_dir("legacy-unhydrated");
+        let seg_dir = dir.join("ns/legacy-vec");
+        copy_dir(&legacy_fixture("legacy-vector-seg"), &seg_dir);
+        let parked = dir.join("parked");
+        std::fs::create_dir_all(&parked).unwrap();
+        for file in ["vector.idx", "vector.offsets"] {
+            std::fs::rename(seg_dir.join(file), parked.join(file)).unwrap();
+        }
+        let reader = SegmentReader::open_with_options(seg_dir.clone(), true).unwrap();
+        assert_eq!(reader.vector_field_status("emb"), VectorFieldStatus::Absent);
+        for file in ["vector.idx", "vector.offsets"] {
+            std::fs::rename(parked.join(file), seg_dir.join(file)).unwrap();
+        }
+        assert_eq!(
+            reader.vector_field_status("emb"),
+            VectorFieldStatus::Legacy { dim: Some(4) }
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -22184,6 +22405,8 @@ mod filtered_knn_tests {
         }))
         .unwrap();
         q.knn = Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector,
             k,

@@ -19,8 +19,8 @@ pub mod docset;
 pub mod nested;
 pub mod sharding;
 pub use analysis::{
-    AnalysisConfig, AnalyzerSpec, FieldSchema, NamespaceSchema, SegmentAnalysis, TokenFilterSpec,
-    TokenizerKind,
+    AnalysisConfig, AnalyzerSpec, EmbeddingSpec, FieldSchema, NamespaceSchema, SegmentAnalysis,
+    TokenFilterSpec, TokenizerKind,
 };
 pub use docset::{check_filter, evaluate_filter, DocSet};
 pub use fields::{FieldBoost, FieldIndex, FieldStats, ALL_FIELD};
@@ -2181,6 +2181,14 @@ pub struct VectorFieldMeta {
     /// #210 reads as `f32`.
     #[serde(default, skip_serializing_if = "VectorQuantization::is_f32")]
     pub quantization: VectorQuantization,
+    /// The embedding model the namespace schema declared for this field
+    /// when the segment was written (#209). A kNN whose vector the server
+    /// embedded with a different model skips this column (and counts it in
+    /// `knn_degraded_segments`) rather than compare two vector spaces.
+    /// `None` — client-supplied vectors, and every footer written before
+    /// #209 — is omitted, so such footers stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
 }
 
 /// Storage of a vector column's ANN posting entries (#210). Centroids and
@@ -2281,6 +2289,20 @@ pub struct MultiVectorField {
 /// Current segment format version written by `SegmentWriter`. See
 /// `Footer::format_version`.
 pub const SEGMENT_FORMAT_VERSION: u32 = 2;
+
+/// Prefix of the transient segment ids (and directories) a strong-
+/// consistency search builds from a namespace's unindexed tail (#255).
+/// Never published in a manifest.
+pub const TAIL_SEGMENT_PREFIX: &str = "_tail-";
+
+/// Whether `segment_id` names a transient tail segment, including a shard's
+/// tail in a sharded namespace's merged view (`_shard-0000/_tail-…`).
+pub fn is_tail_segment_id(segment_id: &str) -> bool {
+    segment_id
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with(TAIL_SEGMENT_PREFIX))
+}
 
 // ─── Bloom filter (segment pruning) ────────────────────────────────────────
 
@@ -2970,6 +2992,16 @@ pub struct KnnQuery {
     /// otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoring: Option<KnnScoring>,
+    /// Native embedding (#209): text the server embeds into `vector` with
+    /// the model the namespace schema declares for `field`. Resolved by
+    /// the HTTP layer before the query reaches the searcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_text: Option<String>,
+    /// The embedding model `vector` came from. Set by the server when it
+    /// embeds `query_text`; a segment whose column records another model
+    /// contributes no kNN hits and is counted in `knn_degraded_segments`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
 }
 
 /// `knn.scoring`.
@@ -3006,6 +3038,19 @@ impl KnnQuery {
 
     /// Shape checks that need no segment. An `Err` is a client error.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(ref text) = self.query_text {
+            // Exactly one of vector / vectors / query_text.
+            if !self.vector.is_empty() || self.vectors.is_some() {
+                return Err("knn takes exactly one of vector, vectors or query_text".into());
+            }
+            if text.trim().is_empty() {
+                return Err("knn.query_text must not be empty".into());
+            }
+            if self.scoring == Some(KnnScoring::LateInteraction) {
+                return Err("knn.query_text cannot be used with late_interaction scoring".into());
+            }
+            return Ok(());
+        }
         if self.vectors.is_some() && !self.vector.is_empty() {
             return Err("knn takes either vector or vectors, not both".into());
         }
@@ -3914,6 +3959,13 @@ pub struct SearchResult {
     /// was already indexed.
     #[serde(default)]
     pub exhaustive_search_count: u64,
+    /// Set when a `consistency: "strong"` search was answered as
+    /// `"eventual"` instead (#255): the writer is ahead of every manifest
+    /// this node can read, because a publication is in progress or
+    /// failing, so its unindexed tail cannot be combined with any of them.
+    /// Says why. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consistency_fallback: Option<String>,
 }
 
 // ─── Indexing types ────────────────────────────────────────────────────────
@@ -5393,5 +5445,41 @@ mod rerank_spec {
             serde_json::from_str(r#"{"doc_id": "a", "score": 1.0, "fields": []}"#).unwrap();
         let v = serde_json::to_value(hit).unwrap();
         assert!(v.get("fused_score").is_none() && v.get("rerank_score").is_none());
+    }
+}
+
+#[cfg(test)]
+mod knn_query_text {
+    use super::*;
+
+    fn knn(json: &str) -> KnnQuery {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn exactly_one_of_vector_vectors_or_query_text() {
+        assert!(knn(r#"{"field": "e", "query_text": "red shoes"}"#)
+            .validate()
+            .is_ok());
+        for bad in [
+            r#"{"field": "e", "query_text": "x", "vector": [1.0]}"#,
+            r#"{"field": "e", "query_text": "x", "vectors": [[1.0]]}"#,
+            r#"{"field": "e", "query_text": "  "}"#,
+            r#"{"field": "e", "query_text": "x", "scoring": "late_interaction"}"#,
+            r#"{"field": "e"}"#,
+        ] {
+            assert!(knn(bad).validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn absent_fields_serialize_as_before() {
+        let v = serde_json::to_value(knn(r#"{"field": "e", "vector": [1.0]}"#)).unwrap();
+        assert!(v.get("query_text").is_none() && v.get("embedding_model").is_none());
+        let meta: VectorFieldMeta =
+            serde_json::from_str(r#"{"name": "e", "dim": 4, "count": 1, "slot": 0}"#).unwrap();
+        assert_eq!(meta.embedding_model, None);
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("embedding_model"), "{json}");
     }
 }

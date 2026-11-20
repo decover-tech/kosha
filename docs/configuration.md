@@ -283,6 +283,25 @@ provider named `my-model`. Keys are never logged or returned.
 | `KOSHA_RERANK_N_API_KEY` | Sent as `Authorization: Bearer ...`. `cohere` also reads `COHERE_API_KEY`, and is registered only when it has a key | unset | string |
 | `KOSHA_RERANK_N_MODEL` | Model used when a request names none | `cohere`: `rerank-v3.5` | string |
 
+## Native embedding
+
+Read in `EmbedderRegistry::from_env` (`crates/kosha-server/src/embedding.rs`, #209). A vector
+field opts in through the namespace schema
+(`{"fields": {"emb": {"embedding": {"model": "...", "dims": 384, "provider": "http"}}}}`); the server
+then embeds text sent for that field at ingest and `knn.query_text` at query time. Ingest and
+query pods need the same settings; an `indexer` pod needs none (compaction copies vectors and
+never embeds). A schema naming a model this pod has no provider for answers
+`503` to text writes and `query_text` searches; namespaces without a declared model never call a
+provider. The API key is never logged or returned.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_EMBEDDING_PROVIDERS` | Enabled providers: `http` (OpenAI-compatible server) and/or `mock` (deterministic hashed bag of words, for tests and local development only) | unset (no native embedding) | list |
+| `KOSHA_EMBEDDING_URL` | Base URL of the OpenAI-compatible server; `/embeddings` is appended. Required for `http` | unset | URL |
+| `KOSHA_EMBEDDING_API_KEY` | Sent as `Authorization: Bearer ...` | unset | string |
+| `KOSHA_EMBEDDING_TIMEOUT_MS` | Timeout of one provider request | `10000` | ms |
+| `KOSHA_EMBEDDING_BATCH_SIZE` | Texts per provider request | `64` | count |
+
 ## CLI and Python client
 
 Read by `kosha` (`crates/kosha-cli`). The Python client (`clients/python`) reads

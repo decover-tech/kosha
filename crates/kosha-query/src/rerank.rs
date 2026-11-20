@@ -346,6 +346,7 @@ pub(crate) mod tests {
             knn_mode: None,
             knn_filtered_candidates: None,
             exhaustive_search_count: Default::default(),
+            consistency_fallback: None,
         }
     }
 

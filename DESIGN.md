@@ -286,8 +286,18 @@ that no segment indexes and no legacy segment could answer, or a query vector wh
 differs from the field's, is a 400. The writer fixes each field's dimension per namespace at the
 first vector written to it (from segment footers and the write buffer) and rejects a document that
 disagrees with a 400; a segment writer that still meets one stores it without indexing it rather
-than failing the flush. There is no namespace schema for vector fields: everything above is read
-from segment footers.
+than failing the flush. Dimensions are read from segment footers, not the namespace schema.
+
+**Native embedding (#209).** A vector field may declare `embedding: {model, dims, provider}` in
+the namespace schema. The HTTP layer embeds text values of such a field before the write reaches
+the indexer (so the WAL, doc store, replay and compaction see vectors only and never need a
+provider), and turns `knn.query_text` into `knn.vector` plus `knn.embedding_model` before the
+result-cache key and the searcher. The segment writer records the declared model in
+`vector_fields[].embedding_model` (omitted when none, so other footers are unchanged). A schema
+edit that changes a field's model or dims while a segment or the write buffer holds vectors for it
+is refused (409), and a segment whose recorded model differs from the query's contributes no kNN
+hits and counts in `knn_degraded_segments`. Providers live in `kosha-server/src/embedding.rs`:
+an OpenAI-compatible HTTP client and a deterministic mock; a local model runtime is follow-up work.
 
 **i8 posting entries (#210).** A column's `vector.idx` entries are `[id][f32 x dim]` or, at
 on-disk version 4, `[id][scale: f32][i8 x dim]`: the unit-normalized vector scaled by
@@ -815,8 +825,12 @@ existing org/user auth context Bach already establishes.
     exactly as after a flush. Indexed copies the tail supersedes are masked like deletes, so the
     newest version wins. A tail relative to another manifest version than the query's (a flush
     published in between) is refused; the query pod refreshes its manifest and retries a few
-    times, then fails with 503 rather than miss or double-count documents. Responses report
-    `exhaustive_search_count`, the number of unindexed documents scanned.
+    times, then fails with 503 rather than miss or double-count documents. The exception is a
+    writer *ahead* of the newest stored manifest (it flushed or compacted and the publication is
+    still uploading, or failing): no reader can have its version, so the query is answered from
+    the last published manifest, as `eventual`, with `consistency_fallback` in the response
+    saying why. Responses report `exhaustive_search_count`, the number of unindexed documents
+    scanned.
   - `eventual`: indexed segments only; visibility is bounded by the flush interval (§7).
 
   The unindexed backlog per namespace is capped (`KOSHA_MAX_UNINDEXED_BYTES`, default 2 GiB;
