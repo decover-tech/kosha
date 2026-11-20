@@ -7358,14 +7358,14 @@ struct AggregationState {
     /// Metric sub-aggregations of a bucket aggregation: bucket key →
     /// sub-aggregation name → partial.
     sub: std::collections::BTreeMap<Vec<String>, HashMap<String, MetricPartial>>,
-    /// `histogram` / `date_histogram`: bucket index
-    /// (`floor((v - offset) / interval)`) → documents in the bucket.
+    /// `histogram` / `date_histogram`: bucket index (see
+    /// `kosha_core::histogram`) → documents in the bucket.
     histogram: std::collections::BTreeMap<i64, usize>,
     /// Metric sub-aggregations of a histogram: bucket index → name →
     /// partial.
     histogram_sub: std::collections::BTreeMap<i64, HashMap<String, MetricPartial>>,
-    /// The `(interval, offset)` the indices above were computed with, so
-    /// a merge can check that every segment bucketed alike.
+    /// The bucketing the indices above were computed with, so a merge can
+    /// check that every segment bucketed alike.
     histogram_params: Option<HistogramParams>,
 }
 
@@ -7384,13 +7384,15 @@ impl AggregationState {
         // Histogram bucket indices only mean the same bucket when every
         // segment used the same interval and offset. They all come from
         // the one request, so this holds by construction; check it.
-        if let (Some(mine), Some(theirs)) = (self.histogram_params, other.histogram_params) {
+        if let (Some(mine), Some(theirs)) = (&self.histogram_params, &other.histogram_params) {
             debug_assert_eq!(
                 mine, theirs,
                 "histogram partials bucketed with different interval/offset"
             );
         }
-        self.histogram_params = self.histogram_params.or(other.histogram_params);
+        if self.histogram_params.is_none() {
+            self.histogram_params = other.histogram_params;
+        }
         for (index, count) in other.histogram {
             *self.histogram.entry(index).or_default() += count;
         }
@@ -7403,56 +7405,94 @@ impl AggregationState {
     }
 }
 
-/// How a `histogram` / `date_histogram` maps a value to a bucket index.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// How a `histogram` / `date_histogram` maps a value to a bucket index
+/// and back.
+#[derive(Debug, Clone, PartialEq)]
 enum HistogramParams {
     /// `histogram`: f64 arithmetic over numeric values.
-    Numeric { interval: f64, offset: f64 },
-    /// `date_histogram`: i64 arithmetic over epoch milliseconds.
-    Date { interval: i64, offset: i64 },
+    Numeric(kosha_core::histogram::NumericHistogram),
+    /// `date_histogram`: epoch milliseconds, calendar- and zone-aware.
+    Date(kosha_core::histogram::DateHistogram),
 }
 
 impl HistogramParams {
     /// The parameters of a histogram aggregation, `None` for any other
-    /// type. An invalid date interval is an error (normally caught when
-    /// the query is parsed or validated).
+    /// type. Invalid parameters are an error (normally caught when the
+    /// query is parsed or validated).
     fn of(agg: &Aggregation) -> Option<Result<(Self, u64), String>> {
         match agg {
-            Aggregation::Histogram { histogram, .. } => Some(histogram.validate().map(|()| {
-                (
-                    HistogramParams::Numeric {
-                        interval: histogram.interval,
-                        offset: histogram.offset,
-                    },
-                    histogram.min_doc_count,
-                )
-            })),
-            Aggregation::DateHistogram { date_histogram, .. } => {
-                Some(date_histogram.resolve().map(|(interval, offset)| {
-                    (
-                        HistogramParams::Date { interval, offset },
-                        date_histogram.min_doc_count,
-                    )
-                }))
-            }
+            Aggregation::Histogram { histogram, .. } => Some(
+                histogram
+                    .plan()
+                    .map(|plan| (HistogramParams::Numeric(plan), histogram.min_doc_count)),
+            ),
+            Aggregation::DateHistogram { date_histogram, .. } => Some(
+                date_histogram
+                    .plan()
+                    .map(|plan| (HistogramParams::Date(plan), date_histogram.min_doc_count)),
+            ),
             _ => None,
         }
     }
 
-    /// The `key` (and, for dates, `key_as_string`) of bucket `index`.
-    fn render_key(self, index: i64, out: &mut serde_json::Map<String, serde_json::Value>) {
+    /// The indices to gap-fill given the non-empty buckets, and for a
+    /// `date_histogram` the key range a filled bucket must also fall in
+    /// (see `NumericHistogram::fill_range` and `DateHistogram::fill`).
+    fn fill(
+        &self,
+        observed: &std::collections::BTreeMap<i64, usize>,
+    ) -> Option<((i64, i64), Option<kosha_core::histogram::DateFill>)> {
         match self {
-            HistogramParams::Numeric { interval, offset } => {
-                let key = kosha_core::histogram::histogram_key(index, interval, offset);
-                out.insert("key".into(), serde_json::json!(key));
+            HistogramParams::Numeric(plan) => {
+                let observed = observed
+                    .first_key_value()
+                    .zip(observed.last_key_value())
+                    .map(|((&lo, _), (&hi, _))| (lo, hi));
+                plan.fill_range(observed).map(|range| (range, None))
             }
-            HistogramParams::Date { interval, offset } => {
-                let key = kosha_core::histogram::date_histogram_key(index, interval, offset);
-                out.insert(
-                    "key_as_string".into(),
-                    kosha_core::datetime::format_epoch_millis(key).into(),
-                );
+            HistogramParams::Date(plan) => plan
+                .fill(observed.keys().copied())
+                .map(|fill| (fill.indices, Some(fill))),
+        }
+    }
+
+    /// Whether gap filling emits bucket `index`: its key is in `fill`'s
+    /// key range (always, for a numeric histogram).
+    fn fills(&self, index: i64, fill: Option<&kosha_core::histogram::DateFill>) -> bool {
+        match (self, fill) {
+            (HistogramParams::Date(plan), Some(fill)) => {
+                plan.key(index).is_some_and(|key| fill.contains(key))
+            }
+            _ => true,
+        }
+    }
+
+    /// Indices per bucket at most (see `DateHistogram::index_stride`).
+    fn index_stride(&self) -> u64 {
+        match self {
+            HistogramParams::Numeric(_) => 1,
+            HistogramParams::Date(plan) => plan.index_stride(),
+        }
+    }
+
+    /// The `key` (and, for dates, `key_as_string`) of bucket `index`, with
+    /// the key as a sort key; `None` when no bucket has this index.
+    fn render_key(
+        &self,
+        index: i64,
+        out: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Option<f64> {
+        match self {
+            HistogramParams::Numeric(plan) => {
+                let key = plan.key(index);
+                out.insert("key".into(), serde_json::json!(key));
+                Some(key)
+            }
+            HistogramParams::Date(plan) => {
+                let key = plan.key(index)?;
+                out.insert("key_as_string".into(), plan.key_as_string(key).into());
                 out.insert("key".into(), key.into());
+                Some(key as f64)
             }
         }
     }
@@ -7553,24 +7593,22 @@ fn aggregate_histogram(
     field: &str,
 ) -> AggregationState {
     let mut per_doc: HashMap<u32, std::collections::BTreeSet<i64>> = HashMap::new();
-    match params {
-        HistogramParams::Numeric { interval, offset } => {
+    match &params {
+        HistogramParams::Numeric(plan) => {
             visit_metric_values(store, field, MetricKind::Min, wanted, |doc, sample| {
                 if let MetricSample::Number(v, _) = sample {
-                    per_doc
-                        .entry(doc)
-                        .or_default()
-                        .insert(kosha_core::histogram::histogram_bucket(v, interval, offset));
+                    // `None`: outside `hard_bounds`.
+                    if let Some(index) = plan.bucket(v) {
+                        per_doc.entry(doc).or_default().insert(index);
+                    }
                 }
             })
         }
-        HistogramParams::Date { interval, offset } => {
-            visit_date_values(store, field, wanted, |doc, ms| {
-                per_doc.entry(doc).or_default().insert(
-                    kosha_core::histogram::date_histogram_bucket(ms, interval, offset),
-                );
-            })
-        }
+        HistogramParams::Date(plan) => visit_date_values(store, field, wanted, |doc, ms| {
+            if let Some(index) = plan.bucket(ms) {
+                per_doc.entry(doc).or_default().insert(index);
+            }
+        }),
     }
     let subs = metric_sub_partials(store, wanted, agg);
     let mut state = AggregationState {
@@ -7597,7 +7635,8 @@ fn aggregate_histogram(
 /// The finished `{"buckets": [...]}` of a histogram, sorted by key
 /// ascending. With `min_doc_count: 0` (the default) every bucket between
 /// the lowest and the highest non-empty one is emitted, empty ones with
-/// `doc_count: 0`; otherwise buckets below `min_doc_count` are dropped.
+/// `doc_count: 0`, the range widened by `extended_bounds` and clipped by
+/// `hard_bounds`; otherwise buckets below `min_doc_count` are dropped.
 /// More than [`kosha_core::histogram::MAX_HISTOGRAM_BUCKETS`] buckets is
 /// an error, checked before anything is allocated.
 fn finish_histogram(
@@ -7612,50 +7651,61 @@ fn finish_histogram(
     let too_many = |n: u128| {
         KoshaError::InvalidQuery(format!(
             "aggregation `{name}` would return {n} buckets, more than the limit of {max}; use a \
-             larger interval, narrow the query, or set `min_doc_count` to 1 or more to skip \
-             empty buckets"
+             larger interval, narrow the query or the `extended_bounds`, or set \
+             `min_doc_count` to 1 or more to skip empty buckets"
         ))
     };
-    let indices: Vec<i64> = match (
-        state.histogram.first_key_value(),
-        state.histogram.last_key_value(),
-    ) {
-        (Some((&lo, _)), Some((&hi, _))) if min_doc_count == 0 => {
-            let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
-            if span > u128::from(max) {
-                return Err(too_many(span));
+    let mut fill = None;
+    let indices: Vec<i64> = if min_doc_count == 0 {
+        match params.fill(&state.histogram) {
+            None => Vec::new(),
+            Some(((lo, hi), keys)) => {
+                fill = keys;
+                let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
+                // Where an index also encodes which occurrence of a
+                // repeated wall-clock time it is, about half the indices
+                // have no bucket; the exact count is checked below.
+                let stride = u128::from(params.index_stride());
+                if span > u128::from(max) * stride {
+                    return Err(too_many(span / stride));
+                }
+                (lo..=hi).collect()
             }
-            (lo..=hi).collect()
         }
-        _ => {
-            let kept: Vec<i64> = state
-                .histogram
-                .iter()
-                .filter(|(_, &count)| count as u64 >= min_doc_count)
-                .map(|(&index, _)| index)
-                .collect();
-            if kept.len() as u128 > u128::from(max) {
-                return Err(too_many(kept.len() as u128));
-            }
-            kept
-        }
+    } else {
+        state
+            .histogram
+            .iter()
+            .filter(|(_, &count)| count as u64 >= min_doc_count)
+            .map(|(&index, _)| index)
+            .collect()
     };
-    let buckets: Vec<serde_json::Value> = indices
-        .into_iter()
-        .map(|index| {
-            let mut bucket = serde_json::Map::new();
-            params.render_key(index, &mut bucket);
-            bucket.insert(
-                "doc_count".into(),
-                state.histogram.get(&index).copied().unwrap_or(0).into(),
-            );
-            bucket.extend(render_sub_aggregations(
-                agg,
-                state.histogram_sub.get(&index),
-            ));
-            serde_json::Value::Object(bucket)
-        })
-        .collect();
+    let mut buckets: Vec<(f64, serde_json::Value)> = Vec::new();
+    for index in indices {
+        if !params.fills(index, fill.as_ref()) {
+            continue; // an index of the overlap whose key is out of range
+        }
+        let mut bucket = serde_json::Map::new();
+        let Some(sort_key) = params.render_key(index, &mut bucket) else {
+            continue; // a wall-clock time a DST transition skipped
+        };
+        if buckets.len() as u64 >= max {
+            return Err(too_many(u128::from(max) + 1));
+        }
+        bucket.insert(
+            "doc_count".into(),
+            state.histogram.get(&index).copied().unwrap_or(0).into(),
+        );
+        bucket.extend(render_sub_aggregations(
+            agg,
+            state.histogram_sub.get(&index),
+        ));
+        buckets.push((sort_key, serde_json::Value::Object(bucket)));
+    }
+    // Keys follow indices except across a DST fall-back, where the second
+    // occurrence of a wall-clock time sorts after the first.
+    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let buckets: Vec<serde_json::Value> = buckets.into_iter().map(|(_, b)| b).collect();
     Ok(serde_json::json!({ "buckets": buckets }))
 }
 
@@ -8234,22 +8284,22 @@ fn aggregate_histogram_columnar(
     field: &str,
 ) -> Result<AggregationState, KoshaError> {
     let mut per_doc: HashMap<usize, std::collections::BTreeSet<i64>> = HashMap::new();
-    match params {
-        HistogramParams::Numeric { interval, offset } => {
+    match &params {
+        HistogramParams::Numeric(plan) => {
             visit_metric_values_columnar(reader, field, MetricKind::Min, wanted, |wi, sample| {
                 if let MetricSample::Number(v, _) = sample {
-                    per_doc
-                        .entry(wi)
-                        .or_default()
-                        .insert(kosha_core::histogram::histogram_bucket(v, interval, offset));
+                    // `None`: outside `hard_bounds`.
+                    if let Some(index) = plan.bucket(v) {
+                        per_doc.entry(wi).or_default().insert(index);
+                    }
                 }
             })?
         }
-        HistogramParams::Date { interval, offset } => {
+        HistogramParams::Date(plan) => {
             visit_date_values_columnar(reader, field, wanted, |wi, ms| {
-                per_doc.entry(wi).or_default().insert(
-                    kosha_core::histogram::date_histogram_bucket(ms, interval, offset),
-                );
+                if let Some(index) = plan.bucket(ms) {
+                    per_doc.entry(wi).or_default().insert(index);
+                }
             })?
         }
     }
@@ -21615,6 +21665,19 @@ mod histogram_aggregation_tests {
             "sent": {"date_histogram": {"field": "sent", "fixed_interval": "7d", "offset": "-12h"},
                      "aggs": {"avg_price": {"avg": {"field": "price"}}}},
             "weeks": {"date_histogram": {"field": "sent", "calendar_interval": "week"}},
+            // Issues #300-#302: calendar months / quarters / years, time
+            // zones and bounds merge across segments the same way.
+            "months": {"date_histogram": {"field": "sent", "calendar_interval": "1M", "time_zone": "America/New_York"},
+                       "aggs": {"avg_price": {"avg": {"field": "price"}}}},
+            "quarters": {"date_histogram": {"field": "sent", "calendar_interval": "quarter", "time_zone": "+05:30"}},
+            "years": {"date_histogram": {"field": "sent", "calendar_interval": "1y",
+                                          "extended_bounds": {"min": "2020-06-01", "max": "2026-01-01"}}},
+            "paris_hours": {"date_histogram": {"field": "sent", "calendar_interval": "1h", "time_zone": "Europe/Paris",
+                                                "hard_bounds": {"min": "2024-01-01", "max": "2024-03-31"}}},
+            "ny_half_days": {"date_histogram": {"field": "sent", "fixed_interval": "12h", "time_zone": "America/New_York",
+                                                 "min_doc_count": 1}},
+            "bounded": {"histogram": {"field": "price", "interval": 1,
+                                      "extended_bounds": {"min": -3, "max": 4}, "hard_bounds": {"min": 0, "max": 20}}},
         })
     }
 
@@ -21794,6 +21857,461 @@ mod histogram_aggregation_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// `(key, doc_count)` of every bucket, keys as RFC 3339 strings.
+    fn pairs(out: &serde_json::Value, name: &str) -> Vec<(String, u64)> {
+        date_buckets(&out[name])
+    }
+
+    fn strs(want: &[(&str, u64)]) -> Vec<(String, u64)> {
+        want.iter().map(|(k, n)| (k.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn calendar_months_quarters_and_years_with_gap_filling() {
+        let root = temp_root("date-hist-calendar");
+        let segments = vec![
+            vec![
+                sent("a", "2023-11-30T23:59:59.999Z"),
+                // Leap day, and the first instant of March.
+                sent("b", "2024-02-29T23:59:59.999Z"),
+                sent("c", "2024-03-01T00:00:00Z"),
+            ],
+            vec![
+                sent("d", "2024-03-31T12:00:00Z"),
+                sent("e", "2024-05-01"),
+                // Before the epoch.
+                sent("f", "1969-12-31T23:59:59.999Z"),
+            ],
+            vec![sent("g", "2023-02-28T12:00:00Z"), sent("h", "2023-03-01")],
+        ];
+        let aggs = serde_json::json!({
+            "months": {"date_histogram": {"field": "sent", "calendar_interval": "1M", "hard_bounds": {"min": "2023-01-01"}}},
+            "quarters": {"date_histogram": {"field": "sent", "calendar_interval": "1q", "hard_bounds": {"min": "2023-01-01"}}},
+            "years": {"date_histogram": {"field": "sent", "calendar_interval": "year"}},
+            "dense_months": {"date_histogram": {"field": "sent", "calendar_interval": "month", "min_doc_count": 1}},
+        });
+        let out = one(&root, &segments, aggs.clone());
+        assert_eq!(
+            pairs(&out, "months"),
+            strs(&[
+                ("2023-02-01T00:00:00.000Z", 1),
+                ("2023-03-01T00:00:00.000Z", 1),
+                ("2023-04-01T00:00:00.000Z", 0),
+                ("2023-05-01T00:00:00.000Z", 0),
+                ("2023-06-01T00:00:00.000Z", 0),
+                ("2023-07-01T00:00:00.000Z", 0),
+                ("2023-08-01T00:00:00.000Z", 0),
+                ("2023-09-01T00:00:00.000Z", 0),
+                ("2023-10-01T00:00:00.000Z", 0),
+                ("2023-11-01T00:00:00.000Z", 1),
+                ("2023-12-01T00:00:00.000Z", 0),
+                ("2024-01-01T00:00:00.000Z", 0),
+                ("2024-02-01T00:00:00.000Z", 1),
+                ("2024-03-01T00:00:00.000Z", 2),
+                ("2024-04-01T00:00:00.000Z", 0),
+                ("2024-05-01T00:00:00.000Z", 1),
+            ]),
+            "{out}"
+        );
+        assert_eq!(
+            pairs(&out, "quarters"),
+            strs(&[
+                ("2023-01-01T00:00:00.000Z", 2),
+                ("2023-04-01T00:00:00.000Z", 0),
+                ("2023-07-01T00:00:00.000Z", 0),
+                ("2023-10-01T00:00:00.000Z", 1),
+                ("2024-01-01T00:00:00.000Z", 3),
+                ("2024-04-01T00:00:00.000Z", 1),
+            ]),
+            "{out}"
+        );
+        let years = pairs(&out, "years");
+        assert_eq!(years.len(), 2024 - 1969 + 1, "{out}");
+        assert_eq!(years[0], ("1969-01-01T00:00:00.000Z".to_string(), 1));
+        assert_eq!(years[1], ("1970-01-01T00:00:00.000Z".to_string(), 0));
+        assert_eq!(years[54], ("2023-01-01T00:00:00.000Z".to_string(), 3));
+        assert_eq!(years[55], ("2024-01-01T00:00:00.000Z".to_string(), 4));
+        assert_eq!(
+            pairs(&out, "dense_months")[0],
+            ("1969-12-01T00:00:00.000Z".to_string(), 1)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        // One segment gives the same result.
+        assert_eq!(one(&root, &[segments.concat()], aggs), out);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn time_zones_shift_boundaries_and_follow_dst() {
+        let root = temp_root("date-hist-tz");
+        let segments = vec![
+            vec![
+                // 2024-03-10: New York springs forward at 07:00Z.
+                sent("a", "2024-03-10T04:59:59Z"), // 23:59:59 EST on the 9th
+                sent("b", "2024-03-10T05:00:00Z"), // 00:00 EST on the 10th
+                sent("c", "2024-03-11T03:59:59Z"), // 23:59:59 EDT on the 10th
+                sent("d", "2024-03-11T04:00:00Z"), // 00:00 EDT on the 11th
+            ],
+            vec![
+                // 2024-11-03: New York falls back at 06:00Z; 01:30 happens
+                // twice.
+                sent("e", "2024-11-03T05:30:00Z"), // 01:30 EDT
+                sent("f", "2024-11-03T06:30:00Z"), // 01:30 EST
+                sent("g", "2024-11-04T04:59:59Z"), // 23:59:59 EST on the 3rd
+            ],
+        ];
+        let out = one(
+            &root,
+            &segments,
+            serde_json::json!({
+                "ny_days": {"date_histogram": {"field": "sent", "calendar_interval": "1d", "time_zone": "America/New_York", "min_doc_count": 1}},
+                "ny_hours": {"date_histogram": {"field": "sent", "calendar_interval": "1h", "time_zone": "America/New_York",
+                                                 "hard_bounds": {"min": "2024-11-03T00:00:00", "max": "2024-11-03T03:00:00"}}},
+                "ist_days": {"date_histogram": {"field": "sent", "fixed_interval": "1d", "time_zone": "+05:30", "min_doc_count": 1}},
+                "utc_days": {"date_histogram": {"field": "sent", "calendar_interval": "1d", "time_zone": "UTC", "min_doc_count": 1}},
+            }),
+        );
+        assert_eq!(
+            pairs(&out, "ny_days"),
+            strs(&[
+                ("2024-03-09T00:00:00.000-05:00", 1),
+                ("2024-03-10T00:00:00.000-05:00", 2),
+                ("2024-03-11T00:00:00.000-04:00", 1),
+                ("2024-11-03T00:00:00.000-04:00", 3),
+            ]),
+            "{out}"
+        );
+        // The 2024-03-10 bucket is 23 hours long, 2024-11-03 is 25.
+        let ny = &out["ny_days"]["buckets"];
+        assert_eq!(
+            ny[2]["key"].as_i64().unwrap() - ny[1]["key"].as_i64().unwrap(),
+            23 * 3_600_000
+        );
+        // Each 01:00 hour of the fall-back night is its own bucket, as in
+        // Elasticsearch; empty hours in between are filled, within the
+        // (wall-clock) hard bounds.
+        assert_eq!(
+            pairs(&out, "ny_hours"),
+            strs(&[
+                ("2024-11-03T01:00:00.000-04:00", 1),
+                ("2024-11-03T01:00:00.000-05:00", 1),
+            ]),
+            "{out}"
+        );
+        assert_eq!(
+            pairs(&out, "ist_days")[0],
+            ("2024-03-10T00:00:00.000+05:30".to_string(), 2),
+            "{out}"
+        );
+        // `time_zone: UTC` keys are exactly those without a time zone.
+        assert_eq!(
+            pairs(&out, "utc_days")[0],
+            ("2024-03-10T00:00:00.000Z".to_string(), 2),
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extended_bounds_add_leading_and_trailing_empty_buckets() {
+        let root = temp_root("hist-extended");
+        let segments = vec![
+            vec![price("a", 12.0), sent("b", "2024-01-03T10:00:00Z")],
+            vec![price("c", 31.0)],
+        ];
+        let out = one(
+            &root,
+            &segments,
+            serde_json::json!({
+                "h": {"histogram": {"field": "price", "interval": 10, "extended_bounds": {"min": -5, "max": 55}}},
+                "inside": {"histogram": {"field": "price", "interval": 10, "extended_bounds": {"min": 20, "max": 25}}},
+                "dense": {"histogram": {"field": "price", "interval": 10, "min_doc_count": 1, "extended_bounds": {"min": -5, "max": 55}}},
+                "d": {"date_histogram": {"field": "sent", "calendar_interval": "1d",
+                                         "extended_bounds": {"min": "2024-01-01", "max": 1_704_499_200_000_i64}}},
+                "none": {"date_histogram": {"field": "absent", "fixed_interval": "1d",
+                                            "extended_bounds": {"min": "2024-01-01", "max": "2024-01-02T12:00:00Z"}}},
+            }),
+        );
+        assert_eq!(
+            numeric_buckets(&out["h"]),
+            vec![
+                (-10.0, 0),
+                (0.0, 0),
+                (10.0, 1),
+                (20.0, 0),
+                (30.0, 1),
+                (40.0, 0),
+                (50.0, 0)
+            ],
+            "{out}"
+        );
+        assert_eq!(
+            numeric_buckets(&out["inside"]),
+            vec![(10.0, 1), (20.0, 0), (30.0, 1)],
+            "{out}"
+        );
+        // `min_doc_count` 1: no empty buckets at all.
+        assert_eq!(
+            numeric_buckets(&out["dense"]),
+            vec![(10.0, 1), (30.0, 1)],
+            "{out}"
+        );
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[
+                ("2024-01-01T00:00:00.000Z", 0),
+                ("2024-01-02T00:00:00.000Z", 0),
+                ("2024-01-03T00:00:00.000Z", 1),
+                ("2024-01-04T00:00:00.000Z", 0),
+                ("2024-01-05T00:00:00.000Z", 0),
+                ("2024-01-06T00:00:00.000Z", 0),
+            ]),
+            "{out}"
+        );
+        // No values at all: the extended range alone.
+        assert_eq!(
+            pairs(&out, "none"),
+            strs(&[
+                ("2024-01-01T00:00:00.000Z", 0),
+                ("2024-01-02T00:00:00.000Z", 0)
+            ]),
+            "{out}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        // The bucket cap applies to the widened range.
+        let err = try_search(
+            &root,
+            &segments,
+            serde_json::json!({"d": {"date_histogram": {"field": "sent", "fixed_interval": "1h",
+                                     "extended_bounds": {"min": "2020-01-01", "max": "2024-01-01"}}}}),
+        )
+        .unwrap_err();
+        match err {
+            KoshaError::InvalidQuery(msg) => {
+                assert!(msg.contains("more than the limit of 10000"), "{msg}")
+            }
+            other => panic!("expected InvalidQuery, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        // Also where indices encode DST occurrences (stride 2).
+        let err = try_search(
+            &root,
+            &segments,
+            serde_json::json!({"d": {"date_histogram": {"field": "sent", "fixed_interval": "1h", "time_zone": "Europe/Paris",
+                                     "extended_bounds": {"min": "2022-11-01", "max": "2024-01-01"}}}}),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, KoshaError::InvalidQuery(ref m) if m.contains("limit of 10000")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn values_whose_bucket_key_is_outside_hard_bounds_get_no_bucket() {
+        let root = temp_root("hist-hard");
+        let segments = vec![
+            vec![
+                price("a", -4.0),
+                price("b", 3.0),
+                sent("c", "2023-12-31T23:59:59Z"),
+            ],
+            vec![
+                price("d", 19.0),
+                price("e", 20.5),
+                sent("f", "2024-01-02T00:00:00Z"),
+                sent("g", "2024-01-05T00:00:00.001Z"),
+            ],
+        ];
+        let out = one(
+            &root,
+            &segments,
+            serde_json::json!({
+                "h": {"histogram": {"field": "price", "interval": 5, "hard_bounds": {"min": 0, "max": 20}}},
+                "clipped": {"histogram": {"field": "price", "interval": 5,
+                                          "hard_bounds": {"min": 0, "max": 20}, "extended_bounds": {"min": -50, "max": 50}}},
+                "mid": {"histogram": {"field": "price", "interval": 5,
+                                      "hard_bounds": {"min": 2, "max": 20}, "extended_bounds": {"min": -50, "max": 50}}},
+                "d": {"date_histogram": {"field": "sent", "fixed_interval": "1d",
+                                         "hard_bounds": {"min": "2024-01-01", "max": "2024-01-05T00:00:00Z"}}},
+                "d_noon": {"date_histogram": {"field": "sent", "fixed_interval": "1d",
+                                              "hard_bounds": {"min": "2024-01-02T12:00:00Z"}}},
+            }),
+        );
+        // As in Elasticsearch the bounds apply to the bucket key, not the
+        // value: -4 (bucket -5) is dropped, 20.5 (bucket 20) is kept.
+        assert_eq!(
+            numeric_buckets(&out["h"]),
+            vec![(0.0, 1), (5.0, 0), (10.0, 0), (15.0, 1), (20.0, 1)],
+            "{out}"
+        );
+        assert_eq!(
+            numeric_buckets(&out["clipped"]),
+            vec![(0.0, 1), (5.0, 0), (10.0, 0), (15.0, 1), (20.0, 1)],
+            "{out}"
+        );
+        // A min inside a bucket excludes that bucket, its values (3) and
+        // its gap-filled slot.
+        assert_eq!(
+            numeric_buckets(&out["mid"]),
+            vec![(5.0, 0), (10.0, 0), (15.0, 1), (20.0, 1)],
+            "{out}"
+        );
+        // 00:00:00.001 on the 5th is in the bucket keyed at the max.
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[
+                ("2024-01-02T00:00:00.000Z", 1),
+                ("2024-01-03T00:00:00.000Z", 0),
+                ("2024-01-04T00:00:00.000Z", 0),
+                ("2024-01-05T00:00:00.000Z", 1),
+            ]),
+            "{out}"
+        );
+        // The 2nd's bucket is keyed before the noon min, so its document
+        // is dropped.
+        assert_eq!(
+            pairs(&out, "d_noon"),
+            strs(&[("2024-01-05T00:00:00.000Z", 1)]),
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sub_hour_gap_filling_across_a_fall_back_night_goes_by_key() {
+        // 2024-11-03: New York falls back at 06:00Z, so 01:00-02:00 happens
+        // twice; with sub-hour buckets the indices of the two occurrences
+        // interleave, but filling must follow time.
+        let run = |tag: &str, dates: &[&'static str], aggs: serde_json::Value| {
+            let root = temp_root(tag);
+            let docs = dates
+                .iter()
+                .enumerate()
+                .map(|(i, at)| sent(&format!("d{i}"), at))
+                .collect();
+            let out = one(&root, &[docs], aggs);
+            std::fs::remove_dir_all(root).unwrap();
+            out
+        };
+        let ny = |interval: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({"field": "sent", "fixed_interval": interval,
+                                              "time_zone": "America/New_York"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::json!({"d": {"date_histogram": body}})
+        };
+
+        // No bucket after the last document (06:00Z / 01:00 EST used to be
+        // filled).
+        let out = run(
+            "dst-tail",
+            &["2024-11-03T05:10:00Z", "2024-11-03T05:40:00Z"],
+            ny("30m", serde_json::json!({})),
+        );
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[
+                ("2024-11-03T01:00:00.000-04:00", 1),
+                ("2024-11-03T01:30:00.000-04:00", 1),
+            ]),
+            "{out}"
+        );
+
+        // No bucket before `hard_bounds.min` (01:30 EDT used to be filled);
+        // 06:10Z is in the 06:00Z bucket, keyed before the min, so dropped.
+        let out = run(
+            "dst-hard-min",
+            &["2024-11-03T06:10:00Z", "2024-11-03T06:40:00Z"],
+            ny(
+                "30m",
+                serde_json::json!({"hard_bounds": {"min": "2024-11-03T06:10:00Z"}}),
+            ),
+        );
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[("2024-11-03T01:30:00.000-05:00", 1)]),
+            "{out}"
+        );
+
+        // The first 01:30 to the second: the 01:00 EST bucket between them
+        // in time (but not by index) is filled.
+        let out = run(
+            "dst-between",
+            &["2024-11-03T05:40:00Z", "2024-11-03T06:40:00Z"],
+            ny("30m", serde_json::json!({})),
+        );
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[
+                ("2024-11-03T01:30:00.000-04:00", 1),
+                ("2024-11-03T01:00:00.000-05:00", 0),
+                ("2024-11-03T01:30:00.000-05:00", 1),
+            ]),
+            "{out}"
+        );
+
+        // 15 minutes: only the buckets between the two documents in time.
+        let out = run(
+            "dst-15m",
+            &["2024-11-03T05:50:00Z", "2024-11-03T06:05:00Z"],
+            ny("15m", serde_json::json!({})),
+        );
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[
+                ("2024-11-03T01:45:00.000-04:00", 1),
+                ("2024-11-03T01:00:00.000-05:00", 1),
+            ]),
+            "{out}"
+        );
+
+        // 15 minutes, extended past a hard max: filled up to the last
+        // bucket keyed at or before it; the 06:40Z document's bucket is
+        // past it.
+        let out = run(
+            "dst-15m-hard",
+            &["2024-11-03T05:40:00Z", "2024-11-03T06:40:00Z"],
+            ny(
+                "15m",
+                serde_json::json!({"hard_bounds": {"max": "2024-11-03T06:15:00Z"},
+                                   "extended_bounds": {"max": "2024-11-03T07:00:00Z"}}),
+            ),
+        );
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[
+                ("2024-11-03T01:30:00.000-04:00", 1),
+                ("2024-11-03T01:45:00.000-04:00", 0),
+                ("2024-11-03T01:00:00.000-05:00", 0),
+                ("2024-11-03T01:15:00.000-05:00", 0),
+            ]),
+            "{out}"
+        );
+
+        // Extended bounds across the night fill every quarter hour once.
+        let out = run(
+            "dst-15m-extended",
+            &["2024-11-03T05:40:00Z"],
+            ny(
+                "15m",
+                serde_json::json!({"extended_bounds": {"min": "2024-11-03T05:00:00Z",
+                                                       "max": "2024-11-03T07:00:00Z"}}),
+            ),
+        );
+        let got = pairs(&out, "d");
+        assert_eq!(got.len(), 9, "{out}");
+        let keys: Vec<i64> = out["d"]["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["key"].as_i64().unwrap())
+            .collect();
+        assert!(keys.windows(2).all(|w| w[1] - w[0] == 15 * 60_000), "{out}");
+    }
+
     #[test]
     fn invalid_intervals_built_in_code_are_rejected_by_validate() {
         let mut q = query("", 0, serde_json::json!({}));
@@ -21805,6 +22323,8 @@ mod histogram_aggregation_tests {
                     interval: 0.0,
                     offset: 0.0,
                     min_doc_count: 0,
+                    extended_bounds: None,
+                    hard_bounds: None,
                 },
                 aggs: None,
             },

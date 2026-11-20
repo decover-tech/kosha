@@ -15,6 +15,7 @@
 //! Start at [`ClusterIndex`].
 
 mod build;
+mod centroid_index;
 mod centroid_probe;
 mod error;
 mod kmeans;
@@ -70,6 +71,18 @@ pub struct ClusterIndexConfig {
     pub enable_split: bool,
     pub enable_merge: bool,
     pub enable_reassign: bool,
+    /// Rounds of post-build refinement in [`ClusterIndex::build`]: after
+    /// balanced bisection, every vector moves to the nearest centroid
+    /// among its posting's `build_refine_candidates` nearest postings,
+    /// centroids are recomputed, and [`ClusterIndex::rebalance`] restores
+    /// the size bounds. Bisection's balance pass pushes far members into
+    /// the other half, which leaves loose postings (large radii); this
+    /// tightens them. `0` turns refinement off and builds exactly as
+    /// before (kosha: `KOSHA_VECTOR_BUILD_REFINE=off`).
+    pub build_refine_rounds: usize,
+    /// How many nearby postings (including its own) a vector may move to
+    /// during build refinement.
+    pub build_refine_candidates: usize,
 }
 
 impl ClusterIndexConfig {
@@ -92,6 +105,8 @@ impl ClusterIndexConfig {
             enable_split: true,
             enable_merge: true,
             enable_reassign: true,
+            build_refine_rounds: 2,
+            build_refine_candidates: 16,
         }
     }
 }
@@ -200,8 +215,10 @@ pub struct ClusterIndex {
 
 impl ClusterIndex {
     /// Builds an index from a full vector set via recursive balanced
-    /// bisection (see `build.rs`). `vectors` must have unique ids and
-    /// uniform dimensionality matching `config.dim`.
+    /// bisection, then (unless `config.build_refine_rounds` is 0) a
+    /// bounded nearest-centroid refinement and a [`Self::rebalance`] (see
+    /// `build.rs`). `vectors` must have unique ids and uniform
+    /// dimensionality matching `config.dim`.
     pub fn build(
         vectors: &[(u32, Vec<f32>)],
         config: ClusterIndexConfig,
@@ -286,7 +303,9 @@ impl ClusterIndex {
 
     /// Folds another partition's postings into this index (#253): each
     /// posting's centroid picks its `candidates` nearest postings here
-    /// (one centroid scan per absorbed posting), and each of its entries
+    /// (one centroid-index lookup per absorbed posting — a coarse index
+    /// over this index's centroids once it has 256 or more postings, an
+    /// exact scan below that), and each of its entries
     /// is appended to the nearest of those. A loose vector is absorbed as
     /// a one-entry posting centred on itself, which makes the choice
     /// exact. Postings that took entries get their centroid recomputed;

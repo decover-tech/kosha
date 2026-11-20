@@ -1,11 +1,13 @@
 # Metrics
 
-Every Kosha pod serves `GET /metrics` on its HTTP port (`8080` by default) in the Prometheus
-text exposition format, version 0.0.4
-(`content-type: text/plain; version=0.0.4; charset=utf-8`). Each pod reports its own process:
-a query pod answers `/metrics` itself and never forwards it to the ingest pod.
+Every Kosha pod, whatever its `KOSHA_ROLE` (`query`, `ingest`, `indexer` or `standalone`), serves
+`GET /metrics` on its HTTP port (`8080` by default) in the Prometheus text exposition format,
+version 0.0.4 (`content-type: text/plain; version=0.0.4; charset=utf-8`). Each pod reports its
+own process: a query pod answers `/metrics` itself and never forwards it to the ingest pod, and
+an indexer serves it alongside its compaction admin API.
 
-The pods in `k8s/base/deployment.yaml` and `k8s/base/deployment-query.yaml` carry the
+The pods in `k8s/base/deployment.yaml`, `k8s/base/deployment-query.yaml` and
+`k8s/base/deployment-indexer.yaml` carry the
 `prometheus.io/scrape`, `prometheus.io/port` and `prometheus.io/path` annotations, so a
 Prometheus using the usual annotation-based pod discovery collects them with no extra
 configuration.
@@ -46,6 +48,7 @@ plus `+Inf`.
 | --- | --- | --- | --- |
 | `kosha_index_documents_total` | counter | none | Documents accepted by index and replace requests on this pod (the ingest pod; a query pod forwards writes) |
 | `kosha_flush_total` | counter | none | Flush requests that succeeded. The idle-flush timer is not counted |
+| `kosha_writer_fenced_total` | counter | none | Namespaces this writer fenced itself from because another writer took its writer lease (`KOSHA_WRITER_LEASE`). Any increase means two writers contended for a namespace; this one now refuses its writes |
 
 ### Caches and hydration
 

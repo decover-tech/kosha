@@ -4,6 +4,11 @@
 //! either from scratch (`rebuild`) or seeded from the inputs' postings and
 //! repaired by LIRE (`lire`), and measure kNN recall@10 through the real
 //! `Searcher` against brute force over the live documents.
+//!
+//! Both modes probe at the namespace floor budget (5% of centroids), with
+//! postings ranked by the radius-aware bound `max(0, d - r)`: loose
+//! postings (large radii) cost probes. Build refinement (#253,
+//! `KOSHA_VECTOR_BUILD_REFINE`) is what keeps from-scratch postings tight.
 
 use std::collections::{HashMap, HashSet};
 
@@ -197,4 +202,20 @@ fn lire_compaction_recall_is_within_half_a_point_of_rebuild() {
         lire >= rebuild - 0.005,
         "lire recall@10 {lire:.4} is more than 0.5pt below rebuild {rebuild:.4}"
     );
+    assert!(lire >= 0.99, "lire recall@10 {lire:.4} below 0.99");
+    // From-scratch builds (every flush, and `rebuild` compaction) refine
+    // bisection's postings unless `KOSHA_VECTOR_BUILD_REFINE=off`. Without
+    // it their loose radii leave `rebuild` near 0.47 at the 5% floor.
+    let refine_off = std::env::var("KOSHA_VECTOR_BUILD_REFINE").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "false" | "0"
+        )
+    });
+    if !refine_off {
+        assert!(
+            rebuild >= 0.85,
+            "rebuild recall@10 {rebuild:.4} below 0.85 with build refinement on"
+        );
+    }
 }
