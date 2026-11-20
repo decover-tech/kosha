@@ -2577,7 +2577,10 @@ impl AppState {
     /// advanced (`follow_stored_version`). The ingest pod never starts it.
     /// The thread holds only a `Weak` and exits when the state is dropped.
     fn spawn_manifest_refresher(self: &Arc<Self>) {
-        if self.ingest_host.is_none() {
+        // DELIBERATELY BROKEN (#256 acceptance): no refresher, so a query
+        // pod never sees versions published after it loaded a namespace.
+        // Reverted in the next commit.
+        if self.ingest_host.is_none() || std::env::var("KOSHA_ROLE").is_ok() {
             return;
         }
         let Some(interval) = self.manifest_follow.interval else {
