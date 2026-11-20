@@ -305,88 +305,20 @@ impl SpanHydrator {
             .filter(|&i| !fallback[i] && !pages[i].reader.has_local_doc_vectors_header())
             .collect();
         if !header_segs.is_empty() {
-            let probes: Vec<(String, u64, u64)> = header_segs
+            let targets: Vec<(&Path, &str)> = header_segs
                 .iter()
-                .map(|&i| {
-                    let key = format!("{}/{DOC_VECTORS_FILE}", rels[i].as_deref().unwrap());
-                    (key, 0, DOC_VECTORS_HEADER_PROBE)
-                })
+                .map(|&i| (pages[i].segment_dir, rels[i].as_deref().unwrap()))
                 .collect();
-            out.rounds += 1;
-            let results = fetcher.fetch(&probes);
-            let mut rest: Vec<(usize, Vec<u8>, u64)> = Vec::new();
-            for (&i, result) in header_segs.iter().zip(results) {
-                out.gets += 1;
-                seg_gets[i] += 1;
-                let prefix = match result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        out.shed |= matches!(e, KoshaError::Overloaded(_));
-                        fallback[i] = !matches!(e, KoshaError::Overloaded(_));
-                        continue;
-                    }
-                };
-                out.bytes += prefix.len() as u64;
-                seg_bytes[i] += prefix.len() as u64;
-                match doc_vectors_header_len(&prefix) {
-                    Ok(Ok(_)) => {
-                        self.persist(
-                            cache,
-                            pages[i].segment_dir,
-                            &rels[i],
-                            DOC_VECTORS_FILE,
-                            0,
-                            &prefix,
-                        );
-                    }
-                    // A full probe that ended inside the header: fetch the
-                    // rest. A short probe was the whole file, so a header
-                    // still incomplete there is corrupt.
-                    Ok(Err(need)) if prefix.len() as u64 == DOC_VECTORS_HEADER_PROBE => {
-                        rest.push((i, prefix, need));
-                    }
-                    _ => fallback[i] = true,
-                }
-            }
-            if !rest.is_empty() {
-                let reqs: Vec<(String, u64, u64)> = rest
-                    .iter()
-                    .map(|(i, prefix, need)| {
-                        let key = format!("{}/{DOC_VECTORS_FILE}", rels[*i].as_deref().unwrap());
-                        (key, prefix.len() as u64, need - prefix.len() as u64)
-                    })
-                    .collect();
-                out.rounds += 1;
-                let results = fetcher.fetch(&reqs);
-                for ((i, mut prefix, need), result) in rest.into_iter().zip(results) {
-                    out.gets += 1;
-                    seg_gets[i] += 1;
-                    match result {
-                        Ok(bytes) => {
-                            out.bytes += bytes.len() as u64;
-                            seg_bytes[i] += bytes.len() as u64;
-                            prefix.extend_from_slice(&bytes);
-                            if prefix.len() as u64 >= need
-                                && matches!(doc_vectors_header_len(&prefix), Ok(Ok(_)))
-                            {
-                                self.persist(
-                                    cache,
-                                    pages[i].segment_dir,
-                                    &rels[i],
-                                    DOC_VECTORS_FILE,
-                                    0,
-                                    &prefix,
-                                );
-                            } else {
-                                fallback[i] = true;
-                            }
-                        }
-                        Err(e) => {
-                            out.shed |= matches!(e, KoshaError::Overloaded(_));
-                            fallback[i] = !matches!(e, KoshaError::Overloaded(_));
-                        }
-                    }
-                }
+            let fetched = fetch_doc_vectors_headers(&targets, fetcher, cache);
+            out.rounds += fetched.rounds;
+            out.shed |= fetched.shed;
+            for (&i, seg) in header_segs.iter().zip(fetched.segments) {
+                out.gets += seg.gets;
+                out.bytes += seg.bytes;
+                seg_gets[i] += seg.gets;
+                seg_bytes[i] += seg.bytes;
+                // A shed fetch is not retried as a whole file (larger).
+                fallback[i] = seg.status == HeaderStatus::Failed;
             }
         }
 
@@ -596,6 +528,146 @@ pub(crate) fn persist_span(
             eprintln!("WARN: failed to persist span {}: {e}", dest.display());
         }
     }
+}
+
+/// How fetching one segment's `doc_vectors.bin` header went — see
+/// [`fetch_doc_vectors_headers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderStatus {
+    /// The header is now in the span cache.
+    Cached,
+    /// The object is missing, short or corrupt.
+    Failed,
+    /// Refused by the request's byte ceiling or the in-flight budget.
+    Shed,
+}
+
+/// One segment's share of a [`fetch_doc_vectors_headers`] call.
+#[derive(Debug, Clone, Copy)]
+pub struct HeaderFetch {
+    pub status: HeaderStatus,
+    pub gets: u64,
+    pub bytes: u64,
+}
+
+/// The result of [`fetch_doc_vectors_headers`]: one entry per target, in
+/// order, plus the sequential rounds it took.
+#[derive(Debug, Default)]
+pub struct HeadersFetched {
+    pub segments: Vec<HeaderFetch>,
+    pub rounds: u64,
+    pub shed: bool,
+}
+
+/// Whether `doc_vectors.bin`'s header is readable locally: the whole file,
+/// or a span from offset 0 in the sparse span cache (only ever persisted
+/// once it parsed as a complete header).
+pub fn doc_vectors_header_local(segment_dir: &Path) -> bool {
+    std::fs::metadata(segment_dir.join(DOC_VECTORS_FILE)).is_ok_and(|m| m.len() > 0)
+        || SpanIndex::load(segment_dir, DOC_VECTORS_FILE)
+            .spans()
+            .iter()
+            .any(|&(start, _)| start == 0)
+}
+
+/// Fetch the `doc_vectors.bin` header of each `(segment_dir, rel)` target
+/// by range into the span cache — never the whole file. Two rounds at
+/// most: a [`DOC_VECTORS_HEADER_PROBE`]-byte probe, then the rest of any
+/// header longer than that.
+pub fn fetch_doc_vectors_headers(
+    targets: &[(&Path, &str)],
+    fetcher: &dyn RangeFetcher,
+    cache: &Cache,
+) -> HeadersFetched {
+    let mut out = HeadersFetched {
+        segments: vec![
+            HeaderFetch {
+                status: HeaderStatus::Failed,
+                gets: 0,
+                bytes: 0,
+            };
+            targets.len()
+        ],
+        ..Default::default()
+    };
+    if targets.is_empty() {
+        return out;
+    }
+    let key = |rel: &str| format!("{rel}/{DOC_VECTORS_FILE}");
+    let probes: Vec<(String, u64, u64)> = targets
+        .iter()
+        .map(|(_, rel)| (key(rel), 0, DOC_VECTORS_HEADER_PROBE))
+        .collect();
+    out.rounds += 1;
+    let mut rest: Vec<(usize, Vec<u8>, u64)> = Vec::new();
+    for (i, result) in fetcher.fetch(&probes).into_iter().enumerate() {
+        let seg = &mut out.segments[i];
+        seg.gets += 1;
+        let prefix = match result {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if matches!(e, KoshaError::Overloaded(_)) {
+                    seg.status = HeaderStatus::Shed;
+                    out.shed = true;
+                }
+                continue;
+            }
+        };
+        seg.bytes += prefix.len() as u64;
+        match doc_vectors_header_len(&prefix) {
+            Ok(Ok(_)) => {
+                let (dir, rel) = targets[i];
+                persist_span(cache, dir, rel, DOC_VECTORS_FILE, 0, &prefix);
+                seg.status = HeaderStatus::Cached;
+            }
+            // A full probe that ended inside the header: fetch the rest. A
+            // short probe was the whole file, so a header still incomplete
+            // there is corrupt.
+            Ok(Err(need)) if prefix.len() as u64 == DOC_VECTORS_HEADER_PROBE => {
+                rest.push((i, prefix, need));
+            }
+            _ => {}
+        }
+    }
+    if rest.is_empty() {
+        return out;
+    }
+    let reqs: Vec<(String, u64, u64)> = rest
+        .iter()
+        .map(|(i, prefix, need)| {
+            (
+                key(targets[*i].1),
+                prefix.len() as u64,
+                need - prefix.len() as u64,
+            )
+        })
+        .collect();
+    out.rounds += 1;
+    let results = fetcher.fetch(&reqs);
+    for ((i, mut prefix, need), result) in rest.into_iter().zip(results) {
+        let seg = &mut out.segments[i];
+        seg.gets += 1;
+        match result {
+            Ok(bytes) => {
+                seg.bytes += bytes.len() as u64;
+                prefix.extend_from_slice(&bytes);
+                if prefix.len() as u64 >= need
+                    && matches!(doc_vectors_header_len(&prefix), Ok(Ok(_)))
+                {
+                    let (dir, rel) = targets[i];
+                    persist_span(cache, dir, rel, DOC_VECTORS_FILE, 0, &prefix);
+                    seg.status = HeaderStatus::Cached;
+                }
+            }
+            Err(e) => {
+                if matches!(e, KoshaError::Overloaded(_)) {
+                    seg.status = HeaderStatus::Shed;
+                    out.shed = true;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Segments waiting for a background whole-file promotion. FIFO; the
@@ -1120,5 +1192,71 @@ mod tests {
             q.pop_timeout(std::time::Duration::ZERO),
             Some(PathBuf::from("b"))
         );
+    }
+
+    /// A legacy segment's `doc_vectors.bin` binds its unnamed vector index
+    /// to a field: a kNN needs only that header, fetched by range into the
+    /// span cache, never the whole file (as large as the index itself).
+    #[test]
+    fn legacy_doc_vectors_header_is_fetched_by_range_and_binds_the_index() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kosha-segment/tests/fixtures/legacy-vector-seg");
+        let root = std::env::temp_dir().join(format!(
+            "kosha-dv-header-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (remote, data) = (root.join("remote"), root.join("data"));
+        let (remote_seg, seg) = (remote.join("ns/legacy-vec"), data.join("ns/legacy-vec"));
+        std::fs::create_dir_all(&remote_seg).unwrap();
+        std::fs::create_dir_all(&seg).unwrap();
+        for entry in std::fs::read_dir(&fixture).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap();
+            std::fs::copy(&path, remote_seg.join(name)).unwrap();
+            if name != DOC_VECTORS_FILE {
+                std::fs::copy(&path, seg.join(name)).unwrap();
+            }
+        }
+        assert!(!doc_vectors_header_local(&seg));
+
+        let store = CountingStore::new(remote.clone());
+        let cache = Cache::new(data.clone());
+        let fetched = fetch_doc_vectors_headers(&[(&seg, "ns/legacy-vec")], &store, &cache);
+        assert_eq!(fetched.segments[0].status, HeaderStatus::Cached);
+        assert_eq!(fetched.rounds, 1);
+        assert!(doc_vectors_header_local(&seg));
+        assert!(!seg.join(DOC_VECTORS_FILE).exists(), "whole file fetched");
+        let header_len = {
+            let all = std::fs::read(remote_seg.join(DOC_VECTORS_FILE)).unwrap();
+            doc_vectors_header_len(&all).unwrap().unwrap()
+        };
+        assert!(
+            header_len
+                < std::fs::metadata(remote_seg.join(DOC_VECTORS_FILE))
+                    .unwrap()
+                    .len()
+        );
+
+        // The header alone binds the unnamed index to `emb`.
+        let reader = SegmentReader::open_with_options(seg.clone(), true).unwrap();
+        assert_eq!(
+            reader.vector_field_status("emb"),
+            kosha_segment::VectorFieldStatus::Legacy { dim: Some(4) }
+        );
+        assert_eq!(
+            reader.vector_field_status("title_emb"),
+            kosha_segment::VectorFieldStatus::Absent
+        );
+
+        // A missing object fails the segment, without a whole-file fetch.
+        let missing = data.join("ns/gone");
+        std::fs::create_dir_all(&missing).unwrap();
+        let fetched = fetch_doc_vectors_headers(&[(&missing, "ns/gone")], &store, &cache);
+        assert_eq!(fetched.segments[0].status, HeaderStatus::Failed);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

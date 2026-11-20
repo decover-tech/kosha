@@ -804,8 +804,12 @@ existing org/user auth context Bach already establishes.
     exactly as after a flush. Indexed copies the tail supersedes are masked like deletes, so the
     newest version wins. A tail relative to another manifest version than the query's (a flush
     published in between) is refused; the query pod refreshes its manifest and retries a few
-    times, then fails with 503 rather than miss or double-count documents. Responses report
-    `exhaustive_search_count`, the number of unindexed documents scanned.
+    times, then fails with 503 rather than miss or double-count documents. The exception is a
+    writer *ahead* of the newest stored manifest (it flushed or compacted and the publication is
+    still uploading, or failing): no reader can have its version, so the query is answered from
+    the last published manifest, as `eventual`, with `consistency_fallback` in the response
+    saying why. Responses report `exhaustive_search_count`, the number of unindexed documents
+    scanned.
   - `eventual`: indexed segments only; visibility is bounded by the flush interval (§7).
 
   The unindexed backlog per namespace is capped (`KOSHA_MAX_UNINDEXED_BYTES`, default 2 GiB;
