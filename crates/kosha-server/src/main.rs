@@ -12756,7 +12756,6 @@ mod tests {
         assert_eq!(
             aggs["sizes"],
             serde_json::json!({"buckets": [
-                {"key": 0.0, "doc_count": 0},
                 {"key": 1024.0, "doc_count": 1},
                 {"key": 2048.0, "doc_count": 1},
                 {"key": 3072.0, "doc_count": 0},

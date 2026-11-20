@@ -541,6 +541,12 @@ impl Metrics {
         self.writer_fenced.inc();
     }
 
+    /// `kosha_writer_fenced_total` so far.
+    #[cfg(test)]
+    pub(crate) fn writer_fenced_count(&self) -> u64 {
+        self.writer_fenced.get()
+    }
+
     pub(crate) fn record_hydrations(&self, source: HydrationSource, files: u64) {
         if files > 0 {
             self.hydrations[source as usize].inc_by(files);

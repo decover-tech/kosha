@@ -146,10 +146,15 @@ fn state(
     role: role::Role,
     lease: bool,
 ) -> (AppState, LeasedStore) {
+    // The clock alone collides between tests running in parallel (macOS
+    // reports microseconds), and a test deleting its dir would take another
+    // test's WAL with it.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let store = LeasedStore::new(shared.clone());
     let dir = std::env::temp_dir().join(format!(
-        "kosha-lease-test-{}-{}",
+        "kosha-lease-test-{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -272,6 +277,8 @@ fn a_writer_fenced_at_commit_stops_writing_and_drops_unpublished_state() {
     assert_eq!(status(&fenced), 503, "{fenced}");
     assert!(fenced.contains("retry-after:"), "{fenced}");
     assert!(a.writer_leases.is_fenced(&ns()));
+    assert_eq!(a.metrics.writer_fenced_count(), 1);
+    assert_eq!(b.metrics.writer_fenced_count(), 0);
     // Nothing changed in the control store; A rolled back to it.
     assert!(committed(&shared).same_contents(&before));
     assert_eq!(a.indexer.pending_doc_count(&ns()), 0);
@@ -288,7 +295,11 @@ fn a_writer_fenced_at_commit_stops_writing_and_drops_unpublished_state() {
     assert_eq!(status(&flush(&b)), 200);
     assert_eq!(committed_docs(&shared), 2);
     assert_eq!(status(&write(&a, &["a4"])), 503);
+    assert_eq!(status(&flush(&a)), 503);
     assert_eq!(shared.lock().unwrap().writer_lease_token(&ns()), Some(2));
+    // One takeover is one fence, however many writes it refuses.
+    assert_eq!(a.metrics.writer_fenced_count(), 1);
+    assert_eq!(b.metrics.writer_fenced_count(), 0);
 }
 
 /// A renewal that finds the lease taken over fences the namespace too.
@@ -305,10 +316,14 @@ fn a_lost_renewal_fences_the_namespace() {
             Some(2)
         );
     }
+    assert_eq!(a.metrics.writer_fenced_count(), 0);
     a.renew_writer_leases();
     assert!(a.writer_leases.is_fenced(&ns()));
+    assert_eq!(a.metrics.writer_fenced_count(), 1);
     assert_eq!(a.indexer.pending_doc_count(&ns()), 0);
     assert_eq!(status(&write(&a, &["a2"])), 503);
+    a.renew_writer_leases();
+    assert_eq!(a.metrics.writer_fenced_count(), 1);
 }
 
 /// `KOSHA_WRITER_LEASE=off`: two writers behave exactly as before #254,

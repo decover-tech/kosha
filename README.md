@@ -164,9 +164,13 @@ request and response shapes:
 - **`extended_bounds`** `{"min", "max"}` (either may be left out) widens the
   gap-filled range to the buckets holding `min` and `max`, so a chart of a
   fixed window gets leading and trailing zero buckets — with
-  `min_doc_count: 0` only. **`hard_bounds`** `{"min", "max"}` drops values
-  outside `[min, max]` (no bucket for them) and clips the gap-filled range to
-  the buckets holding the bounds. For `date_histogram` the bounds are date
+  `min_doc_count: 0` only. **`hard_bounds`** `{"min", "max"}` keeps only
+  buckets whose key lies in `[min, max]`, as in Elasticsearch: a value whose
+  bucket key is outside is dropped (so with `interval: 5` and `max: 20` the
+  value 20.5 still counts in bucket 20, and a `min` in the middle of a bucket
+  drops that whole bucket), and gap filling stops at the bounds. Gap filling
+  goes by key, so across a fall-back night sub-hour buckets are filled in
+  time order. For `date_histogram` the bounds are date
   strings (one without its own offset is wall-clock time in `time_zone`) or
   epoch milliseconds.
 - Anything else is a 400 with the reason: a malformed interval

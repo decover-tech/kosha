@@ -7435,11 +7435,35 @@ impl HistogramParams {
         }
     }
 
-    /// The indices to gap-fill: see `fill_range` in `kosha_core::histogram`.
-    fn fill_range(&self, observed: Option<(i64, i64)>) -> Option<(i64, i64)> {
+    /// The indices to gap-fill given the non-empty buckets, and for a
+    /// `date_histogram` the key range a filled bucket must also fall in
+    /// (see `NumericHistogram::fill_range` and `DateHistogram::fill`).
+    fn fill(
+        &self,
+        observed: &std::collections::BTreeMap<i64, usize>,
+    ) -> Option<((i64, i64), Option<kosha_core::histogram::DateFill>)> {
         match self {
-            HistogramParams::Numeric(plan) => plan.fill_range(observed),
-            HistogramParams::Date(plan) => plan.fill_range(observed),
+            HistogramParams::Numeric(plan) => {
+                let observed = observed
+                    .first_key_value()
+                    .zip(observed.last_key_value())
+                    .map(|((&lo, _), (&hi, _))| (lo, hi));
+                plan.fill_range(observed).map(|range| (range, None))
+            }
+            HistogramParams::Date(plan) => plan
+                .fill(observed.keys().copied())
+                .map(|fill| (fill.indices, Some(fill))),
+        }
+    }
+
+    /// Whether gap filling emits bucket `index`: its key is in `fill`'s
+    /// key range (always, for a numeric histogram).
+    fn fills(&self, index: i64, fill: Option<&kosha_core::histogram::DateFill>) -> bool {
+        match (self, fill) {
+            (HistogramParams::Date(plan), Some(fill)) => {
+                plan.key(index).is_some_and(|key| fill.contains(key))
+            }
+            _ => true,
         }
     }
 
@@ -7631,15 +7655,12 @@ fn finish_histogram(
              `min_doc_count` to 1 or more to skip empty buckets"
         ))
     };
+    let mut fill = None;
     let indices: Vec<i64> = if min_doc_count == 0 {
-        let observed = state
-            .histogram
-            .first_key_value()
-            .zip(state.histogram.last_key_value())
-            .map(|((&lo, _), (&hi, _))| (lo, hi));
-        match params.fill_range(observed) {
+        match params.fill(&state.histogram) {
             None => Vec::new(),
-            Some((lo, hi)) => {
+            Some(((lo, hi), keys)) => {
+                fill = keys;
                 let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
                 // Where an index also encodes which occurrence of a
                 // repeated wall-clock time it is, about half the indices
@@ -7661,6 +7682,9 @@ fn finish_histogram(
     };
     let mut buckets: Vec<(f64, serde_json::Value)> = Vec::new();
     for index in indices {
+        if !params.fills(index, fill.as_ref()) {
+            continue; // an index of the overlap whose key is out of range
+        }
         let mut bucket = serde_json::Map::new();
         let Some(sort_key) = params.render_key(index, &mut bucket) else {
             continue; // a wall-clock time a DST transition skipped
@@ -22085,7 +22109,7 @@ mod histogram_aggregation_tests {
     }
 
     #[test]
-    fn values_outside_hard_bounds_get_no_bucket() {
+    fn values_whose_bucket_key_is_outside_hard_bounds_get_no_bucket() {
         let root = temp_root("hist-hard");
         let segments = vec![
             vec![
@@ -22107,27 +22131,185 @@ mod histogram_aggregation_tests {
                 "h": {"histogram": {"field": "price", "interval": 5, "hard_bounds": {"min": 0, "max": 20}}},
                 "clipped": {"histogram": {"field": "price", "interval": 5,
                                           "hard_bounds": {"min": 0, "max": 20}, "extended_bounds": {"min": -50, "max": 50}}},
+                "mid": {"histogram": {"field": "price", "interval": 5,
+                                      "hard_bounds": {"min": 2, "max": 20}, "extended_bounds": {"min": -50, "max": 50}}},
                 "d": {"date_histogram": {"field": "sent", "fixed_interval": "1d",
                                          "hard_bounds": {"min": "2024-01-01", "max": "2024-01-05T00:00:00Z"}}},
+                "d_noon": {"date_histogram": {"field": "sent", "fixed_interval": "1d",
+                                              "hard_bounds": {"min": "2024-01-02T12:00:00Z"}}},
             }),
         );
-        // -4 and 20.5 are dropped; the 20 bucket is the last one.
+        // As in Elasticsearch the bounds apply to the bucket key, not the
+        // value: -4 (bucket -5) is dropped, 20.5 (bucket 20) is kept.
         assert_eq!(
             numeric_buckets(&out["h"]),
-            vec![(0.0, 1), (5.0, 0), (10.0, 0), (15.0, 1)],
+            vec![(0.0, 1), (5.0, 0), (10.0, 0), (15.0, 1), (20.0, 1)],
             "{out}"
         );
         assert_eq!(
             numeric_buckets(&out["clipped"]),
-            vec![(0.0, 1), (5.0, 0), (10.0, 0), (15.0, 1), (20.0, 0)],
+            vec![(0.0, 1), (5.0, 0), (10.0, 0), (15.0, 1), (20.0, 1)],
             "{out}"
         );
+        // A min inside a bucket excludes that bucket, its values (3) and
+        // its gap-filled slot.
+        assert_eq!(
+            numeric_buckets(&out["mid"]),
+            vec![(5.0, 0), (10.0, 0), (15.0, 1), (20.0, 1)],
+            "{out}"
+        );
+        // 00:00:00.001 on the 5th is in the bucket keyed at the max.
         assert_eq!(
             pairs(&out, "d"),
-            strs(&[("2024-01-02T00:00:00.000Z", 1)]),
+            strs(&[
+                ("2024-01-02T00:00:00.000Z", 1),
+                ("2024-01-03T00:00:00.000Z", 0),
+                ("2024-01-04T00:00:00.000Z", 0),
+                ("2024-01-05T00:00:00.000Z", 1),
+            ]),
+            "{out}"
+        );
+        // The 2nd's bucket is keyed before the noon min, so its document
+        // is dropped.
+        assert_eq!(
+            pairs(&out, "d_noon"),
+            strs(&[("2024-01-05T00:00:00.000Z", 1)]),
             "{out}"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sub_hour_gap_filling_across_a_fall_back_night_goes_by_key() {
+        // 2024-11-03: New York falls back at 06:00Z, so 01:00-02:00 happens
+        // twice; with sub-hour buckets the indices of the two occurrences
+        // interleave, but filling must follow time.
+        let run = |tag: &str, dates: &[&'static str], aggs: serde_json::Value| {
+            let root = temp_root(tag);
+            let docs = dates
+                .iter()
+                .enumerate()
+                .map(|(i, at)| sent(&format!("d{i}"), at))
+                .collect();
+            let out = one(&root, &[docs], aggs);
+            std::fs::remove_dir_all(root).unwrap();
+            out
+        };
+        let ny = |interval: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({"field": "sent", "fixed_interval": interval,
+                                              "time_zone": "America/New_York"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::json!({"d": {"date_histogram": body}})
+        };
+
+        // No bucket after the last document (06:00Z / 01:00 EST used to be
+        // filled).
+        let out = run(
+            "dst-tail",
+            &["2024-11-03T05:10:00Z", "2024-11-03T05:40:00Z"],
+            ny("30m", serde_json::json!({})),
+        );
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[
+                ("2024-11-03T01:00:00.000-04:00", 1),
+                ("2024-11-03T01:30:00.000-04:00", 1),
+            ]),
+            "{out}"
+        );
+
+        // No bucket before `hard_bounds.min` (01:30 EDT used to be filled);
+        // 06:10Z is in the 06:00Z bucket, keyed before the min, so dropped.
+        let out = run(
+            "dst-hard-min",
+            &["2024-11-03T06:10:00Z", "2024-11-03T06:40:00Z"],
+            ny(
+                "30m",
+                serde_json::json!({"hard_bounds": {"min": "2024-11-03T06:10:00Z"}}),
+            ),
+        );
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[("2024-11-03T01:30:00.000-05:00", 1)]),
+            "{out}"
+        );
+
+        // The first 01:30 to the second: the 01:00 EST bucket between them
+        // in time (but not by index) is filled.
+        let out = run(
+            "dst-between",
+            &["2024-11-03T05:40:00Z", "2024-11-03T06:40:00Z"],
+            ny("30m", serde_json::json!({})),
+        );
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[
+                ("2024-11-03T01:30:00.000-04:00", 1),
+                ("2024-11-03T01:00:00.000-05:00", 0),
+                ("2024-11-03T01:30:00.000-05:00", 1),
+            ]),
+            "{out}"
+        );
+
+        // 15 minutes: only the buckets between the two documents in time.
+        let out = run(
+            "dst-15m",
+            &["2024-11-03T05:50:00Z", "2024-11-03T06:05:00Z"],
+            ny("15m", serde_json::json!({})),
+        );
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[
+                ("2024-11-03T01:45:00.000-04:00", 1),
+                ("2024-11-03T01:00:00.000-05:00", 1),
+            ]),
+            "{out}"
+        );
+
+        // 15 minutes, extended past a hard max: filled up to the last
+        // bucket keyed at or before it; the 06:40Z document's bucket is
+        // past it.
+        let out = run(
+            "dst-15m-hard",
+            &["2024-11-03T05:40:00Z", "2024-11-03T06:40:00Z"],
+            ny(
+                "15m",
+                serde_json::json!({"hard_bounds": {"max": "2024-11-03T06:15:00Z"},
+                                   "extended_bounds": {"max": "2024-11-03T07:00:00Z"}}),
+            ),
+        );
+        assert_eq!(
+            pairs(&out, "d"),
+            strs(&[
+                ("2024-11-03T01:30:00.000-04:00", 1),
+                ("2024-11-03T01:45:00.000-04:00", 0),
+                ("2024-11-03T01:00:00.000-05:00", 0),
+                ("2024-11-03T01:15:00.000-05:00", 0),
+            ]),
+            "{out}"
+        );
+
+        // Extended bounds across the night fill every quarter hour once.
+        let out = run(
+            "dst-15m-extended",
+            &["2024-11-03T05:40:00Z"],
+            ny(
+                "15m",
+                serde_json::json!({"extended_bounds": {"min": "2024-11-03T05:00:00Z",
+                                                       "max": "2024-11-03T07:00:00Z"}}),
+            ),
+        );
+        let got = pairs(&out, "d");
+        assert_eq!(got.len(), 9, "{out}");
+        let keys: Vec<i64> = out["d"]["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["key"].as_i64().unwrap())
+            .collect();
+        assert!(keys.windows(2).all(|w| w[1] - w[0] == 15 * 60_000), "{out}");
     }
 
     #[test]

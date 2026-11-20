@@ -34,8 +34,13 @@
 //! back by `+offset`.
 //!
 //! `extended_bounds` widens the gap-filled range (with `min_doc_count: 0`)
-//! to the buckets holding `min` and `max`; `hard_bounds` drops values
-//! outside `[min, max]` and clips the gap-filled range to it. Date bounds
+//! to the buckets holding `min` and `max`; `hard_bounds` keeps only the
+//! buckets whose key lies in `[min, max]`, as in Elasticsearch (which tests
+//! the rounded key, not the raw value): a value is dropped when its
+//! bucket's key is outside, and no bucket keyed outside is gap-filled.
+//! Gap filling covers the buckets keyed from the lowest to the highest
+//! key — by key, not by index, since the indices of a fall-back night's
+//! repeated wall-clock times are not in time order. Date bounds
 //! are date strings (a string without its own UTC offset is wall-clock
 //! time in `time_zone`) or epoch milliseconds.
 //!
@@ -114,8 +119,9 @@ pub struct AggHistogram {
     /// holding `min` and `max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extended_bounds: Option<HistogramBounds>,
-    /// Values outside `[min, max]` are dropped; no bucket is returned
-    /// (or gap-filled) beyond the ones holding `min` and `max`.
+    /// Only buckets whose key lies in `[min, max]` are returned: a value
+    /// whose bucket key is outside is dropped (Elasticsearch's rule), and
+    /// gap filling stops at the bounds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_bounds: Option<HistogramBounds>,
 }
@@ -168,11 +174,13 @@ pub struct NumericHistogram {
 
 impl NumericHistogram {
     /// The index of the bucket `value` falls in, `None` when `hard_bounds`
-    /// excludes it.
+    /// excludes that bucket's key.
     pub fn bucket(&self, value: f64) -> Option<i64> {
-        let below = self.hard.min.is_some_and(|min| value < min);
-        let above = self.hard.max.is_some_and(|max| value > max);
-        (!below && !above).then(|| histogram_bucket(value, self.interval, self.offset))
+        let index = histogram_bucket(value, self.interval, self.offset);
+        let key = self.key(index);
+        let below = self.hard.min.is_some_and(|min| key < min);
+        let above = self.hard.max.is_some_and(|max| key > max);
+        (!below && !above).then_some(index)
     }
 
     /// The key of bucket `index`.
@@ -181,39 +189,34 @@ impl NumericHistogram {
     }
 
     /// The indices to gap-fill (with `min_doc_count: 0`): the observed
-    /// range widened by `extended_bounds` and clipped by `hard_bounds`.
+    /// range widened by `extended_bounds` and clipped to the buckets whose
+    /// key `hard_bounds` admits (keys grow with the index here).
     pub fn fill_range(&self, observed: Option<(i64, i64)>) -> Option<(i64, i64)> {
         let index = |v: f64| histogram_bucket(v, self.interval, self.offset);
-        fill_range(
-            observed,
-            [self.extended.min.map(index), self.extended.max.map(index)],
-            [self.hard.min.map(index), self.hard.max.map(index)],
-        )
+        let ends = || {
+            observed.into_iter().flat_map(|(lo, hi)| [lo, hi]).chain(
+                [self.extended.min, self.extended.max]
+                    .into_iter()
+                    .flatten()
+                    .map(index),
+            )
+        };
+        let mut lo = ends().min()?;
+        let mut hi = ends().max()?;
+        if let Some(min) = self.hard.min {
+            let first = index(min);
+            lo = lo.max(if self.key(first) < min {
+                first + 1
+            } else {
+                first
+            });
+        }
+        if let Some(max) = self.hard.max {
+            let last = index(max);
+            hi = hi.min(if self.key(last) > max { last - 1 } else { last });
+        }
+        (lo <= hi).then_some((lo, hi))
     }
-}
-
-/// `observed` widened to `extended` and clipped to `hard` (each a
-/// `[min, max]` pair of bucket indices, either end optional).
-fn fill_range(
-    observed: Option<(i64, i64)>,
-    extended: [Option<i64>; 2],
-    hard: [Option<i64>; 2],
-) -> Option<(i64, i64)> {
-    let ends = || {
-        observed
-            .into_iter()
-            .flat_map(|(lo, hi)| [lo, hi])
-            .chain(extended.into_iter().flatten())
-    };
-    let mut lo = ends().min()?;
-    let mut hi = ends().max()?;
-    if let Some(min) = hard[0] {
-        lo = lo.max(min);
-    }
-    if let Some(max) = hard[1] {
-        hi = hi.min(max);
-    }
-    (lo <= hi).then_some((lo, hi))
 }
 
 /// A duration as Elasticsearch writes it in `offset`: a string such as
@@ -601,6 +604,29 @@ impl Zone {
         [found.first().copied(), found.get(1).copied()]
     }
 
+    /// The lowest and the highest wall-clock time (milliseconds since
+    /// 1970-01-01T00:00 local) of any instant in `[from, to]`. Local time
+    /// rises with the instant except at a fall-back transition, where it
+    /// jumps back, so the extremes are at the ends or either side of a
+    /// transition inside the range.
+    fn local_range(&self, from: i64, to: i64) -> (i64, i64) {
+        let local = |utc: i64| utc.saturating_add(self.offset_at(utc));
+        let (mut lo, mut hi) = (local(from), local(to));
+        if let (Zone::Named { tz, .. }, Some(start)) = (self, timestamp(from)) {
+            // Far more transitions than a capped bucket count can span;
+            // past it the caller's bucket limit rejects the range anyway.
+            for transition in tz.following(start).take(100_000) {
+                let at = transition.timestamp().as_millisecond();
+                if at > to {
+                    break;
+                }
+                lo = lo.min(local(at));
+                hi = hi.max(local(at - 1));
+            }
+        }
+        (lo, hi)
+    }
+
     /// The instant of wall-clock time `local`: the earlier one in an
     /// overlap, and in a gap the instant the gap ends (the wall-clock time
     /// read with the offset before the transition) — `java.time`'s and
@@ -670,11 +696,18 @@ pub struct DateHistogram {
 
 impl DateHistogram {
     /// The index of the bucket epoch-millisecond `value` falls in, `None`
-    /// when `hard_bounds` excludes it.
+    /// when `hard_bounds` excludes that bucket's key.
     pub fn bucket(&self, value: i64) -> Option<i64> {
-        let below = self.hard[0].is_some_and(|min| value < min);
-        let above = self.hard[1].is_some_and(|max| value > max);
-        (!below && !above).then(|| self.index(value))
+        let index = self.index(value);
+        let key = self.key(index).unwrap_or(value);
+        self.admits(key).then_some(index)
+    }
+
+    /// Whether `hard_bounds` admits a bucket keyed `key`.
+    fn admits(&self, key: i64) -> bool {
+        let below = self.hard[0].is_some_and(|min| key < min);
+        let above = self.hard[1].is_some_and(|max| key > max);
+        !below && !above
     }
 
     fn index(&self, value: i64) -> i64 {
@@ -756,15 +789,68 @@ impl DateHistogram {
         }
     }
 
-    /// The indices to gap-fill (with `min_doc_count: 0`): the observed
-    /// range widened by `extended_bounds` and clipped by `hard_bounds`.
-    pub fn fill_range(&self, observed: Option<(i64, i64)>) -> Option<(i64, i64)> {
-        let index = |end: Option<i64>| end.map(|v| self.index(v));
-        fill_range(
-            observed,
-            [index(self.extended[0]), index(self.extended[1])],
-            [index(self.hard[0]), index(self.hard[1])],
-        )
+    /// What to gap-fill (with `min_doc_count: 0`) given the indices of the
+    /// non-empty buckets: every bucket keyed from the lowest observed key to
+    /// the highest, widened to the buckets holding `extended_bounds` and
+    /// clipped to `hard_bounds`. Filling goes by key because the indices
+    /// of a fall-back night's sub-hour buckets interleave the two
+    /// occurrences of each wall-clock time; [`DateFill::indices`] covers
+    /// every index whose key can be in [`DateFill::keys`], and a bucket
+    /// is filled only when its key is.
+    pub fn fill(&self, observed: impl IntoIterator<Item = i64>) -> Option<DateFill> {
+        let bucket_key = |value: i64| self.key(self.index(value)).unwrap_or(value);
+        let ends = observed
+            .into_iter()
+            .filter_map(|index| self.key(index))
+            .chain(self.extended.into_iter().flatten().map(bucket_key));
+        let (mut lo, mut hi) = ends.fold(None, |range: Option<(i64, i64)>, key| {
+            Some(range.map_or((key, key), |(lo, hi)| (lo.min(key), hi.max(key))))
+        })?;
+        if let Some(min) = self.hard[0] {
+            lo = lo.max(min);
+        }
+        if let Some(max) = self.hard[1] {
+            hi = hi.min(max);
+        }
+        if lo > hi {
+            return None;
+        }
+        let indices = match (self.interval, &self.zone) {
+            (Interval::Fixed { width, .. }, Zone::Named { .. }) => {
+                // A key is the instant of wall-clock time `n * width`
+                // (shifted by `offset`), so every key in range has its `n`
+                // within the wall-clock times the range passes through.
+                let (first, last) = self.zone.local_range(
+                    lo.saturating_sub(self.offset),
+                    hi.saturating_sub(self.offset),
+                );
+                (
+                    first.div_euclid(width).saturating_mul(2),
+                    last.div_euclid(width).saturating_mul(2).saturating_add(1),
+                )
+            }
+            // Keys grow with the index.
+            _ => (self.index(lo), self.index(hi)),
+        };
+        Some(DateFill {
+            indices,
+            keys: (lo, hi),
+        })
+    }
+}
+
+/// The gap-filled buckets of a `date_histogram`: those with an index in
+/// `indices` (inclusive) and a key in `keys` (inclusive, epoch ms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DateFill {
+    pub indices: (i64, i64),
+    pub keys: (i64, i64),
+}
+
+impl DateFill {
+    /// Whether the bucket keyed `key` is filled.
+    pub fn contains(&self, key: i64) -> bool {
+        (self.keys.0..=self.keys.1).contains(&key)
     }
 }
 
@@ -1412,8 +1498,10 @@ mod tests {
         });
         let p = h.plan().unwrap();
         assert_eq!(p.fill_range(Some((2, 3))), Some((0, 5)));
+        // The bounds apply to the bucket key, as in Elasticsearch.
         assert_eq!(p.bucket(-0.1), None);
-        assert_eq!(p.bucket(50.1), None);
+        assert_eq!(p.bucket(50.1), Some(5));
+        assert_eq!(p.bucket(60.0), None);
         assert_eq!(p.bucket(0.0), Some(0));
         assert_eq!(p.bucket(50.0), Some(5));
         // Only `max` given.
@@ -1436,16 +1524,34 @@ mod tests {
         assert_eq!(d.extended[0], Some(ms("2024-03-01T08:00:00Z")));
         assert_eq!(d.hard[1], Some(ms("2024-03-20T08:00:00Z")));
         let day = |date: &str| d.bucket(ms(date)).unwrap();
+        let fill = d
+            .fill([day("2024-03-05T12:00:00Z"), day("2024-03-06T12:00:00Z")])
+            .unwrap();
         assert_eq!(
-            d.fill_range(Some((
-                day("2024-03-05T12:00:00Z"),
-                day("2024-03-06T12:00:00Z")
-            ))),
-            Some((day("2024-03-01T12:00:00Z"), day("2024-03-10T12:00:00Z")))
+            fill.indices,
+            (day("2024-03-01T12:00:00Z"), day("2024-03-10T12:00:00Z"))
         );
+        assert_eq!(
+            fill.keys,
+            (ms("2024-03-01T08:00:00Z"), ms("2024-03-10T08:00:00Z"))
+        );
+        // The hard min is 2024-02-28 00:00 local, so the 27th's bucket is
+        // out and the 28th's in; the hard max is 2024-03-20 00:00 local, a
+        // bucket key, so all of the 20th is in and the 21st is out.
         assert_eq!(d.bucket(ms("2024-02-28T07:59:59Z")), None);
-        assert_eq!(d.bucket(ms("2024-03-20T08:00:00.001Z")), None);
-        assert!(d.bucket(ms("2024-03-20T08:00:00Z")).is_some());
+        assert!(d.bucket(ms("2024-02-28T08:00:00Z")).is_some());
+        assert!(d.bucket(ms("2024-03-21T07:59:59Z")).is_some());
+        assert_eq!(d.bucket(ms("2024-03-21T08:00:00Z")), None);
+        // A hard min inside a bucket excludes the bucket.
+        let noon = dh(serde_json::json!({"fixed_interval": "1d",
+                                         "hard_bounds": {"min": "2024-01-01T12:00:00Z"}}));
+        assert_eq!(noon.bucket(ms("2024-01-01T13:00:00Z")), None);
+        assert!(noon.bucket(ms("2024-01-02T00:00:00Z")).is_some());
+        let fill = noon.fill([noon.bucket(ms("2024-01-03T00:00:00Z")).unwrap()]);
+        assert_eq!(
+            fill.map(|f| f.keys),
+            Some((ms("2024-01-03T00:00:00Z"), ms("2024-01-03T00:00:00Z")))
+        );
     }
 
     #[test]
