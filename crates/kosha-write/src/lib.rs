@@ -1,4 +1,5 @@
 pub mod compaction;
+pub mod object_wal;
 pub mod wal;
 
 pub use compaction::{
@@ -398,8 +399,36 @@ impl Indexer {
     pub fn new(data_dir: PathBuf) -> Self {
         let wal_dir = data_dir.join("_wal");
         std::fs::create_dir_all(&wal_dir).ok();
-        let wal = crate::wal::WalWriter::new(wal_dir.clone());
+        let (wal, records) = crate::wal::WalWriter::open(
+            Arc::new(crate::wal::LocalWalStore::new(wal_dir)),
+            crate::wal::GroupCommitConfig::from_env(),
+        )
+        .expect("WAL recovery failed");
+        Self::with_wal_writer(data_dir, wal, records)
+    }
 
+    /// An indexer whose WAL lives in `store` instead of `data_dir/_wal`
+    /// (`KOSHA_WAL_MODE=s3`, #236). A local WAL left in `data_dir/_wal` is
+    /// first copied into `store` (see
+    /// [`migrate_local_wal`](crate::object_wal::migrate_local_wal)); then
+    /// every record in `store` is recovered into the write buffers, exactly
+    /// like a local restart, so a fresh disk loses no acknowledged write.
+    pub fn with_wal_store(
+        data_dir: PathBuf,
+        store: Arc<dyn crate::wal::WalStore>,
+    ) -> Result<Self, KoshaError> {
+        std::fs::create_dir_all(&data_dir)?;
+        crate::object_wal::migrate_local_wal(&data_dir.join("_wal"), store.as_ref())?;
+        let (wal, records) =
+            crate::wal::WalWriter::open(store, crate::wal::GroupCommitConfig::from_env())?;
+        Ok(Self::with_wal_writer(data_dir, wal, records))
+    }
+
+    fn with_wal_writer(
+        data_dir: PathBuf,
+        wal: crate::wal::WalWriter,
+        records: crate::wal::RecoveredRecords,
+    ) -> Self {
         let idx = Self {
             data_dir,
             flush_threshold: 1000,
@@ -416,17 +445,13 @@ impl Indexer {
         };
 
         // Recover un-flushed documents from WAL on startup.
-        {
-            let records =
-                crate::wal::WalWriter::recover_sequenced(&wal_dir).expect("WAL recovery failed");
-            for (seq, record) in &records {
-                let handle = idx.ns_handle(&record.namespace);
-                let mut state = handle.state.lock().unwrap();
-                idx.apply_recovered_record(&mut state, record);
-                state.wal_sequence = state.wal_sequence.max(*seq);
-                state.recovered.push((*seq, record.clone()));
-                state.known = true;
-            }
+        for (seq, record) in &records {
+            let handle = idx.ns_handle(&record.namespace);
+            let mut state = handle.state.lock().unwrap();
+            idx.apply_recovered_record(&mut state, record);
+            state.wal_sequence = state.wal_sequence.max(*seq);
+            state.recovered.push((*seq, record.clone()));
+            state.known = true;
         }
 
         idx
@@ -782,8 +807,22 @@ impl Indexer {
             }
 
             if self.wal_enabled {
+                // The append (an fsync, or an S3 PUT in s3 mode) runs with
+                // the state lock released, so searches and flushes of this
+                // namespace never wait on it; `writes` still orders it
+                // against other writes here.
+                drop(state);
                 let lsn = self.wal.append(&namespace, &documents)?;
+                state = handle.state.lock().unwrap();
                 state.wal_sequence = state.wal_sequence.max(lsn);
+                // A flush may have taken a buffered copy of one of these
+                // ids meanwhile. The record is durable (replay is
+                // last-write-wins), so publish through the upsert path.
+                if Self::has_flushed_ids_in(&mut state, &namespace, &self.data_dir, &ids)? {
+                    drop(state);
+                    drop(writes);
+                    return self.upsert_documents(namespace, documents, false);
+                }
             }
 
             if let Some(buf) = state.buffer.as_mut() {
@@ -3023,6 +3062,71 @@ mod tests {
         }
         assert_eq!(seen, 3);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn object_wal_recovers_acked_writes_after_losing_the_data_dir() {
+        use crate::object_wal::{MemoryObjectBackend, ObjectWalStore};
+        let backend = MemoryObjectBackend::new();
+        let store = || -> Arc<dyn wal::WalStore> {
+            Arc::new(ObjectWalStore::new(Arc::new(backend.clone()), "ingest-0").unwrap())
+        };
+        let temp = || std::env::temp_dir().join(format!("kosha-s3-wal-{}", uuid::Uuid::new_v4()));
+        let ns = NamespaceId("t/ns".into());
+        let doc = |id: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", "durable")],
+        };
+
+        // Publish a segment first, so recovery has a checkpoint to honor.
+        let first = temp();
+        let idx = Indexer::with_wal_store(first.clone(), store()).unwrap();
+        idx.index_documents(ns.clone(), vec![doc("flushed")])
+            .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let published = idx.manifest(&ns).unwrap();
+        idx.acknowledge_manifest(&ns, &published).unwrap();
+        idx.index_documents(ns.clone(), vec![doc("a"), doc("b")])
+            .unwrap();
+        // Node loss: no shutdown flush, the whole data_dir is gone. Only
+        // the published segment survives (in S3; copied here the way the
+        // server hydrates it before a write).
+        std::mem::forget(idx);
+        let second = temp();
+        let copy = |from: &Path, to: &Path| {
+            for segment in std::fs::read_dir(from).unwrap() {
+                let segment = segment.unwrap().path();
+                let target = to.join(segment.file_name().unwrap());
+                std::fs::create_dir_all(&target).unwrap();
+                for file in std::fs::read_dir(&segment).unwrap() {
+                    let file = file.unwrap().path();
+                    std::fs::copy(&file, target.join(file.file_name().unwrap())).unwrap();
+                }
+            }
+        };
+        copy(&first.join(&ns.0), &second.join(&ns.0));
+        std::fs::remove_dir_all(&first).unwrap();
+
+        let idx = Indexer::with_wal_store(second.clone(), store()).unwrap();
+        idx.restore_manifest(ns.clone(), published.clone());
+        assert_eq!(
+            idx.pending_doc_count(&ns),
+            2,
+            "only unflushed writes replay"
+        );
+        idx.flush_namespace(&ns).unwrap();
+        let manifest = idx.manifest(&ns).unwrap();
+        assert_eq!(manifest.wal_origin, published.wal_origin);
+        assert!(manifest.wal_checkpoint > published.wal_checkpoint);
+        let docs: u32 = manifest.segments.iter().map(|s| s.doc_count).sum();
+        assert_eq!(docs, 3);
+        idx.acknowledge_manifest(&ns, &manifest).unwrap();
+        assert!(
+            !backend.keys().iter().any(|k| k.ends_with(".bin")),
+            "objects at or below the published checkpoint are reclaimed: {:?}",
+            backend.keys()
+        );
+        std::fs::remove_dir_all(second).unwrap();
     }
 
     #[test]

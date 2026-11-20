@@ -37,6 +37,8 @@ mod rerank;
 #[cfg(feature = "s3")]
 mod s3_storage;
 #[cfg(feature = "s3")]
+mod s3_wal;
+#[cfg(feature = "s3")]
 mod segment_commit;
 mod segment_gc;
 mod warm;
@@ -897,8 +899,89 @@ fn sync_segment_dir_to_s3(
         .map_err(|e| format!("S3 upload of segment {rel} failed: {e}"))
 }
 
+/// Parts the environment normally decides, supplied directly (tests).
+#[derive(Default)]
+struct StateOptions {
+    /// WAL store instead of `KOSHA_WAL_MODE`.
+    wal_store: Option<Arc<dyn kosha_write::wal::WalStore>>,
+    /// Control store instead of `DATABASE_URL`.
+    control_store: Option<Box<dyn ControlStore>>,
+}
+
+fn fatal(message: &str) -> ! {
+    eprintln!("FATAL: {message}");
+    std::process::exit(1)
+}
+
+/// `KOSHA_WAL_MODE` (#236): `local` (default) keeps the WAL in
+/// `data_dir/_wal`; `s3` puts every group commit in the segment bucket
+/// before acknowledging it, under `_wal/{KOSHA_WAL_WRITER_ID}/`, so an
+/// acknowledged write survives losing the node. Only a node that accepts
+/// writes uses it: a query pod forwards writes to ingest.
+fn wal_store_from_env(
+    #[cfg(feature = "s3")] s3: Option<&s3_storage::S3Storage>,
+) -> Option<Arc<dyn kosha_write::wal::WalStore>> {
+    let mode = std::env::var("KOSHA_WAL_MODE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match mode.as_str() {
+        "" | "local" => {
+            println!(
+                "WAL: local (KOSHA_WAL_MODE=local); acked writes are not S3-durable until flushed"
+            );
+            None
+        }
+        "s3" => {
+            if std::env::var("KOSHA_INGEST_HOST").is_ok_and(|h| !h.is_empty()) {
+                println!("WAL: writes are forwarded to ingest; KOSHA_WAL_MODE=s3 applies there");
+                return None;
+            }
+            #[cfg(feature = "s3")]
+            {
+                let Some(s3) = s3 else {
+                    fatal("KOSHA_WAL_MODE=s3 needs S3 storage (set KOSHA_S3_BUCKET)");
+                };
+                let writer = std::env::var("KOSHA_WAL_WRITER_ID")
+                    .ok()
+                    .map(|w| w.trim().to_owned())
+                    .filter(|w| !w.is_empty())
+                    .unwrap_or_else(|| "default".into());
+                let timeout = s3_wal::timeout_from_env();
+                let backend = s3_wal::S3WalBackend::new(s3, timeout)
+                    .unwrap_or_else(|e| fatal(&format!("cannot start the S3 WAL client: {e}")));
+                let store =
+                    kosha_write::object_wal::ObjectWalStore::new(Arc::new(backend), &writer)
+                        .unwrap_or_else(|e| fatal(&e.to_string()));
+                if let Err(e) = store.verify_conditional_put() {
+                    fatal(&format!(
+                        "KOSHA_WAL_MODE=s3: the object store must honor If-None-Match: * on \
+                         PutObject so one writer owns each WAL key ({e})"
+                    ));
+                }
+                println!(
+                    "WAL: s3 (bucket={} key={}/{}, timeout {timeout:?}); writes are acked after the S3 PUT",
+                    s3.bucket(),
+                    s3.prefix(),
+                    store.root()
+                );
+                Some(Arc::new(store))
+            }
+            #[cfg(not(feature = "s3"))]
+            fatal("KOSHA_WAL_MODE=s3 needs a build with the `s3` feature")
+        }
+        other => fatal(&format!(
+            "unknown KOSHA_WAL_MODE {other:?}: use local or s3"
+        )),
+    }
+}
+
 impl AppState {
     fn new(data_dir: PathBuf) -> Self {
+        Self::with_options(data_dir, StateOptions::default())
+    }
+
+    fn with_options(data_dir: PathBuf, options: StateOptions) -> Self {
         std::fs::create_dir_all(&data_dir).ok();
         // Segment files must live under data_dir (indexer/searcher paths).
         // KOSHA_CACHE_DIR is accepted for deploy overlays but Phase 1 always
@@ -956,7 +1039,61 @@ impl AppState {
             .and_then(|v| v.parse().ok())
             .filter(|n| *n > 0)
             .unwrap_or(flush_threshold);
-        let indexer = Indexer::new(data_dir.clone())
+        #[cfg(feature = "s3")]
+        let s3_storage = {
+            match s3_storage::S3Config::from_env() {
+                Some(cfg) => {
+                    let bucket = cfg.bucket.clone();
+                    let prefix = cfg.prefix.clone();
+                    let endpoint = cfg.endpoint.clone();
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    match rt {
+                        Ok(rt) => {
+                            let fut = s3_storage::S3Storage::new(data_dir.clone(), cfg);
+                            match rt.block_on(fut) {
+                                Ok(s3) => {
+                                    println!(
+                                        "S3 storage enabled: bucket={bucket} prefix={prefix:?} endpoint={endpoint:?} local_cache={}",
+                                        data_dir.display()
+                                    );
+                                    Some(s3)
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to init S3 storage: {e}");
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to create tokio runtime: {e}");
+                            None
+                        }
+                    }
+                }
+                None => {
+                    println!(
+                        "S3 storage disabled (KOSHA_S3_BUCKET unset); segments are local-only under {}",
+                        data_dir.display()
+                    );
+                    None
+                }
+            }
+        };
+
+        let wal_store = options.wal_store.or_else(|| {
+            wal_store_from_env(
+                #[cfg(feature = "s3")]
+                s3_storage.as_ref(),
+            )
+        });
+        let indexer = match wal_store {
+            Some(store) => Indexer::with_wal_store(data_dir.clone(), store)
+                .unwrap_or_else(|e| fatal(&format!("cannot open the WAL: {e}"))),
+            None => Indexer::new(data_dir.clone()),
+        };
+        let indexer = indexer
             .with_flush_threshold(flush_threshold)
             .with_max_concurrent_flush_writers(max_concurrent_flush_writers)
             .with_min_docs_per_flush_writer(min_docs_per_flush_writer);
@@ -1008,53 +1145,11 @@ impl AppState {
             admission_timeout,
         );
 
-        #[cfg(feature = "s3")]
-        let s3_storage = {
-            match s3_storage::S3Config::from_env() {
-                Some(cfg) => {
-                    let bucket = cfg.bucket.clone();
-                    let prefix = cfg.prefix.clone();
-                    let endpoint = cfg.endpoint.clone();
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build();
-                    match rt {
-                        Ok(rt) => {
-                            let fut = s3_storage::S3Storage::new(data_dir.clone(), cfg);
-                            match rt.block_on(fut) {
-                                Ok(s3) => {
-                                    println!(
-                                        "S3 storage enabled: bucket={bucket} prefix={prefix:?} endpoint={endpoint:?} local_cache={}",
-                                        data_dir.display()
-                                    );
-                                    Some(s3)
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to init S3 storage: {e}");
-                                    None
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to create tokio runtime: {e}");
-                            None
-                        }
-                    }
-                }
-                None => {
-                    println!(
-                        "S3 storage disabled (KOSHA_S3_BUCKET unset); segments are local-only under {}",
-                        data_dir.display()
-                    );
-                    None
-                }
-            }
-        };
-
         // ── Control plane: in-memory or Postgres ─────────────────────────
         let mut control_plane_kind: &'static str = "in-memory";
-        let control_store: Box<dyn ControlStore> = if let Ok(db_url) = std::env::var("DATABASE_URL")
-        {
+        let control_store: Box<dyn ControlStore> = if let Some(store) = options.control_store {
+            store
+        } else if let Ok(db_url) = std::env::var("DATABASE_URL") {
             #[cfg(feature = "postgres")]
             match kosha_control::PgStore::connect_with_retry(&db_url) {
                 Ok(store) => {
@@ -8421,6 +8516,118 @@ mod tests {
         );
     }
 
+    /// An ingest node in `KOSHA_WAL_MODE=s3`, against a fake bucket.
+    fn s3_wal_node(
+        dir: PathBuf,
+        bucket: &kosha_write::object_wal::MemoryObjectBackend,
+        control: &SharedManifestStore,
+    ) -> AppState {
+        let store =
+            kosha_write::object_wal::ObjectWalStore::new(Arc::new(bucket.clone()), "ingest-0")
+                .unwrap();
+        AppState::with_options(
+            dir,
+            StateOptions {
+                wal_store: Some(Arc::new(store)),
+                control_store: Some(Box::new(control.clone())),
+            },
+        )
+    }
+
+    fn index_body(ns: &str, ids: &[&str]) -> Vec<u8> {
+        serde_json::to_vec(&IndexRequest {
+            namespace: NamespaceId(ns.into()),
+            documents: ids
+                .iter()
+                .map(|id| Document {
+                    id: DocumentId((*id).into()),
+                    fields: vec![Field::text("text", "survivor")],
+                })
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    fn wal_objects(bucket: &kosha_write::object_wal::MemoryObjectBackend) -> usize {
+        bucket.keys().iter().filter(|k| k.ends_with(".bin")).count()
+    }
+
+    #[test]
+    fn s3_wal_acked_index_survives_losing_the_node() {
+        let bucket = kosha_write::object_wal::MemoryObjectBackend::new();
+        let control = shared_store();
+        let search = br#"{"namespace":"t/ns","query_text":"survivor"}"#;
+
+        let first = test_dir();
+        let node = s3_wal_node(first.clone(), &bucket, &control);
+        let ack = handle_index(&index_body("t/ns", &["a", "b"]), &node);
+        assert!(ack.starts_with("HTTP/1.1 200"), "{ack}");
+        assert_eq!(wal_objects(&bucket), 1, "acked after the PUT");
+        // Node loss: no shutdown flush, and the data_dir is gone.
+        std::mem::forget(node);
+        fs::remove_dir_all(&first).unwrap();
+
+        let second = test_dir();
+        let node = s3_wal_node(second.clone(), &bucket, &control);
+        let flush = handle_flush(br#"{"namespace":"t/ns"}"#, &node);
+        assert!(flush.starts_with("HTTP/1.1 200"), "{flush}");
+        let found = handle_search_post(search, &node);
+        assert!(found.contains("\"total_hits\":2"), "{found}");
+        assert_eq!(wal_objects(&bucket), 0, "published checkpoint reclaims");
+        let manifest = control
+            .manifest_cloned(&NamespaceId("t/ns".into()))
+            .unwrap();
+        assert!(manifest.wal_checkpoint > 0);
+        assert!(manifest.wal_origin.is_some());
+
+        // Losing this node too replays nothing: the checkpoint covers it.
+        std::mem::forget(node);
+        let third = test_dir();
+        let node = s3_wal_node(third.clone(), &bucket, &control);
+        assert_eq!(
+            node.indexer.pending_doc_count(&NamespaceId("t/ns".into())),
+            0
+        );
+        for dir in [second, third] {
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn s3_wal_put_failure_fails_the_write_and_acks_nothing() {
+        let bucket = kosha_write::object_wal::MemoryObjectBackend::new();
+        let control = shared_store();
+        let dir = test_dir();
+        let node = s3_wal_node(dir.clone(), &bucket, &control);
+        let ns = NamespaceId("t/ns".into());
+
+        bucket.fail_next_puts(1);
+        let response = handle_index(&index_body("t/ns", &["lost"]), &node);
+        assert!(response.starts_with("HTTP/1.1 5"), "{response}");
+        assert_eq!(wal_objects(&bucket), 0);
+        assert_eq!(node.indexer.pending_doc_count(&ns), 0, "not buffered");
+
+        let ok = handle_index(&index_body("t/ns", &["kept"]), &node);
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        let flush = handle_flush(br#"{"namespace":"t/ns"}"#, &node);
+        assert!(flush.starts_with("HTTP/1.1 200"), "{flush}");
+
+        // A delete is acknowledged only after its WAL PUT too.
+        bucket.fail_next_puts(1);
+        let delete = handle_delete(br#"{"namespace":"t/ns","filter":{"match_all":{}}}"#, &node);
+        assert!(delete.starts_with("HTTP/1.1 5"), "{delete}");
+        let search = br#"{"namespace":"t/ns","query_text":"survivor"}"#;
+        let found = handle_search_post(search, &node);
+        assert!(found.contains("\"total_hits\":1"), "{found}");
+
+        std::mem::forget(node);
+        fs::remove_dir_all(&dir).unwrap();
+        let node = s3_wal_node(test_dir(), &bucket, &control);
+        let found = handle_search_post(search, &node);
+        assert!(!found.contains("\"lost\""), "{found}");
+        fs::remove_dir_all(&node.data_dir).ok();
+    }
+
     fn shared_store() -> SharedManifestStore {
         SharedManifestStore {
             inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
@@ -13606,6 +13813,10 @@ mod tests {
     }
 
     fn test_state() -> AppState {
+        AppState::new(test_dir())
+    }
+
+    fn test_dir() -> PathBuf {
         // A per-process counter, not just the clock: macOS `SystemTime` has
         // microsecond resolution, so tests running in parallel could get the
         // same nanos, share a data dir, and race on its WAL `origin` file.
@@ -13621,7 +13832,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        AppState::new(dir)
+        dir
     }
 
     // ─── Multi-field highlighting (#195) ─────────────────────────────────

@@ -341,8 +341,10 @@ existing data automatically.
   `KOSHA_LEGACY_ROUTES=off` turns the unversioned routes into 410s.
 
 A successful flush uploads its segment snapshot before publishing its manifest.
-Upload and manifest-store failures return errors and remain retryable. Buffered
-writes use a local, fsynced WAL; they are not S3-durable until a successful flush.
+Upload and manifest-store failures return errors and remain retryable. By
+default (`KOSHA_WAL_MODE=local`) buffered writes use a local, fsynced WAL under
+`data_dir/_wal`; they are not S3-durable until a successful flush, so losing the
+node (not just the pod) loses acknowledged, unflushed writes.
 Concurrent appends are group-committed: one WAL file and one fsync cover every
 record queued while the previous commit ran, and each caller is acknowledged
 only after the fsync covering its own record. Once the previous group held more
@@ -375,6 +377,76 @@ writer identifier to avoid collisions before publication. Migration
 (`kosha-server migrate`) and `POST /v1/admin/import-namespace` also publish by
 CAS against the version they read. They never rebase, and they fail instead of
 overwriting a manifest another writer committed (409 for import).
+
+### S3 WAL (`KOSHA_WAL_MODE=s3`)
+
+With `KOSHA_WAL_MODE=s3` (needs the `s3` feature and `KOSHA_S3_BUCKET`), an
+ingest node acknowledges `/index`, `/replace` and `/delete` only after the
+group commit holding the write is stored in the segment bucket, so an
+acknowledged write survives losing the node and its disk. Each group commit is
+one object, `{KOSHA_S3_PREFIX}/_wal/{KOSHA_WAL_WRITER_ID}/{lsn:020}.bin`, with
+the same checksummed v3 frames as the local WAL, created with a conditional
+`PutObject` (`If-None-Match: *`). The stream's `meta/origin` and
+`meta/sequence` objects sit next to it.
+
+- **Writer id.** `KOSHA_WAL_WRITER_ID` (default `default`) names the stream.
+  Every ingest process running at the same time needs its own id; a
+  replacement for a lost node must reuse the lost node's id. Set the mode
+  only where writes land: a node with `KOSHA_INGEST_HOST` forwards writes and
+  keeps a local WAL. The stock
+  single-replica, `Recreate` ingest Deployment can keep the default.
+- **LSNs** are allocated per writer stream (per `wal_origin`), not per
+  namespace: one object holds every namespace's records that arrived during
+  the previous PUT. A manifest's `wal_checkpoint` is still the highest LSN of
+  its `wal_origin` that its segments contain. The origin lives in the bucket,
+  so a replacement node recognizes its predecessor's checkpoints.
+- **One writer per stream.** Group `n + 1` is keyed by the LSN after group
+  `n`'s last record. Two processes appending to one stream race for the same
+  key; exactly one PUT succeeds. The loser fails that write (HTTP 500),
+  rejects every later write, and must be restarted, which re-reads the stream.
+  A PUT that timed out but landed is recognized by its bytes on the next PUT
+  and kept (its records replay; they were never acknowledged). At startup the
+  server checks that the store rejects a second conditional PUT of one key and
+  refuses to start otherwise. MinIO and AWS S3 both support `If-None-Match`
+  on `PutObject`. Conditional PUTs do not fence a writer that stays paused
+  until the object it would collide with has been reclaimed; run one ingest
+  process per writer id (the default Deployment's `Recreate` strategy does).
+- **Timeouts.** Every WAL S3 call has a deadline of `KOSHA_WAL_S3_TIMEOUT_MS`
+  (default 10000). A failed or timed-out PUT fails the write with a 500 and
+  nothing is buffered.
+- **Recovery.** On startup the node lists the stream, replays every record
+  above each namespace's published checkpoint into its write buffers (the
+  same path as a local restart) and continues after the highest LSN. A flush
+  then builds segments as usual and publishes the manifest by CAS with the new
+  `wal_checkpoint`; objects at or below it are deleted after the publication
+  is acknowledged, as local files are.
+- **Latency trade-off.** An acknowledgement now waits for an S3 PUT instead of
+  an fsync. Writes to one namespace are serialized, so a single namespace
+  writer gets one PUT round trip per write; concurrent writes to different
+  namespaces share a PUT. Groups are written one at a time, so throughput is
+  bounded by one PUT stream. `cargo bench -p kosha-write --bench s3_wal_ack`
+  (500 kB writes, simulated PUT of 25 ms + 100 MB/s; not real S3):
+
+  | writers | window ms | writes/s | MB/s | p50 ms | p99 ms | PUTs/write |
+  |--------:|----------:|---------:|-----:|-------:|-------:|-----------:|
+  | 1  | 0 | 26.4  | 13.6 | 38.1  | 38.5  | 1.00 |
+  | 4  | 0 | 50.6  | 26.1 | 79.3  | 82.4  | 0.51 |
+  | 4  | 2 | 55.6  | 28.6 | 78.9  | 95.2  | 0.41 |
+  | 16 | 0 | 108.7 | 55.9 | 143.7 | 177.4 | 0.14 |
+
+  turbopuffer reports p50 ≈ 165 ms for 500 kB writes. Measure on real S3
+  before relying on these numbers.
+- **Switching local → s3.** On the first start in s3 mode, a non-empty local
+  `data_dir/_wal` is copied into the stream with its origin, sequence and
+  file keys, so existing manifest checkpoints keep their meaning, and is then
+  renamed to `_wal.migrated-{unix seconds}`. If the stream already belongs to
+  another origin the node refuses to start: flush every namespace in one mode
+  first.
+- **Switching s3 → local.** Local mode does not read the S3 stream. Stop
+  writes, flush every namespace (`POST /flush`) so the checkpoint covers every
+  record, and check that `_wal/{writer id}/` holds no `.bin` objects before
+  restarting with `KOSHA_WAL_MODE=local`. The local WAL then starts a new
+  origin.
 
 Each WAL directory has a persistent origin identifier. New manifest checkpoints
 apply only to that origin, so another writer's checkpoint cannot discard local

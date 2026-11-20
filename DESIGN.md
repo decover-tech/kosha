@@ -308,12 +308,20 @@ Iceberg/Delta Lake use for tables, applied to a search index.
    extracted text, chunk boundaries, embeddings, and metadata arrive at an ingest node's gRPC
    `IndexDocuments` call.
 2. **Buffer**: the ingest node appends to an in-memory + local-SSD write buffer for that namespace,
-   and synchronously appends to a WAL object in S3 (small, cheap PUTs) so the write survives node
-   loss before it's part of a segment. *Implemented today:* the WAL is on local disk behind a
-   `WalStore` trait (an S3 implementation is #236). Concurrent appends are group-committed: one
-   WAL file (one fsync) holds the records of every namespace that arrived during the previous
-   commit, each record carries its own LSN, and a file is deleted only once every namespace in it
-   has a published manifest checkpoint at or past its records there.
+   and synchronously appends to the WAL before acknowledging. *Implemented:* the WAL sits behind a
+   `WalStore` trait with two modes. `KOSHA_WAL_MODE=local` (default) writes fsynced files under
+   `data_dir/_wal`, which survive pod restarts but not node loss. `KOSHA_WAL_MODE=s3` (#236)
+   writes each group commit as one object `_wal/{writer_id}/{lsn:020}.bin` in the segment bucket
+   with a conditional PUT (`If-None-Match: *`) and acknowledges only after the PUT, so the write
+   survives node loss before it is part of a segment. Concurrent appends are group-committed: one
+   WAL file or object holds the records of every namespace that arrived during the previous
+   commit. LSNs are allocated per writer stream (the manifest's `wal_origin`), not per namespace;
+   each record carries its own LSN, and a file is deleted only once every namespace in it has a
+   published manifest checkpoint at or past its records there. In s3 mode group `n + 1` is keyed
+   by the LSN after group `n`, so two writers on one stream race for the same key: one wins, the
+   other fails the write and stops accepting writes until restarted. A node that starts on an empty
+   disk lists its stream, replays every record above each namespace's checkpoint into its
+   buffers and continues after the highest LSN.
 3. **Flush**: when the buffer crosses a size/time threshold (default: 512MB or 60s, whichever
    first), the ingest node builds inverted + vector + filter indices for the buffered documents,
    writes a new segment to S3, and publishes an updated manifest that adds the new segment.
@@ -696,8 +704,16 @@ existing org/user auth context Bach already establishes.
 
 ## 11. Consistency & Durability
 
-- **Durability**: WAL append to S3 acks before the ingest RPC returns → data survives node loss
-  immediately. Segment + manifest writes are the durable "committed" state for query visibility.
+- **Durability**: with `KOSHA_WAL_MODE=s3` the WAL PUT to S3 completes before `/index`,
+  `/replace` or `/delete` returns, so an acknowledged write survives node loss immediately; a failed
+  or timed-out PUT (`KOSHA_WAL_S3_TIMEOUT_MS`) fails the request and nothing is acknowledged. The
+  cost is ack latency: one S3 PUT instead of an fsync (in a simulated 25 ms + 100 MB/s PUT model, a
+  500 kB write acks at p50 ≈ 38 ms alone and ≈ 144 ms with 16 concurrent namespaces sharing PUTs;
+  turbopuffer reports p50 ≈ 165 ms). With the default `KOSHA_WAL_MODE=local` the WAL is an fsynced
+  local file: acknowledged writes survive process and pod restarts, but not the loss of the node's
+  disk until a flush publishes them. Segment + manifest writes are the durable "committed" state
+  for query visibility; a flush publishes `wal_checkpoint` by CAS and only then reclaims the WAL
+  records it covers.
 - **Read consistency**: each query snapshots one manifest version for its whole execution —
   read-your-writes is bounded by the flush interval (§7), not immediate, which matches the
   approach we already accept operationally with ES refresh tuning.

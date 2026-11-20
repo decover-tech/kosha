@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "wal_group_commit"
 harness = false
+
+[[bench]]
+name = "s3_wal_ack"
+harness = false
