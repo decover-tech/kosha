@@ -47,7 +47,12 @@ mod role;
 mod s3_storage;
 #[cfg(feature = "s3")]
 mod s3_wal;
-#[cfg(feature = "s3")]
+// The crash-point harness uploads to an in-memory bucket through the same
+// commit-marker sequence as S3, so it needs this module without `s3`.
+#[cfg(all(test, feature = "failpoints"))]
+mod crash_points_tests;
+#[cfg(any(feature = "s3", all(test, feature = "failpoints")))]
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 mod segment_commit;
 mod segment_gc;
 mod unindexed;
@@ -2783,6 +2788,10 @@ impl AppState {
             if self.s3_storage.is_some() {
                 self.sync_manifest_to_s3(ns, manifest)?;
             }
+            // The crash-point harness's in-memory bucket, when one is
+            // installed on this thread; never compiled into a server.
+            #[cfg(all(test, feature = "failpoints"))]
+            crash_points_tests::upload_hook(&self.data_dir, ns, manifest)?;
             let _ = manifest;
             Ok(())
         })
@@ -2881,7 +2890,11 @@ impl AppState {
                 }
                 Err(error) => return Err(error),
             };
+            // Crash-point seams (#257): segment files are local only; then
+            // uploaded, but no manifest references them.
+            fail::fail_point!("flush.before_upload");
             upload(&manifest)?;
+            fail::fail_point!("publish.before_cas");
             let committed = self
                 .controller
                 .lock()
@@ -2889,6 +2902,9 @@ impl AppState {
                 .compare_and_swap_manifest_fenced(ns, expected_version, manifest.clone(), token);
             match committed {
                 Ok(()) => {
+                    // Crash-point seam (#257): committed remotely, not yet
+                    // acknowledged locally (WAL not reclaimed).
+                    fail::fail_point!("publish.after_cas_before_ack");
                     self.indexer.acknowledge_manifest(ns, &manifest)?;
                     println!(
                         "manifest published: ns={} version={} segments={} ms={:.1}",
@@ -9753,6 +9769,7 @@ fn compaction_pass_with(
 
         // Persist the merged manifest and upload the new segment to S3,
         // the same path a normal flush uses.
+        fail::fail_point!("compaction.before_publish");
         state
             .publish_namespace(ns)
             .map_err(|e| format!("publication failed: {e}"))?;
@@ -10593,7 +10610,7 @@ mod tests {
     use std::fs;
 
     #[derive(Clone)]
-    struct SharedManifestStore {
+    pub(crate) struct SharedManifestStore {
         inner: Arc<Mutex<kosha_control::Controller>>,
         lose_next_commit_reply: Arc<std::sync::atomic::AtomicBool>,
         /// Commit this manifest (over the stored version) right after the
@@ -11465,7 +11482,7 @@ mod tests {
         fs::remove_dir_all(&node.data_dir).ok();
     }
 
-    fn shared_store() -> SharedManifestStore {
+    pub(crate) fn shared_store() -> SharedManifestStore {
         SharedManifestStore {
             inner: Arc::new(Mutex::new(kosha_control::Controller::new())),
             lose_next_commit_reply: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -17319,7 +17336,7 @@ mod tests {
         AppState::new(test_dir())
     }
 
-    fn test_dir() -> PathBuf {
+    pub(crate) fn test_dir() -> PathBuf {
         // A per-process counter, not just the clock: macOS `SystemTime` has
         // microsecond resolution, so tests running in parallel could get the
         // same nanos, share a data dir, and race on its WAL `origin` file.
