@@ -177,6 +177,8 @@ fn mk_knn(dim: usize, k: usize) -> KnnQuery {
     // so the search can't degenerate into an exact-match shortcut.
     let mut rng = Lcg(0xC0FFEE);
     KnnQuery {
+        query_text: None,
+        embedding_model: None,
         field: "embedding".into(),
         vector: (0..dim).map(|_| rng.coord()).collect(),
         k,

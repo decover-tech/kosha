@@ -228,6 +228,8 @@ pub fn build_search_query(
                 .map(|src| parse_json_flag::<FilterClause>("--knn-filter", src))
                 .transpose()?;
             Some(KnnQuery {
+                query_text: None,
+                embedding_model: None,
                 field: field.clone(),
                 vector,
                 k,

@@ -136,6 +136,7 @@ fn main() {
         let config = AnalysisConfig {
             default: AnalyzerSpec::resolve(&names, None).unwrap(),
             fields: Default::default(),
+            embedding_models: Default::default(),
         };
         let mut best = f64::MAX;
         for round in 0..3 {
