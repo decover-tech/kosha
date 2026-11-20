@@ -32,7 +32,10 @@ fn server(envs: &[(&str, &str)]) -> (Command, u16) {
     (cmd, port)
 }
 
+/// One request per connection, read to EOF: asks the (keep-alive, #259)
+/// server to close after answering.
 fn http(port: u16, raw: &str) -> Option<String> {
+    let raw = raw.replacen("\r\n", "\r\nconnection: close\r\n", 1);
     let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     s.write_all(raw.as_bytes()).ok()?;

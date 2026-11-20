@@ -920,6 +920,17 @@ The service is defined once in `proto/kosha/v1/kosha.proto` and exposed two ways
 | **HTTP/JSON** | gRPC transcoding via `google.api.http` annotations | External/open-source callers, curl, serverless |
 | **gRPC** | Direct HTTP/2 | Internal Decover services (Sage, Bach) |
 
+*Implemented (#259):* the HTTP/1.1 server is hyper 1.x on tokio (`crates/kosha-server/src/http.rs`).
+It owns the socket — keep-alive, a connection semaphore (`KOSHA_HTTP_MAX_CONNECTIONS`), header-read
+and idle timeouts, a whole-body timeout, the body-size limit, SIGTERM drain — and hands each request
+to the synchronous router (`handle_request` → `route()`) on tokio's bounded blocking pool; scoring
+still runs on rayon. Routes keep returning a complete HTTP/1.1 response string, which the transport
+parses into a hyper response, so wire bytes are unchanged apart from `connection: close`. The one
+exception is peer segment transfer: `GET /internal/segment/*` with `x-kosha-accept-encoding: raw` is
+streamed from the cache file in 64 KiB chunks (`x-kosha-encoding: raw`), and the receiving pod writes
+it to a temp file and renames it into the cache; peers that do not send the header get the original
+base64 body, so a mixed-version fleet keeps working during a rolling upgrade. gRPC is not served yet.
+
 Equivalent HTTP calls from the proto definition:
 
 ```

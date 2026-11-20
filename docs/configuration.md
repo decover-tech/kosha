@@ -155,7 +155,10 @@ The control plane is in memory unless `DATABASE_URL` is set in a binary built wi
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_HTTP_PORT` | HTTP listen port (binds `0.0.0.0`) | `8080` | port |
-| `KOSHA_HTTP_IO_TIMEOUT_SECS` | Per-syscall socket read/write timeout. Bounds stalled clients, not how long a request may take | `300` | seconds |
+| `KOSHA_HTTP_IO_TIMEOUT_SECS` | Budget for receiving a whole request body; a slower body gets `408`. Not a processing deadline: a slow handler still delivers its response (`http.rs`) | `300` | seconds |
+| `KOSHA_HTTP_HEADER_READ_TIMEOUT_SECS` | Time a client has to send a complete request head, and how long an idle keep-alive connection stays open waiting for its next request. Closes slowloris connections | `30` | seconds |
+| `KOSHA_HTTP_MAX_CONNECTIONS` | Connections served at once. At the limit the server stops accepting and further clients wait in the kernel backlog | `1024` | connections |
+| `KOSHA_HTTP_MAX_BLOCKING_THREADS` | Maximum threads running request handlers (tokio's blocking pool). Health probes are answered on the event loop and never wait for one | `512` | threads |
 | `KOSHA_AUTH` | `disabled` (or `off`, `false`, `0`, `none`) turns authentication off; every request becomes tenant `dev`. Local development only | enabled | flag |
 | `KOSHA_API_KEY` | One tenant API key, mapped to tenant `default` | unset | string |
 | `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs | unset | list |

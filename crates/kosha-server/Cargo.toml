@@ -10,7 +10,7 @@ workspace = true
 
 [features]
 default = []
-s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:tokio"]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
 postgres = ["kosha-control/postgres"]
 migrate = [
     "s3",
@@ -32,12 +32,19 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
-# `io-util` is what provides `AsyncWriteExt`, used to stream S3 response
-# bodies chunk-by-chunk into the local cache instead of buffering whole
-# objects (see s3_storage::stream_body_to_file). It resolves today via
-# feature unification with aws-sdk-s3's own tokio dependency; naming it
-# here keeps this crate compiling if that ever changes.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "time"], optional = true }
+# Not optional: the HTTP server (http.rs) runs on tokio + hyper (#259).
+# `io-util` also provides `AsyncWriteExt`, used to stream S3 response bodies
+# chunk-by-chunk into the local cache instead of buffering whole objects (see
+# s3_storage::stream_body_to_file). `net`/`signal`/`sync` are the listener,
+# SIGTERM drain and connection semaphore.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "time", "net", "signal", "sync"] }
+# HTTP/1.1 server with keep-alive, header-read timeouts and graceful
+# shutdown (http.rs). Routing stays in main.rs's `route()`.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-graceful", "http1"] }
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
 # Not optional/migrate-gated: also used for query→ingest write forwarding
 # (see main.rs's is_write_path/forward_to_ingest), a core server feature
 # independent of the `migrate` CLI subcommand.
@@ -46,10 +53,16 @@ aws-sigv4 = { version = "1.5.1", optional = true }
 aws-credential-types = { version = "1.3.0", optional = true }
 aws-smithy-runtime-api = { version = "1.14.0", optional = true }
 http = { version = "1.5.0", optional = true }
-# Encodes/decodes segment bytes served over the internal peer-hydration
-# endpoint (see main.rs's `hydrate_files`/`GET /internal/segment`) — the
-# hand-rolled HTTP layer here works in `String` responses, so binary segment
-# payloads travel as base64 rather than requiring a raw-bytes response path.
+# Encodes/decodes segment bytes on the internal peer-hydration endpoint
+# (`GET /internal/segment`) for peers that do not send
+# `x-kosha-accept-encoding: raw`: pods from before #259 only understand the
+# base64 body, so it stays as the negotiated fallback during a rolling
+# upgrade. Current pods stream raw bytes (http.rs).
 base64 = "0.22"
 # Per-file checksums in the segment `_COMMIT` marker (segment_commit.rs).
 crc32fast = "1"
+
+[dev-dependencies]
+# Process-wide heap counter for the peer-transfer memory test (http.rs);
+# same approach as kosha-segment/tests/build_memory.rs.
+cap = { version = "0.1.2", features = ["stats"] }

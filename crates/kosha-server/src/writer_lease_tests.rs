@@ -3,6 +3,8 @@
 //! over one shared in-memory control store.
 
 use super::*;
+use std::io::Write;
+use std::net::TcpStream;
 
 /// The in-memory controller shared by several `AppState`s, forwarding the
 /// writer-lease methods too. `takeover_before_next_cas` hands the lease to
@@ -518,7 +520,9 @@ fn indexer_serves_only_probes_and_compaction_admin() {
     let get = |method: &str, path: &str| -> u16 {
         let mut s = TcpStream::connect(addr).unwrap();
         s.write_all(
-            format!("{method} {path} HTTP/1.1\r\nhost: i\r\ncontent-length: 2\r\n\r\n{{}}")
+            format!(
+                "{method} {path} HTTP/1.1\r\nhost: i\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{{}}"
+            )
                 .as_bytes(),
         )
         .unwrap();
