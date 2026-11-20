@@ -2076,6 +2076,23 @@ fn late_interaction_nprobe() -> usize {
     })
 }
 
+/// Whether `footer`'s column for `knn.field` was embedded with a model
+/// other than the one `knn.vector` came from (#209). Only a query whose
+/// model is known (the server embedded its `query_text`) and a column that
+/// records one can mismatch.
+pub fn segment_embedding_model_mismatch(footer: &Footer, knn: &kosha_core::KnnQuery) -> bool {
+    let Some(ref model) = knn.embedding_model else {
+        return false;
+    };
+    footer
+        .vector_fields
+        .iter()
+        .flatten()
+        .filter(|meta| meta.name == knn.field)
+        .filter_map(|meta| meta.embedding_model.as_ref())
+        .any(|recorded| recorded != model)
+}
+
 fn late_interaction_params(knn: &kosha_core::KnnQuery) -> kosha_segment::LateInteractionParams {
     kosha_segment::LateInteractionParams {
         nprobe: late_interaction_nprobe(),
@@ -4985,7 +5002,15 @@ impl Searcher {
                     }
                 }
             }
-            let field_index = if nothing_passes || late_interaction {
+            // Native embedding (#209): a column written under another
+            // embedding model holds vectors of another space. It
+            // contributes nothing, and the segment is reported degraded,
+            // instead of being compared against this query's vector.
+            let model_mismatch = segment_embedding_model_mismatch(reader.footer(), knn);
+            if model_mismatch {
+                knn_segment_degraded = true;
+            }
+            let field_index = if nothing_passes || late_interaction || model_mismatch {
                 Ok(None)
             } else {
                 reader.vector_field(&knn.field)
@@ -9639,6 +9664,8 @@ mod tests {
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0],
             k: 10,
@@ -9685,6 +9712,8 @@ mod tests {
         let query_vector = vec![1.0, 0.0, 0.0, 0.0];
         let mut q = mk_query("", 5);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: query_vector.clone(),
             k: 5,
@@ -9956,6 +9985,8 @@ mod tests {
 
         let mut knn_q = mk_query("", 10);
         knn_q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![1.0, 0.0, 0.0],
             k: 10,
@@ -10199,6 +10230,8 @@ mod tests {
 
         let mut knn_q = mk_query("", 10);
         knn_q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![1.0, 0.0, 0.0],
             k: 10,
@@ -10512,6 +10545,8 @@ mod tests {
         // nearest chunks are all m1's.
         let mut query = mk_query("", 3);
         query.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             k: 3,
@@ -11010,6 +11045,8 @@ mod tests {
 
         let mut q = mk_query("", 1);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0],
             k: 1,
@@ -11157,6 +11194,8 @@ mod tests {
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0],
             k: 1,
@@ -11219,6 +11258,8 @@ mod tests {
         let query_vector = vec![1.0, 0.0, 0.0, 0.0]; // exact match for d0 (angle 0)
         let mut q = mk_query("", 5);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: query_vector.clone(),
             k: 5,
@@ -11395,6 +11436,8 @@ mod tests {
         let mk_knn_q = |num_candidates: usize| {
             let mut q = mk_query("", 1);
             q.knn = Some(kosha_core::KnnQuery {
+                query_text: None,
+                embedding_model: None,
                 field: "emb".into(),
                 vector: unit(0.0),
                 k: 1,
@@ -11532,6 +11575,8 @@ mod tests {
             let query = vector(900_000 + q_seed);
             let mut q = mk_query("", 10);
             q.knn = Some(kosha_core::KnnQuery {
+                query_text: None,
+                embedding_model: None,
                 field: "emb".into(),
                 vector: query.clone(),
                 k: 10,
@@ -11642,6 +11687,8 @@ mod tests {
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 1);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![1.0, 0.0],
             k: 1,
@@ -11719,6 +11766,8 @@ mod tests {
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0],
             k: 5,
@@ -11791,6 +11840,8 @@ mod tests {
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0],
             k: 5,
@@ -11871,6 +11922,8 @@ mod tests {
     fn mk_knn_circle_query(k: usize, filter: Option<kosha_core::FilterClause>) -> SearchQuery {
         let mut q = mk_query("", k);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0], // exact match for d0
             k,
@@ -16531,6 +16584,8 @@ mod rrf_tests {
             serde_json::from_value(serde_json::json!({"query_text": text, "max_results": max}))
                 .unwrap();
         q.knn = Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: unit(0.0),
             k,
@@ -17162,6 +17217,8 @@ mod rrf_tests {
             q
         };
         let knn = |qv: &[f32], k: usize| KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: qv.to_vec(),
             k,
@@ -18348,6 +18405,8 @@ mod field_tests {
         );
         let mut q = query("rust", &["title"]);
         q.knn = Some(kosha_core::KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: vec![0.0, 1.0],
             k: 1,
@@ -18551,6 +18610,8 @@ mod limit_per_tests {
 
     fn knn(k: usize) -> Option<KnnQuery> {
         Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: unit(0.0),
             k,
@@ -19429,6 +19490,8 @@ mod rank_by_tests {
         let (manifest, _) = write(&dir, &docs, 3);
         let searcher = Searcher::new(dir.clone());
         let knn = KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: unit(0.0),
             k: 15,
@@ -20733,6 +20796,8 @@ mod prefix_filter_tests {
         let mut q = query("", r#"{"match_all": {}}"#);
         q.filter = None;
         q.knn = Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "contentEmbedding".into(),
             vector: vec![1.0, 0.0, 0.0, 0.0],
             k: 8,
@@ -21853,6 +21918,8 @@ mod vector_column_tests {
         }))
         .unwrap();
         q.knn = Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: field.into(),
             vector,
             k,
@@ -22338,6 +22405,8 @@ mod filtered_knn_tests {
         }))
         .unwrap();
         q.knn = Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector,
             k,

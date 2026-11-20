@@ -1,0 +1,89 @@
+# Overlay for the repo-root docker-compose.yml that runs the read/write split
+# the way k8s/base deploys it: one ingest pod that accepts writes and one
+# query pod that forwards them (KOSHA_INGEST_HOST) and follows the manifests
+# the ingest pod publishes. Both share MinIO and Postgres; each has its own
+# local data volume. Used by scripts/integration/run.py (see its README).
+#
+#   docker compose -f docker-compose.yml \
+#     -f scripts/integration/docker-compose.integration.yml up --build -d
+#
+# The base file's single `kosha-server` is parked behind a profile so it does
+# not start (and does not hold port 8080).
+
+x-kosha-env: &kosha-env
+  # Tenant keys: KOSHA_API_KEY is tenant `default`; the two extra tenants are
+  # what the tenant-isolation scenario plays against each other. Dev-only.
+  KOSHA_API_KEY: sk-kosha-dev
+  KOSHA_API_KEYS: sk-tenant-a=tenant-a,sk-tenant-b=tenant-b
+  KOSHA_ADMIN_API_KEY: sk-kosha-admin-dev
+  # Peers and strong-consistency tail reads (#255), as in k8s/base.
+  KOSHA_INTERNAL_API_KEY: sk-kosha-internal-dev
+  KOSHA_HTTP_PORT: "8080"
+  KOSHA_DATA_DIR: /var/lib/kosha/data
+  KOSHA_S3_BUCKET: dsearch-dev
+  KOSHA_S3_PREFIX: kosha/
+  KOSHA_S3_ENDPOINT: http://minio:9000
+  KOSHA_S3_FORCE_PATH_STYLE: "true"
+  KOSHA_S3_ACCESS_KEY: kosha
+  KOSHA_S3_SECRET_KEY: kosha-dev-secret
+  AWS_DEFAULT_REGION: us-east-1
+  DATABASE_URL: postgres://kosha:kosha-dev@postgres:5432/kosha
+  # Deterministic segment layout, as in the conformance overlay: segments
+  # come only from explicit flushes (one per flush), no idle-flush timer and
+  # no background compaction, so the BM25 reference model predicts exact
+  # scores on both pods.
+  KOSHA_FLUSH_THRESHOLD: "1000000"
+  KOSHA_MAX_CONCURRENT_FLUSH_WRITERS: "1"
+  KOSHA_FLUSH_MAX_AGE_MS: "0"
+  KOSHA_COMPACTION_INTERVAL_MS: "0"
+  # Query pod follows published manifests quickly (#232); run.py bounds how
+  # long a new version may take to show up.
+  KOSHA_MANIFEST_REFRESH_MS: "200"
+
+services:
+  kosha-server:
+    profiles: ["single-server"]
+
+  kosha-ingest:
+    build: .
+    image: kosha:latest
+    depends_on:
+      createbuckets:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *kosha-env
+      KOSHA_ROLE: ingest
+      # Acknowledged writes go to S3 before the ack (#236), so wiping this
+      # pod's volume loses nothing (scenario "ingest-restart-wiped").
+      KOSHA_WAL_MODE: s3
+      KOSHA_WAL_WRITER_ID: integration-ingest
+      # Writer lease (#254) TTL, so a replaced ingest pod takes over quickly.
+      # Builds without #254 ignore it.
+      KOSHA_WRITER_LEASE_TTL_MS: "5000"
+    volumes:
+      - ingest-data:/var/lib/kosha/data
+    ports:
+      - "8080:8080"
+
+  kosha-query:
+    build: .
+    image: kosha:latest
+    depends_on:
+      kosha-ingest:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *kosha-env
+      KOSHA_ROLE: query
+      KOSHA_INGEST_HOST: http://kosha-ingest:8080
+    volumes:
+      - query-data:/var/lib/kosha/data
+    ports:
+      - "8081:8080"
+
+volumes:
+  ingest-data:
+  query-data:

@@ -2295,6 +2295,12 @@ impl Indexer {
             .map_err(|e| KoshaError::InvalidQuery(format!("invalid schema: {e}")))?;
         let handle = self.ns_handle(namespace);
         let _mutation = handle.mutation.lock().unwrap();
+        // Backstop for callers that skipped `embedding_conflict` (the HTTP
+        // layer checks first and answers 409); re-checked here, where no
+        // flush can land in between.
+        if let Some(conflict) = self.embedding_conflict_in(namespace, &handle, &schema) {
+            return Err(KoshaError::InvalidQuery(conflict));
+        }
         let mut state = handle.state.lock().unwrap();
         if state.known && state.manifest.schema.as_ref() == Some(&schema) {
             return Ok(false);
@@ -2303,6 +2309,108 @@ impl Indexer {
         state.manifest.version += 1;
         state.known = true;
         Ok(true)
+    }
+
+    /// Why setting `schema` on `namespace` would mix two embedding models in
+    /// one vector field (#209), if it would: the current schema declares a
+    /// model for a field, `schema` declares a different model or dimension
+    /// for it, and the namespace already holds vectors for that field
+    /// (a segment whose footer lists the column, or a buffered document
+    /// carrying it). A segment that recorded another model than `schema`'s
+    /// conflicts the same way. `None` = the change is safe. Changing to a
+    /// different model requires a reindex, which is not automatic.
+    pub fn embedding_conflict(
+        &self,
+        namespace: &NamespaceId,
+        schema: &kosha_core::NamespaceSchema,
+    ) -> Option<String> {
+        let handle = self.ns_handle(namespace);
+        self.embedding_conflict_in(namespace, &handle, schema)
+    }
+
+    fn embedding_conflict_in(
+        &self,
+        namespace: &NamespaceId,
+        handle: &NamespaceHandle,
+        schema: &kosha_core::NamespaceSchema,
+    ) -> Option<String> {
+        let state = {
+            let state = handle.state.lock().unwrap();
+            let old_declares = state
+                .manifest
+                .schema
+                .as_ref()
+                .is_some_and(|old| old.embedded_fields().next().is_some());
+            if !old_declares && schema.embedded_fields().next().is_none() {
+                // Neither schema embeds anything: nothing to pin.
+                return None;
+            }
+            state.clone()
+        };
+        // Per vector field: the models its segments recorded, and whether
+        // any segment indexes it at all.
+        let mut indexed: HashMap<String, Vec<Option<String>>> = HashMap::new();
+        for entry in &state.manifest.segments {
+            let fields = match state.manifest.segment_footer(&entry.segment_id) {
+                Some(footer) => footer.vector_fields.clone(),
+                None => {
+                    let seg_dir =
+                        state
+                            .manifest
+                            .segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                    match kosha_segment::SegmentReader::read_footer(&seg_dir) {
+                        Ok(footer) => footer.vector_fields,
+                        Err(_) => continue,
+                    }
+                }
+            };
+            for meta in fields.into_iter().flatten() {
+                indexed
+                    .entry(meta.name)
+                    .or_default()
+                    .push(meta.embedding_model);
+            }
+        }
+        let buffered = |field: &str| {
+            state
+                .buffer
+                .iter()
+                .flat_map(|buf| buf.documents.iter())
+                .chain(state.flushing_docs.iter().flat_map(|docs| docs.iter()))
+                .any(|doc| doc.fields.iter().any(|f| f.name == field))
+        };
+        let conflict = |field: &str, from: &str, to: &kosha_core::EmbeddingSpec| {
+            format!(
+                "field {field:?} is indexed with model {from}; changing to {} ({} dims) \
+                 requires a reindex (delete and re-ingest the namespace's documents, or use a \
+                 new field)",
+                to.model, to.dims
+            )
+        };
+        if let Some(old) = state.manifest.schema.as_ref() {
+            for (field, old_spec) in old.embedded_fields() {
+                let new_spec = schema.embedding_for(field);
+                if new_spec.is_some_and(|new| new.same_space(old_spec)) {
+                    continue;
+                }
+                // Dropping the declaration leaves the stored vectors as
+                // they are; clients then send their own vectors.
+                let Some(new_spec) = new_spec else {
+                    continue;
+                };
+                if indexed.contains_key(field.as_str()) || buffered(field) {
+                    let from = format!("{} ({} dims)", old_spec.model, old_spec.dims);
+                    return Some(conflict(field, &from, new_spec));
+                }
+            }
+        }
+        for (field, new_spec) in schema.embedded_fields() {
+            let recorded = indexed.get(field.as_str()).into_iter().flatten().flatten();
+            if let Some(model) = recorded.into_iter().find(|m| **m != new_spec.model) {
+                return Some(conflict(field, model, new_spec));
+            }
+        }
+        None
     }
 
     /// Forget everything this writer holds for a deleted namespace: its
@@ -2438,6 +2546,27 @@ impl Indexer {
             return None;
         }
         state.manifest.shards.filter(|&n| n > 1)
+    }
+
+    /// The fields `namespace`'s schema embeds server-side (#209), with
+    /// their models. `None` — no schema, or one declaring no model — costs
+    /// one map lookup and no allocation, like [`Self::shard_count`], so the
+    /// write path of a namespace that never opted in is unchanged.
+    pub fn embedded_fields(
+        &self,
+        namespace: &NamespaceId,
+    ) -> Option<Vec<(String, kosha_core::EmbeddingSpec)>> {
+        let map = self.namespaces.lock().unwrap();
+        let handle = map.get(namespace)?;
+        let state = handle.state.lock().unwrap();
+        let schema = state.manifest.schema.as_ref()?;
+        let mut fields = schema.embedded_fields().peekable();
+        fields.peek()?;
+        Some(
+            fields
+                .map(|(name, spec)| (name.clone(), spec.clone()))
+                .collect(),
+        )
     }
 
     pub fn manifest(&self, namespace: &NamespaceId) -> Option<Manifest> {
@@ -6134,6 +6263,84 @@ mod tests {
             RebaseOutcome::Adopted
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    /// #254: a compaction-only writer (the `indexer` role) has no WAL
+    /// records. Its compaction keeps the ingest writer's WAL checkpoint and
+    /// origin, and so does its rebase onto a newer ingest publish: the
+    /// published manifest must keep telling the ingest writer which of its
+    /// WAL records are covered, or a restart would replay (or keep) them
+    /// wrongly.
+    #[test]
+    fn compaction_writer_rebase_keeps_the_remote_wal_checkpoint_and_origin() {
+        let ingest_dir = rebase_dir("wal-ingest");
+        let compactor_dir = rebase_dir("wal-compactor");
+        let ns = NamespaceId("ns".into());
+        let ingest = Indexer::new(ingest_dir.clone());
+        write_docs(&ingest, &ns, &["a"]);
+        write_docs(&ingest, &ns, &["b"]);
+        write_docs(&ingest, &ns, &["c"]);
+        let base = commit(&ingest, &ns);
+        let ingest_origin = base.wal_origin.clone();
+        assert!(ingest_origin.is_some() && base.wal_checkpoint > 0);
+
+        // The compactor installs the committed manifest (segments come from
+        // object storage; here, a copy of the ingest's directory).
+        copy_dir(&ingest_dir.join(&ns.0), &compactor_dir.join(&ns.0));
+        let compactor = Indexer::new(compactor_dir.clone());
+        assert_ne!(Some(compactor.wal.origin().to_owned()), ingest_origin);
+        compactor.restore_manifest(ns.clone(), base.clone());
+        let result = compactor
+            .compact_namespace_with_options(&ns, CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
+        let compacted = compactor.publication_snapshot(&ns).unwrap().1;
+        assert_eq!(compacted.wal_origin, ingest_origin);
+        assert_eq!(compacted.wal_checkpoint, base.wal_checkpoint);
+
+        // Meanwhile the ingest writer flushed and published again.
+        write_docs(&ingest, &ns, &["d"]);
+        let remote = commit(&ingest, &ns);
+        assert!(remote.wal_checkpoint > base.wal_checkpoint);
+
+        assert_eq!(
+            compactor.rebase_onto(&ns, remote.clone()).unwrap(),
+            RebaseOutcome::Rebased
+        );
+        let (expected, rebased) = compactor.publication_snapshot(&ns).unwrap();
+        assert_eq!(expected, remote.version);
+        assert_eq!(
+            rebased.wal_origin, remote.wal_origin,
+            "origin stays the ingest's"
+        );
+        assert_eq!(
+            rebased.wal_checkpoint, remote.wal_checkpoint,
+            "checkpoint stays the ingest's"
+        );
+        // The merge output replaced the three inputs; the ingest's new
+        // segment is kept.
+        let base_ids = segment_ids(&base);
+        let ids = segment_ids(&rebased);
+        assert!(ids.is_disjoint(&base_ids));
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&remote.segments.last().unwrap().segment_id));
+        let docs: u32 = rebased.segments.iter().map(|e| e.doc_count).sum();
+        assert_eq!(docs, 4);
+        let _ = std::fs::remove_dir_all(ingest_dir);
+        let _ = std::fs::remove_dir_all(compactor_dir);
     }
 
     #[test]

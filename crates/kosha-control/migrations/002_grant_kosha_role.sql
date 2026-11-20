@@ -12,3 +12,6 @@ ALTER TABLE kosha.namespaces OWNER TO kosha;
 ALTER TABLE kosha.manifests OWNER TO kosha;
 ALTER TABLE kosha.api_keys OWNER TO kosha;
 ALTER TABLE kosha.retired_namespaces OWNER TO kosha;
+-- 003_writer_leases.sql (#254). IF EXISTS: 002 may run before 003 on an
+-- instance that has not been migrated past 001 yet.
+ALTER TABLE IF EXISTS kosha.writer_leases OWNER TO kosha;
