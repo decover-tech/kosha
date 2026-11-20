@@ -9607,6 +9607,95 @@ mod tests {
     }
 
     #[test]
+    fn histogram_aggregations_over_http_and_bad_intervals_are_400() {
+        // Issue #219: `histogram` / `date_histogram` over `/search`, and a
+        // garbage interval or unsupported calendar interval is a 400.
+        let state = test_state();
+        let ns = NamespaceId("histns".into());
+        let doc = |id: &str, bytes: i64, at: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![
+                Field::text("text", "invoice"),
+                Field::integer("bytes", bytes),
+                Field::date_val("sentAt", at),
+            ],
+        };
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    doc("1", 100, "2024-06-15T00:10:00Z"),
+                    doc("2", 1024, "2024-06-15T00:59:59Z"),
+                    doc("3", 3000, "2024-06-15T02:00:00Z"),
+                ],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |aggs: &str| {
+            let body = format!(
+                r#"{{"namespace":"histns","query_text":"invoice","max_results":0,"aggs":{aggs}}}"#
+            );
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let resp = post(
+            r#"{"by_size":{"histogram":{"field":"bytes","interval":1024}},
+                "over_time":{"date_histogram":{"field":"sentAt","fixed_interval":"1h"}}}"#,
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        let aggs = &v["aggregations"];
+        assert_eq!(
+            aggs["by_size"],
+            serde_json::json!({"buckets": [
+                {"key": 0.0, "doc_count": 1},
+                {"key": 1024.0, "doc_count": 1},
+                {"key": 2048.0, "doc_count": 1},
+            ]}),
+            "{v}"
+        );
+        assert_eq!(
+            aggs["over_time"],
+            serde_json::json!({"buckets": [
+                {"key": 1_718_409_600_000_i64, "key_as_string": "2024-06-15T00:00:00.000Z", "doc_count": 2},
+                {"key": 1_718_413_200_000_i64, "key_as_string": "2024-06-15T01:00:00.000Z", "doc_count": 0},
+                {"key": 1_718_416_800_000_i64, "key_as_string": "2024-06-15T02:00:00.000Z", "doc_count": 1},
+            ]}),
+            "{v}"
+        );
+
+        for (bad, needle) in [
+            (
+                r#"{"x":{"date_histogram":{"field":"sentAt","fixed_interval":"1 banana"}}}"#,
+                "invalid `fixed_interval`",
+            ),
+            (
+                r#"{"x":{"date_histogram":{"field":"sentAt","calendar_interval":"1M"}}}"#,
+                "fixed_interval",
+            ),
+            (
+                r#"{"x":{"histogram":{"field":"bytes","interval":0}}}"#,
+                "greater than 0",
+            ),
+            (
+                r#"{"x":{"histogram":{"field":"bytes","interval":-1}}}"#,
+                "greater than 0",
+            ),
+            (
+                r#"{"x":{"date_histogram":{"field":"sentAt","fixed_interval":"1ms"}}}"#,
+                "more than the limit",
+            ),
+        ] {
+            let resp = post(bad);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+            assert!(resp.contains(needle), "{bad}: {resp}");
+        }
+    }
+
+    #[test]
     fn field_restricted_search_over_http_and_through_the_result_cache() {
         // Issue #249: `fields` reaches the scorer over POST and GET, is part
         // of the result-cache key (the same text with other fields must not

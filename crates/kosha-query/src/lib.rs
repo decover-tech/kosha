@@ -5469,7 +5469,7 @@ impl Searcher {
             page.push(doc);
         }
 
-        let merged_aggs = finish_aggregations(query, all_aggs);
+        let merged_aggs = finish_aggregations(query, all_aggs)?;
 
         phase_stats.materialize_wall_ms = t_materialize.elapsed().as_secs_f64() * 1e3;
 
@@ -6708,6 +6708,15 @@ struct AggregationState {
     /// Metric sub-aggregations of a bucket aggregation: bucket key →
     /// sub-aggregation name → partial.
     sub: std::collections::BTreeMap<Vec<String>, HashMap<String, MetricPartial>>,
+    /// `histogram` / `date_histogram`: bucket index
+    /// (`floor((v - offset) / interval)`) → documents in the bucket.
+    histogram: std::collections::BTreeMap<i64, usize>,
+    /// Metric sub-aggregations of a histogram: bucket index → name →
+    /// partial.
+    histogram_sub: std::collections::BTreeMap<i64, HashMap<String, MetricPartial>>,
+    /// The `(interval, offset)` the indices above were computed with, so
+    /// a merge can check that every segment bucketed alike.
+    histogram_params: Option<HistogramParams>,
 }
 
 impl AggregationState {
@@ -6722,7 +6731,282 @@ impl AggregationState {
                 mine.entry(name).or_default().merge(&partial);
             }
         }
+        // Histogram bucket indices only mean the same bucket when every
+        // segment used the same interval and offset. They all come from
+        // the one request, so this holds by construction; check it.
+        if let (Some(mine), Some(theirs)) = (self.histogram_params, other.histogram_params) {
+            debug_assert_eq!(
+                mine, theirs,
+                "histogram partials bucketed with different interval/offset"
+            );
+        }
+        self.histogram_params = self.histogram_params.or(other.histogram_params);
+        for (index, count) in other.histogram {
+            *self.histogram.entry(index).or_default() += count;
+        }
+        for (index, subs) in other.histogram_sub {
+            let mine = self.histogram_sub.entry(index).or_default();
+            for (name, partial) in subs {
+                mine.entry(name).or_default().merge(&partial);
+            }
+        }
     }
+}
+
+/// How a `histogram` / `date_histogram` maps a value to a bucket index.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HistogramParams {
+    /// `histogram`: f64 arithmetic over numeric values.
+    Numeric { interval: f64, offset: f64 },
+    /// `date_histogram`: i64 arithmetic over epoch milliseconds.
+    Date { interval: i64, offset: i64 },
+}
+
+impl HistogramParams {
+    /// The parameters of a histogram aggregation, `None` for any other
+    /// type. An invalid date interval is an error (normally caught when
+    /// the query is parsed or validated).
+    fn of(agg: &Aggregation) -> Option<Result<(Self, u64), String>> {
+        match agg {
+            Aggregation::Histogram { histogram, .. } => Some(histogram.validate().map(|()| {
+                (
+                    HistogramParams::Numeric {
+                        interval: histogram.interval,
+                        offset: histogram.offset,
+                    },
+                    histogram.min_doc_count,
+                )
+            })),
+            Aggregation::DateHistogram { date_histogram, .. } => {
+                Some(date_histogram.resolve().map(|(interval, offset)| {
+                    (
+                        HistogramParams::Date { interval, offset },
+                        date_histogram.min_doc_count,
+                    )
+                }))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `key` (and, for dates, `key_as_string`) of bucket `index`.
+    fn render_key(self, index: i64, out: &mut serde_json::Map<String, serde_json::Value>) {
+        match self {
+            HistogramParams::Numeric { interval, offset } => {
+                let key = kosha_core::histogram::histogram_key(index, interval, offset);
+                out.insert("key".into(), serde_json::json!(key));
+            }
+            HistogramParams::Date { interval, offset } => {
+                let key = kosha_core::histogram::date_histogram_key(index, interval, offset);
+                out.insert(
+                    "key_as_string".into(),
+                    kosha_core::datetime::format_epoch_millis(key).into(),
+                );
+                out.insert("key".into(), key.into());
+            }
+        }
+    }
+}
+
+/// A stored string value as epoch milliseconds: a date, or failing that a
+/// number of milliseconds (floored). `None` for anything else.
+fn date_millis_from_text(text: &str) -> Option<i64> {
+    kosha_core::datetime::parse_epoch_millis(text)
+        .or_else(|| text.trim().parse::<i64>().ok())
+        .or_else(|| {
+            text.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .map(|v| v.floor() as i64)
+        })
+}
+
+/// Epoch milliseconds of every value `field` holds for the documents in
+/// `wanted`: `Integer` columns as milliseconds, `Float` columns floored,
+/// and string-column text (where `Date` fields live) parsed as a date or,
+/// failing that, as a number of milliseconds. Other values are skipped.
+fn visit_date_values(
+    store: &FilterStore,
+    field: &str,
+    wanted: &HashSet<u32>,
+    mut f: impl FnMut(u32, i64),
+) {
+    let from_text = date_millis_from_text;
+    if let Some(entries) = kosha_core::lookup_field(&store.integer_fields, field) {
+        for (doc, value) in entries {
+            if wanted.contains(doc) {
+                f(*doc, *value);
+            }
+        }
+    }
+    if let Some(entries) = kosha_core::lookup_field(&store.float_fields, field) {
+        for (doc, value) in entries {
+            if wanted.contains(doc) && value.is_finite() {
+                f(*doc, value.floor() as i64);
+            }
+        }
+    }
+    if let Some(entries) = kosha_core::lookup_field(&store.string_fields, field) {
+        for (doc, value) in entries {
+            if !wanted.contains(doc) {
+                continue;
+            }
+            match value
+                .starts_with('[')
+                .then(|| kosha_core::list_elements(value))
+                .flatten()
+            {
+                Some(elements) => elements
+                    .iter()
+                    .filter_map(|e| from_text(e))
+                    .for_each(|ms| f(*doc, ms)),
+                None => {
+                    if let Some(ms) = from_text(value) {
+                        f(*doc, ms);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Per-document partials of each metric sub-aggregation of `agg`, to be
+/// folded into every bucket a document lands in.
+fn metric_sub_partials<'a>(
+    store: &FilterStore,
+    wanted: &HashSet<u32>,
+    agg: &'a Aggregation,
+) -> Vec<(&'a String, HashMap<u32, MetricPartial>)> {
+    agg.sub_aggregations()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, sub)| {
+            let (kind, metric) = sub.metric()?;
+            let mut per_doc: HashMap<u32, MetricPartial> = HashMap::new();
+            visit_metric_values(store, &metric.field, kind, wanted, |doc, sample| {
+                per_doc.entry(doc).or_default().add(sample)
+            });
+            Some((name, per_doc))
+        })
+        .collect()
+}
+
+/// One segment's `histogram` / `date_histogram` partial: each matched
+/// document counts once in every bucket one of its values falls in (a
+/// multi-valued document with two values in one bucket counts once).
+fn aggregate_histogram(
+    store: &FilterStore,
+    wanted: &HashSet<u32>,
+    agg: &Aggregation,
+    params: HistogramParams,
+    field: &str,
+) -> AggregationState {
+    let mut per_doc: HashMap<u32, std::collections::BTreeSet<i64>> = HashMap::new();
+    match params {
+        HistogramParams::Numeric { interval, offset } => {
+            visit_metric_values(store, field, MetricKind::Min, wanted, |doc, sample| {
+                if let MetricSample::Number(v, _) = sample {
+                    per_doc
+                        .entry(doc)
+                        .or_default()
+                        .insert(kosha_core::histogram::histogram_bucket(v, interval, offset));
+                }
+            })
+        }
+        HistogramParams::Date { interval, offset } => {
+            visit_date_values(store, field, wanted, |doc, ms| {
+                per_doc.entry(doc).or_default().insert(
+                    kosha_core::histogram::date_histogram_bucket(ms, interval, offset),
+                );
+            })
+        }
+    }
+    let subs = metric_sub_partials(store, wanted, agg);
+    let mut state = AggregationState {
+        histogram_params: Some(params),
+        ..Default::default()
+    };
+    for (doc, indices) in per_doc {
+        for index in indices {
+            *state.histogram.entry(index).or_default() += 1;
+            if !subs.is_empty() {
+                let bucket = state.histogram_sub.entry(index).or_default();
+                for (name, partials) in &subs {
+                    let partial = bucket.entry((*name).clone()).or_default();
+                    if let Some(doc_partial) = partials.get(&doc) {
+                        partial.merge(doc_partial);
+                    }
+                }
+            }
+        }
+    }
+    state
+}
+
+/// The finished `{"buckets": [...]}` of a histogram, sorted by key
+/// ascending. With `min_doc_count: 0` (the default) every bucket between
+/// the lowest and the highest non-empty one is emitted, empty ones with
+/// `doc_count: 0`; otherwise buckets below `min_doc_count` are dropped.
+/// More than [`kosha_core::histogram::MAX_HISTOGRAM_BUCKETS`] buckets is
+/// an error, checked before anything is allocated.
+fn finish_histogram(
+    name: &str,
+    agg: &Aggregation,
+    state: &AggregationState,
+) -> Result<serde_json::Value, KoshaError> {
+    let (params, min_doc_count) = HistogramParams::of(agg)
+        .expect("histogram aggregation")
+        .map_err(|e| KoshaError::InvalidQuery(format!("in aggregation `{name}`: {e}")))?;
+    let max = kosha_core::histogram::MAX_HISTOGRAM_BUCKETS;
+    let too_many = |n: u128| {
+        KoshaError::InvalidQuery(format!(
+            "aggregation `{name}` would return {n} buckets, more than the limit of {max}; use a \
+             larger interval, narrow the query, or set `min_doc_count` to 1 or more to skip \
+             empty buckets"
+        ))
+    };
+    let indices: Vec<i64> = match (
+        state.histogram.first_key_value(),
+        state.histogram.last_key_value(),
+    ) {
+        (Some((&lo, _)), Some((&hi, _))) if min_doc_count == 0 => {
+            let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
+            if span > u128::from(max) {
+                return Err(too_many(span));
+            }
+            (lo..=hi).collect()
+        }
+        _ => {
+            let kept: Vec<i64> = state
+                .histogram
+                .iter()
+                .filter(|(_, &count)| count as u64 >= min_doc_count)
+                .map(|(&index, _)| index)
+                .collect();
+            if kept.len() as u128 > u128::from(max) {
+                return Err(too_many(kept.len() as u128));
+            }
+            kept
+        }
+    };
+    let buckets: Vec<serde_json::Value> = indices
+        .into_iter()
+        .map(|index| {
+            let mut bucket = serde_json::Map::new();
+            params.render_key(index, &mut bucket);
+            bucket.insert(
+                "doc_count".into(),
+                state.histogram.get(&index).copied().unwrap_or(0).into(),
+            );
+            bucket.extend(render_sub_aggregations(
+                agg,
+                state.histogram_sub.get(&index),
+            ));
+            serde_json::Value::Object(bucket)
+        })
+        .collect();
+    Ok(serde_json::json!({ "buckets": buckets }))
 }
 
 /// Mergeable partial of a single-value metric over some set of values.
@@ -6921,7 +7205,9 @@ fn aggregation_sources(agg: &Aggregation) -> Vec<(String, String)> {
         | Aggregation::Max { .. }
         | Aggregation::Sum { .. }
         | Aggregation::Avg { .. }
-        | Aggregation::ValueCount { .. } => Vec::new(),
+        | Aggregation::ValueCount { .. }
+        | Aggregation::Histogram { .. }
+        | Aggregation::DateHistogram { .. } => Vec::new(),
     }
 }
 
@@ -6936,6 +7222,17 @@ fn aggregate_matches(
             state.metric.add(sample)
         });
         return state;
+    }
+    match (HistogramParams::of(agg), agg) {
+        (Some(Ok((params, _))), Aggregation::Histogram { histogram, .. }) => {
+            return aggregate_histogram(store, wanted, agg, params, &histogram.field)
+        }
+        (Some(Ok((params, _))), Aggregation::DateHistogram { date_histogram, .. }) => {
+            return aggregate_histogram(store, wanted, agg, params, &date_histogram.field)
+        }
+        // Invalid parameters: reported by `finish_histogram`.
+        (Some(_), _) => return state,
+        (None, _) => {}
     }
     let sources = aggregation_sources(agg);
     let values: Vec<HashMap<u32, HashSet<String>>> = sources
@@ -6986,19 +7283,7 @@ fn aggregate_matches(
     }
     // Per-document partials of each metric sub-aggregation, folded into
     // every bucket the document lands in below.
-    let subs: Vec<(&String, HashMap<u32, MetricPartial>)> = agg
-        .sub_aggregations()
-        .into_iter()
-        .flatten()
-        .filter_map(|(name, sub)| {
-            let (kind, metric) = sub.metric()?;
-            let mut per_doc: HashMap<u32, MetricPartial> = HashMap::new();
-            visit_metric_values(store, &metric.field, kind, wanted, |doc, sample| {
-                per_doc.entry(doc).or_default().add(sample)
-            });
-            Some((name, per_doc))
-        })
-        .collect();
+    let subs = metric_sub_partials(store, wanted, agg);
     for doc in wanted {
         let mut keys = vec![Vec::new()];
         for field in &values {
@@ -7190,6 +7475,17 @@ fn aggregate_matches_columnar(
         })?;
         return Ok(state);
     }
+    match (HistogramParams::of(agg), agg) {
+        (Some(Ok((params, _))), Aggregation::Histogram { histogram, .. }) => {
+            return aggregate_histogram_columnar(reader, wanted, agg, params, &histogram.field)
+        }
+        (Some(Ok((params, _))), Aggregation::DateHistogram { date_histogram, .. }) => {
+            return aggregate_histogram_columnar(reader, wanted, agg, params, &date_histogram.field)
+        }
+        // Invalid parameters: reported by `finish_histogram`.
+        (Some(_), _) => return Ok(state),
+        (None, _) => {}
+    }
     let sources = aggregation_sources(agg);
     if sources.is_empty() {
         return Ok(state);
@@ -7200,17 +7496,7 @@ fn aggregate_matches_columnar(
         .collect::<Result<_, _>>()?;
     // Per-candidate partials of each metric sub-aggregation (indexed like
     // `wanted`), folded into every bucket the document lands in below.
-    let mut subs: Vec<(&String, HashMap<usize, MetricPartial>)> = Vec::new();
-    for (name, sub) in agg.sub_aggregations().into_iter().flatten() {
-        let Some((kind, metric)) = sub.metric() else {
-            continue;
-        };
-        let mut per_doc: HashMap<usize, MetricPartial> = HashMap::new();
-        visit_metric_values_columnar(reader, &metric.field, kind, wanted, |wi, sample| {
-            per_doc.entry(wi).or_default().add(sample)
-        })?;
-        subs.push((name, per_doc));
-    }
+    let subs = metric_sub_partials_columnar(reader, wanted, agg)?;
     if let ([only], true) = (values.as_slice(), subs.is_empty()) {
         // One source (`terms`, `cardinality`, a one-source `composite`):
         // count per key id, and make each key's text once.
@@ -7262,6 +7548,138 @@ fn aggregate_matches_columnar(
         }
     }
     Ok(state)
+}
+
+/// [`metric_sub_partials`] over a columnar segment's filter columns, keyed
+/// by index into `wanted`.
+fn metric_sub_partials_columnar<'a>(
+    reader: &SegmentReader,
+    wanted: &[u32],
+    agg: &'a Aggregation,
+) -> Result<Vec<(&'a String, HashMap<usize, MetricPartial>)>, KoshaError> {
+    let mut subs = Vec::new();
+    for (name, sub) in agg.sub_aggregations().into_iter().flatten() {
+        let Some((kind, metric)) = sub.metric() else {
+            continue;
+        };
+        let mut per_doc: HashMap<usize, MetricPartial> = HashMap::new();
+        visit_metric_values_columnar(reader, &metric.field, kind, wanted, |wi, sample| {
+            per_doc.entry(wi).or_default().add(sample)
+        })?;
+        subs.push((name, per_doc));
+    }
+    Ok(subs)
+}
+
+/// [`aggregate_histogram`] over a columnar segment's filter columns.
+fn aggregate_histogram_columnar(
+    reader: &SegmentReader,
+    wanted: &[u32],
+    agg: &Aggregation,
+    params: HistogramParams,
+    field: &str,
+) -> Result<AggregationState, KoshaError> {
+    let mut per_doc: HashMap<usize, std::collections::BTreeSet<i64>> = HashMap::new();
+    match params {
+        HistogramParams::Numeric { interval, offset } => {
+            visit_metric_values_columnar(reader, field, MetricKind::Min, wanted, |wi, sample| {
+                if let MetricSample::Number(v, _) = sample {
+                    per_doc
+                        .entry(wi)
+                        .or_default()
+                        .insert(kosha_core::histogram::histogram_bucket(v, interval, offset));
+                }
+            })?
+        }
+        HistogramParams::Date { interval, offset } => {
+            visit_date_values_columnar(reader, field, wanted, |wi, ms| {
+                per_doc.entry(wi).or_default().insert(
+                    kosha_core::histogram::date_histogram_bucket(ms, interval, offset),
+                );
+            })?
+        }
+    }
+    let subs = metric_sub_partials_columnar(reader, wanted, agg)?;
+    let mut state = AggregationState {
+        histogram_params: Some(params),
+        ..Default::default()
+    };
+    for (wi, indices) in per_doc {
+        for index in indices {
+            *state.histogram.entry(index).or_default() += 1;
+            if !subs.is_empty() {
+                let bucket = state.histogram_sub.entry(index).or_default();
+                for (name, partials) in &subs {
+                    let partial = bucket.entry((*name).clone()).or_default();
+                    if let Some(doc_partial) = partials.get(&wi) {
+                        partial.merge(doc_partial);
+                    }
+                }
+            }
+        }
+    }
+    Ok(state)
+}
+
+/// [`visit_date_values`] over a columnar segment's filter columns:
+/// `f(wanted_index, epoch_ms)` per value, by the same rules.
+fn visit_date_values_columnar(
+    reader: &SegmentReader,
+    field: &str,
+    wanted: &[u32],
+    mut f: impl FnMut(usize, i64),
+) -> Result<(), KoshaError> {
+    use kosha_core::FilterColumnKind;
+    use kosha_segment::filter_columns::FilterColumn;
+    use kosha_segment::filter_eval::resolve_column;
+    for column_kind in [
+        FilterColumnKind::Integer,
+        FilterColumnKind::Float,
+        FilterColumnKind::String,
+    ] {
+        let Some(column) = resolve_column(reader, field, column_kind)? else {
+            continue;
+        };
+        match &*column {
+            FilterColumn::Integer(c) => {
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| f(wi, values[i]));
+            }
+            FilterColumn::Float(c) => {
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    if values[i].is_finite() {
+                        f(wi, values[i].floor() as i64);
+                    }
+                });
+            }
+            FilterColumn::String(c) => {
+                let ords = c.ords();
+                let mut cache: HashMap<u32, Vec<i64>> = HashMap::new();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    let ord = ords[i];
+                    let millis = cache.entry(ord).or_insert_with(|| {
+                        let value = c.term(ord);
+                        match value
+                            .starts_with('[')
+                            .then(|| kosha_core::list_elements(value))
+                            .flatten()
+                        {
+                            Some(elements) => elements
+                                .iter()
+                                .filter_map(|e| date_millis_from_text(e))
+                                .collect(),
+                            None => date_millis_from_text(value).into_iter().collect(),
+                        }
+                    });
+                    for ms in millis.iter() {
+                        f(wi, *ms);
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`visit_metric_values`] over a columnar segment's filter columns:
@@ -7451,9 +7869,9 @@ fn render_sub_aggregations(
 fn finish_aggregations(
     query: &SearchQuery,
     mut states: HashMap<String, AggregationState>,
-) -> Option<AggregationResults> {
+) -> Result<Option<AggregationResults>, KoshaError> {
     if query.aggs.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut output = serde_json::Map::new();
     for (name, agg) in &query.aggs {
@@ -7485,6 +7903,9 @@ fn finish_aggregations(
             | Aggregation::ValueCount { .. } => {
                 let (kind, _) = agg.metric().expect("metric variant");
                 state.metric.render(kind)
+            }
+            Aggregation::Histogram { .. } | Aggregation::DateHistogram { .. } => {
+                finish_histogram(name, agg, &state)?
             }
             Aggregation::Composite { composite, .. } => {
                 let sources = aggregation_sources(agg);
@@ -7554,7 +7975,7 @@ fn finish_aggregations(
             }
         }
     }
-    Some(result)
+    Ok(Some(result))
 }
 
 /// How a query's terms may prune segments by their footer term bloom, or
@@ -18822,520 +19243,6 @@ mod fuzzy_tests {
 }
 
 #[cfg(test)]
-mod metric_aggregation_tests {
-    //! Issues #218 / #196 / #202: `min` / `max` / `sum` / `avg` /
-    //! `value_count`, top-level and nested under `terms` / `composite`,
-    //! checked against a brute-force computation over a multi-segment
-    //! namespace.
-    use super::*;
-    use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId};
-    use kosha_segment::SegmentWriter;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
-
-    #[derive(Clone)]
-    struct Doc {
-        id: String,
-        text: &'static str,
-        category: &'static str,
-        price: Option<f64>,
-        qty: Option<i64>,
-        sent: Option<&'static str>,
-        tags: Option<&'static [&'static str]>,
-    }
-
-    fn temp_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "kosha-metric-aggs-{tag}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        root
-    }
-
-    fn empty_manifest() -> Manifest {
-        Manifest {
-            version: 1,
-            segments: vec![],
-            segment_footers: Default::default(),
-            footer_crc32: Default::default(),
-            wal_checkpoint: 0,
-            wal_origin: None,
-            tombstones: Default::default(),
-            deletion_vectors: Default::default(),
-            schema: None,
-            retired: Default::default(),
-        }
-    }
-
-    /// One segment per element of `segments`, in order.
-    fn build(root: &Path, segments: &[Vec<Doc>]) -> (NamespaceId, Manifest) {
-        let ns = NamespaceId("ns".into());
-        let mut manifest = empty_manifest();
-        for (i, docs) in segments.iter().enumerate() {
-            let id = SegmentId(format!("seg{i}"));
-            let mut writer = SegmentWriter::new(id.clone(), root.join(&ns.0).join(&id.0));
-            for doc in docs {
-                let mut fields = vec![
-                    Field::text("text", doc.text),
-                    Field::keyword("category", doc.category),
-                ];
-                if let Some(price) = doc.price {
-                    fields.push(Field::float_val("price", price));
-                }
-                if let Some(qty) = doc.qty {
-                    fields.push(Field::integer("qty", qty));
-                }
-                if let Some(sent) = doc.sent {
-                    fields.push(Field::date_val("sent", sent));
-                }
-                if let Some(tags) = doc.tags {
-                    fields.push(Field::keyword("tags", serde_json::to_string(tags).unwrap()));
-                }
-                writer.add_document(DocumentId(doc.id.clone()), fields);
-            }
-            let footer = writer.finalize(Bm25Params::default()).unwrap();
-            manifest.segments.push(ManifestEntry {
-                segment_id: id,
-                doc_count: footer.doc_count,
-            });
-            manifest.remember_segment_footer(footer);
-        }
-        (ns, manifest)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn doc(
-        id: &str,
-        text: &'static str,
-        category: &'static str,
-        price: Option<f64>,
-        qty: Option<i64>,
-        sent: Option<&'static str>,
-        tags: Option<&'static [&'static str]>,
-    ) -> Doc {
-        Doc {
-            id: id.into(),
-            text,
-            category,
-            price,
-            qty,
-            sent,
-            tags,
-        }
-    }
-
-    /// Three segments of unequal size; some documents lack each field.
-    fn fixture() -> Vec<Vec<Doc>> {
-        vec![
-            vec![
-                doc(
-                    "a1",
-                    "apple pie",
-                    "fruit",
-                    Some(1.5),
-                    Some(3),
-                    Some("2024-01-01T00:00:00Z"),
-                    Some(&["x", "y"]),
-                ),
-                doc(
-                    "a2",
-                    "apple tart",
-                    "fruit",
-                    None,
-                    Some(-7),
-                    None,
-                    Some(&["x"]),
-                ),
-            ],
-            vec![
-                doc(
-                    "b1",
-                    "banana bread",
-                    "bakery",
-                    Some(10.25),
-                    None,
-                    Some("2024-03-15"),
-                    None,
-                ),
-                doc(
-                    "b2",
-                    "banana split",
-                    "fruit",
-                    Some(-2.0),
-                    Some(11),
-                    Some("2023-12-31T23:00:00-02:00"),
-                    Some(&[]),
-                ),
-                doc(
-                    "b3",
-                    "plain bread",
-                    "bakery",
-                    None,
-                    None,
-                    None,
-                    Some(&["z", "x", "y"]),
-                ),
-                doc(
-                    "b4",
-                    "apple bread",
-                    "bakery",
-                    Some(4.0),
-                    Some(5),
-                    Some("2024-02-29T12:00:00Z"),
-                    None,
-                ),
-            ],
-            vec![
-                doc("c1", "cherry", "fruit", Some(100.0), Some(0), None, None),
-                doc("c2", "apple cherry", "dairy", None, None, None, None),
-                doc(
-                    "c3",
-                    "cream",
-                    "dairy",
-                    Some(0.75),
-                    Some(2),
-                    Some("2024-06-15T00:00:00Z"),
-                    Some(&["y"]),
-                ),
-            ],
-        ]
-    }
-
-    fn query(text: &str, max_results: usize, aggs: serde_json::Value) -> SearchQuery {
-        let mut q = serde_json::json!({
-            "query_text": text,
-            "max_results": max_results,
-            "aggs": aggs,
-        });
-        if text.is_empty() {
-            q["filter"] = serde_json::json!({"match_all": {}});
-        }
-        serde_json::from_value(q).unwrap()
-    }
-
-    fn run(
-        root: &Path,
-        ns: &NamespaceId,
-        manifest: &Manifest,
-        q: &SearchQuery,
-    ) -> serde_json::Value {
-        let result = Searcher::new(root.to_path_buf())
-            .search(ns, manifest, q, None)
-            .unwrap();
-        serde_json::to_value(result.aggregations.unwrap()).unwrap()
-    }
-
-    /// Brute-force expected `{min, max, sum, avg, count}` over `values`.
-    fn expected(values: &[f64]) -> (Option<f64>, Option<f64>, f64, Option<f64>) {
-        if values.is_empty() {
-            return (None, None, 0.0, None);
-        }
-        let sum: f64 = values.iter().sum();
-        (
-            values.iter().copied().reduce(f64::min),
-            values.iter().copied().reduce(f64::max),
-            sum,
-            Some(sum / values.len() as f64),
-        )
-    }
-
-    fn assert_metric(agg: &serde_json::Value, want: Option<f64>, what: &str) {
-        match want {
-            None => assert!(agg["value"].is_null(), "{what}: expected null, got {agg}"),
-            Some(want) => {
-                let got = agg["value"]
-                    .as_f64()
-                    .unwrap_or_else(|| panic!("{what}: {agg}"));
-                assert!((got - want).abs() < 1e-9, "{what}: got {got}, want {want}");
-            }
-        }
-    }
-
-    fn metric_aggs(field: &str) -> serde_json::Value {
-        serde_json::json!({
-            "min": {"min": {"field": field}},
-            "max": {"max": {"field": field}},
-            "sum": {"sum": {"field": field}},
-            "avg": {"avg": {"field": field}},
-            "count": {"value_count": {"field": field}},
-        })
-    }
-
-    fn check_all(out: &serde_json::Value, values: &[f64], count: u64, what: &str) {
-        let (min, max, sum, avg) = expected(values);
-        assert_metric(&out["min"], min, &format!("{what} min"));
-        assert_metric(&out["max"], max, &format!("{what} max"));
-        assert_metric(&out["sum"], Some(sum), &format!("{what} sum"));
-        assert_metric(&out["avg"], avg, &format!("{what} avg"));
-        assert_eq!(out["count"]["value"], count, "{what} value_count: {out}");
-    }
-
-    #[test]
-    fn all_five_metrics_match_brute_force_across_segments() {
-        let root = temp_root("brute");
-        let segments = fixture();
-        let (ns, manifest) = build(&root, &segments);
-        let docs: Vec<Doc> = segments.concat();
-
-        // Float and Integer columns, every document (match_all), and
-        // scoped to a query (only the "apple" documents).
-        for (text, scope) in [("", None), ("apple", Some("apple"))] {
-            let in_scope: Vec<&Doc> = docs
-                .iter()
-                .filter(|d| scope.is_none_or(|s| d.text.split(' ').any(|w| w == s)))
-                .collect();
-
-            let prices: Vec<f64> = in_scope.iter().filter_map(|d| d.price).collect();
-            let out = run(&root, &ns, &manifest, &query(text, 0, metric_aggs("price")));
-            check_all(
-                &out,
-                &prices,
-                prices.len() as u64,
-                &format!("price/{text:?}"),
-            );
-
-            let qtys: Vec<f64> = in_scope
-                .iter()
-                .filter_map(|d| d.qty.map(|q| q as f64))
-                .collect();
-            let out = run(&root, &ns, &manifest, &query(text, 0, metric_aggs("qty")));
-            check_all(&out, &qtys, qtys.len() as u64, &format!("qty/{text:?}"));
-
-            // A field no document has: null / 0, never an error.
-            let out = run(
-                &root,
-                &ns,
-                &manifest,
-                &query(text, 0, metric_aggs("absent")),
-            );
-            check_all(&out, &[], 0, &format!("absent/{text:?}"));
-
-            // value_count counts the elements of a list value (ES counts
-            // values, not documents); an empty list counts nothing.
-            let tag_count: usize = in_scope
-                .iter()
-                .filter_map(|d| d.tags)
-                .map(|t| t.len())
-                .sum();
-            let out = run(
-                &root,
-                &ns,
-                &manifest,
-                &query(
-                    text,
-                    0,
-                    serde_json::json!({"n": {"value_count": {"field": "tags"}}}),
-                ),
-            );
-            assert_eq!(out["n"]["value"], tag_count, "{text:?}: {out}");
-            // ... and a numeric metric over a keyword column of words has
-            // no values: null, not 0.
-            let out = run(
-                &root,
-                &ns,
-                &manifest,
-                &query(
-                    text,
-                    0,
-                    serde_json::json!({"m": {"min": {"field": "category"}}}),
-                ),
-            );
-            assert!(out["m"]["value"].is_null(), "{out}");
-        }
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn avg_divides_merged_sum_by_merged_count_not_averages_of_averages() {
-        // Segment 0: one value 100. Segment 1: three values 0. The true
-        // mean is 25; the mean of the per-segment means would be 50.
-        let root = temp_root("avg");
-        let mk = |id: &str, price: f64| doc(id, "x", "c", Some(price), None, None, None);
-        let (ns, manifest) = build(
-            &root,
-            &[
-                vec![mk("a", 100.0)],
-                vec![mk("b", 0.0), mk("c", 0.0), mk("d", 0.0)],
-            ],
-        );
-        let out = run(
-            &root,
-            &ns,
-            &manifest,
-            &query(
-                "",
-                0,
-                serde_json::json!({"avg": {"avg": {"field": "price"}}}),
-            ),
-        );
-        assert_eq!(out["avg"]["value"], 25.0, "{out}");
-        assert!(out["avg"].get("value_as_string").is_none(), "{out}");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn date_fields_aggregate_on_epoch_millis() {
-        let root = temp_root("date");
-        let segments = fixture();
-        let (ns, manifest) = build(&root, &segments);
-        let millis: Vec<f64> = segments
-            .concat()
-            .iter()
-            .filter_map(|d| d.sent)
-            .map(|s| kosha_core::datetime::parse_epoch_millis(s).unwrap() as f64)
-            .collect();
-        let out = run(&root, &ns, &manifest, &query("", 0, metric_aggs("sent")));
-        check_all(&out, &millis, millis.len() as u64, "sent");
-        // Numeric, not string, order: "2023-12-31T23:00:00-02:00" is
-        // 2024-01-01T01:00Z, later than "2024-01-01T00:00:00Z" though it
-        // sorts first as text.
-        assert_eq!(out["min"]["value"], 1_704_067_200_000.0, "{out}");
-        assert_eq!(out["min"]["value_as_string"], "2024-01-01T00:00:00.000Z");
-        assert_eq!(out["max"]["value_as_string"], "2024-06-15T00:00:00.000Z");
-        assert!(out["avg"]["value_as_string"].is_string(), "{out}");
-        assert!(out["sum"].get("value_as_string").is_none(), "{out}");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn metrics_nested_under_terms_and_composite_give_per_bucket_totals() {
-        let root = temp_root("nested");
-        let segments = fixture();
-        let (ns, manifest) = build(&root, &segments);
-        let docs = segments.concat();
-        let subs = serde_json::json!({
-            "total": {"sum": {"field": "price"}},
-            "mean": {"avg": {"field": "price"}},
-            "low": {"min": {"field": "qty"}},
-            "n": {"value_count": {"field": "price"}},
-        });
-        let out = run(
-            &root,
-            &ns,
-            &manifest,
-            &query(
-                "",
-                0,
-                serde_json::json!({
-                    "by_cat": {"terms": {"field": "category"}, "aggs": subs},
-                    "pages": {
-                        "composite": {"size": 10, "sources": [{"cat": {"terms": {"field": "category"}}}]},
-                        "aggregations": subs,
-                    },
-                }),
-            ),
-        );
-        let terms = out["by_cat"]["buckets"].as_array().unwrap();
-        let composite = out["pages"]["buckets"].as_array().unwrap();
-        assert_eq!(terms.len(), 3, "{out}");
-        assert_eq!(composite.len(), 3, "{out}");
-        for cat in ["fruit", "bakery", "dairy"] {
-            let members: Vec<&Doc> = docs.iter().filter(|d| d.category == cat).collect();
-            let prices: Vec<f64> = members.iter().filter_map(|d| d.price).collect();
-            let qtys: Vec<f64> = members
-                .iter()
-                .filter_map(|d| d.qty.map(|q| q as f64))
-                .collect();
-            let (_, _, sum, avg) = expected(&prices);
-            let (low, _, _, _) = expected(&qtys);
-            for bucket in [
-                terms.iter().find(|b| b["key"] == cat).unwrap(),
-                composite.iter().find(|b| b["key"]["cat"] == cat).unwrap(),
-            ] {
-                assert_eq!(bucket["doc_count"], members.len(), "{cat}: {bucket}");
-                assert_metric(&bucket["total"], Some(sum), &format!("{cat} total"));
-                assert_metric(&bucket["mean"], avg, &format!("{cat} mean"));
-                assert_metric(&bucket["low"], low, &format!("{cat} low"));
-                assert_eq!(bucket["n"]["value"], prices.len(), "{cat}: {bucket}");
-            }
-        }
-        // "fruit" spans all three segments: 1.5 + -2.0 + 100.0.
-        let fruit = terms.iter().find(|b| b["key"] == "fruit").unwrap();
-        assert_eq!(fruit["total"]["value"], 99.5, "{fruit}");
-        // "dairy" has no qty in c2 but has c3's 2; no price-less bucket
-        // reports 0 for avg.
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn existing_typed_result_fields_survive_metric_names() {
-        // A metric named like a historical typed field still lands in the
-        // response, whether its value fits the typed field or not.
-        let root = temp_root("typed");
-        let (ns, manifest) = build(&root, &fixture());
-        let out = run(
-            &root,
-            &ns,
-            &manifest,
-            &query(
-                "",
-                0,
-                serde_json::json!({
-                    "total_documents": {"avg": {"field": "absent"}},
-                    "per_document": {"terms": {"field": "category"}, "aggs": {"s": {"sum": {"field": "qty"}}}},
-                }),
-            ),
-        );
-        assert!(out["total_documents"]["value"].is_null(), "{out}");
-        assert!(
-            out["per_document"]["buckets"][0]["s"]["value"].is_number(),
-            "{out}"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn aggregation_only_request_never_touches_the_doc_store() {
-        // `max_results: 0` with aggregations reads filter columns only:
-        // `doc_store.bin` is removed outright, leaving the offsets sidecar
-        // as on a cold, scoring-set-only hydrated pod, and the hydrator
-        // must never be asked for it.
-        let root = temp_root("nohydrate");
-        let segments = fixture();
-        let (ns, manifest) = build(&root, &segments);
-        for entry in &manifest.segments {
-            let dir = root.join(&ns.0).join(&entry.segment_id.0);
-            std::fs::remove_file(dir.join("doc_store.bin")).unwrap();
-        }
-        let calls: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-        let hydrator = |segs: &[PageSegment<'_>]| {
-            calls
-                .lock()
-                .unwrap()
-                .extend(segs.iter().map(|seg| seg.segment_dir.to_path_buf()))
-        };
-        let mut aggs = metric_aggs("price");
-        aggs["by_cat"] = serde_json::json!({
-            "terms": {"field": "category"},
-            "aggs": {"total": {"sum": {"field": "price"}}}
-        });
-        let (result, _stats) = Searcher::new(root.clone())
-            .search_with_doc_store_hydrator(
-                &ns,
-                &manifest,
-                &query("", 0, aggs),
-                None,
-                Some(&hydrator),
-            )
-            .unwrap();
-        assert!(result.results.is_empty());
-        assert!(
-            calls.lock().unwrap().is_empty(),
-            "aggregation-only request hydrated the doc store: {:?}",
-            calls.lock().unwrap()
-        );
-        let out = serde_json::to_value(result.aggregations.unwrap()).unwrap();
-        let prices: Vec<f64> = segments.concat().iter().filter_map(|d| d.price).collect();
-        check_all(&out, &prices, prices.len() as u64, "no-hydrate price");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
-#[cfg(test)]
 mod nested_attribute_tests {
     //! Issue #206: objects and arrays inside documents, addressed by
     //! dotted path in filters, sorts, aggregations and highlights, across
@@ -19894,5 +19801,977 @@ mod prefix_filter_tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod metric_aggregation_tests {
+    //! Issues #218 / #196 / #202: `min` / `max` / `sum` / `avg` /
+    //! `value_count`, top-level and nested under `terms` / `composite`,
+    //! checked against a brute-force computation over a multi-segment
+    //! namespace.
+    use super::*;
+    use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId};
+    use kosha_segment::SegmentWriter;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    pub(super) struct Doc {
+        pub(super) id: String,
+        pub(super) text: &'static str,
+        pub(super) category: &'static str,
+        pub(super) price: Option<f64>,
+        pub(super) qty: Option<i64>,
+        pub(super) sent: Option<&'static str>,
+        pub(super) tags: Option<&'static [&'static str]>,
+    }
+
+    pub(super) fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "kosha-metric-aggs-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    fn empty_manifest() -> Manifest {
+        Manifest {
+            version: 1,
+            segments: vec![],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            retired: Default::default(),
+            schema: Default::default(),
+        }
+    }
+
+    /// One segment per element of `segments`, in order.
+    pub(super) fn build(root: &Path, segments: &[Vec<Doc>]) -> (NamespaceId, Manifest) {
+        let ns = NamespaceId("ns".into());
+        let mut manifest = empty_manifest();
+        for (i, docs) in segments.iter().enumerate() {
+            let id = SegmentId(format!("seg{i}"));
+            let mut writer = SegmentWriter::new(id.clone(), root.join(&ns.0).join(&id.0));
+            for doc in docs {
+                let mut fields = vec![
+                    Field::text("text", doc.text),
+                    Field::keyword("category", doc.category),
+                ];
+                if let Some(price) = doc.price {
+                    fields.push(Field::float_val("price", price));
+                }
+                if let Some(qty) = doc.qty {
+                    fields.push(Field::integer("qty", qty));
+                }
+                if let Some(sent) = doc.sent {
+                    fields.push(Field::date_val("sent", sent));
+                }
+                if let Some(tags) = doc.tags {
+                    fields.push(Field::keyword("tags", serde_json::to_string(tags).unwrap()));
+                }
+                writer.add_document(DocumentId(doc.id.clone()), fields);
+            }
+            let footer = writer.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id: id,
+                doc_count: footer.doc_count,
+            });
+            manifest.remember_segment_footer(footer);
+        }
+        (ns, manifest)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn doc(
+        id: &str,
+        text: &'static str,
+        category: &'static str,
+        price: Option<f64>,
+        qty: Option<i64>,
+        sent: Option<&'static str>,
+        tags: Option<&'static [&'static str]>,
+    ) -> Doc {
+        Doc {
+            id: id.into(),
+            text,
+            category,
+            price,
+            qty,
+            sent,
+            tags,
+        }
+    }
+
+    /// Three segments of unequal size; some documents lack each field.
+    pub(super) fn fixture() -> Vec<Vec<Doc>> {
+        vec![
+            vec![
+                doc(
+                    "a1",
+                    "apple pie",
+                    "fruit",
+                    Some(1.5),
+                    Some(3),
+                    Some("2024-01-01T00:00:00Z"),
+                    Some(&["x", "y"]),
+                ),
+                doc(
+                    "a2",
+                    "apple tart",
+                    "fruit",
+                    None,
+                    Some(-7),
+                    None,
+                    Some(&["x"]),
+                ),
+            ],
+            vec![
+                doc(
+                    "b1",
+                    "banana bread",
+                    "bakery",
+                    Some(10.25),
+                    None,
+                    Some("2024-03-15"),
+                    None,
+                ),
+                doc(
+                    "b2",
+                    "banana split",
+                    "fruit",
+                    Some(-2.0),
+                    Some(11),
+                    Some("2023-12-31T23:00:00-02:00"),
+                    Some(&[]),
+                ),
+                doc(
+                    "b3",
+                    "plain bread",
+                    "bakery",
+                    None,
+                    None,
+                    None,
+                    Some(&["z", "x", "y"]),
+                ),
+                doc(
+                    "b4",
+                    "apple bread",
+                    "bakery",
+                    Some(4.0),
+                    Some(5),
+                    Some("2024-02-29T12:00:00Z"),
+                    None,
+                ),
+            ],
+            vec![
+                doc("c1", "cherry", "fruit", Some(100.0), Some(0), None, None),
+                doc("c2", "apple cherry", "dairy", None, None, None, None),
+                doc(
+                    "c3",
+                    "cream",
+                    "dairy",
+                    Some(0.75),
+                    Some(2),
+                    Some("2024-06-15T00:00:00Z"),
+                    Some(&["y"]),
+                ),
+            ],
+        ]
+    }
+
+    pub(super) fn query(text: &str, max_results: usize, aggs: serde_json::Value) -> SearchQuery {
+        let mut q = serde_json::json!({
+            "query_text": text,
+            "max_results": max_results,
+            "aggs": aggs,
+        });
+        if text.is_empty() {
+            q["filter"] = serde_json::json!({"match_all": {}});
+        }
+        serde_json::from_value(q).unwrap()
+    }
+
+    pub(super) fn run(
+        root: &Path,
+        ns: &NamespaceId,
+        manifest: &Manifest,
+        q: &SearchQuery,
+    ) -> serde_json::Value {
+        let result = Searcher::new(root.to_path_buf())
+            .search(ns, manifest, q, None)
+            .unwrap();
+        serde_json::to_value(result.aggregations.unwrap()).unwrap()
+    }
+
+    /// Brute-force expected `{min, max, sum, avg, count}` over `values`.
+    fn expected(values: &[f64]) -> (Option<f64>, Option<f64>, f64, Option<f64>) {
+        if values.is_empty() {
+            return (None, None, 0.0, None);
+        }
+        let sum: f64 = values.iter().sum();
+        (
+            values.iter().copied().reduce(f64::min),
+            values.iter().copied().reduce(f64::max),
+            sum,
+            Some(sum / values.len() as f64),
+        )
+    }
+
+    fn assert_metric(agg: &serde_json::Value, want: Option<f64>, what: &str) {
+        match want {
+            None => assert!(agg["value"].is_null(), "{what}: expected null, got {agg}"),
+            Some(want) => {
+                let got = agg["value"]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("{what}: {agg}"));
+                assert!((got - want).abs() < 1e-9, "{what}: got {got}, want {want}");
+            }
+        }
+    }
+
+    fn metric_aggs(field: &str) -> serde_json::Value {
+        serde_json::json!({
+            "min": {"min": {"field": field}},
+            "max": {"max": {"field": field}},
+            "sum": {"sum": {"field": field}},
+            "avg": {"avg": {"field": field}},
+            "count": {"value_count": {"field": field}},
+        })
+    }
+
+    fn check_all(out: &serde_json::Value, values: &[f64], count: u64, what: &str) {
+        let (min, max, sum, avg) = expected(values);
+        assert_metric(&out["min"], min, &format!("{what} min"));
+        assert_metric(&out["max"], max, &format!("{what} max"));
+        assert_metric(&out["sum"], Some(sum), &format!("{what} sum"));
+        assert_metric(&out["avg"], avg, &format!("{what} avg"));
+        assert_eq!(out["count"]["value"], count, "{what} value_count: {out}");
+    }
+
+    #[test]
+    fn all_five_metrics_match_brute_force_across_segments() {
+        let root = temp_root("brute");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let docs: Vec<Doc> = segments.concat();
+
+        // Float and Integer columns, every document (match_all), and
+        // scoped to a query (only the "apple" documents).
+        for (text, scope) in [("", None), ("apple", Some("apple"))] {
+            let in_scope: Vec<&Doc> = docs
+                .iter()
+                .filter(|d| scope.is_none_or(|s| d.text.split(' ').any(|w| w == s)))
+                .collect();
+
+            let prices: Vec<f64> = in_scope.iter().filter_map(|d| d.price).collect();
+            let out = run(&root, &ns, &manifest, &query(text, 0, metric_aggs("price")));
+            check_all(
+                &out,
+                &prices,
+                prices.len() as u64,
+                &format!("price/{text:?}"),
+            );
+
+            let qtys: Vec<f64> = in_scope
+                .iter()
+                .filter_map(|d| d.qty.map(|q| q as f64))
+                .collect();
+            let out = run(&root, &ns, &manifest, &query(text, 0, metric_aggs("qty")));
+            check_all(&out, &qtys, qtys.len() as u64, &format!("qty/{text:?}"));
+
+            // A field no document has: null / 0, never an error.
+            let out = run(
+                &root,
+                &ns,
+                &manifest,
+                &query(text, 0, metric_aggs("absent")),
+            );
+            check_all(&out, &[], 0, &format!("absent/{text:?}"));
+
+            // value_count counts the elements of a list value (ES counts
+            // values, not documents); an empty list counts nothing.
+            let tag_count: usize = in_scope
+                .iter()
+                .filter_map(|d| d.tags)
+                .map(|t| t.len())
+                .sum();
+            let out = run(
+                &root,
+                &ns,
+                &manifest,
+                &query(
+                    text,
+                    0,
+                    serde_json::json!({"n": {"value_count": {"field": "tags"}}}),
+                ),
+            );
+            assert_eq!(out["n"]["value"], tag_count, "{text:?}: {out}");
+            // ... and a numeric metric over a keyword column of words has
+            // no values: null, not 0.
+            let out = run(
+                &root,
+                &ns,
+                &manifest,
+                &query(
+                    text,
+                    0,
+                    serde_json::json!({"m": {"min": {"field": "category"}}}),
+                ),
+            );
+            assert!(out["m"]["value"].is_null(), "{out}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn avg_divides_merged_sum_by_merged_count_not_averages_of_averages() {
+        // Segment 0: one value 100. Segment 1: three values 0. The true
+        // mean is 25; the mean of the per-segment means would be 50.
+        let root = temp_root("avg");
+        let mk = |id: &str, price: f64| doc(id, "x", "c", Some(price), None, None, None);
+        let (ns, manifest) = build(
+            &root,
+            &[
+                vec![mk("a", 100.0)],
+                vec![mk("b", 0.0), mk("c", 0.0), mk("d", 0.0)],
+            ],
+        );
+        let out = run(
+            &root,
+            &ns,
+            &manifest,
+            &query(
+                "",
+                0,
+                serde_json::json!({"avg": {"avg": {"field": "price"}}}),
+            ),
+        );
+        assert_eq!(out["avg"]["value"], 25.0, "{out}");
+        assert!(out["avg"].get("value_as_string").is_none(), "{out}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn date_fields_aggregate_on_epoch_millis() {
+        let root = temp_root("date");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let millis: Vec<f64> = segments
+            .concat()
+            .iter()
+            .filter_map(|d| d.sent)
+            .map(|s| kosha_core::datetime::parse_epoch_millis(s).unwrap() as f64)
+            .collect();
+        let out = run(&root, &ns, &manifest, &query("", 0, metric_aggs("sent")));
+        check_all(&out, &millis, millis.len() as u64, "sent");
+        // Numeric, not string, order: "2023-12-31T23:00:00-02:00" is
+        // 2024-01-01T01:00Z, later than "2024-01-01T00:00:00Z" though it
+        // sorts first as text.
+        assert_eq!(out["min"]["value"], 1_704_067_200_000.0, "{out}");
+        assert_eq!(out["min"]["value_as_string"], "2024-01-01T00:00:00.000Z");
+        assert_eq!(out["max"]["value_as_string"], "2024-06-15T00:00:00.000Z");
+        assert!(out["avg"]["value_as_string"].is_string(), "{out}");
+        assert!(out["sum"].get("value_as_string").is_none(), "{out}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metrics_nested_under_terms_and_composite_give_per_bucket_totals() {
+        let root = temp_root("nested");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let docs = segments.concat();
+        let subs = serde_json::json!({
+            "total": {"sum": {"field": "price"}},
+            "mean": {"avg": {"field": "price"}},
+            "low": {"min": {"field": "qty"}},
+            "n": {"value_count": {"field": "price"}},
+        });
+        let out = run(
+            &root,
+            &ns,
+            &manifest,
+            &query(
+                "",
+                0,
+                serde_json::json!({
+                    "by_cat": {"terms": {"field": "category"}, "aggs": subs},
+                    "pages": {
+                        "composite": {"size": 10, "sources": [{"cat": {"terms": {"field": "category"}}}]},
+                        "aggregations": subs,
+                    },
+                }),
+            ),
+        );
+        let terms = out["by_cat"]["buckets"].as_array().unwrap();
+        let composite = out["pages"]["buckets"].as_array().unwrap();
+        assert_eq!(terms.len(), 3, "{out}");
+        assert_eq!(composite.len(), 3, "{out}");
+        for cat in ["fruit", "bakery", "dairy"] {
+            let members: Vec<&Doc> = docs.iter().filter(|d| d.category == cat).collect();
+            let prices: Vec<f64> = members.iter().filter_map(|d| d.price).collect();
+            let qtys: Vec<f64> = members
+                .iter()
+                .filter_map(|d| d.qty.map(|q| q as f64))
+                .collect();
+            let (_, _, sum, avg) = expected(&prices);
+            let (low, _, _, _) = expected(&qtys);
+            for bucket in [
+                terms.iter().find(|b| b["key"] == cat).unwrap(),
+                composite.iter().find(|b| b["key"]["cat"] == cat).unwrap(),
+            ] {
+                assert_eq!(bucket["doc_count"], members.len(), "{cat}: {bucket}");
+                assert_metric(&bucket["total"], Some(sum), &format!("{cat} total"));
+                assert_metric(&bucket["mean"], avg, &format!("{cat} mean"));
+                assert_metric(&bucket["low"], low, &format!("{cat} low"));
+                assert_eq!(bucket["n"]["value"], prices.len(), "{cat}: {bucket}");
+            }
+        }
+        // "fruit" spans all three segments: 1.5 + -2.0 + 100.0.
+        let fruit = terms.iter().find(|b| b["key"] == "fruit").unwrap();
+        assert_eq!(fruit["total"]["value"], 99.5, "{fruit}");
+        // "dairy" has no qty in c2 but has c3's 2; no price-less bucket
+        // reports 0 for avg.
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_typed_result_fields_survive_metric_names() {
+        // A metric named like a historical typed field still lands in the
+        // response, whether its value fits the typed field or not.
+        let root = temp_root("typed");
+        let (ns, manifest) = build(&root, &fixture());
+        let out = run(
+            &root,
+            &ns,
+            &manifest,
+            &query(
+                "",
+                0,
+                serde_json::json!({
+                    "total_documents": {"avg": {"field": "absent"}},
+                    "per_document": {"terms": {"field": "category"}, "aggs": {"s": {"sum": {"field": "qty"}}}},
+                }),
+            ),
+        );
+        assert!(out["total_documents"]["value"].is_null(), "{out}");
+        assert!(
+            out["per_document"]["buckets"][0]["s"]["value"].is_number(),
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn aggregation_only_request_never_touches_the_doc_store() {
+        // `max_results: 0` with aggregations reads filter columns only:
+        // `doc_store.bin` is removed outright, leaving the offsets sidecar
+        // as on a cold, scoring-set-only hydrated pod, and the hydrator
+        // must never be asked for it.
+        let root = temp_root("nohydrate");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        for entry in &manifest.segments {
+            let dir = root.join(&ns.0).join(&entry.segment_id.0);
+            std::fs::remove_file(dir.join("doc_store.bin")).unwrap();
+        }
+        let calls: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        let hydrator = |segs: &[PageSegment<'_>]| {
+            calls
+                .lock()
+                .unwrap()
+                .extend(segs.iter().map(|seg| seg.segment_dir.to_path_buf()))
+        };
+        let mut aggs = metric_aggs("price");
+        aggs["by_cat"] = serde_json::json!({
+            "terms": {"field": "category"},
+            "aggs": {"total": {"sum": {"field": "price"}}}
+        });
+        let (result, _stats) = Searcher::new(root.clone())
+            .search_with_doc_store_hydrator(
+                &ns,
+                &manifest,
+                &query("", 0, aggs),
+                None,
+                Some(&hydrator),
+            )
+            .unwrap();
+        assert!(result.results.is_empty());
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "aggregation-only request hydrated the doc store: {:?}",
+            calls.lock().unwrap()
+        );
+        let out = serde_json::to_value(result.aggregations.unwrap()).unwrap();
+        let prices: Vec<f64> = segments.concat().iter().filter_map(|d| d.price).collect();
+        check_all(&out, &prices, prices.len() as u64, "no-hydrate price");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod histogram_aggregation_tests {
+    //! Issue #219: `histogram` / `date_histogram` bucket boundaries
+    //! (negative values, values exactly on a boundary, non-zero offsets),
+    //! gap filling, cross-segment merging, query/filter scoping and metric
+    //! sub-aggregations.
+    use super::metric_aggregation_tests::{build, doc, fixture, query, run, temp_root, Doc};
+    use super::*;
+    use std::path::Path;
+
+    fn price(id: &str, p: f64) -> Doc {
+        doc(id, "x", "c", Some(p), None, None, None)
+    }
+
+    fn sent(id: &str, at: &'static str) -> Doc {
+        doc(id, "x", "c", None, None, Some(at), None)
+    }
+
+    /// `(key, doc_count)` pairs of a numeric histogram result.
+    fn numeric_buckets(agg: &serde_json::Value) -> Vec<(f64, u64)> {
+        agg["buckets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no buckets: {agg}"))
+            .iter()
+            .map(|b| (b["key"].as_f64().unwrap(), b["doc_count"].as_u64().unwrap()))
+            .collect()
+    }
+
+    /// `(key_as_string, doc_count)` pairs of a date histogram result,
+    /// checking `key` agrees with `key_as_string`.
+    fn date_buckets(agg: &serde_json::Value) -> Vec<(String, u64)> {
+        agg["buckets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no buckets: {agg}"))
+            .iter()
+            .map(|b| {
+                let text = b["key_as_string"].as_str().unwrap().to_string();
+                let key = b["key"].as_i64().unwrap_or_else(|| panic!("{b}"));
+                assert_eq!(
+                    kosha_core::datetime::parse_epoch_millis(&text),
+                    Some(key),
+                    "{b}"
+                );
+                (text, b["doc_count"].as_u64().unwrap())
+            })
+            .collect()
+    }
+
+    fn one(root: &Path, segments: &[Vec<Doc>], aggs: serde_json::Value) -> serde_json::Value {
+        let (ns, manifest) = build(root, segments);
+        run(root, &ns, &manifest, &query("", 0, aggs))
+    }
+
+    fn try_search(
+        root: &Path,
+        segments: &[Vec<Doc>],
+        aggs: serde_json::Value,
+    ) -> Result<serde_json::Value, KoshaError> {
+        let (ns, manifest) = build(root, segments);
+        let q = query("", 0, aggs);
+        Searcher::new(root.to_path_buf())
+            .search(&ns, &manifest, &q, None)
+            .map(|r| serde_json::to_value(r.aggregations.unwrap()).unwrap())
+    }
+
+    /// Prices on and around the boundaries of width-10 buckets, split
+    /// over two segments.
+    fn boundary_prices() -> Vec<Vec<Doc>> {
+        vec![
+            vec![
+                price("a", -10.5),
+                price("b", -10.0),
+                price("c", -0.001),
+                price("d", 0.0),
+            ],
+            vec![price("e", 9.999), price("f", 10.0), price("g", 25.0)],
+        ]
+    }
+
+    #[test]
+    fn histogram_boundaries_negatives_and_offset_match_hand_computed_buckets() {
+        let root = temp_root("hist-boundaries");
+        let out = one(
+            &root,
+            &boundary_prices(),
+            serde_json::json!({
+                "plain": {"histogram": {"field": "price", "interval": 10}},
+                "shifted": {"histogram": {"field": "price", "interval": 10, "offset": 3}},
+                "dense": {"histogram": {"field": "price", "interval": 10, "offset": 3, "min_doc_count": 1}},
+                "busy": {"histogram": {"field": "price", "interval": 10, "offset": 3, "min_doc_count": 2}},
+            }),
+        );
+        // floor(v / 10) * 10: -10.5 → -20; -10 (on the boundary) → -10;
+        // -0.001 → -10; 0 → 0; 9.999 → 0; 10 (on the boundary) → 10;
+        // 25 → 20.
+        assert_eq!(
+            numeric_buckets(&out["plain"]),
+            vec![(-20.0, 1), (-10.0, 2), (0.0, 2), (10.0, 1), (20.0, 1)],
+            "{out}"
+        );
+        // floor((v - 3) / 10) * 10 + 3: -10.5, -10 → -17; -0.001, 0 → -7;
+        // 9.999, 10 → 3; nothing in [13, 23) → an empty gap bucket at 13;
+        // 25 → 23.
+        assert_eq!(
+            numeric_buckets(&out["shifted"]),
+            vec![(-17.0, 2), (-7.0, 2), (3.0, 2), (13.0, 0), (23.0, 1)],
+            "{out}"
+        );
+        assert_eq!(
+            numeric_buckets(&out["dense"]),
+            vec![(-17.0, 2), (-7.0, 2), (3.0, 2), (23.0, 1)],
+            "{out}"
+        );
+        assert_eq!(
+            numeric_buckets(&out["busy"]),
+            vec![(-17.0, 2), (-7.0, 2), (3.0, 2)],
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn histogram_over_integer_field_and_fractional_interval() {
+        let root = temp_root("hist-int");
+        let qty = |id: &str, q: i64| doc(id, "x", "c", None, Some(q), None, None);
+        let out = one(
+            &root,
+            &[
+                vec![qty("a", -7), qty("b", -5), qty("c", 4)],
+                vec![qty("d", 5)],
+            ],
+            serde_json::json!({
+                "q": {"histogram": {"field": "qty", "interval": 5}},
+                "halves": {"histogram": {"field": "qty", "interval": 2.5, "offset": -1}},
+            }),
+        );
+        assert_eq!(
+            numeric_buckets(&out["q"]),
+            vec![(-10.0, 1), (-5.0, 1), (0.0, 1), (5.0, 1)],
+            "{out}"
+        );
+        // floor((v + 1) / 2.5) * 2.5 - 1: -7 → -8.5, -5 → -6, 4 → 4, 5 → 4.
+        assert_eq!(
+            numeric_buckets(&out["halves"]),
+            vec![
+                (-8.5, 1),
+                (-6.0, 1),
+                (-3.5, 0),
+                (-1.0, 0),
+                (1.5, 0),
+                (4.0, 2)
+            ],
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn date_histogram_boundaries_offsets_and_calendar_week() {
+        let root = temp_root("date-hist");
+        let segments = vec![
+            vec![
+                sent("a", "2023-12-31T23:59:59Z"),
+                sent("b", "2024-01-01T00:00:00Z"),
+                sent("c", "2024-01-01T00:59:59.999Z"),
+            ],
+            vec![
+                sent("d", "2024-01-01T01:00:00Z"),
+                // 02:30 UTC, written with an offset.
+                sent("e", "2024-01-01T03:30:00+01:00"),
+                // A date-only value: midnight UTC.
+                sent("f", "2024-01-03"),
+            ],
+        ];
+        let out = one(
+            &root,
+            &segments,
+            serde_json::json!({
+                "hourly": {"date_histogram": {"field": "sent", "fixed_interval": "1h", "min_doc_count": 1}},
+                "half_past": {"date_histogram": {"field": "sent", "fixed_interval": "60m", "offset": "+30m", "min_doc_count": 1}},
+                "daily": {"date_histogram": {"field": "sent", "fixed_interval": "1d"}},
+                "weekly": {"date_histogram": {"field": "sent", "calendar_interval": "1w"}},
+            }),
+        );
+        let s = |t: &str| t.to_string();
+        assert_eq!(
+            date_buckets(&out["hourly"]),
+            vec![
+                (s("2023-12-31T23:00:00.000Z"), 1),
+                (s("2024-01-01T00:00:00.000Z"), 2),
+                (s("2024-01-01T01:00:00.000Z"), 1),
+                (s("2024-01-01T02:00:00.000Z"), 1),
+                (s("2024-01-03T00:00:00.000Z"), 1),
+            ],
+            "{out}"
+        );
+        assert_eq!(
+            date_buckets(&out["half_past"]),
+            vec![
+                (s("2023-12-31T23:30:00.000Z"), 2),
+                (s("2024-01-01T00:30:00.000Z"), 2),
+                (s("2024-01-01T02:30:00.000Z"), 1),
+                (s("2024-01-02T23:30:00.000Z"), 1),
+            ],
+            "{out}"
+        );
+        // Default min_doc_count 0: the empty 2024-01-02 is filled.
+        assert_eq!(
+            date_buckets(&out["daily"]),
+            vec![
+                (s("2023-12-31T00:00:00.000Z"), 1),
+                (s("2024-01-01T00:00:00.000Z"), 4),
+                (s("2024-01-02T00:00:00.000Z"), 0),
+                (s("2024-01-03T00:00:00.000Z"), 1),
+            ],
+            "{out}"
+        );
+        // Weeks start on Monday: Sunday 2023-12-31 is in the week of
+        // Monday 2023-12-25; Monday 2024-01-01 starts the next.
+        assert_eq!(
+            date_buckets(&out["weekly"]),
+            vec![
+                (s("2023-12-25T00:00:00.000Z"), 1),
+                (s("2024-01-01T00:00:00.000Z"), 5),
+            ],
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn date_histogram_before_the_epoch_floors_down() {
+        let root = temp_root("date-hist-epoch");
+        let out = one(
+            &root,
+            &[vec![
+                sent("a", "1969-12-31T23:59:59.999Z"),
+                sent("b", "1970-01-01T00:00:00Z"),
+            ]],
+            serde_json::json!({"d": {"date_histogram": {"field": "sent", "fixed_interval": "1d"}}}),
+        );
+        assert_eq!(out["d"]["buckets"][0]["key"], -86_400_000, "{out}");
+        assert_eq!(
+            date_buckets(&out["d"]),
+            vec![
+                ("1969-12-31T00:00:00.000Z".to_string(), 1),
+                ("1970-01-01T00:00:00.000Z".to_string(), 1),
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn comparison_aggs() -> serde_json::Value {
+        serde_json::json!({
+            "price": {"histogram": {"field": "price", "interval": 5, "offset": 1.5},
+                      "aggs": {"total": {"sum": {"field": "price"}}, "n": {"value_count": {"field": "qty"}}}},
+            "qty": {"histogram": {"field": "qty", "interval": 3, "min_doc_count": 1}},
+            "sent": {"date_histogram": {"field": "sent", "fixed_interval": "7d", "offset": "-12h"},
+                     "aggs": {"avg_price": {"avg": {"field": "price"}}}},
+            "weeks": {"date_histogram": {"field": "sent", "calendar_interval": "week"}},
+        })
+    }
+
+    #[test]
+    fn multi_segment_results_equal_single_segment_results() {
+        let segments = fixture();
+        let multi_root = temp_root("hist-multi");
+        let single_root = temp_root("hist-single");
+        for text in ["", "apple"] {
+            let (ns, manifest) = build(&multi_root, &segments);
+            assert_eq!(manifest.segments.len(), 3);
+            let multi = run(
+                &multi_root,
+                &ns,
+                &manifest,
+                &query(text, 0, comparison_aggs()),
+            );
+            let (ns, manifest) = build(&single_root, &[segments.concat()]);
+            assert_eq!(manifest.segments.len(), 1);
+            let single = run(
+                &single_root,
+                &ns,
+                &manifest,
+                &query(text, 0, comparison_aggs()),
+            );
+            assert_eq!(multi, single, "{text:?}");
+            assert!(!multi["price"]["buckets"].as_array().unwrap().is_empty());
+        }
+        std::fs::remove_dir_all(multi_root).unwrap();
+        std::fs::remove_dir_all(single_root).unwrap();
+    }
+
+    #[test]
+    fn buckets_are_scoped_to_query_and_filter_matches() {
+        let root = temp_root("hist-scope");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let docs = segments.concat();
+        let aggs = serde_json::json!({"h": {"histogram": {"field": "price", "interval": 10, "min_doc_count": 1}}});
+        let brute = |keep: &dyn Fn(&Doc) -> bool| {
+            let mut counts: std::collections::BTreeMap<i64, u64> = Default::default();
+            for d in docs.iter().filter(|d| keep(d)) {
+                if let Some(p) = d.price {
+                    *counts.entry((p / 10.0).floor() as i64).or_default() += 1;
+                }
+            }
+            counts
+                .into_iter()
+                .map(|(i, c)| (i as f64 * 10.0, c))
+                .collect::<Vec<_>>()
+        };
+        // Query only.
+        let out = run(&root, &ns, &manifest, &query("apple", 0, aggs.clone()));
+        assert_eq!(
+            numeric_buckets(&out["h"]),
+            brute(&|d| d.text.split(' ').any(|w| w == "apple")),
+            "{out}"
+        );
+        // Query plus filter.
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "apple",
+            "max_results": 3,
+            "filter": {"term": {"category": "bakery"}},
+            "aggs": aggs,
+        }))
+        .unwrap();
+        let out = run(&root, &ns, &manifest, &q);
+        let want = brute(&|d| d.text.split(' ').any(|w| w == "apple") && d.category == "bakery");
+        assert_eq!(numeric_buckets(&out["h"]), want, "{out}");
+        assert_eq!(want, vec![(0.0, 1)]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metric_sub_aggregations_per_histogram_bucket_including_gaps() {
+        let root = temp_root("hist-subs");
+        let out = one(
+            &root,
+            &[
+                vec![price("a", 1.0), price("b", 2.0)],
+                vec![price("c", 21.0), price("d", 3.5)],
+            ],
+            serde_json::json!({"h": {
+                "histogram": {"field": "price", "interval": 10},
+                "aggs": {"total": {"sum": {"field": "price"}}, "low": {"min": {"field": "price"}}}
+            }}),
+        );
+        let buckets = out["h"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 3, "{out}");
+        assert_eq!(buckets[0]["key"], 0.0);
+        assert_eq!(buckets[0]["doc_count"], 3);
+        assert_eq!(buckets[0]["total"]["value"], 6.5);
+        assert_eq!(buckets[0]["low"]["value"], 1.0);
+        // The filled gap: no values, so sum 0 and min null.
+        assert_eq!(buckets[1]["key"], 10.0);
+        assert_eq!(buckets[1]["doc_count"], 0);
+        assert_eq!(buckets[1]["total"]["value"], 0.0);
+        assert!(buckets[1]["low"]["value"].is_null(), "{out}");
+        assert_eq!(buckets[2]["total"]["value"], 21.0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multi_valued_documents_count_once_per_bucket() {
+        let root = temp_root("hist-multi-valued");
+        // A JSON-list Date value: 3 elements, two in the same day.
+        let d = doc(
+            "a",
+            "x",
+            "c",
+            None,
+            None,
+            Some(r#"["2024-01-01T01:00:00Z","2024-01-01T05:00:00Z","2024-01-02T00:00:00Z"]"#),
+            None,
+        );
+        let out = one(
+            &root,
+            &[vec![d, sent("b", "2024-01-01T12:00:00Z")]],
+            serde_json::json!({"d": {"date_histogram": {"field": "sent", "fixed_interval": "1d"}}}),
+        );
+        assert_eq!(
+            date_buckets(&out["d"]),
+            vec![
+                ("2024-01-01T00:00:00.000Z".to_string(), 2),
+                ("2024-01-02T00:00:00.000Z".to_string(), 1),
+            ],
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_values_gives_no_buckets() {
+        let root = temp_root("hist-empty");
+        let out = one(
+            &root,
+            &[vec![price("a", 1.0)]],
+            serde_json::json!({
+                "h": {"histogram": {"field": "absent", "interval": 1}},
+                "d": {"date_histogram": {"field": "category", "fixed_interval": "1d"}},
+            }),
+        );
+        assert_eq!(out["h"], serde_json::json!({"buckets": []}));
+        assert_eq!(out["d"], serde_json::json!({"buckets": []}));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gap_filling_past_the_bucket_cap_is_an_invalid_query() {
+        let root = temp_root("hist-cap");
+        let segments = vec![vec![
+            sent("a", "1970-01-01T00:00:00Z"),
+            sent("b", "2024-01-01T00:00:00Z"),
+        ]];
+        let err = try_search(
+            &root,
+            &segments,
+            serde_json::json!({"d": {"date_histogram": {"field": "sent", "fixed_interval": "1h"}}}),
+        )
+        .unwrap_err();
+        match err {
+            KoshaError::InvalidQuery(msg) => {
+                assert!(msg.contains("more than the limit of 10000"), "{msg}");
+                assert!(msg.contains("min_doc_count"), "{msg}");
+            }
+            other => panic!("expected InvalidQuery, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        // Without gap filling only the two non-empty buckets are returned.
+        let out = try_search(
+            &root,
+            &segments,
+            serde_json::json!({"d": {"date_histogram": {"field": "sent", "fixed_interval": "1h", "min_doc_count": 1}}}),
+        )
+        .unwrap();
+        assert_eq!(out["d"]["buckets"].as_array().unwrap().len(), 2, "{out}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_intervals_built_in_code_are_rejected_by_validate() {
+        let mut q = query("", 0, serde_json::json!({}));
+        q.aggs.insert(
+            "h".into(),
+            Aggregation::Histogram {
+                histogram: kosha_core::AggHistogram {
+                    field: "price".into(),
+                    interval: 0.0,
+                    offset: 0.0,
+                    min_doc_count: 0,
+                },
+                aggs: None,
+            },
+        );
+        assert!(matches!(q.validate(), Err(KoshaError::InvalidQuery(_))));
     }
 }

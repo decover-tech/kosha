@@ -48,7 +48,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | Score modifiers | `rank_by` blends attributes into the score: `field_value` (`modifier(factor × value)`, Elasticsearch `field_value_factor` modifiers) and `decay` (`linear` / `exp` / `gauss` around an `origin`, with `scale`, `offset`, `decay`) over `Integer`, `Float`, `Date` and `GeoPoint` fields, each with a `weight`. Functions combine by `score_mode` (`sum` default, `multiply`, `avg`, `max`, `min`) and apply to the text score by `boost_mode` (`multiply` default: `text_weight × score × F`; `sum`: `text_weight × score + F`; `replace`: `F`). A decay's `origin` picks its axis: a number (numeric field), a date or `"now"` (scale like `"30d"`), or `{"lat", "lon"}` (scale like `"5km"`). Values come from the filter columns, never the doc store. Applied in a rescore window: the best `window_size` hits by the query's own score (BM25, fused RRF or vector; default `max(100, max_results)`, at most 10,000; a hybrid request rescores within its fused `rank_window_size` list, a kNN request within its `k` neighbours) are rescored and re-sorted, so block-max WAND keeps pruning on BM25 alone; hits below the window are not returned, `total_hits` still counts every match. Each hit reports `rank_details.base_score`. Missing values use the function's `missing` (default 0, which under `multiply` zeroes the hit). `collapse` / `limit_per` apply to the rescored order; `sort` must be by `_score`; `origin: "now"` responses are not cached. Example — halve the score every 30 days: `"rank_by": {"functions": [{"decay": {"field": "published", "function": "exp", "origin": "now", "scale": "30d", "decay": 0.5}}]}` |
 | Geo | `GeoPoint` fields (`"lat,lon"`, `{"lat", "lon"}` or GeoJSON `[lon, lat]`; invalid points are a 400 at index time). `{"geo_distance": {"distance": "10km", "<field>": {"lat": .., "lon": ..}}}` filters by great-circle distance; a `decay` with a geo `origin` ranks by distance |
 | Highlighting | Any number of text fields per request (including a [nested](#nested-attributes) dotted path such as `author.bio`), Elasticsearch-shaped: `"highlight": {"pre_tags": ["<em>"], "post_tags": ["</em>"], "fields": {"title": {}, "body": {"pre_tags": ["<mark>"], "post_tags": ["</mark>"]}}}`. Each field's tags fall back to the top-level `pre_tags` / `post_tags`, then to `<b>` / `</b>`. Hits return `"highlight": {"title": ["..."], "body": ["..."]}` (one fragment per field value, the whole value with the query's terms marked up); requested fields that a hit lacks or that are not `Text` are left out silently. The legacy single-field form `"highlight": {"field": "body"}` still works and still returns the flat `"highlights": [...]` list; that form and `highlights` are deprecated. Giving both `field` and `fields` is a 400. Fragment size/count options and other highlighter types are not supported (unknown options are ignored) |
-| Aggregations | Buckets: `terms`, `composite`. Metrics: `cardinality`, `min`, `max`, `sum`, `avg`, `value_count`, top-level or nested under a `terms` / `composite` bucket via `aggs`. Computed over every document the query and filter match (not just the page), from the filter columns only — see [Aggregations](#aggregations) |
+| Aggregations | Buckets: `terms`, `composite`, `histogram`, `date_histogram`. Metrics: `cardinality`, `min`, `max`, `sum`, `avg`, `value_count`, top-level or nested under a bucket aggregation via `aggs`. Computed over every document the query and filter match (not just the page), from the filter columns only — see [Aggregations](#aggregations) |
 | Total-hit accounting | Capped counting with an `eq` / `gte` relation (`track_total_hits`-style), overridable per query via `exact_total_hits` / `total_hits_cap` |
 | Rerank | `"rerank": {"provider": "cohere", "model": "rerank-v3.5", "field": "content", "top_n": 50, "timeout_ms": 2000}` sends the top `top_n` hits (the fused list for a hybrid request) to an external reranker and pages the reordered list. `top_n` defaults to `from + max_results` and must be ≥ it (≤ 1000; ≤ `rank_window_size` when that is set); `timeout_ms` defaults to 2000. Each hit then has `score` = `rerank_score` (the provider's) and `fused_score` (the search-stage score). On timeout or provider error the hits keep search order and the response has `rerank_degraded: true` and `rerank_degraded_reason`; such responses are not cached. Not combinable with `sort` / `search_after`. Providers are configured on the server from the environment (`KOSHA_RERANK_PROVIDERS`, `KOSHA_RERANK_<NAME>_URL` / `_API_KEY` / `_MODEL`; `cohere` reads `COHERE_API_KEY`); any Cohere-style `POST /rerank` API works. Per-provider calls, outcomes, documents, billed units and a latency histogram are under `rerank` in admin `/stats` |
 | Degradation signal | `knn_degraded_segments` reports segments whose vector search failed, so a 200 with silently missing neighbors is visible to the caller |
@@ -88,8 +88,8 @@ request and response shapes:
   `doc_count`.
 - With no matching values, `min`, `max` and `avg` return `{"value": null}`;
   `sum` and `value_count` return `0`.
-- Sub-aggregations (`aggs` or `aggregations` beside `terms` / `composite`) may
-  only be metrics (`min`, `max`, `sum`, `avg`, `value_count`); their results
+- Sub-aggregations (`aggs` or `aggregations` beside `terms`, `composite`,
+  `histogram` or `date_histogram`) may only be metrics (`min`, `max`, `sum`, `avg`, `value_count`); their results
   appear inside each bucket under the sub-aggregation's name. Nesting a bucket
   aggregation, or putting `aggs` under a metric, is a 400.
 - Partial results — bucket counts, and `(count, sum, min, max)` for metrics —
@@ -97,8 +97,66 @@ request and response shapes:
   merged sum over the merged count, not an average of per-segment averages.
 - An aggregation-only request (`max_results: 0`) never reads the document
   store.
-- Not supported yet: `stats`, `percentiles`, `histogram`, `date_histogram`,
-  `range` buckets, `missing` / `script` / `format` options.
+- Not supported yet: `stats`, `percentiles`, `range` buckets, `missing` /
+  `script` / `format` options.
+
+#### Histograms
+
+```json
+{"query_text": "", "max_results": 0, "filter": {"match_all": {}},
+ "aggs": {
+   "by_size":   {"histogram": {"field": "bytes", "interval": 1024}},
+   "over_time": {"date_histogram": {"field": "sentAt", "fixed_interval": "1h"},
+                 "aggs": {"total": {"sum": {"field": "amount"}}}}}}
+```
+
+```json
+{"aggregations": {
+   "by_size": {"buckets": [{"key": 0.0, "doc_count": 3}, {"key": 1024.0, "doc_count": 0},
+                           {"key": 2048.0, "doc_count": 1}]},
+   "over_time": {"buckets": [{"key": 1718409600000, "key_as_string": "2024-06-15T00:00:00.000Z",
+                              "doc_count": 2, "total": {"value": 41.5}}]}}}
+```
+
+- A value `v` lands in the bucket keyed
+  `floor((v - offset) / interval) * interval + offset`, so a value exactly on
+  a boundary starts the higher bucket and negative values round down
+  (`-0.5` with `interval: 10` is in bucket `-10`). `histogram` computes this
+  in floating point (as Elasticsearch does); `date_histogram` in integer
+  epoch milliseconds, all in UTC.
+- `histogram` takes `field`, `interval` (a number > 0), optional `offset`
+  (a number) and `min_doc_count`. It reads `Integer` and `Float` fields, and
+  string values that are numbers or dates (as epoch milliseconds).
+- `date_histogram` takes `field` and either `fixed_interval` — a positive
+  whole number and one of `ms`, `s`, `m`, `h`, `d` (`"30s"`, `"5m"`, `"1h"`,
+  `"7d"`) — or `calendar_interval`, limited to the units whose length is
+  fixed in UTC: `1m`, `1h`, `1d` and `1w` (`minute`, `hour`, `day`, `week`;
+  weeks start on Monday, as in Elasticsearch). `1M`, `1q` and `1y` are a 400
+  that points at `fixed_interval` (#300). `offset` is a signed duration
+  (`"+6h"`, `"-30m"`) or milliseconds. `Date` fields are read as epoch
+  milliseconds; `Integer` fields are taken to already be epoch milliseconds.
+- Anything else is a 400 with the reason: a malformed interval
+  (`"1 banana"`, `"1.5h"`, `"1w"` as a fixed interval), a zero or negative
+  interval, both or neither of `fixed_interval` / `calendar_interval`, the
+  deprecated `interval` on `date_histogram`, and the not-yet-supported
+  `time_zone` (#301), `extended_bounds` / `hard_bounds` (#302), `keyed`,
+  `order`, `missing` and `format`.
+- Buckets are sorted by key ascending. `key` is a number; `date_histogram`
+  also returns `key_as_string` (RFC 3339, UTC, millisecond precision).
+- **Empty buckets.** `min_doc_count` defaults to 0, as in Elasticsearch:
+  every bucket between the lowest and the highest non-empty bucket is
+  returned, empty ones with `doc_count: 0` (and their metric
+  sub-aggregations `null`, or `0` for `sum` / `value_count`), so a time
+  series has no missing days. No buckets are added before the first or after
+  the last value (`extended_bounds`, #302). With `min_doc_count: n ≥ 1` only
+  buckets holding at least `n` documents are returned. A histogram that
+  would return more than 10,000 buckets, filled gaps included, is a 400 —
+  use a larger interval, a narrower query, or `min_doc_count: 1`.
+- A document counts once per bucket: a multi-valued field with two values in
+  one bucket adds 1 to it, with values in two buckets adds 1 to each.
+- Each segment buckets its own matches with the request's interval and
+  offset, and the coordinator sums counts bucket by bucket, so results are
+  the same however the documents are split into segments.
 
 ### Nested attributes
 

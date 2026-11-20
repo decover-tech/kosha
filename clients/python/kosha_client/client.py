@@ -902,9 +902,9 @@ class KoshaClient:
     # Aggregation types Kosha computes. Metric aggregations can be nested
     # under a bucket aggregation; any other sub-aggregation is refused
     # rather than ignored: the caller would read buckets that are not there.
-    _BUCKET_AGG_TYPES = ("terms", "composite")
+    _BUCKET_AGG_TYPES = ("terms", "composite", "histogram", "date_histogram")
     _METRIC_AGG_TYPES = ("min", "max", "sum", "avg", "value_count")
-    _AGG_TYPES = ("terms", "cardinality", "composite", *_METRIC_AGG_TYPES)
+    _AGG_TYPES = ("cardinality", *_BUCKET_AGG_TYPES, *_METRIC_AGG_TYPES)
 
     @classmethod
     def _extract_aggs(cls, body: dict | None) -> dict | None:

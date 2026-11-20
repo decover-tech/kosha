@@ -535,6 +535,27 @@ def test_metric_aggregations_and_metric_sub_aggregations_pass_through():
     }
 
 
+def test_histogram_aggregations_pass_through_with_metric_sub_aggregations():
+    aggs = {
+        "by_size": {"histogram": {"field": "bytes", "interval": 1024, "min_doc_count": 1}},
+        "over_time": {
+            "date_histogram": {"field": "sentAt", "fixed_interval": "1h", "offset": "+30m"},
+            "aggs": {"pages": {"sum": {"field": "pageNumber"}}},
+        },
+    }
+    assert translate({"size": 0, "aggs": aggs})["aggs"] == aggs
+    assert "sub-aggregations other than" in refused(
+        {
+            "aggs": {
+                "h": {
+                    "histogram": {"field": "bytes", "interval": 1},
+                    "aggs": {"t": {"terms": {"field": "senderEmail"}}},
+                }
+            }
+        }
+    )
+
+
 def test_response_reports_relation_sort_values_collapse_fields_and_highlight():
     client = KoshaClient(hosts=["http://localhost:9"], api_key="k")
     result = {

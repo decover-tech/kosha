@@ -196,6 +196,8 @@ fn aggregation_paths<'a>(agg: &'a Aggregation, out: &mut Vec<&'a str>) {
                 out.extend(source.source.values().map(|s| s.terms.field.as_str()));
             }
         }
+        Aggregation::Histogram { histogram, .. } => out.push(&histogram.field),
+        Aggregation::DateHistogram { date_histogram, .. } => out.push(&date_histogram.field),
         _ => {
             if let Some((_, metric)) = agg.metric() {
                 out.push(&metric.field);
