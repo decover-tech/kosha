@@ -211,7 +211,7 @@ s3://kosha-{env}/{namespace_id}/segments/{segment_id}/
     vector.idx           # ANN index of the first vector column (cluster centroids + posting lists)
     vector.offsets       # its centroids and posting byte ranges, read at open
     vector.<n>.idx       # ANN index of vector column n (#204), and vector.<n>.offsets beside it
-    doc_vectors.bin      # stored vector values, binary f32 (#243)
+    doc_vectors.bin      # stored vector values, binary f32 (#243); never quantized
     filters.bin          # filter fields (dates, ids, tags), row-oriented — or, with the columnar format:
     filters.toc          #   column directory + per-column stats (#244)
     filters-NNN.col      #   one file per (field, type) column, numbered by id
@@ -283,6 +283,20 @@ first vector written to it (from segment footers and the write buffer) and rejec
 disagrees with a 400; a segment writer that still meets one stores it without indexing it rather
 than failing the flush. There is no namespace schema for vector fields: everything above is read
 from segment footers.
+
+**i8 posting entries (#210).** A column's `vector.idx` entries are `[id][f32 x dim]` or, at
+on-disk version 4, `[id][scale: f32][i8 x dim]`: the unit-normalized vector scaled by
+`max|x_i| / 127` and rounded. Centroids and radii in `vector.offsets` stay f32 (radii are computed
+from the exact vectors, so the probe's lower bound still holds). The reader dispatches on the
+header version, so f32 and i8 segments coexist in a namespace and in one query; a version it does
+not know fails that column loudly (counted in `knn_degraded_segments`) rather than being misread
+as the legacy format. The footer's `vector_fields[].quantization` records the choice (omitted for
+f32). i8 entries score as `scale * Σ q_i·code_i` against the normalized query, without
+dequantizing, and the posting cache holds them as i8. Each segment then rescores its best
+`k * KOSHA_VECTOR_RESCORE_FACTOR` candidates with the f32 vectors in `doc_vectors.bin`, which is
+never quantized: it is the document's own value, and compaction rebuilds every index from it.
+Quantization is chosen at write time by `KOSHA_VECTOR_QUANTIZATION` /
+`KOSHA_VECTOR_QUANTIZATION_FIELDS`, not by the namespace schema.
 
 **Analysis is versioned per segment (#220, #221).** `inverted.idx` holds whatever terms the
 analyzer produced at write time, so a segment's `footer.json` records the exact analysis chains its

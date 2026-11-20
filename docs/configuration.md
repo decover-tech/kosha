@@ -224,6 +224,9 @@ before rolling back, until every reader understands the newer one. Read once in
 | `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written: `4` or `5` | `5` | version |
 | `KOSHA_VECTOR_WRITE_VERSION` | Vector-index version written: `1` (flat), `2`, `3` or `4` (posting-based) | `4` | version |
 | `KOSHA_VECTOR_STORE` | Where vector field values are stored: `sidecar` (`doc_vectors.bin`) or `inline` (in `doc_store.bin`). Set `inline` before rolling back past #243 | `sidecar` | enum |
+| `KOSHA_VECTOR_QUANTIZATION` | How new segments store vector posting entries: `f32` or `i8` (scalar-quantized, vector index version 4, #210). Turn `i8` on only once every query pod reads version 4; turn it off and compact before rolling back past it | `f32` | enum |
+| `KOSHA_VECTOR_QUANTIZATION_FIELDS` | Per-field overrides of `KOSHA_VECTOR_QUANTIZATION`, e.g. `body_emb:i8,title_emb:f32` | empty | list |
+| `KOSHA_VECTOR_RESCORE_FACTOR` | An i8 column rescores its best `k * factor` probe candidates with the f32 vectors in `doc_vectors.bin` (#210); `0` disables | `4` | multiplier |
 | `KOSHA_TEXT_FILTER_IGNORE_ABOVE` | Longest `Text` value copied into filter columns, like Elasticsearch's `ignore_above`; `off` copies every value | `256` | characters |
 | `KOSHA_FIELD_INDEX` | Per-field inverted indexes (#249); `off` writes segments exactly as before. Set it and compact before rolling back past #249 | on | flag (default on) |
 | `KOSHA_FILTERS_WRITE_VERSION` | Filter index written: `1` (`filters.bin`) or `2` (columnar `filters.toc` + `filters-NNN.col`, #244) (`filter_columns.rs`) | `1` | version |

@@ -14,7 +14,7 @@ use kosha_core::{
     build_filter_blooms, build_term_bloom, AggBucket, AggBucketResult, AggMetricResult,
     AggregationResults, Bm25Params, DocRecord, DocSet, DocumentId, Field, FieldType, FilterClause,
     FilterStore, Footer, KoshaError, LocalStorage, Posting, SegmentId, StorageBackend,
-    VectorFieldMeta, VectorStore,
+    VectorFieldMeta, VectorQuantization, VectorStore,
 };
 use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 
@@ -122,6 +122,9 @@ pub struct SegmentWriter {
     vector_store_mode: VectorStoreMode,
     /// `doc_vectors.bin` field-name table (sidecar mode only).
     doc_vector_fields: Vec<String>,
+    /// How each vector column's posting entries are stored (#210). See
+    /// [`VectorQuantizationConfig`].
+    vector_quantization: VectorQuantizationConfig,
     /// `(doc_seq, field_idx, where the vector is buffered)` for each vector
     /// moved to the sidecar, in doc_seq then field order.
     doc_vector_entries: Vec<(u32, u32, VectorRef)>,
@@ -231,6 +234,7 @@ impl SegmentWriter {
             text_filter_ignore_above: text_filter_ignore_above(),
             vector_store_mode: VectorStoreMode::from_env(),
             doc_vector_fields: Vec::new(),
+            vector_quantization: VectorQuantizationConfig::from_env().clone(),
             doc_vector_entries: Vec::new(),
             default_analyzer: Analyzer::new(&AnalyzerSpec::legacy()),
             field_analyzers: HashMap::new(),
@@ -314,6 +318,14 @@ impl SegmentWriter {
     /// Production writers use `KOSHA_VECTOR_STORE`; see [`VectorStoreMode`].
     pub fn with_vector_store_mode(mut self, mode: VectorStoreMode) -> Self {
         self.vector_store_mode = mode;
+        self
+    }
+
+    /// Override how this writer stores vector posting entries (#210).
+    /// Production writers use `KOSHA_VECTOR_QUANTIZATION` and
+    /// `KOSHA_VECTOR_QUANTIZATION_FIELDS`; see [`VectorQuantizationConfig`].
+    pub fn with_vector_quantization(mut self, config: VectorQuantizationConfig) -> Self {
+        self.vector_quantization = config;
         self
     }
 
@@ -1026,12 +1038,15 @@ impl SegmentWriter {
                     buf.extend_from_slice(&val.to_le_bytes());
                 }
             }
+            // The flat format has no version field to tag quantization
+            // with: it is always f32 (see `write_vectors_v2`).
             let meta = VectorFieldMeta {
                 name: column.name.clone(),
                 dim,
                 count: column.vectors.len() as u32,
                 slot: slot as u32,
                 offsets: false,
+                quantization: VectorQuantization::F32,
             };
             self.backend.write(&meta.idx_file(), &buf)?;
             metas.push(meta);
@@ -1056,14 +1071,28 @@ impl SegmentWriter {
             if column.vectors.is_empty() {
                 continue;
             }
+            // i8 entries need the newest header version: a writer pinned
+            // to an older `KOSHA_VECTOR_WRITE_VERSION` for a rolling deploy
+            // keeps writing f32, which every reader of that version reads.
+            let requested = self.vector_quantization.for_field(&column.name);
+            let quantization = if vector_write_version() >= 4 {
+                requested
+            } else {
+                if !requested.is_f32() {
+                    warn_quantization_needs_v4();
+                }
+                VectorQuantization::F32
+            };
             let meta = VectorFieldMeta {
                 name: column.name.clone(),
                 dim: column.dim as u32,
                 count: column.vectors.len() as u32,
                 slot: slot as u32,
                 offsets: true,
+                quantization,
             };
-            let (idx_bytes, offsets_bytes) = Self::encode_vector_column(&column.vectors)?;
+            let (idx_bytes, offsets_bytes) =
+                Self::encode_vector_column(&column.vectors, quantization)?;
             self.backend.write(&meta.idx_file(), &idx_bytes)?;
             self.backend.write(&meta.offsets_file(), &offsets_bytes)?;
             metas.push(meta);
@@ -1074,7 +1103,10 @@ impl SegmentWriter {
     /// Cluster one column's vectors and encode `(vector.idx bytes,
     /// vector.offsets bytes)` for it. Every vector must share one
     /// dimension (`buffer_vector` guarantees it).
-    fn encode_vector_column(column: &[(u32, Vec<f32>)]) -> Result<(Vec<u8>, Vec<u8>), KoshaError> {
+    fn encode_vector_column(
+        column: &[(u32, Vec<f32>)],
+        quantization: VectorQuantization,
+    ) -> Result<(Vec<u8>, Vec<u8>), KoshaError> {
         let dim = column[0].1.len();
         // Unit-norm (write version 3, on-disk header version 2): normalize
         // once here so the read path can score with a bare dot product.
@@ -1127,7 +1159,11 @@ impl SegmentWriter {
                         .fold(0.0f32, f32::max);
                 }
             }
-            if radius_aware {
+            if radius_aware && quantization == VectorQuantization::I8 {
+                // Radii were computed above from the exact vectors, so the
+                // probe's lower bound stays a bound on the true distance.
+                I8_VECTOR_INDEX_VERSION
+            } else if radius_aware {
                 RADIUS_AWARE_VECTOR_INDEX_VERSION
             } else {
                 UNIT_NORM_VECTOR_INDEX_VERSION
@@ -1278,11 +1314,43 @@ pub const UNIT_NORM_VECTOR_INDEX_VERSION: u32 = 2;
 /// which degrades exactly to today's raw-centroid-distance ranking — no
 /// regression, just no improvement, until a segment is rewritten.
 pub const RADIUS_AWARE_VECTOR_INDEX_VERSION: u32 = 3;
+/// Version 4 (#210): everything version 3 is (unit-norm vectors and
+/// centroids, per-posting radius in `vector.offsets`), but each
+/// `vector.idx` entry is scalar-quantized to i8: `[id:u32][scale:f32]
+/// [i8×dim]` instead of `[id:u32][f32×dim]` — ~4x smaller at embedding
+/// dimensions. `scale` is `max|x_i| / 127` of the unit vector, so `x_i ≈
+/// scale * code_i` and a query scores with `scale * Σ q_i·code_i` (see
+/// `kosha_vector_spfresh::dot_i8`). Centroids and radii stay f32 (they are
+/// small and resident) and radii are computed from the exact vectors.
+///
+/// Written only when `KOSHA_VECTOR_QUANTIZATION` (or its per-field
+/// override) asks for `i8`: a reader that predates this version cannot
+/// read it, so the flag must stay off until every query pod runs a build
+/// that knows it. The footer's `VectorFieldMeta::quantization` records the
+/// choice per column; the header version alone decides how entries parse.
+pub const I8_VECTOR_INDEX_VERSION: u32 = 4;
 
 pub fn is_known_vector_index_version(version: u32) -> bool {
     version == VECTOR_INDEX_VERSION
         || version == UNIT_NORM_VECTOR_INDEX_VERSION
         || version == RADIUS_AWARE_VECTOR_INDEX_VERSION
+        || version == I8_VECTOR_INDEX_VERSION
+}
+
+/// Whether `version`'s `vector.idx` entries are i8-quantized (see
+/// [`I8_VECTOR_INDEX_VERSION`]). `==`, not `>=`: a later version is free to
+/// choose another entry encoding, and must say so here.
+pub fn is_i8_vector_index_version(version: u32) -> bool {
+    version == I8_VECTOR_INDEX_VERSION
+}
+
+/// Bytes of one `vector.idx` entry (id included) for `version`.
+fn vector_entry_size(dim: u32, version: u32) -> usize {
+    if is_i8_vector_index_version(version) {
+        4 + 4 + dim as usize
+    } else {
+        4 + 4 * dim as usize
+    }
 }
 
 /// `>=` rather than `==`: every version from [`UNIT_NORM_VECTOR_INDEX_VERSION`]
@@ -1335,12 +1403,20 @@ fn encode_vector_index_v2(
     offsets_buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
 
     let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
+    let quantized = is_i8_vector_index_version(version);
+    let mut codes: Vec<i8> = Vec::with_capacity(dim as usize);
     for p in postings {
         let offset = idx_buf.len() as u64;
         for (id, v) in &p.entries {
             idx_buf.extend_from_slice(&id.to_le_bytes());
-            for &x in v {
-                idx_buf.extend_from_slice(&x.to_le_bytes());
+            if quantized {
+                let scale = kosha_vector_spfresh::quantize_i8(v, &mut codes);
+                idx_buf.extend_from_slice(&scale.to_le_bytes());
+                idx_buf.extend(codes.iter().map(|&c| c as u8));
+            } else {
+                for &x in v {
+                    idx_buf.extend_from_slice(&x.to_le_bytes());
+                }
             }
         }
         let length = (idx_buf.len() as u64 - offset) as u32;
@@ -1515,22 +1591,18 @@ fn parse_vector_idx_header(data: &[u8]) -> Option<(u32, u32, u32)> {
 /// returns `None`, same "never trust blindly" discipline as
 /// `try_read_doc_index`'s doc-count cross-check.
 fn parse_vector_idx_eager(data: &[u8]) -> Option<VectorStore> {
-    let (dim, total_count, _version) = parse_vector_idx_header(data)?;
-    let record_size = 4 + 4 * dim as usize;
+    let (dim, total_count, version) = parse_vector_idx_header(data)?;
+    let record_size = vector_entry_size(dim, version);
     let expected_len = VECTOR_IDX_HEADER_LEN + total_count as usize * record_size;
     if data.len() != expected_len {
         return None;
     }
-    let mut cursor = &data[VECTOR_IDX_HEADER_LEN..];
-    let mut vectors = Vec::with_capacity(total_count as usize);
-    for _ in 0..total_count {
-        let id = read_u32_le(&mut cursor);
-        let mut v = Vec::with_capacity(dim as usize);
-        for _ in 0..dim {
-            v.push(read_f32_le(&mut cursor));
-        }
-        vectors.push((id, v));
-    }
+    // An i8 column served without its sidecar is dequantized: the flat
+    // scan only knows f32 vectors, and this path is a fallback anyway.
+    let vectors = match decode_posting_entries(&data[VECTOR_IDX_HEADER_LEN..], dim, version) {
+        VectorPosting::F32(vectors) => vectors,
+        quantized @ VectorPosting::I8 { .. } => quantized.dequantized(),
+    };
     Some(VectorStore {
         vectors,
         dimensions: dim as usize,
@@ -1594,11 +1666,29 @@ fn parse_vector_offsets(
 }
 
 /// Decodes one posting's raw entry bytes (sliced from `vector.idx` via a
-/// `VectorPostingIndex`'s `offset`/`length`) into `(id, vector)` pairs.
-fn decode_posting_entries(mut cursor: &[u8], dim: u32) -> Vec<(u32, Vec<f32>)> {
+/// `VectorPostingIndex`'s `offset`/`length`) for an index of `version`.
+fn decode_posting_entries(mut cursor: &[u8], dim: u32, version: u32) -> VectorPosting {
     // record_size is always >= 4 (id alone, even at dim=0), so this never divides by zero.
-    let record_size = 4 + 4 * dim as usize;
+    let record_size = vector_entry_size(dim, version);
     let count = cursor.len() / record_size;
+    if is_i8_vector_index_version(version) {
+        let dim = dim as usize;
+        let mut ids = Vec::with_capacity(count);
+        let mut scales = Vec::with_capacity(count);
+        let mut codes = Vec::with_capacity(count * dim);
+        for _ in 0..count {
+            ids.push(read_u32_le(&mut cursor));
+            scales.push(read_f32_le(&mut cursor));
+            codes.extend(cursor[..dim].iter().map(|&b| b as i8));
+            cursor = &cursor[dim..];
+        }
+        return VectorPosting::I8 {
+            dim,
+            ids,
+            scales,
+            codes,
+        };
+    }
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let id = read_u32_le(&mut cursor);
@@ -1608,7 +1698,102 @@ fn decode_posting_entries(mut cursor: &[u8], dim: u32) -> Vec<(u32, Vec<f32>)> {
         }
         out.push((id, v));
     }
-    out
+    VectorPosting::F32(out)
+}
+
+/// One vector posting's decoded live entries, in the encoding its
+/// `vector.idx` stores (#210). Cached as-is, so an i8 column's posting
+/// cache holds ~4x more postings in the same bytes.
+#[derive(Debug, Clone, PartialEq)]
+enum VectorPosting {
+    F32(Vec<(u32, Vec<f32>)>),
+    /// Entry `i` is `ids[i]`, scale `scales[i]`, codes
+    /// `codes[i * dim..(i + 1) * dim]`.
+    I8 {
+        dim: usize,
+        ids: Vec<u32>,
+        scales: Vec<f32>,
+        codes: Vec<i8>,
+    },
+}
+
+impl VectorPosting {
+    /// Approximate heap + inline bytes, for the posting cache's budget.
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                VectorPosting::F32(entries) => {
+                    entries.len()
+                        * (std::mem::size_of::<(u32, Vec<f32>)>()
+                            + entries.first().map_or(0, |(_, v)| v.len())
+                                * std::mem::size_of::<f32>())
+                }
+                VectorPosting::I8 {
+                    ids, scales, codes, ..
+                } => ids.len() * 4 + scales.len() * 4 + codes.len(),
+            }
+    }
+
+    /// Calls `emit(id, similarity)` for every entry `accept` lets through
+    /// (all of them when `None`). `f32_similarity` scores an f32 entry —
+    /// each caller keeps the formula it has always used. An i8 entry is
+    /// scored against `unit_query` (the query, unit-normalized; only read
+    /// for i8) as `scale * Σ q_i·code_i`, clamped like the f32 dot path:
+    /// the stored vector is unit-norm, so that is its cosine.
+    fn for_each_similarity(
+        &self,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        f32_similarity: impl Fn(&[f32]) -> f32,
+        unit_query: &[f32],
+        mut emit: impl FnMut(u32, f32),
+    ) {
+        match self {
+            VectorPosting::F32(entries) => {
+                for (id, v) in entries {
+                    if accept.is_some_and(|accept| !accept(*id)) {
+                        continue;
+                    }
+                    emit(*id, f32_similarity(v));
+                }
+            }
+            VectorPosting::I8 {
+                dim,
+                ids,
+                scales,
+                codes,
+            } => {
+                for (i, (&id, &scale)) in ids.iter().zip(scales).enumerate() {
+                    if accept.is_some_and(|accept| !accept(id)) {
+                        continue;
+                    }
+                    let entry = &codes[i * dim..(i + 1) * dim];
+                    let sim = kosha_vector_spfresh::dot_i8(unit_query, entry, scale);
+                    emit(id, sim.clamp(-1.0, 1.0));
+                }
+            }
+        }
+    }
+
+    /// The entries as f32 vectors (an i8 posting dequantized).
+    fn dequantized(self) -> Vec<(u32, Vec<f32>)> {
+        match self {
+            VectorPosting::F32(entries) => entries,
+            VectorPosting::I8 {
+                dim,
+                ids,
+                scales,
+                codes,
+            } => ids
+                .into_iter()
+                .zip(scales)
+                .enumerate()
+                .map(|(i, (id, scale))| {
+                    let entry = &codes[i * dim..(i + 1) * dim];
+                    (id, kosha_vector_spfresh::dequantize_i8(entry, scale))
+                })
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1668,8 +1853,8 @@ mod vector_index_v2_tests {
         for (i, entry) in parsed_offsets.iter().enumerate() {
             let slice =
                 &idx_bytes[entry.offset as usize..(entry.offset as usize + entry.length as usize)];
-            let decoded = decode_posting_entries(slice, dim);
-            assert_eq!(decoded, postings[i].entries);
+            let decoded = decode_posting_entries(slice, dim, VECTOR_INDEX_VERSION);
+            assert_eq!(decoded, VectorPosting::F32(postings[i].entries.clone()));
         }
     }
 
@@ -1811,7 +1996,9 @@ mod vector_index_v2_tests {
                 decode_posting_entries(
                     &data[p.offset as usize..(p.offset + p.length as u64) as usize],
                     dim,
+                    version,
                 )
+                .dequantized()
             })
             .map(|(id, _)| id)
             .collect();
@@ -2831,6 +3018,106 @@ pub fn doc_vectors_header_len(prefix: &[u8]) -> Result<Result<u64, u64>, KoshaEr
         HeaderParse::Need(n) => Ok(Err(n)),
         HeaderParse::Done(h) => Ok(Ok(h.offsets.first().copied().unwrap_or(h.file_len))),
     }
+}
+
+/// How a [`SegmentWriter`] stores each vector column's ANN posting entries
+/// (#210): a default for every field plus per-field overrides.
+///
+/// Production writers read it once from the environment:
+/// `KOSHA_VECTOR_QUANTIZATION=f32|i8` (default `f32`) sets the default and
+/// `KOSHA_VECTOR_QUANTIZATION_FIELDS=body_emb:i8,title_emb:f32` overrides
+/// it per field. The namespace schema (#220) carries only analyzers so
+/// far; declaring quantization per field there is follow-up work.
+///
+/// `i8` writes vector index version [`I8_VECTOR_INDEX_VERSION`], which a
+/// reader built before it cannot read (it fails the kNN on that column).
+/// Turn it on only once every query pod runs a build that reads it, and
+/// turn it off and compact before rolling back past one. With it off (the default) segments are byte-identical to those
+/// written before #210. `doc_vectors.bin` keeps full-precision vectors
+/// either way: it is the document's own value, rescoring reads it, and
+/// compaction rebuilds every index from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorQuantizationConfig {
+    pub default: VectorQuantization,
+    pub fields: HashMap<String, VectorQuantization>,
+}
+
+impl VectorQuantizationConfig {
+    /// Every field stored as `quantization`.
+    pub fn all(quantization: VectorQuantization) -> Self {
+        Self {
+            default: quantization,
+            fields: HashMap::new(),
+        }
+    }
+
+    /// `self` with `field` stored as `quantization`.
+    pub fn with_field(
+        mut self,
+        field: impl Into<String>,
+        quantization: VectorQuantization,
+    ) -> Self {
+        self.fields.insert(field.into(), quantization);
+        self
+    }
+
+    /// How `field`'s postings are stored.
+    pub fn for_field(&self, field: &str) -> VectorQuantization {
+        self.fields.get(field).copied().unwrap_or(self.default)
+    }
+
+    fn from_env() -> &'static Self {
+        static CONFIG: OnceLock<VectorQuantizationConfig> = OnceLock::new();
+        CONFIG.get_or_init(|| {
+            Self::parse(
+                std::env::var("KOSHA_VECTOR_QUANTIZATION").ok().as_deref(),
+                std::env::var("KOSHA_VECTOR_QUANTIZATION_FIELDS")
+                    .ok()
+                    .as_deref(),
+            )
+        })
+    }
+
+    /// Parses the two env values. Anything unrecognised is warned about
+    /// and ignored — falling back to `f32`, which every reader reads.
+    pub fn parse(default: Option<&str>, fields: Option<&str>) -> Self {
+        let default = match default.map(str::trim) {
+            None | Some("") => VectorQuantization::F32,
+            Some(raw) => VectorQuantization::parse(raw).unwrap_or_else(|| {
+                eprintln!("WARN: KOSHA_VECTOR_QUANTIZATION={raw} not f32|i8 — using f32");
+                VectorQuantization::F32
+            }),
+        };
+        let mut config = Self::all(default);
+        for entry in fields.unwrap_or("").split(',').map(str::trim) {
+            if entry.is_empty() {
+                continue;
+            }
+            match entry
+                .rsplit_once(':')
+                .and_then(|(name, q)| Some((name.trim(), VectorQuantization::parse(q)?)))
+            {
+                Some((name, q)) if !name.is_empty() => {
+                    config.fields.insert(name.to_string(), q);
+                }
+                _ => eprintln!(
+                    "WARN: KOSHA_VECTOR_QUANTIZATION_FIELDS entry {entry:?} not <field>:f32|i8 — ignored"
+                ),
+            }
+        }
+        config
+    }
+}
+
+/// Logged once: i8 was asked for but `KOSHA_VECTOR_WRITE_VERSION` pins an
+/// older index version, so the writer keeps writing f32.
+fn warn_quantization_needs_v4() {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        eprintln!(
+            "WARN: i8 vector quantization needs KOSHA_VECTOR_WRITE_VERSION=4 (the default) — writing f32 vectors"
+        );
+    });
 }
 
 /// Parsed `doc_vectors.bin` header: field names, entries and where each
@@ -4895,7 +5182,7 @@ impl LazyFilters {
 
 /// A vector posting's decoded live entries, shared between the per-segment
 /// cache and in-flight queries (a cache hit is a pointer clone).
-type SharedVectorPosting = Arc<Vec<(u32, Vec<f32>)>>;
+type SharedVectorPosting = Arc<VectorPosting>;
 
 /// Resident state for a v2 (posting-based) vector column: centroids are
 /// always in memory (small — a segment's posting count tops out in the
@@ -4929,6 +5216,15 @@ struct LazyVectorIndex {
     /// [`UNIT_NORM_VECTOR_INDEX_VERSION`]) — scoring uses the dot-only fast
     /// path: normalize the query once, then `1 - dot` *is* cosine distance.
     unit_norm: bool,
+    /// The idx header's version — decides how posting entries decode.
+    version: u32,
+    /// Entries are i8-quantized ([`I8_VECTOR_INDEX_VERSION`]): scores are
+    /// approximate, and the probe rescores its best candidates from
+    /// `doc_vectors.bin` (see [`SegmentReader::with_vector_rescore_factor`]).
+    quantized: bool,
+    /// The column's field name, from the footer (`None` for a legacy
+    /// segment's unnamed index) — what `doc_vectors.bin` is keyed by.
+    field: Option<String>,
 }
 
 impl LazyVectorIndex {
@@ -4938,6 +5234,7 @@ impl LazyVectorIndex {
         dim: u32,
         version: u32,
         parsed: Vec<VectorPostingIndex>,
+        field: Option<String>,
     ) -> Self {
         let mut centroids = Vec::with_capacity(parsed.len());
         let mut ranges = Vec::with_capacity(parsed.len());
@@ -4959,6 +5256,9 @@ impl LazyVectorIndex {
             ranges,
             radii,
             unit_norm: is_unit_norm_vector_index_version(version),
+            version,
+            quantized: is_i8_vector_index_version(version),
+            field,
         }
     }
 }
@@ -5131,7 +5431,32 @@ pub struct SegmentReader {
     /// Per-field document lengths decoded from the norms lists (#249),
     /// dense by doc_seq, for the fields queries have asked about.
     field_lengths: Mutex<HashMap<String, Arc<Vec<u32>>>>,
+    /// i8 columns rescore their best `k * vector_rescore_factor` probe
+    /// candidates at full precision (#210); `0` disables. See
+    /// [`vector_rescore_factor`].
+    vector_rescore_factor: usize,
 }
+
+/// Default of [`SegmentReader::with_vector_rescore_factor`]:
+/// `KOSHA_VECTOR_RESCORE_FACTOR`, default `4`, `0` disables rescoring.
+/// Only i8-quantized vector columns (#210) are rescored — an f32 column's
+/// probe scores are already exact.
+pub fn vector_rescore_factor() -> usize {
+    static FACTOR: OnceLock<usize> = OnceLock::new();
+    *FACTOR.get_or_init(|| {
+        match std::env::var("KOSHA_VECTOR_RESCORE_FACTOR").ok().as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_VECTOR_RESCORE_FACTOR,
+            Some(raw) => raw.parse().unwrap_or_else(|_| {
+                eprintln!(
+                    "WARN: KOSHA_VECTOR_RESCORE_FACTOR={raw} not a non-negative integer — using {DEFAULT_VECTOR_RESCORE_FACTOR}"
+                );
+                DEFAULT_VECTOR_RESCORE_FACTOR
+            }),
+        }
+    })
+}
+
+const DEFAULT_VECTOR_RESCORE_FACTOR: usize = 4;
 
 /// Posting-cache key for `range_idx` of the column at `slot`.
 fn vector_cache_key(slot: u32, range_idx: usize) -> usize {
@@ -5204,7 +5529,23 @@ impl SegmentReader {
             vector_cache: PostingsCache::new(vector_postings_cache_max_bytes(), postings_account),
             doc_vectors: Mutex::new(None),
             field_lengths: Mutex::new(HashMap::new()),
+            vector_rescore_factor: vector_rescore_factor(),
         })
+    }
+
+    /// Override how many probe candidates per wanted hit an i8 vector
+    /// column rescores at full precision (#210); `0` disables rescoring.
+    /// Readers default to `KOSHA_VECTOR_RESCORE_FACTOR` (see
+    /// [`vector_rescore_factor`]).
+    pub fn with_vector_rescore_factor(mut self, factor: usize) -> Self {
+        self.vector_rescore_factor = factor;
+        self
+    }
+
+    /// Bytes the decoded vector-posting cache holds right now (#210
+    /// measurement; also what it reports to the live-bytes account).
+    pub fn vector_cache_resident_bytes(&self) -> usize {
+        self.vector_cache.state.lock().unwrap().total_bytes
     }
 
     /// The vector columns `footer` declares, or the single unnamed legacy
@@ -5413,6 +5754,7 @@ impl SegmentReader {
             &slot.idx_path,
             &slot.offsets_path,
             slot.meta.as_ref().map_or(0, |m| m.slot),
+            slot.meta.as_ref().map(|m| m.name.clone()),
         )?);
         // A declared column that is neither local nor servable from its
         // offsets sidecar alone (S3 hydration fetches only the queried
@@ -5438,6 +5780,7 @@ impl SegmentReader {
         idx_path: &Path,
         offsets_path: &Path,
         slot: u32,
+        field: Option<String>,
     ) -> Result<VectorFieldIndex, KoshaError> {
         let empty = |degraded| VectorFieldIndex {
             lazy: None,
@@ -5460,7 +5803,7 @@ impl SegmentReader {
             // repeats the index's dim and version, plus whichever postings
             // it fetched into the span cache.
             return Ok(
-                match Self::load_vector_index_from_offsets(idx_path, offsets_path, slot) {
+                match Self::load_vector_index_from_offsets(idx_path, offsets_path, slot, field) {
                     Some(vi) => VectorFieldIndex {
                         lazy: Some(vi),
                         flat: VectorStore::default(),
@@ -5471,6 +5814,19 @@ impl SegmentReader {
             );
         };
 
+        // A v2 magic with a version this build does not know (written by a
+        // newer build) must not be parsed as the magic-less legacy format,
+        // which would read the magic as a dimension. Fail the column
+        // loudly instead; the query layer counts it as degraded.
+        if header_buf.len() >= 8 && header_buf[0..4] == VECTOR_MAGIC.to_le_bytes() {
+            let version = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+            if !is_known_vector_index_version(version) {
+                return Err(KoshaError::CorruptSegment(format!(
+                    "{} has vector index version {version}, which this build cannot read",
+                    idx_path.display()
+                )));
+            }
+        }
         let Some((dim, _total_count, version)) = parse_vector_idx_header(&header_buf) else {
             // Short (<HEADER_LEN) file, or no magic/an unrecognized version
             // — legacy v1 flat format. Serve it with exact flat_knn: ANN
@@ -5498,7 +5854,7 @@ impl SegmentReader {
             if let Some(parsed) = parse_vector_offsets(&offsets_data, dim, version) {
                 return Ok(VectorFieldIndex {
                     lazy: Some(LazyVectorIndex::from_parsed(
-                        idx_path, slot, dim, version, parsed,
+                        idx_path, slot, dim, version, parsed, field,
                     )),
                     flat: VectorStore::default(),
                     degraded: false,
@@ -5557,6 +5913,7 @@ impl SegmentReader {
         idx_path: &Path,
         offsets_path: &Path,
         slot: u32,
+        field: Option<String>,
     ) -> Option<LazyVectorIndex> {
         let data = fs::read(offsets_path).ok()?;
         if data.len() < VECTOR_OFFSETS_HEADER_LEN {
@@ -5566,7 +5923,7 @@ impl SegmentReader {
         let dim = u32::from_le_bytes(data[8..12].try_into().ok()?);
         let parsed = parse_vector_offsets(&data, dim, version)?;
         Some(LazyVectorIndex::from_parsed(
-            idx_path, slot, dim, version, parsed,
+            idx_path, slot, dim, version, parsed, field,
         ))
     }
 
@@ -5623,14 +5980,13 @@ impl SegmentReader {
                 ),
             ))
         })?;
-        let decoded = Arc::new(decode_posting_entries(&buf, vi.dim as u32));
+        let decoded = Arc::new(decode_posting_entries(&buf, vi.dim as u32, vi.version));
         // Second-touch admission, same as text postings: one-shot probes
         // (a cold namespace scanned once) pass through without evicting a
         // hot working set; recurring probes get cached on their second
         // hydration.
         if self.vector_cache.admit_on_miss(key) {
-            let bytes = decoded.len()
-                * (std::mem::size_of::<(u32, Vec<f32>)>() + vi.dim * std::mem::size_of::<f32>());
+            let bytes = decoded.resident_bytes();
             self.vector_cache.insert(key, Arc::clone(&decoded), bytes);
         }
         Ok(decoded)
@@ -5984,20 +6340,22 @@ impl SegmentReader {
         }
         // No usable sidecar: every posting, filtered while it is scored.
         self.prefetch_vector_postings(vi, 0..vi.ranges.len(), fetch);
+        // An i8 column scores approximately here (it has no exact vectors
+        // without the sidecar).
         let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
+        let unit_query = Self::unit_query(vi, query);
+        let is_candidate = |id: u32| candidates.binary_search(&id).is_ok();
         for range_idx in 0..vi.ranges.len() {
             let posting = match self.hydrate_posting(vi, range_idx) {
                 Ok(posting) => posting,
                 Err(e) => return Some(Err(e)),
             };
-            for (id, v) in posting.iter() {
-                if candidates.binary_search(id).is_ok() {
-                    scored.push((
-                        *id,
-                        kosha_vector_spfresh::cosine_similarity(query, v) as f64,
-                    ));
-                }
-            }
+            posting.for_each_similarity(
+                Some(&is_candidate),
+                |v| kosha_vector_spfresh::cosine_similarity(query, v),
+                &unit_query,
+                |id, sim| scored.push((id, sim as f64)),
+            );
         }
         let vectors_scored = scored.len();
         Some(Ok(ExactKnnResult {
@@ -6045,6 +6403,7 @@ impl SegmentReader {
 
         let mut probes = 0usize;
         let mut scored: Vec<(u32, f64)> = Vec::new();
+        let unit_query = Self::unit_query(vi, query);
         for (position, (range_idx, _)) in ranked.iter().enumerate() {
             if position >= budgeted {
                 // Past the budget. Without a restriction this is where the
@@ -6060,19 +6419,14 @@ impl SegmentReader {
                 }
             }
             probes += 1;
-            for (id, v) in self.hydrate_posting(vi, *range_idx)?.iter() {
-                if accept.is_some_and(|accept| !accept(*id)) {
-                    continue;
-                }
-                scored.push((
-                    *id,
-                    kosha_vector_spfresh::cosine_similarity(query, v) as f64,
-                ));
-            }
+            self.hydrate_posting(vi, *range_idx)?.for_each_similarity(
+                accept,
+                |v| kosha_vector_spfresh::cosine_similarity(query, v),
+                &unit_query,
+                |id, sim| scored.push((id, sim as f64)),
+            );
         }
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-        Ok((scored, probes))
+        Ok((self.finish_probe(vi, query, scored, k), probes))
     }
 
     // Deliberately NOT radius-aware: this is the per-segment `nprobe`
@@ -6128,21 +6482,120 @@ impl SegmentReader {
                     &candidates[position..(position + VECTOR_PREFETCH_CHUNK).min(candidates.len())];
                 self.prefetch_vector_postings(vi, chunk.iter().copied(), fetch);
             }
-            for (id, v) in self.hydrate_posting(vi, range_idx)?.iter() {
-                if accept.is_some_and(|accept| !accept(*id)) {
-                    continue;
-                }
-                let sim = if vi.unit_norm {
-                    kosha_vector_spfresh::dot(query, v).clamp(-1.0, 1.0)
-                } else {
-                    kosha_vector_spfresh::cosine_similarity(query, v)
-                };
-                scored.push((*id, sim as f64));
+            // `query` is already unit-normalized for every unit-norm
+            // column, which includes every i8 one.
+            self.hydrate_posting(vi, range_idx)?.for_each_similarity(
+                accept,
+                |v| {
+                    if vi.unit_norm {
+                        kosha_vector_spfresh::dot(query, v).clamp(-1.0, 1.0)
+                    } else {
+                        kosha_vector_spfresh::cosine_similarity(query, v)
+                    }
+                },
+                query,
+                |id, sim| scored.push((id, sim as f64)),
+            );
+        }
+        Ok(self.finish_probe(vi, query, scored, k))
+    }
+
+    /// `query` unit-normalized when `vi` is i8 (whose entries score
+    /// against a unit query); otherwise unused, so not computed.
+    fn unit_query<'q>(vi: &LazyVectorIndex, query: &'q [f32]) -> std::borrow::Cow<'q, [f32]> {
+        if vi.quantized {
+            let mut q = query.to_vec();
+            kosha_vector_spfresh::normalize_in_place(&mut q);
+            std::borrow::Cow::Owned(q)
+        } else {
+            std::borrow::Cow::Borrowed(query)
+        }
+    }
+
+    /// The probe's top `k` of `scored`, best first.
+    ///
+    /// An f32 column's scores are exact: sort and cut, as always. An i8
+    /// column's are approximate, so its best `k * rescore_factor` are
+    /// rescored with their full-precision vectors from `doc_vectors.bin`
+    /// (#210) before the cut — the quantization error then only decides
+    /// which candidates make that shortlist, not their final order.
+    /// Rescoring needs the sidecar locally and holding this field; without
+    /// it (inline-vector segments, a factor of `0`, a sidecar not yet
+    /// hydrated) the i8 scores stand.
+    fn finish_probe(
+        &self,
+        vi: &LazyVectorIndex,
+        query: &[f32],
+        mut scored: Vec<(u32, f64)>,
+        k: usize,
+    ) -> Vec<(u32, f64)> {
+        let by_score_desc = |a: &(u32, f64), b: &(u32, f64)| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        if !vi.quantized || self.vector_rescore_factor == 0 {
+            scored.sort_by(by_score_desc);
+            scored.truncate(k);
+            return scored;
+        }
+        let mut shortlist = top_k_by_score(scored, k.saturating_mul(self.vector_rescore_factor));
+        if let Some(field) = vi.field.as_deref() {
+            self.rescore_exact(field, query, &mut shortlist);
+        }
+        shortlist.sort_by(by_score_desc);
+        shortlist.truncate(k);
+        shortlist
+    }
+
+    /// Replaces each candidate's score with the cosine similarity of
+    /// `query` and its full-precision vector in `doc_vectors.bin`, where
+    /// the sidecar has one. Returns how many were rescored; `0` (scores
+    /// untouched) when the sidecar is absent, lacks `field`, or fails to
+    /// read.
+    fn rescore_exact(&self, field: &str, query: &[f32], candidates: &mut [(u32, f64)]) -> usize {
+        if candidates.is_empty()
+            || !self.footer.doc_vectors
+            || !self.segment_dir.join(DOC_VECTORS_FILE).exists()
+        {
+            return 0;
+        }
+        let dv = match self.doc_vectors() {
+            Ok(dv) if dv.has_field(field) => dv,
+            Ok(_) => return 0,
+            Err(e) => {
+                eprintln!(
+                    "WARN: cannot rescore i8 kNN candidates of {}: {e} — keeping quantized scores",
+                    self.segment_dir.display()
+                );
+                return 0;
+            }
+        };
+        let mut doc_seqs: Vec<u32> = candidates.iter().map(|(id, _)| *id).collect();
+        doc_seqs.sort_unstable();
+        doc_seqs.dedup();
+        let mut exact: HashMap<u32, f64> = HashMap::with_capacity(doc_seqs.len());
+        let visited = dv.visit_field_vectors(field, &doc_seqs, |doc_seq, v| {
+            if v.len() == query.len() {
+                exact.insert(
+                    doc_seq,
+                    kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                );
+            }
+        });
+        if let Err(e) = visited {
+            eprintln!(
+                "WARN: cannot rescore i8 kNN candidates of {}: {e} — keeping quantized scores",
+                self.segment_dir.display()
+            );
+            return 0;
+        }
+        let mut rescored = 0;
+        for (id, score) in candidates.iter_mut() {
+            if let Some(&s) = exact.get(id) {
+                *score = s;
+                rescored += 1;
             }
         }
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-        Ok(scored)
+        rescored
     }
 
     /// The segment's filter columns, parsed on first use (see

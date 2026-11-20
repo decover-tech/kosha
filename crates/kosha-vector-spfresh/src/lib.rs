@@ -20,6 +20,7 @@ mod kmeans;
 mod ops;
 mod point;
 mod posting;
+mod quant;
 mod rng;
 mod search;
 
@@ -28,6 +29,7 @@ use std::collections::HashMap;
 pub use centroid_probe::{nearest_centroids, nearest_centroids_dot};
 pub use error::VectorIndexError;
 pub use point::{cosine_distance, cosine_similarity, dot, normalize_in_place};
+pub use quant::{dequantize_i8, dot_i8, quantize_i8, I8_MAX_CODE};
 pub use rng::DeterministicRng;
 
 use posting::{Posting, PostingId};
