@@ -10,7 +10,8 @@ runner drives them over HTTP and checks every answer exactly.
 CI runs it on every PR (`.github/workflows/integration.yml`, 15-minute
 timeout), followed by the Postgres CAS tests that plain `cargo test` skips:
 `cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored`
-against a database created in the compose Postgres.
+against a database created in the compose Postgres (one test thread until
+#330, a race between concurrent first-time migrations, is fixed).
 
 It reuses the conformance suite (`scripts/conformance/`): its HTTP client,
 deterministic corpus, query set and BM25/filter reference model. Where
@@ -34,7 +35,7 @@ docker compose -f docker-compose.yml \
   -f scripts/integration/docker-compose.integration.yml \
   exec -T postgres createdb -U kosha kosha_cas_test
 KOSHA_TEST_DATABASE_URL=postgres://kosha:kosha-dev@localhost:5432/kosha_cas_test \
-  cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored
+  cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored --test-threads=1
 # Tear down (volumes included):
 docker compose -f docker-compose.yml \
   -f scripts/integration/docker-compose.integration.yml down -v
@@ -53,7 +54,7 @@ two processes or a restart (b, c, h) are skipped, and the rest run against the
 single server.
 
 Useful flags: `--only a,g` (run some scenarios), `--seed N`, `--docs N`
-(main-lifecycle corpus size, default 2000), `--loaders N` / `--loader-docs N`
+(main-lifecycle corpus size, default 4000), `--loaders N` / `--loader-docs N`
 (scenario d), `--strict`, `--verbose`.
 
 ## The stack
@@ -90,7 +91,7 @@ refresh and hide a broken refresher.
 | a | ingest publish | Index and flush on ingest, then exact answers on the query pod, which has its own empty volume and must fetch every segment from S3. Three more flushes then reach the already-loaded query pod through the background refresher alone. | #230 (CAS publish after S3 durability), #231 (`_COMMIT` marker), #232 (refresher) |
 | b | forwarded writes | Index, upsert, delete-by-query and flush sent to the query pod are forwarded to ingest. A `strong` search on the query pod sees unflushed writes. | #255 |
 | f | deletes | Delete by id (`terms` on a `slot` keyword) on ingest and delete-by-query through the query pod. Visible on both pods. Every later checkpoint (after compaction and both restarts) checks that the deleted ids stay deleted. | #237 |
-| d | bulk loaders | 8 concurrent loader threads (half through each pod) index 400 docs each in batches with interleaved flushes, then upsert every fifth doc. The final contents on both pods must be exact: every id, no extras, newest revision. | |
+| d | bulk loaders | 8 concurrent loader threads (half through each pod) index 500 docs each in batches with interleaved flushes, then upsert every fifth doc. The final contents on both pods must be exact: every id, no extras, newest revision. | |
 | g | tenant isolation | Tenants A and B own namespaces with the same name. Key A must be refused (4xx, nothing leaked) on B's namespace on both pods, over the v1 routes (search, stats, exists, documents, delete, flush, drop), the legacy routes (`POST /search`, `GET /search`, `/index`, `/replace`, `/delete`, `/flush`, `/exists`), an admin route and global stats. Legacy routes scope an unqualified name to the caller, and A's legacy delete-all leaves B intact. | #234 |
 | e | compaction | `POST /v1/admin/compact-namespace`, then exact answers on both pods. | |
 | c | ingest restart | Index without flushing, restart ingest, flush, check. Then the same with the ingest volume wiped: the acknowledged writes come back from the S3 WAL and the manifests from Postgres. | #236, boot reconciliation |
