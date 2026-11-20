@@ -43,12 +43,13 @@ ANN structure when a segment is opened.
   Split / Merge / Reassign) to restore the 16..128 size bounds. A stray that
   bisection pushed into an unrelated region can be farther from all of its
   posting's neighbours than from some other posting; in the first round a
-  vector the candidates cannot be shown to cover (an angular
+  vector that is far from every candidate (beyond 1.25x its posting's median)
+  and that the candidates cannot be shown to cover (an angular
   triangle-inequality test against the farthest candidate) looks up its own
-  nearest posting. On 10k unit-norm 128-d vectors this lifts radius-aware
-  recall@10 at a 5% probe budget from 0.44 to 1.00 (median radius 0.87 to
-  0.45) for about 23% more build time; at 200k, p90 radius drops from 0.83 to
-  0.19 for about 11%.
+  nearest posting. On 10k unit-norm 128-d vectors from a 200-centre mixture
+  this lifts radius-aware recall@10 at a 5% probe budget from 0.44 to 0.997
+  (median radius 0.87 to 0.47) for about 12% more build time; at 200k the p90
+  radius drops from 0.83 to 0.20 for about 8%.
   `build_refine_rounds = 0` (kosha: `KOSHA_VECTOR_BUILD_REFINE=off`) is the
   plain bisection build, with undersized postings merged away, exactly as
   before. The same build serves `KOSHA_VECTOR_COMPACTION=rebuild` and the
