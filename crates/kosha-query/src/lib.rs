@@ -1043,22 +1043,37 @@ pub struct QueryAnalysis {
     /// Fuzzy-bloom probes per token: the hashes of its deletion
     /// neighbourhood, computed once and shared by every segment.
     fuzzy_probes: Mutex<HashMap<String, Arc<BloomProbes>>>,
+    /// The legacy `standard@1` reading, analyzed up front: it is what every
+    /// segment without a footer `analysis` (nearly all of them) uses, so
+    /// those segments skip the per-chain map, its lock and its hashing on
+    /// the per-segment hot path.
+    legacy: Arc<AnalyzedQuery>,
     by_chain: Mutex<HashMap<AnalyzerSpec, Arc<AnalyzedQuery>>>,
 }
 
 impl QueryAnalysis {
     pub fn new(query: &SearchQuery) -> Self {
+        let text = query.query_text.clone();
+        let phrase = query.match_phrase.as_ref().map(|mp| mp.phrase.clone());
+        let fuzzy = query.fuzzy.clone();
+        let legacy = Arc::new(Self::analyze(
+            &Analyzer::new(&AnalyzerSpec::legacy()),
+            &text,
+            phrase.as_deref(),
+            fuzzy.as_ref().map(|fuzzy| fuzzy.value.as_str()),
+        ));
         Self {
-            has_text: !tokenize(&query.query_text).is_empty(),
-            text: query.query_text.clone(),
-            phrase: query.match_phrase.as_ref().map(|mp| mp.phrase.clone()),
+            has_text: !legacy.terms.is_empty(),
+            text,
+            phrase,
             fields: query.field_boosts(),
             phrase_fields: query
                 .match_phrase
                 .as_ref()
                 .and_then(|mp| mp.restricted_fields()),
-            fuzzy: query.fuzzy.clone(),
+            fuzzy,
             fuzzy_probes: Mutex::new(HashMap::new()),
+            legacy,
             by_chain: Mutex::new(HashMap::new()),
         }
     }
@@ -1206,24 +1221,35 @@ impl QueryAnalysis {
         keys
     }
 
+    fn analyze(
+        analyzer: &Analyzer,
+        text: &str,
+        phrase: Option<&str>,
+        fuzzy: Option<&str>,
+    ) -> AnalyzedQuery {
+        AnalyzedQuery {
+            terms: analyzer.analyze(text),
+            positioned: analyzer.analyze_with_positions(text),
+            phrase: phrase.map(|phrase| analyzer.analyze_with_positions(phrase)),
+            fuzzy: fuzzy
+                .map(|value| analyzer.analyze(value))
+                .unwrap_or_default(),
+        }
+    }
+
     pub fn for_chain(&self, spec: &AnalyzerSpec) -> Arc<AnalyzedQuery> {
+        if spec.is_legacy() {
+            return Arc::clone(&self.legacy);
+        }
         if let Some(found) = self.by_chain.lock().unwrap().get(spec) {
             return Arc::clone(found);
         }
-        let analyzer = Analyzer::new(spec);
-        let analyzed = Arc::new(AnalyzedQuery {
-            terms: analyzer.analyze(&self.text),
-            positioned: analyzer.analyze_with_positions(&self.text),
-            phrase: self
-                .phrase
-                .as_ref()
-                .map(|phrase| analyzer.analyze_with_positions(phrase)),
-            fuzzy: self
-                .fuzzy
-                .as_ref()
-                .map(|fuzzy| analyzer.analyze(&fuzzy.value))
-                .unwrap_or_default(),
-        });
+        let analyzed = Arc::new(Self::analyze(
+            &Analyzer::new(spec),
+            &self.text,
+            self.phrase.as_deref(),
+            self.fuzzy.as_ref().map(|fuzzy| fuzzy.value.as_str()),
+        ));
         Arc::clone(
             self.by_chain
                 .lock()
@@ -1237,6 +1263,10 @@ impl QueryAnalysis {
     /// holds `analysis`. Never empty. Readings with no terms are dropped
     /// unless every reading is empty.
     pub fn for_segment(&self, analysis: Option<&SegmentAnalysis>) -> Vec<Arc<AnalyzedQuery>> {
+        let Some(analysis) = analysis else {
+            return vec![Arc::clone(&self.legacy)];
+        };
+        let analysis = Some(analysis);
         let mut readings: Vec<Arc<AnalyzedQuery>> = Vec::new();
         for chain in kosha_core::analysis::segment_query_chains(analysis) {
             let reading = self.for_chain(&chain);
