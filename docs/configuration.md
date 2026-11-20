@@ -113,6 +113,7 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | `KOSHA_KNN_EXACT_THRESHOLD` | A filtered kNN with at most this many filter-passing documents namespace-wide scores every passing document's vector exactly instead of probing (#252). `0` disables exact filtered kNN | `50000` | documents |
 | `KOSHA_KNN_EXACT_FRACTION` | A segment where at most this fraction of documents pass the filter is searched exactly too (#252) | `0.01` | fraction |
 | `KOSHA_KNN_FILTER_BUDGET_MAX_SCALE` | Most a filtered kNN widens the global probe budget by (`1 / selectivity`, #252) | `8` | multiplier |
+| `KOSHA_LATE_INTERACTION_NPROBE` | Token-index postings probed per query token by a late-interaction (`knn.vectors`) search, before candidates are re-scored exactly (#205) | `16` | postings |
 
 ## Warmup
 

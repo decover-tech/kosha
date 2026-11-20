@@ -143,6 +143,8 @@ fn query(vector: Vec<f32>, k: usize, num_candidates: usize, field: &str) -> Sear
         filter: (!field.is_empty()).then(|| FilterClause::Term {
             term: HashMap::from([(field.to_string(), "y".to_string())]),
         }),
+        scoring: None,
+        vectors: None,
     });
     q
 }

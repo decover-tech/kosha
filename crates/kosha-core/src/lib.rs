@@ -1937,6 +1937,15 @@ pub struct Footer {
     /// and `Some([])` means the segment has no vector index at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_fields: Option<Vec<VectorFieldMeta>>,
+    /// Late-interaction (multi-vector) fields in this segment (#205): one
+    /// entry per `Vector` field whose values were bags of token vectors
+    /// (`[[f32; dim]; n]`). Entry `i`'s files are
+    /// `multivec.{i}.bags` and `multivec.{i}.ivf`. Empty — every segment
+    /// written before #205, and every segment without a bag — means no
+    /// late-interaction data; nothing is serialized then, so such footers
+    /// stay byte-identical to before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub multi_vectors: Vec<MultiVectorField>,
 }
 
 /// Value type of one filter column (#244). A field name can appear with
@@ -2170,6 +2179,19 @@ pub fn is_vector_index_file(name: &str) -> bool {
         None => rest,
     };
     tail == "idx" || tail == "offsets"
+}
+
+/// One late-interaction field of a segment; see [`Footer::multi_vectors`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiVectorField {
+    /// The document field name the bags were read from.
+    pub name: String,
+    /// Dimensionality of every token vector in the field.
+    pub dim: u32,
+    /// Documents with a bag in this field.
+    pub docs: u32,
+    /// Token vectors across all of those bags.
+    pub tokens: u64,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -2772,13 +2794,96 @@ impl Manifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnnQuery {
     pub field: String,
+    /// The query vector for single-vector kNN. Empty (and omitted) for a
+    /// late-interaction query that sends `vectors` instead.
+    #[serde(default)]
     pub vector: Vec<f32>,
     #[serde(default = "default_knn_k")]
     pub k: usize,
+    /// Single-vector kNN: the whole-query posting probe budget. Late
+    /// interaction: how many candidate documents per segment are re-scored
+    /// with exact MaxSim (at least `k`).
     #[serde(default = "default_knn_num_candidates")]
     pub num_candidates: usize,
     #[serde(default)]
     pub filter: Option<FilterClause>,
+    /// Late interaction (#205): the query's bag of token vectors. Setting
+    /// it selects [`KnnScoring::LateInteraction`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<Vec<Vec<f32>>>,
+    /// How documents are scored against the query. `None` is inferred:
+    /// late interaction when `vectors` is set, single-vector cosine
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring: Option<KnnScoring>,
+}
+
+/// `knn.scoring`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnnScoring {
+    /// One query vector against one document vector, cosine similarity.
+    Cosine,
+    /// ColBERT-style MaxSim (#205): the query and each document are bags
+    /// of token vectors, and the score is the sum over query tokens of the
+    /// best cosine similarity against any of the document's tokens.
+    LateInteraction,
+}
+
+impl KnnQuery {
+    /// Whether this query is scored with late interaction (MaxSim).
+    pub fn is_late_interaction(&self) -> bool {
+        match self.scoring {
+            Some(KnnScoring::LateInteraction) => true,
+            Some(KnnScoring::Cosine) => false,
+            None => self.vectors.is_some(),
+        }
+    }
+
+    /// The query's token vectors for late interaction: `vectors`, or the
+    /// single `vector` as a one-token bag.
+    pub fn query_tokens(&self) -> Vec<&[f32]> {
+        match self.vectors {
+            Some(ref bag) => bag.iter().map(Vec::as_slice).collect(),
+            None if !self.vector.is_empty() => vec![self.vector.as_slice()],
+            None => Vec::new(),
+        }
+    }
+
+    /// Shape checks that need no segment. An `Err` is a client error.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.vectors.is_some() && !self.vector.is_empty() {
+            return Err("knn takes either vector or vectors, not both".into());
+        }
+        if self.scoring == Some(KnnScoring::Cosine) && self.vectors.is_some() {
+            return Err(
+                "knn.vectors is a bag of token vectors and needs scoring \"late_interaction\""
+                    .into(),
+            );
+        }
+        if !self.is_late_interaction() {
+            // `vector` used to be a required field; it may be omitted now
+            // only because `vectors` can stand in for it.
+            if self.vector.is_empty() {
+                return Err("knn needs a vector (or vectors, for late interaction)".into());
+            }
+            return Ok(());
+        }
+        let tokens = self.query_tokens();
+        let Some(first) = tokens.first() else {
+            return Err("late-interaction knn needs at least one query vector".into());
+        };
+        if first.is_empty() {
+            return Err("knn.vectors entries must not be empty".into());
+        }
+        if tokens.iter().any(|t| t.len() != first.len()) {
+            return Err("every knn.vectors entry must have the same dimension".into());
+        }
+        if tokens.iter().any(|t| t.iter().any(|x| !x.is_finite())) {
+            return Err("knn.vectors must hold finite numbers".into());
+        }
+        Ok(())
+    }
 }
 fn default_knn_k() -> usize {
     10
@@ -3143,6 +3248,9 @@ impl SearchQuery {
         }
         for (name, agg) in &self.aggs {
             agg.validate(name).map_err(KoshaError::InvalidQuery)?;
+        }
+        if let Some(ref knn) = self.knn {
+            knn.validate().map_err(KoshaError::InvalidQuery)?;
         }
         let has_lexical = self.has_lexical_query();
         let has_knn = self.knn.is_some();
@@ -4243,6 +4351,7 @@ mod tests {
             field_index: None,
             fuzzy_bloom: None,
             vector_fields: None,
+            multi_vectors: Vec::new(),
         }
     }
 

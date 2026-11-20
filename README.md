@@ -43,6 +43,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | `prefix` filter | `{"prefix": {"path": "/matters/2026/"}}`, or the long form `{"prefix": {"path": {"value": "/matters/2026/", "case_insensitive": true}}}`. Case-sensitive by default, like `term` (and unlike the `wildcard` query): `"ab"` matches `abc` and `ab`, not `a`, `xab` or `ABC`. A list value matches when any element does. The empty prefix matches exactly the documents `exists` matches. String fields only: a `prefix` on an `Integer`/`Float` field is a 400. Only `value` and `case_insensitive` are accepted in the long form. Evaluated by a scan of the segment's filter column (each distinct value once on a columnar segment), cached per segment; bloom filters cannot skip segments for it |
 | Multiple vector columns | A namespace can hold several `Vector` fields (e.g. a 384-dim `title_emb` and a 1536-dim `body_emb`); each segment builds one index per field and `knn.field` picks the one searched. Each field has one dimension per namespace, fixed by the first vector written to it: a document whose vector disagrees is rejected with a 400, and so is a `knn` naming a field no segment indexes or a query vector of the wrong dimension. Segments written before this change keep serving any `knn.field` from their single index, unless their `doc_vectors.bin` names exactly one field (#204) |
 | i8 vector quantization | `KOSHA_VECTOR_QUANTIZATION=i8` (or per field, `KOSHA_VECTOR_QUANTIZATION_FIELDS=body_emb:i8,title_emb:f32`) stores each segment's ANN posting entries as one f32 scale plus `dim` signed bytes instead of `dim` f32s: `vector.idx`, the bytes a cold kNN hydrates and the warm posting cache all shrink ~4x (measured 3.96x at 768 dims). The probe scores with an i8 dot product, then rescores its best `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates (default 4, `0` disables) with the full-precision vectors in `doc_vectors.bin`, so final scores are exact cosine. f32 and i8 segments mix freely in a namespace. Default `f32`; see the rollout note below (#210) |
+| Late-interaction (ColBERT-style) vectors | A `Vector` field whose value is a bag of token vectors (`[[f32; dim]; n]`) is indexed for MaxSim: `"knn": {"field": "tokens", "vectors": [[...], [...]], "k": 10}` scores `Σ over query tokens of max cosine over the document's tokens`. See [Late interaction](#late-interaction) |
 | kNN-scoped filters | `knn.filter` restricts only the vector list; the top-level `filter` restricts both the lexical and the vector list |
 | Filtered kNN | Filters are applied inside the probe, and a filtered kNN always returns `min(k, documents passing)` hits. When at most 50,000 documents pass namespace-wide (`KOSHA_KNN_EXACT_THRESHOLD`; `0` disables), every passing document's vector is scored exactly instead of probing centroids, so recall is 1.0. A segment where at most 1% of documents pass (`KOSHA_KNN_EXACT_FRACTION`) is searched exactly too. Otherwise the global probe budget is widened by the inverse of the filter's selectivity (at most 8x, `KOSHA_KNN_FILTER_BUDGET_MAX_SCALE`). The response reports `knn_mode` (`ann` / `exact` / `mixed`) and `knn_filtered_candidates` (documents passing the filter). Unfiltered kNN is unchanged and reports `ann` |
 | Sorting | Multi-field `sort` over stored fields and [nested dotted paths](#nested-attributes), plus `_id`. A multi-valued field sorts by its smallest value for `asc` and its largest for `desc` (Elasticsearch's default `mode`) |
@@ -431,6 +432,47 @@ manifest for it: within one manifest refresh (`KOSHA_MANIFEST_REFRESH_MS`,
 default 500 ms), or at once for a search with `max_staleness_seconds: 0`. Their local disk copies of its segments are not removed
 eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them. Re-creating the
 namespace, explicitly or by writing to it, starts it empty.
+
+## Late interaction
+
+ColBERT-style multi-vector retrieval (issue #205). Send a document's token embeddings as a
+`Vector` field whose value is a JSON array of equal-length arrays, and query them with a bag of
+query token embeddings:
+
+```json
+{"id": "p1", "fields": [{"name": "tokens", "field_type": "Vector",
+                         "value": "[[0.12, -0.03, ...], [0.08, 0.41, ...], ...]"}]}
+
+{"query_text": "", "max_results": 10,
+ "knn": {"field": "tokens", "vectors": [[0.2, ...], [0.1, ...]], "k": 10, "num_candidates": 100}}
+```
+
+The score is `MaxSim(Q, D) = Σ_q max_d cosine(q, d)` (so it ranges up to the number of query
+tokens). `vectors` implies `"scoring": "late_interaction"`; setting that with a single `vector`
+searches with a one-token bag. `knn.filter`, the top-level `filter`, deletes and hybrid RRF work
+as for single-vector kNN. A query whose tokens differ in dimension from the field's is a 400.
+
+**How it runs.** Each segment keeps, per late-interaction field, `multivec.{i}.bags` (every
+token, unit-normalized f32, with a per-document offsets table so one bag is one ranged read) and
+`multivec.{i}.ivf` (the tokens clustered with the same balanced k-means as the single-vector
+index; each posting holds its tokens' doc ids and int8 codes). For every query token the
+`KOSHA_LATE_INTERACTION_NPROBE` (default 16) nearest postings are scored from the int8 codes,
+the best `num_candidates` documents by that approximate MaxSim are re-scored exactly from their
+bags, and the top `k` are kept. With enough probes and candidates the result is exact MaxSim
+(tested against a brute-force reference). The source JSON stays in the doc store, so documents
+read back as sent and compaction rebuilds the files from it; a binary older than this change
+reads these segments normally, just without late-interaction hits, and its compactions drop the
+`multivec` files until a newer binary compacts again.
+
+**Cost** (`cargo bench -p kosha-query --bench late_interaction`, synthetic clustered corpus,
+Apple M5). Per document, relative to its raw f32 tokens: `.bags` 1.00x, `.ivf` 0.28x, and the
+source JSON in the doc store 2.55x, so about 4.8x the raw token bytes in all. With 128-dim
+tokens, 64 per document, that is 32 KB raw, ~124 KB stored, against ~0.5 KB for one 128-dim
+vector; the index build is k-means over every token (7.6 s for 8,000 such documents, 512k
+tokens). Queries: 8,000 documents x 64 tokens, 32 query tokens: warm p50 15.3 ms, recall@10
+against brute-force MaxSim 1.000 (single-vector kNN over mean-pooled tokens: 1.1 ms, but only
+0.40 of the MaxSim top 10). 4,000 x 32 tokens at 64 dim, 16 query tokens: 1.9 ms. Single-vector
+kNN is unchanged when the feature is unused (`knn_open_search` p50s identical to main).
 
 ## Authorization and durability
 

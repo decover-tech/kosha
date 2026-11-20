@@ -233,6 +233,8 @@ pub fn build_search_query(
                 k,
                 num_candidates,
                 filter,
+                vectors: None,
+                scoring: None,
             })
         }
         // clap's `requires` makes these unreachable from the command line.

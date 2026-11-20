@@ -158,6 +158,8 @@ fn compacted_recall(mode: VectorCompactionMode, data_seed: u64, queries: &[Vec<f
             k: 10,
             num_candidates: 1,
             filter: None,
+            scoring: None,
+            vectors: None,
         });
         let r = searcher
             .search(&ns, &manifest, &query, Some(&manifest.tombstones))

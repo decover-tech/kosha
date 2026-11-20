@@ -80,6 +80,20 @@ pub fn mean_vector<'a>(vectors: impl Iterator<Item = &'a [f32]>, dim: usize) -> 
     sum
 }
 
+/// Brute-force late-interaction score (ColBERT MaxSim): for each query
+/// token, the best [`cosine_similarity`] against any document token,
+/// summed. The reference the segment index is tested against (#205).
+pub fn maxsim<Q: AsRef<[f32]>, D: AsRef<[f32]>>(query: &[Q], doc: &[D]) -> f32 {
+    query
+        .iter()
+        .map(|q| {
+            doc.iter()
+                .map(|d| cosine_similarity(q.as_ref(), d.as_ref()))
+                .fold(f32::NEG_INFINITY, f32::max)
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

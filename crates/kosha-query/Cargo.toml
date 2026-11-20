@@ -78,3 +78,7 @@ harness = false
 [[bench]]
 name = "filtered_knn"
 harness = false
+
+[[bench]]
+name = "late_interaction"
+harness = false
