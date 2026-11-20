@@ -6,14 +6,16 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+pub mod rerank;
+
 use kosha_core::fields::{field_norms_key, field_term_key, segment_field_chain};
 use kosha_core::fuzzy::{ExpandStats, FuzzyQuery, MAX_FUZZY_EDITS};
 use kosha_core::{
     segment_may_contain_terms, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
     AggMetricResult, Aggregation, AggregationResults, Bm25Params, Bm25StatsScope, DocSet,
     DocumentId, FieldType, FilterClause, FilterStore, HighlightConfig, KoshaError, Manifest,
-    ManifestEntry, NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery, SearchResult,
-    SortSpec, TermBloomMode, TotalHitsRelation,
+    ManifestEntry, MetricKind, NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery,
+    SearchResult, SortSpec, TermBloomMode, TotalHitsRelation,
 };
 use kosha_core::{AnalyzerSpec, FieldBoost, Footer, SegmentAnalysis};
 pub use kosha_segment::VectorSpanFetch;
@@ -317,10 +319,14 @@ impl TrackedSegment {
     /// column fails the request instead of matching nothing. The set is
     /// also the segment's pre-filter for a filtered vector probe (#252):
     /// [`DocSet::to_bitmap`] gives it as a roaring bitmap.
+    /// Fails, and caches nothing, when the clause cannot apply to this
+    /// segment's columns (see [`kosha_core::check_filter`]).
     fn filter_set(&self, key: &str, clause: &FilterClause) -> Result<Arc<DocSet>, KoshaError> {
         if let Some(set) = self.filter_sets.lock().unwrap().get(key) {
             return Ok(Arc::clone(set));
         }
+        let store = self.reader.filter_store();
+        kosha_core::check_filter(clause, &store).map_err(KoshaError::InvalidQuery)?;
         // Evaluated outside the lock: two requests racing on a new filter
         // both compute it, and one result is dropped. That is cheaper than
         // making every other request for this segment wait behind a scan.
@@ -479,6 +485,22 @@ impl SegmentCache {
     /// wait on in-flight releases.
     fn evict_idle(&self, needed: u64) {
         self.evict_idle_until(|_len, _total, freed| freed >= needed);
+    }
+
+    /// Drop every cached entry for one segment (both `load_vectors`
+    /// variants), pinned or not, and hand back the removed readers. Stale
+    /// recency keys are skipped by the eviction walk.
+    fn remove_segment(&self, namespace: &str, segment_id: &str) -> Vec<Arc<TrackedSegment>> {
+        let mut entries = self.entries.lock().unwrap();
+        let mut removed = Vec::new();
+        for load_vectors in [false, true] {
+            let key = (namespace.to_string(), segment_id.to_string(), load_vectors);
+            if let Some((reader, size)) = entries.remove(&key) {
+                self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                removed.push(reader);
+            }
+        }
+        removed
     }
 
     /// Shared eviction walk: pop LRU-order entries, evicting the *idle*
@@ -1767,6 +1789,7 @@ impl FilterApplier {
         store: &FilterStore,
         candidates: &HashSet<u32>,
     ) -> Result<HashSet<u32>, KoshaError> {
+        kosha_core::check_filter(clause, store).map_err(KoshaError::InvalidQuery)?;
         let doc_count = candidates.iter().max().map_or(0, |max| max + 1);
         let passing = kosha_core::evaluate_filter(clause, store, doc_count);
         Ok(candidates
@@ -1778,6 +1801,26 @@ impl FilterApplier {
 }
 
 // ─── Highlight applier ──────────────────────────────────────────────────────
+
+/// The string leaves a dotted `path` names inside a document's nested
+/// containers (#206): for `author.bio`, the `bio` leaves of a `Keyword`
+/// field `author` holding a JSON object or array of objects. Every split
+/// point is tried, so a container whose own name has a dot still resolves.
+fn nested_highlight_sources(fields: &[kosha_core::Field], path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (split, _) in path.match_indices('.') {
+        let (container, rest) = (&path[..split], &path[split + 1..]);
+        for field in fields {
+            if field.name != container || field.field_type != FieldType::Keyword {
+                continue;
+            }
+            if let Some(value) = kosha_core::nested::parse_container(&field.value) {
+                out.extend(kosha_core::nested::leaf_strings(&value, rest));
+            }
+        }
+    }
+    out
+}
 
 pub fn apply_highlight(
     text: &str,
@@ -1816,12 +1859,20 @@ pub fn apply_highlights(
     for requested in &config.fields {
         let pre = config.pre_tag(requested);
         let post = config.post_tag(requested);
-        let fragments: Vec<String> = doc
+        let mut fragments: Vec<String> = doc
             .fields
             .iter()
             .filter(|f| f.name == requested.name && f.field_type == FieldType::Text)
             .map(|f| apply_highlight(&f.value, query_terms, pre, post))
             .collect();
+        if fragments.is_empty() {
+            // A dotted path into a nested container (#206): highlight the
+            // string leaves at that path.
+            fragments = nested_highlight_sources(&doc.fields, &requested.name)
+                .iter()
+                .map(|text| apply_highlight(text, query_terms, pre, post))
+                .collect();
+        }
         if !fragments.is_empty() {
             by_field.insert(requested.name.clone(), fragments);
         }
@@ -2082,7 +2133,14 @@ pub struct Searcher {
     global_wand: std::sync::atomic::AtomicBool,
     /// Per-segment score-ceiling inputs per manifest version (issue #248).
     ceilings: CeilingCache,
+    /// Readers of retired segments, released from the cache by
+    /// [`Searcher::release_segment`] while an in-flight search still held
+    /// them. Keyed by `(namespace, segment_id)`.
+    draining: Mutex<HashMap<(String, String), DrainingReaders>>,
 }
+
+/// Weak handles to the readers of one released segment.
+type DrainingReaders = Vec<std::sync::Weak<TrackedSegment>>;
 
 /// Result of a [`Searcher::warm_segments`] pass — how many segments were
 /// newly opened/cached vs. already resident, and the estimated bytes
@@ -2142,6 +2200,7 @@ impl Searcher {
             corpus_stats: CorpusStatsCache::default(),
             global_wand: std::sync::atomic::AtomicBool::new(true),
             ceilings: CeilingCache::default(),
+            draining: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2152,6 +2211,35 @@ impl Searcher {
     #[doc(hidden)]
     pub fn set_global_wand_threshold(&self, enabled: bool) {
         self.global_wand.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Stop caching a retired segment and report whether any reader of it
+    /// is still alive (#239).
+    ///
+    /// Drops the segment's cache entries, then checks every reader of it
+    /// this searcher has handed out and not yet seen dropped. `true` means
+    /// an in-flight search still holds one and the segment's files must
+    /// stay on disk (its doc store and postings are read lazily, by path);
+    /// call again later. `false` means nothing can read it any more. A
+    /// search that reopens it after this call puts it back in the cache,
+    /// and the next call removes it again.
+    pub fn release_segment(&self, namespace: &str, segment_id: &str) -> bool {
+        let removed = self.segment_cache.remove_segment(namespace, segment_id);
+        let weak: Vec<std::sync::Weak<TrackedSegment>> =
+            removed.iter().map(Arc::downgrade).collect();
+        // Release the cache's own references (and so their ledger bytes)
+        // before counting who else holds one.
+        drop(removed);
+        let key = (namespace.to_string(), segment_id.to_string());
+        let mut draining = self.draining.lock().unwrap();
+        let list = draining.entry(key.clone()).or_default();
+        list.extend(weak);
+        list.retain(|w| w.strong_count() > 0);
+        let busy = !list.is_empty();
+        if !busy {
+            draining.remove(&key);
+        }
+        busy
     }
 
     /// Return the cached parsed segment for `(namespace, segment_id,
@@ -4587,7 +4675,7 @@ impl Searcher {
                 .chain(knn_hits.iter().map(|(doc_seq, _, _)| *doc_seq))
                 .collect();
             if columnar_filters {
-                build_sort_value_maps_columnar(&reader, sort_value_fields, &wanted)?
+                build_sort_value_maps_columnar(&reader, sort_value_fields, &wanted, &query.sort)?
             } else {
                 build_sort_value_maps(
                     filter_store
@@ -4595,6 +4683,7 @@ impl Searcher {
                         .expect("custom sort requires filter_store"),
                     sort_value_fields,
                     &wanted,
+                    &query.sort,
                 )
             }
         };
@@ -4805,6 +4894,27 @@ impl Searcher {
         )
     }
 
+    /// A request with `rerank`: run its first-stage query, then
+    /// [`rerank::apply`] with `provider`. Returns the call made, if any,
+    /// for metrics. `query.rerank` must be set.
+    pub fn search_reranked(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
+        provider: &Arc<dyn rerank::RerankProvider>,
+    ) -> Result<(SearchResult, Option<rerank::RerankCall>), KoshaError> {
+        query.validate()?;
+        let first = query.first_stage_query().ok_or_else(|| {
+            KoshaError::InvalidQuery("search_reranked needs a request with rerank".into())
+        })?;
+        let (result, _) = self.search_inner(namespace, manifest, &first, tombstones, None, None)?;
+        Ok(rerank::apply(query, result, provider))
+    }
+
     fn search_inner(
         &self,
         namespace: &NamespaceId,
@@ -4819,6 +4929,16 @@ impl Searcher {
         // Out-of-range BM25 parameters are a client error, not something
         // to clamp: every entry point funnels through here.
         query.validate()?;
+        if query.rerank.is_some() {
+            // The searcher never calls a provider; ignoring the field would
+            // silently return an unreranked page.
+            return Err(KoshaError::InvalidQuery(
+                "rerank is applied after the search: use Searcher::search_reranked, or \
+                 search SearchQuery::first_stage_query() and pass the result to \
+                 kosha_query::rerank::apply"
+                    .into(),
+            ));
+        }
         let mut hydrated;
         let manifest = if manifest
             .deletion_vectors
@@ -4847,6 +4967,8 @@ impl Searcher {
                     // No segments existed to search, degraded or otherwise —
                     // distinct from "searched N segments, 0 degraded".
                     knn_degraded_segments: None,
+                    rerank_degraded: None,
+                    rerank_degraded_reason: None,
                 },
                 phase_stats,
             ));
@@ -5331,6 +5453,8 @@ impl Searcher {
                 highlights: None,
                 highlight: None,
                 rank_details: cand.rank_details.clone(),
+                fused_score: None,
+                rerank_score: None,
             };
             if let Some(ref highlight) = query.highlight {
                 if !query_terms.is_empty() {
@@ -5345,7 +5469,7 @@ impl Searcher {
             page.push(doc);
         }
 
-        let merged_aggs = finish_aggregations(query, all_aggs);
+        let merged_aggs = finish_aggregations(query, all_aggs)?;
 
         phase_stats.materialize_wall_ms = t_materialize.elapsed().as_secs_f64() * 1e3;
 
@@ -5356,6 +5480,8 @@ impl Searcher {
                 total_hits_relation,
                 aggregations: merged_aggs,
                 knn_degraded_segments: query.knn.as_ref().map(|_| knn_degraded_segments),
+                rerank_degraded: None,
+                rerank_degraded_reason: None,
             },
             phase_stats,
         ))
@@ -6211,34 +6337,71 @@ fn build_sort_value_maps(
     store: &FilterStore,
     fields: &[String],
     wanted: &HashSet<u32>,
+    sort: &[SortSpec],
 ) -> HashMap<String, HashMap<u32, SortValue>> {
     fields
         .iter()
         .map(|field| {
-            let map = if let Some(entries) = kosha_core::lookup_field(&store.string_fields, field) {
-                entries
-                    .iter()
-                    .filter(|(seq, _)| wanted.contains(seq))
-                    .map(|(seq, v)| (*seq, SortValue::Text(v.clone())))
-                    .collect()
-            } else if let Some(entries) = kosha_core::lookup_field(&store.integer_fields, field) {
-                entries
-                    .iter()
-                    .filter(|(seq, _)| wanted.contains(seq))
-                    .map(|(seq, v)| (*seq, SortValue::Number(*v as f64)))
-                    .collect()
-            } else if let Some(entries) = kosha_core::lookup_field(&store.float_fields, field) {
-                entries
-                    .iter()
-                    .filter(|(seq, _)| wanted.contains(seq))
-                    .map(|(seq, v)| (*seq, SortValue::Number(*v)))
-                    .collect()
-            } else {
-                HashMap::new()
+            // A multi-valued field (a JSON-list value, or a flattened
+            // nested path with several entries per document, #206) sorts
+            // by its smallest value ascending and its largest descending,
+            // Elasticsearch's default `mode`.
+            let descending = sort_field_is_descending(sort, field);
+            // A field carried only for `collapse` groups by its stored
+            // value as it always has; only a sort key reads list elements.
+            let is_sort_key = sort.iter().any(|spec| spec.fields.contains_key(field));
+            let mut map: HashMap<u32, SortValue> = HashMap::new();
+            let mut offer = |seq: u32, value: SortValue| match map.entry(seq) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(value);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let ord = value.compare(slot.get());
+                    let better = if descending {
+                        ord == std::cmp::Ordering::Greater
+                    } else {
+                        ord == std::cmp::Ordering::Less
+                    };
+                    if better {
+                        slot.insert(value);
+                    }
+                }
             };
+            if let Some(entries) = kosha_core::lookup_field(&store.string_fields, field) {
+                for (seq, v) in entries.iter().filter(|(seq, _)| wanted.contains(seq)) {
+                    match (is_sort_key && v.starts_with('['))
+                        .then(|| kosha_core::list_elements(v))
+                        .flatten()
+                    {
+                        // An empty list is no value: the document sorts as
+                        // missing.
+                        Some(elements) => elements
+                            .into_iter()
+                            .for_each(|e| offer(*seq, SortValue::Text(e))),
+                        None => offer(*seq, SortValue::Text(v.clone())),
+                    }
+                }
+            } else if let Some(entries) = kosha_core::lookup_field(&store.integer_fields, field) {
+                for (seq, v) in entries.iter().filter(|(seq, _)| wanted.contains(seq)) {
+                    offer(*seq, SortValue::Number(*v as f64));
+                }
+            } else if let Some(entries) = kosha_core::lookup_field(&store.float_fields, field) {
+                for (seq, v) in entries.iter().filter(|(seq, _)| wanted.contains(seq)) {
+                    offer(*seq, SortValue::Number(*v));
+                }
+            }
             (field.clone(), map)
         })
         .collect()
+}
+
+/// Whether the first sort key on `field` is descending. A field that is
+/// only carried for `collapse` is not a sort key, and takes the ascending
+/// (smallest) value.
+fn sort_field_is_descending(sort: &[SortSpec], field: &str) -> bool {
+    sort.iter()
+        .find_map(|spec| spec.fields.get(field))
+        .is_some_and(|order| order.order == "desc")
 }
 
 fn extract_sort_values(
@@ -6530,9 +6693,30 @@ impl FilterKeys {
 
 /// Lossless intermediate state: trim buckets and count distinct values only
 /// after merging all segments, never on a per-segment top-N.
+///
+/// What crosses the segment boundary is always a *partial* — bucket
+/// counts, and for metrics `(count, sum, min, max)` — never a finished
+/// value: an average of per-segment averages is wrong whenever segments
+/// hold different numbers of values, so `avg` divides only in
+/// [`finish_aggregations`].
 #[derive(Default)]
 struct AggregationState {
+    /// Bucket aggregations (`terms`, `composite`) and `cardinality`.
     buckets: std::collections::BTreeMap<Vec<String>, usize>,
+    /// Metric aggregations (`min`, `max`, `sum`, `avg`, `value_count`).
+    metric: MetricPartial,
+    /// Metric sub-aggregations of a bucket aggregation: bucket key →
+    /// sub-aggregation name → partial.
+    sub: std::collections::BTreeMap<Vec<String>, HashMap<String, MetricPartial>>,
+    /// `histogram` / `date_histogram`: bucket index
+    /// (`floor((v - offset) / interval)`) → documents in the bucket.
+    histogram: std::collections::BTreeMap<i64, usize>,
+    /// Metric sub-aggregations of a histogram: bucket index → name →
+    /// partial.
+    histogram_sub: std::collections::BTreeMap<i64, HashMap<String, MetricPartial>>,
+    /// The `(interval, offset)` the indices above were computed with, so
+    /// a merge can check that every segment bucketed alike.
+    histogram_params: Option<HistogramParams>,
 }
 
 impl AggregationState {
@@ -6540,16 +6724,471 @@ impl AggregationState {
         for (key, count) in other.buckets {
             *self.buckets.entry(key).or_default() += count;
         }
+        self.metric.merge(&other.metric);
+        for (key, subs) in other.sub {
+            let mine = self.sub.entry(key).or_default();
+            for (name, partial) in subs {
+                mine.entry(name).or_default().merge(&partial);
+            }
+        }
+        // Histogram bucket indices only mean the same bucket when every
+        // segment used the same interval and offset. They all come from
+        // the one request, so this holds by construction; check it.
+        if let (Some(mine), Some(theirs)) = (self.histogram_params, other.histogram_params) {
+            debug_assert_eq!(
+                mine, theirs,
+                "histogram partials bucketed with different interval/offset"
+            );
+        }
+        self.histogram_params = self.histogram_params.or(other.histogram_params);
+        for (index, count) in other.histogram {
+            *self.histogram.entry(index).or_default() += count;
+        }
+        for (index, subs) in other.histogram_sub {
+            let mine = self.histogram_sub.entry(index).or_default();
+            for (name, partial) in subs {
+                mine.entry(name).or_default().merge(&partial);
+            }
+        }
+    }
+}
+
+/// How a `histogram` / `date_histogram` maps a value to a bucket index.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HistogramParams {
+    /// `histogram`: f64 arithmetic over numeric values.
+    Numeric { interval: f64, offset: f64 },
+    /// `date_histogram`: i64 arithmetic over epoch milliseconds.
+    Date { interval: i64, offset: i64 },
+}
+
+impl HistogramParams {
+    /// The parameters of a histogram aggregation, `None` for any other
+    /// type. An invalid date interval is an error (normally caught when
+    /// the query is parsed or validated).
+    fn of(agg: &Aggregation) -> Option<Result<(Self, u64), String>> {
+        match agg {
+            Aggregation::Histogram { histogram, .. } => Some(histogram.validate().map(|()| {
+                (
+                    HistogramParams::Numeric {
+                        interval: histogram.interval,
+                        offset: histogram.offset,
+                    },
+                    histogram.min_doc_count,
+                )
+            })),
+            Aggregation::DateHistogram { date_histogram, .. } => {
+                Some(date_histogram.resolve().map(|(interval, offset)| {
+                    (
+                        HistogramParams::Date { interval, offset },
+                        date_histogram.min_doc_count,
+                    )
+                }))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `key` (and, for dates, `key_as_string`) of bucket `index`.
+    fn render_key(self, index: i64, out: &mut serde_json::Map<String, serde_json::Value>) {
+        match self {
+            HistogramParams::Numeric { interval, offset } => {
+                let key = kosha_core::histogram::histogram_key(index, interval, offset);
+                out.insert("key".into(), serde_json::json!(key));
+            }
+            HistogramParams::Date { interval, offset } => {
+                let key = kosha_core::histogram::date_histogram_key(index, interval, offset);
+                out.insert(
+                    "key_as_string".into(),
+                    kosha_core::datetime::format_epoch_millis(key).into(),
+                );
+                out.insert("key".into(), key.into());
+            }
+        }
+    }
+}
+
+/// A stored string value as epoch milliseconds: a date, or failing that a
+/// number of milliseconds (floored). `None` for anything else.
+fn date_millis_from_text(text: &str) -> Option<i64> {
+    kosha_core::datetime::parse_epoch_millis(text)
+        .or_else(|| text.trim().parse::<i64>().ok())
+        .or_else(|| {
+            text.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .map(|v| v.floor() as i64)
+        })
+}
+
+/// Epoch milliseconds of every value `field` holds for the documents in
+/// `wanted`: `Integer` columns as milliseconds, `Float` columns floored,
+/// and string-column text (where `Date` fields live) parsed as a date or,
+/// failing that, as a number of milliseconds. Other values are skipped.
+fn visit_date_values(
+    store: &FilterStore,
+    field: &str,
+    wanted: &HashSet<u32>,
+    mut f: impl FnMut(u32, i64),
+) {
+    let from_text = date_millis_from_text;
+    if let Some(entries) = kosha_core::lookup_field(&store.integer_fields, field) {
+        for (doc, value) in entries {
+            if wanted.contains(doc) {
+                f(*doc, *value);
+            }
+        }
+    }
+    if let Some(entries) = kosha_core::lookup_field(&store.float_fields, field) {
+        for (doc, value) in entries {
+            if wanted.contains(doc) && value.is_finite() {
+                f(*doc, value.floor() as i64);
+            }
+        }
+    }
+    if let Some(entries) = kosha_core::lookup_field(&store.string_fields, field) {
+        for (doc, value) in entries {
+            if !wanted.contains(doc) {
+                continue;
+            }
+            match value
+                .starts_with('[')
+                .then(|| kosha_core::list_elements(value))
+                .flatten()
+            {
+                Some(elements) => elements
+                    .iter()
+                    .filter_map(|e| from_text(e))
+                    .for_each(|ms| f(*doc, ms)),
+                None => {
+                    if let Some(ms) = from_text(value) {
+                        f(*doc, ms);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Per-document partials of each metric sub-aggregation of `agg`, to be
+/// folded into every bucket a document lands in.
+fn metric_sub_partials<'a>(
+    store: &FilterStore,
+    wanted: &HashSet<u32>,
+    agg: &'a Aggregation,
+) -> Vec<(&'a String, HashMap<u32, MetricPartial>)> {
+    agg.sub_aggregations()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, sub)| {
+            let (kind, metric) = sub.metric()?;
+            let mut per_doc: HashMap<u32, MetricPartial> = HashMap::new();
+            visit_metric_values(store, &metric.field, kind, wanted, |doc, sample| {
+                per_doc.entry(doc).or_default().add(sample)
+            });
+            Some((name, per_doc))
+        })
+        .collect()
+}
+
+/// One segment's `histogram` / `date_histogram` partial: each matched
+/// document counts once in every bucket one of its values falls in (a
+/// multi-valued document with two values in one bucket counts once).
+fn aggregate_histogram(
+    store: &FilterStore,
+    wanted: &HashSet<u32>,
+    agg: &Aggregation,
+    params: HistogramParams,
+    field: &str,
+) -> AggregationState {
+    let mut per_doc: HashMap<u32, std::collections::BTreeSet<i64>> = HashMap::new();
+    match params {
+        HistogramParams::Numeric { interval, offset } => {
+            visit_metric_values(store, field, MetricKind::Min, wanted, |doc, sample| {
+                if let MetricSample::Number(v, _) = sample {
+                    per_doc
+                        .entry(doc)
+                        .or_default()
+                        .insert(kosha_core::histogram::histogram_bucket(v, interval, offset));
+                }
+            })
+        }
+        HistogramParams::Date { interval, offset } => {
+            visit_date_values(store, field, wanted, |doc, ms| {
+                per_doc.entry(doc).or_default().insert(
+                    kosha_core::histogram::date_histogram_bucket(ms, interval, offset),
+                );
+            })
+        }
+    }
+    let subs = metric_sub_partials(store, wanted, agg);
+    let mut state = AggregationState {
+        histogram_params: Some(params),
+        ..Default::default()
+    };
+    for (doc, indices) in per_doc {
+        for index in indices {
+            *state.histogram.entry(index).or_default() += 1;
+            if !subs.is_empty() {
+                let bucket = state.histogram_sub.entry(index).or_default();
+                for (name, partials) in &subs {
+                    let partial = bucket.entry((*name).clone()).or_default();
+                    if let Some(doc_partial) = partials.get(&doc) {
+                        partial.merge(doc_partial);
+                    }
+                }
+            }
+        }
+    }
+    state
+}
+
+/// The finished `{"buckets": [...]}` of a histogram, sorted by key
+/// ascending. With `min_doc_count: 0` (the default) every bucket between
+/// the lowest and the highest non-empty one is emitted, empty ones with
+/// `doc_count: 0`; otherwise buckets below `min_doc_count` are dropped.
+/// More than [`kosha_core::histogram::MAX_HISTOGRAM_BUCKETS`] buckets is
+/// an error, checked before anything is allocated.
+fn finish_histogram(
+    name: &str,
+    agg: &Aggregation,
+    state: &AggregationState,
+) -> Result<serde_json::Value, KoshaError> {
+    let (params, min_doc_count) = HistogramParams::of(agg)
+        .expect("histogram aggregation")
+        .map_err(|e| KoshaError::InvalidQuery(format!("in aggregation `{name}`: {e}")))?;
+    let max = kosha_core::histogram::MAX_HISTOGRAM_BUCKETS;
+    let too_many = |n: u128| {
+        KoshaError::InvalidQuery(format!(
+            "aggregation `{name}` would return {n} buckets, more than the limit of {max}; use a \
+             larger interval, narrow the query, or set `min_doc_count` to 1 or more to skip \
+             empty buckets"
+        ))
+    };
+    let indices: Vec<i64> = match (
+        state.histogram.first_key_value(),
+        state.histogram.last_key_value(),
+    ) {
+        (Some((&lo, _)), Some((&hi, _))) if min_doc_count == 0 => {
+            let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
+            if span > u128::from(max) {
+                return Err(too_many(span));
+            }
+            (lo..=hi).collect()
+        }
+        _ => {
+            let kept: Vec<i64> = state
+                .histogram
+                .iter()
+                .filter(|(_, &count)| count as u64 >= min_doc_count)
+                .map(|(&index, _)| index)
+                .collect();
+            if kept.len() as u128 > u128::from(max) {
+                return Err(too_many(kept.len() as u128));
+            }
+            kept
+        }
+    };
+    let buckets: Vec<serde_json::Value> = indices
+        .into_iter()
+        .map(|index| {
+            let mut bucket = serde_json::Map::new();
+            params.render_key(index, &mut bucket);
+            bucket.insert(
+                "doc_count".into(),
+                state.histogram.get(&index).copied().unwrap_or(0).into(),
+            );
+            bucket.extend(render_sub_aggregations(
+                agg,
+                state.histogram_sub.get(&index),
+            ));
+            serde_json::Value::Object(bucket)
+        })
+        .collect();
+    Ok(serde_json::json!({ "buckets": buckets }))
+}
+
+/// Mergeable partial of a single-value metric over some set of values.
+#[derive(Debug, Clone, Copy)]
+struct MetricPartial {
+    /// Values seen: numeric values for `min`/`max`/`sum`/`avg`, values of
+    /// any type for `value_count`.
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+    /// How many of the `count` values were dates (epoch milliseconds
+    /// parsed from a `Date` field's text) — when all were, the result also
+    /// carries `value_as_string`.
+    dates: u64,
+}
+
+impl Default for MetricPartial {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            dates: 0,
+        }
+    }
+}
+
+/// One observation fed into a [`MetricPartial`].
+#[derive(Clone, Copy)]
+enum MetricSample {
+    /// A numeric value, and whether it came from a date.
+    Number(f64, bool),
+    /// `n` values of any type (`value_count`).
+    Values(u64),
+}
+
+impl MetricPartial {
+    fn add(&mut self, sample: MetricSample) {
+        match sample {
+            MetricSample::Number(v, is_date) => {
+                self.count += 1;
+                self.sum += v;
+                self.min = self.min.min(v);
+                self.max = self.max.max(v);
+                self.dates += u64::from(is_date);
+            }
+            MetricSample::Values(n) => self.count += n,
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.count += other.count;
+        self.sum += other.sum;
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.dates += other.dates;
+    }
+
+    /// The Elasticsearch-shaped result: `{"value": ...}`. With no values,
+    /// `min`, `max` and `avg` are `null` (0 would be a wrong answer for
+    /// `min`), `sum` and `value_count` are `0`.
+    fn render(&self, kind: MetricKind) -> serde_json::Value {
+        let value = match kind {
+            MetricKind::ValueCount => return serde_json::json!({ "value": self.count }),
+            MetricKind::Sum => Some(self.sum),
+            _ if self.count == 0 => None,
+            MetricKind::Min => Some(self.min),
+            MetricKind::Max => Some(self.max),
+            MetricKind::Avg => Some(self.sum / self.count as f64),
+        };
+        let mut out = serde_json::Map::new();
+        out.insert("value".into(), serde_json::json!(value));
+        if let Some(v) = value {
+            let all_dates = self.count > 0 && self.dates == self.count;
+            if all_dates && kind != MetricKind::Sum && v.is_finite() {
+                out.insert(
+                    "value_as_string".into(),
+                    kosha_core::datetime::format_epoch_millis(v.floor() as i64).into(),
+                );
+            }
+        }
+        serde_json::Value::Object(out)
+    }
+}
+
+/// The number a stored string value stands for: a date's epoch
+/// milliseconds (`Date` fields live in the string columns as text), or a
+/// plain number written as text. Anything else is not a value of a numeric
+/// metric.
+fn numeric_from_text(text: &str) -> Option<MetricSample> {
+    if let Some(millis) = kosha_core::datetime::parse_epoch_millis(text) {
+        return Some(MetricSample::Number(millis as f64, true));
+    }
+    text.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .map(|v| MetricSample::Number(v, false))
+}
+
+/// Feed every value `field` holds for the documents in `wanted` to `f`,
+/// read from the segment's filter columns only (never the doc store).
+///
+/// Numeric metrics take `Integer` and `Float` columns as they are and
+/// string-column values that parse as a date or a number; other values are
+/// skipped, as is a document without the field. `value_count` counts every
+/// value in any column. A list value stored as JSON text (`["a","b"]`)
+/// contributes each element — the multi-valued-field semantics `terms`
+/// already uses, and Elasticsearch's: `value_count` counts values, not
+/// documents.
+fn visit_metric_values(
+    store: &FilterStore,
+    field: &str,
+    kind: MetricKind,
+    wanted: &HashSet<u32>,
+    mut f: impl FnMut(u32, MetricSample),
+) {
+    let counting = kind == MetricKind::ValueCount;
+    if let Some(entries) = kosha_core::lookup_field(&store.integer_fields, field) {
+        for (doc, value) in entries {
+            if wanted.contains(doc) {
+                f(
+                    *doc,
+                    if counting {
+                        MetricSample::Values(1)
+                    } else {
+                        MetricSample::Number(*value as f64, false)
+                    },
+                );
+            }
+        }
+    }
+    if let Some(entries) = kosha_core::lookup_field(&store.float_fields, field) {
+        for (doc, value) in entries {
+            if !wanted.contains(doc) {
+                continue;
+            }
+            if counting {
+                f(*doc, MetricSample::Values(1));
+            } else if value.is_finite() {
+                f(*doc, MetricSample::Number(*value, false));
+            }
+        }
+    }
+    if let Some(entries) = kosha_core::lookup_field(&store.string_fields, field) {
+        for (doc, value) in entries {
+            if !wanted.contains(doc) {
+                continue;
+            }
+            let elements = value
+                .starts_with('[')
+                .then(|| kosha_core::list_elements(value))
+                .flatten();
+            match (elements, counting) {
+                (Some(elements), true) => f(*doc, MetricSample::Values(elements.len() as u64)),
+                (None, true) => f(*doc, MetricSample::Values(1)),
+                (Some(elements), false) => {
+                    for element in &elements {
+                        if let Some(sample) = numeric_from_text(element) {
+                            f(*doc, sample);
+                        }
+                    }
+                }
+                (None, false) => {
+                    if let Some(sample) = numeric_from_text(value) {
+                        f(*doc, sample);
+                    }
+                }
+            }
+        }
     }
 }
 
 fn aggregation_sources(agg: &Aggregation) -> Vec<(String, String)> {
     match agg {
-        Aggregation::Terms { terms } => vec![(terms.field.clone(), terms.field.clone())],
+        Aggregation::Terms { terms, .. } => vec![(terms.field.clone(), terms.field.clone())],
         Aggregation::Cardinality { cardinality } => {
             vec![(cardinality.field.clone(), cardinality.field.clone())]
         }
-        Aggregation::Composite { composite } => composite
+        Aggregation::Composite { composite, .. } => composite
             .sources
             .iter()
             .flat_map(|source| {
@@ -6562,6 +7201,13 @@ fn aggregation_sources(agg: &Aggregation) -> Vec<(String, String)> {
                 entries
             })
             .collect(),
+        Aggregation::Min { .. }
+        | Aggregation::Max { .. }
+        | Aggregation::Sum { .. }
+        | Aggregation::Avg { .. }
+        | Aggregation::ValueCount { .. }
+        | Aggregation::Histogram { .. }
+        | Aggregation::DateHistogram { .. } => Vec::new(),
     }
 }
 
@@ -6570,6 +7216,24 @@ fn aggregate_matches(
     wanted: &HashSet<u32>,
     agg: &Aggregation,
 ) -> AggregationState {
+    let mut state = AggregationState::default();
+    if let Some((kind, metric)) = agg.metric() {
+        visit_metric_values(store, &metric.field, kind, wanted, |_, sample| {
+            state.metric.add(sample)
+        });
+        return state;
+    }
+    match (HistogramParams::of(agg), agg) {
+        (Some(Ok((params, _))), Aggregation::Histogram { histogram, .. }) => {
+            return aggregate_histogram(store, wanted, agg, params, &histogram.field)
+        }
+        (Some(Ok((params, _))), Aggregation::DateHistogram { date_histogram, .. }) => {
+            return aggregate_histogram(store, wanted, agg, params, &date_histogram.field)
+        }
+        // Invalid parameters: reported by `finish_histogram`.
+        (Some(_), _) => return state,
+        (None, _) => {}
+    }
     let sources = aggregation_sources(agg);
     let values: Vec<HashMap<u32, HashSet<String>>> = sources
         .iter()
@@ -6614,10 +7278,12 @@ fn aggregate_matches(
             result
         })
         .collect();
-    let mut state = AggregationState::default();
     if sources.is_empty() {
         return state;
     }
+    // Per-document partials of each metric sub-aggregation, folded into
+    // every bucket the document lands in below.
+    let subs = metric_sub_partials(store, wanted, agg);
     for doc in wanted {
         let mut keys = vec![Vec::new()];
         for field in &values {
@@ -6637,6 +7303,15 @@ fn aggregate_matches(
                 .collect();
         }
         for key in keys {
+            if !subs.is_empty() {
+                let bucket = state.sub.entry(key.clone()).or_default();
+                for (name, per_doc) in &subs {
+                    let partial = bucket.entry((*name).clone()).or_default();
+                    if let Some(doc_partial) = per_doc.get(doc) {
+                        partial.merge(doc_partial);
+                    }
+                }
+            }
             *state.buckets.entry(key).or_default() += 1;
         }
     }
@@ -6793,8 +7468,25 @@ fn aggregate_matches_columnar(
     wanted: &[u32],
     agg: &Aggregation,
 ) -> Result<AggregationState, KoshaError> {
-    let sources = aggregation_sources(agg);
     let mut state = AggregationState::default();
+    if let Some((kind, metric)) = agg.metric() {
+        visit_metric_values_columnar(reader, &metric.field, kind, wanted, |_, sample| {
+            state.metric.add(sample)
+        })?;
+        return Ok(state);
+    }
+    match (HistogramParams::of(agg), agg) {
+        (Some(Ok((params, _))), Aggregation::Histogram { histogram, .. }) => {
+            return aggregate_histogram_columnar(reader, wanted, agg, params, &histogram.field)
+        }
+        (Some(Ok((params, _))), Aggregation::DateHistogram { date_histogram, .. }) => {
+            return aggregate_histogram_columnar(reader, wanted, agg, params, &date_histogram.field)
+        }
+        // Invalid parameters: reported by `finish_histogram`.
+        (Some(_), _) => return Ok(state),
+        (None, _) => {}
+    }
+    let sources = aggregation_sources(agg);
     if sources.is_empty() {
         return Ok(state);
     }
@@ -6802,7 +7494,10 @@ fn aggregate_matches_columnar(
         .iter()
         .map(|(_, field)| columnar_source_values(reader, field, wanted))
         .collect::<Result<_, _>>()?;
-    if let [only] = values.as_slice() {
+    // Per-candidate partials of each metric sub-aggregation (indexed like
+    // `wanted`), folded into every bucket the document lands in below.
+    let subs = metric_sub_partials_columnar(reader, wanted, agg)?;
+    if let ([only], true) = (values.as_slice(), subs.is_empty()) {
         // One source (`terms`, `cardinality`, a one-source `composite`):
         // count per key id, and make each key's text once.
         let mut counts = vec![0usize; only.names.len()];
@@ -6840,17 +7535,247 @@ fn aggregate_matches_columnar(
                 .collect();
         }
         for key in keys {
+            if !subs.is_empty() {
+                let bucket = state.sub.entry(key.clone()).or_default();
+                for (name, per_doc) in &subs {
+                    let partial = bucket.entry((*name).clone()).or_default();
+                    if let Some(doc_partial) = per_doc.get(&wi) {
+                        partial.merge(doc_partial);
+                    }
+                }
+            }
             *state.buckets.entry(key).or_default() += 1;
         }
     }
     Ok(state)
 }
 
-/// [`build_sort_value_maps`] over a columnar segment's filter columns.
+/// Metric sub-aggregation partials by name, each keyed by index into a
+/// columnar segment's sorted candidate list.
+type ColumnarSubPartials<'a> = Vec<(&'a String, HashMap<usize, MetricPartial>)>;
+
+/// [`metric_sub_partials`] over a columnar segment's filter columns, keyed
+/// by index into `wanted`.
+fn metric_sub_partials_columnar<'a>(
+    reader: &SegmentReader,
+    wanted: &[u32],
+    agg: &'a Aggregation,
+) -> Result<ColumnarSubPartials<'a>, KoshaError> {
+    let mut subs = Vec::new();
+    for (name, sub) in agg.sub_aggregations().into_iter().flatten() {
+        let Some((kind, metric)) = sub.metric() else {
+            continue;
+        };
+        let mut per_doc: HashMap<usize, MetricPartial> = HashMap::new();
+        visit_metric_values_columnar(reader, &metric.field, kind, wanted, |wi, sample| {
+            per_doc.entry(wi).or_default().add(sample)
+        })?;
+        subs.push((name, per_doc));
+    }
+    Ok(subs)
+}
+
+/// [`aggregate_histogram`] over a columnar segment's filter columns.
+fn aggregate_histogram_columnar(
+    reader: &SegmentReader,
+    wanted: &[u32],
+    agg: &Aggregation,
+    params: HistogramParams,
+    field: &str,
+) -> Result<AggregationState, KoshaError> {
+    let mut per_doc: HashMap<usize, std::collections::BTreeSet<i64>> = HashMap::new();
+    match params {
+        HistogramParams::Numeric { interval, offset } => {
+            visit_metric_values_columnar(reader, field, MetricKind::Min, wanted, |wi, sample| {
+                if let MetricSample::Number(v, _) = sample {
+                    per_doc
+                        .entry(wi)
+                        .or_default()
+                        .insert(kosha_core::histogram::histogram_bucket(v, interval, offset));
+                }
+            })?
+        }
+        HistogramParams::Date { interval, offset } => {
+            visit_date_values_columnar(reader, field, wanted, |wi, ms| {
+                per_doc.entry(wi).or_default().insert(
+                    kosha_core::histogram::date_histogram_bucket(ms, interval, offset),
+                );
+            })?
+        }
+    }
+    let subs = metric_sub_partials_columnar(reader, wanted, agg)?;
+    let mut state = AggregationState {
+        histogram_params: Some(params),
+        ..Default::default()
+    };
+    for (wi, indices) in per_doc {
+        for index in indices {
+            *state.histogram.entry(index).or_default() += 1;
+            if !subs.is_empty() {
+                let bucket = state.histogram_sub.entry(index).or_default();
+                for (name, partials) in &subs {
+                    let partial = bucket.entry((*name).clone()).or_default();
+                    if let Some(doc_partial) = partials.get(&wi) {
+                        partial.merge(doc_partial);
+                    }
+                }
+            }
+        }
+    }
+    Ok(state)
+}
+
+/// [`visit_date_values`] over a columnar segment's filter columns:
+/// `f(wanted_index, epoch_ms)` per value, by the same rules.
+fn visit_date_values_columnar(
+    reader: &SegmentReader,
+    field: &str,
+    wanted: &[u32],
+    mut f: impl FnMut(usize, i64),
+) -> Result<(), KoshaError> {
+    use kosha_core::FilterColumnKind;
+    use kosha_segment::filter_columns::FilterColumn;
+    use kosha_segment::filter_eval::resolve_column;
+    for column_kind in [
+        FilterColumnKind::Integer,
+        FilterColumnKind::Float,
+        FilterColumnKind::String,
+    ] {
+        let Some(column) = resolve_column(reader, field, column_kind)? else {
+            continue;
+        };
+        match &*column {
+            FilterColumn::Integer(c) => {
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| f(wi, values[i]));
+            }
+            FilterColumn::Float(c) => {
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    if values[i].is_finite() {
+                        f(wi, values[i].floor() as i64);
+                    }
+                });
+            }
+            FilterColumn::String(c) => {
+                let ords = c.ords();
+                let mut cache: HashMap<u32, Vec<i64>> = HashMap::new();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    let ord = ords[i];
+                    let millis = cache.entry(ord).or_insert_with(|| {
+                        let value = c.term(ord);
+                        match value
+                            .starts_with('[')
+                            .then(|| kosha_core::list_elements(value))
+                            .flatten()
+                        {
+                            Some(elements) => elements
+                                .iter()
+                                .filter_map(|e| date_millis_from_text(e))
+                                .collect(),
+                            None => date_millis_from_text(value).into_iter().collect(),
+                        }
+                    });
+                    for ms in millis.iter() {
+                        f(wi, *ms);
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`visit_metric_values`] over a columnar segment's filter columns:
+/// `f(wanted_index, sample)` for every value `field` holds for a document
+/// in `wanted` (sorted, distinct), by the same rules as the `FilterStore`
+/// path.
+fn visit_metric_values_columnar(
+    reader: &SegmentReader,
+    field: &str,
+    kind: MetricKind,
+    wanted: &[u32],
+    mut f: impl FnMut(usize, MetricSample),
+) -> Result<(), KoshaError> {
+    use kosha_core::FilterColumnKind;
+    use kosha_segment::filter_columns::FilterColumn;
+    use kosha_segment::filter_eval::resolve_column;
+    let counting = kind == MetricKind::ValueCount;
+    for column_kind in [
+        FilterColumnKind::Integer,
+        FilterColumnKind::Float,
+        FilterColumnKind::String,
+    ] {
+        let Some(column) = resolve_column(reader, field, column_kind)? else {
+            continue;
+        };
+        match &*column {
+            FilterColumn::Integer(c) => {
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    f(
+                        wi,
+                        if counting {
+                            MetricSample::Values(1)
+                        } else {
+                            MetricSample::Number(values[i] as f64, false)
+                        },
+                    )
+                });
+            }
+            FilterColumn::Float(c) => {
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    if counting {
+                        f(wi, MetricSample::Values(1));
+                    } else if values[i].is_finite() {
+                        f(wi, MetricSample::Number(values[i], false));
+                    }
+                });
+            }
+            FilterColumn::String(c) => {
+                let ords = c.ords();
+                // Samples per dictionary ordinal, parsed once.
+                let mut cache: HashMap<u32, Vec<MetricSample>> = HashMap::new();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    let ord = ords[i];
+                    let samples = cache.entry(ord).or_insert_with(|| {
+                        let value = c.term(ord);
+                        let elements = value
+                            .starts_with('[')
+                            .then(|| kosha_core::list_elements(value))
+                            .flatten();
+                        match (elements, counting) {
+                            (Some(elements), true) => {
+                                vec![MetricSample::Values(elements.len() as u64)]
+                            }
+                            (None, true) => vec![MetricSample::Values(1)],
+                            (Some(elements), false) => elements
+                                .iter()
+                                .filter_map(|e| numeric_from_text(e))
+                                .collect(),
+                            (None, false) => numeric_from_text(value).into_iter().collect(),
+                        }
+                    });
+                    for sample in samples.iter() {
+                        f(wi, *sample);
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`build_sort_value_maps`] over a columnar segment's filter columns, by
+/// the same rules: the first column kind the field has (string, then
+/// integer, then float), and a multi-valued field (#206) sorting by its
+/// smallest value ascending and its largest descending.
 fn build_sort_value_maps_columnar(
     reader: &SegmentReader,
     fields: &[String],
     wanted: &HashSet<u32>,
+    sort: &[SortSpec],
 ) -> Result<HashMap<String, HashMap<u32, SortValue>>, KoshaError> {
     use kosha_core::FilterColumnKind;
     use kosha_segment::filter_columns::FilterColumn;
@@ -6859,9 +7784,25 @@ fn build_sort_value_maps_columnar(
     sorted.sort_unstable();
     let mut out = HashMap::with_capacity(fields.len());
     for field in fields {
+        let descending = sort_field_is_descending(sort, field);
+        let is_sort_key = sort.iter().any(|spec| spec.fields.contains_key(field));
         let mut map: HashMap<u32, SortValue> = HashMap::new();
-        // The first kind the field has a column of, as on `filters.bin`.
-        // A document with several values keeps its last, as there.
+        let mut offer = |seq: u32, value: SortValue| match map.entry(seq) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(value);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let ord = value.compare(slot.get());
+                let better = if descending {
+                    ord == std::cmp::Ordering::Greater
+                } else {
+                    ord == std::cmp::Ordering::Less
+                };
+                if better {
+                    slot.insert(value);
+                }
+            }
+        };
         let mut column = None;
         for kind in [
             FilterColumnKind::String,
@@ -6877,19 +7818,30 @@ fn build_sort_value_maps_columnar(
             Some(FilterColumn::String(c)) => {
                 let ords = c.ords();
                 for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
-                    map.insert(sorted[wi], SortValue::Text(c.term(ords[i]).to_string()));
+                    let v = c.term(ords[i]);
+                    match (is_sort_key && v.starts_with('['))
+                        .then(|| kosha_core::list_elements(v))
+                        .flatten()
+                    {
+                        // An empty list is no value: the document sorts as
+                        // missing.
+                        Some(elements) => elements
+                            .into_iter()
+                            .for_each(|e| offer(sorted[wi], SortValue::Text(e))),
+                        None => offer(sorted[wi], SortValue::Text(v.to_string())),
+                    }
                 });
             }
             Some(FilterColumn::Integer(c)) => {
                 let values = c.values();
                 for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
-                    map.insert(sorted[wi], SortValue::Number(values[i] as f64));
+                    offer(sorted[wi], SortValue::Number(values[i] as f64));
                 });
             }
             Some(FilterColumn::Float(c)) => {
                 let values = c.values();
                 for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
-                    map.insert(sorted[wi], SortValue::Number(values[i]));
+                    offer(sorted[wi], SortValue::Number(values[i]));
                 });
             }
             None => {}
@@ -6899,22 +7851,42 @@ fn build_sort_value_maps_columnar(
     Ok(out)
 }
 
+/// Render a bucket's metric sub-aggregations from their merged partials.
+fn render_sub_aggregations(
+    agg: &Aggregation,
+    partials: Option<&HashMap<String, MetricPartial>>,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    agg.sub_aggregations()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, sub)| {
+            let (kind, _) = sub.metric()?;
+            let partial = partials
+                .and_then(|p| p.get(name))
+                .copied()
+                .unwrap_or_default();
+            Some((name.clone(), partial.render(kind)))
+        })
+        .collect()
+}
+
 fn finish_aggregations(
     query: &SearchQuery,
     mut states: HashMap<String, AggregationState>,
-) -> Option<AggregationResults> {
+) -> Result<Option<AggregationResults>, KoshaError> {
     if query.aggs.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut output = serde_json::Map::new();
     for (name, agg) in &query.aggs {
         let state = states.remove(name).unwrap_or_default();
         let value = match agg {
-            Aggregation::Terms { terms } => {
+            Aggregation::Terms { terms, .. } => {
                 let mut buckets: Vec<AggBucket> = state
                     .buckets
                     .into_iter()
                     .map(|(key, doc_count)| AggBucket {
+                        sub_aggregations: render_sub_aggregations(agg, state.sub.get(&key)),
                         key: key[0].clone(),
                         doc_count,
                     })
@@ -6928,7 +7900,18 @@ fn finish_aggregations(
                 serde_json::to_value(AggBucketResult { buckets }).unwrap()
             }
             Aggregation::Cardinality { .. } => serde_json::json!({"value": state.buckets.len()}),
-            Aggregation::Composite { composite } => {
+            Aggregation::Min { .. }
+            | Aggregation::Max { .. }
+            | Aggregation::Sum { .. }
+            | Aggregation::Avg { .. }
+            | Aggregation::ValueCount { .. } => {
+                let (kind, _) = agg.metric().expect("metric variant");
+                state.metric.render(kind)
+            }
+            Aggregation::Histogram { .. } | Aggregation::DateHistogram { .. } => {
+                finish_histogram(name, agg, &state)?
+            }
+            Aggregation::Composite { composite, .. } => {
                 let sources = aggregation_sources(agg);
                 let after: Option<Vec<String>> = composite.after.as_ref().map(|cursor| {
                     sources
@@ -6942,6 +7925,7 @@ fn finish_aggregations(
                     .filter(|(key, _)| after.as_ref().is_none_or(|after| key > after))
                     .take(composite.size)
                     .map(|(key, doc_count)| AggCompositeBucket {
+                        sub_aggregations: render_sub_aggregations(agg, state.sub.get(&key)),
                         key: sources
                             .iter()
                             .map(|(name, _)| name.clone())
@@ -6973,8 +7957,15 @@ fn finish_aggregations(
                     result.extra.insert(name, value);
                 }
             }
-            "total_documents" if value.get("value").is_some() => {
-                result.total_documents = Some(serde_json::from_value(value).unwrap())
+            // A metric named `total_documents` can hold a float or `null`,
+            // which the typed (integer) field cannot: it goes to `extra`.
+            "total_documents" if value.get("value").is_some_and(|v| v.is_u64()) => {
+                match serde_json::from_value(value.clone()) {
+                    Ok(parsed) => result.total_documents = Some(parsed),
+                    Err(_) => {
+                        result.extra.insert(name, value);
+                    }
+                }
             }
             "matched_docs" if value.get("buckets").is_some() => {
                 if let Ok(parsed) = serde_json::from_value(value.clone()) {
@@ -6988,7 +7979,7 @@ fn finish_aggregations(
             }
         }
     }
-    Some(result)
+    Ok(Some(result))
 }
 
 /// How a query's terms may prune segments by their footer term bloom, or
@@ -7089,6 +8080,7 @@ pub fn compute_single_aggregation(store: &FilterStore, field: &str) -> Aggregati
         .map(|(k, c)| AggBucket {
             key: k.to_string(),
             doc_count: c,
+            ..Default::default()
         })
         .collect();
     buckets.sort_by_key(|b| std::cmp::Reverse(b.doc_count));
@@ -7142,6 +8134,7 @@ pub fn compute_composite(
                     buckets.push(AggCompositeBucket {
                         key: key_map,
                         doc_count: count,
+                        ..Default::default()
                     });
                 }
             }
@@ -7264,6 +8257,8 @@ mod tests {
             highlights: None,
             highlight: None,
             rank_details: None,
+            fused_score: Default::default(),
+            rerank_score: Default::default(),
         };
         let terms = vec!["contract".to_string(), "breach".to_string()];
         let config: HighlightConfig = serde_json::from_value(serde_json::json!({
@@ -7318,6 +8313,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         }
     }
 
@@ -7340,6 +8336,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         for (segment, docs) in [
             (
@@ -7547,6 +8544,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7682,6 +8680,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7774,6 +8773,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -7844,6 +8844,44 @@ mod tests {
     fn ledger_snapshot(searcher: &Searcher) -> (u64, u64, usize) {
         let st = searcher.ledger.state.lock().unwrap();
         (st.live, st.reserved, st.active)
+    }
+
+    #[test]
+    fn release_segment_reports_inflight_readers_until_they_drop() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-release-segment-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s1_dir = mk_segment(&dir, "test", "s1", "alpha");
+        let searcher = Searcher::with_segment_cache_limits(dir.clone(), 10, u64::MAX);
+
+        // Idle in the cache only: released and reported free at once.
+        drop(
+            searcher
+                .open_segment("test", "s1", s1_dir.clone(), false, None, None, None)
+                .unwrap(),
+        );
+        let key = ("test".to_string(), "s1".to_string(), false);
+        assert!(searcher.segment_cache.contains(&key));
+        assert!(!searcher.release_segment("test", "s1"));
+        assert!(!searcher.segment_cache.contains(&key));
+        assert_eq!(
+            searcher.segment_cache.total_bytes.load(Ordering::Relaxed),
+            0
+        );
+
+        // Held by an in-flight search: busy until that reader drops, and the
+        // reader keeps working in the meantime.
+        let held = searcher
+            .open_segment("test", "s1", s1_dir, false, None, None, None)
+            .unwrap();
+        assert!(searcher.release_segment("test", "s1"));
+        assert!(!searcher.segment_cache.contains(&key));
+        assert!(searcher.release_segment("test", "s1"), "still held");
+        assert_eq!(held.doc_count(), 1);
+        drop(held);
+        assert!(!searcher.release_segment("test", "s1"));
+        assert!(searcher.draining.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -7945,6 +8983,7 @@ mod tests {
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
                 schema: None,
+                retired: Default::default(),
             },
             all,
         )
@@ -8212,6 +9251,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
 
         // Reproduce the production regime exactly, independent of how this
@@ -8379,6 +9419,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let result = searcher.search(
             &NamespaceId("test".into()),
@@ -8435,6 +9476,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8508,6 +9550,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8596,6 +9639,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let result = searcher
             .search(
@@ -8681,6 +9725,7 @@ mod tests {
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
                 schema: None,
+                retired: Default::default(),
             },
         )
     }
@@ -9078,6 +10123,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut query = mk_query("", 10);
@@ -9159,6 +10205,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -9248,6 +10295,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
 
         // Generous entry-count cap (10) but a byte budget that fits s1 alone,
@@ -9368,6 +10416,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -9400,6 +10449,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
@@ -9439,6 +10489,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
@@ -9494,6 +10545,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -9666,6 +10718,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mk_knn_q = |num_candidates: usize| {
@@ -9794,6 +10847,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 1);
@@ -9866,6 +10920,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -9933,6 +10988,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -10005,6 +11061,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         (dir, manifest)
     }
@@ -10125,6 +11182,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         // Fresh searcher (no warm in-memory segment cache) so opening the
         // segment for these searches goes through the real `try_read_doc_index`
@@ -10206,6 +11264,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         // Fresh searcher so each segment is actually opened (Lazy), not
         // served from a warm cache populated by an earlier call here.
@@ -10332,6 +11391,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let calls: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -10416,6 +11476,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -10468,6 +11529,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -10528,6 +11590,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -10627,6 +11690,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -10673,6 +11737,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -10734,6 +11799,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         }
     }
 
@@ -10788,6 +11854,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         }
     }
 
@@ -10978,6 +12045,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -11111,6 +12179,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let run = |b: f64| {
@@ -11283,6 +12352,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let scores = |q: SearchQuery| -> Vec<(String, f64)> {
@@ -11444,6 +12514,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
 
         // Baseline (uncorrupted): "alpha beta" intersects, "beta" matches.
@@ -11540,6 +12611,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         // Open + warm the segment so the reader is cached, THEN evict
@@ -11595,6 +12667,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -11736,6 +12809,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -11801,6 +12875,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -11985,6 +13060,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -12036,6 +13112,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -12077,6 +13154,7 @@ mod tests {
                     rank: None,
                     mode: None,
                     fields: Vec::new(),
+                    rerank: None,
                 },
                 None,
             )
@@ -12148,6 +13226,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -12189,6 +13268,7 @@ mod tests {
                     rank: None,
                     mode: None,
                     fields: Vec::new(),
+                    rerank: None,
                 },
                 None,
             )
@@ -12234,6 +13314,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let mut id_sort = std::collections::HashMap::new();
@@ -12276,6 +13357,7 @@ mod tests {
                     rank: None,
                     mode: None,
                     fields: Vec::new(),
+                    rerank: None,
                 },
                 None,
             )
@@ -12314,6 +13396,7 @@ mod tests {
                     rank: None,
                     mode: None,
                     fields: Vec::new(),
+                    rerank: None,
                 },
                 None,
             )
@@ -12369,6 +13452,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -12441,6 +13525,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -12496,6 +13581,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -12574,6 +13660,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -12604,6 +13691,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -12672,6 +13760,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -12700,6 +13789,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         };
 
         let first = searcher.search(&ns, &manifest, &q, None).unwrap();
@@ -12757,6 +13847,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -12787,6 +13878,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
@@ -12839,6 +13931,7 @@ mod columnar_filter_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         }
     }
 
@@ -13027,6 +14120,7 @@ mod columnar_eval_differential_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         }
     }
 
@@ -13363,6 +14457,7 @@ mod corpus_stats_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         }
     }
 
@@ -14469,6 +15564,7 @@ mod rrf_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let mut locations = HashMap::new();
         for (g, docs) in groups.iter().enumerate() {
@@ -15068,6 +16164,7 @@ mod rrf_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         for (g, docs) in groups.iter().enumerate() {
             let id = SegmentId(format!("seg-{g:03}"));
@@ -15186,6 +16283,99 @@ mod rrf_tests {
         assert!(r.results[0].rank_details.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    /// Issue #251: rerank after fusion, end to end over a real segment.
+    #[test]
+    fn rerank_reorders_the_fused_list_and_falls_back_on_timeout() {
+        use crate::rerank::{tests::MockProvider, RerankOutcome, RerankProvider};
+        let dir = scratch("rerank");
+        let (manifest, _) = write(&dir, "s", &[agreement_corpus()]);
+        let searcher = Searcher::new(dir.clone());
+
+        let fused = searcher
+            .search(
+                &ns(),
+                &manifest,
+                &hybrid("breach", 20, 10, rrf(Some(20), None)),
+                None,
+            )
+            .unwrap();
+        let fused_ids = ids(&fused);
+        // The mock scores by occurrences of "padding". The fused hit with
+        // the most is a long, weak lexical match that RRF put far down.
+        let paddings = |d: &ScoredDocument| {
+            d.fields
+                .iter()
+                .find(|f| f.name == "content")
+                .map_or(0, |f| f.value.matches("padding").count())
+        };
+        let pos = (0..fused.results.len())
+            .max_by_key(|&i| (paddings(&fused.results[i]), std::cmp::Reverse(i)))
+            .unwrap();
+        let expected = fused_ids[pos].clone();
+        let expected_paddings = paddings(&fused.results[pos]) as f64;
+        assert!(
+            expected.starts_with("lexfill") && pos >= 3,
+            "{expected} at {pos}: {fused_ids:?}"
+        );
+
+        let mut q = hybrid("breach", 3, 10, rrf(Some(20), None));
+        q.rerank = Some(kosha_core::RerankSpec {
+            provider: "mock".into(),
+            model: None,
+            field: "content".into(),
+            top_n: Some(20),
+            timeout_ms: Some(2_000),
+            query: None,
+        });
+        // The plain search entry points refuse rather than ignore it.
+        assert!(matches!(
+            searcher.search(&ns(), &manifest, &q, None),
+            Err(KoshaError::InvalidQuery(_))
+        ));
+
+        let mock = Arc::new(MockProvider::counting("padding"));
+        let provider: Arc<dyn RerankProvider> = mock.clone();
+        let (r, call) = searcher
+            .search_reranked(&ns(), &manifest, &q, None, &provider)
+            .unwrap();
+        assert_eq!(r.results[0].doc_id.0, expected, "{:?}", ids(&r));
+        assert_eq!(r.results.len(), 3);
+        assert_eq!(r.rerank_degraded, Some(false));
+        assert_eq!(r.total_hits, fused.total_hits);
+        let top = &r.results[0];
+        assert_eq!(top.rerank_score, Some(expected_paddings));
+        assert_eq!(top.score, expected_paddings);
+        assert_eq!(top.fused_score, Some(fused.results[pos].score));
+        assert_eq!(
+            top.rank_details, fused.results[pos].rank_details,
+            "per-retriever ranks are still reported"
+        );
+        let seen = mock.seen.lock().unwrap();
+        assert_eq!(seen[0].query, "breach");
+        assert_eq!(seen[0].documents.len(), fused_ids.len().min(20));
+        assert_eq!(call.unwrap().outcome, RerankOutcome::Ok);
+        drop(seen);
+
+        // Timeout: the fused order, flagged.
+        q.rerank.as_mut().unwrap().timeout_ms = Some(30);
+        let slow: Arc<dyn RerankProvider> = Arc::new(MockProvider {
+            delay: std::time::Duration::from_secs(3),
+            ..MockProvider::counting("padding")
+        });
+        let (r, call) = searcher
+            .search_reranked(&ns(), &manifest, &q, None, &slow)
+            .unwrap();
+        assert_eq!(ids(&r), fused_ids[..3]);
+        assert_eq!(r.rerank_degraded, Some(true));
+        for (hit, f) in r.results.iter().zip(&fused.results) {
+            assert_eq!(hit.score, f.score);
+            assert_eq!(hit.fused_score, Some(f.score));
+            assert_eq!(hit.rerank_score, None);
+        }
+        assert_eq!(call.unwrap().outcome, RerankOutcome::Timeout);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 /// Configurable, versioned analyzers end to end: write path, footer, and
@@ -15225,6 +16415,7 @@ mod analyzer_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         }
     }
 
@@ -15657,6 +16848,7 @@ mod field_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         }
     }
 
@@ -16369,6 +17561,7 @@ mod limit_per_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let mut locations = HashMap::new();
         for s in 0..segments {
@@ -16857,6 +18050,7 @@ mod rank_by_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let mut locations = HashMap::new();
         for s in 0..segments {
@@ -17547,6 +18741,7 @@ mod fuzzy_tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         }
     }
 
@@ -18048,5 +19243,1539 @@ mod fuzzy_tests {
         assert!(!serde_json::to_string(&plain).unwrap().contains("fuzzy"));
         // The clause is part of the request's serialized form (result cache key).
         assert!(serde_json::to_string(&hybrid).unwrap().contains("recieve"));
+    }
+}
+
+#[cfg(test)]
+mod nested_attribute_tests {
+    //! Issue #206: objects and arrays inside documents, addressed by
+    //! dotted path in filters, sorts, aggregations and highlights, across
+    //! more than one segment.
+    use super::*;
+    use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId};
+    use kosha_segment::SegmentWriter;
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "kosha-nested-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    /// `(id, text, author object, authors array)`; `None` leaves the
+    /// field off the document.
+    type Doc = (
+        &'static str,
+        &'static str,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+    );
+
+    fn fixture() -> Vec<Vec<Doc>> {
+        vec![
+            vec![
+                (
+                    "d1",
+                    "quarterly report",
+                    Some(json!({"name": "Ada", "org": "acme", "age": 36,
+                                "bio": "loves report writing"})),
+                    Some(json!([{"name": "Ada", "org": "acme"},
+                                {"name": "Bob", "org": "beta"}])),
+                ),
+                (
+                    "d2",
+                    "annual report",
+                    Some(json!({"name": "Bob", "org": "beta", "age": 41})),
+                    Some(json!([{"name": "Cy", "org": "acme"}])),
+                ),
+            ],
+            vec![
+                (
+                    "d3",
+                    "report draft",
+                    Some(json!({"name": "Ada", "org": "beta", "age": 29})),
+                    Some(json!([{"name": "Bob", "org": "acme", "score": 5},
+                                {"name": "Bob", "org": "acme", "score": 1}])),
+                ),
+                ("d4", "report memo", None, None),
+                (
+                    "d5",
+                    "report notes",
+                    None,
+                    Some(json!([{"score": 3}, {"score": 10}])),
+                ),
+            ],
+        ]
+    }
+
+    fn build(root: &Path, segments: &[Vec<Doc>]) -> (NamespaceId, Manifest) {
+        let ns = NamespaceId("ns".into());
+        let mut manifest = Manifest {
+            version: 1,
+            segments: vec![],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            retired: Default::default(),
+        };
+        for (i, docs) in segments.iter().enumerate() {
+            let id = SegmentId(format!("seg{i}"));
+            let mut writer = SegmentWriter::new(id.clone(), root.join(&ns.0).join(&id.0));
+            for (doc_id, text, author, authors) in docs {
+                let mut fields = vec![Field::text("text", *text)];
+                if let Some(author) = author {
+                    fields.push(Field::keyword("author", author.to_string()));
+                }
+                if let Some(authors) = authors {
+                    fields.push(Field::keyword("authors", authors.to_string()));
+                }
+                writer.add_document(DocumentId((*doc_id).into()), fields);
+            }
+            let footer = writer.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id: id,
+                doc_count: footer.doc_count,
+            });
+            manifest.remember_segment_footer(footer);
+        }
+        (ns, manifest)
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        ns: NamespaceId,
+        manifest: Manifest,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let root = temp_root(tag);
+            let (ns, manifest) = build(&root, &fixture());
+            Self { root, ns, manifest }
+        }
+
+        fn search(&self, query: serde_json::Value) -> SearchResult {
+            let mut query = query;
+            if query.get("query_text").is_none() {
+                query["query_text"] = json!("");
+            }
+            if query.get("max_results").is_none() {
+                query["max_results"] = json!(10);
+            }
+            let q: SearchQuery = serde_json::from_value(query).unwrap();
+            Searcher::new(self.root.clone())
+                .search(&self.ns, &self.manifest, &q, None)
+                .unwrap()
+        }
+
+        fn ids(&self, query: serde_json::Value) -> Vec<String> {
+            self.search(query)
+                .results
+                .into_iter()
+                .map(|r| r.doc_id.0)
+                .collect()
+        }
+
+        fn sorted_ids(&self, query: serde_json::Value) -> Vec<String> {
+            let mut ids = self.ids(query);
+            ids.sort();
+            ids
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn filters_on_dotted_paths_across_segments() {
+        let f = Fixture::new("filter");
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"term": {"author.name": "Ada"}}})),
+            vec!["d1", "d3"]
+        );
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"term": {"author.name.keyword": "Bob"}}})),
+            vec!["d2"]
+        );
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"range": {"author.age": {"gte": "30"}}}})),
+            vec!["d1", "d2"]
+        );
+        // Multi-valued: any value matches.
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"terms": {"authors.name": ["Bob"]}}})),
+            vec!["d1", "d3"]
+        );
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"range": {"authors.score": {"gt": "8"}}}})),
+            vec!["d5"]
+        );
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"exists": {"field": "authors.score"}}})),
+            vec!["d3", "d5"]
+        );
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"exists": {"field": "authors"}}})),
+            vec!["d1", "d2", "d3", "d5"]
+        );
+        assert!(f
+            .ids(json!({"filter": {"term": {"author.nope": "Ada"}}}))
+            .is_empty());
+    }
+
+    #[test]
+    fn array_of_objects_matches_across_elements() {
+        // Flattened semantics, documented in the README: d1's authors are
+        // {Ada, acme} and {Bob, beta}. No single author is Ada at beta, yet
+        // the document matches, because each path pools every element.
+        let f = Fixture::new("cross");
+        let both = |name: &str, org: &str| {
+            json!({"filter": {"bool": {"must": [
+                {"term": {"authors.name": name}},
+                {"term": {"authors.org": org}}
+            ]}}})
+        };
+        assert_eq!(f.sorted_ids(both("Ada", "beta")), vec!["d1"]);
+        assert_eq!(f.sorted_ids(both("Ada", "acme")), vec!["d1"]);
+        // Neither element of any document holds both values.
+        assert!(f.ids(both("Cy", "beta")).is_empty());
+    }
+
+    #[test]
+    fn sort_on_dotted_paths_uses_min_ascending_and_max_descending() {
+        let f = Fixture::new("sort");
+        let sorted = |field: &str, order: &str| {
+            f.ids(json!({
+                "filter": {"exists": {"field": field}},
+                "sort": [{field: {"order": order}}]
+            }))
+        };
+        assert_eq!(sorted("author.age", "asc"), vec!["d3", "d1", "d2"]);
+        assert_eq!(sorted("author.age", "desc"), vec!["d2", "d1", "d3"]);
+        // d3 has scores {5, 1}, d5 has {3, 10}: min ascending, max
+        // descending.
+        assert_eq!(sorted("authors.score", "asc"), vec!["d3", "d5"]);
+        assert_eq!(sorted("authors.score", "desc"), vec!["d5", "d3"]);
+        // Strings: d1 {Ada, Bob}, d2 {Cy}, d3 {Bob, Bob}.
+        assert_eq!(sorted("authors.name", "asc"), vec!["d1", "d3", "d2"]);
+        assert_eq!(sorted("authors.name", "desc"), vec!["d2", "d1", "d3"]);
+    }
+
+    #[test]
+    fn aggregations_on_dotted_paths_count_each_value_once_per_document() {
+        let f = Fixture::new("aggs");
+        let result = f.search(json!({
+            "filter": {"match_all": {}},
+            "aggs": {
+                "names": {"terms": {"field": "authors.name"}},
+                "orgs": {"terms": {"field": "author.org"},
+                         "aggs": {"oldest": {"max": {"field": "author.age"}}}},
+                "score_sum": {"sum": {"field": "authors.score"}},
+                "score_count": {"value_count": {"field": "authors.score"}}
+            }
+        }));
+        let aggs = serde_json::to_value(result.aggregations.unwrap()).unwrap();
+        let buckets = |name: &str| -> Vec<(String, u64)> {
+            let mut out: Vec<(String, u64)> = aggs[name]["buckets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| {
+                    (
+                        b["key"].as_str().unwrap().to_string(),
+                        b["doc_count"].as_u64().unwrap(),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        // d3 lists Bob twice and still counts once.
+        assert_eq!(
+            buckets("names"),
+            vec![("Ada".into(), 1), ("Bob".into(), 2), ("Cy".into(), 1)]
+        );
+        assert_eq!(
+            buckets("orgs"),
+            vec![("acme".into(), 1), ("beta".into(), 2)]
+        );
+        let beta = aggs["orgs"]["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["key"] == "beta")
+            .unwrap();
+        assert_eq!(beta["oldest"]["value"].as_f64(), Some(41.0));
+        assert_eq!(aggs["score_sum"]["value"].as_f64(), Some(19.0));
+        assert_eq!(aggs["score_count"]["value"].as_f64(), Some(4.0));
+    }
+
+    #[test]
+    fn source_round_trips_the_original_nesting() {
+        let f = Fixture::new("source");
+        let result = f.search(json!({"filter": {"term": {"author.name": "Ada"}},
+                                     "sort": [{"_id": {"order": "asc"}}]}));
+        let d1 = &result.results[0];
+        assert_eq!(d1.doc_id.0, "d1");
+        let names: Vec<&str> = d1.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["text", "author", "authors"]);
+        let source = |name: &str| -> serde_json::Value {
+            let field = d1.fields.iter().find(|f| f.name == name).unwrap();
+            assert_eq!(field.field_type, FieldType::Keyword);
+            serde_json::from_str(&field.value).unwrap()
+        };
+        assert_eq!(source("author"), fixture()[0][0].2.clone().unwrap());
+        assert_eq!(source("authors"), fixture()[0][0].3.clone().unwrap());
+    }
+
+    #[test]
+    fn highlight_on_a_dotted_path() {
+        let f = Fixture::new("highlight");
+        let result = f.search(json!({
+            "query_text": "report",
+            "filter": {"term": {"author.name": "Ada"}},
+            "highlight": {"field": "author.bio"},
+            "sort": [{"_id": {"order": "asc"}}]
+        }));
+        let by_id: HashMap<&str, &ScoredDocument> = result
+            .results
+            .iter()
+            .map(|r| (r.doc_id.0.as_str(), r))
+            .collect();
+        assert_eq!(
+            by_id["d1"].highlights.as_deref(),
+            Some(&["loves <b>report</b> writing".to_string()][..])
+        );
+        // d3's author has no bio.
+        assert_eq!(by_id["d3"].highlights, None);
+    }
+
+    #[test]
+    fn flat_documents_are_untouched() {
+        // A Keyword value that is not a container (a plain list, a value
+        // that only looks like JSON) adds no dotted-path columns.
+        let root = temp_root("flat");
+        let ns = NamespaceId("ns".into());
+        let id = SegmentId("seg0".into());
+        let mut writer = SegmentWriter::new(id.clone(), root.join(&ns.0).join(&id.0));
+        writer.add_document(
+            DocumentId("a".into()),
+            vec![
+                Field::keyword("tags", r#"["b","z"]"#),
+                Field::keyword("k", "{not json"),
+            ],
+        );
+        writer.add_document(
+            DocumentId("b".into()),
+            vec![Field::keyword("tags", r#"["c"]"#)],
+        );
+        writer.finalize(Bm25Params::default()).unwrap();
+        let reader = kosha_segment::SegmentReader::open(root.join(&ns.0).join(&id.0)).unwrap();
+        let store = reader.filter_store();
+        let mut names: Vec<&String> = store.string_fields.keys().collect();
+        names.sort();
+        assert_eq!(names, vec!["k", "tags"]);
+        assert!(store.float_fields.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// The `prefix` filter clause (#199, #217) end to end through the
+/// searcher, over a namespace of two segments, on every path a filter is
+/// applied: lexical scoring, filter-only, and `knn.filter`.
+#[cfg(test)]
+mod prefix_filter_tests {
+    use super::*;
+    use kosha_core::{DocumentId, Field, KnnQuery, ManifestEntry, SegmentId};
+    use kosha_segment::SegmentWriter;
+
+    /// `(segment, doc id, path or None)`; every document says "contract",
+    /// has a `page` and a vector a little further round the circle.
+    const DOCS: &[(&str, &str, Option<&str>)] = &[
+        ("s1", "d0", Some("/matters/2026/a")),
+        ("s1", "d1", Some("/matters/2025/b")),
+        ("s1", "d2", Some("/Matters/2026/c")),
+        ("s1", "d3", Some(r#"["/x","/matters/2026/l"]"#)),
+        ("s2", "d4", Some("/matters/2026/z")),
+        ("s2", "d5", Some("/other")),
+        ("s2", "d6", None),
+        ("s2", "d7", Some("/matters/2026/q")),
+    ];
+
+    fn corpus(name: &str) -> (std::path::PathBuf, NamespaceId, Manifest) {
+        let dir = std::env::temp_dir().join(format!("kosha-test-prefix-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let mut segments = Vec::new();
+        for seg in ["s1", "s2"] {
+            let mut w = SegmentWriter::new(SegmentId(seg.into()), dir.join("test").join(seg));
+            let mut count = 0;
+            for (i, (s, id, path)) in DOCS.iter().enumerate() {
+                if *s != seg {
+                    continue;
+                }
+                let angle = i as f32 * 0.1;
+                let mut fields = vec![
+                    Field::text("content", "contract"),
+                    Field::integer("page", i as i64),
+                    Field::vector("contentEmbedding", vec![angle.cos(), angle.sin(), 0.0, 0.0]),
+                ];
+                if let Some(path) = path {
+                    fields.push(Field::keyword("path", *path));
+                }
+                w.add_document(DocumentId((*id).into()), fields);
+                count += 1;
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            segments.push(ManifestEntry {
+                segment_id: SegmentId(seg.into()),
+                doc_count: count,
+            });
+        }
+        let manifest = Manifest {
+            version: 1,
+            segments,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            retired: Default::default(),
+            schema: Default::default(),
+        };
+        (dir, ns, manifest)
+    }
+
+    fn query(text: &str, filter: &str) -> SearchQuery {
+        SearchQuery {
+            query_text: text.into(),
+            max_results: 100,
+            from: 0,
+            bm25_params: Default::default(),
+            filter: Some(serde_json::from_str(filter).unwrap()),
+            sort: vec![],
+            search_after: None,
+            highlight: None,
+            aggs: HashMap::new(),
+            wildcard: None,
+            match_phrase: None,
+            knn: None,
+            exact_total_hits: None,
+            total_hits_cap: None,
+            operator: None,
+            no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
+            fields: Default::default(),
+            fuzzy: Default::default(),
+            limit_per: Default::default(),
+            mode: Default::default(),
+            rank: Default::default(),
+            rank_by: Default::default(),
+            rerank: Default::default(),
+        }
+    }
+
+    fn ids(searcher: &Searcher, ns: &NamespaceId, m: &Manifest, q: &SearchQuery) -> Vec<String> {
+        let r = searcher.search(ns, m, q, None).unwrap();
+        let mut ids: Vec<String> = r.results.iter().map(|h| h.doc_id.0.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    const IN_2026: &str = r#"{"prefix": {"path": "/matters/2026/"}}"#;
+
+    #[test]
+    fn prefix_filters_lexical_and_filter_only_search_across_segments() {
+        let (dir, ns, manifest) = corpus("lexical");
+        let searcher = Searcher::new(dir.clone());
+        let expected = vec!["d0", "d3", "d4", "d7"];
+        for text in ["contract", ""] {
+            assert_eq!(
+                ids(&searcher, &ns, &manifest, &query(text, IN_2026)),
+                expected,
+                "query_text={text:?}"
+            );
+        }
+        // Case-insensitive also takes /Matters/.
+        let ci = r#"{"prefix": {"path": {"value": "/MATTERS/2026/", "case_insensitive": true}}}"#;
+        assert_eq!(
+            ids(&searcher, &ns, &manifest, &query("contract", ci)),
+            vec!["d0", "d2", "d3", "d4", "d7"]
+        );
+        // The default is case-sensitive.
+        assert_eq!(
+            ids(
+                &searcher,
+                &ns,
+                &manifest,
+                &query("contract", r#"{"prefix": {"path": "/MATTERS"}}"#)
+            ),
+            Vec::<String>::new()
+        );
+        // Empty prefix: everything that has a path (all but d6).
+        assert_eq!(
+            ids(
+                &searcher,
+                &ns,
+                &manifest,
+                &query("", r#"{"prefix": {"path": ""}}"#)
+            ),
+            vec!["d0", "d1", "d2", "d3", "d4", "d5", "d7"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_composes_in_bool_across_segments() {
+        let (dir, ns, manifest) = corpus("bool");
+        let searcher = Searcher::new(dir.clone());
+        // must, together with a numeric range (page = index in DOCS).
+        let must = r#"{"bool": {"must": [{"prefix": {"path": "/matters/2026/"}},
+                                          {"range": {"page": {"gte": "3"}}}]}}"#;
+        assert_eq!(
+            ids(&searcher, &ns, &manifest, &query("contract", must)),
+            vec!["d3", "d4", "d7"]
+        );
+        let must_not = r#"{"bool": {"must_not": [{"prefix": {"path": "/matters/"}}]}}"#;
+        assert_eq!(
+            ids(&searcher, &ns, &manifest, &query("contract", must_not)),
+            vec!["d2", "d5", "d6"]
+        );
+        let should = r#"{"bool": {"should": [{"prefix": {"path": "/other"}},
+                                            {"prefix": {"path": "/Matters"}}]}}"#;
+        assert_eq!(
+            ids(&searcher, &ns, &manifest, &query("", should)),
+            vec!["d2", "d5"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_works_as_a_knn_filter() {
+        let (dir, ns, manifest) = corpus("knn");
+        let searcher = Searcher::new(dir.clone());
+        let mut q = query("", r#"{"match_all": {}}"#);
+        q.filter = None;
+        q.knn = Some(KnnQuery {
+            field: "contentEmbedding".into(),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            k: 8,
+            num_candidates: 8,
+            filter: Some(serde_json::from_str(IN_2026).unwrap()),
+        });
+        assert_eq!(
+            ids(&searcher, &ns, &manifest, &q),
+            vec!["d0", "d3", "d4", "d7"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_on_a_numeric_field_is_a_query_error() {
+        let (dir, ns, manifest) = corpus("numeric");
+        let searcher = Searcher::new(dir.clone());
+        for filter in [
+            r#"{"prefix": {"page": "1"}}"#,
+            r#"{"bool": {"must_not": [{"prefix": {"page": "1"}}]}}"#,
+        ] {
+            let err = searcher
+                .search(&ns, &manifest, &query("contract", filter), None)
+                .expect_err(filter);
+            assert!(
+                matches!(&err, KoshaError::InvalidQuery(msg) if msg.contains("numeric field")),
+                "{filter}: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod metric_aggregation_tests {
+    //! Issues #218 / #196 / #202: `min` / `max` / `sum` / `avg` /
+    //! `value_count`, top-level and nested under `terms` / `composite`,
+    //! checked against a brute-force computation over a multi-segment
+    //! namespace.
+    use super::*;
+    use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId};
+    use kosha_segment::SegmentWriter;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    pub(super) struct Doc {
+        pub(super) id: String,
+        pub(super) text: &'static str,
+        pub(super) category: &'static str,
+        pub(super) price: Option<f64>,
+        pub(super) qty: Option<i64>,
+        pub(super) sent: Option<&'static str>,
+        pub(super) tags: Option<&'static [&'static str]>,
+    }
+
+    pub(super) fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "kosha-metric-aggs-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    fn empty_manifest() -> Manifest {
+        Manifest {
+            version: 1,
+            segments: vec![],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            retired: Default::default(),
+            schema: Default::default(),
+        }
+    }
+
+    /// One segment per element of `segments`, in order.
+    pub(super) fn build(root: &Path, segments: &[Vec<Doc>]) -> (NamespaceId, Manifest) {
+        let ns = NamespaceId("ns".into());
+        let mut manifest = empty_manifest();
+        for (i, docs) in segments.iter().enumerate() {
+            let id = SegmentId(format!("seg{i}"));
+            let mut writer = SegmentWriter::new(id.clone(), root.join(&ns.0).join(&id.0));
+            for doc in docs {
+                let mut fields = vec![
+                    Field::text("text", doc.text),
+                    Field::keyword("category", doc.category),
+                ];
+                if let Some(price) = doc.price {
+                    fields.push(Field::float_val("price", price));
+                }
+                if let Some(qty) = doc.qty {
+                    fields.push(Field::integer("qty", qty));
+                }
+                if let Some(sent) = doc.sent {
+                    fields.push(Field::date_val("sent", sent));
+                }
+                if let Some(tags) = doc.tags {
+                    fields.push(Field::keyword("tags", serde_json::to_string(tags).unwrap()));
+                }
+                writer.add_document(DocumentId(doc.id.clone()), fields);
+            }
+            let footer = writer.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id: id,
+                doc_count: footer.doc_count,
+            });
+            manifest.remember_segment_footer(footer);
+        }
+        (ns, manifest)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn doc(
+        id: &str,
+        text: &'static str,
+        category: &'static str,
+        price: Option<f64>,
+        qty: Option<i64>,
+        sent: Option<&'static str>,
+        tags: Option<&'static [&'static str]>,
+    ) -> Doc {
+        Doc {
+            id: id.into(),
+            text,
+            category,
+            price,
+            qty,
+            sent,
+            tags,
+        }
+    }
+
+    /// Three segments of unequal size; some documents lack each field.
+    pub(super) fn fixture() -> Vec<Vec<Doc>> {
+        vec![
+            vec![
+                doc(
+                    "a1",
+                    "apple pie",
+                    "fruit",
+                    Some(1.5),
+                    Some(3),
+                    Some("2024-01-01T00:00:00Z"),
+                    Some(&["x", "y"]),
+                ),
+                doc(
+                    "a2",
+                    "apple tart",
+                    "fruit",
+                    None,
+                    Some(-7),
+                    None,
+                    Some(&["x"]),
+                ),
+            ],
+            vec![
+                doc(
+                    "b1",
+                    "banana bread",
+                    "bakery",
+                    Some(10.25),
+                    None,
+                    Some("2024-03-15"),
+                    None,
+                ),
+                doc(
+                    "b2",
+                    "banana split",
+                    "fruit",
+                    Some(-2.0),
+                    Some(11),
+                    Some("2023-12-31T23:00:00-02:00"),
+                    Some(&[]),
+                ),
+                doc(
+                    "b3",
+                    "plain bread",
+                    "bakery",
+                    None,
+                    None,
+                    None,
+                    Some(&["z", "x", "y"]),
+                ),
+                doc(
+                    "b4",
+                    "apple bread",
+                    "bakery",
+                    Some(4.0),
+                    Some(5),
+                    Some("2024-02-29T12:00:00Z"),
+                    None,
+                ),
+            ],
+            vec![
+                doc("c1", "cherry", "fruit", Some(100.0), Some(0), None, None),
+                doc("c2", "apple cherry", "dairy", None, None, None, None),
+                doc(
+                    "c3",
+                    "cream",
+                    "dairy",
+                    Some(0.75),
+                    Some(2),
+                    Some("2024-06-15T00:00:00Z"),
+                    Some(&["y"]),
+                ),
+            ],
+        ]
+    }
+
+    pub(super) fn query(text: &str, max_results: usize, aggs: serde_json::Value) -> SearchQuery {
+        let mut q = serde_json::json!({
+            "query_text": text,
+            "max_results": max_results,
+            "aggs": aggs,
+        });
+        if text.is_empty() {
+            q["filter"] = serde_json::json!({"match_all": {}});
+        }
+        serde_json::from_value(q).unwrap()
+    }
+
+    pub(super) fn run(
+        root: &Path,
+        ns: &NamespaceId,
+        manifest: &Manifest,
+        q: &SearchQuery,
+    ) -> serde_json::Value {
+        let result = Searcher::new(root.to_path_buf())
+            .search(ns, manifest, q, None)
+            .unwrap();
+        serde_json::to_value(result.aggregations.unwrap()).unwrap()
+    }
+
+    /// Brute-force expected `{min, max, sum, avg, count}` over `values`.
+    fn expected(values: &[f64]) -> (Option<f64>, Option<f64>, f64, Option<f64>) {
+        if values.is_empty() {
+            return (None, None, 0.0, None);
+        }
+        let sum: f64 = values.iter().sum();
+        (
+            values.iter().copied().reduce(f64::min),
+            values.iter().copied().reduce(f64::max),
+            sum,
+            Some(sum / values.len() as f64),
+        )
+    }
+
+    fn assert_metric(agg: &serde_json::Value, want: Option<f64>, what: &str) {
+        match want {
+            None => assert!(agg["value"].is_null(), "{what}: expected null, got {agg}"),
+            Some(want) => {
+                let got = agg["value"]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("{what}: {agg}"));
+                assert!((got - want).abs() < 1e-9, "{what}: got {got}, want {want}");
+            }
+        }
+    }
+
+    fn metric_aggs(field: &str) -> serde_json::Value {
+        serde_json::json!({
+            "min": {"min": {"field": field}},
+            "max": {"max": {"field": field}},
+            "sum": {"sum": {"field": field}},
+            "avg": {"avg": {"field": field}},
+            "count": {"value_count": {"field": field}},
+        })
+    }
+
+    fn check_all(out: &serde_json::Value, values: &[f64], count: u64, what: &str) {
+        let (min, max, sum, avg) = expected(values);
+        assert_metric(&out["min"], min, &format!("{what} min"));
+        assert_metric(&out["max"], max, &format!("{what} max"));
+        assert_metric(&out["sum"], Some(sum), &format!("{what} sum"));
+        assert_metric(&out["avg"], avg, &format!("{what} avg"));
+        assert_eq!(out["count"]["value"], count, "{what} value_count: {out}");
+    }
+
+    #[test]
+    fn all_five_metrics_match_brute_force_across_segments() {
+        let root = temp_root("brute");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let docs: Vec<Doc> = segments.concat();
+
+        // Float and Integer columns, every document (match_all), and
+        // scoped to a query (only the "apple" documents).
+        for (text, scope) in [("", None), ("apple", Some("apple"))] {
+            let in_scope: Vec<&Doc> = docs
+                .iter()
+                .filter(|d| scope.is_none_or(|s| d.text.split(' ').any(|w| w == s)))
+                .collect();
+
+            let prices: Vec<f64> = in_scope.iter().filter_map(|d| d.price).collect();
+            let out = run(&root, &ns, &manifest, &query(text, 0, metric_aggs("price")));
+            check_all(
+                &out,
+                &prices,
+                prices.len() as u64,
+                &format!("price/{text:?}"),
+            );
+
+            let qtys: Vec<f64> = in_scope
+                .iter()
+                .filter_map(|d| d.qty.map(|q| q as f64))
+                .collect();
+            let out = run(&root, &ns, &manifest, &query(text, 0, metric_aggs("qty")));
+            check_all(&out, &qtys, qtys.len() as u64, &format!("qty/{text:?}"));
+
+            // A field no document has: null / 0, never an error.
+            let out = run(
+                &root,
+                &ns,
+                &manifest,
+                &query(text, 0, metric_aggs("absent")),
+            );
+            check_all(&out, &[], 0, &format!("absent/{text:?}"));
+
+            // value_count counts the elements of a list value (ES counts
+            // values, not documents); an empty list counts nothing.
+            let tag_count: usize = in_scope
+                .iter()
+                .filter_map(|d| d.tags)
+                .map(|t| t.len())
+                .sum();
+            let out = run(
+                &root,
+                &ns,
+                &manifest,
+                &query(
+                    text,
+                    0,
+                    serde_json::json!({"n": {"value_count": {"field": "tags"}}}),
+                ),
+            );
+            assert_eq!(out["n"]["value"], tag_count, "{text:?}: {out}");
+            // ... and a numeric metric over a keyword column of words has
+            // no values: null, not 0.
+            let out = run(
+                &root,
+                &ns,
+                &manifest,
+                &query(
+                    text,
+                    0,
+                    serde_json::json!({"m": {"min": {"field": "category"}}}),
+                ),
+            );
+            assert!(out["m"]["value"].is_null(), "{out}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn avg_divides_merged_sum_by_merged_count_not_averages_of_averages() {
+        // Segment 0: one value 100. Segment 1: three values 0. The true
+        // mean is 25; the mean of the per-segment means would be 50.
+        let root = temp_root("avg");
+        let mk = |id: &str, price: f64| doc(id, "x", "c", Some(price), None, None, None);
+        let (ns, manifest) = build(
+            &root,
+            &[
+                vec![mk("a", 100.0)],
+                vec![mk("b", 0.0), mk("c", 0.0), mk("d", 0.0)],
+            ],
+        );
+        let out = run(
+            &root,
+            &ns,
+            &manifest,
+            &query(
+                "",
+                0,
+                serde_json::json!({"avg": {"avg": {"field": "price"}}}),
+            ),
+        );
+        assert_eq!(out["avg"]["value"], 25.0, "{out}");
+        assert!(out["avg"].get("value_as_string").is_none(), "{out}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn date_fields_aggregate_on_epoch_millis() {
+        let root = temp_root("date");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let millis: Vec<f64> = segments
+            .concat()
+            .iter()
+            .filter_map(|d| d.sent)
+            .map(|s| kosha_core::datetime::parse_epoch_millis(s).unwrap() as f64)
+            .collect();
+        let out = run(&root, &ns, &manifest, &query("", 0, metric_aggs("sent")));
+        check_all(&out, &millis, millis.len() as u64, "sent");
+        // Numeric, not string, order: "2023-12-31T23:00:00-02:00" is
+        // 2024-01-01T01:00Z, later than "2024-01-01T00:00:00Z" though it
+        // sorts first as text.
+        assert_eq!(out["min"]["value"], 1_704_067_200_000.0, "{out}");
+        assert_eq!(out["min"]["value_as_string"], "2024-01-01T00:00:00.000Z");
+        assert_eq!(out["max"]["value_as_string"], "2024-06-15T00:00:00.000Z");
+        assert!(out["avg"]["value_as_string"].is_string(), "{out}");
+        assert!(out["sum"].get("value_as_string").is_none(), "{out}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metrics_nested_under_terms_and_composite_give_per_bucket_totals() {
+        let root = temp_root("nested");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let docs = segments.concat();
+        let subs = serde_json::json!({
+            "total": {"sum": {"field": "price"}},
+            "mean": {"avg": {"field": "price"}},
+            "low": {"min": {"field": "qty"}},
+            "n": {"value_count": {"field": "price"}},
+        });
+        let out = run(
+            &root,
+            &ns,
+            &manifest,
+            &query(
+                "",
+                0,
+                serde_json::json!({
+                    "by_cat": {"terms": {"field": "category"}, "aggs": subs},
+                    "pages": {
+                        "composite": {"size": 10, "sources": [{"cat": {"terms": {"field": "category"}}}]},
+                        "aggregations": subs,
+                    },
+                }),
+            ),
+        );
+        let terms = out["by_cat"]["buckets"].as_array().unwrap();
+        let composite = out["pages"]["buckets"].as_array().unwrap();
+        assert_eq!(terms.len(), 3, "{out}");
+        assert_eq!(composite.len(), 3, "{out}");
+        for cat in ["fruit", "bakery", "dairy"] {
+            let members: Vec<&Doc> = docs.iter().filter(|d| d.category == cat).collect();
+            let prices: Vec<f64> = members.iter().filter_map(|d| d.price).collect();
+            let qtys: Vec<f64> = members
+                .iter()
+                .filter_map(|d| d.qty.map(|q| q as f64))
+                .collect();
+            let (_, _, sum, avg) = expected(&prices);
+            let (low, _, _, _) = expected(&qtys);
+            for bucket in [
+                terms.iter().find(|b| b["key"] == cat).unwrap(),
+                composite.iter().find(|b| b["key"]["cat"] == cat).unwrap(),
+            ] {
+                assert_eq!(bucket["doc_count"], members.len(), "{cat}: {bucket}");
+                assert_metric(&bucket["total"], Some(sum), &format!("{cat} total"));
+                assert_metric(&bucket["mean"], avg, &format!("{cat} mean"));
+                assert_metric(&bucket["low"], low, &format!("{cat} low"));
+                assert_eq!(bucket["n"]["value"], prices.len(), "{cat}: {bucket}");
+            }
+        }
+        // "fruit" spans all three segments: 1.5 + -2.0 + 100.0.
+        let fruit = terms.iter().find(|b| b["key"] == "fruit").unwrap();
+        assert_eq!(fruit["total"]["value"], 99.5, "{fruit}");
+        // "dairy" has no qty in c2 but has c3's 2; no price-less bucket
+        // reports 0 for avg.
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_typed_result_fields_survive_metric_names() {
+        // A metric named like a historical typed field still lands in the
+        // response, whether its value fits the typed field or not.
+        let root = temp_root("typed");
+        let (ns, manifest) = build(&root, &fixture());
+        let out = run(
+            &root,
+            &ns,
+            &manifest,
+            &query(
+                "",
+                0,
+                serde_json::json!({
+                    "total_documents": {"avg": {"field": "absent"}},
+                    "per_document": {"terms": {"field": "category"}, "aggs": {"s": {"sum": {"field": "qty"}}}},
+                }),
+            ),
+        );
+        assert!(out["total_documents"]["value"].is_null(), "{out}");
+        assert!(
+            out["per_document"]["buckets"][0]["s"]["value"].is_number(),
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn aggregation_only_request_never_touches_the_doc_store() {
+        // `max_results: 0` with aggregations reads filter columns only:
+        // `doc_store.bin` is removed outright, leaving the offsets sidecar
+        // as on a cold, scoring-set-only hydrated pod, and the hydrator
+        // must never be asked for it.
+        let root = temp_root("nohydrate");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        for entry in &manifest.segments {
+            let dir = root.join(&ns.0).join(&entry.segment_id.0);
+            std::fs::remove_file(dir.join("doc_store.bin")).unwrap();
+        }
+        let calls: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        let hydrator = |segs: &[PageSegment<'_>]| {
+            calls
+                .lock()
+                .unwrap()
+                .extend(segs.iter().map(|seg| seg.segment_dir.to_path_buf()))
+        };
+        let mut aggs = metric_aggs("price");
+        aggs["by_cat"] = serde_json::json!({
+            "terms": {"field": "category"},
+            "aggs": {"total": {"sum": {"field": "price"}}}
+        });
+        let (result, _stats) = Searcher::new(root.clone())
+            .search_with_doc_store_hydrator(
+                &ns,
+                &manifest,
+                &query("", 0, aggs),
+                None,
+                Some(&hydrator),
+            )
+            .unwrap();
+        assert!(result.results.is_empty());
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "aggregation-only request hydrated the doc store: {:?}",
+            calls.lock().unwrap()
+        );
+        let out = serde_json::to_value(result.aggregations.unwrap()).unwrap();
+        let prices: Vec<f64> = segments.concat().iter().filter_map(|d| d.price).collect();
+        check_all(&out, &prices, prices.len() as u64, "no-hydrate price");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod histogram_aggregation_tests {
+    //! Issue #219: `histogram` / `date_histogram` bucket boundaries
+    //! (negative values, values exactly on a boundary, non-zero offsets),
+    //! gap filling, cross-segment merging, query/filter scoping and metric
+    //! sub-aggregations.
+    use super::metric_aggregation_tests::{build, doc, fixture, query, run, temp_root, Doc};
+    use super::*;
+    use std::path::Path;
+
+    fn price(id: &str, p: f64) -> Doc {
+        doc(id, "x", "c", Some(p), None, None, None)
+    }
+
+    fn sent(id: &str, at: &'static str) -> Doc {
+        doc(id, "x", "c", None, None, Some(at), None)
+    }
+
+    /// `(key, doc_count)` pairs of a numeric histogram result.
+    fn numeric_buckets(agg: &serde_json::Value) -> Vec<(f64, u64)> {
+        agg["buckets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no buckets: {agg}"))
+            .iter()
+            .map(|b| (b["key"].as_f64().unwrap(), b["doc_count"].as_u64().unwrap()))
+            .collect()
+    }
+
+    /// `(key_as_string, doc_count)` pairs of a date histogram result,
+    /// checking `key` agrees with `key_as_string`.
+    fn date_buckets(agg: &serde_json::Value) -> Vec<(String, u64)> {
+        agg["buckets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no buckets: {agg}"))
+            .iter()
+            .map(|b| {
+                let text = b["key_as_string"].as_str().unwrap().to_string();
+                let key = b["key"].as_i64().unwrap_or_else(|| panic!("{b}"));
+                assert_eq!(
+                    kosha_core::datetime::parse_epoch_millis(&text),
+                    Some(key),
+                    "{b}"
+                );
+                (text, b["doc_count"].as_u64().unwrap())
+            })
+            .collect()
+    }
+
+    fn one(root: &Path, segments: &[Vec<Doc>], aggs: serde_json::Value) -> serde_json::Value {
+        let (ns, manifest) = build(root, segments);
+        run(root, &ns, &manifest, &query("", 0, aggs))
+    }
+
+    fn try_search(
+        root: &Path,
+        segments: &[Vec<Doc>],
+        aggs: serde_json::Value,
+    ) -> Result<serde_json::Value, KoshaError> {
+        let (ns, manifest) = build(root, segments);
+        let q = query("", 0, aggs);
+        Searcher::new(root.to_path_buf())
+            .search(&ns, &manifest, &q, None)
+            .map(|r| serde_json::to_value(r.aggregations.unwrap()).unwrap())
+    }
+
+    /// Prices on and around the boundaries of width-10 buckets, split
+    /// over two segments.
+    fn boundary_prices() -> Vec<Vec<Doc>> {
+        vec![
+            vec![
+                price("a", -10.5),
+                price("b", -10.0),
+                price("c", -0.001),
+                price("d", 0.0),
+            ],
+            vec![price("e", 9.999), price("f", 10.0), price("g", 25.0)],
+        ]
+    }
+
+    #[test]
+    fn histogram_boundaries_negatives_and_offset_match_hand_computed_buckets() {
+        let root = temp_root("hist-boundaries");
+        let out = one(
+            &root,
+            &boundary_prices(),
+            serde_json::json!({
+                "plain": {"histogram": {"field": "price", "interval": 10}},
+                "shifted": {"histogram": {"field": "price", "interval": 10, "offset": 3}},
+                "dense": {"histogram": {"field": "price", "interval": 10, "offset": 3, "min_doc_count": 1}},
+                "busy": {"histogram": {"field": "price", "interval": 10, "offset": 3, "min_doc_count": 2}},
+            }),
+        );
+        // floor(v / 10) * 10: -10.5 → -20; -10 (on the boundary) → -10;
+        // -0.001 → -10; 0 → 0; 9.999 → 0; 10 (on the boundary) → 10;
+        // 25 → 20.
+        assert_eq!(
+            numeric_buckets(&out["plain"]),
+            vec![(-20.0, 1), (-10.0, 2), (0.0, 2), (10.0, 1), (20.0, 1)],
+            "{out}"
+        );
+        // floor((v - 3) / 10) * 10 + 3: -10.5, -10 → -17; -0.001, 0 → -7;
+        // 9.999, 10 → 3; nothing in [13, 23) → an empty gap bucket at 13;
+        // 25 → 23.
+        assert_eq!(
+            numeric_buckets(&out["shifted"]),
+            vec![(-17.0, 2), (-7.0, 2), (3.0, 2), (13.0, 0), (23.0, 1)],
+            "{out}"
+        );
+        assert_eq!(
+            numeric_buckets(&out["dense"]),
+            vec![(-17.0, 2), (-7.0, 2), (3.0, 2), (23.0, 1)],
+            "{out}"
+        );
+        assert_eq!(
+            numeric_buckets(&out["busy"]),
+            vec![(-17.0, 2), (-7.0, 2), (3.0, 2)],
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn histogram_over_integer_field_and_fractional_interval() {
+        let root = temp_root("hist-int");
+        let qty = |id: &str, q: i64| doc(id, "x", "c", None, Some(q), None, None);
+        let out = one(
+            &root,
+            &[
+                vec![qty("a", -7), qty("b", -5), qty("c", 4)],
+                vec![qty("d", 5)],
+            ],
+            serde_json::json!({
+                "q": {"histogram": {"field": "qty", "interval": 5}},
+                "halves": {"histogram": {"field": "qty", "interval": 2.5, "offset": -1}},
+            }),
+        );
+        assert_eq!(
+            numeric_buckets(&out["q"]),
+            vec![(-10.0, 1), (-5.0, 1), (0.0, 1), (5.0, 1)],
+            "{out}"
+        );
+        // floor((v + 1) / 2.5) * 2.5 - 1: -7 → -8.5, -5 → -6, 4 → 4, 5 → 4.
+        assert_eq!(
+            numeric_buckets(&out["halves"]),
+            vec![
+                (-8.5, 1),
+                (-6.0, 1),
+                (-3.5, 0),
+                (-1.0, 0),
+                (1.5, 0),
+                (4.0, 2)
+            ],
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn date_histogram_boundaries_offsets_and_calendar_week() {
+        let root = temp_root("date-hist");
+        let segments = vec![
+            vec![
+                sent("a", "2023-12-31T23:59:59Z"),
+                sent("b", "2024-01-01T00:00:00Z"),
+                sent("c", "2024-01-01T00:59:59.999Z"),
+            ],
+            vec![
+                sent("d", "2024-01-01T01:00:00Z"),
+                // 02:30 UTC, written with an offset.
+                sent("e", "2024-01-01T03:30:00+01:00"),
+                // A date-only value: midnight UTC.
+                sent("f", "2024-01-03"),
+            ],
+        ];
+        let out = one(
+            &root,
+            &segments,
+            serde_json::json!({
+                "hourly": {"date_histogram": {"field": "sent", "fixed_interval": "1h", "min_doc_count": 1}},
+                "half_past": {"date_histogram": {"field": "sent", "fixed_interval": "60m", "offset": "+30m", "min_doc_count": 1}},
+                "daily": {"date_histogram": {"field": "sent", "fixed_interval": "1d"}},
+                "weekly": {"date_histogram": {"field": "sent", "calendar_interval": "1w"}},
+            }),
+        );
+        let s = |t: &str| t.to_string();
+        assert_eq!(
+            date_buckets(&out["hourly"]),
+            vec![
+                (s("2023-12-31T23:00:00.000Z"), 1),
+                (s("2024-01-01T00:00:00.000Z"), 2),
+                (s("2024-01-01T01:00:00.000Z"), 1),
+                (s("2024-01-01T02:00:00.000Z"), 1),
+                (s("2024-01-03T00:00:00.000Z"), 1),
+            ],
+            "{out}"
+        );
+        assert_eq!(
+            date_buckets(&out["half_past"]),
+            vec![
+                (s("2023-12-31T23:30:00.000Z"), 2),
+                (s("2024-01-01T00:30:00.000Z"), 2),
+                (s("2024-01-01T02:30:00.000Z"), 1),
+                (s("2024-01-02T23:30:00.000Z"), 1),
+            ],
+            "{out}"
+        );
+        // Default min_doc_count 0: the empty 2024-01-02 is filled.
+        assert_eq!(
+            date_buckets(&out["daily"]),
+            vec![
+                (s("2023-12-31T00:00:00.000Z"), 1),
+                (s("2024-01-01T00:00:00.000Z"), 4),
+                (s("2024-01-02T00:00:00.000Z"), 0),
+                (s("2024-01-03T00:00:00.000Z"), 1),
+            ],
+            "{out}"
+        );
+        // Weeks start on Monday: Sunday 2023-12-31 is in the week of
+        // Monday 2023-12-25; Monday 2024-01-01 starts the next.
+        assert_eq!(
+            date_buckets(&out["weekly"]),
+            vec![
+                (s("2023-12-25T00:00:00.000Z"), 1),
+                (s("2024-01-01T00:00:00.000Z"), 5),
+            ],
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn date_histogram_before_the_epoch_floors_down() {
+        let root = temp_root("date-hist-epoch");
+        let out = one(
+            &root,
+            &[vec![
+                sent("a", "1969-12-31T23:59:59.999Z"),
+                sent("b", "1970-01-01T00:00:00Z"),
+            ]],
+            serde_json::json!({"d": {"date_histogram": {"field": "sent", "fixed_interval": "1d"}}}),
+        );
+        assert_eq!(out["d"]["buckets"][0]["key"], -86_400_000, "{out}");
+        assert_eq!(
+            date_buckets(&out["d"]),
+            vec![
+                ("1969-12-31T00:00:00.000Z".to_string(), 1),
+                ("1970-01-01T00:00:00.000Z".to_string(), 1),
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn comparison_aggs() -> serde_json::Value {
+        serde_json::json!({
+            "price": {"histogram": {"field": "price", "interval": 5, "offset": 1.5},
+                      "aggs": {"total": {"sum": {"field": "price"}}, "n": {"value_count": {"field": "qty"}}}},
+            "qty": {"histogram": {"field": "qty", "interval": 3, "min_doc_count": 1}},
+            "sent": {"date_histogram": {"field": "sent", "fixed_interval": "7d", "offset": "-12h"},
+                     "aggs": {"avg_price": {"avg": {"field": "price"}}}},
+            "weeks": {"date_histogram": {"field": "sent", "calendar_interval": "week"}},
+        })
+    }
+
+    #[test]
+    fn multi_segment_results_equal_single_segment_results() {
+        let segments = fixture();
+        let multi_root = temp_root("hist-multi");
+        let single_root = temp_root("hist-single");
+        for text in ["", "apple"] {
+            let (ns, manifest) = build(&multi_root, &segments);
+            assert_eq!(manifest.segments.len(), 3);
+            let multi = run(
+                &multi_root,
+                &ns,
+                &manifest,
+                &query(text, 0, comparison_aggs()),
+            );
+            let (ns, manifest) = build(&single_root, &[segments.concat()]);
+            assert_eq!(manifest.segments.len(), 1);
+            let single = run(
+                &single_root,
+                &ns,
+                &manifest,
+                &query(text, 0, comparison_aggs()),
+            );
+            assert_eq!(multi, single, "{text:?}");
+            assert!(!multi["price"]["buckets"].as_array().unwrap().is_empty());
+        }
+        std::fs::remove_dir_all(multi_root).unwrap();
+        std::fs::remove_dir_all(single_root).unwrap();
+    }
+
+    #[test]
+    fn buckets_are_scoped_to_query_and_filter_matches() {
+        let root = temp_root("hist-scope");
+        let segments = fixture();
+        let (ns, manifest) = build(&root, &segments);
+        let docs = segments.concat();
+        let aggs = serde_json::json!({"h": {"histogram": {"field": "price", "interval": 10, "min_doc_count": 1}}});
+        let brute = |keep: &dyn Fn(&Doc) -> bool| {
+            let mut counts: std::collections::BTreeMap<i64, u64> = Default::default();
+            for d in docs.iter().filter(|d| keep(d)) {
+                if let Some(p) = d.price {
+                    *counts.entry((p / 10.0).floor() as i64).or_default() += 1;
+                }
+            }
+            counts
+                .into_iter()
+                .map(|(i, c)| (i as f64 * 10.0, c))
+                .collect::<Vec<_>>()
+        };
+        // Query only.
+        let out = run(&root, &ns, &manifest, &query("apple", 0, aggs.clone()));
+        assert_eq!(
+            numeric_buckets(&out["h"]),
+            brute(&|d| d.text.split(' ').any(|w| w == "apple")),
+            "{out}"
+        );
+        // Query plus filter.
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "apple",
+            "max_results": 3,
+            "filter": {"term": {"category": "bakery"}},
+            "aggs": aggs,
+        }))
+        .unwrap();
+        let out = run(&root, &ns, &manifest, &q);
+        let want = brute(&|d| d.text.split(' ').any(|w| w == "apple") && d.category == "bakery");
+        assert_eq!(numeric_buckets(&out["h"]), want, "{out}");
+        assert_eq!(want, vec![(0.0, 1)]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metric_sub_aggregations_per_histogram_bucket_including_gaps() {
+        let root = temp_root("hist-subs");
+        let out = one(
+            &root,
+            &[
+                vec![price("a", 1.0), price("b", 2.0)],
+                vec![price("c", 21.0), price("d", 3.5)],
+            ],
+            serde_json::json!({"h": {
+                "histogram": {"field": "price", "interval": 10},
+                "aggs": {"total": {"sum": {"field": "price"}}, "low": {"min": {"field": "price"}}}
+            }}),
+        );
+        let buckets = out["h"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 3, "{out}");
+        assert_eq!(buckets[0]["key"], 0.0);
+        assert_eq!(buckets[0]["doc_count"], 3);
+        assert_eq!(buckets[0]["total"]["value"], 6.5);
+        assert_eq!(buckets[0]["low"]["value"], 1.0);
+        // The filled gap: no values, so sum 0 and min null.
+        assert_eq!(buckets[1]["key"], 10.0);
+        assert_eq!(buckets[1]["doc_count"], 0);
+        assert_eq!(buckets[1]["total"]["value"], 0.0);
+        assert!(buckets[1]["low"]["value"].is_null(), "{out}");
+        assert_eq!(buckets[2]["total"]["value"], 21.0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multi_valued_documents_count_once_per_bucket() {
+        let root = temp_root("hist-multi-valued");
+        // A JSON-list Date value: 3 elements, two in the same day.
+        let d = doc(
+            "a",
+            "x",
+            "c",
+            None,
+            None,
+            Some(r#"["2024-01-01T01:00:00Z","2024-01-01T05:00:00Z","2024-01-02T00:00:00Z"]"#),
+            None,
+        );
+        let out = one(
+            &root,
+            &[vec![d, sent("b", "2024-01-01T12:00:00Z")]],
+            serde_json::json!({"d": {"date_histogram": {"field": "sent", "fixed_interval": "1d"}}}),
+        );
+        assert_eq!(
+            date_buckets(&out["d"]),
+            vec![
+                ("2024-01-01T00:00:00.000Z".to_string(), 2),
+                ("2024-01-02T00:00:00.000Z".to_string(), 1),
+            ],
+            "{out}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_values_gives_no_buckets() {
+        let root = temp_root("hist-empty");
+        let out = one(
+            &root,
+            &[vec![price("a", 1.0)]],
+            serde_json::json!({
+                "h": {"histogram": {"field": "absent", "interval": 1}},
+                "d": {"date_histogram": {"field": "category", "fixed_interval": "1d"}},
+            }),
+        );
+        assert_eq!(out["h"], serde_json::json!({"buckets": []}));
+        assert_eq!(out["d"], serde_json::json!({"buckets": []}));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gap_filling_past_the_bucket_cap_is_an_invalid_query() {
+        let root = temp_root("hist-cap");
+        let segments = vec![vec![
+            sent("a", "1970-01-01T00:00:00Z"),
+            sent("b", "2024-01-01T00:00:00Z"),
+        ]];
+        let err = try_search(
+            &root,
+            &segments,
+            serde_json::json!({"d": {"date_histogram": {"field": "sent", "fixed_interval": "1h"}}}),
+        )
+        .unwrap_err();
+        match err {
+            KoshaError::InvalidQuery(msg) => {
+                assert!(msg.contains("more than the limit of 10000"), "{msg}");
+                assert!(msg.contains("min_doc_count"), "{msg}");
+            }
+            other => panic!("expected InvalidQuery, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        // Without gap filling only the two non-empty buckets are returned.
+        let out = try_search(
+            &root,
+            &segments,
+            serde_json::json!({"d": {"date_histogram": {"field": "sent", "fixed_interval": "1h", "min_doc_count": 1}}}),
+        )
+        .unwrap();
+        assert_eq!(out["d"]["buckets"].as_array().unwrap().len(), 2, "{out}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_intervals_built_in_code_are_rejected_by_validate() {
+        let mut q = query("", 0, serde_json::json!({}));
+        q.aggs.insert(
+            "h".into(),
+            Aggregation::Histogram {
+                histogram: kosha_core::AggHistogram {
+                    field: "price".into(),
+                    interval: 0.0,
+                    offset: 0.0,
+                    min_doc_count: 0,
+                },
+                aggs: None,
+            },
+        );
+        assert!(matches!(q.validate(), Err(KoshaError::InvalidQuery(_))));
     }
 }

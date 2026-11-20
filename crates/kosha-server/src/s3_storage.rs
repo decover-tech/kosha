@@ -14,7 +14,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kosha_core::{KoshaError, LocalStorage, StorageBackend};
+use kosha_core::{KoshaError, LocalStorage, ObjectMeta, StorageBackend};
 
 use crate::hydration_budget::{HydrationBudget, RequestHydration};
 use crate::segment_commit;
@@ -22,13 +22,26 @@ use crate::segment_commit;
 /// Join a configured key prefix with a logical (unprefixed) path, the same
 /// way for every call site — `S3Storage::s3_key` and the concurrent fetch
 /// path in `read_many` both delegate here so they can't drift apart.
-fn join_s3_key(prefix: &str, path: &str) -> String {
+pub(crate) fn join_s3_key(prefix: &str, path: &str) -> String {
     let path = path.trim_start_matches('/');
     if prefix.is_empty() {
         path.to_string()
     } else {
         format!("{}/{}", prefix.trim_end_matches('/'), path)
     }
+}
+
+/// The logical (unprefixed) path of an S3 key listed under `key_prefix`,
+/// the inverse of [`join_s3_key`]. `None` for a key outside the prefix.
+fn logical_path_of_key(key_prefix: &str, key: &str) -> Option<String> {
+    let prefix = key_prefix.trim_end_matches('/');
+    let rest = if prefix.is_empty() {
+        key
+    } else {
+        key.strip_prefix(prefix)?.strip_prefix('/')?
+    };
+    let rest = rest.trim_start_matches('/');
+    (!rest.is_empty()).then(|| rest.to_string())
 }
 
 /// Configuration for the S3-backed segment store.
@@ -164,6 +177,10 @@ impl S3Storage {
         &self.prefix
     }
 
+    pub fn client(&self) -> &aws_sdk_s3::Client {
+        &self.client
+    }
+
     pub fn s3_key(&self, path: &str) -> String {
         join_s3_key(&self.prefix, path)
     }
@@ -194,9 +211,13 @@ impl S3Storage {
             // uploaded ahead of the files it vouches for. In-progress
             // atomic-write temps are never segment data: writer temps are
             // `.{name}.tmp.{pid}.{n}`, hydration temps `{stem}.tmp.{pid}.{n}`.
+            // Deletion generations are uploaded with the manifest that
+            // references them, not as segment data, so GC can drop a
+            // superseded one without breaking this segment's `_COMMIT`.
             if name == segment_commit::COMMIT_FILE
                 || name.starts_with('.')
                 || name.contains(".tmp.")
+                || kosha_core::gc::deletion_generation_of(&name).is_some()
             {
                 continue;
             }
@@ -638,6 +659,140 @@ impl S3Storage {
             Ok::<_, KoshaError>(out)
         })?;
         Ok(objects)
+    }
+
+    /// Every object under a logical prefix, recursively and fully paginated,
+    /// with size and `LastModified`: the listing segment GC (#239) decides
+    /// from. S3 only, never the local cache: GC must judge what the bucket
+    /// holds.
+    pub fn list_objects_remote(&self, prefix: &str) -> Result<Vec<ObjectMeta>, KoshaError> {
+        let key_prefix = self.s3_key(prefix);
+        let root = self.prefix.clone();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        self.rt.block_on(async move {
+            let mut out = Vec::new();
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket).prefix(&key_prefix);
+                if let Some(token) = continuation.take() {
+                    req = req.continuation_token(token);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                for obj in resp.contents() {
+                    let Some(path) = obj.key().and_then(|k| logical_path_of_key(&root, k)) else {
+                        continue;
+                    };
+                    out.push(ObjectMeta {
+                        path,
+                        size: obj.size().unwrap_or(0).max(0) as u64,
+                        // An object S3 reports no time for is treated as
+                        // brand new, so GC's age checks keep it.
+                        last_modified_ms: obj
+                            .last_modified()
+                            .and_then(|t| t.to_millis().ok())
+                            .map_or(u64::MAX, |ms| ms.max(0) as u64),
+                    });
+                }
+                match resp.next_continuation_token() {
+                    Some(t) if resp.is_truncated().unwrap_or(false) => {
+                        continuation = Some(t.to_string())
+                    }
+                    _ => break,
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Delete one object from S3, surfacing failures (unlike the trait's
+    /// `delete`, which predates GC and is best-effort remotely).
+    pub fn delete_remote(&self, path: &str) -> Result<(), KoshaError> {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(path);
+        self.rt.block_on(async move {
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| KoshaError::NotFound(format!("S3 delete_object {key}: {e}")))
+        })
+    }
+
+    /// Delete every object under a logical directory, recursively: a
+    /// deleted namespace's segments, footers and deletion sidecars
+    /// (`DELETE /v1/namespaces/{ns}`). Paginated listing, `DeleteObjects`
+    /// in batches of up to 1000 keys. Returns how many objects were
+    /// deleted. Refuses an empty path (the whole bucket prefix).
+    pub fn delete_prefix(&self, path: &str) -> Result<usize, KoshaError> {
+        if path.trim_matches('/').is_empty() {
+            return Err(KoshaError::NotFound(
+                "refusing to delete the whole S3 prefix".into(),
+            ));
+        }
+        let mut prefix = self.s3_key(path.trim_end_matches('/'));
+        prefix.push('/');
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+
+        self.rt.block_on(async move {
+            use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+            let mut deleted = 0usize;
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                if let Some(token) = continuation.take() {
+                    req = req.continuation_token(token);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let objects = resp
+                    .contents()
+                    .iter()
+                    .filter_map(|obj| obj.key())
+                    .map(|key| ObjectIdentifier::builder().key(key).build())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| KoshaError::NotFound(format!("S3 delete batch: {e}")))?;
+                if !objects.is_empty() {
+                    let count = objects.len();
+                    let delete = Delete::builder()
+                        .set_objects(Some(objects))
+                        .quiet(true)
+                        .build()
+                        .map_err(|e| KoshaError::NotFound(format!("S3 delete batch: {e}")))?;
+                    let out = client
+                        .delete_objects()
+                        .bucket(&bucket)
+                        .delete(delete)
+                        .send()
+                        .await
+                        .map_err(|e| KoshaError::NotFound(format!("S3 delete_objects: {e}")))?;
+                    if let Some(err) = out.errors().first() {
+                        return Err(KoshaError::NotFound(format!(
+                            "S3 delete_objects: {} of {count} objects failed, first {}: {}",
+                            out.errors().len(),
+                            err.key().unwrap_or("?"),
+                            err.message().unwrap_or("unknown error")
+                        )));
+                    }
+                    deleted += count;
+                }
+                match resp.next_continuation_token() {
+                    Some(t) => continuation = Some(t.to_string()),
+                    None => break,
+                }
+            }
+            Ok(deleted)
+        })
     }
 
     /// Ground-truth durability check for one segment prefix, unlike
@@ -1322,6 +1477,47 @@ impl StorageBackend for S3Storage {
     fn create_dir_all(&self, path: &str) -> Result<(), KoshaError> {
         self.local.create_dir_all(path)
     }
+
+    fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectMeta>, KoshaError> {
+        self.list_objects_remote(prefix)
+    }
+}
+
+/// The object store segment GC (#239) works against: S3 for listing and
+/// deleting. A local copy of a deleted object is left to the node's local
+/// GC, which knows whether a reader still has it open.
+#[derive(Debug)]
+pub struct S3GcStore<'a>(pub &'a S3Storage);
+
+impl StorageBackend for S3GcStore<'_> {
+    fn read(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
+        self.0.read_remote(path)
+    }
+    fn write(&self, _path: &str, _data: &[u8]) -> Result<(), KoshaError> {
+        Err(KoshaError::NotFound("S3GcStore is read/delete only".into()))
+    }
+    fn exists(&self, path: &str) -> bool {
+        self.0
+            .list_objects_remote(path)
+            .is_ok_and(|objects| objects.iter().any(|o| o.path == path))
+    }
+    fn delete(&self, path: &str) -> Result<(), KoshaError> {
+        self.0.delete_remote(path)
+    }
+    fn list(&self, path: &str) -> Result<Vec<String>, KoshaError> {
+        Ok(self
+            .0
+            .list_remote_with_sizes(path)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+    fn create_dir_all(&self, _path: &str) -> Result<(), KoshaError> {
+        Ok(())
+    }
+    fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectMeta>, KoshaError> {
+        self.0.list_objects_remote(prefix)
+    }
 }
 
 fn local_list_with_zero_sizes(
@@ -1454,6 +1650,21 @@ mod tests {
         assert_eq!(streamed.bytes, payload.len() as u64);
         assert_eq!(std::fs::read(&tmp_path).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listed_keys_map_back_to_logical_paths() {
+        for prefix in ["", "kosha", "kosha/", "a/b/"] {
+            let key = join_s3_key(prefix, "tenant/ns/seg-1/_COMMIT");
+            assert_eq!(
+                logical_path_of_key(prefix, &key).as_deref(),
+                Some("tenant/ns/seg-1/_COMMIT"),
+                "prefix {prefix:?}"
+            );
+        }
+        assert_eq!(logical_path_of_key("kosha", "other/x"), None);
+        assert_eq!(logical_path_of_key("kosha", "koshax/x"), None);
+        assert_eq!(logical_path_of_key("kosha", "kosha/"), None);
     }
 
     #[test]

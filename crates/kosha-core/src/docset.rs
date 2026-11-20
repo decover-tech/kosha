@@ -17,7 +17,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{list_elements, lookup_field, BoolFilter, FilterClause, FilterStore, RangeBound};
+use crate::{
+    list_elements, lookup_field, BoolFilter, FilterClause, FilterStore, PrefixFilter, RangeBound,
+};
 
 /// A set of `doc_seq`s within one segment, as a bitmap.
 ///
@@ -210,8 +212,12 @@ pub fn evaluate_filter(clause: &FilterClause, store: &FilterStore, doc_count: u3
             let field = exists.field.as_str();
             if let Some(entries) = lookup_field(&store.string_fields, field) {
                 for (doc_seq, value) in entries {
-                    // An empty list is "no value", as in OpenSearch.
-                    if list_elements(value).is_none_or(|elements| !elements.is_empty()) {
+                    // An empty list is "no value", as in OpenSearch. A
+                    // list of objects (a nested container, see
+                    // `crate::nested`) has no plain elements but is a value.
+                    if list_elements(value).is_none_or(|elements| !elements.is_empty())
+                        || crate::nested::parse_container(value).is_some()
+                    {
                         set.insert(*doc_seq);
                     }
                 }
@@ -242,6 +248,128 @@ pub fn evaluate_filter(clause: &FilterClause, store: &FilterStore, doc_count: u3
                 }
             }
             set
+        }
+        FilterClause::Prefix { prefix } => {
+            let mut set = DocSet::empty(doc_count);
+            mark_prefixed(&mut set, store, prefix);
+            set
+        }
+    }
+}
+
+/// Rejects a clause this segment's columns cannot answer, before it is
+/// evaluated.
+///
+/// Today that is a `prefix` on a numeric (Integer / Float) column: a
+/// prefix of a number's decimal text is not a meaningful filter, and
+/// quietly matching nothing would hide the mistake. [`evaluate_filter`]
+/// itself stays infallible (and matches nothing for such a clause), so
+/// every caller that takes a filter from a request runs this first: the
+/// search path, `FilterApplier`, and delete-by-query.
+pub fn check_filter(clause: &FilterClause, store: &FilterStore) -> Result<(), String> {
+    match clause {
+        FilterClause::Prefix { prefix } => {
+            let field = prefix.field.as_str();
+            if lookup_field(&store.string_fields, field).is_none()
+                && (lookup_field(&store.integer_fields, field).is_some()
+                    || lookup_field(&store.float_fields, field).is_some())
+            {
+                return Err(prefix_on_numeric_error(field));
+            }
+            Ok(())
+        }
+        FilterClause::Bool { bool: b } => b
+            .must
+            .iter()
+            .chain(&b.must_not)
+            .chain(&b.should)
+            .try_for_each(|child| check_filter(child, store)),
+        FilterClause::Term { .. }
+        | FilterClause::Terms { .. }
+        | FilterClause::Range { .. }
+        | FilterClause::MatchAll { .. }
+        | FilterClause::Exists { .. }
+        | FilterClause::GeoDistance { .. } => Ok(()),
+    }
+}
+
+/// The error [`check_filter`] reports for a `prefix` on a numeric field,
+/// shared with the columnar evaluator so both formats say the same thing.
+pub fn prefix_on_numeric_error(field: &str) -> String {
+    format!(
+        "prefix filter on `{field}` is not supported: it is a numeric \
+         field; use `range` or `term` instead"
+    )
+}
+
+/// Whether `value` (or, for a list value, one of its elements) starts with
+/// `prefix`; see [`mark_prefixed`]. Shared with the columnar evaluator,
+/// which tests each distinct dictionary term once.
+pub fn prefix_matches(prefix: &PrefixFilter, value: &str) -> bool {
+    let matches = |candidate: &str| {
+        if prefix.case_insensitive {
+            candidate
+                .to_lowercase()
+                .starts_with(&prefix.value.to_lowercase())
+        } else {
+            candidate.starts_with(&prefix.value)
+        }
+    };
+    match value
+        .starts_with('[')
+        .then(|| list_elements(value))
+        .flatten()
+    {
+        Some(elements) => elements.iter().any(|e| matches(e)),
+        None => matches(value),
+    }
+}
+
+/// Marks every document whose string `field` starts with the prefix.
+///
+/// A list value (see [`list_elements`]) matches when any element does, and
+/// is matched on its elements only, never on its JSON text: otherwise a
+/// prefix of `[` would match every list, and the empty prefix would match
+/// an empty list, which `exists` treats as "no value". With that rule an
+/// empty prefix matches exactly the documents `exists` matches.
+///
+/// This is a linear scan of the column. Filter columns are stored in
+/// `doc_seq` order, not sorted by value, so there is no range to seek to;
+/// the result is cached per segment like every other filter (see
+/// kosha-query's `TrackedSegment::filter_set`), so the scan is paid once
+/// per segment and clause. A value-sorted column that answers a prefix
+/// with a range scan is a possible follow-up.
+///
+/// Numeric columns never match here; [`check_filter`] rejects them up
+/// front.
+fn mark_prefixed(set: &mut DocSet, store: &FilterStore, prefix: &PrefixFilter) {
+    let Some(entries) = lookup_field(&store.string_fields, &prefix.field) else {
+        return;
+    };
+    // The prefix is folded once, not once per value.
+    let needle = if prefix.case_insensitive {
+        prefix.value.to_lowercase()
+    } else {
+        prefix.value.clone()
+    };
+    let matches = |candidate: &str| {
+        if prefix.case_insensitive {
+            candidate.to_lowercase().starts_with(&needle)
+        } else {
+            candidate.starts_with(&needle)
+        }
+    };
+    for (doc_seq, value) in entries {
+        let hit = match value
+            .starts_with('[')
+            .then(|| list_elements(value))
+            .flatten()
+        {
+            Some(elements) => elements.iter().any(|e| matches(e)),
+            None => matches(value),
+        };
+        if hit {
+            set.insert(*doc_seq);
         }
     }
 }
@@ -313,7 +441,17 @@ fn mark_in_range(set: &mut DocSet, store: &FilterStore, field: &str, bound: &Ran
         }
     } else if let Some(entries) = lookup_field(&store.string_fields, field) {
         for (doc_seq, value) in entries {
-            if in_range_str(value, bound) {
+            // A list value is in range when any element is (#206): the
+            // multi-valued semantics `term` already has.
+            let hit = match value
+                .starts_with('[')
+                .then(|| list_elements(value))
+                .flatten()
+            {
+                Some(elements) => elements.iter().any(|e| in_range_str(e, bound)),
+                None => in_range_str(value, bound),
+            };
+            if hit {
                 set.insert(*doc_seq);
             }
         }
@@ -584,6 +722,42 @@ mod tests {
     }
 
     #[test]
+    fn multi_valued_columns_match_on_any_value() {
+        // What the segment writer stores for a flattened array of objects
+        // (#206): JSON-list text in the string column, one float entry per
+        // number, so a doc_seq can repeat.
+        let mut store = FilterStore::default();
+        store.string_fields.insert(
+            "authors.name".into(),
+            vec![(0, r#"["Ada","Bob"]"#.into()), (1, "Cy".into())],
+        );
+        store
+            .float_fields
+            .insert("authors.n".into(), vec![(0, 1.0), (0, 9.0), (1, 5.0)]);
+        store.string_fields.insert(
+            "authors".into(),
+            vec![(0, r#"[{"name":"Ada"},{"name":"Bob"}]"#.into())],
+        );
+        let eval = |json: &str| -> Vec<u32> {
+            let clause: FilterClause = serde_json::from_str(json).unwrap();
+            evaluate_filter(&clause, &store, 2).iter().collect()
+        };
+        assert_eq!(eval(r#"{"term": {"authors.name": "Bob"}}"#), vec![0]);
+        assert_eq!(eval(r#"{"term": {"authors.n": "9"}}"#), vec![0]);
+        assert_eq!(
+            eval(r#"{"range": {"authors.n": {"gte": "5"}}}"#),
+            vec![0, 1]
+        );
+        assert_eq!(eval(r#"{"range": {"authors.n": {"lt": "2"}}}"#), vec![0]);
+        assert_eq!(
+            eval(r#"{"range": {"authors.name": {"gte": "B", "lt": "C"}}}"#),
+            vec![0]
+        );
+        assert_eq!(eval(r#"{"exists": {"field": "authors"}}"#), vec![0]);
+        assert_eq!(eval(r#"{"exists": {"field": "authors.n"}}"#), vec![0, 1]);
+    }
+
+    #[test]
     fn exists_matches_documents_with_a_value_in_any_column_type() {
         let mut store = store();
         store
@@ -601,5 +775,146 @@ mod tests {
             eval(r#"{"bool": {"must_not": [{"exists": {"field": "tag"}}]}}"#),
             vec![0, 2, 3]
         );
+    }
+
+    /// Codes for the `prefix` acceptance criteria, plus a list value, a
+    /// document without the field, and a mixed-case value.
+    fn prefix_store() -> FilterStore {
+        let mut store = store();
+        store.string_fields.insert(
+            "code".into(),
+            vec![
+                (0, "abc".into()),
+                (1, "ab".into()),
+                (2, "a".into()),
+                (3, "xab".into()),
+                (4, "ABC".into()),
+                (5, r#"["zz","abd"]"#.into()),
+                (6, "[]".into()),
+                // 7: no `code`
+            ],
+        );
+        store
+    }
+
+    fn eval_prefix(json: &str) -> Vec<u32> {
+        let clause: FilterClause = serde_json::from_str(json).unwrap();
+        let store = prefix_store();
+        check_filter(&clause, &store).unwrap();
+        evaluate_filter(&clause, &store, 8).iter().collect()
+    }
+
+    #[test]
+    fn prefix_matches_values_that_start_with_it() {
+        // "ab" matches "abc" and "ab", not "a" or "xab"; a list matches on
+        // any element.
+        assert_eq!(eval_prefix(r#"{"prefix": {"code": "ab"}}"#), vec![0, 1, 5]);
+        assert_eq!(eval_prefix(r#"{"prefix": {"code": "abc"}}"#), vec![0]);
+        assert_eq!(
+            eval_prefix(r#"{"prefix": {"code": "q"}}"#),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            eval_prefix(r#"{"prefix": {"nope": "a"}}"#),
+            Vec::<u32>::new()
+        );
+        // A list's JSON text is never matched, only its elements.
+        assert_eq!(
+            eval_prefix(r#"{"prefix": {"code": "["}}"#),
+            Vec::<u32>::new()
+        );
+        // `.keyword` resolves to the stored column.
+        assert_eq!(
+            eval_prefix(r#"{"prefix": {"code.keyword": "ab"}}"#),
+            vec![0, 1, 5]
+        );
+    }
+
+    #[test]
+    fn prefix_is_case_sensitive_unless_asked() {
+        assert_eq!(eval_prefix(r#"{"prefix": {"code": "AB"}}"#), vec![4]);
+        assert_eq!(
+            eval_prefix(r#"{"prefix": {"code": {"value": "ab", "case_insensitive": true}}}"#),
+            vec![0, 1, 4, 5]
+        );
+        assert_eq!(
+            eval_prefix(r#"{"prefix": {"code": {"value": "aB", "case_insensitive": true}}}"#),
+            vec![0, 1, 4, 5]
+        );
+        assert_eq!(
+            eval_prefix(r#"{"prefix": {"code": {"value": "ab", "case_insensitive": false}}}"#),
+            vec![0, 1, 5]
+        );
+    }
+
+    #[test]
+    fn empty_prefix_matches_exactly_what_exists_matches() {
+        let store = prefix_store();
+        let run = |json: &str| -> Vec<u32> {
+            let clause: FilterClause = serde_json::from_str(json).unwrap();
+            evaluate_filter(&clause, &store, 8).iter().collect()
+        };
+        let exists = run(r#"{"exists": {"field": "code"}}"#);
+        assert_eq!(exists, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(run(r#"{"prefix": {"code": ""}}"#), exists);
+        assert_eq!(
+            run(r#"{"prefix": {"code": {"value": "", "case_insensitive": true}}}"#),
+            exists
+        );
+    }
+
+    #[test]
+    fn prefix_composes_inside_bool() {
+        // must: prefix AND a numeric term (page 7 is docs 1 and 2).
+        assert_eq!(
+            eval_prefix(
+                r#"{"bool": {"must": [{"prefix": {"code": "a"}}, {"term": {"page": "7"}}]}}"#
+            ),
+            vec![1, 2]
+        );
+        // must_not
+        assert_eq!(
+            eval_prefix(r#"{"bool": {"must_not": [{"prefix": {"code": "ab"}}]}}"#),
+            vec![2, 3, 4, 6, 7]
+        );
+        // should
+        assert_eq!(
+            eval_prefix(
+                r#"{"bool": {"should": [{"prefix": {"code": "x"}},
+                                        {"prefix": {"code": "AB"}}]}}"#
+            ),
+            vec![3, 4]
+        );
+        // With a range, the motivating case from #199.
+        assert_eq!(
+            eval_prefix(
+                r#"{"bool": {"filter": [{"prefix": {"code": "ab"}},
+                                        {"range": {"page": {"gte": "7"}}}]}}"#
+            ),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn prefix_on_a_numeric_field_is_rejected() {
+        let store = prefix_store();
+        for json in [
+            r#"{"prefix": {"page": "1"}}"#,
+            r#"{"prefix": {"score": "2"}}"#,
+            r#"{"prefix": {"page.keyword": "1"}}"#,
+            r#"{"bool": {"must_not": [{"prefix": {"page": "1"}}]}}"#,
+            r#"{"bool": {"should": [{"term": {"code": "a"}}, {"prefix": {"page": "1"}}]}}"#,
+        ] {
+            let clause: FilterClause = serde_json::from_str(json).unwrap();
+            let err = check_filter(&clause, &store).expect_err(json);
+            assert!(err.contains("numeric field"), "{json}: {err}");
+        }
+        // A field the segment does not have is not an error: another
+        // segment may hold it as a string.
+        let clause: FilterClause = serde_json::from_str(r#"{"prefix": {"nope": "1"}}"#).unwrap();
+        assert!(check_filter(&clause, &store).is_ok());
+        // Other clauses on numeric fields are unaffected.
+        let clause: FilterClause = serde_json::from_str(r#"{"term": {"page": "7"}}"#).unwrap();
+        assert!(check_filter(&clause, &store).is_ok());
     }
 }

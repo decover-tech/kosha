@@ -84,6 +84,7 @@ fn build(root: &Path, docs: usize) -> Manifest {
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        retired: Default::default(),
     };
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     let per_segment = docs / SEGMENTS;

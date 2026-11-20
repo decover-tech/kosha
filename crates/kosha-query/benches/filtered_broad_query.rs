@@ -116,6 +116,7 @@ fn run(work: &std::path::Path, label: &str, version: u32, segs: usize, docs: usi
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        retired: Default::default(),
     };
     let query = bench_query();
 
@@ -230,5 +231,6 @@ fn bench_query() -> SearchQuery {
         rank: None,
         mode: None,
         fields: Vec::new(),
+        rerank: Default::default(),
     }
 }

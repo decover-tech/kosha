@@ -59,6 +59,7 @@ fn decode_manifest(version: u64, segments_json: &str) -> Option<Manifest> {
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        retired: Default::default(),
     };
     for entry in entries {
         if let Some(footer) = entry.footer {
@@ -66,6 +67,18 @@ fn decode_manifest(version: u64, segments_json: &str) -> Option<Manifest> {
         }
     }
     Some(manifest)
+}
+
+/// Insert a namespace's empty manifest row at the version its next
+/// incarnation starts at: 0, or one past the version a deleted incarnation
+/// retired at (`kosha.retired_namespaces`). Never replaces a row. `$1` is
+/// the namespace id.
+const INSERT_INITIAL_MANIFEST: &str = "INSERT INTO kosha.manifests (namespace_id, version, segments_json) \
+     VALUES ($1, COALESCE((SELECT last_version + 1 FROM kosha.retired_namespaces WHERE id = $1), 0), '[]') \
+     ON CONFLICT DO NOTHING";
+
+fn empty_manifest(version: u64) -> Manifest {
+    Manifest::empty(version)
 }
 
 impl PgStore {
@@ -234,29 +247,24 @@ impl ControlStore for PgStore {
     fn create_namespace(&mut self, id: NamespaceId) -> Result<(), KoshaError> {
         let id_str = id.0.clone();
         self.rt.block_on(async {
-            let result =
+            let io_error = |e: sqlx::Error| KoshaError::NotFound(e.to_string());
+            let mut tx = self.pool.begin().await.map_err(io_error)?;
+            let inserted =
                 sqlx::query("INSERT INTO kosha.namespaces (id) VALUES ($1) ON CONFLICT DO NOTHING")
                     .bind(&id_str)
-                    .execute(&self.pool)
-                    .await;
-
-            match result {
-                Ok(r) if r.rows_affected() == 0 => {
-                    Err(KoshaError::NamespaceNotFound(NamespaceId(id_str)))
-                }
-                Ok(_) => {
-                    // Also ensure a manifest row exists.
-                    let _ = sqlx::query(
-                        "INSERT INTO kosha.manifests (namespace_id, version, segments_json) \
-                         VALUES ($1, 0, '[]') ON CONFLICT DO NOTHING",
-                    )
-                    .bind(&id_str)
-                    .execute(&self.pool)
-                    .await;
-                    Ok(())
-                }
-                Err(e) => Err(KoshaError::NotFound(e.to_string())),
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(io_error)?;
+            if inserted.rows_affected() == 0 {
+                return Err(KoshaError::NamespaceExists(NamespaceId(id_str)));
             }
+            sqlx::query(INSERT_INITIAL_MANIFEST)
+                .bind(&id_str)
+                .execute(&mut *tx)
+                .await
+                .map_err(io_error)?;
+            tx.commit().await.map_err(io_error)?;
+            Ok(())
         })
     }
 
@@ -269,13 +277,10 @@ impl ControlStore for PgStore {
                     .execute(&self.pool)
                     .await;
 
-            let _ = sqlx::query(
-                "INSERT INTO kosha.manifests (namespace_id, version, segments_json) \
-                 VALUES ($1, 0, '[]') ON CONFLICT DO NOTHING",
-            )
-            .bind(&id_str)
-            .execute(&self.pool)
-            .await;
+            let _ = sqlx::query(INSERT_INITIAL_MANIFEST)
+                .bind(&id_str)
+                .execute(&self.pool)
+                .await;
         });
     }
 
@@ -408,10 +413,18 @@ impl ControlStore for PgStore {
             let io_error = |e: sqlx::Error| KoshaError::NotFound(e.to_string());
             let mut tx = self.pool.begin().await.map_err(io_error)?;
             // Bootstrap is transactional and never replaces an existing row.
-            if expected_version == 0 {
+            // A missing namespace is bootstrapped by a writer that knows
+            // nothing (expected 0) or one that knows the version a deleted
+            // and re-created namespace starts at (see `delete_namespace`).
+            let retired: Option<(i64,)> =
+                sqlx::query_as("SELECT last_version FROM kosha.retired_namespaces WHERE id = $1")
+                    .bind(&id_str).fetch_optional(&mut *tx).await.map_err(io_error)?;
+            let initial = kosha_core::initial_manifest_version(retired.map(|(v,)| v as u64));
+            let bootstrap = expected_version == 0 || expected_version == initial;
+            if bootstrap {
                 sqlx::query("INSERT INTO kosha.namespaces (id) VALUES ($1) ON CONFLICT DO NOTHING")
                     .bind(&id_str).execute(&mut *tx).await.map_err(io_error)?;
-                sqlx::query("INSERT INTO kosha.manifests (namespace_id, version, segments_json) VALUES ($1, 0, '[]') ON CONFLICT DO NOTHING")
+                sqlx::query(INSERT_INITIAL_MANIFEST)
                     .bind(&id_str).execute(&mut *tx).await.map_err(io_error)?;
             }
             let result = sqlx::query(
@@ -428,6 +441,12 @@ impl ControlStore for PgStore {
                 let same = row.as_ref().and_then(|(version, json)| decode_manifest(*version as u64, json))
                     .is_some_and(|current| current.same_contents(&new_manifest));
                 if !same {
+                    // Keep a bootstrap row: a writer with no version (0)
+                    // that met a retired namespace rebases onto the empty
+                    // manifest at its initial version, which must exist.
+                    if bootstrap && row.is_some() {
+                        tx.commit().await.map_err(io_error)?;
+                    }
                     return Err(KoshaError::ManifestConflict {
                         namespace: id.clone(), expected: expected_version,
                         actual: row.map(|(version, _)| version as u64),
@@ -436,6 +455,66 @@ impl ControlStore for PgStore {
             }
             tx.commit().await.map_err(io_error)?;
             Ok(())
+        })
+    }
+
+    fn delete_namespace(
+        &mut self,
+        id: &NamespaceId,
+        retire_at_least: u64,
+    ) -> Result<(Manifest, u64), KoshaError> {
+        let id_str = id.0.clone();
+        self.rt.block_on(async {
+            let io_error = |e: sqlx::Error| KoshaError::NotFound(e.to_string());
+            let mut tx = self.pool.begin().await.map_err(io_error)?;
+            // Lock the manifest row first so a concurrent CAS either lands
+            // before the delete (and its segments are reclaimed with the
+            // rest) or finds no row afterwards.
+            let row: Option<(i64, String)> = sqlx::query_as(
+                "SELECT version, segments_json FROM kosha.manifests \
+                 WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(&id_str)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(io_error)?;
+            sqlx::query("DELETE FROM kosha.manifests WHERE namespace_id = $1")
+                .bind(&id_str)
+                .execute(&mut *tx)
+                .await
+                .map_err(io_error)?;
+            let deleted = sqlx::query("DELETE FROM kosha.namespaces WHERE id = $1")
+                .bind(&id_str)
+                .execute(&mut *tx)
+                .await
+                .map_err(io_error)?;
+            if deleted.rows_affected() == 0 {
+                // Rolled back on drop: nothing changes.
+                return Err(KoshaError::NamespaceNotFound(id.clone()));
+            }
+            let manifest = match row {
+                Some((version, json)) => {
+                    decode_manifest(version as u64, &json).ok_or_else(|| {
+                        KoshaError::NotFound(format!("undecodable manifest for {id_str}"))
+                    })?
+                }
+                None => empty_manifest(0),
+            };
+            let floor = manifest.version.max(retire_at_least) as i64;
+            let (retired,): (i64,) = sqlx::query_as(
+                "INSERT INTO kosha.retired_namespaces AS r (id, last_version) VALUES ($1, $2) \
+                 ON CONFLICT (id) DO UPDATE SET \
+                 last_version = GREATEST(r.last_version, EXCLUDED.last_version), \
+                 retired_at = NOW() \
+                 RETURNING last_version",
+            )
+            .bind(&id_str)
+            .bind(floor)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(io_error)?;
+            tx.commit().await.map_err(io_error)?;
+            Ok((manifest, retired as u64))
         })
     }
 

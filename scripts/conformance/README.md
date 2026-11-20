@@ -49,6 +49,7 @@ known-bug check), `--strict` (also fail when a known bug *didn't* trip).
 | `upserts` | Already-flushed ids re-indexed (segment rewrite path). Buffered ids replaced before their first flush. |
 | `deletes` | Delete-by-query, a delete issued while matching docs are still buffered (they are flushed and deleted too), and deleted ids re-indexed. |
 | `compacted` | Tiered compaction via `POST /v1/admin/compact-namespace`. |
+| `gc` | Segment GC (`POST /v1/admin/gc`, zero grace): the dry run must list exactly the segments compaction merged away, the real run must delete them, and every answer must stay exact. The `restarted` checkpoint after it then hydrates from what GC left in S3. |
 | `restarted` | Server restarted. With the compose script, the local cache is wiped first, so every segment hydrates from S3. |
 
 **Per query**, each a separate check `<checkpoint>:<query id>:<aspect>`:

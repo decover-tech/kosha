@@ -384,7 +384,10 @@ impl StringColumn {
                 let Some(elements) = kosha_core::list_elements(term) else {
                     continue;
                 };
-                if elements.is_empty() {
+                // A list of objects (a nested container, #206) has no
+                // plain elements but is a value, as in
+                // `kosha_core::evaluate_filter`.
+                if elements.is_empty() && kosha_core::nested::parse_container(term).is_none() {
                     index.empty.push(ord);
                 }
                 // Element matching only applies to text that starts with

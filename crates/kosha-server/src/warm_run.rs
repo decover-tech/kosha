@@ -280,6 +280,7 @@ impl AppState {
                     tombstones: HashMap::new(),
                     deletion_vectors: HashMap::new(),
                     schema: None,
+                    retired: Default::default(),
                 };
                 let o =
                     self.hydrate_segments_for_search(ns, &subset, &warmup_probe_query(), &request);

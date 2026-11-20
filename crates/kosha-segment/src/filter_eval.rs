@@ -102,6 +102,34 @@ pub fn evaluate_filter_columns(
             set
         }
         FilterClause::Bool { bool: b } => evaluate_bool(b, source, doc_count)?,
+        FilterClause::Prefix { prefix } => {
+            // `kosha_core::docset`'s rule over the dictionary: each distinct
+            // term is tested once (list terms on their elements) and its
+            // documents taken from the term's bitmap. A numeric field is a
+            // client error, as `kosha_core::check_filter` reports it.
+            let mut set = DocSet::empty(doc_count);
+            match string_column(source, &prefix.field)? {
+                Some(column) => {
+                    if let FilterColumn::String(c) = &*column {
+                        for ord in 0..c.term_count() as u32 {
+                            if kosha_core::docset::prefix_matches(prefix, c.term(ord)) {
+                                c.for_each_doc(ord, |doc| set.insert(doc));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    for kind in [FilterColumnKind::Integer, FilterColumnKind::Float] {
+                        if resolve_column(source, &prefix.field, kind)?.is_some() {
+                            return Err(KoshaError::InvalidQuery(
+                                kosha_core::docset::prefix_on_numeric_error(&prefix.field),
+                            ));
+                        }
+                    }
+                }
+            }
+            set
+        }
         FilterClause::MatchAll { .. } => DocSet::full(doc_count),
         FilterClause::Exists { exists } => {
             let mut set = DocSet::empty(doc_count);
@@ -366,6 +394,32 @@ fn mark_string_range(set: &mut DocSet, column: &StringColumn, bound: &RangeBound
     if let Some(b) = bound.lt.as_deref() {
         narrow(column.ordinal_range(None, Some((b, false))));
     }
+    let lists = column.list_index();
+    if !lists.elements.is_empty() || !lists.empty.is_empty() {
+        // A list term is in range when any of its elements is (#206), as
+        // in `kosha_core::docset::mark_in_range`; its own JSON text is not
+        // compared.
+        let list_ords: HashSet<u32> = lists
+            .elements
+            .values()
+            .flatten()
+            .chain(&lists.empty)
+            .copied()
+            .filter(|ord| column.term(*ord).starts_with('['))
+            .collect();
+        let mut ords: Vec<u32> = range.filter(|ord| !list_ords.contains(ord)).collect();
+        for (element, list) in &lists.elements {
+            if in_range_str(element, bound) {
+                ords.extend_from_slice(list);
+            }
+        }
+        ords.sort_unstable();
+        ords.dedup();
+        for ord in ords {
+            column.for_each_doc(ord, |doc| set.insert(doc));
+        }
+        return;
+    }
     if range.start >= range.end {
         return;
     }
@@ -380,6 +434,14 @@ fn mark_string_range(set: &mut DocSet, column: &StringColumn, bound: &RangeBound
             }
         }
     }
+}
+
+/// `kosha_core::docset`'s string range test, on one value.
+fn in_range_str(value: &str, bound: &RangeBound) -> bool {
+    bound.gte.as_deref().is_none_or(|b| value >= b)
+        && bound.gt.as_deref().is_none_or(|b| value > b)
+        && bound.lte.as_deref().is_none_or(|b| value <= b)
+        && bound.lt.as_deref().is_none_or(|b| value < b)
 }
 
 /// `must` narrows, `must_not` subtracts, and a non-empty `should` requires

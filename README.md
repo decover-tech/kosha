@@ -10,10 +10,10 @@ built to replace Elasticsearch/OpenSearch and is intended to be reusable as a ge
 
 See [DESIGN.md](DESIGN.md) for the full architecture.
 
-> **Status: Phase 1 complete — BM25 lexical + kNN/ANN search implemented.**
-> All seven crates have functional BM25 indexing, query, filtering,
-> aggregation, HNSW vector search, and RRF hybrid fusion. Rerank is Phase 2
-> (DESIGN.md §3.1).
+> **Status: BM25 lexical, kNN/ANN vector and RRF hybrid search are implemented**,
+> with filtering, aggregations, compaction, a Postgres control plane and a
+> pluggable rerank hook. See [Supported features](#supported-features) and
+> [Not supported yet](#not-supported-yet).
 
 ## Install
 
@@ -39,17 +39,186 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | `fuzzy` | Typo-tolerant term matching: `"fuzzy": {"field": "content", "value": "recieve", "fuzziness": 1}` finds `receive`. `fuzziness` is `0`, `1`, `2` or `"auto"` (default; Elasticsearch `AUTO:3,6`: exact below 3 characters, one edit up to 5, two from 6; `"auto:low,high"` moves the thresholds). An edit is an insertion, deletion, substitution or — with `transpositions` (default `true`) — a swap of adjacent characters. `prefix_length` (default 0) leading characters must match exactly and make expansion cheaper; `max_expansions` (default 50, at most 1024) caps the terms each token expands to per segment, nearest first, the exact term always kept. A non-exact match must leave a character of the shorter string untouched (`ox` never matches `o`). The value is analyzed with each segment's own analyzer and every token is expanded against that segment's sorted term dictionary (a Levenshtein-automaton walk that skips whole prefix ranges); several tokens combine with `operator` (AND by default). Scoring is tiered so **an exact match always outranks a one-edit match, which always outranks a two-edit one**: per token, `score = (2 − edits) + tf_norm` with `tf_norm ∈ (0, 1]` BM25's length-normalized tf saturation (namespace `avgdl`); no IDF, since expansions differ per segment. `field` (`""` / `_all` / `*` = every `Text` field) restricts it to one field's postings; segments written before per-field indexes answer from their combined index. Its own lexical query: not combinable with `query_text` / `fields` / `wildcard` / `match_phrase`, but can be the lexical leg of a hybrid request and takes `rank_by`. Segments are bloom-pruned for 0- and 1-edit tokens (see [Fuzzy bloom](#fuzzy-bloom)). Runs on an exhaustive path (no block-max WAND). On 1M docs x 30 words in 8 segments (1.08M distinct terms), warm: ~0.5–1 ms at 1 edit and ~3.5–4.5 ms at 2 edits for mid-frequency and rare words, ~10–14 ms when an expansion is a very frequent word (every posting is scored; the exact `query_text` WAND query takes 0.5 ms). The dictionary walk itself is ~0.2 ms per segment at 1 edit and ~2 ms at 2 edits (~0.3 ms with `prefix_length: 2`). Non-fuzzy queries are unchanged (`cargo bench -p kosha-query --bench fuzzy_expansion`) |
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
 | Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase` / `fuzzy`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
-| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `bool` (`must` / `must_not` / `should` / `minimum_should_match`), `match_all` |
+| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `exists`, `prefix`, `bool` (`must` / `must_not` / `should` / `minimum_should_match`; OpenSearch's `filter` is accepted as `must`), `match_all`. Every clause composes inside `bool` and works in `filter`, `knn.filter` and `/delete`. An unknown or malformed clause is a 400, never a match-all. On a multi-valued field (a list, or a [nested path](#nested-attributes) with several values) a clause matches if ANY value does |
+| `prefix` filter | `{"prefix": {"path": "/matters/2026/"}}`, or the long form `{"prefix": {"path": {"value": "/matters/2026/", "case_insensitive": true}}}`. Case-sensitive by default, like `term` (and unlike the `wildcard` query): `"ab"` matches `abc` and `ab`, not `a`, `xab` or `ABC`. A list value matches when any element does. The empty prefix matches exactly the documents `exists` matches. String fields only: a `prefix` on an `Integer`/`Float` field is a 400. Only `value` and `case_insensitive` are accepted in the long form. Evaluated by a scan of the segment's filter column (each distinct value once on a columnar segment), cached per segment; bloom filters cannot skip segments for it |
 | kNN-scoped filters | `knn.filter` restricts only the vector list; the top-level `filter` restricts both the lexical and the vector list |
-| Sorting | Multi-field `sort` over stored fields, plus `_id` |
+| Sorting | Multi-field `sort` over stored fields and [nested dotted paths](#nested-attributes), plus `_id`. A multi-valued field sorts by its smallest value for `asc` and its largest for `desc` (Elasticsearch's default `mode`) |
 | Pagination | `from` / `max_results`, and an OpenSearch-style `search_after` cursor |
 | Result diversification | `"limit_per": {"field": "author", "max": 2}` returns at most `max` hits per distinct value of a keyword field. The cap is applied while the result list is collected, so a page is filled from the next-best groups instead of coming back short; documents without the field are not capped. `collapse: {"field": ...}` is the one-per-group case (and groups missing values together); the two cannot be combined. `search_after` and `from` resume the same capped list, so no document repeats and a group spent on an earlier page is never refilled. `total_hits` and aggregations count matching documents before the cap (a pure kNN request reports its neighbour set, which is the diversified one). Works for BM25, kNN (diversity is found within the probed `num_candidates`) and hybrid, where each retriever's list is diversified before fusion and `rank_details` ranks are positions in those lists |
 | Score modifiers | `rank_by` blends attributes into the score: `field_value` (`modifier(factor × value)`, Elasticsearch `field_value_factor` modifiers) and `decay` (`linear` / `exp` / `gauss` around an `origin`, with `scale`, `offset`, `decay`) over `Integer`, `Float`, `Date` and `GeoPoint` fields, each with a `weight`. Functions combine by `score_mode` (`sum` default, `multiply`, `avg`, `max`, `min`) and apply to the text score by `boost_mode` (`multiply` default: `text_weight × score × F`; `sum`: `text_weight × score + F`; `replace`: `F`). A decay's `origin` picks its axis: a number (numeric field), a date or `"now"` (scale like `"30d"`), or `{"lat", "lon"}` (scale like `"5km"`). Values come from the filter columns, never the doc store. Applied in a rescore window: the best `window_size` hits by the query's own score (BM25, fused RRF or vector; default `max(100, max_results)`, at most 10,000; a hybrid request rescores within its fused `rank_window_size` list, a kNN request within its `k` neighbours) are rescored and re-sorted, so block-max WAND keeps pruning on BM25 alone; hits below the window are not returned, `total_hits` still counts every match. Each hit reports `rank_details.base_score`. Missing values use the function's `missing` (default 0, which under `multiply` zeroes the hit). `collapse` / `limit_per` apply to the rescored order; `sort` must be by `_score`; `origin: "now"` responses are not cached. Example — halve the score every 30 days: `"rank_by": {"functions": [{"decay": {"field": "published", "function": "exp", "origin": "now", "scale": "30d", "decay": 0.5}}]}` |
 | Geo | `GeoPoint` fields (`"lat,lon"`, `{"lat", "lon"}` or GeoJSON `[lon, lat]`; invalid points are a 400 at index time). `{"geo_distance": {"distance": "10km", "<field>": {"lat": .., "lon": ..}}}` filters by great-circle distance; a `decay` with a geo `origin` ranks by distance |
-| Highlighting | Any number of text fields per request, Elasticsearch-shaped: `"highlight": {"pre_tags": ["<em>"], "post_tags": ["</em>"], "fields": {"title": {}, "body": {"pre_tags": ["<mark>"], "post_tags": ["</mark>"]}}}`. Each field's tags fall back to the top-level `pre_tags` / `post_tags`, then to `<b>` / `</b>`. Hits return `"highlight": {"title": ["..."], "body": ["..."]}` (one fragment per field value, the whole value with the query's terms marked up); requested fields that a hit lacks or that are not `Text` are left out silently. The legacy single-field form `"highlight": {"field": "body"}` still works and still returns the flat `"highlights": [...]` list; that form and `highlights` are deprecated. Giving both `field` and `fields` is a 400. Fragment size/count options and other highlighter types are not supported (unknown options are ignored) |
-| Aggregations | `terms`, `cardinality`, `composite` |
+| Highlighting | Any number of text fields per request (including a [nested](#nested-attributes) dotted path such as `author.bio`), Elasticsearch-shaped: `"highlight": {"pre_tags": ["<em>"], "post_tags": ["</em>"], "fields": {"title": {}, "body": {"pre_tags": ["<mark>"], "post_tags": ["</mark>"]}}}`. Each field's tags fall back to the top-level `pre_tags` / `post_tags`, then to `<b>` / `</b>`. Hits return `"highlight": {"title": ["..."], "body": ["..."]}` (one fragment per field value, the whole value with the query's terms marked up); requested fields that a hit lacks or that are not `Text` are left out silently. The legacy single-field form `"highlight": {"field": "body"}` still works and still returns the flat `"highlights": [...]` list; that form and `highlights` are deprecated. Giving both `field` and `fields` is a 400. Fragment size/count options and other highlighter types are not supported (unknown options are ignored) |
+| Aggregations | Buckets: `terms`, `composite`, `histogram`, `date_histogram`. Metrics: `cardinality`, `min`, `max`, `sum`, `avg`, `value_count`, top-level or nested under a bucket aggregation via `aggs`. Computed over every document the query and filter match (not just the page), from the filter columns only — see [Aggregations](#aggregations) |
 | Total-hit accounting | Capped counting with an `eq` / `gte` relation (`track_total_hits`-style), overridable per query via `exact_total_hits` / `total_hits_cap` |
+| Rerank | `"rerank": {"provider": "cohere", "model": "rerank-v3.5", "field": "content", "top_n": 50, "timeout_ms": 2000}` sends the top `top_n` hits (the fused list for a hybrid request) to an external reranker and pages the reordered list. `top_n` defaults to `from + max_results` and must be ≥ it (≤ 1000; ≤ `rank_window_size` when that is set); `timeout_ms` defaults to 2000. Each hit then has `score` = `rerank_score` (the provider's) and `fused_score` (the search-stage score). On timeout or provider error the hits keep search order and the response has `rerank_degraded: true` and `rerank_degraded_reason`; such responses are not cached. Not combinable with `sort` / `search_after`. Providers are configured on the server from the environment (`KOSHA_RERANK_PROVIDERS`, `KOSHA_RERANK_<NAME>_URL` / `_API_KEY` / `_MODEL`; `cohere` reads `COHERE_API_KEY`); any Cohere-style `POST /rerank` API works. Per-provider calls, outcomes, documents, billed units and a latency histogram are under `rerank` in admin `/stats` |
 | Degradation signal | `knn_degraded_segments` reports segments whose vector search failed, so a 200 with silently missing neighbors is visible to the caller |
+
+### Aggregations
+
+Aggregations go in `aggs`, keyed by a name you choose, in Elasticsearch's
+request and response shapes:
+
+```json
+{"query_text": "invoice", "max_results": 0,
+ "aggs": {
+   "avg_amount": {"avg": {"field": "amount"}},
+   "latest":     {"max": {"field": "sentAt"}},
+   "by_category": {"terms": {"field": "category", "size": 10},
+                   "aggs": {"total": {"sum": {"field": "amount"}}}}}}
+```
+
+```json
+{"aggregations": {
+   "avg_amount": {"value": 41.5},
+   "latest": {"value": 1718409600000.0, "value_as_string": "2024-06-15T00:00:00.000Z"},
+   "by_category": {"buckets": [{"key": "travel", "doc_count": 12, "total": {"value": 498.0}}]}}}
+```
+
+- Each aggregation object has exactly one type key. An unknown or misspelled
+  type (`stats`, `averag`) is a 400 that lists the supported types.
+- `min`, `max`, `sum` and `avg` read `Integer` and `Float` fields, and `Date`
+  fields as epoch milliseconds (`value_as_string` is added for `min` / `max` /
+  `avg` over dates). Date text is parsed as `YYYY-MM-DD[THH:MM[:SS[.fff]]][Z|±HH:MM]`;
+  a string value that is neither a date nor a number is skipped. A document
+  without the field is skipped, never counted as 0.
+- `value_count` counts values in a field of any type. A list value counts once
+  per element, as a multi-valued field does in Elasticsearch, so it can exceed
+  the number of documents. For a plain count of matching documents use
+  `total_hits` (with `exact_total_hits: true` past the cap) or a bucket's
+  `doc_count`.
+- With no matching values, `min`, `max` and `avg` return `{"value": null}`;
+  `sum` and `value_count` return `0`.
+- Sub-aggregations (`aggs` or `aggregations` beside `terms`, `composite`,
+  `histogram` or `date_histogram`) may only be metrics (`min`, `max`, `sum`, `avg`, `value_count`); their results
+  appear inside each bucket under the sub-aggregation's name. Nesting a bucket
+  aggregation, or putting `aggs` under a metric, is a 400.
+- Partial results — bucket counts, and `(count, sum, min, max)` for metrics —
+  are merged across segments before anything is finished, so `avg` is the
+  merged sum over the merged count, not an average of per-segment averages.
+- An aggregation-only request (`max_results: 0`) never reads the document
+  store.
+- Not supported yet: `stats`, `percentiles`, `range` buckets, `missing` /
+  `script` / `format` options.
+
+#### Histograms
+
+```json
+{"query_text": "", "max_results": 0, "filter": {"match_all": {}},
+ "aggs": {
+   "by_size":   {"histogram": {"field": "bytes", "interval": 1024}},
+   "over_time": {"date_histogram": {"field": "sentAt", "fixed_interval": "1h"},
+                 "aggs": {"total": {"sum": {"field": "amount"}}}}}}
+```
+
+```json
+{"aggregations": {
+   "by_size": {"buckets": [{"key": 0.0, "doc_count": 3}, {"key": 1024.0, "doc_count": 0},
+                           {"key": 2048.0, "doc_count": 1}]},
+   "over_time": {"buckets": [{"key": 1718409600000, "key_as_string": "2024-06-15T00:00:00.000Z",
+                              "doc_count": 2, "total": {"value": 41.5}}]}}}
+```
+
+- A value `v` lands in the bucket keyed
+  `floor((v - offset) / interval) * interval + offset`, so a value exactly on
+  a boundary starts the higher bucket and negative values round down
+  (`-0.5` with `interval: 10` is in bucket `-10`). `histogram` computes this
+  in floating point (as Elasticsearch does); `date_histogram` in integer
+  epoch milliseconds, all in UTC.
+- `histogram` takes `field`, `interval` (a number > 0), optional `offset`
+  (a number) and `min_doc_count`. It reads `Integer` and `Float` fields, and
+  string values that are numbers or dates (as epoch milliseconds).
+- `date_histogram` takes `field` and either `fixed_interval` — a positive
+  whole number and one of `ms`, `s`, `m`, `h`, `d` (`"30s"`, `"5m"`, `"1h"`,
+  `"7d"`) — or `calendar_interval`, limited to the units whose length is
+  fixed in UTC: `1m`, `1h`, `1d` and `1w` (`minute`, `hour`, `day`, `week`;
+  weeks start on Monday, as in Elasticsearch). `1M`, `1q` and `1y` are a 400
+  that points at `fixed_interval` (#300). `offset` is a signed duration
+  (`"+6h"`, `"-30m"`) or milliseconds. `Date` fields are read as epoch
+  milliseconds; `Integer` fields are taken to already be epoch milliseconds.
+- Anything else is a 400 with the reason: a malformed interval
+  (`"1 banana"`, `"1.5h"`, `"1w"` as a fixed interval), a zero or negative
+  interval, both or neither of `fixed_interval` / `calendar_interval`, the
+  deprecated `interval` on `date_histogram`, and the not-yet-supported
+  `time_zone` (#301), `extended_bounds` / `hard_bounds` (#302), `keyed`,
+  `order`, `missing` and `format`.
+- Buckets are sorted by key ascending. `key` is a number; `date_histogram`
+  also returns `key_as_string` (RFC 3339, UTC, millisecond precision).
+- **Empty buckets.** `min_doc_count` defaults to 0, as in Elasticsearch:
+  every bucket between the lowest and the highest non-empty bucket is
+  returned, empty ones with `doc_count: 0` (and their metric
+  sub-aggregations `null`, or `0` for `sum` / `value_count`), so a time
+  series has no missing days. No buckets are added before the first or after
+  the last value (`extended_bounds`, #302). With `min_doc_count: n ≥ 1` only
+  buckets holding at least `n` documents are returned. A histogram that
+  would return more than 10,000 buckets, filled gaps included, is a 400 —
+  use a larger interval, a narrower query, or `min_doc_count: 1`.
+- A document counts once per bucket: a multi-valued field with two values in
+  one bucket adds 1 to it, with values in two buckets adds 1 to each.
+- Each segment buckets its own matches with the request's interval and
+  offset, and the coordinator sums counts bucket by bucket, so results are
+  the same however the documents are split into segments.
+
+### Nested attributes
+
+A `Keyword` field whose value is the JSON text of an object, or of an array
+of objects, is a nested container. Filters, `sort`, aggregations and
+`highlight` address its leaves by dotted path (`author.name`), and a hit
+returns the field exactly as it was sent. The Python client sends a `dict`
+this way automatically.
+
+```json
+{"id": "1", "fields": [
+  {"name": "author",  "field_type": "Keyword", "value": "{\"name\":\"Ada\",\"org\":\"acme\",\"age\":36}"},
+  {"name": "authors", "field_type": "Keyword", "value": "[{\"name\":\"Ada\",\"org\":\"acme\"},{\"name\":\"Bob\",\"org\":\"beta\"}]"},
+  {"name": "tags",    "field_type": "Keyword", "value": "[\"a\",\"b\"]"}]}
+```
+
+```json
+{"query_text": "", "filter": {"bool": {"must": [
+   {"term": {"author.org": "acme"}}, {"range": {"author.age": {"gte": "30"}}}]}},
+ "sort": [{"author.age": {"order": "desc"}}],
+ "aggs": {"by_author": {"terms": {"field": "authors.name"}}}}
+```
+
+**Semantics are flattened, like Elasticsearch's `object` type, not
+`nested`.** Each dotted path collects the leaves of every element of an
+array, and the link between leaves of the same element is lost. With the
+`authors` value above:
+
+| Filter | Matches? | Why |
+| --- | --- | --- |
+| `authors.name = Ada` | yes | `authors.name` is `[Ada, Bob]` |
+| `authors.name = Ada AND authors.org = acme` | yes | Ada is at acme |
+| `authors.name = Ada AND authors.org = beta` | **yes** | `authors.org` is `[acme, beta]`; no author is both Ada and at beta, but the paths are matched independently |
+| `authors.name = Cy` | no | no element has that name |
+
+True nested queries, where each array element is matched as a unit, are not
+supported. If you need "same element" matching, index each element as its
+own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`).
+
+- Each leaf is indexed under its full path. Objects inside arrays, and arrays
+  inside arrays, are flattened into the same path. `null`, `{}` and `[]` do
+  not add a value.
+- A path with several values is multi-valued. A filter matches if any value
+  matches. A `terms` bucket counts a document once per distinct value, so a
+  value repeated in one document still counts once. Metric aggregations
+  (`sum`, `avg`, `value_count`...) see every value.
+- Numbers go to the numeric (float) column, with one entry per value, so
+  `range`, numeric `sort` and metrics work on them. Strings and booleans go to
+  the keyword column. If several values are stored at one path, they are kept
+  as their JSON-list text, the same convention `tags` above uses. If a path
+  has both strings and numbers in one document, all of its values are stored
+  as strings, so keep each path to one JSON type.
+- Leaves are filter and sort values. They are not tokenized for full-text
+  `query_text` search.
+- Dotted paths are worked out each time a segment is built. A container
+  indexed before this release can be addressed by dotted path once its
+  segment is rebuilt by compaction or re-indexing. Flat documents are
+  unaffected.
+- The field names a query uses can be listed with
+  `SearchQuery::field_paths()`. `validate_field_paths()` rejects a path that
+  a namespace schema does not know. Until namespace schemas are enforced on
+  search, unknown paths are allowed and match nothing.
 
 ### Indexing and writes
 
@@ -63,12 +232,14 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 - Write-ahead log for buffered documents, replayed on restart.
 - Auto-flush at a configurable document threshold (`KOSHA_FLUSH_THRESHOLD`), plus an explicit `flush` that makes writes visible immediately. A buffer that stays below the threshold is flushed and published once it has been pending for `KOSHA_FLUSH_MAX_AGE_MS` (default 1000; `0` disables), similar to Elasticsearch's `refresh_interval`. The Python client flushes only on `refresh=True` / `"wait_for"` or `indices.refresh()`, not after every bulk batch.
 - Size-tiered compaction with a cap on merged-segment size (5 GiB default). A background scheduler on the write pod runs a tiered pass on any namespace past the segment trigger every `KOSHA_COMPACTION_INTERVAL_MS` (default 30000; `0` disables), at most `KOSHA_COMPACTION_MAX_CONCURRENT` passes at a time (default 1). Every pass plans its merge group from S3 object sizes before downloading anything, hydrates only that group, and evicts the superseded inputs from local disk once the merge is published, so a pass needs about 2 x the cap of local disk rather than the whole namespace. A `full` pass loops capped groups inside one job until none fits; job results report `groups`, `bytes_hydrated`, `bytes_evicted` and `peak_local_bytes`. `POST /v1/admin/compact-namespace` also accepts `"async": true` and returns `202` with a job id; poll `GET /v1/admin/compaction-jobs/{id}`, or see scheduler state in `GET /v1/admin/compaction-status`. Building a segment (flush or merge) keeps at most `KOSHA_SEGMENT_BUILD_MEMORY_BYTES` (default 256 MiB) of postings in memory: stored documents stream to disk as they're added, and postings over the budget spill to sorted runs that are merged on disk when the segment is finished. That final merge streams each term's postings through the encoder, so a term that appears in every document doesn't need its posting list in memory, and compaction passes vectors through as f32. A merge's peak heap is about the budget plus ~35 B per merged document (doc-store offsets and field lengths) plus the vocabulary, not counting short filter values and vectors (#253).
+- Segment garbage collection. Every publish records the segments and deletion generations it stops referencing in the manifest (`retired`). Each pod removes its local copies once `KOSHA_LOCAL_GC_GRACE` (default 5m) has passed and no in-flight search can still read them, checked every `KOSHA_LOCAL_GC_INTERVAL_MS` (default 60000; `0` disables). `POST /v1/admin/gc` `{"namespace"?, "dry_run": true}` lists (dry run, the default) or deletes the S3 objects no current manifest references: retired ones after `KOSHA_GC_GRACE` (default 1h), never-recorded orphans after `KOSHA_GC_ORPHAN_GRACE` (default 24h). A segment's `_COMMIT` is deleted before its data. Counters (`kosha_gc_bytes_reclaimed_total`, `kosha_gc_segments_deleted_total`, `kosha_retired_segments`, local equivalents) are under `gc` in `GET /v1/stats`. `k8s/base/cronjob-segment-gc.yaml` runs it daily, shipped suspended and in dry-run mode.
 
 ### Storage and caching
 
 - S3 as the source of truth; any S3-compatible endpoint works (MinIO locally, path-style supported).
 - Local NVMe read-through cache, size-bounded with LRU eviction.
 - Lazy segment loading — the doc store, filter columns, and postings are read on demand. A cold query fetches only its result page's documents from S3: ranged GETs for those documents' byte spans in `doc_store.bin` (and `doc_vectors.bin`), with nearby spans coalesced into one GET (`KOSHA_DOC_SPAN_COALESCE_GAP_BYTES`, default 64 KiB). Fetched spans are kept in a per-segment sparse span cache that counts toward the cache budget, so a warm repeat makes no S3 request. A segment that has served `KOSHA_DOC_SPAN_PROMOTE_GETS` ranged GETs (default 64) or `KOSHA_DOC_SPAN_PROMOTE_BYTES` (default 16 MiB) is hydrated whole in the background and its spans are dropped. `KOSHA_DOC_STORE_READ_MODE=whole` restores whole-file fetches per page segment. The `search timing:` log line reports `page_gets`, `page_ranged_kb`, `page_whole_files` and `page_whole_mb`; `GET /stats` reports the totals under `doc_store_reads`. Postings are read the same way (#245): segments are written with raw (uncompressed) posting shards (`KOSHA_POSTINGS_RAW_BLOBS`, default `1`; the footer records `posting_blobs_raw`), so a cold query fetches only its terms' postings spans, positions included, in one batch of ranged GETs. A shard that has served `KOSHA_POSTING_SPAN_PROMOTE_GETS` ranged GETs (default 32) or `KOSHA_POSTING_SPAN_PROMOTE_BYTES` (default 8 MiB) is hydrated whole. kNN queries fetch only `vector.offsets` up front and then the probed postings of `vector.idx` by range. Older or compressed-shard segments, wildcard queries, and `KOSHA_POSTINGS_READ_MODE=whole` keep whole-file fetches. A cold BM25 query is 3 sequential S3 round trips (scaffolding: footers, `inverted.idx`, `doc_store.offsets`; postings; page documents), or 4 when the node must first fetch footers it has not cached (persisted manifests no longer carry them, #241). The `search timing:` line adds `s3_rounds`, `s3_bytes`, `postings_gets`, `postings_ranged_kb`, `postings_whole_files`, `postings_whole_mb`, `vector_gets`, `vector_ranged_kb` and `vector_whole_files`; `GET /stats` reports `posting_reads`. Raw shards cost some disk and S3 space: about 25% more for the shard files on a synthetic corpus, since postings are already varint/delta coded.
+- A segment whose `doc_store.offsets` sidecar is missing from S3, or fails the reader's sanity check, is still searchable: the query pod fetches that segment's `doc_store.bin` instead, logs a WARN naming the segment, and counts it in `doc_store_offsets_fallbacks` on `GET /v1/stats`. Repair such segments with `POST /v1/admin/backfill-offset-tables` so cold queries stop paying for the full doc store.
 - In-memory parsed-segment cache governed by a live-bytes ledger and an admission gate, with a per-request hydration byte budget and bounded hydration concurrency.
 - Posting-blob presence cache, postings cache, and vector-postings cache.
 - Whole-response result cache for `POST /search` (bypassable per query with `no_cache`).
@@ -89,19 +260,19 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 ### API and clients
 
-- HTTP/JSON `/v1` API — `documents`, `search`, `flush`, `delete`, `exists`, `stats` — with the Phase 1 unversioned routes still served for backward compatibility.
+- HTTP/JSON `/v1` API (see [HTTP routes](#http-routes)) — namespace create and delete, `documents`, `search`, `flush`, `delete`, `exists`, `stats` — with the Phase 1 unversioned routes still served for backward compatibility.
 - `proto/kosha/v1/kosha.proto` is the canonical API contract and the source for generated stubs and the OpenAPI spec.
 - `kosha` CLI (built from `crates/kosha-cli`, not yet on crates.io): health, index, search, flush, delete, stats, admin commands, named profiles, `--json` output, and a `kosha curl` escape hatch.
 - OpenSearch-compatible Python client, [`kosha-client` on PyPI](https://pypi.org/project/kosha-client/): `search`, `index`, `bulk`, `count`, `update`, `delete_by_query`, `update_by_query`, `scroll`, plus `indices` and `tasks` namespaces, translating the ES query DSL to Kosha's native shape.
 
 ### Not supported yet
 
-- Reranking (Phase 2, DESIGN.md §3.1). Per-retriever weights for RRF.
+- Per-retriever weights for RRF. Reranking over more than one field, and ES `text_similarity_reranker` retrievers in the Python client.
 - Multi-field scoring other than a boosted sum (`dis_max` / `best_fields` tie-breakers, turbopuffer `Product` / `Max` of fields), field-name patterns in `fields`, and block-max WAND for `fields` queries.
 - Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document.
 - Fuzzy: block-max WAND over expansions (fuzzy queries score every posting of every expansion), highlighting of fuzzy matches, fuzzy inside `fields` / `match_phrase`, bloom pruning for two-edit tokens.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
-- `kosha-vector-spfresh` (SPFresh/SPANN with LIRE rebalancing) is a standalone, benchmarked prototype; it is not wired into the segment format or the query path.
+- Incremental vector-index updates. Each segment's posting-based `vector.idx` is built once, with `kosha-vector-spfresh`'s clustering, when the segment is written; the crate's incremental SPFresh/LIRE rebalancing (split / merge / reassign) is a benchmarked prototype the server does not use.
 
 ## Per-field indexes
 
@@ -207,6 +378,51 @@ Throughput on the repository's Markdown (16 MB, ~2 KB documents; `cargo bench -p
 costs 0.82x of a legacy build; the Snowball stemmer is most of the rest). All-ASCII words take a
 hand-written UAX #29 fast path checked against `unicode-segmentation` by a differential test.
 
+## HTTP routes
+
+Every `/v1/namespaces` route is scoped to the caller's tenant: `{ns}` is an
+unqualified name, stored as `{tenant}/{ns}`, and another tenant's namespace of
+the same name is invisible (404). Query pods (`KOSHA_INGEST_HOST` set) forward
+the routes marked *write* to the ingest pod.
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `POST /v1/namespaces` | `CreateNamespaceRequest` → `CreateNamespaceResponse` | *write*. 409 if it exists, 400 for an invalid name or schema. Optional: namespaces still auto-create on first write. A `schema` is validated, echoed back and stored as the namespace schema, as `POST /v1/namespaces/{ns}/schema` would (see [Analyzers](#analyzers)). |
+| `DELETE /v1/namespaces/{ns}` | → `DeleteNamespaceResponse` | *write*. 404 if it does not exist. Permanent; see below. |
+| `POST /v1/namespaces/{ns}/documents` | `IndexDocumentsRequest` → `IndexDocumentsResponse` | *write*. Upsert by id. |
+| `POST /v1/namespaces/{ns}/flush` | → `FlushResponse` | *write*. Make buffered writes searchable. |
+| `POST /v1/namespaces/{ns}/delete` | `DeleteByQueryRequest` → `DeleteByQueryResponse` | *write*. Delete by query. |
+| `POST /v1/namespaces/{ns}/schema`, `GET /v1/namespaces/{ns}/schema` | `NamespaceSchema` | Set (*write*) or read the namespace schema; see [Analyzers](#analyzers). |
+| `POST /v1/namespaces/{ns}/search` | `SearchRequest` → `SearchResponse` | 404 for a missing namespace. |
+| `POST /v1/namespaces/{ns}/exists` | ids → per-id existence | |
+| `GET /v1/namespaces/{ns}/stats` | → `NamespaceStats` | 404 for a missing namespace. |
+| `GET /v1/healthz`, `GET /healthz`, `GET /readyz` | | Unauthenticated probes. |
+| `GET /v1/stats` | | Admin key only. |
+| `/v1/admin/*` | | Admin key only; see the operations list above. |
+
+**Deleting a namespace** (`DELETE /v1/namespaces/{ns}`) runs on the ingest pod
+under the namespace's publication lock:
+
+1. The control store drops the namespace and its manifest. It keeps the highest
+   manifest version the namespace reached (`kosha.retired_namespaces` in
+   Postgres), and a re-created namespace of the same name starts above it, so a
+   query pod's caches, which are keyed by manifest version, can never serve the
+   deleted data.
+2. The writer discards the namespace's manifest, write buffer, pending deletes
+   and every WAL record for it, so neither a later flush nor a restart brings the
+   documents back.
+3. Its local segment directory and per-namespace caches are removed.
+4. With S3 configured, every object under the namespace's prefix
+   (`{KOSHA_S3_PREFIX}/{tenant}/{ns}/`) is deleted before the response returns.
+   If that fails, the namespace is still deleted and the response says
+   `"storage_reclaimed": false`; the leftover objects are unreferenced, and a
+   re-created namespace never reuses their keys.
+
+Query pods answer 404 for the namespace as soon as the control store has no
+manifest for it. Their local disk copies of its segments are not removed
+eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them. Re-creating the
+namespace, explicitly or by writing to it, starts it empty.
+
 ## Authorization and durability
 
 All client namespace routes, including legacy `/index`, `/search`, `/flush`,
@@ -229,8 +445,10 @@ existing data automatically.
   `KOSHA_LEGACY_ROUTES=off` turns the unversioned routes into 410s.
 
 A successful flush uploads its segment snapshot before publishing its manifest.
-Upload and manifest-store failures return errors and remain retryable. Buffered
-writes use a local, fsynced WAL; they are not S3-durable until a successful flush.
+Upload and manifest-store failures return errors and remain retryable. By
+default (`KOSHA_WAL_MODE=local`) buffered writes use a local, fsynced WAL under
+`data_dir/_wal`; they are not S3-durable until a successful flush, so losing the
+node (not just the pod) loses acknowledged, unflushed writes.
 Concurrent appends are group-committed: one WAL file and one fsync cover every
 record queued while the previous commit ran, and each caller is acknowledged
 only after the fsync covering its own record. Once the previous group held more
@@ -263,6 +481,76 @@ writer identifier to avoid collisions before publication. Migration
 (`kosha-server migrate`) and `POST /v1/admin/import-namespace` also publish by
 CAS against the version they read. They never rebase, and they fail instead of
 overwriting a manifest another writer committed (409 for import).
+
+### S3 WAL (`KOSHA_WAL_MODE=s3`)
+
+With `KOSHA_WAL_MODE=s3` (needs the `s3` feature and `KOSHA_S3_BUCKET`), an
+ingest node acknowledges `/index`, `/replace` and `/delete` only after the
+group commit holding the write is stored in the segment bucket, so an
+acknowledged write survives losing the node and its disk. Each group commit is
+one object, `{KOSHA_S3_PREFIX}/_wal/{KOSHA_WAL_WRITER_ID}/{lsn:020}.bin`, with
+the same checksummed v3 frames as the local WAL, created with a conditional
+`PutObject` (`If-None-Match: *`). The stream's `meta/origin` and
+`meta/sequence` objects sit next to it.
+
+- **Writer id.** `KOSHA_WAL_WRITER_ID` (default `default`) names the stream.
+  Every ingest process running at the same time needs its own id; a
+  replacement for a lost node must reuse the lost node's id. Set the mode
+  only where writes land: a node with `KOSHA_INGEST_HOST` forwards writes and
+  keeps a local WAL. The stock
+  single-replica, `Recreate` ingest Deployment can keep the default.
+- **LSNs** are allocated per writer stream (per `wal_origin`), not per
+  namespace: one object holds every namespace's records that arrived during
+  the previous PUT. A manifest's `wal_checkpoint` is still the highest LSN of
+  its `wal_origin` that its segments contain. The origin lives in the bucket,
+  so a replacement node recognizes its predecessor's checkpoints.
+- **One writer per stream.** Group `n + 1` is keyed by the LSN after group
+  `n`'s last record. Two processes appending to one stream race for the same
+  key; exactly one PUT succeeds. The loser fails that write (HTTP 500),
+  rejects every later write, and must be restarted, which re-reads the stream.
+  A PUT that timed out but landed is recognized by its bytes on the next PUT
+  and kept (its records replay; they were never acknowledged). At startup the
+  server checks that the store rejects a second conditional PUT of one key and
+  refuses to start otherwise. MinIO and AWS S3 both support `If-None-Match`
+  on `PutObject`. Conditional PUTs do not fence a writer that stays paused
+  until the object it would collide with has been reclaimed; run one ingest
+  process per writer id (the default Deployment's `Recreate` strategy does).
+- **Timeouts.** Every WAL S3 call has a deadline of `KOSHA_WAL_S3_TIMEOUT_MS`
+  (default 10000). A failed or timed-out PUT fails the write with a 500 and
+  nothing is buffered.
+- **Recovery.** On startup the node lists the stream, replays every record
+  above each namespace's published checkpoint into its write buffers (the
+  same path as a local restart) and continues after the highest LSN. A flush
+  then builds segments as usual and publishes the manifest by CAS with the new
+  `wal_checkpoint`; objects at or below it are deleted after the publication
+  is acknowledged, as local files are.
+- **Latency trade-off.** An acknowledgement now waits for an S3 PUT instead of
+  an fsync. Writes to one namespace are serialized, so a single namespace
+  writer gets one PUT round trip per write; concurrent writes to different
+  namespaces share a PUT. Groups are written one at a time, so throughput is
+  bounded by one PUT stream. `cargo bench -p kosha-write --bench s3_wal_ack`
+  (500 kB writes, simulated PUT of 25 ms + 100 MB/s; not real S3):
+
+  | writers | window ms | writes/s | MB/s | p50 ms | p99 ms | PUTs/write |
+  |--------:|----------:|---------:|-----:|-------:|-------:|-----------:|
+  | 1  | 0 | 26.4  | 13.6 | 38.1  | 38.5  | 1.00 |
+  | 4  | 0 | 50.6  | 26.1 | 79.3  | 82.4  | 0.51 |
+  | 4  | 2 | 55.6  | 28.6 | 78.9  | 95.2  | 0.41 |
+  | 16 | 0 | 108.7 | 55.9 | 143.7 | 177.4 | 0.14 |
+
+  turbopuffer reports p50 ≈ 165 ms for 500 kB writes. Measure on real S3
+  before relying on these numbers.
+- **Switching local → s3.** On the first start in s3 mode, a non-empty local
+  `data_dir/_wal` is copied into the stream with its origin, sequence and
+  file keys, so existing manifest checkpoints keep their meaning, and is then
+  renamed to `_wal.migrated-{unix seconds}`. If the stream already belongs to
+  another origin the node refuses to start: flush every namespace in one mode
+  first.
+- **Switching s3 → local.** Local mode does not read the S3 stream. Stop
+  writes, flush every namespace (`POST /flush`) so the checkpoint covers every
+  record, and check that `_wal/{writer id}/` holds no `.bin` objects before
+  restarting with `KOSHA_WAL_MODE=local`. The local WAL then starts a new
+  origin.
 
 Each WAL directory has a persistent origin identifier. New manifest checkpoints
 apply only to that origin, so another writer's checkpoint cannot discard local
@@ -304,29 +592,37 @@ back requires converting both formats. The SQL column needs no schema change.
 ## Repository layout
 
     crates/
-      kosha-core      shared types, data model, filter/query DSL  — Epic 2
-      kosha-segment   segment format: inverted idx, doc store,    — Epic 2
-                     filter columns, vector store, HNSW graph
-      kosha-write     document buffer + flush-to-segment          — Epic 3
-      kosha-cache     NVMe SSD read-through cache (§9)            — Epic 4
-      kosha-query     BM25 scorer, kNN/ANN search, aggregations,  — Epic 5
-                     wildcard, match phrase, filtering
-      kosha-control   in-memory namespace + manifest store        — Epic 6
-      kosha-server    HTTP API (healthz, index, search, stats,    — Epic 8
-                     delete, flush)
-      kosha-cli       Remote `kosha` CLI (profiles, search,       — Epic 12
-                     index, curl escape hatch)
+      kosha-core            shared types, data model, filter/query DSL, analyzers
+      kosha-segment         segment format: inverted index, doc store, filter
+                            columns, blooms, posting-based vector index
+      kosha-vector-spfresh  vector clustering used to build vector.idx, plus an
+                            incremental SPFresh/LIRE prototype
+      kosha-write           WAL, per-namespace buffer, flush-to-segment, compaction
+      kosha-cache           NVMe SSD read-through cache (DESIGN.md §9)
+      kosha-query           BM25 + WAND, kNN/ANN, RRF fusion, filters, sorting,
+                            highlighting, aggregations, segment cache
+      kosha-control         namespace registry + manifest store (in-memory or
+                            Postgres), hydration leases, SQL migrations
+      kosha-server          HTTP /v1 API, auth, S3 upload/hydration, warmup,
+                            compaction scheduler, `migrate`
+      kosha-cli             remote `kosha` CLI (profiles, search, index, curl)
+      kosha-build-segments  offline parallel segment builder
     clients/
-      python/kosha_client  OpenSearch-compatible Python client    — Epic 11
-                           (spec → codegen → thin client)
-      python/README.md     how the client is structured
+      python/kosha_client   OpenSearch-compatible Python client
+                            (spec → codegen → thin client)
+      python/README.md      how the client is structured
     proto/
-      buf.yaml             Buf module config
-      kosha/v1/kosha.proto  Canonical API contract (source of truth) — Epic 1
-    gen/                   Generated stubs + OpenAPI spec (git-ignored)
-    tools/codegen/         Code generation scripts and docs
-    docs/                  Development and integration guides
-    DESIGN.md              Architecture document (v1 draft)
+      buf.yaml              Buf module config
+      kosha/v1/kosha.proto  canonical API contract (source of truth)
+    gen/                    generated stubs + OpenAPI spec (git-ignored)
+    tools/codegen/          code generation scripts and docs
+    scripts/conformance/    end-to-end BM25 + filter correctness suite
+    scripts/bench/          large-scale benchmark harness
+    docs/                   configuration reference, development guides
+    DESIGN.md               architecture document
+
+[CONTRIBUTING.md](CONTRIBUTING.md#where-does-my-change-go) maps each crate to the kind of
+change that belongs in it.
 
 ## Quickstart (test as a customer would)
 
@@ -346,10 +642,16 @@ kosha index -n quickstart-demo --file crates/kosha-cli/examples/docs.jsonl
 kosha flush -n quickstart-demo
 kosha search -n quickstart-demo "breach"
 kosha stats -n quickstart-demo
+
+# Vector search (the example docs carry a 4-dimensional `embedding`)
+kosha index -n quickstart-demo --file crates/kosha-cli/examples/vectors.jsonl
+kosha flush -n quickstart-demo
+kosha search -n quickstart-demo --knn-field embedding --knn-vector '[0.85,0.15,0,0.05]'
 ```
 
 See [crates/kosha-cli/README.md](crates/kosha-cli/README.md) for profiles
-(`~/.kosha/config.toml`), `--json` output, and the `kosha curl` escape hatch.
+(`~/.kosha/config.toml`), `--json` output, hybrid search / sort / cursor
+flags, admin commands, shell completions, and the `kosha curl` escape hatch.
 
 The Python client ([`kosha-client` on PyPI](https://pypi.org/project/kosha-client/))
 still works the same way for application code:
@@ -376,11 +678,15 @@ Both the CLI and the Python client respect `KOSHA_HOST` and `KOSHA_API_KEY`.
 Prerequisites: Rust stable (via [rustup](https://rustup.rs) — the repo pins the
 channel via `rust-toolchain.toml`), Docker, and optionally `pre-commit`.
 
-    cargo build                                # build the workspace
-    cargo test                                 # run unit tests
-    cargo fmt --all -- --check                 # formatting (CI gate)
-    cargo clippy --all-targets -- -D warnings  # linting (CI gate)
-    pre-commit install                         # optional: run gates on commit
+    cargo build                                                # build the workspace
+    cargo test --all-features                                  # tests, incl. s3/postgres code (CI gate)
+    cargo fmt --all -- --check                                 # formatting (CI gate)
+    cargo clippy --all-targets --all-features -- -D warnings   # linting (CI gate)
+    pre-commit install                                         # optional: run gates on commit
+
+Every `KOSHA_*` environment variable the server reads, with its default and units, is listed
+in [docs/configuration.md](docs/configuration.md). [CONTRIBUTING.md](CONTRIBUTING.md) covers
+the full contributor workflow: crate map, feature flags, benchmarks and PR conventions.
 
 The Postgres CAS integration test races independent writers and checks retries.
 Run it against a dedicated disposable database:
@@ -432,5 +738,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Apache-2.0 (see [LICENSE](LICENSE)). The final open-source license choice is
-confirmed before the v0.1 release (implementation plan step 126).
+Apache-2.0 (see [LICENSE](LICENSE)).

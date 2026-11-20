@@ -1,0 +1,61 @@
+name: Feature request
+description: Propose a new capability or a change to Kosha's API or behavior.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the README's "Supported features" and "Not supported yet" sections first;
+        the feature may already exist or be planned.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what stops you today? Describe the use case, not only the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed request / API shape
+      description: If this changes the API, show the request JSON (and the response, if it changes). Otherwise describe the proposed behavior.
+      placeholder: |
+        POST /v1/namespaces/{ns}/search
+        {
+          "query_text": "...",
+          "new_option": {...}
+        }
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: es-equivalent
+    attributes:
+      label: Elasticsearch / OpenSearch equivalent
+      description: Is there an Elasticsearch or OpenSearch feature that does this? Link its docs, and say whether Kosha should match its names and defaults.
+      placeholder: "e.g. ES `track_total_hits`: https://www.elastic.co/guide/..."
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use today, or other designs you considered.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you like to work on this?
+      options:
+        - "Yes"
+        - "Maybe, with guidance"
+        - "No"
+    validations:
+      required: false

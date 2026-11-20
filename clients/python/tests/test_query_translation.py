@@ -118,13 +118,60 @@ def test_exists_and_range_options():
     assert ranged == {"range": {"publishedAt": {"gte": "2024-01-01", "lte": "2024-12-31"}}}
 
 
+def test_prefix_short_and_long_forms():
+    assert KoshaClient._to_filter({"prefix": {"path": "/matters/2026/"}}) == {
+        "prefix": {"path": "/matters/2026/"}
+    }
+    # Long form, default case: sent in the short form.
+    assert KoshaClient._to_filter(
+        {"prefix": {"path": {"value": "/a/", "boost": 2.0, "rewrite": "constant_score"}}}
+    ) == {"prefix": {"path": "/a/"}}
+    assert KoshaClient._to_filter(
+        {"prefix": {"sku": {"value": "ab", "case_insensitive": True}}}
+    ) == {"prefix": {"sku": {"value": "ab", "case_insensitive": True}}}
+    assert KoshaClient._to_filter(
+        {"prefix": {"sku": {"value": "ab", "case_insensitive": False}}}
+    ) == {"prefix": {"sku": "ab"}}
+
+
+def test_prefix_composes_in_bool_and_query_context():
+    kosha = translate(
+        {
+            "query": {
+                "bool": {
+                    "must": [{"match": {"content": "contract"}}],
+                    "filter": [
+                        {"prefix": {"status": "arch"}},
+                        {"range": {"createdAt": {"gte": "2026-01-01"}}},
+                    ],
+                    "must_not": [{"prefix": {"path": "/tmp/"}}],
+                }
+            }
+        }
+    )
+    assert kosha["query_text"] == "contract"
+    assert kosha["filter"] == {
+        "bool": {
+            "must": [
+                {"prefix": {"status": "arch"}},
+                {"range": {"createdAt": {"gte": "2026-01-01"}}},
+            ],
+            "must_not": [{"prefix": {"path": "/tmp/"}}],
+        }
+    }
+
+
 @pytest.mark.parametrize(
     "clause",
     [
         {"nested": {"path": "comments", "query": {"match_all": {}}}},
         {"term": {"_id": "abc"}},
         {"ids": {"values": ["a"]}},
-        {"prefix": {"title": "ab"}},
+        {"prefix": {"title": {"value": "ab", "fuzziness": 1}}},
+        {"prefix": {"title": 12}},
+        {"prefix": {"title": "ab", "path": "/a"}},
+        {"prefix": {"title": {"case_insensitive": True}}},
+        {"prefix": {"title": {"value": "ab", "case_insensitive": "yes"}}},
         {"bool": {"should": [{"term": {"a": "1"}}], "minimum_should_match": "75%"}},
     ],
 )
@@ -461,7 +508,52 @@ def test_aggregations_pass_through_and_sub_aggregations_are_refused():
     )
     assert "sub-aggregations" in message
     assert "top_hits" in refused({"aggs": {"one": {"top_hits": {"size": 1}}}})
-    assert "max" in refused({"aggs": {"last_page": {"max": {"field": "pageNumber"}}}})
+    assert "stats" in refused({"aggs": {"s": {"stats": {"field": "pageNumber"}}}})
+    assert "sub-aggregations under 'max'" in refused(
+        {"aggs": {"m": {"max": {"field": "a"}, "aggs": {"x": {"min": {"field": "b"}}}}}}
+    )
+
+
+def test_metric_aggregations_and_metric_sub_aggregations_pass_through():
+    metrics = {
+        kind: {kind: {"field": "pageNumber"}}
+        for kind in ("min", "max", "sum", "avg", "value_count")
+    }
+    assert translate({"size": 0, "aggs": metrics})["aggs"] == metrics
+    nested = {
+        "by_sender": {
+            "terms": {"field": "senderEmail"},
+            "meta": {"ignored": True},
+            "aggregations": {"pages": {"sum": {"field": "pageNumber"}}},
+        }
+    }
+    assert translate({"size": 0, "aggs": nested})["aggs"] == {
+        "by_sender": {
+            "terms": {"field": "senderEmail"},
+            "aggs": {"pages": {"sum": {"field": "pageNumber"}}},
+        }
+    }
+
+
+def test_histogram_aggregations_pass_through_with_metric_sub_aggregations():
+    aggs = {
+        "by_size": {"histogram": {"field": "bytes", "interval": 1024, "min_doc_count": 1}},
+        "over_time": {
+            "date_histogram": {"field": "sentAt", "fixed_interval": "1h", "offset": "+30m"},
+            "aggs": {"pages": {"sum": {"field": "pageNumber"}}},
+        },
+    }
+    assert translate({"size": 0, "aggs": aggs})["aggs"] == aggs
+    assert "sub-aggregations other than" in refused(
+        {
+            "aggs": {
+                "h": {
+                    "histogram": {"field": "bytes", "interval": 1},
+                    "aggs": {"t": {"terms": {"field": "senderEmail"}}},
+                }
+            }
+        }
+    )
 
 
 def test_response_reports_relation_sort_values_collapse_fields_and_highlight():

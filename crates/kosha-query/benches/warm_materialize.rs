@@ -118,6 +118,7 @@ fn build_corpus(
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        retired: Default::default(),
     }
 }
 
@@ -148,6 +149,7 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         rank: None,
         mode: None,
         fields: Vec::new(),
+        rerank: None,
     }
 }
 

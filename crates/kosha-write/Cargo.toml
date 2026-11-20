@@ -18,6 +18,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+kosha-query = { path = "../kosha-query" }
 
 [[bench]]
 name = "sustained_concurrent_flush"
@@ -29,4 +30,8 @@ harness = false
 
 [[bench]]
 name = "wal_group_commit"
+harness = false
+
+[[bench]]
+name = "s3_wal_ack"
 harness = false

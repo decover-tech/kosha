@@ -170,7 +170,11 @@ class KoshaClient:
         return str(ns)
 
     def search(
-        self, index: str | None = None, body: dict | None = None, **params: Any
+        self,
+        index: str | None = None,
+        body: dict | None = None,
+        rerank: dict | None = None,
+        **params: Any,
     ) -> dict:
         """Run an OpenSearch search body against Kosha.
 
@@ -178,9 +182,14 @@ class KoshaClient:
         ``_translate_search``). A clause Kosha cannot express raises
         ``KoshaRequestError(400)`` naming it. It is never dropped: dropping
         a filter silently returns documents the caller excluded.
+
+        ``rerank`` (or a ``"rerank"`` key in the body) asks the server to
+        rerank the top hits with an external model; see ``rerank_spec``.
         """
         ns = self._resolve_ns(index)
         body = body or {}
+        if rerank is not None:
+            body = {**body, "rerank": rerank}
         kosha_body, context = self._translate_search(body, params)
         kosha_body["namespace"] = ns
 
@@ -195,6 +204,64 @@ class KoshaClient:
                 raise
         took_ms = int((time.monotonic() - start) * 1000)
         return self._build_search_response(result, took_ms, context)
+
+    # ── Rerank ─────────────────────────────────────────────────────────────
+
+    _RERANK_KEYS = frozenset({"provider", "model", "field", "top_n", "timeout_ms", "query"})
+
+    @staticmethod
+    def rerank_spec(
+        field: str,
+        *,
+        model: str | None = "rerank-v3.5",
+        top_n: int | None = None,
+        provider: str = "cohere",
+        timeout_ms: int | None = None,
+        query: str | None = None,
+    ) -> dict:
+        """The ``rerank`` clause equivalent to a Cohere rerank call.
+
+        ``co.rerank(model=m, query=q, documents=[hit[field] ...], top_n=n)``
+        over the top ``n`` search hits becomes
+        ``client.search(index, body, rerank=KoshaClient.rerank_spec(field,
+        model=m, top_n=n))``. The server sends the same request to the
+        provider it has configured under ``provider`` (the API key stays on
+        the server). ``query`` defaults to the search's query text; set it
+        for a kNN-only search. ``top_n`` defaults to ``from + size`` and
+        must be at least that. If the provider times out or fails, hits
+        come back in search order and the response has
+        ``rerank.degraded = True``.
+        """
+        spec: dict = {"provider": provider, "field": field}
+        for key, value in (
+            ("model", model),
+            ("top_n", top_n),
+            ("timeout_ms", timeout_ms),
+            ("query", query),
+        ):
+            if value is not None:
+                spec[key] = value
+        return spec
+
+    @classmethod
+    def _rerank(cls, spec: Any) -> dict:
+        """Validate a ``rerank`` clause; Cohere's ``rank_fields`` is accepted
+        for ``field`` (one field only)."""
+        if not isinstance(spec, dict):
+            raise cls._unsupported(f"rerank {spec!r}")
+        spec = dict(spec)
+        rank_fields = spec.pop("rank_fields", None)
+        if rank_fields is not None:
+            fields = cls._as_list(rank_fields)
+            if len(fields) != 1 or "field" in spec:
+                raise cls._unsupported("rerank over more than one field")
+            spec["field"] = fields[0]
+        unknown = set(spec) - cls._RERANK_KEYS
+        if unknown:
+            raise cls._unsupported(f"rerank option(s) {sorted(unknown)}")
+        if not spec.get("provider") or not spec.get("field"):
+            raise cls._unsupported("rerank without provider and field")
+        return spec
 
     # ── Query translation ──────────────────────────────────────────────────
 
@@ -274,8 +341,8 @@ class KoshaClient:
     def _to_filter(cls, clause: Any) -> dict:
         """Translate an OpenSearch filter clause into a Kosha filter.
 
-        Handles ``term``, ``terms``, ``range``, ``exists``, ``match_all``
-        and ``bool`` at any depth. Anything else raises.
+        Handles ``term``, ``terms``, ``range``, ``exists``, ``prefix``,
+        ``match_all`` and ``bool`` at any depth. Anything else raises.
 
         ``bool`` follows OpenSearch's rules for ``should``: with no
         ``minimum_should_match``, the clauses are required (at least one)
@@ -338,6 +405,9 @@ class KoshaClient:
                 raise cls._unsupported(f"exists clause {clause!r}")
             return {"exists": {"field": field}}
 
+        if kind == "prefix":
+            return cls._prefix_filter(clause, spec)
+
         if kind == "bool":
             spec = spec or {}
             unknown = set(spec) - {
@@ -366,6 +436,39 @@ class KoshaClient:
             return {"bool": out}
 
         raise cls._unsupported(f"'{kind}' as a filter")
+
+    # Options of OpenSearch's long-form ``prefix`` that only affect scoring
+    # or query rewriting, never which documents match.
+    _IGNORED_PREFIX_KEYS = frozenset({"boost", "rewrite"})
+
+    @classmethod
+    def _prefix_filter(cls, clause: dict, spec: Any) -> dict:
+        """OpenSearch ``prefix`` (short or long form) → Kosha's ``prefix``.
+
+        Kosha's ``prefix`` is case-sensitive by default, as OpenSearch's is,
+        so ``case_insensitive`` is only sent when the caller set it.
+        """
+        fields = {f: v for f, v in (spec or {}).items() if f != "boost"}
+        if len(fields) != 1:
+            raise cls._unsupported(f"prefix clause {clause!r}")
+        field, value = next(iter(fields.items()))
+        if field == "_id":
+            raise cls._unsupported("a prefix filter on _id")
+        if isinstance(value, dict):
+            unknown = set(value) - {"value", "case_insensitive"} - cls._IGNORED_PREFIX_KEYS
+            if unknown:
+                raise cls._unsupported(f"prefix option(s) {sorted(unknown)}")
+            prefix = value.get("value")
+            case_insensitive = value.get("case_insensitive", False)
+            if not isinstance(case_insensitive, bool):
+                raise cls._unsupported(f"prefix case_insensitive={case_insensitive!r}")
+        else:
+            prefix, case_insensitive = value, False
+        if not isinstance(prefix, str):
+            raise cls._unsupported(f"a non-string prefix {prefix!r}")
+        if case_insensitive:
+            return {"prefix": {field: {"value": prefix, "case_insensitive": True}}}
+        return {"prefix": {field: prefix}}
 
     @classmethod
     def _should_need(cls, bool_spec: dict, has_required: bool) -> int:
@@ -760,6 +863,9 @@ class KoshaClient:
         elif isinstance(track, int) and not isinstance(track, bool) and track > 0:
             kosha["total_hits_cap"] = track
 
+        if body.get("rerank") is not None:
+            kosha["rerank"] = cls._rerank(body["rerank"])
+
         collapse = body.get("collapse")
         if collapse:
             unknown = set(collapse) - {"field"}
@@ -793,9 +899,12 @@ class KoshaClient:
         }
         return kosha, context
 
-    # Aggregation types Kosha computes. A sub-aggregation is refused rather
-    # than ignored: the caller would read buckets that are not there.
-    _AGG_TYPES = ("terms", "cardinality", "composite")
+    # Aggregation types Kosha computes. Metric aggregations can be nested
+    # under a bucket aggregation; any other sub-aggregation is refused
+    # rather than ignored: the caller would read buckets that are not there.
+    _BUCKET_AGG_TYPES = ("terms", "composite", "histogram", "date_histogram")
+    _METRIC_AGG_TYPES = ("min", "max", "sum", "avg", "value_count")
+    _AGG_TYPES = ("cardinality", *_BUCKET_AGG_TYPES, *_METRIC_AGG_TYPES)
 
     @classmethod
     def _extract_aggs(cls, body: dict | None) -> dict | None:
@@ -805,16 +914,30 @@ class KoshaClient:
         aggs = body.get("aggs") or body.get("aggregations")
         if not aggs:
             return None
+        return cls._translate_aggs(aggs, parent=None)
+
+    @classmethod
+    def _translate_aggs(cls, aggs: dict, parent: str | None) -> dict:
         out = {}
         for name, spec in aggs.items():
             if not isinstance(spec, dict):
                 raise cls._unsupported(f"aggregation {name!r}: {spec!r}")
-            if "aggs" in spec or "aggregations" in spec:
-                raise cls._unsupported(f"sub-aggregations (in {name!r})")
-            kinds = [k for k in spec if k != "meta"]
+            subs = spec.get("aggs") or spec.get("aggregations")
+            kinds = [k for k in spec if k not in ("meta", "aggs", "aggregations")]
             if len(kinds) != 1 or kinds[0] not in cls._AGG_TYPES:
                 raise cls._unsupported(f"aggregation type(s) {kinds} (in {name!r})")
-            out[name] = {kinds[0]: spec[kinds[0]]}
+            kind = kinds[0]
+            if parent is not None and kind not in cls._METRIC_AGG_TYPES:
+                raise cls._unsupported(
+                    f"sub-aggregations other than {', '.join(cls._METRIC_AGG_TYPES)} "
+                    f"(in {parent!r}: {name!r} is {kind!r})"
+                )
+            translated = {kind: spec[kind]}
+            if subs:
+                if kind not in cls._BUCKET_AGG_TYPES:
+                    raise cls._unsupported(f"sub-aggregations under {kind!r} (in {name!r})")
+                translated["aggs"] = cls._translate_aggs(subs, parent=name)
+            out[name] = translated
         return out
 
     @staticmethod
@@ -881,6 +1004,13 @@ class KoshaClient:
                 "_score": score,
                 "_source": source,
             }
+            # Reranked requests: the search-stage score (RRF for hybrid)
+            # and the reranker's score; ``_score`` is the latter unless
+            # the rerank degraded.
+            if "fused_score" in k_hit:
+                hit["_fused_score"] = k_hit["fused_score"]
+            if "rerank_score" in k_hit:
+                hit["_rerank_score"] = k_hit["rerank_score"]
             if k_hit.get("highlight"):
                 # Per-field fragments, already ES-shaped.
                 hit["highlight"] = dict(k_hit["highlight"])
@@ -923,6 +1053,10 @@ class KoshaClient:
         }
         if result.get("aggregations") is not None:
             response["aggregations"] = result["aggregations"]
+        if "rerank_degraded" in result:
+            response["rerank"] = {"degraded": bool(result["rerank_degraded"])}
+            if result.get("rerank_degraded_reason"):
+                response["rerank"]["reason"] = result["rerank_degraded_reason"]
         return response
 
     # ── Older helper names, kept for callers and tests that use them ──────
@@ -1048,6 +1182,14 @@ class KoshaClient:
                     cls._field_to_kosha(
                         k, json.dumps(list(v), default=json_default), "Keyword"
                     )
+                )
+            elif isinstance(v, dict):
+                # A nested object (#206): sent whole as JSON text in a
+                # Keyword field. The server indexes its leaves under dotted
+                # paths (``author.name``) and returns it unchanged in
+                # ``_source``; decoded back to a dict by _decode_field_value.
+                fields.append(
+                    cls._field_to_kosha(k, json.dumps(v, default=json_default), "Keyword")
                 )
             # else: unsupported type — skip silently (matches prior behavior)
         return fields
@@ -1741,29 +1883,143 @@ class TasksOps:
 class IndexOps:
     """Mimics ``opensearchpy.client.IndicesClient`` for compatibility.
 
-    Phase 1 is schema-less — Kosha creates namespaces on first write, so
-    ``create()`` and ``exists()`` are mostly no-ops.
+    ``create`` and ``delete`` are real: ``POST /v1/namespaces`` and
+    ``DELETE /v1/namespaces/{ns}``. Kosha still creates a namespace on its
+    first write, so calling ``create`` first is optional.
     """
 
     def __init__(self, client: KoshaClient) -> None:
         self._client = client
 
+    # Elasticsearch mapping type -> proto ``FieldType`` name. Types not
+    # listed here (object, nested, geo_point, ...) have no Kosha equivalent
+    # and are left out of the schema rather than guessed.
+    _FIELD_TYPES_FROM_ES = {
+        "text": "FIELD_TYPE_TEXT",
+        "match_only_text": "FIELD_TYPE_TEXT",
+        "keyword": "FIELD_TYPE_KEYWORD",
+        "constant_keyword": "FIELD_TYPE_KEYWORD",
+        "long": "FIELD_TYPE_INTEGER",
+        "integer": "FIELD_TYPE_INTEGER",
+        "short": "FIELD_TYPE_INTEGER",
+        "byte": "FIELD_TYPE_INTEGER",
+        "double": "FIELD_TYPE_FLOAT",
+        "float": "FIELD_TYPE_FLOAT",
+        "half_float": "FIELD_TYPE_FLOAT",
+        "scaled_float": "FIELD_TYPE_FLOAT",
+        "date": "FIELD_TYPE_DATE",
+        "date_nanos": "FIELD_TYPE_DATE",
+        "boolean": "FIELD_TYPE_BOOLEAN",
+        "knn_vector": "FIELD_TYPE_VECTOR",
+        "dense_vector": "FIELD_TYPE_VECTOR",
+    }
+
+    @staticmethod
+    def _ignored(params: dict) -> set[int]:
+        """Status codes the caller asked to ignore (opensearchpy ``ignore``)."""
+        ignore = params.get("ignore", ())
+        if isinstance(ignore, int):
+            ignore = (ignore,)
+        return {int(code) for code in ignore}
+
+    @classmethod
+    def _schema_from_mappings(cls, mappings: Any) -> dict | None:
+        """``NamespaceSchema`` for the plain fields of an ES ``mappings``.
+
+        Each top-level property with a type Kosha has (see
+        ``_FIELD_TYPES_FROM_ES``) becomes a ``FieldSchema``: ``index: false``
+        maps to ``indexed: false``, a text field's ``analyzer`` is passed
+        through. Object/nested properties, multi-fields and unknown types
+        are skipped. ``None`` when nothing translates.
+        """
+        if not isinstance(mappings, dict):
+            return None
+        properties = mappings.get("properties")
+        if not isinstance(properties, dict):
+            return None
+        fields: dict[str, dict] = {}
+        for name, spec in properties.items():
+            if not isinstance(spec, dict):
+                continue
+            field_type = cls._FIELD_TYPES_FROM_ES.get(str(spec.get("type", "")))
+            if field_type is None:
+                logger.info(
+                    "IndexOps.create: mapping for %r (type %r) has no Kosha "
+                    "equivalent; left out of the schema",
+                    name,
+                    spec.get("type", "object"),
+                )
+                continue
+            field = {
+                "type": field_type,
+                "indexed": spec.get("index", True) is not False,
+                "stored": True,
+            }
+            analyzer = spec.get("analyzer")
+            if field_type == "FIELD_TYPE_TEXT" and isinstance(analyzer, str):
+                field["analyzer"] = [analyzer]
+            fields[name] = field
+        return {"fields": fields} if fields else None
+
     def create(self, index: str, body: dict | None = None, **params: Any) -> dict:
-        logger.info("IndexOps.create(%s) — no-op (Kosha is schema-less)", index)
-        return {"acknowledged": True, "shards_acknowledged": True, "index": index}
+        """Create the namespace (``POST /v1/namespaces``).
+
+        ``body["mappings"]`` is translated to a ``NamespaceSchema`` where
+        the mapping is straightforward; ``settings`` are ignored (Kosha has
+        no shards, replicas or refresh interval). An existing namespace
+        raises ``KoshaRequestError`` with status 409; ``ignore=400`` (what
+        ES callers pass for ``resource_already_exists_exception``) or
+        ``ignore=409`` returns the error body instead.
+        """
+        ns = self._client._resolve_ns(index)
+        request: dict[str, Any] = {"namespace": ns}
+        schema = self._schema_from_mappings((body or {}).get("mappings"))
+        if schema is not None:
+            request["schema"] = schema
+        if (body or {}).get("settings"):
+            logger.debug("IndexOps.create(%s): settings ignored", ns)
+        try:
+            self._client._transport.request("POST", "v1/namespaces", request)
+        except KoshaRequestError as e:
+            ignored = self._ignored(params)
+            if e.status_code in ignored or (e.status_code == 409 and 400 in ignored):
+                return e.info or {"error": e.error, "status": e.status_code}
+            raise
+        return {"acknowledged": True, "shards_acknowledged": True, "index": ns}
 
     def exists(self, index: str, **params: Any) -> bool:
-        try:
-            self._client.count(index=index)
-            return True
-        except KoshaRequestError:
-            return False
+        """Whether every named namespace exists (``GET .../stats``)."""
+        for name in self._index_names(index):
+            ns = urllib.parse.quote(name, safe="")
+            try:
+                self._client._v1_request("GET", ns, "stats")
+            except KoshaRequestError as e:
+                if e.status_code == 404:
+                    return False
+                raise
+        return True
 
     def delete(self, index: str, **params: Any) -> dict:
-        logger.info(
-            "IndexOps.delete(%s) — no-op (Kosha does not support index deletion yet)",
-            index,
+        """Delete each named namespace (``DELETE /v1/namespaces/{ns}``).
+
+        Deleting removes the namespace's documents and segments for good. A
+        missing namespace raises ``KoshaRequestError`` with status 404 (ES
+        ``NotFoundError``) unless ``ignore_unavailable=True`` or
+        ``ignore=404`` is passed.
+        """
+        if index is None or index == "" or index == []:
+            raise ValueError("indices.delete needs an index name")
+        skip_missing = bool(params.get("ignore_unavailable")) or 404 in self._ignored(
+            params
         )
+        for name in self._index_names(index):
+            path = f"v1/namespaces/{urllib.parse.quote(name, safe='')}"
+            try:
+                self._client._transport.request("DELETE", path)
+            except KoshaRequestError as e:
+                if e.status_code == 404 and skip_missing:
+                    continue
+                raise
         return {"acknowledged": True}
 
     def put_mapping(self, index: str, body: dict, **params: Any) -> dict:

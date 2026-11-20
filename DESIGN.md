@@ -68,34 +68,42 @@ another and let the SSD cache warm."
   Decover's products need (see §8), not an open-ended query language.
 - General-purpose analytics / aggregations (`terms`, `date_histogram`, etc.) beyond simple
   faceting needed for filters. If a real analytics need emerges, it's a separate consumer of the
-  same S3 data, not a feature of the query path.
+  same S3 data, not a feature of the query path. (Since then a bounded set computed from the
+  filter columns has been added — metrics, `histogram` and fixed-interval `date_histogram`; see
+  the README's Aggregations section.)
 - Real-time (sub-second) durability of every write. Writes are durable to S3 within a bounded
   flush interval (see §7); we accept a small, tunable visibility lag in exchange for not fusing
   compute and storage.
 
 ### 3.1 Phasing
 
-This document describes the target architecture, but it is built in phases. **Phase 1 (this
-implementation effort) is BM25 lexical search only** — no vector index, no ANN, no fusion, no
-rerank hook. Concretely, Phase 1 includes:
+This document describes the target architecture, which was built in phases.
 
-- The S3 segment format and manifest (§6), but each segment contains `doc_store.bin`,
-  `inverted.idx`, and `filters.bin` only — `vector.idx` is not built or read.
+> **Where the implementation stands (keep in sync with the README's supported-features table).**
+> Phase 1 (BM25 lexical search on the S3 + SSD-cache storage model) is complete, and most of
+> what was deferred to Phase 2 has shipped too: segments now carry a posting-based
+> `vector.idx` (cluster-and-posting ANN with centroid probing and triangle-inequality bounds),
+> requests take a `knn` clause with `knn.filter`, and a lexical query plus `knn` is fused with
+> RRF (§8 step 5). Still not implemented: the rerank hook (§8 step 6) and per-retriever RRF
+> weights. The phase plan below is kept as the historical record of how the work was ordered.
+
+Phase 1 was BM25 lexical search only — no vector index, no ANN, no fusion, no rerank hook.
+Concretely, Phase 1 included:
+
+- The S3 segment format and manifest (§6), with each segment containing `doc_store.bin`,
+  `inverted.idx`, and `filters.bin` only.
 - The full write path (§7): WAL, buffering, flush-to-segment, compaction.
 - The full SSD caching layer (§9): read-through cache over segment files, exactly as described.
-- The read path (§8), restricted to step 4's lexical branch only: postings intersection/union +
-  BM25 scoring. Steps 4's semantic branch, step 5 (fusion), and step 6 (rerank hook) are stubbed
-  as no-ops or simply omitted from the Phase 1 API surface.
-- Structured filters and cursor pagination (single cursor, not the lexical/semantic pair) — a
-  namespace running Phase 1 only ever has one retrieval mode, so `SearchCursor`'s dual-cursor
-  shape collapses to one field.
-- Multi-tenancy (§10), migration approach (§14), and operational model (§15) apply unchanged —
-  none of them are vector-specific.
+- The read path (§8), restricted to step 4's lexical branch: postings intersection/union +
+  BM25 scoring.
+- Structured filters and cursor pagination.
+- Multi-tenancy (§10), migration approach (§14), and operational model (§15) — none of them
+  are vector-specific.
 
-**Explicitly deferred to Phase 2**: `vector.idx`, ANN retrieval, RRF fusion, the rerank hook, and
-embedding-dependent parts of the namespace schema (vector dimension/metric). The segment
-`footer.json` and manifest format should still *reserve* the field for a vector index reference so
-Phase 2 can add it without a segment format migration, but Phase 1 never writes or reads it.
+**Deferred to Phase 2** (since implemented, except the rerank hook): `vector.idx`, ANN
+retrieval, RRF fusion, the rerank hook, and embedding-dependent parts of the namespace schema.
+The segment footer reserved a slot for the vector index so Phase 2 could add it without a
+segment format migration.
 
 Rationale: BM25 alone is a complete, independently useful retrieval mode (Sage already runs a pure
 lexical path via `search_filter.lexical_search=True`), and it lets us prove out the harder,
@@ -200,11 +208,11 @@ a directory of objects in S3:
 s3://kosha-{env}/{namespace_id}/segments/{segment_id}/
     doc_store.bin       # document payloads (content, metadata), compressed, block-addressed
     inverted.idx         # term → postings list (docId, freq, positions) for lexical search
-    vector.idx           # ANN index (HNSW graph or IVF-PQ codebook + posting lists) — Phase 2, not written in Phase 1
+    vector.idx           # ANN index: cluster postings (+ vector.offsets with centroids), written when the segment has vectors
     filters.bin          # filter fields (dates, ids, tags), row-oriented — or, with the columnar format:
     filters.toc          #   column directory + per-column stats (#244)
     filters-NNN.col      #   one file per (field, type) column, numbered by id
-    footer.json          # offsets, counts, schema version, checksum (reserves a vector.idx slot even in Phase 1)
+    footer.json          # offsets, counts, schema version, checksum, analysis chains
 ```
 
 **Filter index formats (#244).** A segment stores its filter values in one of two formats, and
@@ -308,12 +316,20 @@ Iceberg/Delta Lake use for tables, applied to a search index.
    extracted text, chunk boundaries, embeddings, and metadata arrive at an ingest node's gRPC
    `IndexDocuments` call.
 2. **Buffer**: the ingest node appends to an in-memory + local-SSD write buffer for that namespace,
-   and synchronously appends to a WAL object in S3 (small, cheap PUTs) so the write survives node
-   loss before it's part of a segment. *Implemented today:* the WAL is on local disk behind a
-   `WalStore` trait (an S3 implementation is #236). Concurrent appends are group-committed: one
-   WAL file (one fsync) holds the records of every namespace that arrived during the previous
-   commit, each record carries its own LSN, and a file is deleted only once every namespace in it
-   has a published manifest checkpoint at or past its records there.
+   and synchronously appends to the WAL before acknowledging. *Implemented:* the WAL sits behind a
+   `WalStore` trait with two modes. `KOSHA_WAL_MODE=local` (default) writes fsynced files under
+   `data_dir/_wal`, which survive pod restarts but not node loss. `KOSHA_WAL_MODE=s3` (#236)
+   writes each group commit as one object `_wal/{writer_id}/{lsn:020}.bin` in the segment bucket
+   with a conditional PUT (`If-None-Match: *`) and acknowledges only after the PUT, so the write
+   survives node loss before it is part of a segment. Concurrent appends are group-committed: one
+   WAL file or object holds the records of every namespace that arrived during the previous
+   commit. LSNs are allocated per writer stream (the manifest's `wal_origin`), not per namespace;
+   each record carries its own LSN, and a file is deleted only once every namespace in it has a
+   published manifest checkpoint at or past its records there. In s3 mode group `n + 1` is keyed
+   by the LSN after group `n`, so two writers on one stream race for the same key: one wins, the
+   other fails the write and stops accepting writes until restarted. A node that starts on an empty
+   disk lists its stream, replays every record above each namespace's checkpoint into its
+   buffers and continues after the highest LSN.
 3. **Flush**: when the buffer crosses a size/time threshold (default: 512MB or 60s, whichever
    first), the ingest node builds inverted + vector + filter indices for the buffered documents,
    writes a new segment to S3, and publishes an updated manifest that adds the new segment.
@@ -402,7 +418,7 @@ document.
 
 Given a namespace manifest and a `CompactionPolicy`:
 
-| Knob | Default (Phase 1) | Meaning |
+| Knob | Default | Meaning |
 |------|-------------------|---------|
 | `max_mergeable_docs` | 50_000 | Segment with `doc_count >=` this is never a merge input |
 | `max_segments_per_merge` | 32 | Cap inputs per pass |
@@ -418,9 +434,14 @@ calls.
 **Triggers & scheduling**
 
 - **Do not** schedule blind periodic full compaction against live ingest/query nodes.
-- A future in-process or compaction-role loop should call `needs_compaction(ns)` (segment-count /
-  size thresholds above) and, when true, run one tiered pass. Backoff when publish CAS fails or
-  when the node is under query load.
+- The background scheduler on the write pod (`crates/kosha-server/src/compaction_sched.rs`,
+  #242) calls `needs_compaction(ns)` every `KOSHA_COMPACTION_INTERVAL_MS` (default 30 s, `0`
+  disables) and runs one tiered pass per due namespace, at most
+  `KOSHA_COMPACTION_MAX_CONCURRENT` at a time, oldest-compacted namespace first. A failed pass
+  backs off exponentially; a pass that merged nothing waits for the manifest to change. A
+  separate compaction node role is still future work.
+- Merged segments are capped at `max_merged_segment_bytes` (default 5 GiB,
+  `KOSHA_COMPACT_MAX_SEGMENT_BYTES`); larger segments are never merge inputs again.
 - The `POST /v1/admin/compact-namespace` route remains the emergency lever; default body mode is
   `tiered`. Pass `"mode": "full"` only for deliberate one-shot remediation.
 - **Bounded local disk (#242).** A pass plans each merge group from object sizes in S3 (one
@@ -437,7 +458,7 @@ calls.
 
 - Running merges on separate compute so ingest/query pods never pay merge CPU/IO.
 - Fair multi-tenant scheduling and cost controls across namespaces.
-- GC of superseded segments after the manifest-staleness window (§11).
+- Off-pod segment GC. Today GC runs on the write pod (`POST /v1/admin/gc`, §11).
 
 **Durability/visibility tradeoff**: a document is durable (survives any single node failure) as
 soon as its WAL append to S3 acknowledges. It becomes *queryable* once its segment is flushed and
@@ -533,8 +554,10 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      is rescored with per-segment floors. Hybrid (RRF) requests are untouched: their lexical
      list is a rank window, scored by the general path. `SearchPhaseStats` reports
      `wand_docs_scored`, `wand_segments_skipped`, `wand_global_threshold` and `wand_bounds_ms`.
-   - Semantic: ANN search over `vector.idx` (HNSW graph traversal or IVF-PQ probe), scored by
-     cosine/dot-product — the direct replacement for OpenSearch's `script_score` cosineSimilarity
+   - Semantic: ANN search over `vector.idx` — probe the nearest cluster centroids (one probe
+     budget for the whole query, bounded with triangle-inequality radii) and score the
+     postings' unit-norm vectors by dot product (cosine); older segments fall back to flat or
+     HNSW search. This is the direct replacement for OpenSearch's `script_score` cosineSimilarity
      query in `query_builder.py`.
 5. **Fusion**: candidate sets from lexical and semantic retrieval are merged via Reciprocal Rank
    Fusion, `score(d) = Σ_r 1/(rank_constant + rank_r(d))`, matching `ranking/rrf.py`'s existing
@@ -579,8 +602,18 @@ true in practice since ES refresh intervals are already tuned up for indexing th
    canonical `"lat,lon"` text — an existing column type, so segments stay readable by older
    binaries and no footer or manifest field changes. `geo_distance` filters parse that column
    (haversine, mean Earth radius); geo decays read it the same way.
-6. **Rerank hook**: an optional, pluggable cross-encoder rerank stage (Cohere today) runs on the
-   fused top-N before results return — same role as `ChunkGenerator.__re_rank`.
+6. **Rerank hook** (implemented, issue #251): an optional, pluggable cross-encoder rerank stage
+   runs on the fused top-N before results return — same role as `ChunkGenerator.__re_rank`.
+   Request: `"rerank": {"provider", "model", "field", "top_n", "timeout_ms"}`. The searcher runs
+   a first-stage query (top `top_n` from offset 0, the rerank field always returned), the server
+   releases its scoring slot, sends the query text and each hit's `field` text to the named
+   provider (`kosha_query::rerank::RerankProvider`; the server's HTTP implementation speaks the
+   Cohere `POST /rerank` shape, keys from the environment), orders by the provider score and
+   then applies `from` / `max_results` and the source filter. Hits carry `fused_score` and
+   `rerank_score`. A timeout or provider error falls back to the fused order with
+   `rerank_degraded: true` (cf. `knn_degraded_segments`) and is not result-cached; totals and
+   aggregations are the first stage's. Rerank params are part of the result-cache key.
+   Per-provider latency / outcome / cost counters are in admin `/stats`.
 7. **Cursor**: response includes per-mode (lexical/semantic) cursor state (last score + doc id) so
    pagination works identically to `SearchCursor` today.
 8. **Highlighting**: computed from the matched postings' term offsets stored in `inverted.idx`,
@@ -686,15 +719,49 @@ existing org/user auth context Bach already establishes.
 
 ## 11. Consistency & Durability
 
-- **Durability**: WAL append to S3 acks before the ingest RPC returns → data survives node loss
-  immediately. Segment + manifest writes are the durable "committed" state for query visibility.
+- **Durability**: with `KOSHA_WAL_MODE=s3` the WAL PUT to S3 completes before `/index`,
+  `/replace` or `/delete` returns, so an acknowledged write survives node loss immediately; a failed
+  or timed-out PUT (`KOSHA_WAL_S3_TIMEOUT_MS`) fails the request and nothing is acknowledged. The
+  cost is ack latency: one S3 PUT instead of an fsync (in a simulated 25 ms + 100 MB/s PUT model, a
+  500 kB write acks at p50 ≈ 38 ms alone and ≈ 144 ms with 16 concurrent namespaces sharing PUTs;
+  turbopuffer reports p50 ≈ 165 ms). With the default `KOSHA_WAL_MODE=local` the WAL is an fsynced
+  local file: acknowledged writes survive process and pod restarts, but not the loss of the node's
+  disk until a flush publishes them. Segment + manifest writes are the durable "committed" state
+  for query visibility; a flush publishes `wal_checkpoint` by CAS and only then reclaims the WAL
+  records it covers.
 - **Read consistency**: each query snapshots one manifest version for its whole execution —
   read-your-writes is bounded by the flush interval (§7), not immediate, which matches the
   approach we already accept operationally with ES refresh tuning.
 - **Manifest updates**: conditional (compare-and-swap) writes prevent lost updates from concurrent
   flush/compaction; a losing writer retries against the new base.
-- **Garbage collection**: superseded segments are deleted only after the max manifest-staleness
-  window elapses (i.e., after no query node could plausibly still be holding a reference to them).
+- **Garbage collection** (#239): superseded segments are deleted only after the max
+  manifest-staleness window elapses (i.e., after no query node could plausibly still be holding a
+  reference to them).
+  - *Retirement records.* A publish that drops a segment (compaction, rebase, admin import) or
+    replaces a segment's deletion generation lists it in the manifest's optional `retired` field
+    with `retired_at_ms` and `retired_in_version`. The record rides in the same compare-and-swap as
+    the change, so neither can commit without the other. The control plane keeps only the current
+    manifest (no history, no branches yet), so "referenced" means referenced by the current
+    manifest of some namespace.
+  - *Local disk.* Each pod queues the segments its manifest dropped and removes their directories
+    once all of these hold: `KOSHA_LOCAL_GC_GRACE` (default 5 min) has passed; the dropping
+    version is committed (without S3, local disk is the only copy until then); every search
+    snapshot alive at retirement has been dropped; and the searcher holds no open reader of the
+    segment (readers load the doc store and postings lazily, by path). Removal goes through the
+    disk cache, so its `eviction_generation` bumps and cached presence verdicts are re-checked.
+  - *Object store.* `POST /v1/admin/gc` lists each namespace's prefix. A candidate is a segment
+    prefix or `deletes-*.roaring` object the current manifest does not reference that was either
+    retired more than `KOSHA_GC_GRACE` ago (default 1 h, above any replica's manifest lag) or has
+    no record and whose newest object is older than `KOSHA_GC_ORPHAN_GRACE` (default 24 h: a
+    crashed flush, a losing CAS writer, pre-#239 compactions; long because an upload whose publish
+    has not committed yet looks the same). Untracked prefixes must carry this namespace's
+    segment-id prefix, and prefixes that belong to a nested namespace are skipped. The manifest is
+    re-read right before deleting; if its version moved, the namespace is skipped. `_COMMIT` goes
+    first, so a half-deleted segment never looks durable. The deleted objects' records are then
+    dropped in one more CAS; if that loses a race, the next run prunes records whose objects are
+    gone. Deletion generations are not part of a segment's `_COMMIT` (they are verified by their
+    checksum in the manifest), so dropping a superseded one never makes its segment look
+    incomplete. Dry run is the default.
 
 ## 12. API & Integration with Sage
 
@@ -795,9 +862,9 @@ config, not code:
    supplies — same contract as today (`query_embedding` computed by Sage/Pandora, not by
    OpenSearch).
 3. **Pluggable rerank/fusion**: fusion strategy (RRF vs. simple concat-dedupe, matching the
-   existing `ENABLE_RRF_FUSION` flag) and whether a rerank hook is invoked are namespace/profile
-   config, exposed as a webhook-style callback or left to the caller (per §12 recommendation, Sage
-   owns rerank).
+   existing `ENABLE_RRF_FUSION` flag) and whether a rerank hook is invoked. Rerank is per request
+   (`rerank`, §8 step 6) against server-configured providers; a caller can still rerank itself
+   (per §12 recommendation, Sage may keep owning rerank).
 
 ## 14. Migration from OpenSearch
 
@@ -859,7 +926,11 @@ one-time batch job reading from the existing Postgres/S3 document store and repl
 
 ## 17. Open Questions / Risks
 
-- **ANN index choice at scale**: HNSW is simple and fast to query but expensive to build/merge
+- **ANN index choice at scale**: *partly resolved* — segments now write a cluster-and-posting
+  index (`KOSHA_VECTOR_WRITE_VERSION=4`) built at flush/merge time, rather than an HNSW graph
+  rebuilt on every open. Still open: incremental updates (the SPFresh/LIRE prototype in
+  `kosha-vector-spfresh`), quantization, and recall tuning at large segment counts. Original
+  note: HNSW is simple and fast to query but expensive to build/merge
   incrementally at compaction time; IVF-PQ compacts cheaper but costs recall. Needs a benchmark
   against Sage's actual embedding dimensionality and namespace size distribution before locking in
   a default per index profile.

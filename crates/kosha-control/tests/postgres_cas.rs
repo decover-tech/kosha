@@ -18,6 +18,7 @@ fn candidate(segment: &str, version: u64) -> Manifest {
         wal_origin: Some(segment.into()),
         deletion_vectors: Default::default(),
         schema: None,
+        retired: Default::default(),
         tombstones: [(SegmentId(segment.into()), (0..256).collect())]
             .into_iter()
             .collect(),
@@ -105,4 +106,40 @@ fn postgres_manifest_versions_poll_and_missing_namespace() {
     assert_eq!(store.manifest_version(&missing).unwrap(), None);
     assert!(store.try_manifest_cloned(&missing).unwrap().is_none());
     assert_eq!(store.try_manifest_cloned(&ns).unwrap().unwrap().version, 3);
+}
+
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_round_trips_retirement_records_and_gc_prunes_them_by_cas() {
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let mut store = PgStore::new(&url).unwrap();
+    let ns = NamespaceId(format!("gc-test-{}", uuid::Uuid::new_v4()));
+    let mut first = candidate("a", 1);
+    first.tombstones.clear();
+    store.compare_and_swap_manifest(&ns, 0, first).unwrap();
+    let mut compacted = candidate("merged", 2);
+    compacted.tombstones.clear();
+    compacted.retired = vec![kosha_core::gc::RetiredObject {
+        segment_id: SegmentId("a".into()),
+        deletion_generation: None,
+        retired_at_ms: 1_700_000_000_000,
+        retired_in_version: 2,
+    }];
+    store
+        .compare_and_swap_manifest(&ns, 1, compacted.clone())
+        .unwrap();
+    let stored = store.manifest_cloned(&ns).unwrap();
+    assert_eq!(stored.retired, compacted.retired);
+    // An identical retry (lost reply) is still idempotent with records.
+    store
+        .compare_and_swap_manifest(&ns, 1, compacted.clone())
+        .unwrap();
+    // GC's prune is an ordinary CAS from the version it planned against.
+    let mut pruned = stored.clone();
+    pruned.retired.clear();
+    pruned.version = 3;
+    store.compare_and_swap_manifest(&ns, 2, pruned).unwrap();
+    let after = store.manifest_cloned(&ns).unwrap();
+    assert!(after.retired.is_empty());
+    assert_eq!(after.version, 3);
 }

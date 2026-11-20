@@ -162,6 +162,7 @@ fn main() {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let query: SearchQuery = serde_json::from_value(serde_json::json!({
             "query_text": "", "max_results": 0,

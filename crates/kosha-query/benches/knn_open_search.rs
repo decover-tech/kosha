@@ -133,6 +133,7 @@ fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, dim: us
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        retired: Default::default(),
     }
 }
 
@@ -165,6 +166,7 @@ fn mk_query(text: &str, knn: Option<KnnQuery>) -> SearchQuery {
         rank: None,
         mode: None,
         fields: Vec::new(),
+        rerank: None,
     }
 }
 
