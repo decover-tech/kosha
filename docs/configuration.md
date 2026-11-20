@@ -168,13 +168,42 @@ key, no Postgres keys) unless `KOSHA_AUTH=disabled`.
 
 ## Roles
 
-There is no role switch. A pod forwards writes when `KOSHA_INGEST_HOST` is set.
+`KOSHA_ROLE` decides what a pod does (#254, `crates/kosha-server/src/role.rs`). An explicit role
+is checked against the rest of the environment, and a pod whose configuration contradicts it exits
+with status 1 at startup.
+
+| Role | Writes | Compaction scheduler | Routes | Requires |
+| --- | --- | --- | --- | --- |
+| `query` | forwarded to `KOSHA_INGEST_HOST` | never | all (mutating routes forwarded) | `KOSHA_INGEST_HOST` |
+| `ingest` | executed, under the writer lease | when `KOSHA_COMPACTION_ON_INGEST` is true | all | no `KOSHA_INGEST_HOST` |
+| `indexer` | none | always | `/healthz`, `/readyz`, `POST /v1/admin/compact*`, `GET /v1/admin/compaction-*`; everything else 404 | `DATABASE_URL`, no `KOSHA_INGEST_HOST` |
+| `standalone` | executed, under the writer lease | when `KOSHA_COMPACTION_ON_INGEST` is true | all | no `KOSHA_INGEST_HOST` |
+
+An unset `KOSHA_ROLE` keeps the pre-#254 rule and logs a warning: `KOSHA_INGEST_HOST` set means
+`query`, unset means `standalone`. The legacy value `compaction` is refused (it used to start a
+second, uncoordinated writer); use `indexer`. An indexer publishes compaction results with manifest
+CAS and rebase, without a WAL (`KOSHA_WAL_MODE=s3` is ignored there) and without a writer lease.
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_INGEST_HOST` | Set on query pods: every mutating route is forwarded to this base URL, and the idle-flush timer and compaction scheduler do not run. Unset = this pod accepts writes | unset (writer) | URL |
+| `KOSHA_ROLE` | `query`, `ingest`, `indexer` or `standalone` (see above). `query` and `ingest` also name the persisted warm set | inferred from `KOSHA_INGEST_HOST` | enum |
+| `KOSHA_INGEST_HOST` | Query pods: the base URL every mutating route is forwarded to. Must be set exactly when the role is `query` | unset | URL |
 | `KOSHA_INGEST_PROXY_TIMEOUT_SECS` | Timeout for a forwarded write | `300` | seconds |
-| `KOSHA_ROLE` | Label printed in the startup log line. Has no other effect | `query` | string |
+
+## Writer lease and fencing
+
+A writer pod (`ingest`, `standalone`) takes a per-namespace lease in the control store
+(`kosha.writer_leases`, migration 003) before it accepts writes for a namespace, renews it every
+TTL/3 in the background, and presents the lease's fencing token on every manifest CAS. A takeover
+after the TTL raises the token, and the CAS of a writer holding an older token is rejected
+(`Fenced`, HTTP 503 with `Retry-After`). A fenced writer stops accepting writes for the namespace
+and drops its unpublished local state; it takes the lease again only once the other writer's lease
+has lapsed. Writes it acknowledged but never published stay in its WAL.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_WRITER_LEASE` | `off` disables leases and fencing: plain CAS, the pre-#254 behaviour | on | flag |
+| `KOSHA_WRITER_LEASE_TTL_MS` | Lease lifetime; renewed every TTL/3. Minimum 300. Also the `Retry-After` of a refused write | `30000` | milliseconds |
 
 ## Write path and flush
 
@@ -202,7 +231,8 @@ Read in `GroupCommitConfig::from_env` (`crates/kosha-write/src/wal.rs`).
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_COMPACTION_INTERVAL_MS` | Background compaction scheduler period on writer pods; `0` disables it (`compaction_sched.rs`). Benchmarks and the conformance suite set `0` | `30000` | milliseconds |
+| `KOSHA_COMPACTION_INTERVAL_MS` | Background compaction scheduler period on pods that run it (`indexer`, `standalone`, and `ingest` unless `KOSHA_COMPACTION_ON_INGEST=false`); `0` disables it (`compaction_sched.rs`). Benchmarks and the conformance suite set `0` | `30000` | milliseconds |
+| `KOSHA_COMPACTION_ON_INGEST` | Whether a writer pod (`ingest`, `standalone`) runs the compaction scheduler. Set `false` once an `indexer` pod compacts (k8s base does). The admin compaction API still works either way | `true` | flag |
 | `KOSHA_COMPACTION_MAX_CONCURRENT` | Compaction passes at once, including API jobs. Must be > 0 | `1` | passes |
 | `KOSHA_COMPACT_MAX_SEGMENT_BYTES` | Largest merged segment; `0` removes the cap. A request's own value overrides it (`compact_options`) | `5368709120` (5 GiB) | bytes |
 
@@ -259,7 +289,8 @@ Read in `EmbedderRegistry::from_env` (`crates/kosha-server/src/embedding.rs`, #2
 field opts in through the namespace schema
 (`{"fields": {"emb": {"embedding": {"model": "...", "dims": 384, "provider": "http"}}}}`); the server
 then embeds text sent for that field at ingest and `knn.query_text` at query time. Ingest and
-query pods need the same settings. A schema naming a model this pod has no provider for answers
+query pods need the same settings; an `indexer` pod needs none (compaction copies vectors and
+never embeds). A schema naming a model this pod has no provider for answers
 `503` to text writes and `query_text` searches; namespaces without a declared model never call a
 provider. The API key is never logged or returned.
 

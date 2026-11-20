@@ -6265,6 +6265,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    /// #254: a compaction-only writer (the `indexer` role) has no WAL
+    /// records. Its compaction keeps the ingest writer's WAL checkpoint and
+    /// origin, and so does its rebase onto a newer ingest publish: the
+    /// published manifest must keep telling the ingest writer which of its
+    /// WAL records are covered, or a restart would replay (or keep) them
+    /// wrongly.
+    #[test]
+    fn compaction_writer_rebase_keeps_the_remote_wal_checkpoint_and_origin() {
+        let ingest_dir = rebase_dir("wal-ingest");
+        let compactor_dir = rebase_dir("wal-compactor");
+        let ns = NamespaceId("ns".into());
+        let ingest = Indexer::new(ingest_dir.clone());
+        write_docs(&ingest, &ns, &["a"]);
+        write_docs(&ingest, &ns, &["b"]);
+        write_docs(&ingest, &ns, &["c"]);
+        let base = commit(&ingest, &ns);
+        let ingest_origin = base.wal_origin.clone();
+        assert!(ingest_origin.is_some() && base.wal_checkpoint > 0);
+
+        // The compactor installs the committed manifest (segments come from
+        // object storage; here, a copy of the ingest's directory).
+        copy_dir(&ingest_dir.join(&ns.0), &compactor_dir.join(&ns.0));
+        let compactor = Indexer::new(compactor_dir.clone());
+        assert_ne!(Some(compactor.wal.origin().to_owned()), ingest_origin);
+        compactor.restore_manifest(ns.clone(), base.clone());
+        let result = compactor
+            .compact_namespace_with_options(&ns, CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
+        let compacted = compactor.publication_snapshot(&ns).unwrap().1;
+        assert_eq!(compacted.wal_origin, ingest_origin);
+        assert_eq!(compacted.wal_checkpoint, base.wal_checkpoint);
+
+        // Meanwhile the ingest writer flushed and published again.
+        write_docs(&ingest, &ns, &["d"]);
+        let remote = commit(&ingest, &ns);
+        assert!(remote.wal_checkpoint > base.wal_checkpoint);
+
+        assert_eq!(
+            compactor.rebase_onto(&ns, remote.clone()).unwrap(),
+            RebaseOutcome::Rebased
+        );
+        let (expected, rebased) = compactor.publication_snapshot(&ns).unwrap();
+        assert_eq!(expected, remote.version);
+        assert_eq!(
+            rebased.wal_origin, remote.wal_origin,
+            "origin stays the ingest's"
+        );
+        assert_eq!(
+            rebased.wal_checkpoint, remote.wal_checkpoint,
+            "checkpoint stays the ingest's"
+        );
+        // The merge output replaced the three inputs; the ingest's new
+        // segment is kept.
+        let base_ids = segment_ids(&base);
+        let ids = segment_ids(&rebased);
+        assert!(ids.is_disjoint(&base_ids));
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&remote.segments.last().unwrap().segment_id));
+        let docs: u32 = rebased.segments.iter().map(|e| e.doc_count).sum();
+        assert_eq!(docs, 4);
+        let _ = std::fs::remove_dir_all(ingest_dir);
+        let _ = std::fs::remove_dir_all(compactor_dir);
+    }
+
     #[test]
     fn rebase_without_local_changes_adopts_the_remote_manifest() {
         let dir = rebase_dir("adopt");

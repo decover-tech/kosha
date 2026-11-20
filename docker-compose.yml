@@ -64,7 +64,9 @@ services:
       # Admin credential for /v1/admin/* (kosha compact / import / admin
       # create-api-key). Dev-only value; never reuse it outside this stack.
       KOSHA_ADMIN_API_KEY: sk-kosha-admin-dev
-      KOSHA_ROLE: query
+      # One pod that serves reads and writes and compacts (#254). `query`
+      # now requires KOSHA_INGEST_HOST.
+      KOSHA_ROLE: standalone
       KOSHA_HTTP_PORT: "8080"
       KOSHA_DATA_DIR: /var/lib/kosha/data
       # S3 / MinIO — kosha-server reads these (and standard AWS_* aliases).
