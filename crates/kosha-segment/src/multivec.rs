@@ -97,6 +97,33 @@ pub fn parse_bag(value: &str) -> Option<Vec<Vec<f32>>> {
     (dim > 0 && bag.iter().all(|t| t.len() == dim)).then_some(bag)
 }
 
+/// Open field `i`'s bag and IVF files in `segment_dir` against footer
+/// metadata of `dim` and `docs`, returning the token count. For property
+/// tests and fuzzing (#257): corrupt files are an error, never a panic.
+#[doc(hidden)]
+pub fn open_multivec_files(
+    segment_dir: &Path,
+    i: usize,
+    dim: u32,
+    docs: u32,
+) -> Result<u32, KoshaError> {
+    let meta = MultiVectorField {
+        name: "bag".into(),
+        dim,
+        docs,
+        tokens: 0,
+    };
+    let index = MultiVectorIndex::open(segment_dir, i, &meta)?;
+    // Every bag's range must resolve inside the token space.
+    for &(doc_seq, _) in &index.docs {
+        let (start, end) = index.bag_range(doc_seq).unwrap_or((0, 0));
+        if start > end || end > index.token_count {
+            return Err(KoshaError::CorruptSegment("bag range out of bounds".into()));
+        }
+    }
+    Ok(index.token_count)
+}
+
 /// Exact MaxSim between unit-normalized query tokens and a flat buffer of
 /// unit-normalized document tokens (`dim` floats each).
 fn maxsim_unit(query: &[Vec<f32>], doc: &[f32], dim: usize) -> f64 {
@@ -373,7 +400,11 @@ impl MultiVectorIndex {
             return Err(corrupt(&bags_name, "header disagrees with the footer"));
         }
         let data_offset = BAGS_HEADER_LEN + doc_count as u64 * 8;
-        if data_offset + token_count as u64 * dim as u64 * 4 != file_len {
+        // Checked: a corrupt header can overflow the product (#257).
+        let expected_len = (token_count as u64)
+            .checked_mul(dim as u64 * 4)
+            .and_then(|body| body.checked_add(data_offset));
+        if expected_len != Some(file_len) {
             return Err(corrupt(&bags_name, "file length disagrees with its header"));
         }
         let mut table = vec![0u8; doc_count as usize * 8];
@@ -411,10 +442,11 @@ impl MultiVectorIndex {
         }
         let posting_count = u32_at(&header, 12).unwrap_or(0) as u64;
         let row = dim as u64 * 4 + 12;
-        let table_end = IVF_HEADER_LEN as u64 + posting_count * row;
-        if table_end > ivf_len {
-            return Err(corrupt(&ivf_name, "posting table past end of file"));
-        }
+        let table_end = posting_count
+            .checked_mul(row)
+            .and_then(|table| table.checked_add(IVF_HEADER_LEN as u64))
+            .filter(|&end| end <= ivf_len)
+            .ok_or_else(|| corrupt(&ivf_name, "posting table past end of file"))?;
         let mut table = vec![0u8; (posting_count * row) as usize];
         file.read_exact(&mut table)
             .map_err(|_| corrupt(&ivf_name, "truncated posting table"))?;
@@ -431,7 +463,10 @@ impl MultiVectorIndex {
             if offset != expected {
                 return Err(corrupt(&ivf_name, "postings not contiguous"));
             }
-            expected += count as u64 * entry_len;
+            expected = (count as u64)
+                .checked_mul(entry_len)
+                .and_then(|bytes| bytes.checked_add(expected))
+                .ok_or_else(|| corrupt(&ivf_name, "posting sizes overflow"))?;
             entries_total += count as u64;
             postings.push((offset, count));
         }

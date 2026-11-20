@@ -114,6 +114,7 @@ A lot of code is behind Cargo features, and **plain `cargo test` skips it**:
 | `s3` | `kosha-server` | S3 upload and hydration, warmup, peer hydration |
 | `postgres` | `kosha-server`, `kosha-control` | Postgres control plane, API-key registry, hydration leases |
 | `migrate` | `kosha-server` | `kosha-server migrate` (Elasticsearch to Kosha backfill); implies `s3` + `postgres` |
+| `failpoints` | `kosha-write`, `kosha-server` | Named failpoints on the write path for the crash-point and interleaving tests ([docs/testing.md](docs/testing.md)). Inert unless a test configures them; never built into the image |
 
 CI builds, lints and tests with `--all-features`, and so should you. The Docker image is
 built with `--features migrate`, which turns all three on.
@@ -165,6 +166,9 @@ All of these are CI gates. Run them locally first:
 
 CI also runs `buf lint` on `proto/` (`make proto-lint`), the bench-hook script tests
 (`make bench-hook-test`) and the conformance suite against the Docker Compose stack.
+
+A nightly workflow (`.github/workflows/fuzz.yml`) runs the fuzz targets and the
+write-path fault-injection suites at high counts; see [docs/testing.md](docs/testing.md).
 
 ## Benchmarks
 

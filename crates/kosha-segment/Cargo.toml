@@ -29,6 +29,7 @@ rust-stemmers = "1"
 # this workspace's `unsafe_code` lint (confirmed: kosha-query's existing
 # benches use this same crate for the same reason).
 cap = { version = "0.1.2", features = ["stats"] }
+proptest = "1"
 
 [[bench]]
 name = "tokenizer"

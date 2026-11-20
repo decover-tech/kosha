@@ -273,6 +273,7 @@ Read by `kosha` (`crates/kosha-cli`). The Python client (`clients/python`) reads
 | `KOSHA_TEST_DATABASE_URL` | Disposable Postgres for the ignored `postgres_cas` test in `kosha-control` | unset (test ignored) | URL |
 | `KOSHA_STATS_BENCH_SEGMENTS` | Segment count for an `#[ignore]`d stats timing test in `kosha-query` | test default | segments |
 | `KOSHA_RRF_BENCH_BACKGROUND` | Background document count for an `#[ignore]`d RRF timing test in `kosha-query` | test default | documents |
+| `KOSHA_INTERLEAVING_SCHEDULES` | Randomized schedules per scenario in `kosha-write`'s `interleavings` test (needs `--features failpoints`; see `docs/testing.md`). The nightly fuzz workflow runs 2500 | `250` | schedules |
 
 ## Benchmark harness (`KOSHA_BENCH_*`)
 

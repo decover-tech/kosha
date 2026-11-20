@@ -1876,7 +1876,11 @@ fn parse_vector_idx_header(data: &[u8]) -> Option<(u32, u32, u32)> {
 fn parse_vector_idx_eager(data: &[u8]) -> Option<VectorStore> {
     let (dim, total_count, version) = parse_vector_idx_header(data)?;
     let record_size = vector_entry_size(dim, version);
-    let expected_len = VECTOR_IDX_HEADER_LEN + total_count as usize * record_size;
+    // Checked: a corrupt header's dim and count can overflow the product
+    // (#257 fuzzing), which must read as corruption, not wrap or panic.
+    let expected_len = (total_count as usize)
+        .checked_mul(record_size)
+        .and_then(|body| body.checked_add(VECTOR_IDX_HEADER_LEN))?;
     if data.len() != expected_len {
         return None;
     }
@@ -1921,7 +1925,10 @@ fn parse_vector_offsets(
     let posting_count = read_u32_le(&mut cursor);
     let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
     let record_size = 4 * dim as usize + 8 + 4 + if radius_aware { 4 } else { 0 };
-    let expected_len = VECTOR_OFFSETS_HEADER_LEN + posting_count as usize * record_size;
+    // Checked, like `parse_vector_idx_eager`: overflow is corruption.
+    let expected_len = (posting_count as usize)
+        .checked_mul(record_size)
+        .and_then(|body| body.checked_add(VECTOR_OFFSETS_HEADER_LEN))?;
     if data.len() != expected_len {
         return None;
     }
@@ -1946,6 +1953,32 @@ fn parse_vector_offsets(
         });
     }
     Some(out)
+}
+
+/// Parse a `vector.idx` / `vector.offsets` pair with the same parsers a
+/// segment open uses (header, lazy sidecar, eager fallback), returning the
+/// number of postings and of vectors recovered. For property tests and
+/// fuzzing (#257): never panics, whatever the bytes.
+#[doc(hidden)]
+pub fn parse_vector_index_files(idx: &[u8], offsets: &[u8]) -> (Option<usize>, Option<usize>) {
+    let Some((dim, _, version)) = parse_vector_idx_header(idx) else {
+        return (None, None);
+    };
+    let postings = parse_vector_offsets(offsets, dim, version);
+    if let Some(postings) = &postings {
+        // Slice each posting the way a lazy read would, bounds-checked.
+        for p in postings {
+            let start = usize::try_from(p.offset).unwrap_or(usize::MAX);
+            if let Some(bytes) = start
+                .checked_add(p.length as usize)
+                .and_then(|end| idx.get(start..end))
+            {
+                let _ = decode_posting_entries(bytes, dim, version);
+            }
+        }
+    }
+    let vectors = parse_vector_idx_eager(idx).map(|store| store.vectors.len());
+    (postings.map(|p| p.len()), vectors)
 }
 
 /// Decodes one posting's raw entry bytes (sliced from `vector.idx` via a
@@ -5295,9 +5328,9 @@ impl LazyFilters {
     /// non-empty (just a zero-entry header) and caches normally on first
     /// read, so this retry loop only ever runs during the brief hydration
     /// race, not on every query against a filter-less segment.
-    fn legacy(&self, state: &mut FilterState) -> Arc<FilterStore> {
+    fn legacy(&self, state: &mut FilterState) -> Result<Arc<FilterStore>, KoshaError> {
         if let Some(store) = state.legacy.as_ref() {
-            return Arc::clone(store);
+            return Ok(Arc::clone(store));
         }
         let raw = SegmentReader::read_filters_raw(&self.segment_dir);
         if raw.is_empty() {
@@ -5308,11 +5341,11 @@ impl LazyFilters {
             // Deliberately not cached — leave `state.legacy` as `None` so
             // the next call re-reads instead of trusting this premature
             // empty parse forever.
-            return Arc::new(SegmentReader::parse_filters(&raw));
+            return Ok(Arc::new(SegmentReader::parse_filters(&raw)?));
         }
-        let store = Arc::new(SegmentReader::parse_filters(&raw));
+        let store = Arc::new(SegmentReader::parse_filters(&raw)?);
         state.legacy = Some(Arc::clone(&store));
-        store
+        Ok(store)
     }
 
     /// `filters.toc`, or `None` while it is not local (not cached).
@@ -5371,7 +5404,7 @@ impl LazyFilters {
     ) -> Result<Arc<FilterStore>, KoshaError> {
         let mut state = self.state.lock().unwrap();
         if !self.columnar {
-            return Ok(self.legacy(&mut state));
+            return self.legacy(&mut state);
         }
         let Some(toc) = self.toc(&mut state)? else {
             return Ok(Arc::new(FilterStore::default()));
@@ -5436,7 +5469,7 @@ impl LazyFilters {
                 None => return Ok(None),
             }
         } else {
-            let store = self.legacy(&mut state);
+            let store = self.legacy(&mut state)?;
             let column = match kind {
                 kosha_core::FilterColumnKind::String => store
                     .string_fields
@@ -7248,14 +7281,14 @@ impl SegmentReader {
                     entry.length as u64,
                 ) {
                     let mut cursor = &buf[..];
-                    return Ok(Some(parse_one_doc_record(&mut cursor, doc_seq)));
+                    return parse_one_doc_record(&mut cursor, doc_seq).map(Some);
                 }
                 let mut file = fs::File::open(doc_store_path)?;
                 file.seek(SeekFrom::Start(entry.offset))?;
                 let mut buf = vec![0u8; entry.length as usize];
                 file.read_exact(&mut buf)?;
                 let mut cursor = &buf[..];
-                Ok(Some(parse_one_doc_record(&mut cursor, doc_seq)))
+                parse_one_doc_record(&mut cursor, doc_seq).map(Some)
             }
         }
     }
@@ -7401,7 +7434,7 @@ impl SegmentReader {
             )));
         }
         let mut cursor = bytes;
-        let mut record = parse_one_doc_record(&mut cursor, doc_seq);
+        let mut record = parse_one_doc_record(&mut cursor, doc_seq)?;
         self.fill_doc_vectors(&mut record)?;
         Ok(Some(record))
     }
@@ -7603,7 +7636,7 @@ impl SegmentReader {
         offsets_buf.extend_from_slice(&doc_count.to_le_bytes());
         for doc_seq in 0..doc_count {
             let record_start = (data.len() - cursor.len()) as u64;
-            let rec = parse_one_doc_record(&mut cursor, doc_seq);
+            let rec = parse_one_doc_record(&mut cursor, doc_seq)?;
             let record_len = (data.len() - cursor.len()) as u64 - record_start;
             let id_bytes = rec.doc_id.0.as_bytes();
             offsets_buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
@@ -7659,7 +7692,7 @@ impl SegmentReader {
         }
         let doc_count = read_u32_le(&mut cursor);
         for doc_seq in 0..doc_count {
-            records.push(parse_one_doc_record(&mut cursor, doc_seq));
+            records.push(parse_one_doc_record(&mut cursor, doc_seq)?);
         }
         Ok(records)
     }
@@ -7690,33 +7723,32 @@ impl SegmentReader {
                 data, account,
             )?));
         }
-        Ok(InvertedAccess::Eager(Self::parse_legacy_inverted(&data)))
+        Ok(InvertedAccess::Eager(Self::parse_legacy_inverted(&data)?))
     }
 
     /// Legacy (v1) `inverted.idx` stream parse: term count, then per term
     /// `len/bytes/df/postings_count` + inline postings. Fully materializes
     /// the vocabulary — kept only for segments written before v2.
-    fn parse_legacy_inverted(data: &[u8]) -> HashMap<String, Vec<Posting>> {
-        let mut cursor = data;
+    fn parse_legacy_inverted(data: &[u8]) -> Result<HashMap<String, Vec<Posting>>, KoshaError> {
         let mut index = HashMap::new();
-        if cursor.len() < 4 {
-            return index;
+        if data.len() < 4 {
+            return Ok(index);
         }
-        let term_count = read_u32_le(&mut cursor);
+        let mut cursor = Checked::new(data, "legacy inverted.idx");
+        let term_count = cursor.u32()?;
         for _ in 0..term_count {
-            let term_len = read_u32_le(&mut cursor) as usize;
-            let term_bytes = read_bytes(&mut cursor, term_len);
-            let term = String::from_utf8_lossy(term_bytes).to_string();
-            let _df = read_u32_le(&mut cursor);
-            let postings_len = read_u32_le(&mut cursor) as usize;
-            let mut postings = Vec::with_capacity(postings_len);
+            let term_len = cursor.u32()? as usize;
+            let term = cursor.text(term_len)?;
+            let _df = cursor.u32()?;
+            let postings_len = cursor.u32()? as usize;
+            let mut postings = Vec::with_capacity(cursor.capacity(postings_len, 12));
             for _ in 0..postings_len {
-                let doc_id = read_u32_le(&mut cursor);
-                let term_frequency = read_u32_le(&mut cursor);
-                let positions_len = read_u32_le(&mut cursor) as usize;
-                let mut positions = Vec::with_capacity(positions_len);
+                let doc_id = cursor.u32()?;
+                let term_frequency = cursor.u32()?;
+                let positions_len = cursor.u32()? as usize;
+                let mut positions = Vec::with_capacity(cursor.capacity(positions_len, 4));
                 for _ in 0..positions_len {
-                    positions.push(read_u32_le(&mut cursor));
+                    positions.push(cursor.u32()?);
                 }
                 postings.push(Posting {
                     doc_id,
@@ -7726,7 +7758,7 @@ impl SegmentReader {
             }
             index.insert(term, postings);
         }
-        index
+        Ok(index)
     }
 
     fn read_vectors(path: &Path) -> Result<VectorStore, KoshaError> {
@@ -7734,18 +7766,18 @@ impl SegmentReader {
             return Ok(VectorStore::default());
         }
         let data = fs::read(path)?;
-        let mut cursor = &data[..];
-        if cursor.len() < 8 {
+        if data.len() < 8 {
             return Ok(VectorStore::default());
         }
-        let dim = read_u32_le(&mut cursor) as usize;
-        let count = read_u32_le(&mut cursor) as usize;
-        let mut vectors = Vec::with_capacity(count);
+        let mut cursor = Checked::new(&data, "legacy vector.idx");
+        let dim = cursor.u32()? as usize;
+        let count = cursor.u32()? as usize;
+        let mut vectors = Vec::with_capacity(cursor.capacity(count, 4));
         for _ in 0..count {
-            let doc_seq = read_u32_le(&mut cursor);
-            let mut v = Vec::with_capacity(dim);
+            let doc_seq = cursor.u32()?;
+            let mut v = Vec::with_capacity(cursor.capacity(dim, 4));
             for _ in 0..dim {
-                v.push(read_f32_le(&mut cursor));
+                v.push(cursor.f32()?);
             }
             vectors.push((doc_seq, v));
         }
@@ -7769,7 +7801,7 @@ impl SegmentReader {
     /// bloom must not silently drop a field).
     fn read_filters_any(segment_dir: &Path, footer: &Footer) -> Result<FilterStore, KoshaError> {
         if footer.filter_columns.is_none() {
-            return Ok(Self::parse_filters(&Self::read_filters_raw(segment_dir)));
+            return Self::parse_filters(&Self::read_filters_raw(segment_dir));
         }
         let filters = LazyFilters {
             segment_dir: segment_dir.to_path_buf(),
@@ -7788,49 +7820,46 @@ impl SegmentReader {
 
     /// Parse filter columns from raw `filters.bin` bytes. Empty/short input
     /// (absent file) yields an empty store.
-    fn parse_filters(data: &[u8]) -> FilterStore {
-        let mut cursor = data;
+    fn parse_filters(data: &[u8]) -> Result<FilterStore, KoshaError> {
         let mut store = FilterStore::default();
-        if cursor.len() < 4 {
-            return store;
+        if data.len() < 4 {
+            return Ok(store);
         }
-        let field_count = read_u32_le(&mut cursor);
+        let mut cursor = Checked::new(data, "filters.bin");
+        let field_count = cursor.u32()?;
         for _ in 0..field_count {
-            let name_len = read_u32_le(&mut cursor) as usize;
-            let name_bytes = read_bytes(&mut cursor, name_len);
-            let name = String::from_utf8_lossy(name_bytes).to_string();
-            let field_type = cursor[0];
-            cursor = &cursor[1..];
-            let entry_count = read_u32_le(&mut cursor) as usize;
+            let name_len = cursor.u32()? as usize;
+            let name = cursor.text(name_len)?;
+            let field_type = cursor.u8()?;
+            let entry_count = cursor.u32()? as usize;
             match field_type {
                 0 => {
-                    let mut entries = Vec::with_capacity(entry_count);
+                    let mut entries = Vec::with_capacity(cursor.capacity(entry_count, 8));
                     for _ in 0..entry_count {
-                        let doc_seq = read_u32_le(&mut cursor);
-                        let val_len = read_u32_le(&mut cursor) as usize;
-                        let val_bytes = read_bytes(&mut cursor, val_len);
-                        entries.push((doc_seq, String::from_utf8_lossy(val_bytes).to_string()));
+                        let doc_seq = cursor.u32()?;
+                        let val_len = cursor.u32()? as usize;
+                        entries.push((doc_seq, cursor.text(val_len)?));
                     }
                     store.string_fields.insert(name, entries);
                 }
                 1 => {
-                    let mut entries = Vec::with_capacity(entry_count);
+                    let mut entries = Vec::with_capacity(cursor.capacity(entry_count, 12));
                     for _ in 0..entry_count {
-                        entries.push((read_u32_le(&mut cursor), read_i64_le(&mut cursor)));
+                        entries.push((cursor.u32()?, cursor.i64()?));
                     }
                     store.integer_fields.insert(name, entries);
                 }
                 2 => {
-                    let mut entries = Vec::with_capacity(entry_count);
+                    let mut entries = Vec::with_capacity(cursor.capacity(entry_count, 12));
                     for _ in 0..entry_count {
-                        entries.push((read_u32_le(&mut cursor), read_f64_le(&mut cursor)));
+                        entries.push((cursor.u32()?, cursor.f64()?));
                     }
                     store.float_fields.insert(name, entries);
                 }
                 _ => {}
             }
         }
-        store
+        Ok(store)
     }
 }
 
@@ -7885,18 +7914,43 @@ pub fn compute_aggregations(
 /// Shared by the legacy full-parse path (`read_doc_store`) and the lazy
 /// single-record path (`SegmentReader::doc_record_full`) so the two can
 /// never silently diverge in how they interpret the wire format.
-fn parse_one_doc_record(cursor: &mut &[u8], doc_seq: u32) -> DocRecord {
-    let id_len = read_u32_le(cursor) as usize;
-    let id_bytes = read_bytes(cursor, id_len);
-    let doc_id = DocumentId(String::from_utf8_lossy(id_bytes).to_string());
-    let field_length = read_u32_le(cursor);
-    let field_count = read_u32_le(cursor);
-    let mut fields = Vec::with_capacity(field_count as usize);
+/// Parse one `doc_store.bin` record. Every length is checked against the
+/// bytes left: a damaged record is `CorruptSegment`, never a panic or an
+/// unbounded allocation (#257 found the unchecked slicing by fuzzing).
+fn parse_one_doc_record(cursor: &mut &[u8], doc_seq: u32) -> Result<DocRecord, KoshaError> {
+    fn take<'a>(cursor: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+        if cursor.len() < n {
+            return None;
+        }
+        let (head, rest) = cursor.split_at(n);
+        *cursor = rest;
+        Some(head)
+    }
+    fn u32_of(cursor: &mut &[u8]) -> Option<u32> {
+        take(cursor, 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn u64_of(cursor: &mut &[u8]) -> Option<u64> {
+        take(cursor, 8).map(|b| u64::from_le_bytes(b.try_into().unwrap_or_default()))
+    }
+    fn text(cursor: &mut &[u8], len: Option<u64>) -> Option<String> {
+        let len = usize::try_from(len?).ok()?;
+        take(cursor, len).map(|b| String::from_utf8_lossy(b).into_owned())
+    }
+    let corrupt = || {
+        KoshaError::CorruptSegment(format!(
+            "doc_store.bin: record {doc_seq} is truncated or malformed"
+        ))
+    };
+    let id_len = u32_of(cursor).map(u64::from);
+    let doc_id = DocumentId(text(cursor, id_len).ok_or_else(corrupt)?);
+    let field_length = u32_of(cursor).ok_or_else(corrupt)?;
+    let field_count = u32_of(cursor).ok_or_else(corrupt)?;
+    // A field takes at least 13 bytes (name length, type, value length).
+    let mut fields = Vec::with_capacity((field_count as usize).min(cursor.len() / 13));
     for _ in 0..field_count {
-        let name_len = read_u32_le(cursor) as usize;
-        let name_bytes = read_bytes(cursor, name_len);
-        let name = String::from_utf8_lossy(name_bytes).to_string();
-        let field_type = match cursor[0] {
+        let name_len = u32_of(cursor).map(u64::from);
+        let name = text(cursor, name_len).ok_or_else(corrupt)?;
+        let field_type = match take(cursor, 1).ok_or_else(corrupt)?[0] {
             0 => FieldType::Text,
             1 => FieldType::Keyword,
             2 => FieldType::Integer,
@@ -7907,22 +7961,20 @@ fn parse_one_doc_record(cursor: &mut &[u8], doc_seq: u32) -> DocRecord {
             7 => FieldType::GeoPoint,
             _ => FieldType::Text,
         };
-        *cursor = &cursor[1..];
-        let val_len = read_u64_le(cursor) as usize;
-        let val_bytes = read_bytes(cursor, val_len);
-        let value = String::from_utf8_lossy(val_bytes).to_string();
+        let val_len = u64_of(cursor);
+        let value = text(cursor, val_len).ok_or_else(corrupt)?;
         fields.push(Field {
             name,
             field_type,
             value,
         });
     }
-    DocRecord {
+    Ok(DocRecord {
         doc_id,
         doc_seq,
         field_length,
         fields,
-    }
+    })
 }
 
 /// The footer a segment is opened with. With no caller-supplied footer,
@@ -8132,24 +8184,71 @@ fn read_u64_le(cursor: &mut &[u8]) -> u64 {
     *cursor = &cursor[8..];
     u64::from_le_bytes(buf)
 }
-fn read_i64_le(cursor: &mut &[u8]) -> i64 {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&cursor[..8]);
-    *cursor = &cursor[8..];
-    i64::from_le_bytes(buf)
-}
 fn read_f32_le(cursor: &mut &[u8]) -> f32 {
     let mut buf = [0u8; 4];
     buf.copy_from_slice(&cursor[..4]);
     *cursor = &cursor[4..];
     f32::from_le_bytes(buf)
 }
-fn read_f64_le(cursor: &mut &[u8]) -> f64 {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&cursor[..8]);
-    *cursor = &cursor[8..];
-    f64::from_le_bytes(buf)
+/// Bounds-checked little-endian reads for the legacy (pre-v2) stream
+/// formats, which used to slice unchecked and panic on a damaged file
+/// (#257). Every read past the end is `CorruptSegment`.
+struct Checked<'a> {
+    data: &'a [u8],
+    what: &'static str,
 }
+
+impl<'a> Checked<'a> {
+    fn new(data: &'a [u8], what: &'static str) -> Self {
+        Self { data, what }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], KoshaError> {
+        if self.data.len() < n {
+            return Err(KoshaError::CorruptSegment(format!(
+                "{}: truncated ({n} bytes wanted, {} left)",
+                self.what,
+                self.data.len()
+            )));
+        }
+        let (head, rest) = self.data.split_at(n);
+        self.data = rest;
+        Ok(head)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], KoshaError> {
+        let mut out = [0u8; N];
+        out.copy_from_slice(self.take(N)?);
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> Result<u8, KoshaError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Result<u32, KoshaError> {
+        self.array().map(u32::from_le_bytes)
+    }
+    fn i64(&mut self) -> Result<i64, KoshaError> {
+        self.array().map(i64::from_le_bytes)
+    }
+    fn f32(&mut self) -> Result<f32, KoshaError> {
+        self.array().map(f32::from_le_bytes)
+    }
+    fn f64(&mut self) -> Result<f64, KoshaError> {
+        self.array().map(f64::from_le_bytes)
+    }
+    fn text(&mut self, len: usize) -> Result<String, KoshaError> {
+        Ok(String::from_utf8_lossy(self.take(len)?).into_owned())
+    }
+
+    /// A capacity for `count` items of at least `min_bytes` each that the
+    /// remaining bytes can actually hold, so a corrupt count cannot
+    /// trigger a huge allocation.
+    fn capacity(&self, count: usize, min_bytes: usize) -> usize {
+        count.min(self.data.len() / min_bytes.max(1))
+    }
+}
+
 fn read_bytes<'a>(cursor: &mut &'a [u8], len: usize) -> &'a [u8] {
     let result = &cursor[..len];
     *cursor = &cursor[len..];
@@ -10537,7 +10636,7 @@ mod doc_vectors_tests {
             "vector JSON left in doc store"
         );
         let mut cursor = &raw[4..];
-        let rec = parse_one_doc_record(&mut cursor, 0);
+        let rec = parse_one_doc_record(&mut cursor, 0).unwrap();
         assert_eq!(rec.fields[0].name, "emb");
         assert_eq!(rec.fields[0].value, "", "placeholder");
         fs::remove_dir_all(dir).unwrap();

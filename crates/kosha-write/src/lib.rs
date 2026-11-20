@@ -765,6 +765,9 @@ impl Indexer {
             changes.push((entry.segment_id.clone(), matching));
         }
         let total = changes.iter().map(|(_, ids)| ids.len()).sum();
+        // Crash-point seam (#257): the matches are known, nothing of the
+        // delete is durable or applied yet.
+        fail::fail_point!("delete.persist.before");
         if total > 0 && self.wal_enabled {
             let lsn = self
                 .wal
@@ -1206,6 +1209,7 @@ impl Indexer {
         self.ensure_id_index(&namespace, &handle)?;
         let snapshot = handle.state.lock().unwrap().clone();
         before_io();
+        fail::fail_point!("upsert.before_io");
         let index = snapshot.id_index.as_ref().unwrap();
         let mut locations = Vec::new();
         let mut replacements = Vec::with_capacity(count);
@@ -1280,6 +1284,9 @@ impl Indexer {
             .map(|b| b.bm25_params.clone())
             .unwrap_or_else(|| self.bm25_params.clone());
         let footer = writer.finalize(params)?;
+        // Crash-point seam (#257): the replacement segment is on disk; the
+        // old copies are not tombstoned yet.
+        fail::fail_point!("upsert.segment_written");
         let origin = self.wal.origin().to_owned();
         let mut state = handle.state.lock().unwrap();
         let ids: HashSet<_> = replacements.iter().map(|doc| &doc.id).collect();
@@ -1416,6 +1423,16 @@ impl Indexer {
             if coord.in_progress {
                 coord.pending = true;
                 let target_gen = coord.generation;
+                // Scheduling seam (#257): a piggybacker that registered its
+                // request but has not started waiting yet. Waiting on a
+                // generation captured above is correct whether or not the
+                // leader finishes in between; default builds skip this.
+                #[cfg(feature = "failpoints")]
+                let coord = {
+                    drop(coord);
+                    fail::fail_point!("flush.piggyback.registered");
+                    handle.flush_coord.lock().unwrap()
+                };
                 let coord = handle
                     .flush_done
                     .wait_while(coord, |c| c.generation <= target_gen)
@@ -1437,6 +1454,8 @@ impl Indexer {
         // Leader: keep running passes until nobody asked for another one
         // while we worked.
         loop {
+            // Scheduling seam (#257): a leader about to start a pass.
+            fail::fail_point!("flush.leader.pass");
             let result = self.run_one_flush_pass(namespace, &handle);
 
             let mut coord = handle.flush_coord.lock().unwrap();
@@ -1515,6 +1534,9 @@ impl Indexer {
             state.tail_epoch += 1;
             (chunks, checkpoint, analysis)
         };
+        // Scheduling seam (#257): the buffer is snapshotted, nothing is
+        // written yet.
+        fail::fail_point!("flush.snapshot_taken");
         if chunks.is_empty() {
             if recovery.is_some() {
                 let mut state = handle.state.lock().unwrap();
@@ -1616,6 +1638,10 @@ impl Indexer {
             state.flushing_ids.clear();
             return Err(error);
         }
+
+        // Crash-point seam (#257): every chunk's segment is on disk, none
+        // is in the manifest yet.
+        fail::fail_point!("flush.segment_written");
 
         // Phase 3 (state locked, cheap): commit every succeeded chunk's
         // segment and restore any failed chunk's documents to the buffer.
@@ -1767,6 +1793,8 @@ impl Indexer {
                 return Err(e);
             }
         };
+
+        fail::fail_point!("flush.segment_written");
 
         // WAL reclamation waits for durable manifest publication.
         let _ = (wal_enabled, wal);
@@ -1945,6 +1973,7 @@ impl Indexer {
         };
 
         after_plan();
+        fail::fail_point!("compaction.planned");
 
         // ── Merge I/O with state lock released (DESIGN.md §7.1) ──────────
         let ns_dir = self.data_dir.join(&namespace.0);
@@ -2020,6 +2049,9 @@ impl Indexer {
 
         let footer = writer.finalize(bm25_params)?;
         let output_segment_id = seg_id.clone();
+        // Crash-point seam (#257): the merged segment is on disk, the
+        // manifest still lists its inputs.
+        fail::fail_point!("compaction.output_written");
 
         // ── CAS publish under state lock ─────────────────────────────────
         {
@@ -2861,18 +2893,30 @@ impl Indexer {
             state.manifest.deletion_vectors = manifest.deletion_vectors.clone();
             state.manifest.retired = manifest.retired.clone();
         }
+        let own_checkpoint = manifest
+            .wal_origin
+            .as_deref()
+            .is_none_or(|origin| origin == self.wal.origin());
+        if own_checkpoint {
+            // WAL records replayed at startup that this commit covers are
+            // durable in segments now. Without this, a namespace that had
+            // no manifest to restore kept them forever: it reported them
+            // as pending (so the idle flusher re-flushed it every tick)
+            // and refused to be dropped. Found by the #257 crash harness.
+            state
+                .recovered
+                .retain(|(seq, _)| *seq > manifest.wal_checkpoint);
+        }
         drop(state);
-        if self.wal_enabled
-            && manifest
-                .wal_origin
-                .as_deref()
-                .is_none_or(|origin| origin == self.wal.origin())
-        {
+        if self.wal_enabled && own_checkpoint {
             // The manifest is committed: a reclamation failure (an S3
             // delete timing out) only leaves files a later publish of this
             // or another namespace reclaims, and recovery filters records
             // at or below a published checkpoint. It must not turn a
             // durable write into a client error.
+            // Crash-point seam (#257): the manifest is committed, the WAL
+            // records it covers are not reclaimed yet.
+            fail::fail_point!("wal.truncate.before");
             if let Err(error) = self.wal.clear_through(namespace, manifest.wal_checkpoint) {
                 eprintln!(
                     "WARN: WAL reclamation through {} for {} failed after a committed \
