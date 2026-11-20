@@ -2076,6 +2076,7 @@ impl AppState {
     /// publication lock.
     fn fence_namespace(&self, ns: &NamespaceId, why: &str) {
         if self.writer_leases.lost(ns) {
+            self.metrics.record_writer_fenced();
             eprintln!(
                 "WARN: writer lease: ns={} fenced ({why}); refusing writes for it and dropping \
                  unpublished local state",
@@ -5575,7 +5576,8 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
 
     // `/metrics` (#223): Prometheus scrapes, unauthenticated by default like
     // the probes above. Never forwarded to the ingest pod (see
-    // `is_write_path`): each pod reports its own process.
+    // `is_write_path`) and answered ahead of the indexer's route gate
+    // (#254): each pod, whatever its role, reports its own process.
     if request_line.starts_with("GET /metrics ") || request_line.starts_with("GET /metrics?") {
         let resp = handle_metrics(state, &headers);
         stream.write_all(resp.as_bytes()).ok();
@@ -14696,6 +14698,25 @@ mod tests {
     fn metrics_is_not_a_write_path() {
         assert!(!is_write_path("GET /metrics HTTP/1.1\r\n"));
         assert!(!is_write_path("GET /metrics?x=1 HTTP/1.1\r\n"));
+    }
+
+    /// An indexer (#254) serves only the compaction admin API, but
+    /// `/metrics` is per-pod and answered ahead of that gate.
+    #[test]
+    fn indexer_pod_serves_metrics() {
+        let mut state = test_state();
+        state.role = role::Role::Indexer;
+        let addr = serve_state(state);
+        let samples = scrape_samples(addr);
+        assert!(
+            samples
+                .iter()
+                .any(|s| s.name == "kosha_search_requests_total"),
+            "{} samples",
+            samples.len()
+        );
+        let other = http(addr, "GET /v1/stats HTTP/1.1\r\nhost: x\r\n\r\n");
+        assert!(other.starts_with("HTTP/1.1 404"), "{other}");
     }
 
     /// Send one raw HTTP request to a live `serve` and return the response.

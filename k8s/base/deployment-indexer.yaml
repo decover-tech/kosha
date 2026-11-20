@@ -37,6 +37,12 @@ spec:
       labels:
         app: kosha
         role: indexer
+      annotations:
+        # Scraped by annotation-based Prometheus pod discovery (#223). See
+        # docs/metrics.md.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: kosha
       containers:

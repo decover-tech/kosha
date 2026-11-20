@@ -352,6 +352,7 @@ pub(crate) struct Metrics {
     queue_rejections: Counter,
     index_documents: Counter,
     flushes: Counter,
+    writer_fenced: Counter,
     hydrations: [Counter; 3],
     lease_outcomes: [Counter; 3],
     knn_degraded_segments: Counter,
@@ -423,6 +424,11 @@ impl Metrics {
             "Documents accepted by index and replace requests",
         );
         let flushes = counter(&mut registry, "kosha_flush", "Successful flush requests");
+        let writer_fenced = counter(
+            &mut registry,
+            "kosha_writer_fenced",
+            "Namespaces this writer was fenced from after losing its writer lease",
+        );
 
         let hydration_family = Family::<Labels, Counter>::default();
         registry.register(
@@ -471,6 +477,7 @@ impl Metrics {
             queue_rejections,
             index_documents,
             flushes,
+            writer_fenced,
             hydrations,
             lease_outcomes,
             knn_degraded_segments,
@@ -527,6 +534,11 @@ impl Metrics {
 
     pub(crate) fn record_flush(&self) {
         self.flushes.inc();
+    }
+
+    /// This writer lost a namespace's writer lease and fenced it (#254).
+    pub(crate) fn record_writer_fenced(&self) {
+        self.writer_fenced.inc();
     }
 
     pub(crate) fn record_hydrations(&self, source: HydrationSource, files: u64) {
@@ -697,6 +709,7 @@ pub(crate) mod tests {
             "kosha_search_queue_rejections_total",
             "kosha_index_documents_total",
             "kosha_flush_total",
+            "kosha_writer_fenced_total",
             "kosha_cache_bytes",
             "kosha_cache_evictions_total",
             "kosha_hydrations_total",
