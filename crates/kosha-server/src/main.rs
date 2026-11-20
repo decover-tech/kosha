@@ -28,6 +28,9 @@ mod compaction_sched;
 mod doc_spans;
 #[cfg(all(test, feature = "s3"))]
 mod doc_store_fallback_tests;
+mod embedding;
+#[cfg(test)]
+mod embedding_server_tests;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 mod manifest_follow;
@@ -278,6 +281,9 @@ struct AppState {
     /// Rerank providers (`SearchQuery.rerank`) and their metrics; see
     /// [`rerank`].
     rerankers: rerank::RerankRegistry,
+    /// Native embedding providers (#209): embed text sent for a vector
+    /// field whose schema declares a model, and `knn.query_text`.
+    embedders: embedding::EmbedderRegistry,
     /// Posting-blob presence cache (Tier 1 O3), the sibling optimization to
     /// `completed_hydrations` above: that verdict can never cover posting
     /// blobs (PR #89 — they're fetched per query term, not per segment), so
@@ -1697,6 +1703,7 @@ impl AppState {
             completed_hydrations: Mutex::new(HashMap::new()),
             result_cache: Mutex::new(ResultCache::new(result_cache_budget())),
             rerankers: rerank::RerankRegistry::from_env(),
+            embedders: embedding::EmbedderRegistry::from_env(),
             posting_blob_presence: Mutex::new(HashMap::new()),
             // Warmup starts ready; `spawn_warmup` flips `false` only when
             // there's configured work to do (and back to `true` on
@@ -6156,13 +6163,140 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     }
 
     let ns = request.namespace;
-    match write_routed(state, &ns, request.documents, index_into) {
+    let mut documents = request.documents;
+    if let Err(response) = embed_documents(state, &ns, &mut documents) {
+        return response;
+    }
+    match write_routed(state, &ns, documents, index_into) {
         Ok(count) => json_ok(&IndexResponse {
             indexed_count: count,
             namespace: ns,
         }),
         Err(response) => response,
     }
+}
+
+/// Native embedding at ingest (#209). For each field the namespace schema
+/// declares an `embedding` for, a value that is text (not a JSON number
+/// array) is embedded with the declared model and replaced by the vector,
+/// typed `Vector`. Runs before the write reaches the indexer, so the WAL,
+/// the doc store, replay and compaction only ever see vectors and never
+/// need an embedder. A supplied number array must have the declared
+/// dimension. One provider call per field per request (the provider
+/// batches further).
+///
+/// A namespace whose schema declares no model returns at once: the cost is
+/// the lookup [`kosha_write::Indexer::embedded_fields`] documents.
+/// `Err` carries a ready-to-send error response.
+fn embed_documents(
+    state: &AppState,
+    ns: &NamespaceId,
+    documents: &mut [kosha_core::Document],
+) -> Result<(), String> {
+    let Some(fields) = state.indexer.embedded_fields(ns) else {
+        return Ok(());
+    };
+    for (field, spec) in &fields {
+        // (document, field) positions of the texts to embed.
+        let mut positions: Vec<(usize, usize)> = Vec::new();
+        for (d, doc) in documents.iter().enumerate() {
+            for (f, value) in doc.fields.iter().enumerate() {
+                if value.name != *field {
+                    continue;
+                }
+                match embedding::supplied_vector(&value.value) {
+                    Some(Ok(vector)) if vector.len() != spec.dims as usize => {
+                        return Err(json_error(
+                            400,
+                            &format!(
+                                "document {:?}: field {field:?} has a {}-dimensional vector, \
+                                 but its embedding model {} has {} dimensions",
+                                doc.id.0,
+                                vector.len(),
+                                spec.model,
+                                spec.dims
+                            ),
+                        ));
+                    }
+                    // A vector already, or a bag of them: the vector path
+                    // takes it as it always has.
+                    Some(_) => {}
+                    None => positions.push((d, f)),
+                }
+            }
+        }
+        if positions.is_empty() {
+            continue;
+        }
+        let embedder = state
+            .embedders
+            .get(spec)
+            .map_err(|e| json_error(e.status(), e.message()))?;
+        let texts: Vec<&str> = positions
+            .iter()
+            .map(|&(d, f)| documents[d].fields[f].value.as_str())
+            .collect();
+        let vectors = embedding::embed_checked(embedder.as_ref(), spec, &texts)
+            .map_err(|e| json_error(e.status(), e.message()))?;
+        for ((d, f), vector) in positions.into_iter().zip(vectors) {
+            let value = &mut documents[d].fields[f];
+            value.value = serde_json::to_string(&vector).unwrap_or_default();
+            value.field_type = kosha_core::FieldType::Vector;
+        }
+    }
+    Ok(())
+}
+
+/// Native embedding at query time (#209): replace `knn.query_text` with
+/// the vector of the model the namespace schema declares for `knn.field`,
+/// and record the model so segments written under another one are skipped
+/// (see `kosha_query::segment_embedding_model_mismatch`). Only a kNN that
+/// carries `query_text` reaches the schema or an embedder. `Err` carries a
+/// ready-to-send error response.
+fn resolve_knn_query_text(
+    state: &AppState,
+    ns: &NamespaceId,
+    max_staleness: Option<Duration>,
+    query: &mut kosha_core::SearchQuery,
+) -> Result<(), String> {
+    let Some(knn) = query.knn.as_mut() else {
+        return Ok(());
+    };
+    let Some(text) = knn.query_text.take() else {
+        return Ok(());
+    };
+    // A query replica embeds with the schema it follows: bring it current
+    // first (the search below does the same and is then a no-op).
+    state
+        .ensure_query_manifest_fresh(ns, max_staleness)
+        .map_err(|e| search_error_response(&e))?;
+    let Some(manifest) = state.indexer.manifest_shared(ns) else {
+        return Err(json_error(404, &format!("namespace '{}' not found", ns.0)));
+    };
+    let Some(spec) = manifest
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.embedding_for(&knn.field))
+        .cloned()
+    else {
+        return Err(json_error(
+            400,
+            &format!(
+                "knn.query_text needs an embedding model for field '{}', and the namespace \
+                 schema declares none; send knn.vector instead",
+                knn.field
+            ),
+        ));
+    };
+    let embedder = state
+        .embedders
+        .get(&spec)
+        .map_err(|e| json_error(e.status(), e.message()))?;
+    let mut vectors = embedding::embed_checked(embedder.as_ref(), &spec, &[text.as_str()])
+        .map_err(|e| json_error(e.status(), e.message()))?;
+    knn.vector = vectors.pop().unwrap_or_default();
+    knn.embedding_model = Some(spec.model);
+    Ok(())
 }
 
 /// Group documents by the shard their id routes to (#207), keeping each
@@ -6389,7 +6523,11 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
         Err(error) => return json_error(400, &format!("invalid JSON: {error}")),
     };
     let namespace = request.namespace;
-    match write_routed(state, &namespace, request.documents, replace_into) {
+    let mut documents = request.documents;
+    if let Err(response) = embed_documents(state, &namespace, &mut documents) {
+        return response;
+    }
+    match write_routed(state, &namespace, documents, replace_into) {
         Ok(count) => json_ok(&IndexResponse {
             indexed_count: count,
             namespace,
@@ -6785,6 +6923,7 @@ fn handle_stats(state: &AppState) -> String {
             state.indexer.local_retired_count(),
         ),
         "rerank": state.rerankers.stats_json(),
+        "embedding_providers": state.embedders.providers(),
     }))
 }
 
@@ -6837,7 +6976,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         Err(e) => return json_error(400, &e),
     };
 
-    let query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
+    let mut query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
         Ok(q) => q,
         Err(e) => return json_error(400, &format!("invalid search query: {e}")),
     };
@@ -6846,6 +6985,12 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     if let Err(e) = query.validate() {
         return search_error_response(&e);
     }
+    // `knn.query_text` becomes `knn.vector` here (#209), before the cache
+    // key and the searcher see the query.
+    if let Err(response) = resolve_knn_query_text(state, &ns, max_staleness, &mut query) {
+        return response;
+    }
+    let query = query;
     // A reranked request searches for its first stage (top `top_n` from
     // offset 0) and is reranked and paged after scoring; see
     // `kosha_query::rerank`. Unknown providers are a 400 before any work.
@@ -7632,9 +7777,12 @@ fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppS
 /// `POST /v1/namespaces/{ns}/schema` — set the namespace schema (#220).
 /// The body is a proto `NamespaceSchema` (`{"fields": {...}}`), or one
 /// wrapped as `{"schema": {...}}` like `CreateNamespaceRequest`. Only the
-/// analysis settings are honored. New segments use it; existing segments
-/// keep the analysis their footer records and stay searchable with it, so
-/// the change reaches old documents when compaction rewrites them.
+/// analysis settings and vector fields' `embedding` (#209) are honored. New
+/// segments use it; existing segments keep the analysis their footer
+/// records and stay searchable with it, so the change reaches old
+/// documents when compaction rewrites them. Changing the embedding model of
+/// a field that already holds vectors is a 409 (see
+/// `kosha_write::Indexer::embedding_conflict`).
 fn handle_put_schema_with_ns(
     namespace: &str,
     tenant: &str,
@@ -7654,6 +7802,21 @@ fn handle_put_schema_with_ns(
         Ok(schema) => schema,
         Err(e) => return json_error(400, &format!("invalid schema: {e}")),
     };
+    if let Err(e) = schema.validate_embeddings() {
+        return json_error(400, &format!("invalid schema: {e}"));
+    }
+    // Model pinning (#209): a field's embedding model cannot change while
+    // vectors of the old one are indexed. Checked on every shard before
+    // any manifest changes, so a refused change leaves none half-applied.
+    let mut pinned = vec![ns.clone()];
+    if let Some(shards) = state.indexer.shard_count(&ns) {
+        pinned.extend(kosha_core::sharding::shard_namespaces(&ns, shards));
+    }
+    for target in &pinned {
+        if let Some(conflict) = state.indexer.embedding_conflict(target, &schema) {
+            return json_error(409, &conflict);
+        }
+    }
     let changed = match state.indexer.set_schema(&ns, schema.clone()) {
         Ok(changed) => changed,
         Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
@@ -9547,6 +9710,7 @@ fn json_error(status_code: u16, message: &str) -> String {
         413 => "413 Payload Too Large",
         429 => "429 Too Many Requests",
         500 => "500 Internal Server Error",
+        502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     };
@@ -16311,6 +16475,8 @@ mod tests {
         let with_vec = |v: Vec<f32>, k: usize| {
             let mut q = base.clone();
             q.knn = Some(kosha_core::KnnQuery {
+                query_text: None,
+                embedding_model: None,
                 field: "text_emb".into(),
                 vector: v,
                 k,
