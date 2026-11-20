@@ -5146,6 +5146,8 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         }
     }
 
+    set_request_id(headers.get("x-request-id").map(String::as_str));
+
     // Reject oversized bodies from the declared length, before reading (or
     // allocating) any of it.
     let max_body = auth::max_body_bytes();
@@ -5243,6 +5245,33 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
     Ok(())
 }
 
+thread_local! {
+    /// " rid=<id>" for the request this connection thread is serving, or
+    /// empty. A caller's `X-Request-Id` on every log line of its request
+    /// lets one slow or failed request be found in the pod log.
+    static REQUEST_ID: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn set_request_id(header: Option<&str>) {
+    let id: String = header
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(64)
+        .collect();
+    REQUEST_ID.with(|r| {
+        *r.borrow_mut() = if id.is_empty() {
+            id
+        } else {
+            format!(" rid={id}")
+        }
+    });
+}
+
+fn request_id() -> String {
+    REQUEST_ID.with(|r| r.borrow().clone())
+}
+
 /// One line per API request: who asked for what, the status returned and how
 /// long it took. A successful search is skipped because it already prints
 /// the more detailed `search timing:` line; probes never reach here.
@@ -5261,9 +5290,10 @@ fn log_request(
         return;
     }
     println!(
-        "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}",
+        "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}{}",
         started.elapsed().as_secs_f64() * 1e3,
-        response.len()
+        response.len(),
+        request_id()
     );
 }
 
@@ -9571,7 +9601,7 @@ fn log_search_timing(
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
          postings_whole_mb={:.1} vector_gets={} vector_ranged_kb={:.1} \
-         vector_whole_files={}",
+         vector_whole_files={}{}",
         ns.0,
         total_ms,
         hydrate_ms,
@@ -9611,6 +9641,7 @@ fn log_search_timing(
         hydration.vectors.ranged_gets,
         hydration.vectors.ranged_bytes as f64 / 1024.0,
         hydration.vectors.whole_files,
+        request_id(),
     );
 }
 
@@ -9660,7 +9691,10 @@ fn json_accepted<T: serde::Serialize>(value: &T) -> String {
 
 fn json_error(status_code: u16, message: &str) -> String {
     // The reason for an error response; `request:` carries the rest.
-    eprintln!("WARN: request failed: status={status_code} {message}");
+    eprintln!(
+        "WARN: request failed: status={status_code} {message}{}",
+        request_id()
+    );
     let body = serde_json::json!({"error": message}).to_string();
     let status_line = match status_code {
         400 => "400 Bad Request",

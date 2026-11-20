@@ -67,7 +67,7 @@ class Transport:
         self.retry_on_timeout = retry_on_timeout
 
     def request(
-        self, method: str, path: str, body: Any = None
+        self, method: str, path: str, body: Any = None, headers: dict | None = None
     ) -> Any:
         """Make an HTTP request, returning the parsed JSON response.
 
@@ -81,6 +81,8 @@ class Transport:
         req.add_header("Content-Type", "application/json")
         if self.api_key:
             req.add_header("Authorization", f"Bearer {self.api_key}")
+        for name, value in (headers or {}).items():
+            req.add_header(name, value)
 
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
