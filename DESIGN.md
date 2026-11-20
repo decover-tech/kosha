@@ -938,6 +938,9 @@ GET /v1/healthz
 GET /v1/stats
 GET /v1/namespaces/{namespace}/stats
 
+# The caller's namespaces
+GET /v1/namespaces
+
 # Flush
 POST /v1/namespaces/{namespace}/flush
 

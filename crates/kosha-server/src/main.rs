@@ -26,6 +26,7 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 mod auth;
 mod branching;
 mod compaction_sched;
+mod dashboard;
 mod doc_spans;
 #[cfg(all(test, feature = "s3"))]
 mod doc_store_fallback_tests;
@@ -431,6 +432,8 @@ struct AppState {
     unindexed_cap: unindexed::UnindexedCap,
     /// Strong-consistency search state: built tails, the tail HTTP client.
     unindexed: unindexed::UnindexedState,
+    /// `KOSHA_DASHBOARD` and the per-namespace recent-query rings (#214).
+    dashboard: dashboard::Dashboard,
 }
 
 /// One cached merged manifest over a sharded namespace (#207).
@@ -1820,6 +1823,7 @@ impl AppState {
             default_consistency: unindexed::Consistency::from_env(),
             unindexed_cap: unindexed::UnindexedCap::from_env(),
             unindexed: unindexed::UnindexedState::new(query_role),
+            dashboard: dashboard::Dashboard::from_env(),
         }
     }
 
@@ -5528,6 +5532,14 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         return Ok(());
     }
 
+    // Built-in dashboard (#214): its static assets hold no data and are
+    // served without a key; every data call the page makes comes back
+    // through the authenticated API below. 404 unless KOSHA_DASHBOARD is on.
+    if let Some(resp) = dashboard::static_response(&request_line, state.dashboard.enabled()) {
+        stream.write_all(resp.as_bytes()).ok();
+        return Ok(());
+    }
+
     // ── API key authentication ──────────────────────────────────────────
     // Per proto/kosha/v1/kosha.proto: Authorization: Bearer <key> or X-Api-Key.
     let authentication = if service_authorized(&headers, state.admin_auth_key.as_deref())
@@ -5923,6 +5935,10 @@ fn route_inner(
         return handle_delete_namespace(&ns, tenant, state);
     }
 
+    if is_list_namespaces_route(request_line) {
+        return handle_list_namespaces(tenant, state);
+    }
+
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/documents") {
         return handle_index_with_ns(&ns, tenant, body, state);
     }
@@ -6113,6 +6129,13 @@ fn extract_namespace(request_line: &str, prefix: &str, suffix: &str) -> Option<S
 fn is_create_namespace_route(request_line: &str) -> bool {
     parse_method_and_path(request_line).is_some_and(|(method, path)| {
         method == "POST" && path.split('?').next() == Some("/v1/namespaces")
+    })
+}
+
+/// `GET /v1/namespaces` (optionally with a query string).
+fn is_list_namespaces_route(request_line: &str) -> bool {
+    parse_method_and_path(request_line).is_some_and(|(method, path)| {
+        method == "GET" && path.split('?').next() == Some("/v1/namespaces")
     })
 }
 
@@ -7404,11 +7427,16 @@ fn add_manifest_follow_stats(state: &AppState, ns: &NamespaceId, entry: &mut ser
 // ─── POST /search (JSON body, supports filters) ─────────────────────────────
 
 fn handle_search_post(body: &[u8], state: &AppState) -> String {
+    let t_request = Instant::now();
     // Parse the full JSON body that includes namespace alongside SearchQuery fields.
     let body_val: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
     };
+    // `"timings": true` asks for the phase breakdown in the response, while
+    // the dashboard is on (#214). Otherwise ignored, like any unknown key.
+    let want_timings = state.dashboard.enabled()
+        && body_val.get("timings") == Some(&serde_json::Value::Bool(true));
 
     let ns = match body_val.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => NamespaceId(n.to_string()),
@@ -7530,6 +7558,22 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                 &kosha_query::SearchPhaseStats::default(),
                 &HydrationOutcome::default(),
             );
+            if state.dashboard.enabled() {
+                let timings = dashboard::SearchTimings {
+                    total_ms: t_request.elapsed().as_secs_f64() * 1e3,
+                    cached: true,
+                    ..Default::default()
+                };
+                let body = response_body_json(&resp);
+                let hits = body["results"].as_array().map_or(0, Vec::len);
+                let degraded = body["knn_degraded_segments"].as_u64().unwrap_or(0) > 0;
+                state
+                    .dashboard
+                    .record(&ns.0, dashboard::QuerySample::new(&timings, hits, degraded));
+                if want_timings {
+                    return with_search_timings(body, &timings);
+                }
+            }
             return resp;
         }
     }
@@ -7710,6 +7754,24 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                     state.rerankers.record(&call);
                 }
             }
+            let timings = dashboard::SearchTimings {
+                total_ms: t_request.elapsed().as_secs_f64() * 1e3,
+                hydrate_ms,
+                queue_ms,
+                admit_ms: phases.admit_wall_ms,
+                bm25_stats_ms: phases.bm25_stats_ms,
+                score_ms: phases.score_wall_ms,
+                materialize_ms: phases.materialize_wall_ms,
+                cached: false,
+            };
+            state.dashboard.record(
+                &ns.0,
+                dashboard::QuerySample::new(
+                    &timings,
+                    result.results.len(),
+                    result.knn_degraded_segments.unwrap_or(0) > 0,
+                ),
+            );
             let resp = json_ok(&result);
             // Only successful responses enter the cache, after the search
             // proved every needed file readable. A search that fell back to
@@ -7724,6 +7786,9 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                 && result.rerank_degraded != Some(true);
             if let Some(key) = cache_key.filter(|_| cacheable) {
                 state.result_cache.lock().unwrap().insert(key, &resp);
+            }
+            if want_timings {
+                return with_search_timings(response_body_json(&resp), &timings);
             }
             resp
         }
@@ -7759,6 +7824,23 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             search_error_response(&e)
         }
     }
+}
+
+/// The JSON body of a response this process built (`Null` if none).
+fn response_body_json(response: &str) -> serde_json::Value {
+    response
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str(body).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// A search response with `timings` added (#214). Built per request, after
+/// the result cache stored the plain response.
+fn with_search_timings(mut body: serde_json::Value, timings: &dashboard::SearchTimings) -> String {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("timings".into(), serde_json::json!(timings));
+    }
+    json_ok(&body)
 }
 
 /// Whole-response cache for `POST /search` — see the cache block in
@@ -8477,6 +8559,54 @@ fn handle_exists_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &App
     handle_exists(&modified, state)
 }
 
+/// `GET /v1/namespaces` (#214): the caller's namespaces, from the control
+/// store, with the `{tenant}/` prefix stripped. Shard namespaces
+/// (`{ns}/_shard-XXXX`) and anything else nested under a namespace are
+/// internal and left out; a sharded namespace reports totals over its
+/// shards, as its stats do. Counts are `null` for a namespace whose
+/// manifest this pod cannot load right now.
+fn handle_list_namespaces(tenant: &str, state: &AppState) -> String {
+    let prefix = format!("{tenant}/");
+    let all = state.controller.lock().unwrap().list_namespaces();
+    let mut names: Vec<String> = all
+        .into_iter()
+        .filter_map(|ns| ns.0.strip_prefix(&prefix).map(str::to_string))
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let namespaces: Vec<serde_json::Value> = names
+        .into_iter()
+        .map(|name| {
+            let id = NamespaceId(tenant_namespace(tenant, &name));
+            // A query replica loads a namespace it has not served yet.
+            let manifest = state
+                .ensure_query_manifest_fresh(&id, None)
+                .ok()
+                .and_then(|()| state.indexer.manifest_shared(&id))
+                .map(|m| match state.indexer.shard_count(&id) {
+                    Some(_) => state.sharded_view(&id, m),
+                    None => m,
+                });
+            match manifest {
+                Some(m) => serde_json::json!({
+                    "name": name,
+                    "documents": m.segments.iter().map(|s| s.doc_count as u64).sum::<u64>(),
+                    "segments": m.segments.len(),
+                    "manifest_version": m.version,
+                }),
+                None => serde_json::json!({
+                    "name": name,
+                    "documents": null,
+                    "segments": null,
+                    "manifest_version": null,
+                }),
+            }
+        })
+        .collect();
+    json_ok(&serde_json::json!({ "namespaces": namespaces }))
+}
+
 fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
     // On a query replica, follow the control store: a namespace created or
@@ -8546,6 +8676,10 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
             "parent_version": branch.parent_version,
             "shared_segments": shared,
         });
+    }
+    // Only while the dashboard is on (#214), so default output is unchanged.
+    if let Some(recent) = state.dashboard.recent_queries_json(&scoped_ns) {
+        body["recent_queries"] = recent;
     }
     if state.ingest_host.is_some() {
         add_manifest_follow_stats(state, &NamespaceId(scoped_ns), &mut body);
@@ -10706,7 +10840,7 @@ mod tests {
             ("DELETE /v1/namespaces/", 400),
             ("DELETE /v1/namespaces/%2F", 400),
             ("GET /v1/namespaces/docs", 404),
-            ("GET /v1/namespaces", 404),
+            // `GET /v1/namespaces` lists the tenant's namespaces (#214).
             ("DELETE /v1/namespaces", 404),
             ("DELETE /v1/namespaces/missing", 404),
         ] {
@@ -14365,6 +14499,8 @@ mod tests {
             "GET /v1/namespaces/foo HTTP/1.1\r\n",
             "POST /v1/namespaces/foo HTTP/1.1\r\n",
             "DELETE /v1/namespaces/foo/documents HTTP/1.1\r\n",
+            "GET /v1/namespaces HTTP/1.1\r\n",
+            "GET /v1/namespaces?x=1 HTTP/1.1\r\n",
         ] {
             assert!(!is_write_path(line), "expected read-path: {line:?}");
         }
@@ -18644,5 +18780,240 @@ mod tests {
             serde_json::json!({"query_text": "contract"}),
         );
         assert!(result["total_hits"].as_u64().unwrap() > 0);
+    }
+
+    // ─── Dashboard (#214) ────────────────────────────────────────────────
+
+    fn dashboard_state(enabled: bool) -> AppState {
+        let mut state = test_state();
+        state.dashboard = dashboard::Dashboard::new(enabled);
+        state
+    }
+
+    /// One request through `handle`, the socket entry point, with no
+    /// credentials at all.
+    fn raw_request(state: &AppState, request: &str) -> String {
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request = request.to_string();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut out = String::new();
+            stream.read_to_string(&mut out).unwrap();
+            out
+        });
+        let (stream, _) = listener.accept().unwrap();
+        handle(state, stream).unwrap();
+        client.join().unwrap()
+    }
+
+    fn header_value<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+        let head = response.split("\r\n\r\n").next()?;
+        head.lines().skip(1).find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+
+    #[test]
+    fn dashboard_is_404_when_off_and_served_without_a_key_when_on() {
+        let off = dashboard_state(false);
+        let resp = raw_request(&off, "GET /dashboard HTTP/1.1\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+
+        let on = dashboard_state(true);
+        let resp = raw_request(&on, "GET /dashboard HTTP/1.1\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(header_value(&resp, "content-type")
+            .unwrap()
+            .starts_with("text/html"));
+        assert!(resp.contains("<title>Kosha dashboard</title>"));
+        for asset in ["/dashboard/app.js", "/dashboard/style.css"] {
+            let resp = raw_request(&on, &format!("GET {asset} HTTP/1.1\r\n\r\n"));
+            assert!(resp.starts_with("HTTP/1.1 200"), "{asset}: {resp}");
+            let csp = header_value(&resp, "content-security-policy").unwrap();
+            assert!(csp.starts_with("default-src 'self'"), "{csp}");
+            assert_eq!(header_value(&resp, "x-frame-options"), Some("DENY"));
+        }
+    }
+
+    #[test]
+    fn list_namespaces_is_tenant_scoped_and_hides_shards() {
+        let state = test_state();
+        for (tenant, ns) in [("acme", "docs"), ("acme", "logs"), ("globex", "secret")] {
+            let resp = v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces",
+                serde_json::json!({ "namespace": ns }),
+            );
+            assert_eq!(status_of(&resp), 200, "{resp}");
+        }
+        v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d1", "breach of contract"),
+        );
+        v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        );
+        // A sharded namespace: its shards are internal namespaces.
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/sharded/shards",
+            serde_json::json!({"shards": 2}),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/sharded/documents",
+            sharding_corpus(0..20),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/sharded/flush",
+            serde_json::json!({}),
+        );
+        assert!(state
+            .controller
+            .lock()
+            .unwrap()
+            .list_namespaces()
+            .iter()
+            .any(|ns| ns.0.starts_with("acme/sharded/_shard-")));
+
+        let resp = v1(
+            &state,
+            "acme",
+            "GET /v1/namespaces",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&resp), 200, "{resp}");
+        let listed = body_of(&resp)["namespaces"].as_array().unwrap().clone();
+        let names: Vec<&str> = listed.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["docs", "logs", "sharded"], "{resp}");
+        let docs = &listed[0];
+        assert_eq!(docs["documents"], 1);
+        assert_eq!(docs["segments"], 1);
+        assert!(docs["manifest_version"].as_u64().unwrap() > 0);
+        assert_eq!(listed[1]["documents"], 0);
+        // A sharded namespace reports totals over its shards.
+        assert_eq!(listed[2]["documents"], 20, "{resp}");
+        assert!(!resp.contains("_shard-"), "{resp}");
+
+        let resp = v1(
+            &state,
+            "globex",
+            "GET /v1/namespaces",
+            serde_json::Value::Null,
+        );
+        let listed = body_of(&resp)["namespaces"].clone();
+        assert_eq!(
+            listed,
+            serde_json::json!([{
+                "name": "secret", "documents": 0, "segments": 0,
+                "manifest_version": listed[0]["manifest_version"],
+            }])
+        );
+        assert!(!resp.contains("docs") && !resp.contains("acme"), "{resp}");
+
+        let resp = v1(
+            &state,
+            "initech",
+            "GET /v1/namespaces",
+            serde_json::Value::Null,
+        );
+        assert_eq!(body_of(&resp)["namespaces"], serde_json::json!([]));
+        // The bare per-namespace path is still not a route.
+        let resp = v1(
+            &state,
+            "acme",
+            "GET /v1/namespaces/docs",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&resp), 404, "{resp}");
+    }
+
+    fn searched_state(enabled: bool) -> AppState {
+        let state = dashboard_state(enabled);
+        v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d1", "breach of contract"),
+        );
+        v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        );
+        state
+    }
+
+    fn search_with_timings(state: &AppState) -> serde_json::Value {
+        let resp = v1(
+            state,
+            "acme",
+            "POST /v1/namespaces/docs/search",
+            serde_json::json!({"query_text": "contract", "timings": true}),
+        );
+        assert_eq!(status_of(&resp), 200, "{resp}");
+        body_of(&resp)
+    }
+
+    #[test]
+    fn recent_queries_and_timings_appear_only_when_the_dashboard_is_on() {
+        let state = searched_state(true);
+        let first = search_with_timings(&state);
+        assert_eq!(first["total_hits"], 1);
+        let timings = &first["timings"];
+        assert_eq!(timings["cached"], false, "{first}");
+        for phase in ["total_ms", "hydrate_ms", "score_ms", "admit_ms", "queue_ms"] {
+            assert!(timings[phase].as_f64().unwrap() >= 0.0, "{phase}: {first}");
+        }
+        // The identical repeat is a result-cache hit: still recorded.
+        let second = search_with_timings(&state);
+        assert_eq!(second["timings"]["cached"], true, "{second}");
+        assert_eq!(second["results"], first["results"]);
+        // Without the opt-in the response is the plain one.
+        let plain = v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/search",
+            serde_json::json!({"query_text": "contract"}),
+        );
+        assert!(body_of(&plain).get("timings").is_none(), "{plain}");
+
+        let stats = body_of(&handle_namespace_stats("docs", "acme", &state));
+        let recent = &stats["recent_queries"];
+        assert_eq!(recent["count"], 3, "{stats}");
+        assert_eq!(recent["capacity"], dashboard::RING_CAPACITY);
+        assert_eq!(recent["degraded"], 0);
+        let samples = recent["samples"].as_array().unwrap();
+        assert_eq!(samples[0]["hits"], 1);
+        assert_eq!(samples[0]["cached"], false);
+        assert_eq!(samples[1]["cached"], true);
+        // Another tenant's namespace of the same name has its own ring.
+        v1(
+            &state,
+            "globex",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "docs"}),
+        );
+        let other = body_of(&handle_namespace_stats("docs", "globex", &state));
+        assert_eq!(other["recent_queries"]["count"], 0, "{other}");
+
+        let state = searched_state(false);
+        let result = search_with_timings(&state);
+        assert_eq!(result["total_hits"], 1);
+        assert!(result.get("timings").is_none(), "{result}");
+        let stats = body_of(&handle_namespace_stats("docs", "acme", &state));
+        assert!(stats.get("recent_queries").is_none(), "{stats}");
     }
 }
