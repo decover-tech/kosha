@@ -24,8 +24,10 @@ OpenSearch-style body, exactly what the backend sends. `expect` holds any of:
 Tier "quick" marks the small subset run after every change.
 
 Text rules (the contract being tested): split on whitespace, trim ASCII
-punctuation from both ends, lowercase; a word matches a chunk if it is in
-any string field; a phrase must sit inside one field.
+punctuation from both ends, lowercase; a word or phrase matches a chunk when
+it is in the field the query names (`content`), as in OpenSearch. Sets up to
+v2 used "in any string field", which is what Kosha did before per-field
+indexes; `in_any_field` keeps that count for reference.
 """
 import argparse
 import collections
@@ -52,7 +54,7 @@ QUICK = {"matter": 9, "word": 10, "word_per_document": 5, "word_grouped": 5, "an
 ap = argparse.ArgumentParser()
 ap.add_argument("export_dir")
 ap.add_argument("out_dir")
-ap.add_argument("--version", default="v2")
+ap.add_argument("--version", default="v3")
 args = ap.parse_args()
 os.makedirs(args.out_dir, exist_ok=True)
 random.seed(11)
@@ -143,7 +145,7 @@ print(f"matter {matter}: {len(WORDS)} words, {len(PHRASES)} phrases, {len(DOCS)}
 # ── One pass over every record ─────────────────────────────────────────────
 wset, ptoks = set(WORDS), {p: p.split() for p in PHRASES}
 word_ids = {w: [] for w in WORDS}
-word_content = collections.Counter()  # how many of those are in `content`
+word_any_field = collections.Counter()  # for reference: chunks with the word in any string field
 word_docs = {w: collections.Counter() for w in WORDS}
 word_format = {(w, f): [] for w in WORDS[:10] for f in FORMATS[:1]}
 phrase_ids = {p: [] for p in PHRASES}
@@ -163,19 +165,21 @@ for path in files:
         total += 1
         doc = src["documentId"]
         all_docs.add(doc)
-        fields = [tokens(v) for k, v in src.items() if isinstance(v, str)]
-        content = set(tokens(src.get("content") or ""))
-        anyset = set().union(*fields) if fields else set()
+        content_tokens = tokens(src.get("content") or "")
+        content = set(content_tokens)
+        elsewhere = set().union(*(tokens(v) for k, v in src.items() if k != "content" and isinstance(v, str)))
         fmts = src.get("fileFormats") or []
-        for w in wset & anyset:
+        for w in wset & (content | elsewhere):
+            word_any_field[w] += 1
+            if w not in content:
+                continue
             word_ids[w].append(cid)
             word_docs[w][doc] += 1
-            word_content[w] += w in content
             for f in fmts:
                 if (w, f) in word_format:
                     word_format[(w, f)].append(cid)
         for p, want in ptoks.items():
-            if want[0] in anyset and any(has_phrase(ft, want) for ft in fields):
+            if want[0] in content and has_phrase(content_tokens, want):
                 phrase_ids[p].append(cid)
         if doc in doc_pages:
             doc_pages[doc].append((src.get("pageNumber") or 0, cid))
@@ -290,7 +294,7 @@ for hot in (True, False):
 
 for w in WORDS:
     ref = case("word", {"size": 20, "track_total_hits": True, "_source": ["documentId"], "query": scoped(must=match(w))},
-               total=len(word_ids[w]), in_content_only=word_content[w], **ids_or_none(word_ids[w]))
+               total=len(word_ids[w]), in_any_field=word_any_field[w], **ids_or_none(word_ids[w]))
     top = top_buckets(word_docs[w])
     case("word_per_document", {"size": 0, "query": scoped(must=match(w)),
                                "aggs": {"per_document": {"terms": {"field": "documentId", "size": 1000}}}},
@@ -343,7 +347,7 @@ manifest = {
     "matter": matter, "version": args.version, "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "source": {"files": len(files), "fingerprint": sha.hexdigest()},
     "chunks": total, "documents": len(all_docs), "chunks_with_vector": n_vec,
-    "text_rules": "whitespace split; trim ASCII punctuation; lowercase; word in any string field; phrase within one field",
+    "text_rules": "whitespace split; trim ASCII punctuation; lowercase; a word or phrase matches in the queried field (content)",
     "cases": dict(seen), "quick_cases": sum(c["tier"] == "quick" for c in cases), "id_cap": ID_CAP,
 }
 json.dump(manifest, open(os.path.join(args.out_dir, "manifest.json"), "w"), indent=1)
