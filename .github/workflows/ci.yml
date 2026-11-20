@@ -54,6 +54,24 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features --locked
+      # `GET /metrics` (#223): check the exposition with Prometheus' own
+      # linter. The sample comes from a test that renders the registry, so
+      # this reuses the build above.
+      - name: promtool check metrics
+        env:
+          PROMETHEUS_VERSION: "2.53.4"
+          PROMETHEUS_SHA256: b8b497c4610d1b93208252b60c8f20f6b2e78596ae8df43397a2e805aa53d475
+        run: |
+          PROMTOOL_METRICS_DUMP="$RUNNER_TEMP/metrics.txt" \
+            cargo test -p kosha-server --all-features --locked --bin kosha-server \
+            -- --exact metrics::tests::dump_exposition_for_promtool
+          tarball="prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/$tarball"
+          echo "$PROMETHEUS_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" \
+            check metrics < "$RUNNER_TEMP/metrics.txt"
 
   python-client:
     name: python client
