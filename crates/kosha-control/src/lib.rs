@@ -259,6 +259,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         ctrl.compare_and_swap_manifest(&ns, 0, candidate.clone())
             .unwrap();
@@ -407,6 +408,7 @@ mod tests {
                 deletion_vectors: Default::default(),
                 schema: None,
                 retired: Default::default(),
+                shards: None,
             },
         )
         .unwrap();
@@ -428,6 +430,7 @@ mod tests {
                 deletion_vectors: Default::default(),
                 schema: None,
                 retired: Default::default(),
+                shards: None,
             },
         )
         .unwrap();
@@ -458,6 +461,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
 
         // CAS with version 0 → should succeed (initial version is 0).
@@ -480,6 +484,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         assert!(ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2).is_err());
     }

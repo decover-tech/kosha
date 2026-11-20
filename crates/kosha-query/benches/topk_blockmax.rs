@@ -125,6 +125,7 @@ fn build_corpus(
         deletion_vectors: Default::default(),
         schema: None,
         retired: Default::default(),
+        shards: None,
     }
 }
 

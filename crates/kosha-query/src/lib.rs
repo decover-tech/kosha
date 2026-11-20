@@ -8908,6 +8908,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         for (segment, docs) in [
             (
@@ -9116,6 +9117,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -9252,6 +9254,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -9345,6 +9348,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -9555,6 +9559,7 @@ mod tests {
                 deletion_vectors: Default::default(),
                 schema: None,
                 retired: Default::default(),
+                shards: None,
             },
             all,
         )
@@ -9827,6 +9832,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
 
         // Reproduce the production regime exactly, independent of how this
@@ -9997,6 +10003,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let result = searcher.search(
             &NamespaceId("test".into()),
@@ -10054,6 +10061,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -10128,6 +10136,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -10219,6 +10228,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let result = searcher
             .search(
@@ -10305,6 +10315,7 @@ mod tests {
                 deletion_vectors: Default::default(),
                 schema: None,
                 retired: Default::default(),
+                shards: None,
             },
         )
     }
@@ -10705,6 +10716,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut query = mk_query("", 10);
@@ -10787,6 +10799,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -10877,6 +10890,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
 
         // Generous entry-count cap (10) but a byte budget that fits s1 alone,
@@ -11000,6 +11014,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -11073,6 +11088,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
@@ -11131,6 +11147,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -11306,6 +11323,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mk_knn_q = |num_candidates: usize| {
@@ -11438,6 +11456,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let (mut hits_from_i8, mut total_recall) = (0usize, 0.0f64);
@@ -11550,6 +11569,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 1);
@@ -11625,6 +11645,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -11695,6 +11716,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -11770,6 +11792,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         (dir, manifest)
     }
@@ -11893,6 +11916,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         // Fresh searcher (no warm in-memory segment cache) so opening the
         // segment for these searches goes through the real `try_read_doc_index`
@@ -11975,6 +11999,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         // Fresh searcher so each segment is actually opened (Lazy), not
         // served from a warm cache populated by an earlier call here.
@@ -12102,6 +12127,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let calls: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -12187,6 +12213,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -12240,6 +12267,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -12301,6 +12329,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -12401,6 +12430,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -12448,6 +12478,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -12510,6 +12541,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -12565,6 +12597,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -12756,6 +12789,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -12890,6 +12924,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let run = |b: f64| {
@@ -13063,6 +13098,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let scores = |q: SearchQuery| -> Vec<(String, f64)> {
@@ -13225,6 +13261,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
 
         // Baseline (uncorrupted): "alpha beta" intersects, "beta" matches.
@@ -13322,6 +13359,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         // Open + warm the segment so the reader is cached, THEN evict
@@ -13378,6 +13416,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -13520,6 +13559,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -13586,6 +13626,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -13771,6 +13812,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -13823,6 +13865,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -13937,6 +13980,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -14025,6 +14069,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut id_sort = std::collections::HashMap::new();
@@ -14163,6 +14208,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -14236,6 +14282,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -14292,6 +14339,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -14371,6 +14419,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -14471,6 +14520,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -14558,6 +14608,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -14642,6 +14693,7 @@ mod columnar_filter_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -14831,6 +14883,7 @@ mod columnar_eval_differential_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -15168,6 +15221,7 @@ mod corpus_stats_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -16275,6 +16329,7 @@ mod rrf_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let mut locations = HashMap::new();
         for (g, docs) in groups.iter().enumerate() {
@@ -16877,6 +16932,7 @@ mod rrf_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         for (g, docs) in groups.iter().enumerate() {
             let id = SegmentId(format!("seg-{g:03}"));
@@ -17130,6 +17186,7 @@ mod analyzer_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -17563,6 +17620,7 @@ mod field_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -18278,6 +18336,7 @@ mod limit_per_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let mut locations = HashMap::new();
         for s in 0..segments {
@@ -18769,6 +18828,7 @@ mod rank_by_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let mut locations = HashMap::new();
         for s in 0..segments {
@@ -19462,6 +19522,7 @@ mod fuzzy_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -20049,6 +20110,7 @@ mod nested_attribute_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         for (i, docs) in segments.iter().enumerate() {
             let id = SegmentId(format!("seg{i}"));
@@ -20378,6 +20440,7 @@ mod prefix_filter_tests {
             deletion_vectors: Default::default(),
             retired: Default::default(),
             schema: Default::default(),
+            shards: None,
         };
         (dir, ns, manifest)
     }
@@ -20577,6 +20640,7 @@ mod metric_aggregation_tests {
             deletion_vectors: Default::default(),
             retired: Default::default(),
             schema: Default::default(),
+            shards: None,
         }
     }
 
@@ -21601,6 +21665,7 @@ mod vector_column_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -22013,6 +22078,7 @@ mod filtered_knn_tests {
                 deletion_vectors: Default::default(),
                 schema: None,
                 retired: Default::default(),
+                shards: None,
             },
             docs,
         }

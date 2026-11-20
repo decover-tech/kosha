@@ -117,6 +117,7 @@ fn run(work: &std::path::Path, label: &str, version: u32, segs: usize, docs: usi
         deletion_vectors: Default::default(),
         schema: None,
         retired: Default::default(),
+        shards: None,
     };
     let query = bench_query();
 

@@ -134,6 +134,7 @@ fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, dim: us
         deletion_vectors: Default::default(),
         schema: None,
         retired: Default::default(),
+        shards: None,
     }
 }
 

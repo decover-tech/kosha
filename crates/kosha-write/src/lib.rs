@@ -229,6 +229,7 @@ impl NamespaceState {
                 deletion_vectors: Default::default(),
                 schema: None,
                 retired: Default::default(),
+                shards: None,
             },
             published_version: 0,
             published_base: PublishedBase::default(),
@@ -537,6 +538,29 @@ impl Indexer {
                 })
             })
             .clone()
+    }
+
+    /// A sharded root (#207) holds no documents: writes go to its shards.
+    /// Reaching here with one is a routing bug, refused rather than written
+    /// where no search would look.
+    fn refuse_sharded_root(
+        handle: &NamespaceHandle,
+        namespace: &NamespaceId,
+    ) -> Result<(), KoshaError> {
+        if handle
+            .state
+            .lock()
+            .unwrap()
+            .manifest
+            .shards
+            .is_some_and(|n| n > 1)
+        {
+            return Err(KoshaError::InvalidQuery(format!(
+                "namespace '{}' is sharded; write to its shards",
+                namespace.0
+            )));
+        }
+        Ok(())
     }
 
     fn buffer_mut_in<'a>(
@@ -883,6 +907,7 @@ impl Indexer {
         let handle = self.ns_handle(&namespace);
 
         let writes = handle.writes.lock().unwrap();
+        Self::refuse_sharded_root(&handle, &namespace)?;
         if self.needs_recovery_hydration(&namespace) {
             self.flush_namespace(&namespace)?;
         }
@@ -987,6 +1012,7 @@ impl Indexer {
         let count = documents.len();
         let handle = self.ns_handle(&namespace);
         let _writes = handle.writes.lock().unwrap();
+        Self::refuse_sharded_root(&handle, &namespace)?;
         // Recovery must be resolved before assigning a new operation order.
         if self.needs_recovery_hydration(&namespace) {
             self.flush_namespace(&namespace)?;
@@ -2080,6 +2106,66 @@ impl Indexer {
         true
     }
 
+    /// Make `namespace` a sharded root with a fixed `shards` count (#207),
+    /// creating it if needed. Only a namespace that holds nothing yet — no
+    /// segments, no buffered or recovered writes — can be sharded:
+    /// documents already written live where unsharded routing put them,
+    /// and moving them is resharding, which this does not do. Asking again
+    /// for the count it already has is a no-op (`Ok(false)`); asking for a
+    /// different one is refused. The caller publishes the manifest.
+    pub fn set_shard_count(
+        &self,
+        namespace: &NamespaceId,
+        shards: u32,
+    ) -> Result<bool, KoshaError> {
+        if !(2..=kosha_core::sharding::MAX_SHARDS).contains(&shards) {
+            return Err(KoshaError::InvalidQuery(format!(
+                "shards must be between 2 and {}",
+                kosha_core::sharding::MAX_SHARDS
+            )));
+        }
+        let handle = self.ns_handle(namespace);
+        let _writes = handle.writes.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        let mut state = handle.state.lock().unwrap();
+        match state.manifest.shards {
+            Some(existing) if existing == shards => return Ok(false),
+            Some(existing) => {
+                return Err(KoshaError::InvalidQuery(format!(
+                    "namespace already has {existing} shards; resharding is not supported"
+                )))
+            }
+            None => {}
+        }
+        let pending = state.buffer.as_ref().map_or(0, |b| b.documents.len())
+            + state.recovered.len()
+            + state.recovered_deletes.len();
+        if !state.manifest.segments.is_empty() || pending > 0 {
+            return Err(KoshaError::InvalidQuery(
+                "namespace already holds documents; a shard count can only be set \
+                 on a new, empty namespace"
+                    .into(),
+            ));
+        }
+        state.manifest.shards = Some(shards);
+        state.manifest.version += 1;
+        state.shared_manifest = None;
+        state.known = true;
+        Ok(true)
+    }
+
+    /// The fixed shard count of a sharded root namespace (#207); `None` for
+    /// an ordinary namespace, a shard, or one this indexer does not know.
+    pub fn shard_count(&self, namespace: &NamespaceId) -> Option<u32> {
+        let map = self.namespaces.lock().unwrap();
+        let handle = map.get(namespace)?;
+        let state = handle.state.lock().unwrap();
+        if !state.known {
+            return None;
+        }
+        state.manifest.shards.filter(|&n| n > 1)
+    }
+
     pub fn manifest(&self, namespace: &NamespaceId) -> Option<Manifest> {
         self.manifest_cloned(namespace)
     }
@@ -2575,6 +2661,8 @@ impl Indexer {
                     remote.schema.clone()
                 },
                 retired: Default::default(),
+                // Fixed once set (#207): whichever side set it.
+                shards: state.manifest.shards.or(remote.shards),
             };
             (manifest, tombstones, RebaseOutcome::Rebased)
         } else {

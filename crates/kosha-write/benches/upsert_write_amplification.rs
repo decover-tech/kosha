@@ -53,6 +53,7 @@ fn main() {
         deletion_vectors: Default::default(),
         schema: None,
         retired: Default::default(),
+        shards: None,
     };
     manifest.remember_segment_footer(footer);
     let idx = Indexer::new(dir.clone());

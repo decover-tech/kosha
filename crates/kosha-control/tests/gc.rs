@@ -161,6 +161,7 @@ fn fixture(name: &str) -> Fixture {
             },
         ],
         schema: Default::default(),
+        shards: None,
     };
     manifest.deletion_vectors.insert(
         SegmentId(LIVE.into()),

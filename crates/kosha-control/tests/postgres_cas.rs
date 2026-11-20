@@ -19,6 +19,7 @@ fn candidate(segment: &str, version: u64) -> Manifest {
         deletion_vectors: Default::default(),
         schema: None,
         retired: Default::default(),
+        shards: None,
         tombstones: [(SegmentId(segment.into()), (0..256).collect())]
             .into_iter()
             .collect(),

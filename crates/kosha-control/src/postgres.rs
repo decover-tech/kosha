@@ -60,6 +60,7 @@ fn decode_manifest(version: u64, segments_json: &str) -> Option<Manifest> {
         deletion_vectors: Default::default(),
         schema: None,
         retired: Default::default(),
+        shards: None,
     };
     for entry in entries {
         if let Some(footer) = entry.footer {

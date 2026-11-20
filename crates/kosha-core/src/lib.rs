@@ -16,6 +16,7 @@ pub mod histogram;
 pub use histogram::{AggDateHistogram, AggHistogram, DurationValue};
 pub mod docset;
 pub mod nested;
+pub mod sharding;
 pub use analysis::{
     AnalysisConfig, AnalyzerSpec, FieldSchema, NamespaceSchema, SegmentAnalysis, TokenFilterSpec,
     TokenizerKind,
@@ -2666,6 +2667,13 @@ pub struct Manifest {
     /// written before it existed still parse and older binaries ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired: Vec<gc::RetiredObject>,
+    /// Fixed shard count (#207), set once when the namespace is created
+    /// sharded. `Some(n)` with `n > 1` marks a *root* manifest: it lists no
+    /// segments itself; documents live in the shard namespaces
+    /// [`sharding::shard_namespace`] names. `None` (every manifest written
+    /// before sharding existed) is an ordinary, unsharded namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shards: Option<u32>,
 }
 
 impl Manifest {
@@ -2698,6 +2706,7 @@ impl Manifest {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -4373,6 +4382,7 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 

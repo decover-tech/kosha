@@ -281,6 +281,7 @@ impl AppState {
                     deletion_vectors: HashMap::new(),
                     schema: None,
                     retired: Default::default(),
+                    shards: None,
                 };
                 let o =
                     self.hydrate_segments_for_search(ns, &subset, &warmup_probe_query(), &request);
@@ -509,6 +510,35 @@ impl AppState {
         // segment's scaffolding lands, the search path's hydration verdict
         // can be recorded, as the static warmup did.
         let mut whole: HashSet<String> = HashSet::new();
+        // A sharded namespace (#207) holds its segments in its shards,
+        // ordinary namespaces nested under its prefix: warm each of them.
+        let specs: Vec<WarmSpec> = specs
+            .into_iter()
+            .flat_map(|spec| match self.indexer.shard_count(&spec.ns) {
+                None => vec![spec],
+                Some(shards) => kosha_core::sharding::shard_namespaces(&spec.ns, shards)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, shard)| WarmSpec {
+                        ns: shard,
+                        source: spec.source,
+                        // Merged-view ids (`_shard-XXXX/{id}`) back to the
+                        // shard's own segment ids.
+                        only: spec.only.as_ref().map(|only| {
+                            only.iter()
+                                .filter_map(|id| {
+                                    kosha_core::sharding::split_merged_segment_id(
+                                        &kosha_core::SegmentId(id.clone()),
+                                    )
+                                    .filter(|(i, _)| *i as usize == index)
+                                    .map(|(_, local)| local.0)
+                                })
+                                .collect()
+                        }),
+                    })
+                    .collect(),
+            })
+            .collect();
         for spec in specs {
             let Some(manifest) = self.indexer.manifest_shared(&spec.ns) else {
                 report
