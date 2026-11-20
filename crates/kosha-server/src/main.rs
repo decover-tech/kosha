@@ -632,6 +632,10 @@ struct HydrationOutcome {
 /// the verdict records which column names were verified. A later query is
 /// covered only if every column it names was (`filters.bin` segments are
 /// verified whole by any filter pass, so the field set is what decides).
+///
+/// Vectors are verified per `knn.field` (#204): a kNN hydrates only the
+/// files of the vector column it searches, so a pass for one column says
+/// nothing about another's.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 struct HydrationVerdict {
     /// A filter-needing pass verified every segment's `filters.bin` or
@@ -639,31 +643,75 @@ struct HydrationVerdict {
     filters_verified: bool,
     /// Filter column names verified local in every columnar segment.
     filter_fields_verified: std::collections::BTreeSet<String>,
-    vectors_verified: bool,
+    /// Vector columns (`knn.field`s) verified local in every segment.
+    vector_fields_verified: std::collections::BTreeSet<String>,
 }
 
 impl HydrationVerdict {
     /// Whether this verdict can be trusted to skip a full
     /// `hydrate_segments_for_search` pass for a query with these needs.
     /// `needs_filters` is the query's filter column names, `None` when it
-    /// needs no filter files at all.
-    fn covers(&self, needs_filters: Option<&FilterFields>, needs_vectors: bool) -> bool {
+    /// needs no filter files at all. `knn_field` is the query's
+    /// `knn.field`, `None` for a non-kNN query.
+    fn covers(&self, needs_filters: Option<&FilterFields>, knn_field: Option<&str>) -> bool {
         let filters_ok = needs_filters.is_none_or(|fields| {
             self.filters_verified && fields.is_subset(&self.filter_fields_verified)
         });
-        filters_ok && (!needs_vectors || self.vectors_verified)
+        filters_ok && knn_field.is_none_or(|field| self.vector_fields_verified.contains(field))
     }
 
     /// Record what a successful, non-bloom-pruned pass for a query with
     /// these needs actually verified, merging with (not replacing) whatever
     /// was already known for this manifest version.
-    fn merge(&mut self, needs_filters: Option<&FilterFields>, needs_vectors: bool) {
+    fn merge(&mut self, needs_filters: Option<&FilterFields>, knn_field: Option<&str>) {
         if let Some(fields) = needs_filters {
             self.filters_verified = true;
             self.filter_fields_verified.extend(fields.iter().cloned());
         }
-        self.vectors_verified |= needs_vectors;
+        if let Some(field) = knn_field {
+            self.vector_fields_verified.insert(field.to_string());
+        }
     }
+}
+
+/// Whether the files a kNN on `field` reads from `seg_path` are local
+/// (#204): `field`'s column only, as `footer` lists it (see
+/// [`kosha_segment::knn_vector_columns`]). In ranged mode (#245) a column
+/// whose offsets sidecar is local is complete: its probed postings are read
+/// by range during the search. Otherwise the idx file is needed, plus the
+/// sidecar where one exists — a legacy segment's only for the clustered
+/// format: a clustered column without it is served by exact scan of every
+/// vector (seconds on a large segment). A legacy segment that stores its
+/// vectors in `doc_vectors.bin` also needs that file, whose field table
+/// binds its unnamed index.
+#[cfg(feature = "s3")]
+fn knn_files_complete(
+    seg_path: &Path,
+    footer: Option<&kosha_core::Footer>,
+    field: &str,
+    vectors_ranged: bool,
+) -> bool {
+    for column in kosha_segment::knn_vector_columns(footer, field) {
+        let offsets_local = column
+            .offsets_file
+            .as_ref()
+            .is_some_and(|f| file_present_nonempty(&seg_path.join(f)));
+        if vectors_ranged && offsets_local {
+            continue;
+        }
+        if !file_present_nonempty(&seg_path.join(&column.idx_file)) {
+            return false;
+        }
+        if column.offsets_file.is_some()
+            && !offsets_local
+            && (!column.legacy
+                || kosha_segment::vector_file_needs_offsets(seg_path, &column.idx_file))
+        {
+            return false;
+        }
+    }
+    !kosha_segment::knn_needs_doc_vectors(footer)
+        || file_present_nonempty(&seg_path.join(kosha_segment::DOC_VECTORS_FILE))
 }
 
 /// Filter column names a query reads (`SearchQuery::filter_column_fields`).
@@ -778,8 +826,9 @@ fn hydration_wants_file(name: &str, needs_vectors: bool) -> bool {
     // "vector.offsets"` too would have flipped this to `needs_vectors ||
     // true` for the sidecar (always fetch it, regardless of
     // `needs_vectors`) — the opposite bug from the one this function
-    // exists to prevent.
-    if name == "vector.idx" || name == "vector.offsets" {
+    // exists to prevent. Every vector column's files (#204:
+    // `vector.<n>.idx` / `vector.<n>.offsets`) are gated the same way.
+    if kosha_core::is_vector_index_file(name) {
         needs_vectors
     } else {
         true
@@ -2020,7 +2069,7 @@ impl AppState {
                     .unwrap()
                     .entry((ns.0.clone(), manifest.version))
                     .or_default()
-                    .merge(None, false);
+                    .merge(None, None);
             } else {
                 eprintln!(
                     "warn: manifest refresh: prewarm of '{}' v{} left {} segment(s) cold",
@@ -3067,7 +3116,7 @@ impl AppState {
         // segment needs depends on its footer.
         let query_analysis = kosha_query::QueryAnalysis::new(query);
         let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
-        let needs_vectors = query.knn.is_some();
+        let knn_field = query.knn.as_ref().map(|knn| knn.field.as_str());
         let filter_fields = query_filter_fields(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
@@ -3210,7 +3259,7 @@ impl AppState {
         }
         let mut outcome = self.ensure_scoring_files_local(
             &to_hydrate,
-            needs_vectors,
+            knn_field,
             &filter_files,
             &manifest_footers,
             request,
@@ -3238,7 +3287,7 @@ impl AppState {
             // ranged spans where the segment allows (#245).
             let stats_files = self.ensure_scoring_files_local(
                 &stats_only,
-                false,
+                None,
                 &HashMap::new(),
                 &manifest_footers,
                 request,
@@ -3279,7 +3328,9 @@ impl AppState {
     /// `doc_store.offsets` sidecar is present (Lazy open: scoring reads only
     /// the small offsets sidecar, never the bulk doc store). Legacy segments
     /// without offsets fall back to eager open, which does need
-    /// `doc_store.bin`. `vector.idx` is required only for kNN queries.
+    /// `doc_store.bin`. Vector files are required only for kNN queries, and
+    /// then only those of the column `knn_field` names (#204, see
+    /// [`kosha_segment::knn_vector_files`]).
     ///
     /// Contrast [`AppState::REQUIRED_SEGMENT_FILES`] / `segment_is_complete`,
     /// which is the *full* set used by the compaction/merge path (those read
@@ -3298,7 +3349,7 @@ impl AppState {
     #[cfg(all(test, feature = "s3"))]
     fn segment_is_scoring_complete(
         seg_path: &Path,
-        needs_vectors: bool,
+        knn_field: Option<&str>,
         needs_filters: bool,
         manifest_footer: Option<&kosha_core::Footer>,
     ) -> bool {
@@ -3307,13 +3358,7 @@ impl AppState {
         } else {
             Vec::new()
         };
-        Self::scoring_complete(
-            seg_path,
-            needs_vectors,
-            false,
-            &filter_files,
-            manifest_footer,
-        )
+        Self::scoring_complete(seg_path, knn_field, false, &filter_files, manifest_footer)
     }
 
     /// [`Self::segment_is_scoring_complete`] with `vectors_ranged`: kNN
@@ -3327,7 +3372,7 @@ impl AppState {
     /// columns for a columnar one.
     fn scoring_complete(
         seg_path: &Path,
-        needs_vectors: bool,
+        knn_field: Option<&str>,
         vectors_ranged: bool,
         filter_files: &[String],
         manifest_footer: Option<&kosha_core::Footer>,
@@ -3354,18 +3399,16 @@ impl AppState {
         // segments never have one. A clustered segment without it is served
         // by exact scan of every vector (seconds on a large segment), so it
         // is not complete until the sidecar has been fetched.
-        if needs_vectors {
-            // `vector.offsets` exists only for the clustered format, whose
-            // postings the reader fetches by range.
-            if vectors_ranged && file_present_nonempty(&seg_path.join("vector.offsets")) {
-                return true;
-            }
-            if !file_present_nonempty(&seg_path.join("vector.idx")) {
-                return false;
-            }
-            if !file_present_nonempty(&seg_path.join("vector.offsets"))
-                && kosha_segment::vector_index_needs_offsets(seg_path)
-            {
+        if let Some(field) = knn_field {
+            let local_footer;
+            let footer = match manifest_footer {
+                Some(footer) => Some(footer),
+                None => {
+                    local_footer = SegmentReader::read_footer(seg_path).ok();
+                    local_footer.as_ref()
+                }
+            };
+            if !knn_files_complete(seg_path, footer, field, vectors_ranged) {
                 return false;
             }
         }
@@ -3390,7 +3433,7 @@ impl AppState {
     fn ensure_scoring_files_local(
         &self,
         seg_paths: &[PathBuf],
-        needs_vectors: bool,
+        knn_field: Option<&str>,
         filter_files: &HashMap<PathBuf, Vec<String>>,
         manifest_footers: &HashMap<PathBuf, &kosha_core::Footer>,
         request: &Arc<RequestHydration>,
@@ -3405,7 +3448,7 @@ impl AppState {
         let (owned, waiting) = partition_for_hydration(&self.in_flight_segments, seg_paths, |p| {
             Self::scoring_complete(
                 p,
-                needs_vectors,
+                knn_field,
                 vectors_ranged,
                 filters_of(p),
                 manifest_footers.get(p).copied(),
@@ -3414,6 +3457,26 @@ impl AppState {
 
         if !owned.is_empty() {
             let _permit = self.hydration_semaphore.acquire();
+
+            // Which vector files a kNN needs is read from each segment's
+            // footer (#204), so a footer known neither from the manifest nor
+            // locally must be fetched before the list below is built.
+            if knn_field.is_some() {
+                let without_footer: Vec<PathBuf> = owned
+                    .iter()
+                    .map(|(p, _)| p.clone())
+                    .filter(|p| {
+                        !manifest_footers.contains_key(p)
+                            && !file_present_nonempty(&p.join("footer.json"))
+                    })
+                    .collect();
+                if !without_footer.is_empty() {
+                    let (files, bytes) =
+                        self.ensure_files_local(&without_footer, "footer.json", request);
+                    outcome.files_fetched += files;
+                    outcome.bytes_fetched += bytes;
+                }
+            }
 
             // Sizes are unknown without a per-segment LIST round trip —
             // avoiding that round trip is half the point of this path (file
@@ -3486,39 +3549,52 @@ impl AppState {
                     logical_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
                 }
 
-                // Ranged mode (#245) fetches `vector.idx` whole only for
-                // segments that turn out to have no `vector.offsets`
-                // (below); clustered segments read their probed postings by
-                // range during the search.
-                if needs_vectors && !vectors_ranged {
-                    if !file_present_nonempty(&seg_path.join("vector.idx")) {
-                        logical_paths.push((format!("{s3_prefix}/vector.idx"), 0));
+                // Only the queried column's files (#204), as the segment's
+                // footer lists them. Ranged mode (#245) fetches a clustered
+                // column's offsets sidecar only: its probed postings are
+                // read by range during the search, and the idx file is
+                // fetched whole only for a column that turns out to have no
+                // sidecar (below). A legacy segment's `vector.offsets`
+                // exists only for the clustered format, and there is no
+                // footer signal to predict that (vector.idx is
+                // deliberately self-describing), so it is always attempted:
+                // a segment that doesn't have one just shows up as a
+                // per-file miss in `s3.read_many`'s accounting, not a
+                // hydration failure. Without the sidecar the lazy path
+                // never activates for S3-backed segments, and every kNN
+                // query silently takes the (still correct, just slower)
+                // eager fallback.
+                if let Some(field) = knn_field {
+                    let local_footer;
+                    let footer = match manifest_footers.get(seg_path) {
+                        Some(footer) => Some(*footer),
+                        None => {
+                            local_footer = SegmentReader::read_footer(seg_path).ok();
+                            local_footer.as_ref()
+                        }
+                    };
+                    for column in kosha_segment::knn_vector_columns(footer, field) {
+                        let mut files: Vec<&str> = Vec::new();
+                        if let Some(offsets) = &column.offsets_file {
+                            files.push(offsets);
+                        }
+                        if !vectors_ranged || column.offsets_file.is_none() {
+                            files.push(&column.idx_file);
+                        }
+                        for file in files {
+                            if !file_present_nonempty(&seg_path.join(file)) {
+                                logical_paths.push((format!("{s3_prefix}/{file}"), 0));
+                            }
+                        }
                     }
-                    // vector.offsets is the v2 posting-index sidecar — like
-                    // doc_store.offsets, only some segments have one
-                    // (legacy v1 segments never do; the reader falls back
-                    // to an eager parse of vector.idx alone when it's
-                    // absent). Unlike doc_store's sidecar, there's no
-                    // Footer.format_version signal to predict its existence
-                    // (vector.idx is deliberately self-describing,
-                    // independent of Footer — same as inverted.idx), so
-                    // this always attempts the fetch when vectors are
-                    // needed; a segment that doesn't have one just shows up
-                    // as a per-file miss in `s3.read_many`'s accounting,
-                    // not a hydration failure. Without this, the lazy path
-                    // never activates for S3-backed segments — the sidecar
-                    // never lands locally before `SegmentReader::open`, so
-                    // every S3-backed KNN query silently takes the (still
-                    // correct, just slower) eager fallback.
-                    if !file_present_nonempty(&seg_path.join("vector.offsets")) {
-                        logical_paths.push((format!("{s3_prefix}/vector.offsets"), 0));
+                    if kosha_segment::knn_needs_doc_vectors(footer)
+                        && !file_present_nonempty(&seg_path.join(kosha_segment::DOC_VECTORS_FILE))
+                    {
+                        logical_paths.push((
+                            format!("{s3_prefix}/{}", kosha_segment::DOC_VECTORS_FILE),
+                            0,
+                        ));
                     }
-                }
-                if needs_vectors
-                    && vectors_ranged
-                    && !file_present_nonempty(&seg_path.join("vector.offsets"))
-                {
-                    logical_paths.push((format!("{s3_prefix}/vector.offsets"), 0));
                 }
             }
 
@@ -3551,16 +3627,34 @@ impl AppState {
             // Ranged mode: a segment with no `vector.offsets` is a legacy
             // flat (or unclustered) one, searched by exact scan of the whole
             // `vector.idx`. One more round, for those segments only.
-            if needs_vectors && vectors_ranged {
-                let legacy: Vec<(String, u64)> = owned
-                    .iter()
-                    .filter(|(p, _)| {
-                        !file_present_nonempty(&p.join("vector.offsets"))
-                            && !file_present_nonempty(&p.join("vector.idx"))
-                    })
-                    .filter_map(|(p, _)| p.strip_prefix(&self.data_dir).ok())
-                    .map(|rel| (format!("{}/vector.idx", rel.to_string_lossy()), 0))
-                    .collect();
+            if let (Some(field), true) = (knn_field, vectors_ranged) {
+                let mut legacy: Vec<(String, u64)> = Vec::new();
+                for (p, _) in &owned {
+                    let Ok(rel) = p.strip_prefix(&self.data_dir) else {
+                        continue;
+                    };
+                    let local_footer;
+                    let footer = match manifest_footers.get(p) {
+                        Some(footer) => Some(*footer),
+                        None => {
+                            local_footer = SegmentReader::read_footer(p).ok();
+                            local_footer.as_ref()
+                        }
+                    };
+                    for column in kosha_segment::knn_vector_columns(footer, field) {
+                        let Some(offsets) = &column.offsets_file else {
+                            continue;
+                        };
+                        if !file_present_nonempty(&p.join(offsets))
+                            && !file_present_nonempty(&p.join(&column.idx_file))
+                        {
+                            legacy.push((
+                                format!("{}/{}", rel.to_string_lossy(), column.idx_file),
+                                0,
+                            ));
+                        }
+                    }
+                }
                 if !legacy.is_empty() {
                     self.hydrate_files(s3, &legacy, self.scoring_hydrate_concurrency, request);
                     outcome.rounds += 1;
@@ -3654,7 +3748,7 @@ impl AppState {
             .filter(|p| {
                 !Self::scoring_complete(
                     p,
-                    needs_vectors,
+                    knn_field,
                     vectors_ranged,
                     filters_of(p),
                     manifest_footers.get(*p).copied(),
@@ -3905,6 +3999,7 @@ impl AppState {
     fn hydrate_vector_postings(
         &self,
         seg: &Path,
+        file: &str,
         ranges: &[(u64, u64)],
         request: &Arc<RequestHydration>,
     ) -> posting_spans::PostingFetchStats {
@@ -3928,7 +4023,7 @@ impl AppState {
         let o = posting_spans::fetch_file_spans(
             &rel,
             seg,
-            kosha_segment::VECTOR_IDX_FILE,
+            file,
             ranges,
             self.posting_span_hydrator.coalesce_gap(),
             &fetcher,
@@ -3938,11 +4033,7 @@ impl AppState {
         stats.ranged_gets = o.gets;
         stats.ranged_bytes = o.bytes;
         if o.failed {
-            let (files, bytes) = self.ensure_files_local(
-                &[seg.to_path_buf()],
-                kosha_segment::VECTOR_IDX_FILE,
-                request,
-            );
+            let (files, bytes) = self.ensure_files_local(&[seg.to_path_buf()], file, request);
             stats.rounds += 1;
             stats.whole_files = files as u64;
             stats.whole_bytes = bytes;
@@ -5717,6 +5808,9 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
         let version_before = indexer.manifest(&ns).map(|m| m.version);
         let count = match indexer.index_documents(ns.clone(), request.documents) {
             Ok(c) => c,
+            // A rejected document (e.g. a vector of the wrong dimension
+            // for its field, #204) is the client's error.
+            Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
             Err(e) => return json_error(500, &format!("indexing error: {e}")),
         };
         // index_documents auto-flushes when the buffer hits the threshold
@@ -5861,6 +5955,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
         let indexer = &state.indexer;
         match indexer.replace_documents(namespace.clone(), request.documents) {
             Ok(count) => count,
+            Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
             Err(error) => return json_error(500, &format!("replacement error: {error}")),
         }
     };
@@ -6325,7 +6420,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         // need one of them; `covers` enforces that per-file-class check
         // instead of trusting a flat "namespace hydrated" bool.
         let needs_filters = query_filter_fields(search_query);
-        let needs_vectors = search_query.knn.is_some();
+        let needs_vectors = search_query.knn.as_ref().map(|knn| knn.field.as_str());
         let cached_covers = state
             .completed_hydrations
             .lock()
@@ -6425,8 +6520,8 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     #[cfg(feature = "s3")]
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
-    let fetch_vectors = |seg: &Path, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, ranges, &hydration_request);
+    let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
+        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request);
         vector_fetch_stats.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -6812,7 +6907,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         // bool.
         let verdict_key = (ns.0.clone(), manifest.version);
         let needs_filters = query_filter_fields(&query);
-        let needs_vectors = query.knn.is_some();
+        let needs_vectors = query.knn.as_ref().map(|knn| knn.field.as_str());
         let cached_covers = state
             .completed_hydrations
             .lock()
@@ -6881,8 +6976,8 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     #[cfg(feature = "s3")]
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
-    let fetch_vectors = |seg: &Path, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, ranges, &hydration_request);
+    let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
+        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request);
         vector_fetch_stats.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -10542,6 +10637,87 @@ mod tests {
         }
     }
 
+    /// #204 over HTTP: two vector columns of different dimensions in one
+    /// namespace; `knn.field` picks the column, an unindexed field or a
+    /// wrong-dimension vector is a 400, and so is indexing a vector whose
+    /// dimension disagrees with its field's.
+    #[test]
+    fn knn_field_selects_the_vector_column_over_http() {
+        let state = test_state();
+        let ns = NamespaceId("columnsns".into());
+        let doc = |id: &str, title: Option<[f32; 2]>, body: Option<[f32; 3]>| {
+            let mut fields = vec![Field::text("text", "x")];
+            if let Some(v) = title {
+                fields.push(Field::vector("title_emb", v.to_vec()));
+            }
+            if let Some(v) = body {
+                fields.push(Field::vector("body_emb", v.to_vec()));
+            }
+            Document {
+                id: DocumentId(id.into()),
+                fields,
+            }
+        };
+        let index = |docs: Vec<Document>| {
+            let body = serde_json::to_vec(&kosha_core::IndexRequest {
+                namespace: ns.clone(),
+                documents: docs,
+            })
+            .unwrap();
+            handle_index(&body, &state)
+        };
+        let resp = index(vec![
+            doc("t1", Some([1.0, 0.0]), None),
+            doc("t2", Some([0.0, 1.0]), Some([0.0, 0.0, 1.0])),
+            doc("b1", None, Some([1.0, 0.0, 0.0])),
+            doc("b2", None, Some([0.0, 1.0, 0.0])),
+        ]);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        // 2 dims where `body_emb` has 3.
+        let bad = Document {
+            id: DocumentId("bad2".into()),
+            fields: vec![Field::vector("body_emb", vec![1.0, 0.0])],
+        };
+        let resp = index(vec![bad]);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("body_emb"), "{resp}");
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |knn: &str| {
+            let body = format!(r#"{{"namespace":"columnsns","query_text":"","knn":{knn}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let ids = |resp: &str| -> Vec<String> {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            v["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let title = ids(&post(
+            r#"{"field":"title_emb","vector":[1.0,0.0],"k":10,"num_candidates":100}"#,
+        ));
+        assert_eq!(title, vec!["t1", "t2"], "only title_emb documents");
+        let body = ids(&post(
+            r#"{"field":"body_emb","vector":[1.0,0.0,0.0],"k":10,"num_candidates":100}"#,
+        ));
+        let mut sorted = body.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["b1", "b2", "t2"], "only body_emb documents");
+        assert_eq!(body[0], "b1", "{body:?}");
+
+        let resp = post(r#"{"field":"nope","vector":[1.0,0.0],"k":3}"#);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("nope"), "{resp}");
+        let resp = post(r#"{"field":"body_emb","vector":[1.0,0.0],"k":3}"#);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+    }
+
     #[test]
     fn metric_aggregations_over_http_and_unknown_types_are_400() {
         // Issues #196 / #218 / #202: metric aggregations, top-level and
@@ -11258,6 +11434,7 @@ mod tests {
             analysis: None,
             field_index: None,
             fuzzy_bloom: kosha_core::fuzzy::build_fuzzy_bloom(terms.iter().copied()),
+            vector_fields: None,
         };
         let mut query: SearchQuery = serde_json::from_str(
             r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
@@ -11971,6 +12148,11 @@ mod tests {
             hydration_wants_file("vector.offsets", true),
             "a knn query must still fetch vector.offsets"
         );
+        // Further vector columns (#204) are gated the same way.
+        for f in ["vector.1.idx", "vector.1.offsets", "vector.12.idx"] {
+            assert!(!hydration_wants_file(f, false), "{f}");
+            assert!(hydration_wants_file(f, true), "{f}");
+        }
         for f in [
             "footer.json",
             "doc_store.bin",
@@ -12296,6 +12478,7 @@ mod tests {
             filter_columns: Default::default(),
             fuzzy_bloom: Default::default(),
             posting_blobs_raw: Default::default(),
+            vector_fields: Default::default(),
         }
     }
 
@@ -12434,6 +12617,58 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #204: a kNN's scoring set holds only the queried column's files, as
+    /// the segment's footer lists them.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn scoring_complete_needs_only_the_queried_vector_column() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-scoring-columns-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut w =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("s".into()), dir.clone());
+        w.add_document(
+            DocumentId("d".into()),
+            vec![
+                Field::text("text", "x"),
+                Field::vector("title_emb", vec![1.0, 0.0]),
+                Field::vector("body_emb", vec![1.0, 0.0, 0.0]),
+            ],
+        );
+        w.finalize(Default::default()).unwrap();
+        assert_eq!(
+            kosha_segment::knn_vector_files(&dir, "body_emb"),
+            vec![
+                ("vector.1.idx".to_string(), true),
+                ("vector.1.offsets".to_string(), true)
+            ]
+        );
+        assert!(kosha_segment::knn_vector_files(&dir, "nope").is_empty());
+        let complete =
+            |field| AppState::segment_is_scoring_complete(&dir, Some(field), false, None);
+        assert!(complete("title_emb") && complete("body_emb") && complete("nope"));
+        fs::remove_file(dir.join("vector.1.idx")).unwrap();
+        assert!(
+            complete("title_emb"),
+            "body_emb's files are not title_emb's"
+        );
+        assert!(!complete("body_emb"));
+        assert!(
+            complete("nope"),
+            "a column the segment does not have needs no files"
+        );
+        assert_eq!(
+            kosha_segment::vector_index_files(&dir),
+            vec![
+                "vector.idx",
+                "vector.offsets",
+                "vector.1.idx",
+                "vector.1.offsets"
+            ]
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn segment_is_scoring_complete_offsets_sidecar_replaces_doc_store_bin() {
@@ -12448,7 +12683,7 @@ mod tests {
         let footer = test_footer("kosha-test-scoring-complete", 1, 2);
 
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false, false, None),
+            !AppState::segment_is_scoring_complete(&dir, None, false, None),
             "empty dir must not be scoring-complete"
         );
 
@@ -12457,11 +12692,11 @@ mod tests {
         // the footer.
         fs::write(dir.join("doc_store.offsets"), 1u32.to_le_bytes()).unwrap();
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false, false, None),
+            !AppState::segment_is_scoring_complete(&dir, None, false, None),
             "without a manifest footer, footer.json on disk is still required"
         );
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false, false, Some(&footer)),
+            AppState::segment_is_scoring_complete(&dir, None, false, Some(&footer)),
             "a manifest footer snapshot must stand in for a missing footer.json"
         );
         fs::write(
@@ -12470,26 +12705,26 @@ mod tests {
         )
         .unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false, false, None),
+            AppState::segment_is_scoring_complete(&dir, None, false, None),
             "offsets sidecar (no doc_store.bin, no filters.bin) must be broad lexical scoring-complete"
         );
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false, true, None),
+            !AppState::segment_is_scoring_complete(&dir, None, true, None),
             "queries using filters/sorts/aggs must still require filters.bin"
         );
         fs::write(dir.join("filters.bin"), b"x").unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false, true, None),
+            AppState::segment_is_scoring_complete(&dir, None, true, None),
             "filters.bin present must make filter/sort/agg queries scoring-complete"
         );
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, true, true, None),
+            !AppState::segment_is_scoring_complete(&dir, Some("emb"), true, None),
             "kNN scoring-complete must require vector.idx (still missing)"
         );
 
         fs::write(dir.join("vector.idx"), b"x").unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, true, true, None),
+            AppState::segment_is_scoring_complete(&dir, Some("emb"), true, None),
             "vector.idx present must make it kNN scoring-complete"
         );
         assert!(
@@ -12497,7 +12732,7 @@ mod tests {
             "sanity: this assertion must be exercising the no-sidecar case"
         );
         assert!(
-            AppState::segment_is_scoring_complete(&dir, true, true, None),
+            AppState::segment_is_scoring_complete(&dir, Some("emb"), true, None),
             "vector.offsets (the v2 posting-index sidecar) must be optional for scoring \
              completeness — legacy v1 segments never have one, and the reader falls back to \
              an eager parse of vector.idx alone when it's absent, same as doc_store's own \
@@ -12519,12 +12754,12 @@ mod tests {
             fs::write(legacy.join(f), b"x").unwrap();
         }
         assert!(
-            AppState::segment_is_scoring_complete(&legacy, false, true, None),
+            AppState::segment_is_scoring_complete(&legacy, None, true, None),
             "legacy segment with doc_store.bin (no offsets) must be scoring-complete"
         );
         fs::remove_file(legacy.join("doc_store.bin")).unwrap();
         assert!(
-            !AppState::segment_is_scoring_complete(&legacy, false, true, None),
+            !AppState::segment_is_scoring_complete(&legacy, None, true, None),
             "legacy segment without offsets and without doc_store.bin is not scorable"
         );
         let _ = fs::remove_dir_all(&legacy);
@@ -12921,34 +13156,38 @@ mod tests {
         let none = fields(&[]);
         let mut v = HydrationVerdict::default();
         assert!(
-            v.covers(None, false),
+            v.covers(None, None),
             "a query needing neither file class is trivially covered by any verdict"
         );
         assert!(
-            !v.covers(Some(&none), false),
+            !v.covers(Some(&none), None),
             "an unverified verdict must not cover a query that needs filters.bin"
         );
         assert!(
-            !v.covers(None, true),
+            !v.covers(None, Some("emb")),
             "an unverified verdict must not cover a query that needs vector.idx"
         );
 
         // A pass that itself needed only filters verifies only that.
-        v.merge(Some(&none), false);
-        assert!(v.covers(None, false));
-        assert!(v.covers(Some(&none), false));
+        v.merge(Some(&none), None);
+        assert!(v.covers(None, None));
+        assert!(v.covers(Some(&none), None));
         assert!(
-            !v.covers(None, true),
+            !v.covers(None, Some("emb")),
             "verifying filters.bin must not also mark vector.idx as verified"
         );
-        assert!(!v.covers(Some(&none), true));
+        assert!(!v.covers(Some(&none), Some("emb")));
 
         // A later pass needing vector.idx merges in, not overwrites.
-        v.merge(None, true);
+        v.merge(None, Some("emb"));
         assert!(
-            v.covers(Some(&none), true),
+            v.covers(Some(&none), Some("emb")),
             "flags accumulate across passes — filters_verified from an earlier pass must \
              survive a later pass that only verified vectors"
+        );
+        assert!(
+            !v.covers(None, Some("other_emb")),
+            "verifying one vector column's files must not cover a kNN on another (#204)"
         );
     }
 
@@ -12960,20 +13199,20 @@ mod tests {
         let fields =
             |names: &[&str]| -> FilterFields { names.iter().map(|s| s.to_string()).collect() };
         let mut v = HydrationVerdict::default();
-        v.merge(Some(&fields(&["matterId"])), false);
-        assert!(v.covers(Some(&fields(&["matterId"])), false));
+        v.merge(Some(&fields(&["matterId"])), None);
+        assert!(v.covers(Some(&fields(&["matterId"])), None));
         assert!(
-            v.covers(Some(&fields(&[])), false),
+            v.covers(Some(&fields(&[])), None),
             "TOC-only needs are covered"
         );
         assert!(
-            !v.covers(Some(&fields(&["documentId"])), false),
+            !v.covers(Some(&fields(&["documentId"])), None),
             "a column no pass fetched must not be assumed local"
         );
-        assert!(!v.covers(Some(&fields(&["matterId", "documentId"])), false));
-        v.merge(Some(&fields(&["documentId"])), false);
+        assert!(!v.covers(Some(&fields(&["matterId", "documentId"])), None));
+        v.merge(Some(&fields(&["documentId"])), None);
         assert!(
-            v.covers(Some(&fields(&["matterId", "documentId"])), false),
+            v.covers(Some(&fields(&["matterId", "documentId"])), None),
             "verified columns accumulate across passes"
         );
     }
@@ -13049,7 +13288,7 @@ mod tests {
             }
         }
         assert!(
-            !AppState::scoring_complete(&local, false, false, &wanted, Some(&footer)),
+            !AppState::scoring_complete(&local, None, false, &wanted, Some(&footer)),
             "not scorable before its filter files land"
         );
         let mut hydrated = 0u64;
@@ -13058,7 +13297,7 @@ mod tests {
         }
         assert!(AppState::scoring_complete(
             &local,
-            false,
+            None,
             false,
             &wanted,
             Some(&footer)
@@ -13123,7 +13362,7 @@ mod tests {
             segment_filter_files(Some(&footer), &local, &query_filter_fields(&other).unwrap());
         assert!(!AppState::scoring_complete(
             &local,
-            false,
+            None,
             false,
             &other_files,
             Some(&footer)
@@ -13187,9 +13426,9 @@ mod tests {
         // `!bloom_pruned` gate) is eligible to merge into the cache.
         let warmup_like = base_query.clone();
         let needs_filters_1 = query_filter_fields(&warmup_like);
-        let needs_vectors_1 = warmup_like.knn.is_some();
+        let needs_vectors_1 = warmup_like.knn.as_ref().map(|knn| knn.field.as_str());
         assert!(
-            needs_filters_1.is_none() && !needs_vectors_1,
+            needs_filters_1.is_none() && needs_vectors_1.is_none(),
             "warmup's probe query must not need filters.bin/vector.idx — this is exactly \
              what makes its success unable to prove either file is local"
         );
@@ -13225,7 +13464,7 @@ mod tests {
         }];
         chunk_lookup.search_after = Some(vec!["0".to_string()]);
         let needs_filters_2 = query_filter_fields(&chunk_lookup);
-        let needs_vectors_2 = chunk_lookup.knn.is_some();
+        let needs_vectors_2 = chunk_lookup.knn.as_ref().map(|knn| knn.field.as_str());
         assert!(
             needs_filters_2.is_some(),
             "a documentId term filter needs filters.bin"
@@ -13261,7 +13500,7 @@ mod tests {
             )]),
         }];
         let needs_filters_3 = query_filter_fields(&sorted_unfiltered);
-        let needs_vectors_3 = sorted_unfiltered.knn.is_some();
+        let needs_vectors_3 = sorted_unfiltered.knn.as_ref().map(|knn| knn.field.as_str());
         assert!(
             needs_filters_3.is_some(),
             "sorting by a real field needs filters.bin"
@@ -13292,7 +13531,7 @@ mod tests {
             .get(&verdict_key)
             .cloned();
         assert!(
-            cached_after.is_some_and(|v| v.covers(needs_filters_3.as_ref(), false)),
+            cached_after.is_some_and(|v| v.covers(needs_filters_3.as_ref(), None)),
             "a pass that itself verified filters.bin must let a later query needing only \
              filters.bin take the fast path"
         );
@@ -15290,6 +15529,7 @@ mod tests {
             analysis: None,
             field_index: None,
             fuzzy_bloom: None,
+            vector_fields: None,
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.

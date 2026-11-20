@@ -208,11 +208,14 @@ a directory of objects in S3:
 s3://kosha-{env}/{namespace_id}/segments/{segment_id}/
     doc_store.bin       # document payloads (content, metadata), compressed, block-addressed
     inverted.idx         # term → postings list (docId, freq, positions) for lexical search
-    vector.idx           # ANN index: cluster postings (+ vector.offsets with centroids), written when the segment has vectors
+    vector.idx           # ANN index of the first vector column (cluster centroids + posting lists)
+    vector.offsets       # its centroids and posting byte ranges, read at open
+    vector.<n>.idx       # ANN index of vector column n (#204), and vector.<n>.offsets beside it
+    doc_vectors.bin      # stored vector values, binary f32 (#243)
     filters.bin          # filter fields (dates, ids, tags), row-oriented — or, with the columnar format:
     filters.toc          #   column directory + per-column stats (#244)
     filters-NNN.col      #   one file per (field, type) column, numbered by id
-    footer.json          # offsets, counts, schema version, checksum, analysis chains
+    footer.json          # counts, blooms, analysis chains, vector columns, format version
 ```
 
 **Filter index formats (#244).** A segment stores its filter values in one of two formats, and
@@ -266,6 +269,21 @@ then set it to `2`; compaction converts segments as it merges them. Rollback: se
 and compaction rewrites columnar segments as `filters.bin`, but a binary older than #244 cannot
 read columnar segments (their filters match nothing), so do not downgrade past this release
 while any remain.
+**Vector columns are per segment (#204).** Every `Vector` field gets its own ANN index, with its
+own dimension. The footer's `vector_fields` lists each column's name, dimension, vector count and
+file slot: slot 0 is `vector.idx` + `vector.offsets`, so a segment with one vector field is
+byte-identical to one written before columns existed, and slot `n` is `vector.<n>.idx` +
+`vector.<n>.offsets` (field names never appear in object keys). A kNN loads, hydrates and probes
+only the column `knn.field` names; its centroids alone take part in the global probe budget. A
+footer without `vector_fields` is a legacy segment: its single unnamed index answers a kNN on any
+field, unless its `doc_vectors.bin` names exactly one field, which then binds it. A `knn.field`
+that no segment indexes and no legacy segment could answer, or a query vector whose dimension
+differs from the field's, is a 400. The writer fixes each field's dimension per namespace at the
+first vector written to it (from segment footers and the write buffer) and rejects a document that
+disagrees with a 400; a segment writer that still meets one stores it without indexing it rather
+than failing the flush. There is no namespace schema for vector fields: everything above is read
+from segment footers.
+
 **Analysis is versioned per segment (#220, #221).** `inverted.idx` holds whatever terms the
 analyzer produced at write time, so a segment's `footer.json` records the exact analysis chains its
 `Text` fields went through (`analysis`: tokenizer + version + filters, with stopword lists copied
@@ -554,7 +572,8 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      is rescored with per-segment floors. Hybrid (RRF) requests are untouched: their lexical
      list is a rank window, scored by the general path. `SearchPhaseStats` reports
      `wand_docs_scored`, `wand_segments_skipped`, `wand_global_threshold` and `wand_bounds_ms`.
-   - Semantic: ANN search over `vector.idx` — probe the nearest cluster centroids (one probe
+   - Semantic: ANN search over the `knn.field` column's index (`vector.idx`, or
+     `vector.<n>.idx` for a second column, #204) — probe the nearest cluster centroids (one probe
      budget for the whole query, bounded with triangle-inequality radii) and score the
      postings' unit-norm vectors by dot product (cosine); older segments fall back to flat or
      HNSW search. This is the direct replacement for OpenSearch's `script_score` cosineSimilarity

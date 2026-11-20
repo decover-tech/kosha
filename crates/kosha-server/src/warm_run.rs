@@ -348,22 +348,41 @@ impl AppState {
             }
             FileClass::Vectors => {
                 let (mut files, mut bytes) = (0usize, 0u64);
+                // Every vector column's files (#204): `vector.idx` +
+                // `vector.offsets`, then `vector.<n>.idx` + `vector.<n>.offsets`
+                // as each segment's (already warmed) footer lists them.
+                let mut by_file: std::collections::BTreeMap<String, Vec<PathBuf>> =
+                    std::collections::BTreeMap::new();
+                for seg in &seg_paths {
+                    for file in kosha_segment::vector_index_files(seg) {
+                        by_file.entry(file).or_default().push(seg.clone());
+                    }
+                }
                 {
                     let _permit = self.hydration_semaphore.acquire();
-                    for file in ["vector.offsets", kosha_segment::VECTOR_IDX_FILE] {
-                        let (f, b) = self.ensure_files_local(&seg_paths, file, &request);
+                    // Offsets sidecars first, as before: they are what an
+                    // open reads.
+                    let mut order: Vec<(&String, &Vec<PathBuf>)> = by_file.iter().collect();
+                    order.sort_by_key(|(file, _)| !file.ends_with(".offsets"));
+                    for (file, segs) in order {
+                        let (f, b) = self.ensure_files_local(segs, file, &request);
                         files += f;
                         bytes += b;
                     }
                 }
                 let mut missing = 0;
-                for seg in &seg_paths {
-                    let idx = seg.join(kosha_segment::VECTOR_IDX_FILE);
-                    if file_present_nonempty(&idx) {
-                        self.posting_span_hydrator
-                            .finish_promotion(&self.cache, &idx, true);
-                    } else {
-                        missing += 1;
+                for (file, segs) in &by_file {
+                    if !file.ends_with(".idx") {
+                        continue;
+                    }
+                    for seg in segs {
+                        let idx = seg.join(file);
+                        if file_present_nonempty(&idx) {
+                            self.posting_span_hydrator
+                                .finish_promotion(&self.cache, &idx, true);
+                        } else {
+                            missing += 1;
+                        }
                     }
                 }
                 BatchOutcome {
@@ -583,7 +602,7 @@ impl AppState {
                     .unwrap()
                     .entry((ns_name.clone(), manifest.version))
                     .or_default()
-                    .merge(None, false);
+                    .merge(None, None);
             }
         }
 

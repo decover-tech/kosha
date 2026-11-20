@@ -20,7 +20,8 @@ use kosha_core::{
 use kosha_core::{AnalyzerSpec, FieldBoost, Footer, SegmentAnalysis};
 pub use kosha_segment::VectorSpanFetch;
 use kosha_segment::{
-    tokenize, Analyzer, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
+    tokenize, Analyzer, PostingsMemoryAccount, ScoringPosting, SegmentReader, VectorFieldStatus,
+    SCORING_BLOCK_LEN,
 };
 
 /// One segment of a materialize page, as handed to a [`DocStoreHydrator`]:
@@ -634,16 +635,90 @@ pub fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u6
     }
 
     if load_vectors {
-        // Resident: centroids + ranges (v2 lazy) or the whole parsed
-        // VectorStore (legacy / missing-sidecar fallback).
-        let vec_offsets = size("vector.offsets");
-        total = total.saturating_add(if vec_offsets > 0 {
-            vec_offsets
-        } else {
-            size("vector.idx")
-        });
+        // Resident, per vector column (#204): centroids + ranges (v2 lazy)
+        // or the whole parsed VectorStore (legacy / missing-sidecar
+        // fallback). Columns load on first use, so this charges every
+        // column present locally up front — the conservative direction.
+        for slot in vector_slots_on_disk(seg_dir) {
+            let vec_offsets = size(&kosha_core::vector_offsets_file(slot));
+            total = total.saturating_add(if vec_offsets > 0 {
+                vec_offsets
+            } else {
+                size(&kosha_core::vector_idx_file(slot))
+            });
+        }
     }
     total
+}
+
+/// Slots of the vector-index files present in `seg_dir` (#204): `0` for
+/// `vector.idx`, `n` for `vector.<n>.idx`. Sorted, deduplicated.
+fn vector_slots_on_disk(seg_dir: &std::path::Path) -> Vec<u32> {
+    let mut slots: Vec<u32> = std::fs::read_dir(seg_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            if !kosha_core::is_vector_index_file(&name) {
+                return None;
+            }
+            let rest = name.strip_prefix("vector.")?;
+            match rest.split_once('.') {
+                Some((slot, _)) => slot.parse().ok(),
+                None => Some(0),
+            }
+        })
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
+/// Reject a kNN that cannot be answered as asked (#204) — see
+/// [`Searcher::global_probe_cutoff`]. `statuses` holds one entry per
+/// segment present locally; with none there is nothing to judge by.
+fn check_knn_field<'a>(
+    namespace: &NamespaceId,
+    knn: &kosha_core::KnnQuery,
+    statuses: impl Iterator<Item = &'a VectorFieldStatus>,
+) -> Result<(), KoshaError> {
+    let dim = knn.vector.len();
+    let mut any = false;
+    let mut answerable = false;
+    let mut legacy_dims = std::collections::BTreeSet::new();
+    for status in statuses {
+        any = true;
+        match *status {
+            VectorFieldStatus::Indexed { dim: indexed } if indexed != dim => {
+                return Err(KoshaError::InvalidQuery(format!(
+                    "knn.vector has {dim} dimensions but vector field '{}' is indexed with {indexed}",
+                    knn.field
+                )));
+            }
+            VectorFieldStatus::Indexed { .. } => answerable = true,
+            // An unnamed legacy index of another dimension holds some
+            // other field's vectors: it cannot answer this query.
+            VectorFieldStatus::Legacy { dim: Some(legacy) } if legacy != dim => {
+                legacy_dims.insert(legacy);
+            }
+            VectorFieldStatus::Legacy { .. } => answerable = true,
+            VectorFieldStatus::Absent => {}
+        }
+    }
+    if answerable || !any {
+        return Ok(());
+    }
+    if let Some(legacy) = legacy_dims.first() {
+        return Err(KoshaError::InvalidQuery(format!(
+            "knn.vector has {dim} dimensions but the vector index that would answer \
+             knn.field '{}' has {legacy}",
+            knn.field
+        )));
+    }
+    Err(KoshaError::InvalidQuery(format!(
+        "knn.field '{}' has no vector index in namespace '{}'",
+        knn.field, namespace.0
+    )))
 }
 
 // ─── BM25 scorer ────────────────────────────────────────────────────────────
@@ -1902,26 +1977,6 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     (dot / (norm_a * norm_b)) as f64
 }
 
-/// Over-fetch multiplier for per-segment kNN whenever candidates can be
-/// rejected *after* the top-`k` cut (tombstones, `knn.filter`, or a
-/// top-level `query.filter`): the segment fetches `k × factor` candidates
-/// and truncates back to `k` survivors post-rejection. Without it, a
-/// selective filter or a batch of deletes landing near the query silently
-/// voids most (or all) of the page. Nearly free on the lazy v2 path, which
-/// scores every hydrated candidate regardless and uses `k` only to
-/// truncate. `KOSHA_KNN_OVERFETCH_FACTOR`, default 10, min 1 (disables
-/// over-fetching). Read once.
-fn knn_overfetch_factor() -> usize {
-    static FACTOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *FACTOR.get_or_init(|| {
-        std::env::var("KOSHA_KNN_OVERFETCH_FACTOR")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10)
-            .max(1)
-    })
-}
-
 /// Whether `knn.num_candidates` is treated as a whole-query probe budget
 /// (default) rather than a per-segment one.
 ///
@@ -2446,6 +2501,15 @@ impl Searcher {
     /// Returns `None` when no segment can report centroids (legacy flat
     /// vector segments), so those namespaces keep their existing behavior
     /// rather than silently searching nothing.
+    ///
+    /// The same walk checks the query against `knn.field` (#204) and fails
+    /// with [`KoshaError::InvalidQuery`] — a client error, never an empty
+    /// or mixed page — when no segment indexes the field and no legacy
+    /// segment (written before vector columns, see
+    /// [`VectorFieldStatus::Legacy`]) could answer it either, or when
+    /// `knn.vector`'s dimension differs from the field's. Judged on the
+    /// segments present locally; with none present there is nothing to
+    /// judge by and the query proceeds.
     fn global_probe_cutoff(
         &self,
         namespace: &NamespaceId,
@@ -2454,19 +2518,21 @@ impl Searcher {
         knn: &kosha_core::KnnQuery,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
-    ) -> Option<(f32, usize)> {
+    ) -> Result<Option<(f32, usize)>, KoshaError> {
+        let budgeted = knn_global_budget_enabled();
         let requested = knn.num_candidates.max(1);
         let prunable = query.has_prunable_filter();
-        // Distances from every segment's centroids, gathered in parallel —
-        // zero posting I/O, centroids are already resident from open. Kept
-        // untruncated per-segment (unlike the pre-corpus-scaling version):
-        // the effective budget below needs the corpus's real total
-        // centroid count, not just enough of it to satisfy the client's
-        // own request, and this pass was already O(that segment's centroid
-        // count) just to compute the distances in the first place — a
-        // segment that fails to open or has no lazy index contributes
-        // nothing, and simply takes the per-segment fallback path later.
-        let all: Vec<f32> = manifest
+        // Distances from every segment's centroids for `knn.field`,
+        // gathered in parallel — zero posting I/O, centroids are resident
+        // once the column is loaded. Kept untruncated per-segment (unlike
+        // the pre-corpus-scaling version): the effective budget below needs
+        // the corpus's real total centroid count, not just enough of it to
+        // satisfy the client's own request, and this pass was already
+        // O(that segment's centroid count) just to compute the distances in
+        // the first place — a segment that fails to open or has no lazy
+        // index contributes nothing, and simply takes the per-segment
+        // fallback path later.
+        let per_segment: Vec<(VectorFieldStatus, Option<Vec<f32>>)> = manifest
             .segments
             .par_iter()
             .filter_map(|entry| {
@@ -2479,13 +2545,19 @@ impl Searcher {
                 // a namespace shared by many matters they otherwise soaked
                 // up most of `num_candidates`, leaving the matter actually
                 // being searched with a fraction of the probes asked for.
+                // Its footer still says whether it indexes `knn.field`
+                // (a legacy footer cannot, so that segment is opened).
                 if prunable {
                     let footer = manifest.footer_or_read(&entry.segment_id, || {
                         SegmentReader::read_footer(&seg_dir).ok()
                     });
                     if let Some(footer) = footer.as_deref() {
                         if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
-                            return None;
+                            if let Some(status) =
+                                kosha_segment::footer_vector_field_status(footer, &knn.field)
+                            {
+                                return Some((status, None));
+                            }
                         }
                     }
                 }
@@ -2500,13 +2572,35 @@ impl Searcher {
                         Some(open_stats),
                     )
                     .ok()?;
-                reader.knn_centroid_distances(&knn.vector)
+                let status = reader.vector_field_status(&knn.field);
+                // Only a column the query vector fits takes a share of the
+                // budget (a mismatch is rejected or skipped below).
+                let fits = match status {
+                    VectorFieldStatus::Indexed { dim } => dim == knn.vector.len(),
+                    VectorFieldStatus::Legacy { dim } => dim == Some(knn.vector.len()),
+                    VectorFieldStatus::Absent => false,
+                };
+                let distances = if budgeted && fits {
+                    reader.knn_centroid_distances(&knn.field, &knn.vector)
+                } else {
+                    None
+                };
+                Some((status, distances))
             })
+            .collect();
+
+        check_knn_field(namespace, knn, per_segment.iter().map(|(status, _)| status))?;
+        if !budgeted {
+            return Ok(None);
+        }
+        let all: Vec<f32> = per_segment
+            .into_iter()
+            .filter_map(|(_, distances)| distances)
             .flatten()
             .collect();
 
         if all.is_empty() {
-            return None; // no v2 vector segments — keep legacy behavior
+            return Ok(None); // no v2 vector segments — keep legacy behavior
         }
         let total_centroids = all.len();
         let budget = effective_knn_budget(requested, total_centroids);
@@ -2514,13 +2608,13 @@ impl Searcher {
         if all.len() <= budget {
             // The whole namespace has fewer centroids than the budget:
             // nothing to prune, admit everything.
-            return Some((f32::INFINITY, budget));
+            return Ok(Some((f32::INFINITY, budget)));
         }
         let idx = budget - 1;
         all.select_nth_unstable_by(idx, |a, b| {
             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
         });
-        Some((all[idx], budget))
+        Ok(Some((all[idx], budget)))
     }
 
     /// Namespace-level BM25 statistics for `terms` at this manifest (issue
@@ -4440,102 +4534,114 @@ impl Searcher {
             // query. Falling back to per-segment `nprobe` (no cutoff) is
             // correct but pays `num_candidates` in EVERY segment, so total
             // probe depth scales with segment count.
-            let probe = if nothing_passes {
-                Some(Ok(Vec::new()))
+            //
+            // Only `knn.field`'s own index is searched (#204): another
+            // vector column of the same documents is never a candidate.
+            let field_index = if nothing_passes {
+                Ok(None)
             } else {
-                match knn_cutoff {
-                    Some((cutoff, effective_budget)) => reader
-                        .knn_search_within_filtered_fetching(
-                            &knn.vector,
-                            fetch_k,
-                            cutoff,
-                            effective_budget,
-                            knn_accept_dyn,
-                            vector_fetch,
-                        )
-                        .map(|r| {
-                            r.map(|(results, probes)| {
-                                open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
-                                results
-                            })
-                        }),
-                    None => reader
-                        .knn_search_filtered_fetching(
-                            &knn.vector,
-                            fetch_k,
-                            knn.num_candidates,
-                            knn_accept_dyn,
-                            vector_fetch,
-                        )
-                        .map(|r| {
-                            r.inspect(|_| {
-                                // Per-segment fallback probes up to
-                                // `num_candidates` in THIS segment; record the
-                                // ceiling so the metric still reflects the
-                                // fan-out being paid.
-                                open_stats
-                                    .knn_postings
-                                    .fetch_add(knn.num_candidates, Ordering::Relaxed);
-                            })
-                        }),
-                }
+                reader.vector_field(&knn.field)
             };
-            let knn_results: Vec<(u32, f64)> = match probe {
-                Some(Ok(results)) => results,
-                Some(Err(e)) => {
+            let knn_results: Vec<(u32, f64)> = match field_index {
+                Err(e) => {
                     eprintln!(
-                        "WARN: knn_search failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
+                        "WARN: vector field '{}' of {} could not be loaded: {e} — treating as no vector hits for this segment",
+                        knn.field,
                         reader.segment_dir().display()
                     );
-                    // Client-visible counterpart to the log line above — see
-                    // `SearchResult::knn_degraded_segments`. This segment's
-                    // true nearest neighbors are silently missing from the
-                    // page below; a caller checking only HTTP status has no
-                    // other way to know.
                     knn_segment_degraded = true;
                     Vec::new()
                 }
-                None if !reader.vector_store.vectors.is_empty() => {
-                    // Legacy segments (pre-v2 vector index). The HNSW walk
-                    // cannot be filtered from inside, so it over-fetches and
-                    // filters afterwards; the flat scan sees every vector
-                    // and filters exactly.
-                    if let Some(ref hnsw) = reader.hnsw_map {
-                        let take = if knn_restricted {
-                            fetch_k.saturating_mul(knn_overfetch_factor())
-                        } else {
-                            fetch_k
-                        };
-                        let query_point = kosha_segment::CosinePoint(knn.vector.clone());
-                        let mut search = instant_distance::Search::default();
-                        hnsw.search(&query_point, &mut search)
-                            .take(take)
-                            .map(|item| (*item.value, (1.0 - item.distance as f64).max(0.0)))
-                            .filter(|(doc_seq, _)| knn_accept(*doc_seq))
-                            .take(fetch_k)
-                            .collect()
-                    } else if knn_restricted {
-                        let allowed: Vec<(u32, Vec<f32>)> = reader
-                            .vector_store
-                            .vectors
+                // No vectors for this field in this segment.
+                Ok(None) => Vec::new(),
+                // A legacy segment's unnamed index holding another field's
+                // vectors (the namespace-wide check in `search_inner`
+                // already rejected a mismatch on an indexed column).
+                Ok(Some(index)) if index.dim().is_some_and(|dim| dim != knn.vector.len()) => {
+                    Vec::new()
+                }
+                Ok(Some(index)) if index.has_lazy_index() => {
+                    let probe = match knn_cutoff {
+                        Some((cutoff, effective_budget)) => reader
+                            .knn_search_within_filtered_fetching(
+                                &knn.field,
+                                &knn.vector,
+                                fetch_k,
+                                cutoff,
+                                effective_budget,
+                                knn_accept_dyn,
+                                vector_fetch,
+                            )
+                            .map(|r| {
+                                r.map(|(results, probes)| {
+                                    open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
+                                    results
+                                })
+                            }),
+                        None => reader
+                            .knn_search_filtered_fetching(
+                                &knn.field,
+                                &knn.vector,
+                                fetch_k,
+                                knn.num_candidates,
+                                knn_accept_dyn,
+                                vector_fetch,
+                            )
+                            .map(|r| {
+                                r.inspect(|_| {
+                                    // Per-segment fallback probes up to
+                                    // `num_candidates` in THIS segment;
+                                    // record the ceiling so the metric still
+                                    // reflects the fan-out being paid.
+                                    open_stats
+                                        .knn_postings
+                                        .fetch_add(knn.num_candidates, Ordering::Relaxed);
+                                })
+                            }),
+                    };
+                    match probe {
+                        Some(Ok(results)) => results,
+                        Some(Err(e)) => {
+                            eprintln!(
+                                "WARN: knn_search failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
+                                reader.segment_dir().display()
+                            );
+                            // Client-visible counterpart to the log line
+                            // above — see
+                            // `SearchResult::knn_degraded_segments`. This
+                            // segment's true nearest neighbors are silently
+                            // missing from the page below; a caller checking
+                            // only HTTP status has no other way to know.
+                            knn_segment_degraded = true;
+                            Vec::new()
+                        }
+                        None => Vec::new(),
+                    }
+                }
+                Ok(Some(index)) if !index.flat().vectors.is_empty() => {
+                    // Legacy flat segments (pre-v2 vector index) or a
+                    // missing sidecar: the flat scan sees every vector and
+                    // filters exactly.
+                    let vectors = &index.flat().vectors;
+                    if knn_restricted {
+                        let allowed: Vec<(u32, Vec<f32>)> = vectors
                             .iter()
                             .filter(|(doc_seq, _)| knn_accept(*doc_seq))
                             .cloned()
                             .collect();
                         flat_knn(&knn.vector, &allowed, fetch_k)
                     } else {
-                        flat_knn(&knn.vector, &reader.vector_store.vectors, fetch_k)
+                        flat_knn(&knn.vector, vectors, fetch_k)
                     }
                 }
-                None => {
-                    // `vector_index` and `vector_store` are both empty
-                    // here (that's why we're in this arm at all), but that
-                    // shape is shared by two different segment states: a
-                    // segment with no vector field at all (legitimate, no
-                    // flag), and one whose vector.idx has a valid header
-                    // but a corrupt/truncated body (its true neighbors are
-                    // silently missing — must be counted).
-                    if reader.vector_index_degraded() {
+                Ok(Some(index)) => {
+                    // No lazy index and no flat vectors. That shape is
+                    // shared by two different states: a column with no
+                    // vectors (legitimate, no flag), and one whose
+                    // vector.idx has a valid header but a corrupt/truncated
+                    // body (its true neighbors are silently missing — must
+                    // be counted).
+                    if index.degraded() {
                         eprintln!(
                             "WARN: segment {} has a corrupt vector.idx body — treating as no vector hits for this segment",
                             reader.segment_dir().display()
@@ -5076,11 +5182,14 @@ impl Searcher {
         // pass over already-resident centroids to find the distance cutoff
         // that admits ~`num_candidates` postings ACROSS the whole query,
         // then let each segment probe only inside it.
+        //
+        // The same pass rejects a `knn.field` nothing can answer, or a
+        // vector of the wrong dimension for it (#204).
         let knn_cutoff = match query.knn {
-            Some(ref knn) if knn_global_budget_enabled() => {
-                self.global_probe_cutoff(namespace, manifest, query, knn, &permit, &open_stats)
+            Some(ref knn) => {
+                self.global_probe_cutoff(namespace, manifest, query, knn, &permit, &open_stats)?
             }
-            _ => None,
+            None => None,
         };
 
         // ── BM25 collection statistics (issue #246) ────────────────────
@@ -20833,5 +20942,354 @@ mod tracked_segment_filter_tests {
             Err(KoshaError::InvalidQuery(msg)) if msg.contains("numeric field")
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Multiple vector columns per namespace (#204): `knn.field` picks the
+/// column searched, a field nothing indexes is a client error, and
+/// segments written before columns existed keep serving.
+#[cfg(test)]
+mod vector_column_tests {
+    use super::*;
+    use kosha_core::{DocumentId, Field, FieldType, KnnQuery, ManifestEntry, SegmentId};
+    use kosha_segment::SegmentWriter;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-query-vector-columns-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn manifest(segments: &[(&str, u32)]) -> Manifest {
+        Manifest {
+            version: 1,
+            segments: segments
+                .iter()
+                .map(|(id, docs)| ManifestEntry {
+                    segment_id: SegmentId((*id).into()),
+                    doc_count: *docs,
+                })
+                .collect(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            retired: Default::default(),
+        }
+    }
+
+    fn knn_query(field: &str, vector: Vec<f32>, k: usize) -> SearchQuery {
+        let mut q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "",
+            "max_results": k,
+        }))
+        .unwrap();
+        q.knn = Some(KnnQuery {
+            field: field.into(),
+            vector,
+            k,
+            // Probe everything: these tests are about which column is
+            // searched, not recall tuning.
+            num_candidates: 10_000,
+            filter: None,
+        });
+        q
+    }
+
+    fn write_segment(ns_dir: &Path, id: &str, docs: &[(String, Vec<Field>)]) {
+        let mut w = SegmentWriter::new(SegmentId(id.into()), ns_dir.join(id));
+        for (doc_id, fields) in docs {
+            w.add_document(DocumentId(doc_id.clone()), fields.clone());
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(&path, to.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+
+    fn legacy_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kosha-segment/tests/fixtures")
+            .join(name)
+    }
+
+    /// The fixture generator's `emb` vectors (see kosha-segment's
+    /// `tests/vector_columns.rs`): doc `legacy-{i:02}`.
+    fn legacy_vectors() -> Vec<(String, Vec<f32>)> {
+        (0..24)
+            .map(|i| {
+                let a = i as f32 * 0.7;
+                (
+                    format!("legacy-{i:02}"),
+                    vec![
+                        a.sin(),
+                        a.cos(),
+                        (a * 1.3).sin(),
+                        ((i % 5) as f32) / 5.0 - 0.4,
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    fn brute_force(vectors: &[(String, Vec<f32>)], query: &[f32], k: usize) -> BTreeSet<String> {
+        let mut scored: Vec<(String, f64)> = vectors
+            .iter()
+            .map(|(id, v)| (id.clone(), cosine_similarity(query, v)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored.into_iter().take(k).map(|(id, _)| id).collect()
+    }
+
+    fn hit_ids(result: &SearchResult) -> BTreeSet<String> {
+        result.results.iter().map(|h| h.doc_id.0.clone()).collect()
+    }
+
+    /// Documents with a 4-dim `title_emb` (not every third), an 8-dim
+    /// `body_emb` (not every fifth), or both.
+    fn two_column_docs(prefix: &str, n: usize) -> Vec<(String, Vec<Field>)> {
+        (0..n)
+            .map(|i| {
+                let a = (i as f32 + prefix.len() as f32 * 3.1) * 0.37;
+                let mut fields = vec![Field::text("body", format!("doc {i}"))];
+                if i % 3 != 0 {
+                    fields.push(Field::vector(
+                        "title_emb",
+                        vec![a.sin(), a.cos(), (2.0 * a).sin(), 0.5],
+                    ));
+                }
+                if i % 5 != 0 {
+                    fields.push(Field::vector(
+                        "body_emb",
+                        (0..8).map(|d| ((d as f32 + 1.0) * a).cos()).collect(),
+                    ));
+                }
+                (format!("{prefix}{i:02}"), fields)
+            })
+            .collect()
+    }
+
+    fn column(docs: &[(String, Vec<Field>)], field: &str) -> Vec<(String, Vec<f32>)> {
+        docs.iter()
+            .filter_map(|(id, fields)| {
+                let f = fields
+                    .iter()
+                    .find(|f| f.name == field && f.field_type == FieldType::Vector)?;
+                Some((id.clone(), serde_json::from_str(&f.value).unwrap()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn knn_field_searches_only_its_own_column() {
+        let dir = temp_dir("two-columns");
+        let ns = NamespaceId("ns".into());
+        let a = two_column_docs("a", 40);
+        let b = two_column_docs("b", 30);
+        write_segment(&dir.join("ns"), "s1", &a);
+        write_segment(&dir.join("ns"), "s2", &b);
+        let manifest = manifest(&[("s1", 40), ("s2", 30)]);
+        let searcher = Searcher::new(dir.clone());
+        let all: Vec<_> = a.iter().chain(&b).cloned().collect();
+
+        for (field, query) in [
+            ("title_emb", vec![0.2, 0.9, 0.1, 0.5]),
+            ("body_emb", (0..8).map(|d| (d as f32 * 0.4).sin()).collect()),
+        ] {
+            let truth = column(&all, field);
+            for k in [1, 5, 12] {
+                let r = searcher
+                    .search(&ns, &manifest, &knn_query(field, query.clone(), k), None)
+                    .unwrap();
+                assert_eq!(hit_ids(&r), brute_force(&truth, &query, k), "{field} k={k}");
+                assert_eq!(r.knn_degraded_segments, Some(0));
+            }
+            // The whole column, and nothing but: documents without this
+            // field are never its neighbours.
+            let r = searcher
+                .search(
+                    &ns,
+                    &manifest,
+                    &knn_query(field, query.clone(), 1_000),
+                    None,
+                )
+                .unwrap();
+            let ids: BTreeSet<String> = truth.iter().map(|(id, _)| id.clone()).collect();
+            assert_eq!(hit_ids(&r), ids, "{field}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn knn_on_an_unindexed_field_or_with_the_wrong_dimension_is_a_client_error() {
+        let dir = temp_dir("invalid");
+        let ns = NamespaceId("ns".into());
+        write_segment(&dir.join("ns"), "s1", &two_column_docs("a", 20));
+        let manifest = manifest(&[("s1", 20)]);
+        let searcher = Searcher::new(dir.clone());
+
+        let err = searcher
+            .search(&ns, &manifest, &knn_query("nope", vec![1.0; 4], 3), None)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KoshaError::InvalidQuery(m) if m.contains("'nope'")),
+            "{err}"
+        );
+        let err = searcher
+            .search(
+                &ns,
+                &manifest,
+                &knn_query("body_emb", vec![1.0; 4], 3),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, KoshaError::InvalidQuery(m) if m.contains("8")),
+            "{err}"
+        );
+        // Also with the global probe budget's filter pruning in play.
+        let mut filtered = knn_query("nope", vec![1.0; 4], 3);
+        filtered.filter =
+            Some(serde_json::from_value(serde_json::json!({"term": {"body": "missing"}})).unwrap());
+        assert!(matches!(
+            searcher.search(&ns, &manifest, &filtered, None),
+            Err(KoshaError::InvalidQuery(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_segment_written_before_vector_columns_still_serves_knn() {
+        let dir = temp_dir("legacy");
+        let ns = NamespaceId("ns".into());
+        copy_dir(
+            &legacy_fixture("legacy-vector-seg"),
+            &dir.join("ns/legacy-vec"),
+        );
+        let manifest = manifest(&[("legacy-vec", 24)]);
+        let searcher = Searcher::new(dir.clone());
+        let query = vec![0.3, 0.9, -0.2, 0.1];
+        let r = searcher
+            .search(&ns, &manifest, &knn_query("emb", query.clone(), 5), None)
+            .unwrap();
+        assert_eq!(hit_ids(&r), brute_force(&legacy_vectors(), &query, 5));
+        assert_eq!(r.knn_degraded_segments, Some(0));
+
+        // `doc_vectors.bin` binds the unnamed index to `emb`, so no other
+        // field name can be answered here.
+        assert!(matches!(
+            searcher.search(
+                &ns,
+                &manifest,
+                &knn_query("title_emb", query.clone(), 5),
+                None
+            ),
+            Err(KoshaError::InvalidQuery(_))
+        ));
+
+        // Inline vectors leave the field unknown: the old index answers
+        // whatever `knn.field` a pre-#204 client sent.
+        let inline_dir = temp_dir("legacy-inline");
+        copy_dir(
+            &legacy_fixture("legacy-vector-seg-inline"),
+            &inline_dir.join("ns/legacy-vec"),
+        );
+        let searcher = Searcher::new(inline_dir.clone());
+        for field in ["emb", "contentEmbedding"] {
+            let r = searcher
+                .search(&ns, &manifest, &knn_query(field, query.clone(), 5), None)
+                .unwrap();
+            assert_eq!(
+                hit_ids(&r),
+                brute_force(&legacy_vectors(), &query, 5),
+                "{field}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&inline_dir).ok();
+    }
+
+    #[test]
+    fn a_namespace_mixing_old_and_new_segments_queries_correctly() {
+        let dir = temp_dir("mixed");
+        let ns = NamespaceId("ns".into());
+        copy_dir(
+            &legacy_fixture("legacy-vector-seg"),
+            &dir.join("ns/legacy-vec"),
+        );
+        // A new segment with the same 4-dim `emb` column plus an 8-dim
+        // `body_emb` one.
+        let new_docs: Vec<(String, Vec<Field>)> = (0..30)
+            .map(|i| {
+                let a = i as f32 * 0.53 + 0.1;
+                (
+                    format!("new-{i:02}"),
+                    vec![
+                        Field::vector("emb", vec![a.cos(), a.sin(), 0.2, (3.0 * a).sin()]),
+                        Field::vector(
+                            "body_emb",
+                            (0..8).map(|d| ((d as f32 + 0.5) * a).sin()).collect(),
+                        ),
+                    ],
+                )
+            })
+            .collect();
+        write_segment(&dir.join("ns"), "s2", &new_docs);
+        let manifest = manifest(&[("legacy-vec", 24), ("s2", 30)]);
+        let searcher = Searcher::new(dir.clone());
+
+        // `emb` spans both segments: the legacy index answers it.
+        let mut emb = legacy_vectors();
+        emb.extend(column(&new_docs, "emb"));
+        let query = vec![0.3, 0.9, -0.2, 0.1];
+        for k in [3, 10, 40] {
+            let r = searcher
+                .search(&ns, &manifest, &knn_query("emb", query.clone(), k), None)
+                .unwrap();
+            assert_eq!(hit_ids(&r), brute_force(&emb, &query, k), "emb k={k}");
+        }
+        let r = searcher
+            .search(&ns, &manifest, &knn_query("emb", query.clone(), 100), None)
+            .unwrap();
+        assert!(hit_ids(&r).iter().any(|id| id.starts_with("legacy-")));
+        assert!(hit_ids(&r).iter().any(|id| id.starts_with("new-")));
+
+        // `body_emb` exists only in the new segment; the legacy index (of
+        // `emb`) never contributes to it.
+        let body = column(&new_docs, "body_emb");
+        let query8: Vec<f32> = (0..8).map(|d| (d as f32 * 0.3).cos()).collect();
+        let r = searcher
+            .search(
+                &ns,
+                &manifest,
+                &knn_query("body_emb", query8.clone(), 100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(hit_ids(&r), brute_force(&body, &query8, 100));
+        assert!(hit_ids(&r).iter().all(|id| id.starts_with("new-")));
+
+        // Neither segment indexes `title_emb`.
+        assert!(matches!(
+            searcher.search(&ns, &manifest, &knn_query("title_emb", query, 5), None),
+            Err(KoshaError::InvalidQuery(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -110,7 +110,6 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | `KOSHA_KNN_GLOBAL_BUDGET` | Treat `knn.num_candidates` as one probe budget for the whole query. `0`, `false` or `off` gives each segment its own budget (old behavior) | on | flag |
 | `KOSHA_KNN_BUDGET_FRACTION` | Lower bound on the probe budget, as a fraction of the namespace's centroids. Must be > 0 | `0.05` | fraction |
 | `KOSHA_KNN_BUDGET_MAX_CAP` | Ceiling on that lower bound. A larger explicit `num_candidates` is still honored | `20000` | centroids |
-| `KOSHA_KNN_OVERFETCH_FACTOR` | Per-segment over-fetch when candidates can be rejected after the top-k cut (deletes, filters). Values below 1 become 1, which turns over-fetch off | `10` | multiplier |
 
 ## Warmup
 

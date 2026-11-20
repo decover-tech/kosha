@@ -1927,6 +1927,16 @@ pub struct Footer {
     /// bloom — means fuzzy queries cannot prune the segment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuzzy_bloom: Option<BloomFilter>,
+    /// The vector columns this segment indexes, one ANN index each (#204).
+    ///
+    /// `None` — every segment written before vector columns existed — is a
+    /// *legacy* segment: its one `vector.idx` (if any) holds vectors of an
+    /// unknown field and answers a kNN on any field name (see
+    /// `kosha_segment::SegmentReader::vector_field`). `Some(list)` is
+    /// authoritative: a field not listed has no vectors in this segment,
+    /// and `Some([])` means the segment has no vector index at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_fields: Option<Vec<VectorFieldMeta>>,
 }
 
 /// Value type of one filter column (#244). A field name can appear with
@@ -2051,6 +2061,74 @@ impl Footer {
             }
         }
     }
+}
+
+/// One vector column's ANN index inside a segment — an entry of
+/// [`Footer::vector_fields`] (#204).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorFieldMeta {
+    /// The document field name the vectors came from.
+    pub name: String,
+    /// Dimension of every vector indexed for this field in this segment.
+    pub dim: u32,
+    /// Number of vectors indexed.
+    pub count: u32,
+    /// Which pair of files holds the index: slot `0` is `vector.idx` +
+    /// `vector.offsets` (the single-column layout, byte-identical to what
+    /// segments have always had), slot `n` is `vector.<n>.idx` +
+    /// `vector.<n>.offsets`. Field names never appear in file names.
+    pub slot: u32,
+    /// Whether the writer emitted the `offsets` sidecar (false only for the
+    /// `KOSHA_VECTOR_WRITE_VERSION=1` flat format).
+    #[serde(default)]
+    pub offsets: bool,
+}
+
+impl VectorFieldMeta {
+    /// File holding this field's vectors.
+    pub fn idx_file(&self) -> String {
+        vector_idx_file(self.slot)
+    }
+    /// File holding this field's posting centroids/ranges sidecar.
+    pub fn offsets_file(&self) -> String {
+        vector_offsets_file(self.slot)
+    }
+}
+
+/// `vector.idx` for slot 0, `vector.<slot>.idx` otherwise (#204).
+pub fn vector_idx_file(slot: u32) -> String {
+    if slot == 0 {
+        "vector.idx".to_string()
+    } else {
+        format!("vector.{slot}.idx")
+    }
+}
+
+/// `vector.offsets` for slot 0, `vector.<slot>.offsets` otherwise (#204).
+pub fn vector_offsets_file(slot: u32) -> String {
+    if slot == 0 {
+        "vector.offsets".to_string()
+    } else {
+        format!("vector.{slot}.offsets")
+    }
+}
+
+/// Whether `name` is one of a segment's vector-index files (any slot) —
+/// `vector.idx`, `vector.offsets`, `vector.<n>.idx` or `vector.<n>.offsets`.
+pub fn is_vector_index_file(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("vector.") else {
+        return false;
+    };
+    let tail = match rest.split_once('.') {
+        Some((slot, tail)) => {
+            if slot.is_empty() || !slot.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            tail
+        }
+        None => rest,
+    };
+    tail == "idx" || tail == "offsets"
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -4111,6 +4189,7 @@ mod tests {
             analysis: None,
             field_index: None,
             fuzzy_bloom: None,
+            vector_fields: None,
         }
     }
 

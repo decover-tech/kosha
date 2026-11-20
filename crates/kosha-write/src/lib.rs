@@ -323,6 +323,11 @@ struct NamespaceHandle {
     /// concurrent writer to drain it.
     flush_coord: Mutex<FlushCoord>,
     flush_done: Condvar,
+    /// Dimension of each vector field written to this namespace (#204),
+    /// learned lazily from segment footers and the write buffer on the
+    /// first write, then from every accepted batch. See
+    /// [`Indexer::check_vector_dims`].
+    vector_dims: Mutex<Option<HashMap<String, usize>>>,
 }
 
 /// Bounded counting semaphore backing `NamespaceHandle::writer_slots`. Not a
@@ -528,6 +533,7 @@ impl Indexer {
                         last_round_error: None,
                     }),
                     flush_done: Condvar::new(),
+                    vector_dims: Mutex::new(None),
                 })
             })
             .clone()
@@ -762,6 +768,99 @@ impl Indexer {
         }
     }
 
+    /// Reject a batch whose vectors disagree in dimension with their
+    /// field's (#204): each vector column has one dimension per namespace,
+    /// fixed by the first vector written to it. Without this check a
+    /// mismatched document would land in the buffer and could only be
+    /// dropped from the index at flush time, silently.
+    ///
+    /// Called with the namespace's `writes` lock held, so accepted batches
+    /// update the map in order.
+    fn check_vector_dims(
+        &self,
+        namespace: &NamespaceId,
+        handle: &NamespaceHandle,
+        documents: &[Document],
+    ) -> Result<(), KoshaError> {
+        let vectors: Vec<(&DocumentId, &str, usize)> = documents
+            .iter()
+            .flat_map(|doc| {
+                doc.fields
+                    .iter()
+                    .filter(|f| f.field_type == kosha_core::FieldType::Vector)
+                    .filter_map(move |f| {
+                        let v = serde_json::from_str::<Vec<f32>>(&f.value).ok()?;
+                        (!v.is_empty()).then_some((&doc.id, f.name.as_str(), v.len()))
+                    })
+            })
+            .collect();
+        if vectors.is_empty() {
+            return Ok(());
+        }
+        let mut guard = handle.vector_dims.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(self.known_vector_dims(namespace, handle));
+        }
+        let known = guard.as_mut().unwrap();
+        let mut batch: HashMap<&str, usize> = HashMap::new();
+        for (id, field, dim) in &vectors {
+            let expected = known
+                .get(*field)
+                .copied()
+                .or_else(|| batch.get(field).copied());
+            match expected {
+                Some(expected) if expected != *dim => {
+                    return Err(KoshaError::InvalidQuery(format!(
+                        "document '{}': vector field '{field}' has {dim} dimensions, but \
+                         '{field}' vectors in namespace '{}' have {expected}",
+                        id.0, namespace.0
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    batch.insert(field, *dim);
+                }
+            }
+        }
+        for (field, dim) in batch {
+            known.insert(field.to_string(), dim);
+        }
+        Ok(())
+    }
+
+    /// Vector field dimensions already in the namespace: from the footers
+    /// of its segments (those written since #204 list their columns) and
+    /// from documents still in the write buffer.
+    fn known_vector_dims(
+        &self,
+        namespace: &NamespaceId,
+        handle: &NamespaceHandle,
+    ) -> HashMap<String, usize> {
+        let state = handle.state.lock().unwrap().clone();
+        let mut dims = HashMap::new();
+        for entry in &state.manifest.segments {
+            let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+            let Ok(footer) = kosha_segment::SegmentReader::read_footer(&seg_dir) else {
+                continue;
+            };
+            for meta in footer.vector_fields.into_iter().flatten() {
+                dims.entry(meta.name).or_insert(meta.dim as usize);
+            }
+        }
+        let buffered = state.buffer.iter().flat_map(|buf| &buf.documents);
+        for field in buffered.flat_map(|doc| &doc.fields) {
+            if field.field_type != kosha_core::FieldType::Vector {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Vec<f32>>(&field.value) {
+                if !v.is_empty() {
+                    dims.entry(field.name.clone()).or_insert(v.len());
+                }
+            }
+        }
+        dims
+    }
+
     /// Index documents into a namespace (OpenSearch `index` semantics).
     ///
     /// Same `doc_id` overwrites any prior live copy: buffered versions are
@@ -787,6 +886,7 @@ impl Indexer {
         if self.needs_recovery_hydration(&namespace) {
             self.flush_namespace(&namespace)?;
         }
+        self.check_vector_dims(&namespace, &handle, &documents)?;
         self.ensure_id_index(&namespace, &handle)?;
 
         // `needs_flush` is decided under `state` but acted on after it's
@@ -891,6 +991,7 @@ impl Indexer {
         if self.needs_recovery_hydration(&namespace) {
             self.flush_namespace(&namespace)?;
         }
+        self.check_vector_dims(&namespace, &handle, &documents)?;
         let _compact = handle.compact.lock().unwrap();
         let _mutation = handle.mutation.lock().unwrap();
         self.ensure_id_index(&namespace, &handle)?;
@@ -1774,6 +1875,14 @@ impl Indexer {
     /// in durable storage (e.g. S3) but not on local disk.
     pub fn restore_manifest(&self, namespace: NamespaceId, mut manifest: Manifest) {
         let handle = self.ns_handle(&namespace);
+        let state = handle.state.lock().unwrap();
+        if state.known && state.manifest.version > manifest.version {
+            return;
+        }
+        // Relearn vector dimensions from the restored segments on the next
+        // write (#204); `vector_dims` is only ever locked before `state`.
+        drop(state);
+        handle.vector_dims.lock().unwrap().take();
         let mut state = handle.state.lock().unwrap();
         if state.known && state.manifest.version > manifest.version {
             return;
@@ -3207,6 +3316,119 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #204: each vector column keeps its own index across a compaction,
+    /// which re-adds every document through `SegmentWriter`.
+    #[test]
+    fn compaction_preserves_vector_columns() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-compact-columns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("cols".into());
+        let title = |i: usize| vec![i as f32 + 1.0, 0.5, -(i as f32), 0.25];
+        let body = |i: usize| -> Vec<f32> { (0..8).map(|d| (d * i) as f32 * 0.1 + 0.3).collect() };
+        for i in 0..4 {
+            let mut fields = vec![Field::text("text", format!("doc {i}"))];
+            if i != 1 {
+                fields.push(Field::vector("title_emb", title(i)));
+            }
+            if i != 2 {
+                fields.push(Field::vector("body_emb", body(i)));
+            }
+            idx.index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId(format!("d{i}")),
+                    fields,
+                }],
+            )
+            .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+        }
+        let result = idx
+            .compact_namespace_with_options(&ns, CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
+        let after = idx.manifest(&ns).unwrap();
+        assert_eq!(after.segments.len(), 1);
+        let seg_dir = dir.join(&ns.0).join(&after.segments[0].segment_id.0);
+        let reader = kosha_segment::SegmentReader::open(seg_dir).unwrap();
+        let columns: Vec<(String, u32, u32)> = reader
+            .footer()
+            .vector_fields
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.name, m.dim, m.count))
+            .collect();
+        assert_eq!(
+            columns,
+            vec![("title_emb".into(), 4, 3), ("body_emb".into(), 8, 3)]
+        );
+        for (field, query, missing) in [("title_emb", title(3), "d1"), ("body_emb", body(3), "d2")]
+        {
+            let hits = reader
+                .knn_search_filtered(field, &query, 10, 100, None)
+                .unwrap()
+                .unwrap();
+            let ids: Vec<String> = hits
+                .iter()
+                .map(|(seq, _)| reader.doc_meta(*seq).unwrap().doc_id.to_owned())
+                .collect();
+            assert_eq!(ids.len(), 3, "{field}: {ids:?}");
+            assert_eq!(ids[0], "d3", "{field}: exact match first");
+            assert!(!ids.iter().any(|id| id == missing), "{field}: {ids:?}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #204: a vector whose dimension differs from its field's is rejected
+    /// at the write API, whether the field's dimension was fixed by a
+    /// flushed segment, by buffered documents, or earlier in the batch.
+    #[test]
+    fn vector_of_the_wrong_dimension_is_rejected_at_write() {
+        let dir = std::env::temp_dir().join(format!("kosha-vector-dims-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("dims".into());
+        let doc = |id: &str, field: &str, dim: usize| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::vector(field, vec![0.5; dim])],
+        };
+        let rejected = |r: Result<usize, KoshaError>| matches!(r, Err(KoshaError::InvalidQuery(ref m)) if m.contains("dimensions"));
+
+        let idx = Indexer::new(dir.clone());
+        idx.index_documents(ns.clone(), vec![doc("a", "emb", 4)])
+            .unwrap();
+        // Fixed by the buffered document.
+        assert!(rejected(
+            idx.index_documents(ns.clone(), vec![doc("b", "emb", 3)])
+        ));
+        // Within one batch.
+        assert!(rejected(idx.index_documents(
+            ns.clone(),
+            vec![doc("c", "other", 2), doc("d", "other", 5)]
+        )));
+        // A different field has its own dimension.
+        idx.index_documents(ns.clone(), vec![doc("e", "other", 8)])
+            .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        assert!(rejected(
+            idx.replace_documents(ns.clone(), vec![doc("a", "emb", 2)])
+        ));
+
+        // Fixed by a flushed segment's footer, for a fresh process.
+        let manifest = idx.manifest(&ns).unwrap();
+        let restarted = Indexer::new(dir.clone());
+        restarted.restore_manifest(ns.clone(), manifest);
+        assert!(rejected(
+            restarted.index_documents(ns.clone(), vec![doc("f", "other", 4)])
+        ));
+        restarted
+            .index_documents(ns.clone(), vec![doc("g", "other", 8), doc("h", "emb", 4)])
+            .unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

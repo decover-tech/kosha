@@ -354,6 +354,25 @@ mod tests {
         assert!(!assess_listing(&without_vec, Some(Ok(&c))).is_durable());
     }
 
+    /// #204: a further vector column's files are committed like any other,
+    /// so a segment missing one is not durable.
+    #[test]
+    fn committed_vector_column_files_are_checked() {
+        let mut listing = full_listing();
+        listing.push(("vector.idx".into(), 1000));
+        listing.push(("vector.offsets".into(), 40));
+        listing.push(("vector.1.idx".into(), 800));
+        listing.push(("vector.1.offsets".into(), 40));
+        let c = commit_for(&listing);
+        assert!(assess_listing(&listing, Some(Ok(&c))).is_durable());
+        let without: Vec<_> = listing
+            .iter()
+            .filter(|(name, _)| name != "vector.1.idx")
+            .cloned()
+            .collect();
+        assert!(!assess_listing(&without, Some(Ok(&c))).is_durable());
+    }
+
     #[test]
     fn unreadable_commit_is_not_durable() {
         assert!(!assess_listing(&full_listing(), Some(Err("boom"))).is_durable());

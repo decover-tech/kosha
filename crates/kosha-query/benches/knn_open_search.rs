@@ -266,9 +266,7 @@ fn main() {
             // v2 segments carry the lazy posting index; legacy/flat ones
             // carry a populated vector_store (served by exact flat_knn).
             assert!(
-                r.has_lazy_vector_index()
-                    || r.hnsw_map.is_some()
-                    || !r.vector_store.vectors.is_empty(),
+                r.has_lazy_vector_index() || !r.vector_store().vectors.is_empty(),
                 "vector segment opened without any vector index"
             );
         }
