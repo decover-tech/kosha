@@ -1927,12 +1927,16 @@ impl AppState {
 
     /// Bring a query replica's manifest for `ns` up to the stored version:
     /// one cheap version read, then the manifest itself only if it moved.
+    /// `NamespaceNotFound` when the control store has no such namespace
+    /// (never created, or deleted with `DELETE /v1/namespaces/{ns}`), so a
+    /// replica that still holds a deleted namespace answers 404 instead of
+    /// serving its old documents.
     fn refresh_query_namespace(&self, ns: &NamespaceId, warm: bool) -> Result<(), KoshaError> {
         let observed_at = Instant::now();
         let stored = self.controller.lock().unwrap().manifest_version(ns)?;
         match stored {
             Some(stored) => self.follow_stored_version(ns, stored, observed_at, warm),
-            None => Ok(()),
+            None => Err(KoshaError::NamespaceNotFound(ns.clone())),
         }
     }
 
@@ -2168,6 +2172,24 @@ impl AppState {
             .entry(ns.clone())
             .or_default()
             .clone()
+    }
+
+    /// Drop every per-namespace cache entry this node keeps for a deleted
+    /// namespace. Versions never repeat across a delete and re-create, so
+    /// this is hygiene (memory) rather than correctness, except for the
+    /// result cache on a writer that searched unpublished versions.
+    fn forget_namespace_caches(&self, ns: &NamespaceId) {
+        self.completed_hydrations
+            .lock()
+            .unwrap()
+            .retain(|(cached, _), _| cached != &ns.0);
+        self.result_cache.lock().unwrap().forget_namespace(&ns.0);
+        self.posting_blob_presence.lock().unwrap().remove(&ns.0);
+        #[cfg(feature = "s3")]
+        self.synced_segments
+            .lock()
+            .unwrap()
+            .retain(|(cached, _)| cached != ns);
     }
 
     fn publish_namespace(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
@@ -4825,6 +4847,10 @@ fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
 /// yes/no classification before a handler ever runs. If a new write route
 /// is added to `route()`, add its prefix here too.
 fn is_write_path(request_line: &str) -> bool {
+    // Namespace lifecycle: create and delete.
+    if is_create_namespace_route(request_line) || bare_namespace(request_line, "DELETE").is_some() {
+        return true;
+    }
     // v1 tenant-scoped write routes.
     if extract_namespace(request_line, "POST /v1/namespaces/", "/documents").is_some() {
         return true;
@@ -4967,8 +4993,11 @@ fn route(
             return json_error(403, "invalid tenant");
         }
         if let Some(rest) = path.strip_prefix("/v1/namespaces/") {
-            let Some((ns, _action)) = rest.rsplit_once('/') else {
-                return json_error(400, "invalid namespace path");
+            // `/v1/namespaces/{ns}/{action}`, or the bare
+            // `/v1/namespaces/{ns}` that `DELETE` addresses.
+            let ns = match rest.rsplit_once('/') {
+                Some((ns, _action)) => ns,
+                None => rest.split('?').next().unwrap_or(rest),
             };
             if !valid_namespace_component(&url_decode(ns)) {
                 return json_error(400, "invalid namespace");
@@ -5052,7 +5081,9 @@ fn route(
             let scoped = format!("GET /search?{} HTTP/1.1", pairs.join("&"));
             return route_inner(&scoped, headers, body, tenant, state);
         }
-        if !path.starts_with("/v1/namespaces/") && !["/healthz", "/v1/healthz"].contains(&path) {
+        if !path.starts_with("/v1/namespaces/")
+            && !["/healthz", "/v1/healthz", "/v1/namespaces"].contains(&bare_path)
+        {
             return json_error(404, "not found");
         }
     }
@@ -5070,6 +5101,14 @@ fn route_inner(
     // proto/kosha/v1/kosha.proto is the canonical source of truth for paths.
     if request_line.starts_with("GET /v1/healthz") {
         return json_ok(&serde_json::json!({"status": "ok"}));
+    }
+
+    if is_create_namespace_route(request_line) {
+        return handle_create_namespace(body, tenant, state);
+    }
+
+    if let Some(ns) = bare_namespace(request_line, "DELETE") {
+        return handle_delete_namespace(&ns, tenant, state);
     }
 
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/documents") {
@@ -5226,6 +5265,363 @@ fn extract_namespace(request_line: &str, prefix: &str, suffix: &str) -> Option<S
         return None;
     }
     Some(url_decode(ns))
+}
+
+/// `POST /v1/namespaces` (optionally with a query string).
+fn is_create_namespace_route(request_line: &str) -> bool {
+    parse_method_and_path(request_line).is_some_and(|(method, path)| {
+        method == "POST" && path.split('?').next() == Some("/v1/namespaces")
+    })
+}
+
+/// The namespace of a bare `METHOD /v1/namespaces/{ns}` path (no action
+/// suffix), URL-decoded. `None` for any other method or path shape.
+fn bare_namespace(request_line: &str, method: &str) -> Option<String> {
+    let (m, path) = parse_method_and_path(request_line)?;
+    if m != method {
+        return None;
+    }
+    let rest = path.strip_prefix("/v1/namespaces/")?;
+    let ns = rest.split('?').next()?;
+    if ns.is_empty() || ns.contains('/') {
+        return None;
+    }
+    Some(url_decode(ns))
+}
+
+// ─── POST /v1/namespaces, DELETE /v1/namespaces/{ns} ────────────────────────
+
+/// Proto `FieldType` names (`proto/kosha/v1/kosha.proto`), by enum number.
+const SCHEMA_FIELD_TYPES: [&str; 8] = [
+    "FIELD_TYPE_UNSPECIFIED",
+    "FIELD_TYPE_TEXT",
+    "FIELD_TYPE_KEYWORD",
+    "FIELD_TYPE_INTEGER",
+    "FIELD_TYPE_FLOAT",
+    "FIELD_TYPE_DATE",
+    "FIELD_TYPE_BOOLEAN",
+    "FIELD_TYPE_VECTOR",
+];
+
+/// Validate a `NamespaceSchema` from a `CreateNamespaceRequest` and return
+/// it in canonical proto-JSON form: every field has `type` (the
+/// `FIELD_TYPE_*` name), `indexed`, `stored` and `analyzer`. A field type
+/// may be given as the enum name, the bare name in any case (`"text"`,
+/// `"Keyword"`), or the enum number, and under `type` or `field_type`.
+/// Unknown keys and unknown types are rejected rather than ignored. The
+/// analysis extensions `POST /v1/namespaces/{ns}/schema` takes
+/// (`default_analyzer`, `default_stopwords`, and a field's `stopwords`)
+/// pass through unchanged.
+fn parse_namespace_schema(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+    const EXTENSIONS: [&str; 2] = ["default_analyzer", "default_stopwords"];
+    let obj = value
+        .as_object()
+        .ok_or("schema must be an object with a 'fields' map")?;
+    if let Some(key) = obj
+        .keys()
+        .find(|k| *k != "fields" && !EXTENSIONS.contains(&k.as_str()))
+    {
+        return Err(format!("unknown schema key '{key}'"));
+    }
+    let fields = match obj.get("fields") {
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(serde_json::Value::Object(map)) => map.clone(),
+        Some(_) => return Err("schema.fields must be an object".into()),
+    };
+    let mut out = serde_json::Map::new();
+    for (name, field) in fields {
+        if name.is_empty() {
+            return Err("schema field names must be non-empty".into());
+        }
+        let field = field
+            .as_object()
+            .ok_or_else(|| format!("schema field '{name}' must be an object"))?;
+        let mut canonical = serde_json::Map::new();
+        let mut field_type = SCHEMA_FIELD_TYPES[0];
+        let mut seen_type = false;
+        for (key, v) in field {
+            match key.as_str() {
+                "type" | "field_type" => {
+                    if seen_type {
+                        return Err(format!("schema field '{name}' names its type twice"));
+                    }
+                    seen_type = true;
+                    field_type = match v {
+                        serde_json::Value::Number(n) => n
+                            .as_u64()
+                            .and_then(|i| SCHEMA_FIELD_TYPES.get(i as usize).copied()),
+                        serde_json::Value::String(t) => {
+                            let upper = t.trim().to_ascii_uppercase();
+                            let bare = upper.strip_prefix("FIELD_TYPE_").unwrap_or(&upper);
+                            SCHEMA_FIELD_TYPES
+                                .iter()
+                                .copied()
+                                .find(|known| known.strip_prefix("FIELD_TYPE_") == Some(bare))
+                        }
+                        _ => None,
+                    }
+                    .ok_or_else(|| format!("schema field '{name}' has unknown type {v}"))?;
+                }
+                "indexed" | "stored" => {
+                    let flag = v
+                        .as_bool()
+                        .ok_or_else(|| format!("schema field '{name}': '{key}' must be a bool"))?;
+                    canonical.insert(key.clone(), serde_json::json!(flag));
+                }
+                "analyzer" => {
+                    let analyzers: Vec<String> = match v {
+                        serde_json::Value::String(a) => vec![a.clone()],
+                        serde_json::Value::Array(items) => items
+                            .iter()
+                            .map(|a| a.as_str().map(str::to_owned))
+                            .collect::<Option<_>>()
+                            .ok_or_else(|| {
+                                format!("schema field '{name}': 'analyzer' must be strings")
+                            })?,
+                        _ => {
+                            return Err(format!(
+                                "schema field '{name}': 'analyzer' must be a list of strings"
+                            ))
+                        }
+                    };
+                    canonical.insert("analyzer".into(), serde_json::json!(analyzers));
+                }
+                "stopwords" => {
+                    canonical.insert(key.clone(), v.clone());
+                }
+                other => return Err(format!("schema field '{name}' has unknown key '{other}'")),
+            }
+        }
+        canonical.insert("type".into(), serde_json::json!(field_type));
+        canonical
+            .entry("indexed")
+            .or_insert(serde_json::json!(false));
+        canonical
+            .entry("stored")
+            .or_insert(serde_json::json!(false));
+        canonical
+            .entry("analyzer")
+            .or_insert(serde_json::json!(Vec::<String>::new()));
+        out.insert(name, serde_json::Value::Object(canonical));
+    }
+    let mut schema = serde_json::json!({ "fields": out });
+    for key in EXTENSIONS {
+        if let Some(v) = obj.get(key) {
+            schema[key] = v.clone();
+        }
+    }
+    // The analyzers must resolve, as `POST /v1/namespaces/{ns}/schema`
+    // requires.
+    let typed: kosha_core::NamespaceSchema =
+        serde_json::from_value(schema.clone()).map_err(|e| e.to_string())?;
+    typed.resolve().map_err(|e| e.to_string())?;
+    Ok(schema)
+}
+
+/// `POST /v1/namespaces` — `CreateNamespaceRequest` → `CreateNamespaceResponse`.
+///
+/// The namespace is created inside the caller's tenant. 409 if it already
+/// exists, 400 for an invalid name or schema. Explicit creation is
+/// optional: namespaces still auto-create on first write.
+///
+/// The schema is validated, echoed back in canonical form, and stored as
+/// the namespace schema exactly as `POST /v1/namespaces/{ns}/schema` would
+/// (its analysis settings apply to the segments written from now on).
+fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> String {
+    let request: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+    };
+    let Some(name) = request.get("namespace").and_then(|v| v.as_str()) else {
+        return json_error(400, "missing 'namespace'");
+    };
+    if !valid_namespace_component(name) {
+        return json_error(400, "invalid namespace; use an unqualified namespace name");
+    }
+    let schema = match request.get("schema") {
+        None | Some(serde_json::Value::Null) => serde_json::json!({ "fields": {} }),
+        Some(raw) => match parse_namespace_schema(raw) {
+            Ok(schema) => schema,
+            Err(e) => return json_error(400, &format!("invalid schema: {e}")),
+        },
+    };
+    let typed_schema: kosha_core::NamespaceSchema =
+        serde_json::from_value(schema.clone()).unwrap_or_default();
+    let id = NamespaceId(tenant_namespace(tenant, name));
+
+    let lock = state.publication_lock(&id);
+    let guard = lock.lock().unwrap();
+    // A namespace this writer already holds (written to, not yet
+    // registered) exists as far as the caller can tell.
+    if state.indexer.manifest_version(&id).is_some() {
+        return json_error(409, &format!("namespace '{name}' already exists"));
+    }
+    let created = state
+        .controller
+        .lock()
+        .unwrap()
+        .create_namespace(id.clone());
+    match created {
+        Ok(()) => {}
+        Err(KoshaError::NamespaceExists(_)) => {
+            return json_error(409, &format!("namespace '{name}' already exists"));
+        }
+        Err(e) => return json_error(500, &format!("create namespace failed: {e}")),
+    }
+    let manifest = state
+        .controller
+        .lock()
+        .unwrap()
+        .manifest_cloned(&id)
+        .unwrap_or_else(|| kosha_core::Manifest::empty(0));
+    // Searchable (empty) right away on this node; query replicas pick the
+    // manifest up on their next refresh.
+    state.indexer.restore_manifest(id.clone(), manifest.clone());
+    println!(
+        "namespace created: ns={} version={}",
+        id.0, manifest.version
+    );
+    // Publishing takes the publication lock itself.
+    drop(guard);
+    let mut manifest = manifest;
+    if typed_schema != kosha_core::NamespaceSchema::default() {
+        match state.indexer.set_schema(&id, typed_schema) {
+            Ok(true) => {
+                if let Err(e) = state.publish_namespace(&id) {
+                    return json_error(500, &format!("schema publication failed: {e}"));
+                }
+                if let Some(published) = state.indexer.manifest(&id) {
+                    manifest = published;
+                }
+            }
+            Ok(false) => {}
+            Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
+            Err(e) => return json_error(500, &format!("schema update failed: {e}")),
+        }
+    }
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    json_ok(&serde_json::json!({
+        "id": name,
+        "schema": schema,
+        "document_count": manifest.segments.iter().map(|s| s.doc_count as u64).sum::<u64>(),
+        "segment_count": manifest.segments.len(),
+        "version": manifest.version,
+        "created_at": created_at,
+    }))
+}
+
+/// `DELETE /v1/namespaces/{ns}` — `DeleteNamespaceResponse`. 404 if the
+/// caller's tenant has no such namespace.
+///
+/// Under the namespace's publication lock, in order:
+/// 1. the control store drops the namespace and its manifest, keeping the
+///    highest version it reached so a re-created namespace continues above
+///    it (query replicas see a new version, never an old cached one);
+/// 2. the writer forgets the namespace: manifest, write buffer, deletes and
+///    every WAL record of it, so neither a flush nor a restart brings the
+///    documents back;
+/// 3. this node's caches for it are purged and its local segment
+///    directory removed;
+/// 4. with S3, every object under the namespace's prefix is deleted,
+///    synchronously, before the response. A failure there is reported
+///    (`storage_reclaimed: false`) but does not undo the delete: the
+///    leftover objects are unreferenced, and a re-created namespace never
+///    reuses their keys (segment ids carry a random writer id).
+///
+/// Query replicas keep their own disk cache of the deleted segments until
+/// LRU eviction (`KOSHA_CACHE_MAX_BYTES`); they answer 404 as soon as the
+/// control store has no manifest.
+fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String {
+    let id = NamespaceId(tenant_namespace(tenant, name));
+    let lock = state.publication_lock(&id);
+    let _guard = lock.lock().unwrap();
+    let local_version = state.indexer.manifest_version(&id);
+    let deleted = state
+        .controller
+        .lock()
+        .unwrap()
+        .delete_namespace(&id, local_version.unwrap_or(0));
+    let (manifest, retired) = match deleted {
+        Ok(deleted) => deleted,
+        // Known only to this writer (written to but not yet registered, or
+        // WAL-recovered under the in-memory control plane): still delete it.
+        Err(KoshaError::NamespaceNotFound(_)) if local_version.is_some() => (
+            state
+                .indexer
+                .manifest_cloned(&id)
+                .unwrap_or_else(|| kosha_core::Manifest::empty(0)),
+            local_version.unwrap_or(0),
+        ),
+        Err(KoshaError::NamespaceNotFound(_)) => {
+            return json_error(404, &format!("namespace '{name}' not found"));
+        }
+        Err(e) => return json_error(500, &format!("delete namespace failed: {e}")),
+    };
+    let next_version =
+        kosha_core::initial_manifest_version(Some(retired.max(local_version.unwrap_or(0))));
+    // Local segment files go while the writer still holds the namespace's
+    // locks, so a write to the new incarnation cannot lose its fresh segment.
+    let mut local_cleanup = Ok(());
+    let dropped = state.indexer.drop_namespace(&id, next_version, || {
+        local_cleanup = state.cache.evict_prefix(&id.0);
+    });
+    match dropped {
+        Ok(0) => {}
+        Ok(shared) => eprintln!(
+            "WARN: namespace {} deleted, but {shared} legacy WAL file(s) also hold other \
+             namespaces' records and were kept; a restart replays this namespace's records \
+             from them",
+            id.0
+        ),
+        Err(e) => {
+            return json_error(
+                500,
+                &format!(
+                    "namespace '{name}' was removed from the control store, but discarding its \
+                     write-ahead log failed: {e}"
+                ),
+            )
+        }
+    }
+    state.forget_namespace_caches(&id);
+    let mut storage_reclaimed = true;
+    if let Err(e) = local_cleanup {
+        eprintln!(
+            "WARN: namespace {} deleted, local segment cleanup failed: {e}",
+            id.0
+        );
+        storage_reclaimed = false;
+    }
+    #[cfg(feature = "s3")]
+    if let Some(ref s3) = state.s3_storage {
+        match s3.delete_prefix(&id.0) {
+            Ok(objects) => println!(
+                "namespace deleted: ns={} s3_objects_deleted={objects}",
+                id.0
+            ),
+            Err(e) => {
+                eprintln!(
+                    "WARN: namespace {} deleted, but deleting its S3 objects failed: {e}",
+                    id.0
+                );
+                storage_reclaimed = false;
+            }
+        }
+    }
+    println!(
+        "namespace deleted: ns={} version={} segments={} next_version={next_version}",
+        id.0,
+        manifest.version,
+        manifest.segments.len()
+    );
+    json_ok(&serde_json::json!({
+        "namespace": name,
+        "acknowledged": true,
+        "storage_reclaimed": storage_reclaimed,
+    }))
 }
 
 // ─── POST /index ────────────────────────────────────────────────────────────
@@ -6180,6 +6576,18 @@ impl ResultCache {
         }
     }
 
+    fn forget_namespace(&mut self, namespace: &str) {
+        let mut freed = 0;
+        self.entries.retain(|(ns, _, _), entry| {
+            let keep = ns != namespace;
+            if !keep {
+                freed += entry.bytes;
+            }
+            keep
+        });
+        self.bytes -= freed;
+    }
+
     fn insert(&mut self, key: (String, u64, String), resp: &str) {
         if self.budget == 0 {
             return;
@@ -6635,6 +7043,18 @@ fn handle_exists_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &App
 
 fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> String {
     let scoped_ns = tenant_namespace(tenant, namespace);
+    // On a query replica, follow the control store: a namespace created or
+    // deleted on the ingest node shows up (or 404s) here too.
+    if let Err(e) =
+        state.ensure_query_manifest_fresh(&NamespaceId(scoped_ns.clone()), Some(Duration::ZERO))
+    {
+        return match e {
+            KoshaError::NamespaceNotFound(_) => {
+                json_error(404, &format!("namespace '{namespace}' not found"))
+            }
+            e => json_error(500, &format!("stats error: {e}")),
+        };
+    }
     let indexer = &state.indexer;
     let manifest = match indexer.manifest(&NamespaceId(scoped_ns.clone())) {
         Some(m) => m,
@@ -8163,6 +8583,9 @@ fn search_error_response(e: &KoshaError) -> String {
         KoshaError::Overloaded(_) => json_error(429, &format!("search overloaded: {e}")),
         KoshaError::ControlPlane(_) => json_error(503, &format!("search unavailable: {e}")),
         KoshaError::InvalidQuery(_) => json_error(400, &e.to_string()),
+        // A query replica learns from the control store that the namespace
+        // does not exist (never created, or deleted).
+        KoshaError::NamespaceNotFound(_) => json_error(404, &e.to_string()),
         _ => json_error(500, &format!("search error: {e}")),
     }
 }
@@ -8344,6 +8767,515 @@ mod tests {
         fn namespace_count(&self) -> usize {
             self.inner.lock().unwrap().namespace_count()
         }
+        fn delete_namespace(
+            &mut self,
+            id: &NamespaceId,
+            retire_at_least: u64,
+        ) -> Result<(kosha_core::Manifest, u64), KoshaError> {
+            self.inner
+                .lock()
+                .unwrap()
+                .delete_namespace(id, retire_at_least)
+        }
+    }
+
+    impl SharedManifestStore {
+        fn new(inner: Arc<Mutex<kosha_control::Controller>>) -> Self {
+            Self {
+                inner,
+                lose_next_commit_reply: Default::default(),
+                commit_on_next_version_read: Default::default(),
+            }
+        }
+    }
+
+    // ── Namespace lifecycle: POST /v1/namespaces, DELETE /v1/namespaces/{ns}
+
+    fn status_of(response: &str) -> u16 {
+        response
+            .get(9..12)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn body_of(response: &str) -> serde_json::Value {
+        let (_, body) = response.split_once("\r\n\r\n").expect("no body");
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn v1(state: &AppState, tenant: &str, line: &str, body: serde_json::Value) -> String {
+        let bytes = if body.is_null() {
+            Vec::new()
+        } else {
+            serde_json::to_vec(&body).unwrap()
+        };
+        route(
+            &format!("{line} HTTP/1.1\r\n"),
+            &HashMap::new(),
+            &bytes,
+            tenant,
+            state,
+        )
+    }
+
+    fn one_doc(id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({"documents": [
+            {"id": id, "fields": [{"name": "title", "field_type": "Text", "value": text}]}
+        ]})
+    }
+
+    #[test]
+    fn namespace_create_conflicts_validates_and_is_tenant_scoped() {
+        let state = test_state();
+        let create =
+            |tenant: &str, body: serde_json::Value| v1(&state, tenant, "POST /v1/namespaces", body);
+
+        let created = create("acme", serde_json::json!({"namespace": "docs"}));
+        assert_eq!(status_of(&created), 200, "{created}");
+        let body = body_of(&created);
+        assert_eq!(body["id"], "docs");
+        assert_eq!(body["document_count"], 0);
+        assert_eq!(body["segment_count"], 0);
+        assert_eq!(body["schema"], serde_json::json!({"fields": {}}));
+        assert!(body["created_at"].as_u64().unwrap() > 0);
+        assert!(state
+            .controller
+            .lock()
+            .unwrap()
+            .has_namespace(&NamespaceId("acme/docs".into())));
+
+        // Duplicate → 409, not 500.
+        let dup = create("acme", serde_json::json!({"namespace": "docs"}));
+        assert_eq!(status_of(&dup), 409, "{dup}");
+        // The same name in another tenant is a different namespace.
+        let other = create("globex", serde_json::json!({"namespace": "docs"}));
+        assert_eq!(status_of(&other), 200, "{other}");
+
+        // An explicitly created namespace is searchable (empty) right away.
+        let search = v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/search",
+            serde_json::json!({"query_text": "anything"}),
+        );
+        assert_eq!(status_of(&search), 200, "{search}");
+        assert_eq!(body_of(&search)["total_hits"], 0);
+        let stats = v1(
+            &state,
+            "acme",
+            "GET /v1/namespaces/docs/stats",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&stats), 200, "{stats}");
+
+        // Invalid names → 400.
+        for bad in [
+            serde_json::json!({"namespace": "a/b"}),
+            serde_json::json!({"namespace": ""}),
+            serde_json::json!({"namespace": ".."}),
+            serde_json::json!({"namespace": 7}),
+            serde_json::json!({}),
+        ] {
+            let resp = create("acme", bad.clone());
+            assert_eq!(status_of(&resp), 400, "{bad} → {resp}");
+        }
+        let not_json = route(
+            "POST /v1/namespaces HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"{",
+            "acme",
+            &state,
+        );
+        assert_eq!(status_of(&not_json), 400, "{not_json}");
+
+        // Schema: validated and returned in canonical proto-JSON form.
+        let with_schema = create(
+            "acme",
+            serde_json::json!({"namespace": "typed", "schema": {"fields": {
+                "body": {"type": "text", "indexed": true, "analyzer": ["standard"]},
+                "sku": {"type": "FIELD_TYPE_KEYWORD", "stored": true},
+                "qty": {"field_type": 3},
+            }}}),
+        );
+        assert_eq!(status_of(&with_schema), 200, "{with_schema}");
+        assert_eq!(
+            body_of(&with_schema)["schema"],
+            serde_json::json!({"fields": {
+                "body": {"type": "FIELD_TYPE_TEXT", "indexed": true, "stored": false, "analyzer": ["standard"]},
+                "sku": {"type": "FIELD_TYPE_KEYWORD", "indexed": false, "stored": true, "analyzer": []},
+                "qty": {"type": "FIELD_TYPE_INTEGER", "indexed": false, "stored": false, "analyzer": []},
+            }})
+        );
+        for bad_schema in [
+            serde_json::json!({"fields": {"x": {"type": "geo_point"}}}),
+            serde_json::json!({"fields": {"x": {"type": 99}}}),
+            serde_json::json!({"fields": {"x": {"typo": true}}}),
+            serde_json::json!({"fields": {"x": {"indexed": "yes"}}}),
+            serde_json::json!({"fields": []}),
+            serde_json::json!({"mappings": {}}),
+        ] {
+            let resp = create(
+                "acme",
+                serde_json::json!({"namespace": "bad-schema", "schema": bad_schema}),
+            );
+            assert_eq!(status_of(&resp), 400, "{bad_schema} → {resp}");
+        }
+        assert!(!state
+            .controller
+            .lock()
+            .unwrap()
+            .has_namespace(&NamespaceId("acme/bad-schema".into())));
+
+        // Auto-create on first write still works without an explicit create,
+        // and an explicit create afterwards is a conflict.
+        let indexed = v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/auto/documents",
+            one_doc("d", "x"),
+        );
+        assert_eq!(status_of(&indexed), 200, "{indexed}");
+        let late = create("acme", serde_json::json!({"namespace": "auto"}));
+        assert_eq!(status_of(&late), 409, "{late}");
+    }
+
+    #[test]
+    fn namespace_delete_round_trip_is_tenant_scoped_and_recreate_starts_empty() {
+        let state = test_state();
+        let ok = |resp: String| {
+            assert_eq!(status_of(&resp), 200, "{resp}");
+            body_of(&resp)
+        };
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "docs"}),
+        ));
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d1", "quick fox"),
+        ));
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        ));
+        // Buffered, never flushed: must not survive the delete either.
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d2", "quick dog"),
+        ));
+        let search = || {
+            v1(
+                &state,
+                "acme",
+                "POST /v1/namespaces/docs/search",
+                serde_json::json!({"query_text": "quick"}),
+            )
+        };
+        assert_eq!(ok(search())["total_hits"], 1);
+        let old_version = state
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_version(&NamespaceId("acme/docs".into()))
+            .unwrap()
+            .unwrap();
+        let seg_dir = state.data_dir.join("acme/docs");
+        assert!(seg_dir.is_dir());
+
+        // Tenant B cannot see or delete tenant A's namespace.
+        let foreign = v1(
+            &state,
+            "globex",
+            "DELETE /v1/namespaces/docs",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&foreign), 404, "{foreign}");
+        let foreign_search = v1(
+            &state,
+            "globex",
+            "POST /v1/namespaces/docs/search",
+            serde_json::json!({"query_text": "quick"}),
+        );
+        assert_eq!(status_of(&foreign_search), 404, "{foreign_search}");
+        assert_eq!(ok(search())["total_hits"], 1);
+
+        let deleted = ok(v1(
+            &state,
+            "acme",
+            "DELETE /v1/namespaces/docs",
+            serde_json::Value::Null,
+        ));
+        assert_eq!(deleted["namespace"], "docs");
+        assert_eq!(deleted["acknowledged"], true);
+        assert_eq!(deleted["storage_reclaimed"], true);
+        assert_eq!(status_of(&search()), 404);
+        let stats = v1(
+            &state,
+            "acme",
+            "GET /v1/namespaces/docs/stats",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&stats), 404, "{stats}");
+        assert!(!seg_dir.exists(), "local segments are removed");
+        let again = v1(
+            &state,
+            "acme",
+            "DELETE /v1/namespaces/docs",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&again), 404, "{again}");
+        assert!(state.result_cache.lock().unwrap().entries.is_empty());
+
+        // Re-create starts empty, above every version the old one used.
+        let created = ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "docs"}),
+        ));
+        assert!(
+            created["version"].as_u64().unwrap() > old_version,
+            "{created}"
+        );
+        assert_eq!(ok(search())["total_hits"], 0);
+        // Flushing the new incarnation must not bring back the buffered doc.
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        ));
+        assert_eq!(ok(search())["total_hits"], 0);
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d3", "quick cat"),
+        ));
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        ));
+        let hits = ok(search());
+        assert_eq!(hits["total_hits"], 1, "{hits}");
+        assert!(hits.to_string().contains("d3"), "{hits}");
+
+        // Deleting a namespace that only ever auto-created works the same.
+        ok(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/auto/documents",
+            one_doc("a", "x"),
+        ));
+        ok(v1(
+            &state,
+            "acme",
+            "DELETE /v1/namespaces/auto",
+            serde_json::Value::Null,
+        ));
+        let gone = v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/auto/search",
+            serde_json::json!({"query_text": "x"}),
+        );
+        assert_eq!(status_of(&gone), 404, "{gone}");
+    }
+
+    #[test]
+    fn namespace_delete_discards_the_wal_so_a_restart_does_not_resurrect_it() {
+        let state = test_state();
+        let dir = state.data_dir.clone();
+        let ns = NamespaceId("acme/docs".into());
+        let kept = NamespaceId("acme/kept".into());
+        for name in ["docs", "kept"] {
+            let resp = v1(
+                &state,
+                "acme",
+                &format!("POST /v1/namespaces/{name}/documents"),
+                one_doc("d", "buffered only"),
+            );
+            assert_eq!(status_of(&resp), 200, "{resp}");
+        }
+        assert!(state.indexer.pending_doc_count(&ns) > 0);
+        let resp = v1(
+            &state,
+            "acme",
+            "DELETE /v1/namespaces/docs",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&resp), 200, "{resp}");
+        drop(state);
+
+        let restarted = AppState::new(dir);
+        assert!(restarted.indexer.manifest(&ns).is_none());
+        assert_eq!(restarted.indexer.pending_doc_count(&ns), 0);
+        assert!(restarted.indexer.pending_doc_count(&kept) > 0);
+    }
+
+    #[test]
+    fn namespace_routes_reject_bad_paths() {
+        let state = test_state();
+        for (line, code) in [
+            ("DELETE /v1/namespaces/..", 400),
+            ("DELETE /v1/namespaces/", 400),
+            ("DELETE /v1/namespaces/%2F", 400),
+            ("GET /v1/namespaces/docs", 404),
+            ("GET /v1/namespaces", 404),
+            ("DELETE /v1/namespaces", 404),
+            ("DELETE /v1/namespaces/missing", 404),
+        ] {
+            let resp = v1(&state, "acme", line, serde_json::Value::Null);
+            assert_eq!(status_of(&resp), code, "{line} → {resp}");
+        }
+    }
+
+    /// A query replica forwards both lifecycle routes to the ingest node
+    /// over real sockets, and its own reads follow the control store they
+    /// share: create → index → search → delete → 404 → re-create → empty.
+    #[test]
+    fn query_replica_forwards_namespace_create_and_delete() {
+        use std::io::Read;
+
+        let shared = Arc::new(Mutex::new(kosha_control::Controller::new()));
+        let ingest = test_state();
+        *ingest.controller.lock().unwrap() = Box::new(SharedManifestStore::new(shared.clone()));
+        let mut query = AppState::new(ingest.data_dir.clone());
+        *query.controller.lock().unwrap() = Box::new(SharedManifestStore::new(shared.clone()));
+
+        let ingest_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ingest_addr = ingest_listener.local_addr().unwrap();
+        let ingest = Arc::new(ingest);
+        let ingest_handle = ingest.clone();
+        std::thread::spawn(move || serve(ingest_listener, ingest, Duration::from_secs(30)));
+        query.ingest_host = Some(format!("http://{ingest_addr}"));
+        query.write_http_client = Some(
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+        );
+        let query_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let query_addr = query_listener.local_addr().unwrap();
+        std::thread::spawn(move || serve(query_listener, Arc::new(query), Duration::from_secs(30)));
+
+        let call =
+            |method: &str, path: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+                let body = if body.is_null() {
+                    String::new()
+                } else {
+                    body.to_string()
+                };
+                let mut s = TcpStream::connect(query_addr).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                s.write_all(
+                    format!(
+                        "{method} {path} HTTP/1.1\r\nhost: q\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+                let mut resp = String::new();
+                s.read_to_string(&mut resp).unwrap();
+                (status_of(&resp), body_of(&resp))
+            };
+        // `max_staleness_seconds: 0`: read the control store on every
+        // search (#232), so each step sees the ingest node's last change.
+        let search = || {
+            call(
+                "POST",
+                "/v1/namespaces/docs/search",
+                serde_json::json!({"query_text": "quick", "max_staleness_seconds": 0}),
+            )
+        };
+        let ns = NamespaceId("dev/docs".into());
+
+        let (code, body) = call(
+            "POST",
+            "/v1/namespaces",
+            serde_json::json!({"namespace": "docs"}),
+        );
+        assert_eq!(code, 200, "{body}");
+        assert!(shared.lock().unwrap().has_namespace(&ns));
+        assert!(
+            ingest_handle.indexer.manifest_version(&ns).is_some(),
+            "the create ran on the ingest node"
+        );
+        let (code, body) = call(
+            "POST",
+            "/v1/namespaces",
+            serde_json::json!({"namespace": "docs"}),
+        );
+        assert_eq!(code, 409, "{body}");
+        assert_eq!(search().0, 200, "the replica sees the new, empty namespace");
+
+        assert_eq!(
+            call(
+                "POST",
+                "/v1/namespaces/docs/documents",
+                one_doc("d1", "quick fox")
+            )
+            .0,
+            200
+        );
+        assert_eq!(
+            call("POST", "/v1/namespaces/docs/flush", serde_json::json!({})).0,
+            200
+        );
+        let (code, body) = search();
+        assert_eq!(
+            (code, body["total_hits"].clone()),
+            (200, serde_json::json!(1)),
+            "{body}"
+        );
+
+        let (code, body) = call("DELETE", "/v1/namespaces/docs", serde_json::Value::Null);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["acknowledged"], true);
+        assert!(!shared.lock().unwrap().has_namespace(&ns));
+        assert!(
+            ingest_handle.indexer.manifest_version(&ns).is_none(),
+            "the delete ran on the ingest node"
+        );
+        assert_eq!(search().0, 404);
+        assert_eq!(
+            call("GET", "/v1/namespaces/docs/stats", serde_json::Value::Null).0,
+            404
+        );
+        assert_eq!(
+            call("DELETE", "/v1/namespaces/docs", serde_json::Value::Null).0,
+            404
+        );
+
+        // Re-create: the replica still holds the old incarnation in memory
+        // (and its result cache has the old answer), but the new one's
+        // versions are all higher, so it serves the new, empty namespace.
+        assert_eq!(
+            call(
+                "POST",
+                "/v1/namespaces",
+                serde_json::json!({"namespace": "docs"})
+            )
+            .0,
+            200
+        );
+        let (code, body) = search();
+        assert_eq!(
+            (code, body["total_hits"].clone()),
+            (200, serde_json::json!(0)),
+            "{body}"
+        );
     }
 
     #[cfg(feature = "s3")]
@@ -11592,6 +12524,8 @@ mod tests {
             "POST /replace HTTP/1.1\r\n",
             "POST /flush HTTP/1.1\r\n",
             "POST /delete HTTP/1.1\r\n",
+            "POST /v1/namespaces HTTP/1.1\r\n",
+            "DELETE /v1/namespaces/foo HTTP/1.1\r\n",
         ] {
             assert!(is_write_path(line), "expected write-path: {line:?}");
         }
@@ -11611,6 +12545,9 @@ mod tests {
             "POST /search HTTP/1.1\r\n",
             "POST /exists HTTP/1.1\r\n",
             "GET /stats HTTP/1.1\r\n",
+            "GET /v1/namespaces/foo HTTP/1.1\r\n",
+            "POST /v1/namespaces/foo HTTP/1.1\r\n",
+            "DELETE /v1/namespaces/foo/documents HTTP/1.1\r\n",
         ] {
             assert!(!is_write_path(line), "expected read-path: {line:?}");
         }

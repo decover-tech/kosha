@@ -103,6 +103,39 @@ pub trait ControlStore: Send + Sync {
     ) -> Result<(), KoshaError>;
     fn list_namespaces(&self) -> Vec<NamespaceId>;
     fn namespace_count(&self) -> usize;
+
+    /// Remove a namespace and its manifest (`DELETE /v1/namespaces/{ns}`).
+    ///
+    /// Returns the manifest the namespace last committed (so the caller can
+    /// reclaim its segment objects) and the namespace's *retired version*:
+    /// the highest manifest version any deleted incarnation of this id
+    /// reached, raised to at least `retire_at_least`. The store keeps that
+    /// number after the namespace is gone, and every later incarnation of
+    /// the same id (explicit create, `ensure_namespace`, or a CAS
+    /// bootstrap) starts at `retired + 1`. Manifest versions therefore never
+    /// repeat across a delete and re-create, which is what keeps caches
+    /// keyed by `(namespace, version)` on query replicas from serving the
+    /// deleted incarnation's data.
+    ///
+    /// `NamespaceNotFound` if the namespace does not exist.
+    fn delete_namespace(
+        &mut self,
+        id: &NamespaceId,
+        retire_at_least: u64,
+    ) -> Result<(Manifest, u64), KoshaError> {
+        let _ = retire_at_least;
+        Err(KoshaError::NotFound(format!(
+            "this control store cannot delete namespace {}",
+            id.0
+        )))
+    }
+}
+
+/// The manifest version a new incarnation of a namespace starts at, given
+/// the version its last deleted incarnation retired at (`None` if it was
+/// never deleted). See [`ControlStore::delete_namespace`].
+pub fn initial_manifest_version(retired: Option<u64>) -> u64 {
+    retired.map_or(0, |v| v.saturating_add(1))
 }
 
 // ─── Identifiers ───────────────────────────────────────────────────────────
@@ -2511,6 +2544,22 @@ impl Manifest {
         }
     }
 
+    /// A manifest with no segments, deletes or WAL checkpoint.
+    pub fn empty(version: u64) -> Self {
+        Self {
+            version,
+            segments: Vec::new(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            retired: Default::default(),
+        }
+    }
+
     /// Semantic equality, independent of hash-map serialization order.
     pub fn same_contents(&self, other: &Self) -> bool {
         if self.tombstones != other.tombstones {
@@ -3486,6 +3535,9 @@ pub struct IndexResponse {
 #[derive(Debug)]
 pub enum KoshaError {
     NamespaceNotFound(NamespaceId),
+    /// An explicit create named a namespace that already exists. Maps to
+    /// HTTP 409.
+    NamespaceExists(NamespaceId),
     ManifestConflict {
         namespace: NamespaceId,
         expected: u64,
@@ -3524,6 +3576,7 @@ impl std::fmt::Display for KoshaError {
             Self::ManifestConflict { namespace, expected, actual } => write!(f,
                 "manifest conflict for {}: expected version {expected}, actual {actual:?}; stale writer must reload before publishing", namespace.0),
             Self::NamespaceNotFound(id) => write!(f, "namespace not found: {}", id.0),
+            Self::NamespaceExists(id) => write!(f, "namespace already exists: {}", id.0),
             Self::SegmentNotFound(id) => write!(f, "segment not found: {}", id.0),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Serde(e) => write!(f, "serialization error: {e}"),

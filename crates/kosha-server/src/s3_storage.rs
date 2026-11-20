@@ -726,6 +726,75 @@ impl S3Storage {
         })
     }
 
+    /// Delete every object under a logical directory, recursively: a
+    /// deleted namespace's segments, footers and deletion sidecars
+    /// (`DELETE /v1/namespaces/{ns}`). Paginated listing, `DeleteObjects`
+    /// in batches of up to 1000 keys. Returns how many objects were
+    /// deleted. Refuses an empty path (the whole bucket prefix).
+    pub fn delete_prefix(&self, path: &str) -> Result<usize, KoshaError> {
+        if path.trim_matches('/').is_empty() {
+            return Err(KoshaError::NotFound(
+                "refusing to delete the whole S3 prefix".into(),
+            ));
+        }
+        let mut prefix = self.s3_key(path.trim_end_matches('/'));
+        prefix.push('/');
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+
+        self.rt.block_on(async move {
+            use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+            let mut deleted = 0usize;
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                if let Some(token) = continuation.take() {
+                    req = req.continuation_token(token);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let objects = resp
+                    .contents()
+                    .iter()
+                    .filter_map(|obj| obj.key())
+                    .map(|key| ObjectIdentifier::builder().key(key).build())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| KoshaError::NotFound(format!("S3 delete batch: {e}")))?;
+                if !objects.is_empty() {
+                    let count = objects.len();
+                    let delete = Delete::builder()
+                        .set_objects(Some(objects))
+                        .quiet(true)
+                        .build()
+                        .map_err(|e| KoshaError::NotFound(format!("S3 delete batch: {e}")))?;
+                    let out = client
+                        .delete_objects()
+                        .bucket(&bucket)
+                        .delete(delete)
+                        .send()
+                        .await
+                        .map_err(|e| KoshaError::NotFound(format!("S3 delete_objects: {e}")))?;
+                    if let Some(err) = out.errors().first() {
+                        return Err(KoshaError::NotFound(format!(
+                            "S3 delete_objects: {} of {count} objects failed, first {}: {}",
+                            out.errors().len(),
+                            err.key().unwrap_or("?"),
+                            err.message().unwrap_or("unknown error")
+                        )));
+                    }
+                    deleted += count;
+                }
+                match resp.next_continuation_token() {
+                    Some(t) => continuation = Some(t.to_string()),
+                    None => break,
+                }
+            }
+            Ok(deleted)
+        })
+    }
+
     /// Ground-truth durability check for one segment prefix, unlike
     /// `StorageBackend::exists` (local disk only) or `list_with_sizes`/`list`
     /// (which fall back to local on an empty S3 listing, so they can't tell

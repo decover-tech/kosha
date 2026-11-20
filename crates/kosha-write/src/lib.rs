@@ -1874,6 +1874,52 @@ impl Indexer {
         Ok(true)
     }
 
+    /// Forget everything this writer holds for a deleted namespace: its
+    /// manifest, write buffer, deletes, WAL-recovered records and every WAL
+    /// record of it on disk, so neither a later flush nor a restart can
+    /// bring the deleted documents back.
+    ///
+    /// Waits for in-flight writes, flushes, upserts and compactions on the
+    /// namespace to finish. A write that arrives afterwards starts a new,
+    /// empty incarnation (namespaces auto-create on first write) whose
+    /// first manifest version is `next_version`, the version the control
+    /// store will accept for a re-created namespace (see
+    /// `ControlStore::delete_namespace`). The namespace reads as unknown
+    /// (`manifest` is `None`) until something is written to it again.
+    ///
+    /// `while_locked` runs after the state is reset, before the
+    /// namespace's locks are released: the place to remove its local
+    /// segment files without racing a write to the new incarnation.
+    ///
+    /// Returns how many WAL files were kept because they also hold another
+    /// namespace's records (legacy multi-record files only).
+    pub fn drop_namespace(
+        &self,
+        namespace: &NamespaceId,
+        next_version: u64,
+        while_locked: impl FnOnce(),
+    ) -> Result<usize, KoshaError> {
+        let handle = self.ns_handle(namespace);
+        // Same order every writer takes them: writes -> compact -> mutation
+        // -> state.
+        let _writes = handle.writes.lock().unwrap();
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        let mut state = handle.state.lock().unwrap();
+        let mut fresh = NamespaceState::new();
+        fresh.manifest.version = next_version;
+        fresh.published_version = next_version;
+        // WAL sequences are process-wide; never hand one out twice.
+        fresh.wal_sequence = state.wal_sequence;
+        *state = fresh;
+        drop(state);
+        // Still under the namespace's locks: no new record can be appended
+        // for it until the old ones are gone.
+        let shared = self.wal.discard_namespace(namespace);
+        while_locked();
+        shared
+    }
+
     pub fn manifest(&self, namespace: &NamespaceId) -> Option<Manifest> {
         self.manifest_cloned(namespace)
     }
@@ -2719,6 +2765,63 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn dropped_namespace_loses_its_buffer_and_wal_but_not_its_neighbours() {
+        let dir = std::env::temp_dir().join(format!("kosha-drop-ns-{}", uuid::Uuid::new_v4()));
+        let gone = NamespaceId("t/gone".into());
+        let kept = NamespaceId("t/kept".into());
+        let doc = |id: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", "hello")],
+        };
+        let idx = Indexer::new(dir.clone());
+        idx.index_documents(gone.clone(), vec![doc("a")]).unwrap();
+        idx.flush_namespace(&gone).unwrap();
+        idx.index_documents(gone.clone(), vec![doc("b")]).unwrap();
+        idx.index_documents(kept.clone(), vec![doc("c")]).unwrap();
+        assert_eq!(idx.pending_doc_count(&gone), 1);
+        let published = idx.manifest(&gone).unwrap().version;
+
+        assert_eq!(idx.drop_namespace(&gone, published + 1, || {}).unwrap(), 0);
+        assert!(
+            idx.manifest(&gone).is_none(),
+            "a dropped namespace is unknown"
+        );
+        assert_eq!(idx.pending_doc_count(&gone), 0);
+        assert!(!idx.namespaces().contains(&gone));
+        assert_eq!(idx.pending_doc_count(&kept), 1);
+
+        // A restart replays only the surviving namespace's WAL.
+        drop(idx);
+        let restart = Indexer::new(dir.clone());
+        assert!(
+            restart.manifest(&gone).is_none(),
+            "WAL must not resurrect it"
+        );
+        // (Counted once buffered and once as a record awaiting replay.)
+        assert!(
+            restart.pending_doc_count(&kept) > 0,
+            "other WAL records survive"
+        );
+        assert_eq!(restart.pending_doc_count(&gone), 0);
+        drop(restart);
+
+        // Writing again starts a new, empty incarnation above the old
+        // versions.
+        let idx = Indexer::new(dir.clone());
+        idx.drop_namespace(&gone, published + 1, || {}).unwrap();
+        idx.index_documents(gone.clone(), vec![doc("d")]).unwrap();
+        idx.flush_namespace(&gone).unwrap();
+        let manifest = idx.manifest(&gone).unwrap();
+        assert_eq!(manifest.version, published + 2);
+        let (expected, _) = idx.publication_snapshot(&gone).unwrap();
+        assert_eq!(expected, published + 1);
+        let live = live_records(&dir, &gone, &manifest);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].doc_id.0, "d");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

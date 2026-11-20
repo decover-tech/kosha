@@ -455,6 +455,52 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Discard every WAL record of a deleted namespace, whatever its LSN,
+    /// so a restart cannot replay them and resurrect the namespace. A
+    /// group-commit file that holds only this namespace's records is
+    /// deleted now. A file shared with other namespaces' records is kept
+    /// (those records are still needed) and counted in the returned number;
+    /// the namespace is marked checkpointed through its records there, so
+    /// the file is reclaimed as soon as the other namespaces in it are
+    /// checkpointed. Until then a restart would replay the deleted
+    /// namespace's records from it.
+    pub fn discard_namespace(&self, namespace: &NamespaceId) -> Result<usize, KoshaError> {
+        let _reclaim = self.reclaim.lock().unwrap();
+        let (eligible, shared, high) = {
+            let mut state = self.state.lock().unwrap();
+            let mut eligible = Vec::new();
+            let mut shared = 0usize;
+            let mut through = 0u64;
+            for (file, namespaces) in &state.files {
+                let Some(max) = namespaces.get(namespace) else {
+                    continue;
+                };
+                through = through.max(*max);
+                if namespaces.len() == 1 {
+                    eligible.push(*file);
+                } else {
+                    shared += 1;
+                }
+            }
+            if through > 0 {
+                let known = state.checkpoints.entry(namespace.clone()).or_insert(0);
+                *known = (*known).max(through);
+            }
+            (eligible, shared, state.next_lsn - 1)
+        };
+        if !eligible.is_empty() {
+            // Deleted files no longer witness their LSNs (as in
+            // `clear_through`).
+            self.persist_high(high)?;
+            self.store.delete(&eligible)?;
+            let mut state = self.state.lock().unwrap();
+            for file in &eligible {
+                state.files.remove(file);
+            }
+        }
+        Ok(shared)
+    }
+
     /// Append a batch of documents; returns the record's LSN once it is
     /// durable.
     pub fn append(
