@@ -461,7 +461,31 @@ def test_aggregations_pass_through_and_sub_aggregations_are_refused():
     )
     assert "sub-aggregations" in message
     assert "top_hits" in refused({"aggs": {"one": {"top_hits": {"size": 1}}}})
-    assert "max" in refused({"aggs": {"last_page": {"max": {"field": "pageNumber"}}}})
+    assert "stats" in refused({"aggs": {"s": {"stats": {"field": "pageNumber"}}}})
+    assert "sub-aggregations under 'max'" in refused(
+        {"aggs": {"m": {"max": {"field": "a"}, "aggs": {"x": {"min": {"field": "b"}}}}}}
+    )
+
+
+def test_metric_aggregations_and_metric_sub_aggregations_pass_through():
+    metrics = {
+        kind: {kind: {"field": "pageNumber"}}
+        for kind in ("min", "max", "sum", "avg", "value_count")
+    }
+    assert translate({"size": 0, "aggs": metrics})["aggs"] == metrics
+    nested = {
+        "by_sender": {
+            "terms": {"field": "senderEmail"},
+            "meta": {"ignored": True},
+            "aggregations": {"pages": {"sum": {"field": "pageNumber"}}},
+        }
+    }
+    assert translate({"size": 0, "aggs": nested})["aggs"] == {
+        "by_sender": {
+            "terms": {"field": "senderEmail"},
+            "aggs": {"pages": {"sum": {"field": "pageNumber"}}},
+        }
+    }
 
 
 def test_response_reports_relation_sort_values_collapse_fields_and_highlight():

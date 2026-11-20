@@ -793,9 +793,12 @@ class KoshaClient:
         }
         return kosha, context
 
-    # Aggregation types Kosha computes. A sub-aggregation is refused rather
-    # than ignored: the caller would read buckets that are not there.
-    _AGG_TYPES = ("terms", "cardinality", "composite")
+    # Aggregation types Kosha computes. Metric aggregations can be nested
+    # under a bucket aggregation; any other sub-aggregation is refused
+    # rather than ignored: the caller would read buckets that are not there.
+    _BUCKET_AGG_TYPES = ("terms", "composite")
+    _METRIC_AGG_TYPES = ("min", "max", "sum", "avg", "value_count")
+    _AGG_TYPES = ("terms", "cardinality", "composite", *_METRIC_AGG_TYPES)
 
     @classmethod
     def _extract_aggs(cls, body: dict | None) -> dict | None:
@@ -805,16 +808,30 @@ class KoshaClient:
         aggs = body.get("aggs") or body.get("aggregations")
         if not aggs:
             return None
+        return cls._translate_aggs(aggs, parent=None)
+
+    @classmethod
+    def _translate_aggs(cls, aggs: dict, parent: str | None) -> dict:
         out = {}
         for name, spec in aggs.items():
             if not isinstance(spec, dict):
                 raise cls._unsupported(f"aggregation {name!r}: {spec!r}")
-            if "aggs" in spec or "aggregations" in spec:
-                raise cls._unsupported(f"sub-aggregations (in {name!r})")
-            kinds = [k for k in spec if k != "meta"]
+            subs = spec.get("aggs") or spec.get("aggregations")
+            kinds = [k for k in spec if k not in ("meta", "aggs", "aggregations")]
             if len(kinds) != 1 or kinds[0] not in cls._AGG_TYPES:
                 raise cls._unsupported(f"aggregation type(s) {kinds} (in {name!r})")
-            out[name] = {kinds[0]: spec[kinds[0]]}
+            kind = kinds[0]
+            if parent is not None and kind not in cls._METRIC_AGG_TYPES:
+                raise cls._unsupported(
+                    f"sub-aggregations other than {', '.join(cls._METRIC_AGG_TYPES)} "
+                    f"(in {parent!r}: {name!r} is {kind!r})"
+                )
+            translated = {kind: spec[kind]}
+            if subs:
+                if kind not in cls._BUCKET_AGG_TYPES:
+                    raise cls._unsupported(f"sub-aggregations under {kind!r} (in {name!r})")
+                translated["aggs"] = cls._translate_aggs(subs, parent=name)
+            out[name] = translated
         return out
 
     @staticmethod

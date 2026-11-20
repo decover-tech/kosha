@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 // ─── Control store trait (in-memory or Postgres) ──────────────────────────
 
+pub mod datetime;
 pub mod docset;
 pub use analysis::{
     AnalysisConfig, AnalyzerSpec, FieldSchema, NamespaceSchema, SegmentAnalysis, TokenFilterSpec,
@@ -959,12 +960,279 @@ impl MatchPhraseQuery {
 
 // ─── Aggregation types ─────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One named aggregation of a search request.
+///
+/// Serialized untagged (each variant is an object keyed by its type, so the
+/// JSON of `terms`, `cardinality` and `composite` is unchanged), but
+/// deserialized by dispatching on the type key — see the `Deserialize` impl
+/// below — so a misspelled or unsupported type is an error rather than a
+/// silent mis-match.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Aggregation {
-    Terms { terms: AggTerms },
-    Cardinality { cardinality: AggCardinality },
-    Composite { composite: AggComposite },
+    Terms {
+        terms: AggTerms,
+        /// Metric sub-aggregations computed per bucket (ES `aggs`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aggs: Option<std::collections::HashMap<String, Aggregation>>,
+    },
+    Cardinality {
+        cardinality: AggCardinality,
+    },
+    Composite {
+        composite: AggComposite,
+        /// Metric sub-aggregations computed per bucket (ES `aggs`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aggs: Option<std::collections::HashMap<String, Aggregation>>,
+    },
+    /// Smallest value of the field over the matched documents.
+    Min {
+        min: AggMetric,
+    },
+    /// Largest value of the field over the matched documents.
+    Max {
+        max: AggMetric,
+    },
+    /// Sum of the field's values over the matched documents.
+    Sum {
+        sum: AggMetric,
+    },
+    /// Mean of the field's values over the matched documents.
+    Avg {
+        avg: AggMetric,
+    },
+    /// Number of values the field has over the matched documents.
+    ValueCount {
+        value_count: AggMetric,
+    },
+}
+
+/// The single-value metric aggregations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetricKind {
+    Min,
+    Max,
+    Sum,
+    Avg,
+    ValueCount,
+}
+
+impl MetricKind {
+    /// The wire name of the aggregation type.
+    pub fn name(self) -> &'static str {
+        match self {
+            MetricKind::Min => "min",
+            MetricKind::Max => "max",
+            MetricKind::Sum => "sum",
+            MetricKind::Avg => "avg",
+            MetricKind::ValueCount => "value_count",
+        }
+    }
+}
+
+/// Body of a metric aggregation (`min`, `max`, `sum`, `avg`,
+/// `value_count`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AggMetric {
+    pub field: String,
+}
+
+/// Aggregation type keys `Aggregation` accepts, as reported in parse errors.
+const AGGREGATION_KEYS: [&str; 8] = [
+    "terms",
+    "cardinality",
+    "composite",
+    "min",
+    "max",
+    "sum",
+    "avg",
+    "value_count",
+];
+
+impl Aggregation {
+    /// The metric kind and body when this is a metric aggregation.
+    pub fn metric(&self) -> Option<(MetricKind, &AggMetric)> {
+        match self {
+            Aggregation::Min { min } => Some((MetricKind::Min, min)),
+            Aggregation::Max { max } => Some((MetricKind::Max, max)),
+            Aggregation::Sum { sum } => Some((MetricKind::Sum, sum)),
+            Aggregation::Avg { avg } => Some((MetricKind::Avg, avg)),
+            Aggregation::ValueCount { value_count } => Some((MetricKind::ValueCount, value_count)),
+            _ => None,
+        }
+    }
+
+    /// The type key this aggregation is written under.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Aggregation::Terms { .. } => "terms",
+            Aggregation::Cardinality { .. } => "cardinality",
+            Aggregation::Composite { .. } => "composite",
+            other => other.metric().map(|(kind, _)| kind.name()).unwrap_or(""),
+        }
+    }
+
+    /// Sub-aggregations of a bucket aggregation, if any.
+    pub fn sub_aggregations(&self) -> Option<&std::collections::HashMap<String, Aggregation>> {
+        match self {
+            Aggregation::Terms { aggs, .. } | Aggregation::Composite { aggs, .. } => aggs.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Checks the parser enforces, repeated for values built in code: only
+    /// metric aggregations may be nested, and only under a bucket
+    /// aggregation.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        if let Some(subs) = self.sub_aggregations() {
+            for (sub_name, sub) in subs {
+                if sub.metric().is_none() {
+                    return Err(nested_bucket_error(name, sub_name, sub.type_name()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn nested_bucket_error(parent: &str, name: &str, kind: &str) -> String {
+    format!(
+        "sub-aggregation `{name}` of `{parent}` is a `{kind}` aggregation; only metric \
+         aggregations (min, max, sum, avg, value_count) can be nested under a bucket \
+         aggregation"
+    )
+}
+
+/// Deserialized by dispatching on the aggregation's type key rather than
+/// with `#[serde(untagged)]`, for the same reason as [`FilterClause`]
+/// (issue #170): untagged tries each variant in turn, so a misspelled type
+/// or an unsupported one (`{"stats": ...}`) would at best produce serde's
+/// unhelpful "did not match any variant", and a new variant whose body
+/// happened to fit would silently capture another type's JSON.
+///
+/// The object holds exactly one type key, plus — for `terms` and
+/// `composite` only — an optional `aggs` (or `aggregations`) map of metric
+/// sub-aggregations, as in Elasticsearch.
+impl<'de> Deserialize<'de> for Aggregation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let expected = || AGGREGATION_KEYS.join(", ");
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let serde_json::Value::Object(mut obj) = value else {
+            return Err(D::Error::custom(format!(
+                "aggregation must be a JSON object with exactly one of: {}",
+                expected()
+            )));
+        };
+
+        let subs = match (obj.remove("aggs"), obj.remove("aggregations")) {
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "aggregation has both `aggs` and `aggregations`; use one",
+                ))
+            }
+            (Some(v), None) | (None, Some(v)) => Some(v),
+            (None, None) => None,
+        };
+
+        let mut keys = obj.keys();
+        let key = keys
+            .next()
+            .ok_or_else(|| {
+                D::Error::custom(format!(
+                    "aggregation has no type; expected exactly one of: {}",
+                    expected()
+                ))
+            })?
+            .clone();
+        if let Some(extra) = keys.next() {
+            return Err(D::Error::custom(format!(
+                "aggregation must have exactly one type, found `{key}` and `{extra}`; give \
+                 each aggregation its own name"
+            )));
+        }
+        let inner = obj.remove(&key).unwrap_or(serde_json::Value::Null);
+        fn body<T, E>(kind: &str, v: serde_json::Value) -> Result<T, E>
+        where
+            T: serde::de::DeserializeOwned,
+            E: serde::de::Error,
+        {
+            serde_json::from_value(v)
+                .map_err(|e| E::custom(format!("in `{kind}` aggregation: {e}")))
+        }
+
+        let subs: Option<std::collections::HashMap<String, Aggregation>> = match subs {
+            None => None,
+            Some(v) => {
+                if key != "terms" && key != "composite" {
+                    return Err(D::Error::custom(format!(
+                        "`{key}` aggregation cannot have sub-aggregations; only `terms` and \
+                         `composite` buckets take `aggs`"
+                    )));
+                }
+                let map: std::collections::HashMap<String, Aggregation> =
+                    serde_json::from_value(v).map_err(D::Error::custom)?;
+                for (name, sub) in &map {
+                    if sub.metric().is_none() {
+                        return Err(D::Error::custom(nested_bucket_error(
+                            &key,
+                            name,
+                            sub.type_name(),
+                        )));
+                    }
+                }
+                Some(map)
+            }
+        };
+
+        match key.as_str() {
+            "terms" => Ok(Aggregation::Terms {
+                terms: body(&key, inner)?,
+                aggs: subs,
+            }),
+            "cardinality" => Ok(Aggregation::Cardinality {
+                cardinality: body(&key, inner)?,
+            }),
+            "composite" => Ok(Aggregation::Composite {
+                composite: body(&key, inner)?,
+                aggs: subs,
+            }),
+            "min" => Ok(Aggregation::Min {
+                min: body(&key, inner)?,
+            }),
+            "max" => Ok(Aggregation::Max {
+                max: body(&key, inner)?,
+            }),
+            "sum" => Ok(Aggregation::Sum {
+                sum: body(&key, inner)?,
+            }),
+            "avg" => Ok(Aggregation::Avg {
+                avg: body(&key, inner)?,
+            }),
+            "value_count" => Ok(Aggregation::ValueCount {
+                value_count: body(&key, inner)?,
+            }),
+            other => {
+                let hint = match other {
+                    "stats" | "extended_stats" | "percentiles" | "histogram" | "date_histogram"
+                    | "range" | "top_hits" | "filter" | "filters" => " (not supported yet)",
+                    "count" => " — use `value_count`, or `total_hits` for the number of matches",
+                    "average" | "mean" => " — did you mean `avg`?",
+                    "minimum" => " — did you mean `min`?",
+                    "maximum" => " — did you mean `max`?",
+                    _ => "",
+                };
+                Err(D::Error::custom(format!(
+                    "unknown aggregation type `{other}`{hint}; expected one of: {}",
+                    expected()
+                )))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1029,10 +1297,19 @@ pub struct AggBucketResult {
     pub buckets: Vec<AggBucket>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AggBucket {
     pub key: String,
     pub doc_count: usize,
+    /// Results of the bucket aggregation's metric sub-aggregations, keyed
+    /// by sub-aggregation name and serialized inline next to `key` and
+    /// `doc_count`, as Elasticsearch does. Empty when none were asked for.
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub sub_aggregations: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1047,10 +1324,17 @@ pub struct AggCompositeResult {
     pub after_key: Option<std::collections::HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AggCompositeBucket {
     pub key: std::collections::HashMap<String, String>,
     pub doc_count: usize,
+    /// See [`AggBucket::sub_aggregations`].
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub sub_aggregations: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 // ─── Storage abstraction (local fs / S3 / etc.) ───────────────────────────
@@ -2340,6 +2624,9 @@ impl SearchQuery {
                 ));
             }
         }
+        for (name, agg) in &self.aggs {
+            agg.validate(name).map_err(KoshaError::InvalidQuery)?;
+        }
         let has_lexical = self.has_lexical_query();
         let has_knn = self.knn.is_some();
         match self.mode {
@@ -2571,15 +2858,27 @@ impl SearchQuery {
                 }
             }
         }
-        for agg in self.aggs.values() {
+        // Metric aggregations, and metric sub-aggregations under a bucket
+        // aggregation, read their fields from the filter columns too.
+        let subs = self
+            .aggs
+            .values()
+            .filter_map(Aggregation::sub_aggregations)
+            .flat_map(|subs| subs.values());
+        for agg in self.aggs.values().chain(subs) {
             match agg {
-                Aggregation::Terms { terms } => add(&terms.field),
+                Aggregation::Terms { terms, .. } => add(&terms.field),
                 Aggregation::Cardinality { cardinality } => add(&cardinality.field),
-                Aggregation::Composite { composite } => {
+                Aggregation::Composite { composite, .. } => {
                     for source in &composite.sources {
                         for terms in source.source.values() {
                             add(&terms.terms.field);
                         }
+                    }
+                }
+                _ => {
+                    if let Some((_, metric)) = agg.metric() {
+                        add(&metric.field);
                     }
                 }
             }
@@ -3626,5 +3925,182 @@ mod filter_column_field_tests {
         ] {
             assert!(!is_filter_column_file(no), "{no}");
         }
+    }
+}
+
+#[cfg(test)]
+mod aggregation_parsing {
+    //! Issues #196 / #218 / #202: aggregations parse by their single type
+    //! key, so a misspelled or unsupported type is an error, the existing
+    //! JSON of `terms` / `cardinality` / `composite` is unchanged, and only
+    //! metric aggregations nest under a bucket aggregation.
+    use super::*;
+    use std::collections::HashMap;
+
+    fn parse(s: &str) -> Result<Aggregation, serde_json::Error> {
+        serde_json::from_str(s)
+    }
+
+    #[test]
+    fn existing_bucket_aggregations_round_trip_byte_for_byte() {
+        for json in [
+            r#"{"terms":{"field":"documentId","size":1000}}"#,
+            r#"{"cardinality":{"field":"documentId","precision_threshold":40000}}"#,
+            r#"{"composite":{"size":2,"sources":[{"label":{"terms":{"field":"color"}}}],"after":{"label":"x"}}}"#,
+            r#"{"composite":{"size":2,"sources":[{"label":{"terms":{"field":"color"}}}]}}"#,
+        ] {
+            let agg = parse(json).unwrap();
+            assert_eq!(serde_json::to_string(&agg).unwrap(), json);
+        }
+        // Defaults still apply.
+        let Aggregation::Terms { terms, aggs } = parse(r#"{"terms":{"field":"f"}}"#).unwrap()
+        else {
+            panic!("expected terms");
+        };
+        assert_eq!(terms.size, 10);
+        assert!(aggs.is_none());
+    }
+
+    #[test]
+    fn metric_aggregations_parse_and_round_trip() {
+        for (json, kind) in [
+            (r#"{"min":{"field":"price"}}"#, MetricKind::Min),
+            (r#"{"max":{"field":"price"}}"#, MetricKind::Max),
+            (r#"{"sum":{"field":"price"}}"#, MetricKind::Sum),
+            (r#"{"avg":{"field":"price"}}"#, MetricKind::Avg),
+            (
+                r#"{"value_count":{"field":"price"}}"#,
+                MetricKind::ValueCount,
+            ),
+        ] {
+            let agg = parse(json).unwrap();
+            let (parsed_kind, metric) = agg.metric().unwrap();
+            assert_eq!(parsed_kind, kind);
+            assert_eq!(metric.field, "price");
+            assert_eq!(agg.type_name(), kind.name());
+            assert_eq!(serde_json::to_string(&agg).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn unknown_or_misspelled_types_are_rejected_with_the_valid_list() {
+        for (json, needle) in [
+            (
+                r#"{"stats":{"field":"price"}}"#,
+                "unknown aggregation type `stats`",
+            ),
+            (r#"{"average":{"field":"price"}}"#, "did you mean `avg`"),
+            (
+                r#"{"term":{"field":"price"}}"#,
+                "unknown aggregation type `term`",
+            ),
+            (r#"{}"#, "aggregation has no type"),
+            (r#"[]"#, "must be a JSON object"),
+        ] {
+            let err = parse(json).unwrap_err().to_string();
+            assert!(err.contains(needle), "{json}: {err}");
+            if needle.starts_with("unknown") || needle.starts_with("did") {
+                assert!(err.contains("value_count"), "{json}: {err}");
+            }
+        }
+        let err = parse(r#"{"min":{"field":"a"},"max":{"field":"a"}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exactly one type"), "{err}");
+        let err = parse(r#"{"min":{"field":"a","missing":0}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("in `min` aggregation"), "{err}");
+    }
+
+    #[test]
+    fn metric_sub_aggregations_nest_under_terms_and_composite() {
+        let agg =
+            parse(r#"{"terms":{"field":"category"},"aggs":{"total":{"sum":{"field":"amount"}}}}"#)
+                .unwrap();
+        let subs = agg.sub_aggregations().unwrap();
+        assert_eq!(subs["total"].metric().unwrap().0, MetricKind::Sum);
+        let json = serde_json::to_value(&agg).unwrap();
+        assert_eq!(json["aggs"]["total"]["sum"]["field"], "amount");
+
+        let agg = parse(
+            r#"{"composite":{"size":5,"sources":[{"c":{"terms":{"field":"category"}}}]},
+                "aggregations":{"avg_amount":{"avg":{"field":"amount"}}}}"#,
+        )
+        .unwrap();
+        assert!(agg.sub_aggregations().unwrap().contains_key("avg_amount"));
+    }
+
+    #[test]
+    fn nested_bucket_aggregations_and_misplaced_aggs_are_rejected() {
+        let err = parse(r#"{"terms":{"field":"a"},"aggs":{"inner":{"terms":{"field":"b"}}}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only metric aggregations"), "{err}");
+        let err = parse(r#"{"min":{"field":"a"},"aggs":{"x":{"max":{"field":"b"}}}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot have sub-aggregations"), "{err}");
+        let err = parse(r#"{"terms":{"field":"a"},"aggs":{},"aggregations":{}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("both `aggs` and `aggregations`"), "{err}");
+        let err = parse(r#"{"terms":{"field":"a"},"aggs":{"x":{"bogus":{}}}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown aggregation type `bogus`"), "{err}");
+    }
+
+    #[test]
+    fn search_query_validate_rejects_nested_buckets_built_in_code() {
+        let mut query: SearchQuery = serde_json::from_str(r#"{"query_text":""}"#).unwrap();
+        query.aggs.insert(
+            "outer".into(),
+            Aggregation::Terms {
+                terms: AggTerms {
+                    field: "a".into(),
+                    size: 10,
+                },
+                aggs: Some(HashMap::from([(
+                    "inner".into(),
+                    Aggregation::Cardinality {
+                        cardinality: AggCardinality {
+                            field: "b".into(),
+                            precision_threshold: 10,
+                        },
+                    },
+                )])),
+            },
+        );
+        assert!(query.validate().is_err());
+    }
+
+    #[test]
+    fn bucket_sub_results_serialize_inline_and_round_trip() {
+        let bucket = AggBucket {
+            key: "k".into(),
+            doc_count: 2,
+            sub_aggregations: std::collections::BTreeMap::from([(
+                "total".to_string(),
+                serde_json::json!({"value": 3.5}),
+            )]),
+        };
+        let json = serde_json::to_value(&bucket).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"key":"k","doc_count":2,"total":{"value":3.5}})
+        );
+        let back: AggBucket = serde_json::from_value(json).unwrap();
+        assert_eq!(back.sub_aggregations["total"]["value"], 3.5);
+        // No sub-aggregations: the historical shape exactly.
+        let plain = AggBucket {
+            key: "k".into(),
+            doc_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"key":"k","doc_count":2}"#
+        );
     }
 }
