@@ -44,7 +44,7 @@ use kosha_write::UnindexedTail;
 use crate::AppState;
 
 /// Prefix of transient tail segment ids (and directories). Never published.
-pub const TAIL_SEGMENT_PREFIX: &str = "_tail-";
+pub const TAIL_SEGMENT_PREFIX: &str = kosha_core::TAIL_SEGMENT_PREFIX;
 
 /// How many times a strong search asks for a tail matching its manifest
 /// version before giving up (each retry refreshes a query pod's manifest).
@@ -236,6 +236,9 @@ pub struct SearchView {
     /// Keeps the transient segments' directories alive during the search:
     /// one tail, or one per shard of a sharded namespace (#207).
     pub tails: Vec<Arc<TailSegment>>,
+    /// A strong search served as eventual, and why — see
+    /// [`kosha_core::SearchResult::consistency_fallback`].
+    pub fallback: Option<String>,
 }
 
 impl SearchView {
@@ -417,6 +420,7 @@ impl AppState {
                 search: Arc::clone(&merged),
                 base: merged,
                 tails: Vec::new(),
+                fallback: None,
             }));
         }
         // Each shard's snapshot and tail, then one merged view over the
@@ -425,12 +429,14 @@ impl AppState {
         let mut bases: Vec<Option<Arc<Manifest>>> = Vec::with_capacity(shard_ids.len());
         let mut searched: Vec<Option<Arc<Manifest>>> = Vec::with_capacity(shard_ids.len());
         let mut tails = Vec::new();
+        let mut fallback = None;
         for shard in &shard_ids {
             match self.namespace_view(shard, consistency)? {
                 Some(view) => {
                     bases.push(Some(view.base));
                     searched.push(Some(view.search));
                     tails.extend(view.tails);
+                    fallback = fallback.or(view.fallback);
                 }
                 None => {
                     bases.push(None);
@@ -450,6 +456,7 @@ impl AppState {
             base,
             search,
             tails,
+            fallback,
         }))
     }
 
@@ -464,6 +471,7 @@ impl AppState {
             search: Arc::clone(&base),
             base,
             tails: Vec::new(),
+            fallback: None,
         };
         if consistency == Consistency::Eventual {
             return Ok(self.indexer.manifest_shared(namespace).map(plain));
@@ -535,6 +543,26 @@ impl AppState {
             return self.view_with_tail(namespace, base, built).map(Some);
         }
         let (writer, local) = last_mismatch.unwrap_or_default();
+        // The writer is ahead of the newest manifest in the control store:
+        // it flushed (or compacted, or deleted) and has not published yet,
+        // or publication is failing. Its tail is relative to a version no
+        // reader can have, so the strong read is impossible until the
+        // publication lands; serve the last published manifest instead,
+        // as every search did before #255, and say so. (A writer that is
+        // behind, e.g. restarting, is waited out with a 503 below.)
+        if writer > local && self.ingest_host.is_some() {
+            if let Some(base) = self.indexer.manifest_shared(namespace) {
+                if base.version < writer {
+                    let mut view = plain(base);
+                    view.fallback = Some(format!(
+                        "eventual: the writer of '{}' is at manifest version {writer}, which \
+                         is not published yet; searched published version {}",
+                        namespace.0, view.base.version
+                    ));
+                    return Ok(Some(view));
+                }
+            }
+        }
         Err(crate::json_error(
             503,
             &format!(
@@ -560,6 +588,7 @@ impl AppState {
             base,
             search,
             tails: vec![tail],
+            fallback: None,
         })
     }
 
@@ -683,6 +712,11 @@ impl AppState {
     fn forget_tail(&self, namespace: &NamespaceId, tail: &TailSegment) {
         if let Some((segment_id, _)) = &tail.segment {
             self.searcher.forget_segment(namespace, segment_id);
+            // A shard's tail (#207) is searched, and cached, through the
+            // sharded root's merged view.
+            if let Some((root, merged)) = crate::merged_view_alias(namespace, segment_id) {
+                self.searcher.forget_segment(&root, &merged);
+            }
         }
     }
 }

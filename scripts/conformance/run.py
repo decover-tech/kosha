@@ -10,6 +10,8 @@ namespace's segment/document counts.
 Checkpoints, in order:
 
   buffered       docs indexed but not flushed  -> nothing may be visible
+                 (searches ask for "consistency": "eventual", the indexed
+                 view the oracle models)
   one-segment    first flush
   many-segments  several more flushes          -> namespace-level BM25 statistics
   upserts        re-index flushed and buffered ids (mark-deleted + append path)
@@ -149,6 +151,10 @@ class Kosha:
         b.setdefault("query_text", "")  # required by the API, even for filter-only
         b.setdefault("exact_total_hits", True)
         b["no_cache"] = True
+        # The oracle models flush-based visibility: what the indexed
+        # segments answer. Searches default to "strong" since #255, which
+        # also scans unflushed writes, so ask for the indexed view.
+        b.setdefault("consistency", "eventual")
         return self.call("POST", self.ns_path("search"), b)
 
     def wait_healthy(self, timeout: float = 120) -> None:
