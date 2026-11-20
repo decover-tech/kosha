@@ -306,6 +306,20 @@ impl Cache {
     /// cache. Returns the bytes removed.
     pub fn evict(&self, key: &str) -> Result<u64, KoshaError> {
         let path = self.path_for(key)?;
+        let nested = format!("{}/", key.trim_end_matches('/'));
+        // Only bytes the cache counted leave the total: a directory can
+        // hold files written by something that never reported them (an
+        // ingest pod's own flushes), and subtracting those would drive the
+        // total below real usage, so `KOSHA_CACHE_MAX_BYTES` stops binding.
+        let tracked: u64 = self
+            .recency
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| *k == key || k.starts_with(&nested))
+            .filter_map(|k| self.path_for(k).ok())
+            .map(|p| p.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum();
         let mut removed = 0;
         if path.is_file() {
             removed = path.metadata().map(|m| m.len()).unwrap_or(0);
@@ -316,19 +330,16 @@ impl Cache {
             std::fs::remove_dir_all(&path)?;
             self.eviction_generation.fetch_add(1, Ordering::Relaxed);
         }
-        // Saturating: a directory can hold files written by something that
-        // never reported them (an ingest pod's own flushes).
         let mut total = self.total_bytes.load(Ordering::Relaxed);
         while let Err(actual) = self.total_bytes.compare_exchange_weak(
             total,
-            total.saturating_sub(removed),
+            total.saturating_sub(tracked),
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
             total = actual;
         }
         let mut recency = self.recency.lock().unwrap();
-        let nested = format!("{}/", key.trim_end_matches('/'));
         recency.retain(|k| k != key && !k.starts_with(&nested));
         Ok(removed)
     }
@@ -599,6 +610,14 @@ mod tests {
         assert!(!dir.join("ns/seg").exists());
         assert_eq!(cache.eviction_generation(), before + 1);
         assert_eq!(cache.total_size(), 0, "never underflows");
+        // Untracked bytes in an evicted directory never offset tracked
+        // bytes elsewhere: the total stays what the cache holds.
+        cache.put_bytes("other/x.bin", &[0u8; 100]).unwrap();
+        cache.put("ns/seg2/a.bin", &src).unwrap();
+        fs::write(dir.join("ns/seg2/flushed.bin"), [0u8; 1000]).unwrap();
+        assert_eq!(cache.total_size(), 104);
+        assert_eq!(cache.evict("ns/seg2").unwrap(), 1004);
+        assert_eq!(cache.total_size(), 100);
         assert!(cache
             .recency
             .lock()

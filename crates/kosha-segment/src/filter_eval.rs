@@ -73,6 +73,38 @@ fn string_column(
 }
 
 /// The documents of a `doc_count`-document segment that pass `clause`.
+/// Reject a `prefix` on a numeric field anywhere in `clause`, as
+/// `kosha_core::check_filter` does for `filters.bin` segments, even where
+/// evaluation would short-circuit past it (an empty `must`). Reads only
+/// the columns `prefix` clauses name.
+pub fn check_filter_columns(
+    clause: &FilterClause,
+    source: &dyn ColumnSource,
+) -> Result<(), KoshaError> {
+    match clause {
+        FilterClause::Prefix { prefix } => {
+            if string_column(source, &prefix.field)?.is_some() {
+                return Ok(());
+            }
+            for kind in [FilterColumnKind::Integer, FilterColumnKind::Float] {
+                if resolve_column(source, &prefix.field, kind)?.is_some() {
+                    return Err(KoshaError::InvalidQuery(
+                        kosha_core::docset::prefix_on_numeric_error(&prefix.field),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        FilterClause::Bool { bool: b } => b
+            .must
+            .iter()
+            .chain(&b.must_not)
+            .chain(&b.should)
+            .try_for_each(|child| check_filter_columns(child, source)),
+        _ => Ok(()),
+    }
+}
+
 pub fn evaluate_filter_columns(
     clause: &FilterClause,
     source: &dyn ColumnSource,
@@ -395,19 +427,28 @@ fn mark_string_range(set: &mut DocSet, column: &StringColumn, bound: &RangeBound
         narrow(column.ordinal_range(None, Some((b, false))));
     }
     let lists = column.list_index();
-    if !lists.elements.is_empty() || !lists.empty.is_empty() {
+    if !lists.lists.is_empty() || !lists.empty.is_empty() {
         // A list term is in range when any of its elements is (#206), as
         // in `kosha_core::docset::mark_in_range`; its own JSON text is not
-        // compared.
+        // compared, also for a nested container with no plain element.
         let list_ords: HashSet<u32> = lists
-            .elements
-            .values()
-            .flatten()
+            .lists
+            .iter()
             .chain(&lists.empty)
             .copied()
             .filter(|ord| column.term(*ord).starts_with('['))
             .collect();
-        let mut ords: Vec<u32> = range.filter(|ord| !list_ords.contains(ord)).collect();
+        let mut ords: Vec<u32> = Vec::new();
+        if range.end.saturating_sub(range.start) <= RANGE_BITMAP_TERMS {
+            ords.extend(range.clone().filter(|ord| !list_ords.contains(ord)));
+        } else if range.start < range.end {
+            // As below: one pass over the entries beats a bitmap per term.
+            for (&doc, ord) in column.docs().iter().zip(column.ords()) {
+                if range.contains(ord) && !list_ords.contains(ord) {
+                    set.insert(doc);
+                }
+            }
+        }
         for (element, list) in &lists.elements {
             if in_range_str(element, bound) {
                 ords.extend_from_slice(list);
@@ -557,6 +598,18 @@ mod tests {
                 } else if i == 1234 {
                     fields.push(Field::integer("extreme", i64::MIN));
                 }
+                // A nested container (list of objects) beside plain values.
+                match i % 5 {
+                    0 => fields.push(Field::keyword("authors", r#"[{"name":"Ada"}]"#)),
+                    1 => fields.push(Field::keyword("authors", format!("Bob{i}"))),
+                    _ => {}
+                }
+                // A high-cardinality column holding a few lists.
+                if i % 1000 == 0 {
+                    fields.push(Field::keyword("codes", format!(r#"["c-{:05}"]"#, i + 3)));
+                } else {
+                    fields.push(Field::keyword("codes", format!("c-{i:05}")));
+                }
                 if i % 5 == 0 {
                     fields.push(Field::integer("mixed", (i % 13) as i64));
                 } else {
@@ -633,6 +686,10 @@ mod tests {
             json!({"range": {"id": {"gt": "z"}}}),
             json!({"range": {"matterId": {"gte": "m2", "lt": "m5"}}}),
             json!({"range": {"tags": {"gte": "[", "lt": "\\"}}}),
+            json!({"range": {"authors": {"gte": "A", "lt": "z"}}}),
+            json!({"range": {"authors": {"gte": "[", "lt": "\\"}}}),
+            json!({"range": {"codes": {"gte": "c-00100", "lt": "c-09000"}}}),
+            json!({"range": {"codes": {"gte": "[", "lte": "c-00010"}}}),
             json!({"match_all": {}}),
             json!({"bool": {}}),
             json!({"bool": {"must": [{"term": {"matterId": "m1"}}, {"range": {"page": {"lt": "50"}}}]}}),
@@ -705,6 +762,18 @@ mod tests {
         // `[]`, ` []` and `[null]` are not values; docs i%8==7 have none.
         assert_eq!(count(json!({"exists": {"field": "tags"}})), 4 * 1250);
         assert_eq!(count(json!({"range": {"extreme": {"gte": "0"}}})), 1);
+        // Only the plain "Bob…" values: a nested container's own JSON text
+        // is never compared, as in `kosha_core::evaluate_filter`.
+        assert_eq!(
+            count(json!({"range": {"authors": {"gte": "A", "lt": "z"}}})),
+            2000
+        );
+        // Plain c-00100..c-08999 minus the 8 lists among them, plus the
+        // lists whose element (i + 3) is in range: i = 1000..8000.
+        assert_eq!(
+            count(json!({"range": {"codes": {"gte": "c-00100", "lt": "c-09000"}}})),
+            8900 - 8 + 8
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

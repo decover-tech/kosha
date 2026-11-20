@@ -1892,7 +1892,8 @@ impl Indexer {
     /// segment files without racing a write to the new incarnation.
     ///
     /// Returns how many WAL files were kept because they also hold another
-    /// namespace's records (legacy multi-record files only).
+    /// namespace's records (group-commit files). Recovery skips this
+    /// namespace's records in them (see `WalWriter::discard_namespace`).
     pub fn drop_namespace(
         &self,
         namespace: &NamespaceId,
@@ -1918,6 +1919,34 @@ impl Indexer {
         let shared = self.wal.discard_namespace(namespace);
         while_locked();
         shared
+    }
+
+    /// Forget a namespace this node only follows (a query replica's copy
+    /// of a namespace deleted elsewhere): it reads as unknown until a
+    /// manifest is restored for it again. Leaves the WAL alone, unlike
+    /// [`Self::drop_namespace`]. Returns whether it was known.
+    pub fn forget_namespace(&self, namespace: &NamespaceId) -> bool {
+        let handle = {
+            let map = self.namespaces.lock().unwrap();
+            match map.get(namespace) {
+                Some(handle) => handle.clone(),
+                None => return false,
+            }
+        };
+        let _writes = handle.writes.lock().unwrap();
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        let mut state = handle.state.lock().unwrap();
+        if !state.known {
+            return false;
+        }
+        let mut fresh = NamespaceState::new();
+        // Versions never go backwards on this node.
+        fresh.manifest.version = state.manifest.version;
+        fresh.published_version = state.published_version;
+        fresh.wal_sequence = state.wal_sequence;
+        *state = fresh;
+        true
     }
 
     pub fn manifest(&self, namespace: &NamespaceId) -> Option<Manifest> {
@@ -2216,7 +2245,18 @@ impl Indexer {
                 .as_deref()
                 .is_none_or(|origin| origin == self.wal.origin())
         {
-            self.wal.clear_through(namespace, manifest.wal_checkpoint)?;
+            // The manifest is committed: a reclamation failure (an S3
+            // delete timing out) only leaves files a later publish of this
+            // or another namespace reclaims, and recovery filters records
+            // at or below a published checkpoint. It must not turn a
+            // durable write into a client error.
+            if let Err(error) = self.wal.clear_through(namespace, manifest.wal_checkpoint) {
+                eprintln!(
+                    "WARN: WAL reclamation through {} for {} failed after a committed \
+                     publish (retried on the next publish): {error}",
+                    manifest.wal_checkpoint, namespace.0
+                );
+            }
         }
         Ok(())
     }
@@ -3168,6 +3208,39 @@ mod tests {
         }
         assert_eq!(seen, 3);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_wal_reclamation_after_a_committed_publish_is_not_an_error() {
+        use crate::object_wal::{MemoryObjectBackend, ObjectWalStore};
+        let backend = MemoryObjectBackend::new();
+        let store: Arc<dyn wal::WalStore> =
+            Arc::new(ObjectWalStore::new(Arc::new(backend.clone()), "ingest-0").unwrap());
+        let dir = std::env::temp_dir().join(format!("kosha-ack-reclaim-{}", uuid::Uuid::new_v4()));
+        let ns = NamespaceId("t/ns".into());
+        let idx = Indexer::with_wal_store(dir.clone(), store).unwrap();
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("a".into()),
+                fields: vec![Field::text("text", "durable")],
+            }],
+        )
+        .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let published = idx.manifest(&ns).unwrap();
+        // Reclamation first persists the `sequence` high-water mark; make
+        // that object-store put fail.
+        backend.fail_next_puts(1);
+        idx.acknowledge_manifest(&ns, &published).unwrap();
+        assert!(
+            backend.keys().iter().any(|k| k.ends_with(".bin")),
+            "the WAL object is kept for a later reclamation"
+        );
+        // The next publish reclaims it.
+        idx.acknowledge_manifest(&ns, &published).unwrap();
+        assert!(!backend.keys().iter().any(|k| k.ends_with(".bin")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

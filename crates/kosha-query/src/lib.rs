@@ -325,8 +325,6 @@ impl TrackedSegment {
         if let Some(set) = self.filter_sets.lock().unwrap().get(key) {
             return Ok(Arc::clone(set));
         }
-        let store = self.reader.filter_store();
-        kosha_core::check_filter(clause, &store).map_err(KoshaError::InvalidQuery)?;
         // Evaluated outside the lock: two requests racing on a new filter
         // both compute it, and one result is dropped. That is cheaper than
         // making every other request for this segment wait behind a scan.
@@ -20777,5 +20775,63 @@ mod histogram_aggregation_tests {
             },
         );
         assert!(matches!(q.validate(), Err(KoshaError::InvalidQuery(_))));
+    }
+}
+
+#[cfg(test)]
+mod tracked_segment_filter_tests {
+    //! `TrackedSegment::filter_set` on a columnar (#244) segment reads only
+    //! the columns the clause names, never the whole row-shaped store.
+    use super::*;
+    use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
+    use kosha_segment::SegmentWriter;
+
+    #[test]
+    fn filter_set_on_a_columnar_segment_reads_only_the_clause_columns() {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-tracked-filter-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut writer =
+            SegmentWriter::new(SegmentId("s".into()), dir.clone()).with_filters_write_version(2);
+        for i in 0..8i64 {
+            writer.add_document(
+                DocumentId(format!("d{i}")),
+                vec![
+                    Field::text("body", "hello"),
+                    Field::keyword("a", format!("a{}", i % 2)),
+                    Field::keyword("b", format!("b{i}")),
+                    Field::integer("n", i),
+                ],
+            );
+        }
+        writer.finalize(Bm25Params::default()).unwrap();
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        assert!(reader.has_filter_columns());
+        let ledger = Arc::new(MemoryLedger::new(u64::MAX, Duration::from_secs(1)));
+        let segment = TrackedSegment::new(reader, 0, ledger);
+
+        let clause: FilterClause = serde_json::from_str(r#"{"term": {"a": "a1"}}"#).unwrap();
+        assert_eq!(segment.filter_set("a", &clause).unwrap().count(), 4);
+        assert_eq!(
+            segment.merged_filter_store_columns(),
+            0,
+            "no column was decoded into the row-shaped store"
+        );
+
+        // A `prefix` on a numeric field is still a client error, also
+        // behind a `must` that matches nothing.
+        let bad: FilterClause = serde_json::from_str(
+            r#"{"bool": {"must": [{"term": {"a": "none"}}], "must_not": [{"prefix": {"n": "1"}}]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            segment.filter_set("bad", &bad),
+            Err(KoshaError::InvalidQuery(msg)) if msg.contains("numeric field")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

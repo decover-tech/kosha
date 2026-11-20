@@ -82,8 +82,20 @@ impl CommittedRefs {
     }
 }
 
+/// How long a retirement record is kept in [`Manifest::retired`] after the
+/// newest one (7 days). Only an object-store GC run removes records whose
+/// objects it deleted, and GC may never run (the shipped CronJob is
+/// suspended), so without a bound every compaction input and superseded
+/// deletion generation would stay in every manifest forever. A dropped
+/// record's object is then "untracked" to GC, which deletes it once its
+/// newest file is older than `KOSHA_GC_ORPHAN_GRACE`; that is already true
+/// when the record is dropped, since the object was written before it was
+/// retired. Keep `KOSHA_GC_GRACE` below this.
+pub const RETIRED_RECORD_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 /// Set `next.retired` to `previous.retired` plus everything `previous`
-/// referenced that `next` does not, minus anything `next` references again.
+/// referenced that `next` does not, minus anything `next` references again,
+/// minus records more than [`RETIRED_RECORD_TTL_MS`] older than the newest.
 ///
 /// `retired_at_ms(segment, generation)` stamps a newly retired object. A
 /// writer that may rebuild the same candidate twice (a retried publish)
@@ -157,6 +169,12 @@ pub fn record_retirements(
         .map(|o| o.segment_id.clone())
         .collect();
     out.retain(|o| o.deletion_generation.is_none() || !whole.contains(&o.segment_id));
+    // Relative to the newest stamp, not the clock, so a retried build of the
+    // same candidate stays byte-identical.
+    if let Some(newest) = out.iter().map(|o| o.retired_at_ms).max() {
+        let cutoff = newest.saturating_sub(RETIRED_RECORD_TTL_MS);
+        out.retain(|o| o.retired_at_ms >= cutoff);
+    }
     next.retired = out;
 }
 
@@ -529,6 +547,41 @@ mod tests {
             generation: generation_byte.to_string().repeat(64),
             count: 1,
         }
+    }
+
+    #[test]
+    fn retirement_records_older_than_the_ttl_are_dropped() {
+        // Many compactions with no GC run: the list stays bounded by age.
+        let day = 24 * 60 * 60 * 1000;
+        let mut current = manifest(1, &["s0"]);
+        for n in 1..=30u64 {
+            let refs = CommittedRefs::of(&current);
+            let mut next = manifest(n + 1, &[&format!("s{n}")]);
+            record_retirements(&refs, &mut next, |_, _| n * day);
+            current = next;
+        }
+        let stamps: Vec<u64> = current
+            .retired
+            .iter()
+            .map(|o| o.retired_at_ms / day)
+            .collect();
+        assert_eq!(
+            stamps,
+            (23..=30).collect::<Vec<_>>(),
+            "seven days back, inclusive"
+        );
+        // Deterministic for a retried build of the same candidate.
+        let refs = CommittedRefs::of(&current);
+        let mut a = manifest(40, &["x"]);
+        let mut b = manifest(40, &["x"]);
+        record_retirements(&refs, &mut a, |_, _| 31 * day);
+        record_retirements(&refs, &mut b, |_, _| 31 * day);
+        assert_eq!(a.retired, b.retired);
+        // Nothing newly retired: nothing is aged out either.
+        let refs = CommittedRefs::of(&a);
+        let mut same = manifest(41, &["x"]);
+        record_retirements(&refs, &mut same, |_, _| 99 * day);
+        assert_eq!(same.retired, a.retired);
     }
 
     #[test]

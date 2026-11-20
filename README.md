@@ -410,7 +410,10 @@ under the namespace's publication lock:
    deleted data.
 2. The writer discards the namespace's manifest, write buffer, pending deletes
    and every WAL record for it, so neither a later flush nor a restart brings the
-   documents back.
+   documents back. A group-commit WAL file that also holds other namespaces'
+   records is kept until those flush, and the deletion is recorded durably in
+   the WAL stream (`discarded`), so recovery skips the deleted namespace's
+   records in it.
 3. Its local segment directory and per-namespace caches are removed.
 4. With S3 configured, every object under the namespace's prefix
    (`{KOSHA_S3_PREFIX}/{tenant}/{ns}/`) is deleted before the response returns.
@@ -418,8 +421,9 @@ under the namespace's publication lock:
    `"storage_reclaimed": false`; the leftover objects are unreferenced, and a
    re-created namespace never reuses their keys.
 
-Query pods answer 404 for the namespace as soon as the control store has no
-manifest for it. Their local disk copies of its segments are not removed
+Query pods answer 404 for the namespace once they see the control store has no
+manifest for it: within one manifest refresh (`KOSHA_MANIFEST_REFRESH_MS`,
+default 500 ms), or at once for a search with `max_staleness_seconds: 0`. Their local disk copies of its segments are not removed
 eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them. Re-creating the
 namespace, explicitly or by writing to it, starts it empty.
 
