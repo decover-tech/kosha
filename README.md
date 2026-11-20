@@ -128,35 +128,66 @@ request and response shapes:
   a boundary starts the higher bucket and negative values round down
   (`-0.5` with `interval: 10` is in bucket `-10`). `histogram` computes this
   in floating point (as Elasticsearch does); `date_histogram` in integer
-  epoch milliseconds, all in UTC.
+  epoch milliseconds, in UTC unless `time_zone` is set.
 - `histogram` takes `field`, `interval` (a number > 0), optional `offset`
-  (a number) and `min_doc_count`. It reads `Integer` and `Float` fields, and
-  string values that are numbers or dates (as epoch milliseconds).
+  (a number), `min_doc_count`, `extended_bounds` and `hard_bounds`. It reads
+  `Integer` and `Float` fields, and string values that are numbers or dates
+  (as epoch milliseconds).
 - `date_histogram` takes `field` and either `fixed_interval` — a positive
   whole number and one of `ms`, `s`, `m`, `h`, `d` (`"30s"`, `"5m"`, `"1h"`,
-  `"7d"`) — or `calendar_interval`, limited to the units whose length is
-  fixed in UTC: `1m`, `1h`, `1d` and `1w` (`minute`, `hour`, `day`, `week`;
-  weeks start on Monday, as in Elasticsearch). `1M`, `1q` and `1y` are a 400
-  that points at `fixed_interval` (#300). `offset` is a signed duration
-  (`"+6h"`, `"-30m"`) or milliseconds. `Date` fields are read as epoch
-  milliseconds; `Integer` fields are taken to already be epoch milliseconds.
+  `"7d"`) — or `calendar_interval`, a single unit: `1m`, `1h`, `1d`, `1w`,
+  `1M`, `1q`, `1y` (`minute`, `hour`, `day`, `week`, `month`, `quarter`,
+  `year`; weeks start on Monday, as in Elasticsearch). Multiples such as
+  `2M` are a 400, as in Elasticsearch — use `fixed_interval` for fixed-length
+  multiples. Month, quarter and year buckets start on the first day of the
+  civil month / quarter / year (leap years included), so they are 28 to 31,
+  90 to 92, or 365 / 366 days long. `offset` is a signed duration (`"+6h"`,
+  `"-30m"`) or milliseconds. `Date` fields are read as epoch milliseconds;
+  `Integer` fields are taken to already be epoch milliseconds.
+- **`time_zone`** (`date_histogram`): an IANA name (`"Europe/Paris"`,
+  `"America/New_York"`), a UTC offset (`"+05:30"`, `"-08:00"`, `"+0530"`), or
+  `"UTC"` / `"Z"`. The tz database is compiled into the binary, so containers
+  without `/usr/share/zoneinfo` work. As in Elasticsearch, buckets are
+  rounded on the zone's wall clock: a `1d` bucket runs from local midnight to
+  local midnight, so across a daylight-saving change it is 23 or 25 hours
+  long, and `1M` / `1q` / `1y` follow the local calendar. For `1m` / `1h`
+  calendar intervals and any `fixed_interval`, a bucket starts at the latest
+  instant whose wall-clock time is a multiple of the interval: across a
+  fall-back the repeated hour is two buckets (`01:00-04:00` then
+  `01:00-05:00` in New York), and across a spring-forward the skipped hour
+  has no bucket. `offset` is applied in UTC around the zone rounding, as in
+  Elasticsearch (`"time_zone": "Europe/Paris", "offset": "+6h"` gives days
+  starting 06:00 Paris time). `key` is the UTC epoch milliseconds of the
+  bucket start; `key_as_string` is that instant on the zone's clock with its
+  offset (`2024-03-10T00:00:00.000-05:00`). Without `time_zone` (or with a
+  zero offset) it ends in `Z` exactly as before.
+- **`extended_bounds`** `{"min", "max"}` (either may be left out) widens the
+  gap-filled range to the buckets holding `min` and `max`, so a chart of a
+  fixed window gets leading and trailing zero buckets — with
+  `min_doc_count: 0` only. **`hard_bounds`** `{"min", "max"}` drops values
+  outside `[min, max]` (no bucket for them) and clips the gap-filled range to
+  the buckets holding the bounds. For `date_histogram` the bounds are date
+  strings (one without its own offset is wall-clock time in `time_zone`) or
+  epoch milliseconds.
 - Anything else is a 400 with the reason: a malformed interval
   (`"1 banana"`, `"1.5h"`, `"1w"` as a fixed interval), a zero or negative
-  interval, both or neither of `fixed_interval` / `calendar_interval`, the
-  deprecated `interval` on `date_histogram`, and the not-yet-supported
-  `time_zone` (#301), `extended_bounds` / `hard_bounds` (#302), `keyed`,
-  `order`, `missing` and `format`.
+  interval, both or neither of `fixed_interval` / `calendar_interval`, a
+  calendar multiple (`"2M"`), the deprecated `interval` on `date_histogram`,
+  an unknown `time_zone`, bounds with `min` greater than `max` or a bound
+  that is not a date, `time_zone` on `histogram`, and the not-yet-supported
+  `keyed`, `order`, `missing` and `format`.
 - Buckets are sorted by key ascending. `key` is a number; `date_histogram`
-  also returns `key_as_string` (RFC 3339, UTC, millisecond precision).
+  also returns `key_as_string` (RFC 3339, millisecond precision).
 - **Empty buckets.** `min_doc_count` defaults to 0, as in Elasticsearch:
-  every bucket between the lowest and the highest non-empty bucket is
-  returned, empty ones with `doc_count: 0` (and their metric
-  sub-aggregations `null`, or `0` for `sum` / `value_count`), so a time
-  series has no missing days. No buckets are added before the first or after
-  the last value (`extended_bounds`, #302). With `min_doc_count: n ≥ 1` only
-  buckets holding at least `n` documents are returned. A histogram that
-  would return more than 10,000 buckets, filled gaps included, is a 400 —
-  use a larger interval, a narrower query, or `min_doc_count: 1`.
+  every bucket between the lowest and the highest non-empty bucket (widened
+  by `extended_bounds`, clipped by `hard_bounds`) is returned, empty ones
+  with `doc_count: 0` (and their metric sub-aggregations `null`, or `0` for
+  `sum` / `value_count`), so a time series has no missing days; calendar
+  buckets are filled month by month (quarter, year, local day). With
+  `min_doc_count: n ≥ 1` only buckets holding at least `n` documents are
+  returned. A histogram that would return more than 10,000 buckets, filled
+  gaps and extended bounds included, is a 400 — use a larger interval, a
+  narrower query or `extended_bounds`, or `min_doc_count: 1`.
 - A document counts once per bucket: a multi-valued field with two values in
   one bucket adds 1 to it, with values in two buckets adds 1 to each.
 - Each segment buckets its own matches with the request's interval and

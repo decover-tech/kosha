@@ -12636,7 +12636,8 @@ mod tests {
     #[test]
     fn histogram_aggregations_over_http_and_bad_intervals_are_400() {
         // Issue #219: `histogram` / `date_histogram` over `/search`, and a
-        // garbage interval or unsupported calendar interval is a 400.
+        // garbage interval or unsupported calendar interval is a 400;
+        // #300-#302: calendar months, `time_zone` and bounds.
         let state = test_state();
         let ns = NamespaceId("histns".into());
         let doc = |id: &str, bytes: i64, at: &str| Document {
@@ -12694,14 +12695,112 @@ mod tests {
             "{v}"
         );
 
+        // Issues #300-#302: calendar months, time zones and bounds.
+        let resp = post(
+            r#"{"month":{"date_histogram":{"field":"sentAt","calendar_interval":"1M"}},
+                "la_days":{"date_histogram":{"field":"sentAt","calendar_interval":"1d","time_zone":"America/Los_Angeles"}},
+                "ist_hours":{"date_histogram":{"field":"sentAt","fixed_interval":"1h","time_zone":"+05:30","min_doc_count":1}},
+                "window":{"date_histogram":{"field":"sentAt","fixed_interval":"1h",
+                          "extended_bounds":{"min":"2024-06-14T23:00:00Z","max":"2024-06-15T03:00:00Z"},
+                          "hard_bounds":{"max":"2024-06-15T01:30:00Z"}}},
+                "sizes":{"histogram":{"field":"bytes","interval":1024,"extended_bounds":{"min":0,"max":4096},"hard_bounds":{"min":500}}}}"#,
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        let aggs = &v["aggregations"];
+        assert_eq!(
+            aggs["month"],
+            serde_json::json!({"buckets": [
+                {"key": 1_717_200_000_000_i64, "key_as_string": "2024-06-01T00:00:00.000Z", "doc_count": 3},
+            ]}),
+            "{v}"
+        );
+        // 2024-06-15 00:10Z is 17:10 on the 14th in Los Angeles (PDT).
+        assert_eq!(
+            aggs["la_days"],
+            serde_json::json!({"buckets": [
+                {"key": 1_718_348_400_000_i64, "key_as_string": "2024-06-14T00:00:00.000-07:00", "doc_count": 3},
+            ]}),
+            "{v}"
+        );
+        // Hours on the local clock: 00:10Z is 05:40 in India.
+        assert_eq!(
+            aggs["ist_hours"]["buckets"][0],
+            serde_json::json!({"key": 1_718_407_800_000_i64, "key_as_string": "2024-06-15T05:00:00.000+05:30", "doc_count": 1}),
+            "{v}"
+        );
+        assert_eq!(aggs["ist_hours"]["buckets"].as_array().unwrap().len(), 3);
+        // Extended to 23:00 on the 14th, clipped by the hard max at the
+        // 01:00 bucket; the 02:00 document is dropped.
+        let window: Vec<(String, u64)> = aggs["window"]["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                (
+                    b["key_as_string"].as_str().unwrap().to_string(),
+                    b["doc_count"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            window,
+            vec![
+                ("2024-06-14T23:00:00.000Z".to_string(), 0),
+                ("2024-06-15T00:00:00.000Z".to_string(), 2),
+                ("2024-06-15T01:00:00.000Z".to_string(), 0),
+            ],
+            "{v}"
+        );
+        assert_eq!(
+            aggs["sizes"],
+            serde_json::json!({"buckets": [
+                {"key": 0.0, "doc_count": 0},
+                {"key": 1024.0, "doc_count": 1},
+                {"key": 2048.0, "doc_count": 1},
+                {"key": 3072.0, "doc_count": 0},
+                {"key": 4096.0, "doc_count": 0},
+            ]}),
+            "{v}"
+        );
+
         for (bad, needle) in [
             (
                 r#"{"x":{"date_histogram":{"field":"sentAt","fixed_interval":"1 banana"}}}"#,
                 "invalid `fixed_interval`",
             ),
             (
-                r#"{"x":{"date_histogram":{"field":"sentAt","calendar_interval":"1M"}}}"#,
-                "fixed_interval",
+                r#"{"x":{"date_histogram":{"field":"sentAt","calendar_interval":"2M"}}}"#,
+                "single unit",
+            ),
+            (
+                r#"{"x":{"date_histogram":{"field":"sentAt","fixed_interval":"1h","time_zone":"Mars/Base"}}}"#,
+                "unknown `time_zone`",
+            ),
+            (
+                r#"{"x":{"date_histogram":{"field":"sentAt","fixed_interval":"1h","time_zone":"+25:00"}}}"#,
+                "invalid `time_zone`",
+            ),
+            (
+                r#"{"x":{"date_histogram":{"field":"sentAt","fixed_interval":"1h","extended_bounds":{"min":"2024-06-16","max":"2024-06-15"}}}}"#,
+                "is after `max`",
+            ),
+            (
+                r#"{"x":{"date_histogram":{"field":"sentAt","fixed_interval":"1h","hard_bounds":{"min":"next week"}}}}"#,
+                "must be a date",
+            ),
+            (
+                r#"{"x":{"histogram":{"field":"bytes","interval":1,"hard_bounds":{"min":5,"max":1}}}}"#,
+                "is greater than `max`",
+            ),
+            (
+                r#"{"x":{"histogram":{"field":"bytes","interval":1,"extended_bounds":{"min":0,"max":20000}}}}"#,
+                "more than the limit",
+            ),
+            (
+                r#"{"x":{"date_histogram":{"field":"sentAt","fixed_interval":"1h","keyed":true}}}"#,
+                "not supported yet",
             ),
             (
                 r#"{"x":{"histogram":{"field":"bytes","interval":0}}}"#,
