@@ -6666,7 +6666,7 @@ fn delete_in(
         let paths: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .map(|e| manifest.segment_dir(&state.data_dir, &ns, &e.segment_id))
+            .map(|e| manifest.segment_dir(&state.data_dir, ns, &e.segment_id))
             .collect();
         let outcome = state.ensure_segments_local(&paths, false);
         if let Some(error) = hydration_error_response(&outcome) {
