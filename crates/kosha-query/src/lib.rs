@@ -1779,6 +1779,26 @@ impl FilterApplier {
 
 // ─── Highlight applier ──────────────────────────────────────────────────────
 
+/// The string leaves a dotted `path` names inside a document's nested
+/// containers (#206): for `author.bio`, the `bio` leaves of a `Keyword`
+/// field `author` holding a JSON object or array of objects. Every split
+/// point is tried, so a container whose own name has a dot still resolves.
+fn nested_highlight_sources(fields: &[kosha_core::Field], path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (split, _) in path.match_indices('.') {
+        let (container, rest) = (&path[..split], &path[split + 1..]);
+        for field in fields {
+            if field.name != container || field.field_type != FieldType::Keyword {
+                continue;
+            }
+            if let Some(value) = kosha_core::nested::parse_container(&field.value) {
+                out.extend(kosha_core::nested::leaf_strings(&value, rest));
+            }
+        }
+    }
+    out
+}
+
 pub fn apply_highlight(
     text: &str,
     query_terms: &[String],
@@ -1816,12 +1836,20 @@ pub fn apply_highlights(
     for requested in &config.fields {
         let pre = config.pre_tag(requested);
         let post = config.post_tag(requested);
-        let fragments: Vec<String> = doc
+        let mut fragments: Vec<String> = doc
             .fields
             .iter()
             .filter(|f| f.name == requested.name && f.field_type == FieldType::Text)
             .map(|f| apply_highlight(&f.value, query_terms, pre, post))
             .collect();
+        if fragments.is_empty() {
+            // A dotted path into a nested container (#206): highlight the
+            // string leaves at that path.
+            fragments = nested_highlight_sources(&doc.fields, &requested.name)
+                .iter()
+                .map(|text| apply_highlight(text, query_terms, pre, post))
+                .collect();
+        }
         if !fragments.is_empty() {
             by_field.insert(requested.name.clone(), fragments);
         }
@@ -4587,7 +4615,7 @@ impl Searcher {
                 .chain(knn_hits.iter().map(|(doc_seq, _, _)| *doc_seq))
                 .collect();
             if columnar_filters {
-                build_sort_value_maps_columnar(&reader, sort_value_fields, &wanted)?
+                build_sort_value_maps_columnar(&reader, sort_value_fields, &wanted, &query.sort)?
             } else {
                 build_sort_value_maps(
                     filter_store
@@ -4595,6 +4623,7 @@ impl Searcher {
                         .expect("custom sort requires filter_store"),
                     sort_value_fields,
                     &wanted,
+                    &query.sort,
                 )
             }
         };
@@ -6211,34 +6240,71 @@ fn build_sort_value_maps(
     store: &FilterStore,
     fields: &[String],
     wanted: &HashSet<u32>,
+    sort: &[SortSpec],
 ) -> HashMap<String, HashMap<u32, SortValue>> {
     fields
         .iter()
         .map(|field| {
-            let map = if let Some(entries) = kosha_core::lookup_field(&store.string_fields, field) {
-                entries
-                    .iter()
-                    .filter(|(seq, _)| wanted.contains(seq))
-                    .map(|(seq, v)| (*seq, SortValue::Text(v.clone())))
-                    .collect()
-            } else if let Some(entries) = kosha_core::lookup_field(&store.integer_fields, field) {
-                entries
-                    .iter()
-                    .filter(|(seq, _)| wanted.contains(seq))
-                    .map(|(seq, v)| (*seq, SortValue::Number(*v as f64)))
-                    .collect()
-            } else if let Some(entries) = kosha_core::lookup_field(&store.float_fields, field) {
-                entries
-                    .iter()
-                    .filter(|(seq, _)| wanted.contains(seq))
-                    .map(|(seq, v)| (*seq, SortValue::Number(*v)))
-                    .collect()
-            } else {
-                HashMap::new()
+            // A multi-valued field (a JSON-list value, or a flattened
+            // nested path with several entries per document, #206) sorts
+            // by its smallest value ascending and its largest descending,
+            // Elasticsearch's default `mode`.
+            let descending = sort_field_is_descending(sort, field);
+            // A field carried only for `collapse` groups by its stored
+            // value as it always has; only a sort key reads list elements.
+            let is_sort_key = sort.iter().any(|spec| spec.fields.contains_key(field));
+            let mut map: HashMap<u32, SortValue> = HashMap::new();
+            let mut offer = |seq: u32, value: SortValue| match map.entry(seq) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(value);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let ord = value.compare(slot.get());
+                    let better = if descending {
+                        ord == std::cmp::Ordering::Greater
+                    } else {
+                        ord == std::cmp::Ordering::Less
+                    };
+                    if better {
+                        slot.insert(value);
+                    }
+                }
             };
+            if let Some(entries) = kosha_core::lookup_field(&store.string_fields, field) {
+                for (seq, v) in entries.iter().filter(|(seq, _)| wanted.contains(seq)) {
+                    match (is_sort_key && v.starts_with('['))
+                        .then(|| kosha_core::list_elements(v))
+                        .flatten()
+                    {
+                        // An empty list is no value: the document sorts as
+                        // missing.
+                        Some(elements) => elements
+                            .into_iter()
+                            .for_each(|e| offer(*seq, SortValue::Text(e))),
+                        None => offer(*seq, SortValue::Text(v.clone())),
+                    }
+                }
+            } else if let Some(entries) = kosha_core::lookup_field(&store.integer_fields, field) {
+                for (seq, v) in entries.iter().filter(|(seq, _)| wanted.contains(seq)) {
+                    offer(*seq, SortValue::Number(*v as f64));
+                }
+            } else if let Some(entries) = kosha_core::lookup_field(&store.float_fields, field) {
+                for (seq, v) in entries.iter().filter(|(seq, _)| wanted.contains(seq)) {
+                    offer(*seq, SortValue::Number(*v));
+                }
+            }
             (field.clone(), map)
         })
         .collect()
+}
+
+/// Whether the first sort key on `field` is descending. A field that is
+/// only carried for `collapse` is not a sort key, and takes the ascending
+/// (smallest) value.
+fn sort_field_is_descending(sort: &[SortSpec], field: &str) -> bool {
+    sort.iter()
+        .find_map(|spec| spec.fields.get(field))
+        .is_some_and(|order| order.order == "desc")
 }
 
 fn extract_sort_values(
@@ -7182,11 +7248,15 @@ fn visit_metric_values_columnar(
     Ok(())
 }
 
-/// [`build_sort_value_maps`] over a columnar segment's filter columns.
+/// [`build_sort_value_maps`] over a columnar segment's filter columns, by
+/// the same rules: the first column kind the field has (string, then
+/// integer, then float), and a multi-valued field (#206) sorting by its
+/// smallest value ascending and its largest descending.
 fn build_sort_value_maps_columnar(
     reader: &SegmentReader,
     fields: &[String],
     wanted: &HashSet<u32>,
+    sort: &[SortSpec],
 ) -> Result<HashMap<String, HashMap<u32, SortValue>>, KoshaError> {
     use kosha_core::FilterColumnKind;
     use kosha_segment::filter_columns::FilterColumn;
@@ -7195,9 +7265,25 @@ fn build_sort_value_maps_columnar(
     sorted.sort_unstable();
     let mut out = HashMap::with_capacity(fields.len());
     for field in fields {
+        let descending = sort_field_is_descending(sort, field);
+        let is_sort_key = sort.iter().any(|spec| spec.fields.contains_key(field));
         let mut map: HashMap<u32, SortValue> = HashMap::new();
-        // The first kind the field has a column of, as on `filters.bin`.
-        // A document with several values keeps its last, as there.
+        let mut offer = |seq: u32, value: SortValue| match map.entry(seq) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(value);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let ord = value.compare(slot.get());
+                let better = if descending {
+                    ord == std::cmp::Ordering::Greater
+                } else {
+                    ord == std::cmp::Ordering::Less
+                };
+                if better {
+                    slot.insert(value);
+                }
+            }
+        };
         let mut column = None;
         for kind in [
             FilterColumnKind::String,
@@ -7213,19 +7299,30 @@ fn build_sort_value_maps_columnar(
             Some(FilterColumn::String(c)) => {
                 let ords = c.ords();
                 for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
-                    map.insert(sorted[wi], SortValue::Text(c.term(ords[i]).to_string()));
+                    let v = c.term(ords[i]);
+                    match (is_sort_key && v.starts_with('['))
+                        .then(|| kosha_core::list_elements(v))
+                        .flatten()
+                    {
+                        // An empty list is no value: the document sorts as
+                        // missing.
+                        Some(elements) => elements
+                            .into_iter()
+                            .for_each(|e| offer(sorted[wi], SortValue::Text(e))),
+                        None => offer(sorted[wi], SortValue::Text(v.to_string())),
+                    }
                 });
             }
             Some(FilterColumn::Integer(c)) => {
                 let values = c.values();
                 for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
-                    map.insert(sorted[wi], SortValue::Number(values[i] as f64));
+                    offer(sorted[wi], SortValue::Number(values[i] as f64));
                 });
             }
             Some(FilterColumn::Float(c)) => {
                 let values = c.values();
                 for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
-                    map.insert(sorted[wi], SortValue::Number(values[i]));
+                    offer(sorted[wi], SortValue::Number(values[i]));
                 });
             }
             None => {}
@@ -18935,5 +19032,353 @@ mod metric_aggregation_tests {
         let prices: Vec<f64> = segments.concat().iter().filter_map(|d| d.price).collect();
         check_all(&out, &prices, prices.len() as u64, "no-hydrate price");
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod nested_attribute_tests {
+    //! Issue #206: objects and arrays inside documents, addressed by
+    //! dotted path in filters, sorts, aggregations and highlights, across
+    //! more than one segment.
+    use super::*;
+    use kosha_core::{DocumentId, Field, ManifestEntry, SegmentId};
+    use kosha_segment::SegmentWriter;
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "kosha-nested-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    /// `(id, text, author object, authors array)`; `None` leaves the
+    /// field off the document.
+    type Doc = (
+        &'static str,
+        &'static str,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+    );
+
+    fn fixture() -> Vec<Vec<Doc>> {
+        vec![
+            vec![
+                (
+                    "d1",
+                    "quarterly report",
+                    Some(json!({"name": "Ada", "org": "acme", "age": 36,
+                                "bio": "loves report writing"})),
+                    Some(json!([{"name": "Ada", "org": "acme"},
+                                {"name": "Bob", "org": "beta"}])),
+                ),
+                (
+                    "d2",
+                    "annual report",
+                    Some(json!({"name": "Bob", "org": "beta", "age": 41})),
+                    Some(json!([{"name": "Cy", "org": "acme"}])),
+                ),
+            ],
+            vec![
+                (
+                    "d3",
+                    "report draft",
+                    Some(json!({"name": "Ada", "org": "beta", "age": 29})),
+                    Some(json!([{"name": "Bob", "org": "acme", "score": 5},
+                                {"name": "Bob", "org": "acme", "score": 1}])),
+                ),
+                ("d4", "report memo", None, None),
+                (
+                    "d5",
+                    "report notes",
+                    None,
+                    Some(json!([{"score": 3}, {"score": 10}])),
+                ),
+            ],
+        ]
+    }
+
+    fn build(root: &Path, segments: &[Vec<Doc>]) -> (NamespaceId, Manifest) {
+        let ns = NamespaceId("ns".into());
+        let mut manifest = Manifest {
+            version: 1,
+            segments: vec![],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+        };
+        for (i, docs) in segments.iter().enumerate() {
+            let id = SegmentId(format!("seg{i}"));
+            let mut writer = SegmentWriter::new(id.clone(), root.join(&ns.0).join(&id.0));
+            for (doc_id, text, author, authors) in docs {
+                let mut fields = vec![Field::text("text", *text)];
+                if let Some(author) = author {
+                    fields.push(Field::keyword("author", author.to_string()));
+                }
+                if let Some(authors) = authors {
+                    fields.push(Field::keyword("authors", authors.to_string()));
+                }
+                writer.add_document(DocumentId((*doc_id).into()), fields);
+            }
+            let footer = writer.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id: id,
+                doc_count: footer.doc_count,
+            });
+            manifest.remember_segment_footer(footer);
+        }
+        (ns, manifest)
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        ns: NamespaceId,
+        manifest: Manifest,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let root = temp_root(tag);
+            let (ns, manifest) = build(&root, &fixture());
+            Self { root, ns, manifest }
+        }
+
+        fn search(&self, query: serde_json::Value) -> SearchResult {
+            let mut query = query;
+            if query.get("query_text").is_none() {
+                query["query_text"] = json!("");
+            }
+            if query.get("max_results").is_none() {
+                query["max_results"] = json!(10);
+            }
+            let q: SearchQuery = serde_json::from_value(query).unwrap();
+            Searcher::new(self.root.clone())
+                .search(&self.ns, &self.manifest, &q, None)
+                .unwrap()
+        }
+
+        fn ids(&self, query: serde_json::Value) -> Vec<String> {
+            self.search(query)
+                .results
+                .into_iter()
+                .map(|r| r.doc_id.0)
+                .collect()
+        }
+
+        fn sorted_ids(&self, query: serde_json::Value) -> Vec<String> {
+            let mut ids = self.ids(query);
+            ids.sort();
+            ids
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn filters_on_dotted_paths_across_segments() {
+        let f = Fixture::new("filter");
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"term": {"author.name": "Ada"}}})),
+            vec!["d1", "d3"]
+        );
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"term": {"author.name.keyword": "Bob"}}})),
+            vec!["d2"]
+        );
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"range": {"author.age": {"gte": "30"}}}})),
+            vec!["d1", "d2"]
+        );
+        // Multi-valued: any value matches.
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"terms": {"authors.name": ["Bob"]}}})),
+            vec!["d1", "d3"]
+        );
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"range": {"authors.score": {"gt": "8"}}}})),
+            vec!["d5"]
+        );
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"exists": {"field": "authors.score"}}})),
+            vec!["d3", "d5"]
+        );
+        assert_eq!(
+            f.sorted_ids(json!({"filter": {"exists": {"field": "authors"}}})),
+            vec!["d1", "d2", "d3", "d5"]
+        );
+        assert!(f
+            .ids(json!({"filter": {"term": {"author.nope": "Ada"}}}))
+            .is_empty());
+    }
+
+    #[test]
+    fn array_of_objects_matches_across_elements() {
+        // Flattened semantics, documented in the README: d1's authors are
+        // {Ada, acme} and {Bob, beta}. No single author is Ada at beta, yet
+        // the document matches, because each path pools every element.
+        let f = Fixture::new("cross");
+        let both = |name: &str, org: &str| {
+            json!({"filter": {"bool": {"must": [
+                {"term": {"authors.name": name}},
+                {"term": {"authors.org": org}}
+            ]}}})
+        };
+        assert_eq!(f.sorted_ids(both("Ada", "beta")), vec!["d1"]);
+        assert_eq!(f.sorted_ids(both("Ada", "acme")), vec!["d1"]);
+        // Neither element of any document holds both values.
+        assert!(f.ids(both("Cy", "beta")).is_empty());
+    }
+
+    #[test]
+    fn sort_on_dotted_paths_uses_min_ascending_and_max_descending() {
+        let f = Fixture::new("sort");
+        let sorted = |field: &str, order: &str| {
+            f.ids(json!({
+                "filter": {"exists": {"field": field}},
+                "sort": [{field: {"order": order}}]
+            }))
+        };
+        assert_eq!(sorted("author.age", "asc"), vec!["d3", "d1", "d2"]);
+        assert_eq!(sorted("author.age", "desc"), vec!["d2", "d1", "d3"]);
+        // d3 has scores {5, 1}, d5 has {3, 10}: min ascending, max
+        // descending.
+        assert_eq!(sorted("authors.score", "asc"), vec!["d3", "d5"]);
+        assert_eq!(sorted("authors.score", "desc"), vec!["d5", "d3"]);
+        // Strings: d1 {Ada, Bob}, d2 {Cy}, d3 {Bob, Bob}.
+        assert_eq!(sorted("authors.name", "asc"), vec!["d1", "d3", "d2"]);
+        assert_eq!(sorted("authors.name", "desc"), vec!["d2", "d1", "d3"]);
+    }
+
+    #[test]
+    fn aggregations_on_dotted_paths_count_each_value_once_per_document() {
+        let f = Fixture::new("aggs");
+        let result = f.search(json!({
+            "filter": {"match_all": {}},
+            "aggs": {
+                "names": {"terms": {"field": "authors.name"}},
+                "orgs": {"terms": {"field": "author.org"},
+                         "aggs": {"oldest": {"max": {"field": "author.age"}}}},
+                "score_sum": {"sum": {"field": "authors.score"}},
+                "score_count": {"value_count": {"field": "authors.score"}}
+            }
+        }));
+        let aggs = serde_json::to_value(result.aggregations.unwrap()).unwrap();
+        let buckets = |name: &str| -> Vec<(String, u64)> {
+            let mut out: Vec<(String, u64)> = aggs[name]["buckets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| {
+                    (
+                        b["key"].as_str().unwrap().to_string(),
+                        b["doc_count"].as_u64().unwrap(),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        // d3 lists Bob twice and still counts once.
+        assert_eq!(
+            buckets("names"),
+            vec![("Ada".into(), 1), ("Bob".into(), 2), ("Cy".into(), 1)]
+        );
+        assert_eq!(
+            buckets("orgs"),
+            vec![("acme".into(), 1), ("beta".into(), 2)]
+        );
+        let beta = aggs["orgs"]["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["key"] == "beta")
+            .unwrap();
+        assert_eq!(beta["oldest"]["value"].as_f64(), Some(41.0));
+        assert_eq!(aggs["score_sum"]["value"].as_f64(), Some(19.0));
+        assert_eq!(aggs["score_count"]["value"].as_f64(), Some(4.0));
+    }
+
+    #[test]
+    fn source_round_trips_the_original_nesting() {
+        let f = Fixture::new("source");
+        let result = f.search(json!({"filter": {"term": {"author.name": "Ada"}},
+                                     "sort": [{"_id": {"order": "asc"}}]}));
+        let d1 = &result.results[0];
+        assert_eq!(d1.doc_id.0, "d1");
+        let names: Vec<&str> = d1.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["text", "author", "authors"]);
+        let source = |name: &str| -> serde_json::Value {
+            let field = d1.fields.iter().find(|f| f.name == name).unwrap();
+            assert_eq!(field.field_type, FieldType::Keyword);
+            serde_json::from_str(&field.value).unwrap()
+        };
+        assert_eq!(source("author"), fixture()[0][0].2.clone().unwrap());
+        assert_eq!(source("authors"), fixture()[0][0].3.clone().unwrap());
+    }
+
+    #[test]
+    fn highlight_on_a_dotted_path() {
+        let f = Fixture::new("highlight");
+        let result = f.search(json!({
+            "query_text": "report",
+            "filter": {"term": {"author.name": "Ada"}},
+            "highlight": {"field": "author.bio"},
+            "sort": [{"_id": {"order": "asc"}}]
+        }));
+        let by_id: HashMap<&str, &ScoredDocument> = result
+            .results
+            .iter()
+            .map(|r| (r.doc_id.0.as_str(), r))
+            .collect();
+        assert_eq!(
+            by_id["d1"].highlights.as_deref(),
+            Some(&["loves <b>report</b> writing".to_string()][..])
+        );
+        // d3's author has no bio.
+        assert_eq!(by_id["d3"].highlights, None);
+    }
+
+    #[test]
+    fn flat_documents_are_untouched() {
+        // A Keyword value that is not a container (a plain list, a value
+        // that only looks like JSON) adds no dotted-path columns.
+        let root = temp_root("flat");
+        let ns = NamespaceId("ns".into());
+        let id = SegmentId("seg0".into());
+        let mut writer = SegmentWriter::new(id.clone(), root.join(&ns.0).join(&id.0));
+        writer.add_document(
+            DocumentId("a".into()),
+            vec![
+                Field::keyword("tags", r#"["b","z"]"#),
+                Field::keyword("k", "{not json"),
+            ],
+        );
+        writer.add_document(
+            DocumentId("b".into()),
+            vec![Field::keyword("tags", r#"["c"]"#)],
+        );
+        writer.finalize(Bm25Params::default()).unwrap();
+        let reader = kosha_segment::SegmentReader::open(root.join(&ns.0).join(&id.0)).unwrap();
+        let store = reader.filter_store();
+        let mut names: Vec<&String> = store.string_fields.keys().collect();
+        names.sort();
+        assert_eq!(names, vec!["k", "tags"]);
+        assert!(store.float_fields.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

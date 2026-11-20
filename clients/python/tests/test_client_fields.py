@@ -478,3 +478,24 @@ def test_indices_refresh_flushes_namespace(monkeypatch):
     client, requests = _recording_client(monkeypatch)
     client.indices.refresh(index="a")
     assert requests == [("POST", "flush", {"namespace": "a"})]
+
+
+def test_nested_object_is_sent_as_keyword_json_and_round_trips():
+    # #206: a dict used to be dropped. It is now sent whole as Keyword JSON
+    # text, which the server flattens into dotted paths for indexing.
+    author = {"name": "Ada", "org": "acme", "tags": ["x"], "age": 36}
+    authors = [{"name": "Ada"}, {"name": "Bob"}]
+    fields = KoshaClient._source_to_fields({"author": author, "authors": authors})
+    by_name = {f["name"]: f for f in fields}
+    assert by_name["author"]["field_type"] == "Keyword"
+    assert json.loads(by_name["author"]["value"]) == author
+    assert by_name["authors"]["field_type"] == "Keyword"
+    assert json.loads(by_name["authors"]["value"]) == authors
+
+    client = KoshaClient(hosts=["http://localhost:9"], api_key="k")
+    response = client._build_search_response(
+        {"total_hits": 1, "results": [{"doc_id": "d1", "score": 1.0, "fields": fields}]}
+    )
+    source = response["hits"]["hits"][0]["_source"]
+    assert source["author"] == author
+    assert source["authors"] == authors

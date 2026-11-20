@@ -3505,6 +3505,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn compaction_keeps_nested_attribute_columns() {
+        // #206: dotted-path columns are derived from the stored container
+        // at every segment build, so a merged segment has them too and its
+        // stored document is still the original JSON.
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-compact-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let idx = Indexer::new(dir.clone()).with_flush_threshold(1);
+        let authors = [
+            r#"[{"name":"Ada","n":1},{"name":"Bob","n":2}]"#,
+            r#"{"name":"Cy","n":3}"#,
+        ];
+        for (i, value) in authors.iter().enumerate() {
+            idx.index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId(format!("d{i}")),
+                    fields: vec![Field::keyword("authors", *value)],
+                }],
+            )
+            .unwrap();
+        }
+        assert_eq!(idx.manifest(&ns).unwrap().segments.len(), 2);
+        assert!(
+            idx.compact_namespace_with_options(&ns, CompactOptions::full())
+                .unwrap()
+                .merged
+        );
+        let seg_id = idx.manifest(&ns).unwrap().segments[0].segment_id.clone();
+        let reader = kosha_segment::SegmentReader::open(dir.join("test").join(&seg_id.0)).unwrap();
+        let store = reader.filter_store();
+        // Merge order is not index order: key everything by document id.
+        let records: Vec<_> = reader.iter_doc_records().map(|r| r.unwrap()).collect();
+        let id_of = |seq: u32| records[seq as usize].doc_id.0.clone();
+        let mut names: Vec<(String, String)> = store.string_fields["authors.name"]
+            .iter()
+            .map(|(seq, v)| (id_of(*seq), v.clone()))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                ("d0".to_string(), r#"["Ada","Bob"]"#.to_string()),
+                ("d1".to_string(), "Cy".to_string())
+            ]
+        );
+        let mut numbers: Vec<(String, f64)> = store.float_fields["authors.n"]
+            .iter()
+            .map(|(seq, v)| (id_of(*seq), *v))
+            .collect();
+        numbers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            numbers,
+            vec![("d0".into(), 1.0), ("d0".into(), 2.0), ("d1".into(), 3.0)]
+        );
+        let mut stored: Vec<(String, String)> = records
+            .iter()
+            .map(|r| (r.doc_id.0.clone(), r.fields[0].value.clone()))
+            .collect();
+        stored.sort();
+        assert_eq!(
+            stored,
+            vec![
+                ("d0".to_string(), authors[0].to_string()),
+                ("d1".to_string(), authors[1].to_string())
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression for the production incident this fixes: tiered compaction
     /// silently lost ~0.24% of a 10M-doc corpus across several rounds, with
     /// every round reporting success — traced to `iter_doc_records`

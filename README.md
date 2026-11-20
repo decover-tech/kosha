@@ -39,14 +39,14 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | `fuzzy` | Typo-tolerant term matching: `"fuzzy": {"field": "content", "value": "recieve", "fuzziness": 1}` finds `receive`. `fuzziness` is `0`, `1`, `2` or `"auto"` (default; Elasticsearch `AUTO:3,6`: exact below 3 characters, one edit up to 5, two from 6; `"auto:low,high"` moves the thresholds). An edit is an insertion, deletion, substitution or — with `transpositions` (default `true`) — a swap of adjacent characters. `prefix_length` (default 0) leading characters must match exactly and make expansion cheaper; `max_expansions` (default 50, at most 1024) caps the terms each token expands to per segment, nearest first, the exact term always kept. A non-exact match must leave a character of the shorter string untouched (`ox` never matches `o`). The value is analyzed with each segment's own analyzer and every token is expanded against that segment's sorted term dictionary (a Levenshtein-automaton walk that skips whole prefix ranges); several tokens combine with `operator` (AND by default). Scoring is tiered so **an exact match always outranks a one-edit match, which always outranks a two-edit one**: per token, `score = (2 − edits) + tf_norm` with `tf_norm ∈ (0, 1]` BM25's length-normalized tf saturation (namespace `avgdl`); no IDF, since expansions differ per segment. `field` (`""` / `_all` / `*` = every `Text` field) restricts it to one field's postings; segments written before per-field indexes answer from their combined index. Its own lexical query: not combinable with `query_text` / `fields` / `wildcard` / `match_phrase`, but can be the lexical leg of a hybrid request and takes `rank_by`. Segments are bloom-pruned for 0- and 1-edit tokens (see [Fuzzy bloom](#fuzzy-bloom)). Runs on an exhaustive path (no block-max WAND). On 1M docs x 30 words in 8 segments (1.08M distinct terms), warm: ~0.5–1 ms at 1 edit and ~3.5–4.5 ms at 2 edits for mid-frequency and rare words, ~10–14 ms when an expansion is a very frequent word (every posting is scored; the exact `query_text` WAND query takes 0.5 ms). The dictionary walk itself is ~0.2 ms per segment at 1 edit and ~2 ms at 2 edits (~0.3 ms with `prefix_length: 2`). Non-fuzzy queries are unchanged (`cargo bench -p kosha-query --bench fuzzy_expansion`) |
 | kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
 | Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase` / `fuzzy`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
-| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `bool` (`must` / `must_not` / `should` / `minimum_should_match`), `match_all` |
+| Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `exists`, `bool` (`must` / `must_not` / `should` / `minimum_should_match`), `match_all`. On a multi-valued field (a list, or a [nested path](#nested-attributes) with several values) a clause matches if ANY value does |
 | kNN-scoped filters | `knn.filter` restricts only the vector list; the top-level `filter` restricts both the lexical and the vector list |
-| Sorting | Multi-field `sort` over stored fields, plus `_id` |
+| Sorting | Multi-field `sort` over stored fields and [nested dotted paths](#nested-attributes), plus `_id`. A multi-valued field sorts by its smallest value for `asc` and its largest for `desc` (Elasticsearch's default `mode`) |
 | Pagination | `from` / `max_results`, and an OpenSearch-style `search_after` cursor |
 | Result diversification | `"limit_per": {"field": "author", "max": 2}` returns at most `max` hits per distinct value of a keyword field. The cap is applied while the result list is collected, so a page is filled from the next-best groups instead of coming back short; documents without the field are not capped. `collapse: {"field": ...}` is the one-per-group case (and groups missing values together); the two cannot be combined. `search_after` and `from` resume the same capped list, so no document repeats and a group spent on an earlier page is never refilled. `total_hits` and aggregations count matching documents before the cap (a pure kNN request reports its neighbour set, which is the diversified one). Works for BM25, kNN (diversity is found within the probed `num_candidates`) and hybrid, where each retriever's list is diversified before fusion and `rank_details` ranks are positions in those lists |
 | Score modifiers | `rank_by` blends attributes into the score: `field_value` (`modifier(factor × value)`, Elasticsearch `field_value_factor` modifiers) and `decay` (`linear` / `exp` / `gauss` around an `origin`, with `scale`, `offset`, `decay`) over `Integer`, `Float`, `Date` and `GeoPoint` fields, each with a `weight`. Functions combine by `score_mode` (`sum` default, `multiply`, `avg`, `max`, `min`) and apply to the text score by `boost_mode` (`multiply` default: `text_weight × score × F`; `sum`: `text_weight × score + F`; `replace`: `F`). A decay's `origin` picks its axis: a number (numeric field), a date or `"now"` (scale like `"30d"`), or `{"lat", "lon"}` (scale like `"5km"`). Values come from the filter columns, never the doc store. Applied in a rescore window: the best `window_size` hits by the query's own score (BM25, fused RRF or vector; default `max(100, max_results)`, at most 10,000; a hybrid request rescores within its fused `rank_window_size` list, a kNN request within its `k` neighbours) are rescored and re-sorted, so block-max WAND keeps pruning on BM25 alone; hits below the window are not returned, `total_hits` still counts every match. Each hit reports `rank_details.base_score`. Missing values use the function's `missing` (default 0, which under `multiply` zeroes the hit). `collapse` / `limit_per` apply to the rescored order; `sort` must be by `_score`; `origin: "now"` responses are not cached. Example — halve the score every 30 days: `"rank_by": {"functions": [{"decay": {"field": "published", "function": "exp", "origin": "now", "scale": "30d", "decay": 0.5}}]}` |
 | Geo | `GeoPoint` fields (`"lat,lon"`, `{"lat", "lon"}` or GeoJSON `[lon, lat]`; invalid points are a 400 at index time). `{"geo_distance": {"distance": "10km", "<field>": {"lat": .., "lon": ..}}}` filters by great-circle distance; a `decay` with a geo `origin` ranks by distance |
-| Highlighting | Any number of text fields per request, Elasticsearch-shaped: `"highlight": {"pre_tags": ["<em>"], "post_tags": ["</em>"], "fields": {"title": {}, "body": {"pre_tags": ["<mark>"], "post_tags": ["</mark>"]}}}`. Each field's tags fall back to the top-level `pre_tags` / `post_tags`, then to `<b>` / `</b>`. Hits return `"highlight": {"title": ["..."], "body": ["..."]}` (one fragment per field value, the whole value with the query's terms marked up); requested fields that a hit lacks or that are not `Text` are left out silently. The legacy single-field form `"highlight": {"field": "body"}` still works and still returns the flat `"highlights": [...]` list; that form and `highlights` are deprecated. Giving both `field` and `fields` is a 400. Fragment size/count options and other highlighter types are not supported (unknown options are ignored) |
+| Highlighting | Any number of text fields per request (including a [nested](#nested-attributes) dotted path such as `author.bio`), Elasticsearch-shaped: `"highlight": {"pre_tags": ["<em>"], "post_tags": ["</em>"], "fields": {"title": {}, "body": {"pre_tags": ["<mark>"], "post_tags": ["</mark>"]}}}`. Each field's tags fall back to the top-level `pre_tags` / `post_tags`, then to `<b>` / `</b>`. Hits return `"highlight": {"title": ["..."], "body": ["..."]}` (one fragment per field value, the whole value with the query's terms marked up); requested fields that a hit lacks or that are not `Text` are left out silently. The legacy single-field form `"highlight": {"field": "body"}` still works and still returns the flat `"highlights": [...]` list; that form and `highlights` are deprecated. Giving both `field` and `fields` is a 400. Fragment size/count options and other highlighter types are not supported (unknown options are ignored) |
 | Aggregations | Buckets: `terms`, `composite`. Metrics: `cardinality`, `min`, `max`, `sum`, `avg`, `value_count`, top-level or nested under a `terms` / `composite` bucket via `aggs`. Computed over every document the query and filter match (not just the page), from the filter columns only — see [Aggregations](#aggregations) |
 | Total-hit accounting | Capped counting with an `eq` / `gte` relation (`track_total_hits`-style), overridable per query via `exact_total_hits` / `total_hits_cap` |
 | Degradation signal | `knn_degraded_segments` reports segments whose vector search failed, so a 200 with silently missing neighbors is visible to the caller |
@@ -97,6 +97,68 @@ request and response shapes:
   store.
 - Not supported yet: `stats`, `percentiles`, `histogram`, `date_histogram`,
   `range` buckets, `missing` / `script` / `format` options.
+
+### Nested attributes
+
+A `Keyword` field whose value is the JSON text of an object, or of an array
+of objects, is a nested container. Filters, `sort`, aggregations and
+`highlight` address its leaves by dotted path (`author.name`), and a hit
+returns the field exactly as it was sent. The Python client sends a `dict`
+this way automatically.
+
+```json
+{"id": "1", "fields": [
+  {"name": "author",  "field_type": "Keyword", "value": "{\"name\":\"Ada\",\"org\":\"acme\",\"age\":36}"},
+  {"name": "authors", "field_type": "Keyword", "value": "[{\"name\":\"Ada\",\"org\":\"acme\"},{\"name\":\"Bob\",\"org\":\"beta\"}]"},
+  {"name": "tags",    "field_type": "Keyword", "value": "[\"a\",\"b\"]"}]}
+```
+
+```json
+{"query_text": "", "filter": {"bool": {"must": [
+   {"term": {"author.org": "acme"}}, {"range": {"author.age": {"gte": "30"}}}]}},
+ "sort": [{"author.age": {"order": "desc"}}],
+ "aggs": {"by_author": {"terms": {"field": "authors.name"}}}}
+```
+
+**Semantics are flattened, like Elasticsearch's `object` type, not
+`nested`.** Each dotted path collects the leaves of every element of an
+array, and the link between leaves of the same element is lost. With the
+`authors` value above:
+
+| Filter | Matches? | Why |
+| --- | --- | --- |
+| `authors.name = Ada` | yes | `authors.name` is `[Ada, Bob]` |
+| `authors.name = Ada AND authors.org = acme` | yes | Ada is at acme |
+| `authors.name = Ada AND authors.org = beta` | **yes** | `authors.org` is `[acme, beta]`; no author is both Ada and at beta, but the paths are matched independently |
+| `authors.name = Cy` | no | no element has that name |
+
+True nested queries, where each array element is matched as a unit, are not
+supported. If you need "same element" matching, index each element as its
+own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`).
+
+- Each leaf is indexed under its full path. Objects inside arrays, and arrays
+  inside arrays, are flattened into the same path. `null`, `{}` and `[]` do
+  not add a value.
+- A path with several values is multi-valued. A filter matches if any value
+  matches. A `terms` bucket counts a document once per distinct value, so a
+  value repeated in one document still counts once. Metric aggregations
+  (`sum`, `avg`, `value_count`...) see every value.
+- Numbers go to the numeric (float) column, with one entry per value, so
+  `range`, numeric `sort` and metrics work on them. Strings and booleans go to
+  the keyword column. If several values are stored at one path, they are kept
+  as their JSON-list text, the same convention `tags` above uses. If a path
+  has both strings and numbers in one document, all of its values are stored
+  as strings, so keep each path to one JSON type.
+- Leaves are filter and sort values. They are not tokenized for full-text
+  `query_text` search.
+- Dotted paths are worked out each time a segment is built. A container
+  indexed before this release can be addressed by dotted path once its
+  segment is rebuilt by compaction or re-indexing. Flat documents are
+  unaffected.
+- The field names a query uses can be listed with
+  `SearchQuery::field_paths()`. `validate_field_paths()` rejects a path that
+  a namespace schema does not know. Until namespace schemas are enforced on
+  search, unknown paths are allowed and match nothing.
 
 ### Indexing and writes
 

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod datetime;
 pub mod docset;
+pub mod nested;
 pub use analysis::{
     AnalysisConfig, AnalyzerSpec, FieldSchema, NamespaceSchema, SegmentAnalysis, TokenFilterSpec,
     TokenizerKind,

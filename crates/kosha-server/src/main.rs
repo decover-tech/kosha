@@ -12081,6 +12081,98 @@ mod tests {
     }
 
     #[test]
+    fn nested_attributes_round_trip_through_the_http_api() {
+        // #206: a Keyword field holding a JSON object or array of objects
+        // is filterable, sortable and aggregatable by dotted path, across
+        // two flushed segments, and comes back exactly as sent.
+        let state = test_state();
+        let author = serde_json::json!({"name": "Ada", "org": "acme", "age": 36});
+        let index = |id: &str, author: &serde_json::Value, authors: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({"documents": [{"id": id, "fields": [
+                {"name": "title", "field_type": "Text", "value": "report"},
+                {"name": "author", "field_type": "Keyword", "value": author.to_string()},
+                {"name": "authors", "field_type": "Keyword", "value": authors.to_string()}
+            ]}]}))
+            .unwrap();
+            let resp = route(
+                "POST /v1/namespaces/nested/documents HTTP/1.1\r\n",
+                &HashMap::new(),
+                &body,
+                "acme-corp",
+                &state,
+            );
+            assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+            state
+                .indexer
+                .flush_namespace(&NamespaceId("acme-corp/nested".into()))
+                .unwrap();
+        };
+        index(
+            "d1",
+            &author,
+            serde_json::json!([{"name": "Ada", "org": "acme"}, {"name": "Bob", "org": "beta"}]),
+        );
+        index(
+            "d2",
+            &serde_json::json!({"name": "Bob", "org": "beta", "age": 41}),
+            serde_json::json!([{"name": "Bob", "org": "acme"}]),
+        );
+        let search = |query: serde_json::Value| {
+            let resp = route(
+                "POST /v1/namespaces/nested/search HTTP/1.1\r\n",
+                &HashMap::new(),
+                &serde_json::to_vec(&query).unwrap(),
+                "acme-corp",
+                &state,
+            );
+            assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+            json_body(&resp)
+        };
+        let ids = |body: &serde_json::Value| -> Vec<String> {
+            body["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let body = search(serde_json::json!({
+            "query_text": "report", "max_results": 5,
+            "filter": {"bool": {"must": [{"term": {"authors.name": "Ada"}},
+                                         {"term": {"authors.org": "beta"}}]}}
+        }));
+        assert_eq!(ids(&body), vec!["d1"], "flattened: matches across elements");
+        let fields = body["results"][0]["fields"].as_array().unwrap();
+        let stored = fields.iter().find(|f| f["name"] == "author").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(stored["value"].as_str().unwrap()).unwrap(),
+            author
+        );
+        assert!(fields.iter().all(|f| f["name"] != "author.name"));
+
+        let body = search(serde_json::json!({
+            "query_text": "report", "max_results": 5,
+            "sort": [{"author.age": {"order": "desc"}}],
+            "aggs": {"names": {"terms": {"field": "authors.name"}}}
+        }));
+        assert_eq!(ids(&body), vec!["d2", "d1"]);
+        let mut buckets: Vec<(String, u64)> = body["aggregations"]["names"]["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                (
+                    b["key"].as_str().unwrap().into(),
+                    b["doc_count"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        buckets.sort();
+        assert_eq!(buckets, vec![("Ada".into(), 1), ("Bob".into(), 2)]);
+    }
+
+    #[test]
     fn v1_tenant_scoped_index_then_search_works() {
         // Regression test: extract_namespace previously could never match
         // (it stripped a method-prefixed string like "POST /v1/namespaces/"
