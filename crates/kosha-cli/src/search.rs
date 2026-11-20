@@ -579,6 +579,7 @@ mod tests {
             knn_mode: None,
             knn_filtered_candidates: None,
             exhaustive_search_count: 0,
+            consistency_fallback: None,
         }
     }
 
