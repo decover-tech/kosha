@@ -14,7 +14,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kosha_core::{KoshaError, LocalStorage, StorageBackend};
+use kosha_core::{KoshaError, LocalStorage, ObjectMeta, StorageBackend};
 
 use crate::hydration_budget::{HydrationBudget, RequestHydration};
 use crate::segment_commit;
@@ -22,13 +22,26 @@ use crate::segment_commit;
 /// Join a configured key prefix with a logical (unprefixed) path, the same
 /// way for every call site — `S3Storage::s3_key` and the concurrent fetch
 /// path in `read_many` both delegate here so they can't drift apart.
-fn join_s3_key(prefix: &str, path: &str) -> String {
+pub(crate) fn join_s3_key(prefix: &str, path: &str) -> String {
     let path = path.trim_start_matches('/');
     if prefix.is_empty() {
         path.to_string()
     } else {
         format!("{}/{}", prefix.trim_end_matches('/'), path)
     }
+}
+
+/// The logical (unprefixed) path of an S3 key listed under `key_prefix`,
+/// the inverse of [`join_s3_key`]. `None` for a key outside the prefix.
+fn logical_path_of_key(key_prefix: &str, key: &str) -> Option<String> {
+    let prefix = key_prefix.trim_end_matches('/');
+    let rest = if prefix.is_empty() {
+        key
+    } else {
+        key.strip_prefix(prefix)?.strip_prefix('/')?
+    };
+    let rest = rest.trim_start_matches('/');
+    (!rest.is_empty()).then(|| rest.to_string())
 }
 
 /// Configuration for the S3-backed segment store.
@@ -164,6 +177,10 @@ impl S3Storage {
         &self.prefix
     }
 
+    pub fn client(&self) -> &aws_sdk_s3::Client {
+        &self.client
+    }
+
     pub fn s3_key(&self, path: &str) -> String {
         join_s3_key(&self.prefix, path)
     }
@@ -194,9 +211,13 @@ impl S3Storage {
             // uploaded ahead of the files it vouches for. In-progress
             // atomic-write temps are never segment data: writer temps are
             // `.{name}.tmp.{pid}.{n}`, hydration temps `{stem}.tmp.{pid}.{n}`.
+            // Deletion generations are uploaded with the manifest that
+            // references them, not as segment data, so GC can drop a
+            // superseded one without breaking this segment's `_COMMIT`.
             if name == segment_commit::COMMIT_FILE
                 || name.starts_with('.')
                 || name.contains(".tmp.")
+                || kosha_core::gc::deletion_generation_of(&name).is_some()
             {
                 continue;
             }
@@ -375,31 +396,30 @@ impl S3Storage {
         })
     }
 
-    /// Ranged-read counterpart of `read_many` for page materialization:
-    /// fetch each `(logical_path, offset, length)` span as an S3 ranged GET
-    /// (`Range: bytes=offset-offset+length-1`) — KBs per span instead of
-    /// the whole multi-hundred-MB object — with the same concurrent fan-out
-    /// and bounded retry as whole-file fetches. Nothing is persisted to the
-    /// local cache: span bytes belong to exactly one in-flight response.
+    /// Ranged-read counterpart of `read_many`, for page materialization
+    /// (#245): fetch each `(logical_path, offset, length)` range as one S3
+    /// ranged GET (`Range: bytes=offset-offset+length-1`), KBs instead of
+    /// the whole object, with the same concurrent fan-out and bounded retry
+    /// as whole-file fetches. Bytes are returned, not written: the caller
+    /// persists them into the sparse span cache
+    /// (`kosha_segment::span_cache`), never at the file's real path, which
+    /// every existence check treats as complete.
     ///
-    /// Returns one entry per input span, index-aligned; `None` for a span
-    /// whose fetch failed after retries (already WARN-logged here). A span
-    /// whose file is already fully local is served from disk instead — a
-    /// concurrent whole-file hydration may have landed it since the caller
-    /// decided to go ranged.
+    /// Each range is charged to `request` and holds `length` bytes of the
+    /// process-wide `budget` while in flight, like a whole-file fetch.
     ///
-    /// Currently unused by the search path — that switched to Option A
-    /// (whole-file `doc_store.bin` per page-segment, persisted) to make warm
-    /// reads local. Kept as a pub API for the future Option B refinement
-    /// (per-segment sparse span cache: cold-bytes + warm-local) and any
-    /// other caller that wants ranged S3 reads; gated `allow(dead_code)`
-    /// accordingly so clippy stays clean.
-    #[allow(dead_code)]
+    /// Returns one result per input range, index-aligned. A range may come
+    /// back shorter than asked when it runs past the end of the object
+    /// (header probes rely on that); callers needing an exact length check
+    /// it. A range whose file is already whole on local disk is served from
+    /// disk — a concurrent whole-file hydration may have landed it.
     pub fn read_ranges(
         &self,
-        ranges: &[(String, u64, u32)],
+        ranges: &[(String, u64, u64)],
         max_concurrent: usize,
-    ) -> Vec<Option<Vec<u8>>> {
+        budget: Option<&Arc<HydrationBudget>>,
+        request: &Arc<RequestHydration>,
+    ) -> Vec<Result<Vec<u8>, KoshaError>> {
         if ranges.is_empty() {
             return Vec::new();
         }
@@ -408,6 +428,7 @@ impl S3Storage {
         let prefix = self.prefix.clone();
         let client = self.client.clone();
         let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
+        let budget = budget.cloned();
 
         self.rt.block_on(async move {
             let mut set = tokio::task::JoinSet::new();
@@ -417,8 +438,10 @@ impl S3Storage {
                 let path = path.clone();
                 let (offset, length) = (*offset, *length);
                 let limit = std::sync::Arc::clone(&limit);
+                let budget = budget.clone();
+                let request = Arc::clone(request);
                 set.spawn(async move {
-                    let _permit = limit.acquire_owned().await;
+                    let _slot = limit.acquire_owned().await;
                     let result = fetch_range_one(
                         &client,
                         &bucket,
@@ -427,19 +450,25 @@ impl S3Storage {
                         &path,
                         offset,
                         length,
+                        budget,
+                        &request,
                     )
                     .await;
                     (idx, path, result)
                 });
             }
 
-            let mut out: Vec<Option<Vec<u8>>> = vec![None; ranges.len()];
+            let mut out: Vec<Result<Vec<u8>, KoshaError>> = (0..ranges.len())
+                .map(|_| Err(KoshaError::NotFound("ranged GET did not complete".into())))
+                .collect();
             while let Some(joined) = set.join_next().await {
                 if let Ok((idx, path, result)) = joined {
-                    match result {
-                        Ok(bytes) => out[idx] = Some(bytes),
-                        Err(e) => eprintln!("WARN: ranged GET of {path} failed: {e}"),
+                    if let Err(ref e) = result {
+                        if !matches!(e, KoshaError::Overloaded(_)) {
+                            eprintln!("WARN: ranged GET of {path} failed: {e}");
+                        }
                     }
+                    out[idx] = result;
                 }
             }
             out
@@ -569,6 +598,200 @@ impl S3Storage {
                 }
             }
             Ok(out)
+        })
+    }
+
+    /// Total object bytes per segment under a namespace path, from one
+    /// paginated ListObjectsV2 over the whole namespace prefix (no
+    /// delimiter): about one request per 1,000 objects, instead of one LIST
+    /// per segment or a `_COMMIT` GET each. Compaction plans merge groups
+    /// from these sizes before hydrating anything (#242). `wants(file)`
+    /// filters which files count (the files hydration would fetch).
+    ///
+    /// Keys deeper than `<segment>/<file>` are counted against their
+    /// segment too. A segment with no listed objects is absent from the map.
+    pub fn segment_sizes(
+        &self,
+        ns_path: &str,
+        wants: impl Fn(&str) -> bool,
+    ) -> Result<std::collections::HashMap<String, u64>, KoshaError> {
+        Ok(sum_segment_sizes(
+            self.list_namespace_objects(ns_path)?,
+            wants,
+        ))
+    }
+
+    /// Every object under a namespace prefix as `(<segment>/<file>, size)`,
+    /// from one paginated LIST (about one request per 1,000 objects). The
+    /// raw listing behind [`Self::segment_sizes`]; usage-driven warming
+    /// (#213) sizes each file class of each segment from it.
+    pub fn list_namespace_objects(&self, ns_path: &str) -> Result<Vec<(String, u64)>, KoshaError> {
+        let mut prefix = self.s3_key(ns_path);
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let objects: Vec<(String, u64)> = self.rt.block_on(async move {
+            let mut out = Vec::new();
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                if let Some(token) = continuation.take() {
+                    req = req.continuation_token(token);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                for obj in resp.contents() {
+                    if let Some(key) = obj.key() {
+                        let relative = key.strip_prefix(&prefix).unwrap_or(key);
+                        let size = obj.size().unwrap_or(0).max(0) as u64;
+                        out.push((relative.trim_start_matches('/').to_string(), size));
+                    }
+                }
+                match resp.next_continuation_token() {
+                    Some(t) => continuation = Some(t.to_string()),
+                    None => break,
+                }
+            }
+            Ok::<_, KoshaError>(out)
+        })?;
+        Ok(objects)
+    }
+
+    /// Every object under a logical prefix, recursively and fully paginated,
+    /// with size and `LastModified`: the listing segment GC (#239) decides
+    /// from. S3 only, never the local cache: GC must judge what the bucket
+    /// holds.
+    pub fn list_objects_remote(&self, prefix: &str) -> Result<Vec<ObjectMeta>, KoshaError> {
+        let key_prefix = self.s3_key(prefix);
+        let root = self.prefix.clone();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        self.rt.block_on(async move {
+            let mut out = Vec::new();
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket).prefix(&key_prefix);
+                if let Some(token) = continuation.take() {
+                    req = req.continuation_token(token);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                for obj in resp.contents() {
+                    let Some(path) = obj.key().and_then(|k| logical_path_of_key(&root, k)) else {
+                        continue;
+                    };
+                    out.push(ObjectMeta {
+                        path,
+                        size: obj.size().unwrap_or(0).max(0) as u64,
+                        // An object S3 reports no time for is treated as
+                        // brand new, so GC's age checks keep it.
+                        last_modified_ms: obj
+                            .last_modified()
+                            .and_then(|t| t.to_millis().ok())
+                            .map_or(u64::MAX, |ms| ms.max(0) as u64),
+                    });
+                }
+                match resp.next_continuation_token() {
+                    Some(t) if resp.is_truncated().unwrap_or(false) => {
+                        continuation = Some(t.to_string())
+                    }
+                    _ => break,
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Delete one object from S3, surfacing failures (unlike the trait's
+    /// `delete`, which predates GC and is best-effort remotely).
+    pub fn delete_remote(&self, path: &str) -> Result<(), KoshaError> {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.s3_key(path);
+        self.rt.block_on(async move {
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| KoshaError::NotFound(format!("S3 delete_object {key}: {e}")))
+        })
+    }
+
+    /// Delete every object under a logical directory, recursively: a
+    /// deleted namespace's segments, footers and deletion sidecars
+    /// (`DELETE /v1/namespaces/{ns}`). Paginated listing, `DeleteObjects`
+    /// in batches of up to 1000 keys. Returns how many objects were
+    /// deleted. Refuses an empty path (the whole bucket prefix).
+    pub fn delete_prefix(&self, path: &str) -> Result<usize, KoshaError> {
+        if path.trim_matches('/').is_empty() {
+            return Err(KoshaError::NotFound(
+                "refusing to delete the whole S3 prefix".into(),
+            ));
+        }
+        let mut prefix = self.s3_key(path.trim_end_matches('/'));
+        prefix.push('/');
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+
+        self.rt.block_on(async move {
+            use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+            let mut deleted = 0usize;
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                if let Some(token) = continuation.take() {
+                    req = req.continuation_token(token);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| KoshaError::NotFound(format!("S3 list_objects_v2: {e}")))?;
+                let objects = resp
+                    .contents()
+                    .iter()
+                    .filter_map(|obj| obj.key())
+                    .map(|key| ObjectIdentifier::builder().key(key).build())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| KoshaError::NotFound(format!("S3 delete batch: {e}")))?;
+                if !objects.is_empty() {
+                    let count = objects.len();
+                    let delete = Delete::builder()
+                        .set_objects(Some(objects))
+                        .quiet(true)
+                        .build()
+                        .map_err(|e| KoshaError::NotFound(format!("S3 delete batch: {e}")))?;
+                    let out = client
+                        .delete_objects()
+                        .bucket(&bucket)
+                        .delete(delete)
+                        .send()
+                        .await
+                        .map_err(|e| KoshaError::NotFound(format!("S3 delete_objects: {e}")))?;
+                    if let Some(err) = out.errors().first() {
+                        return Err(KoshaError::NotFound(format!(
+                            "S3 delete_objects: {} of {count} objects failed, first {}: {}",
+                            out.errors().len(),
+                            err.key().unwrap_or("?"),
+                            err.message().unwrap_or("unknown error")
+                        )));
+                    }
+                    deleted += count;
+                }
+                match resp.next_continuation_token() {
+                    Some(t) => continuation = Some(t.to_string()),
+                    None => break,
+                }
+            }
+            Ok(deleted)
         })
     }
 
@@ -1036,16 +1259,10 @@ async fn stream_body_to_file(
     Ok(StreamedFetch { bytes, write_ms })
 }
 
-/// Fetch one exact byte span for [`S3Storage::read_ranges`]: serve it from
-/// the local file when the whole object is already on disk, otherwise as an
-/// S3 ranged GET. Returns the span's bytes — never persisted locally (a
-/// partial `doc_store.bin` on disk would read as a complete file to every
-/// existence check in the hydration path).
-///
-/// Currently unused (see `read_ranges` — search path switched to Option A).
-/// Kept + `allow(dead_code)` as the ranged-read primitive for the future
-/// Option B sparse span cache.
-#[allow(dead_code)]
+/// Fetch one byte range for [`S3Storage::read_ranges`]: from the local file
+/// when the whole object is already on disk (files at their real path are
+/// only ever renamed into place complete), otherwise as an S3 ranged GET.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_range_one(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -1053,39 +1270,70 @@ async fn fetch_range_one(
     local_root: &Path,
     path: &str,
     offset: u64,
-    length: u32,
+    length: u64,
+    budget: Option<Arc<HydrationBudget>>,
+    request: &Arc<RequestHydration>,
 ) -> Result<Vec<u8>, KoshaError> {
     if length == 0 {
         return Ok(Vec::new());
     }
 
     let local_path = local_root.join(path);
-    if local_path.exists() {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let mut file = tokio::fs::File::open(&local_path)
-            .await
-            .map_err(KoshaError::Io)?;
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(KoshaError::Io)?;
-        let mut buf = vec![0u8; length as usize];
-        file.read_exact(&mut buf).await.map_err(KoshaError::Io)?;
-        return Ok(buf);
+    if let Ok(meta) = tokio::fs::metadata(&local_path).await {
+        if meta.len() > offset {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let mut file = tokio::fs::File::open(&local_path)
+                .await
+                .map_err(KoshaError::Io)?;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(KoshaError::Io)?;
+            let mut buf = vec![0u8; length.min(meta.len() - offset) as usize];
+            file.read_exact(&mut buf).await.map_err(KoshaError::Io)?;
+            return Ok(buf);
+        }
     }
 
-    let s3_key = join_s3_key(prefix, path);
-    let range = format!("bytes={}-{}", offset, offset + length as u64 - 1);
-    let bytes = get_object_with_retry_ranged(client, bucket, &s3_key, Some(&range))
-        .await?
-        .into_bytes();
-    // A short response means the range ran past EOF — the offsets sidecar
-    // and the remote object disagree. Parsing it would be garbage; fail so
-    // the caller's fallback (local read) surfaces a real error instead.
-    if bytes.len() != length as usize {
-        return Err(KoshaError::NotFound(format!(
-            "ranged GET {s3_key} [{range}] returned {} bytes, expected {length}",
-            bytes.len()
+    if request.is_shed() || !request.charge(length) {
+        return Err(KoshaError::Overloaded(format!(
+            "ranged read of {path} would put this request over its byte ceiling"
         )));
+    }
+    let _permit = match budget {
+        Some(budget) => {
+            let t_wait = std::time::Instant::now();
+            let permit = budget.acquire(length);
+            request.record_wait(t_wait.elapsed());
+            match permit {
+                Some(permit) => Some(permit),
+                None => {
+                    request.refund(length);
+                    request.mark_shed();
+                    return Err(KoshaError::Overloaded(format!(
+                        "ranged read of {path} waited out the in-flight byte budget"
+                    )));
+                }
+            }
+        }
+        None => None,
+    };
+
+    let s3_key = join_s3_key(prefix, path);
+    let range = format!("bytes={}-{}", offset, offset + length - 1);
+    let bytes = match get_object_with_retry_ranged(client, bucket, &s3_key, Some(&range)).await {
+        Ok(bytes) => bytes.into_bytes(),
+        Err(e) => {
+            request.refund(length);
+            return Err(e);
+        }
+    };
+    if bytes.is_empty() {
+        return Err(KoshaError::NotFound(format!(
+            "ranged GET {s3_key} [{range}] returned no bytes"
+        )));
+    }
+    if (bytes.len() as u64) < length {
+        request.refund(length - bytes.len() as u64);
     }
     Ok(bytes.to_vec())
 }
@@ -1229,6 +1477,47 @@ impl StorageBackend for S3Storage {
     fn create_dir_all(&self, path: &str) -> Result<(), KoshaError> {
         self.local.create_dir_all(path)
     }
+
+    fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectMeta>, KoshaError> {
+        self.list_objects_remote(prefix)
+    }
+}
+
+/// The object store segment GC (#239) works against: S3 for listing and
+/// deleting. A local copy of a deleted object is left to the node's local
+/// GC, which knows whether a reader still has it open.
+#[derive(Debug)]
+pub struct S3GcStore<'a>(pub &'a S3Storage);
+
+impl StorageBackend for S3GcStore<'_> {
+    fn read(&self, path: &str) -> Result<Vec<u8>, KoshaError> {
+        self.0.read_remote(path)
+    }
+    fn write(&self, _path: &str, _data: &[u8]) -> Result<(), KoshaError> {
+        Err(KoshaError::NotFound("S3GcStore is read/delete only".into()))
+    }
+    fn exists(&self, path: &str) -> bool {
+        self.0
+            .list_objects_remote(path)
+            .is_ok_and(|objects| objects.iter().any(|o| o.path == path))
+    }
+    fn delete(&self, path: &str) -> Result<(), KoshaError> {
+        self.0.delete_remote(path)
+    }
+    fn list(&self, path: &str) -> Result<Vec<String>, KoshaError> {
+        Ok(self
+            .0
+            .list_remote_with_sizes(path)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+    fn create_dir_all(&self, _path: &str) -> Result<(), KoshaError> {
+        Ok(())
+    }
+    fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectMeta>, KoshaError> {
+        self.0.list_objects_remote(prefix)
+    }
 }
 
 fn local_list_with_zero_sizes(
@@ -1242,9 +1531,54 @@ fn local_list_with_zero_sizes(
         .collect())
 }
 
+/// Group `(<segment>/<file>, size)` listing rows into bytes per segment,
+/// counting only files `wants` accepts (by basename). Rows with no segment
+/// component (stray objects at the namespace root) are ignored. A segment
+/// whose files are all filtered out still appears, with `0` bytes.
+pub(crate) fn sum_segment_sizes(
+    objects: Vec<(String, u64)>,
+    wants: impl Fn(&str) -> bool,
+) -> std::collections::HashMap<String, u64> {
+    let mut sizes = std::collections::HashMap::new();
+    for (relative, size) in objects {
+        let Some((segment, rest)) = relative.split_once('/') else {
+            continue;
+        };
+        if segment.is_empty() || rest.is_empty() {
+            continue;
+        }
+        let file = rest.rsplit('/').next().unwrap_or(rest);
+        let entry = sizes.entry(segment.to_string()).or_insert(0u64);
+        if wants(file) {
+            *entry = entry.saturating_add(size);
+        }
+    }
+    sizes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sum_segment_sizes_groups_by_segment_and_filters_files() {
+        let rows = vec![
+            ("seg-a/doc_store.bin".to_string(), 100),
+            ("seg-a/vector.idx".to_string(), 1_000),
+            ("seg-a/_COMMIT".to_string(), 5),
+            ("seg-b/inverted.idx".to_string(), 7),
+            ("seg-c/vector.idx".to_string(), 9),
+            ("stray.json".to_string(), 50),
+            ("seg-d/".to_string(), 0),
+        ];
+        let sizes = sum_segment_sizes(rows.clone(), |_| true);
+        assert_eq!(sizes["seg-a"], 1_105);
+        assert_eq!(sizes["seg-b"], 7);
+        assert_eq!(sizes.len(), 3, "stray root object and empty key ignored");
+        let lexical = sum_segment_sizes(rows, |f| f != "vector.idx");
+        assert_eq!(lexical["seg-a"], 105);
+        assert_eq!(lexical["seg-c"], 0);
+    }
 
     /// Regression for the BM25 benchmark re-run's bug #4
     /// (`scripts/bench/bm25_scale/RESULTS.md`): "hydration S3 GETs have no
@@ -1316,6 +1650,21 @@ mod tests {
         assert_eq!(streamed.bytes, payload.len() as u64);
         assert_eq!(std::fs::read(&tmp_path).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listed_keys_map_back_to_logical_paths() {
+        for prefix in ["", "kosha", "kosha/", "a/b/"] {
+            let key = join_s3_key(prefix, "tenant/ns/seg-1/_COMMIT");
+            assert_eq!(
+                logical_path_of_key(prefix, &key).as_deref(),
+                Some("tenant/ns/seg-1/_COMMIT"),
+                "prefix {prefix:?}"
+            );
+        }
+        assert_eq!(logical_path_of_key("kosha", "other/x"), None);
+        assert_eq!(logical_path_of_key("kosha", "koshax/x"), None);
+        assert_eq!(logical_path_of_key("kosha", "kosha/"), None);
     }
 
     #[test]

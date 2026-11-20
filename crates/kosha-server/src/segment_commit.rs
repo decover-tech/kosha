@@ -32,12 +32,16 @@ pub const COMMIT_FORMAT: u32 = 1;
 /// Files that must all be present for a segment to be usable by the searcher.
 /// `vector.idx` is intentionally excluded: lexical queries never load it, so
 /// its absence must not make a segment count as incomplete.
-pub const REQUIRED_SEGMENT_FILES: [&str; 4] = [
-    "footer.json",
-    "doc_store.bin",
-    "inverted.idx",
-    "filters.bin",
-];
+///
+/// The filter index is required too, but in one of two formats (#244):
+/// see [`FILTER_INDEX_FILES`].
+pub const REQUIRED_SEGMENT_FILES: [&str; 3] = ["footer.json", "doc_store.bin", "inverted.idx"];
+
+/// A segment's filter index: the row-oriented `filters.bin`, or the
+/// columnar `filters.toc` (#244), whose column files a `_COMMIT` lists like
+/// any other file. A commit must list one of these. A segment without a
+/// `_COMMIT` predates the columnar format, so it must have `filters.bin`.
+pub const FILTER_INDEX_FILES: [&str; 2] = ["filters.bin", "filters.toc"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitFile {
@@ -165,6 +169,11 @@ pub fn assess_listing(
         Some(Ok(commit)) => {
             for f in &commit.files {
                 match size_of(&f.name) {
+                    // Deletion generations are not segment data: they are
+                    // validated by the manifest's checksum, uploaded on
+                    // their own, and garbage-collected once superseded
+                    // (#239). A commit from before that may still list one.
+                    None if kosha_core::gc::deletion_generation_of(&f.name).is_some() => {}
                     None => return Durability::Incomplete(format!("missing {}", f.name)),
                     Some(s) if s != f.size => {
                         return Durability::Incomplete(format!(
@@ -183,11 +192,17 @@ pub fn assess_listing(
                     return Durability::Incomplete(format!("{COMMIT_FILE} does not list {req}"));
                 }
             }
+            if !FILTER_INDEX_FILES.iter().any(|f| commit.get(f).is_some()) {
+                return Durability::Incomplete(format!(
+                    "{COMMIT_FILE} lists no filter index ({})",
+                    FILTER_INDEX_FILES.join(" or ")
+                ));
+            }
             Durability::Committed
         }
         Some(Err(e)) => Durability::Incomplete(format!("unreadable {COMMIT_FILE}: {e}")),
         None => {
-            for req in REQUIRED_SEGMENT_FILES {
+            for req in REQUIRED_SEGMENT_FILES.iter().chain(&["filters.bin"]) {
                 match size_of(req) {
                     None => return Durability::Incomplete(format!("missing {req}")),
                     Some(0) => return Durability::Incomplete(format!("{req} is empty")),
@@ -226,6 +241,19 @@ mod tests {
     }
 
     #[test]
+    fn a_collected_deletion_generation_does_not_make_a_segment_incomplete() {
+        let mut listing = full_listing();
+        let generation = format!("deletes-{}.roaring", "ab".repeat(32));
+        listing.push((generation.clone(), 8));
+        let commit = commit_for(&listing);
+        listing.retain(|(n, _)| *n != generation);
+        assert_eq!(
+            assess_listing(&listing, Some(Ok(&commit))),
+            Durability::Committed
+        );
+    }
+
+    #[test]
     fn committed_segment_is_durable() {
         let listing = full_listing();
         let c = commit_for(&listing);
@@ -240,9 +268,43 @@ mod tests {
     /// Acceptance criterion from #231: a segment missing any required file
     /// must not count as durable, so reconciliation re-uploads it. This is
     /// the exact failure the old "any object exists" check let through.
+    /// #244: a columnar segment has `filters.toc` and column files instead
+    /// of `filters.bin`; its commit covers them like any other file.
+    #[test]
+    fn committed_columnar_segment_is_durable_and_checks_its_columns() {
+        let listing: Vec<(String, u64)> = vec![
+            ("doc_store.bin".into(), 100),
+            ("filters-000.col".into(), 30),
+            ("filters.toc".into(), 12),
+            ("footer.json".into(), 5),
+            ("inverted.idx".into(), 50),
+        ];
+        let c = commit_for(&listing);
+        assert_eq!(
+            assess_listing(&listing, Some(Ok(&c))),
+            Durability::Committed
+        );
+        let missing_column: Vec<_> = listing
+            .iter()
+            .filter(|(n, _)| n != "filters-000.col")
+            .cloned()
+            .collect();
+        assert!(!assess_listing(&missing_column, Some(Ok(&c))).is_durable());
+        // A commit listing no filter index at all is not a usable segment.
+        let no_filters: Vec<_> = listing
+            .iter()
+            .filter(|(n, _)| !n.starts_with("filters"))
+            .cloned()
+            .collect();
+        let c = commit_for(&no_filters);
+        assert!(!assess_listing(&no_filters, Some(Ok(&c))).is_durable());
+        // Without a commit (pre-#231), only the legacy format qualifies.
+        assert!(!assess_listing(&listing, None).is_durable());
+    }
+
     #[test]
     fn legacy_segment_missing_any_required_file_is_not_durable() {
-        for missing in REQUIRED_SEGMENT_FILES {
+        for missing in REQUIRED_SEGMENT_FILES.iter().chain(&["filters.bin"]) {
             let listing: Vec<_> = full_listing()
                 .into_iter()
                 .filter(|(n, _)| n != missing)
@@ -290,6 +352,25 @@ mod tests {
         let c = commit_for(&listing);
         let without_vec: Vec<_> = listing[..4].to_vec();
         assert!(!assess_listing(&without_vec, Some(Ok(&c))).is_durable());
+    }
+
+    /// #204: a further vector column's files are committed like any other,
+    /// so a segment missing one is not durable.
+    #[test]
+    fn committed_vector_column_files_are_checked() {
+        let mut listing = full_listing();
+        listing.push(("vector.idx".into(), 1000));
+        listing.push(("vector.offsets".into(), 40));
+        listing.push(("vector.1.idx".into(), 800));
+        listing.push(("vector.1.offsets".into(), 40));
+        let c = commit_for(&listing);
+        assert!(assess_listing(&listing, Some(Ok(&c))).is_durable());
+        let without: Vec<_> = listing
+            .iter()
+            .filter(|(name, _)| name != "vector.1.idx")
+            .cloned()
+            .collect();
+        assert!(!assess_listing(&without, Some(Ok(&c))).is_durable());
     }
 
     #[test]

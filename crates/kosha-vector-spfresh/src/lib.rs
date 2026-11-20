@@ -1,15 +1,16 @@
-//! A standalone, in-memory implementation of the SPFresh/SPANN algorithmic
-//! core: a cluster/posting-based ANN index kept balanced by LIRE
+//! An in-memory implementation of the SPFresh/SPANN algorithmic core: a
+//! cluster/posting-based ANN index kept balanced by LIRE
 //! (**L**ightweight **I**ncremental **RE**-balancing — Split, Merge, and a
 //! bounded Reassign, on top of Insert/Delete).
 //!
-//! This crate is **not** wired into kosha's on-disk segment format or query
-//! path — it's a self-contained, benchmarked proof of the mechanism, built
-//! to answer the open question `DESIGN.md` already flags about kosha's
-//! current per-segment HNSW-rebuilt-from-scratch-on-every-open vector index.
-//! See `README.md` for the concept-to-code map and the list of deliberate
-//! simplifications versus the full paper (no disk/SPDK backing, no
-//! concurrent background rebuilder, no PQ compression).
+//! kosha builds every segment's vector index with it: a flush clusters
+//! from scratch with [`ClusterIndex::build`], and compaction (#253) seeds
+//! the merged index from its inputs' postings with
+//! [`ClusterIndex::from_postings`] and [`ClusterIndex::absorb_postings`],
+//! then repairs it with [`ClusterIndex::rebalance`]. `kosha-segment`
+//! serializes [`ClusterIndex::snapshot`] to `vector.idx` +
+//! `vector.offsets`. This crate has no I/O. See `README.md` for what is
+//! wired where and the simplifications versus the paper.
 //!
 //! Start at [`ClusterIndex`].
 
@@ -20,14 +21,16 @@ mod kmeans;
 mod ops;
 mod point;
 mod posting;
+mod quant;
 mod rng;
 mod search;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub use centroid_probe::{nearest_centroids, nearest_centroids_dot};
 pub use error::VectorIndexError;
-pub use point::{cosine_distance, cosine_similarity, dot, normalize_in_place};
+pub use point::{cosine_distance, cosine_similarity, dot, maxsim, mean_vector, normalize_in_place};
+pub use quant::{dequantize_i8, dot_i8, quantize_i8, I8_MAX_CODE};
 pub use rng::DeterministicRng;
 
 use posting::{Posting, PostingId};
@@ -187,6 +190,12 @@ pub struct ClusterIndex {
     pub(crate) free_slots: Vec<PostingId>,
     pub(crate) owner_map: HashMap<u32, PostingId>,
     pub(crate) rng: DeterministicRng,
+    /// Set while [`Self::rebalance`] runs: Reassign then leaves postings it
+    /// grew past `max_posting_size` to rebalance's own split loop instead
+    /// of splitting them in a nested cascade. With many postings oversized
+    /// at once (just after `absorb_postings`), cascades would otherwise
+    /// chain from one oversized neighbour to the next.
+    pub(crate) defer_cascade_splits: bool,
 }
 
 impl ClusterIndex {
@@ -218,12 +227,101 @@ impl ClusterIndex {
         search::search(self, query, k)
     }
 
+    /// Seeds an index from existing postings — each snapshot's centroid
+    /// and entries become one posting, as given — without any clustering.
+    /// This is how compaction reuses its input segments' postings (#253):
+    /// the k-means work already done when those segments were written is
+    /// kept, and [`Self::rebalance`] then repairs only the postings the
+    /// merge actually disturbed (oversized after inserts, undersized after
+    /// deletes) with LIRE's own Split/Merge/Reassign.
+    ///
+    /// Centroids are taken verbatim (`radius` is ignored; [`Self::snapshot`]
+    /// recomputes it): a caller that dropped members from a posting should
+    /// pass a fresh [`mean_vector`] of what is left. Postings with no
+    /// entries are skipped. Errors on a dimension mismatch (centroid or
+    /// entry) or an id present in more than one entry.
+    pub fn from_postings(
+        postings: Vec<PostingSnapshot>,
+        config: ClusterIndexConfig,
+    ) -> Result<Self, VectorIndexError> {
+        validate_config(&config)?;
+        let dim = config.dim;
+        let mut index = Self::empty(config);
+        for snap in postings {
+            if snap.entries.is_empty() {
+                continue;
+            }
+            if snap.centroid.len() != dim {
+                return Err(VectorIndexError::DimensionMismatch {
+                    expected: dim,
+                    got: snap.centroid.len(),
+                });
+            }
+            let pid = index.postings.len();
+            let mut entries = Vec::with_capacity(snap.entries.len());
+            for (id, vector) in snap.entries {
+                if vector.len() != dim {
+                    return Err(VectorIndexError::DimensionMismatch {
+                        expected: dim,
+                        got: vector.len(),
+                    });
+                }
+                if index.owner_map.insert(id, pid).is_some() {
+                    return Err(VectorIndexError::DuplicateId(id));
+                }
+                entries.push(posting::PostingEntry {
+                    id,
+                    vector,
+                    deleted: false,
+                    version: 0,
+                });
+            }
+            index.postings.push(Some(Posting {
+                centroid: snap.centroid,
+                entries,
+            }));
+        }
+        Ok(index)
+    }
+
+    /// Folds another partition's postings into this index (#253): each
+    /// posting's centroid picks its `candidates` nearest postings here
+    /// (one centroid scan per absorbed posting), and each of its entries
+    /// is appended to the nearest of those. A loose vector is absorbed as
+    /// a one-entry posting centred on itself, which makes the choice
+    /// exact. Postings that took entries get their centroid recomputed;
+    /// none is split, so call [`Self::rebalance`] afterwards. Into an
+    /// empty index a posting comes over whole.
+    ///
+    /// Returns the number of entries absorbed. Errors, leaving the index
+    /// unchanged, on a dimension mismatch or an id already present (here
+    /// or twice in `postings`).
+    pub fn absorb_postings(
+        &mut self,
+        postings: Vec<PostingSnapshot>,
+        candidates: usize,
+    ) -> Result<usize, VectorIndexError> {
+        ops::absorb::absorb(self, postings, candidates)
+    }
+
     /// An explicit, full rebalance pass: physically GCs every posting's
-    /// tombstones, then re-checks every active posting against the
-    /// split/merge thresholds. `insert`/`delete` already keep the index
-    /// balanced incrementally — this is a batch convenience (used by tests,
-    /// and documented as the hook a future background rebuilder would call).
+    /// tombstones, then splits every posting over `max_posting_size`
+    /// (repeatedly — a seeded posting can be many times the cap, and one
+    /// bisection only halves it) and merges every posting under
+    /// `min_posting_size` into its nearest neighbor, each followed by
+    /// LIRE's bounded Reassign. Rounds of split-then-merge repeat until
+    /// neither fires (a merge can push its target over the cap), up to a
+    /// small fixed bound.
+    ///
+    /// Cost is proportional to the postings that violate a bound (plus
+    /// their `reassign_radius` neighbors), not to the index size — beyond
+    /// one O(postings) scan per round to find them. `insert`/`delete`
+    /// already keep the index balanced incrementally; this is the batch
+    /// form, used after [`Self::from_postings`].
     pub fn rebalance(&mut self) -> RebalanceStats {
+        /// Each round either splits or merges something, and posting
+        /// count is bounded both ways; this only guards a bookkeeping bug.
+        const MAX_ROUNDS: usize = 16;
         let mut stats = RebalanceStats::default();
 
         let ids: Vec<PostingId> = self.active_posting_ids().collect();
@@ -235,25 +333,73 @@ impl ClusterIndex {
             }
         }
 
-        let ids: Vec<PostingId> = self.active_posting_ids().collect();
-        for pid in ids {
-            // May already have been split/merged away by an earlier
-            // iteration's cascade.
-            let Some(p) = self.postings[pid].as_ref() else {
-                continue;
-            };
-            let live = p.live_count();
-            if self.config.enable_split && live > self.config.max_posting_size {
-                ops::split::split_posting(self, pid, 0);
-                stats.postings_split += 1;
-            } else if self.config.enable_merge
-                && live < self.config.min_posting_size
-                && self.active_posting_count() > 1
-            {
-                ops::merge::merge_posting(self, pid);
-                stats.postings_merged += 1;
+        self.defer_cascade_splits = true;
+        // A posting `balanced_bisect` cannot separate (every member
+        // identical) stays oversized; never retry it.
+        let mut unsplittable: HashSet<PostingId> = HashSet::new();
+        for _ in 0..MAX_ROUNDS {
+            let mut changed = false;
+            if self.config.enable_split {
+                loop {
+                    let max = self.config.max_posting_size;
+                    let oversized: Vec<PostingId> = self
+                        .active_posting_ids()
+                        .filter(|pid| {
+                            !unsplittable.contains(pid)
+                                && self.postings[*pid].as_ref().unwrap().live_count() > max
+                        })
+                        .collect();
+                    if oversized.is_empty() {
+                        break;
+                    }
+                    let mut split_any = false;
+                    for pid in oversized {
+                        // A cascade from an earlier split may already have
+                        // dealt with it.
+                        let still = self.postings[pid]
+                            .as_ref()
+                            .is_some_and(|p| p.live_count() > max);
+                        if !still {
+                            continue;
+                        }
+                        if ops::split::split_posting(self, pid, 0) {
+                            stats.postings_split += 1;
+                            split_any = true;
+                        } else {
+                            unsplittable.insert(pid);
+                        }
+                    }
+                    changed |= split_any;
+                    if !split_any {
+                        break;
+                    }
+                }
+            }
+            if self.config.enable_merge {
+                let mut active = self.active_posting_count();
+                for pid in self.active_posting_ids().collect::<Vec<_>>() {
+                    // May already have been merged away by this loop.
+                    let Some(p) = self.postings[pid].as_ref() else {
+                        continue;
+                    };
+                    if active > 1 && p.live_count() < self.config.min_posting_size {
+                        ops::merge::merge_posting(self, pid);
+                        // The merge target grew and the freed slot may be
+                        // reused: retry splits from scratch next round.
+                        unsplittable.clear();
+                        stats.postings_merged += 1;
+                        changed = true;
+                        // Reassign can cascade into splits, so recount
+                        // rather than assume one fewer.
+                        active = self.active_posting_count();
+                    }
+                }
+            }
+            if !changed {
+                break;
             }
         }
+        self.defer_cascade_splits = false;
 
         stats
     }
@@ -352,6 +498,7 @@ impl ClusterIndex {
             free_slots: Vec::new(),
             owner_map: HashMap::new(),
             rng,
+            defer_cascade_splits: false,
         }
     }
 

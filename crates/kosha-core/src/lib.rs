@@ -1,4 +1,10 @@
+pub mod analysis;
+pub mod branch;
 pub mod deletes;
+pub mod fields;
+pub mod fuzzy;
+pub mod gc;
+pub mod rank;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -6,8 +12,20 @@ use serde::{Deserialize, Serialize};
 
 // ─── Control store trait (in-memory or Postgres) ──────────────────────────
 
+pub mod datetime;
+pub mod histogram;
+pub use histogram::{AggDateHistogram, AggHistogram, DurationValue};
 pub mod docset;
-pub use docset::{evaluate_filter, DocSet};
+pub mod nested;
+pub mod sharding;
+pub use analysis::{
+    AnalysisConfig, AnalyzerSpec, FieldSchema, NamespaceSchema, SegmentAnalysis, TokenFilterSpec,
+    TokenizerKind,
+};
+pub use docset::{check_filter, evaluate_filter, DocSet};
+pub use fields::{FieldBoost, FieldIndex, FieldStats, ALL_FIELD};
+pub use fuzzy::{Fuzziness, FuzzyQuery};
+pub use rank::{CompiledRankBy, RankBySpec};
 
 /// Pluggable namespace registry and manifest store.
 ///
@@ -29,22 +47,51 @@ pub trait ControlStore: Send + Sync {
         self.manifest(id).cloned()
     }
 
-    /// The stored manifest's version, without its segment list.
+    /// Owned copy of the manifest, distinguishing "no such namespace"
+    /// (`Ok(None)`) from "the control store could not be read"
+    /// (`Err(KoshaError::ControlPlane)`).
     ///
-    /// A query replica asks this before every search to learn whether the
-    /// ingest node has published since it last looked, so it has to be
-    /// cheap: the manifest itself carries a footer for every segment and
-    /// runs to megabytes for a few hundred segments. The default reads the
-    /// whole manifest; stores that can do better override it.
-    fn manifest_version(&self, id: &NamespaceId) -> Option<u64> {
-        self.manifest_cloned(id).map(|manifest| manifest.version)
+    /// Query replicas use this to follow published manifests: an
+    /// unreachable control plane must leave them serving their
+    /// last-known-good manifest (DESIGN.md §17), not report the namespace
+    /// missing. The default wraps `manifest_cloned`, which is infallible
+    /// for in-memory stores; stores that talk to a database override it.
+    fn try_manifest_cloned(&self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
+        Ok(self.manifest_cloned(id))
+    }
+
+    /// The stored manifest's version, without its segment list. `Ok(None)`
+    /// means the namespace has no manifest; `Err` means the store could not
+    /// be read and says nothing about the namespace.
+    ///
+    /// Has to be cheap: the manifest itself can run to megabytes for a few
+    /// hundred segments. The default reads the whole manifest; stores that
+    /// can do better override it.
+    fn manifest_version(&self, id: &NamespaceId) -> Result<Option<u64>, KoshaError> {
+        Ok(self
+            .try_manifest_cloned(id)?
+            .map(|manifest| manifest.version))
+    }
+
+    /// Every namespace's stored manifest version in one read: the query
+    /// replicas' manifest refresher polls this (`SELECT namespace_id,
+    /// version FROM kosha.manifests` on Postgres) instead of one round trip
+    /// per namespace per search. `Err` means the store could not be read.
+    fn manifest_versions(&self) -> Result<Vec<(NamespaceId, u64)>, KoshaError> {
+        let mut versions = Vec::new();
+        for id in self.list_namespaces() {
+            if let Some(version) = self.manifest_version(&id)? {
+                versions.push((id, version));
+            }
+        }
+        Ok(versions)
     }
 
     /// Persist a manifest for a namespace (upsert, last-write-wins).
     ///
-    /// Used by the node to publish the current segment list after flush so
-    /// the state survives restarts. For multi-writer publish with optimistic
-    /// concurrency, use `compare_and_swap_manifest` instead.
+    /// Bootstrap and tests only: it can overwrite a concurrent writer's
+    /// commit, so no publish path (flush, compaction, migrate, admin
+    /// import) uses it. Publish with `compare_and_swap_manifest`.
     fn save_manifest(&mut self, id: &NamespaceId, manifest: &Manifest) -> Result<(), KoshaError>;
 
     /// Publish only over the writer's last committed version. An identical
@@ -58,6 +105,54 @@ pub trait ControlStore: Send + Sync {
     ) -> Result<(), KoshaError>;
     fn list_namespaces(&self) -> Vec<NamespaceId>;
     fn namespace_count(&self) -> usize;
+
+    /// Remove a namespace and its manifest (`DELETE /v1/namespaces/{ns}`).
+    ///
+    /// Returns the manifest the namespace last committed (so the caller can
+    /// reclaim its segment objects) and the namespace's *retired version*:
+    /// the highest manifest version any deleted incarnation of this id
+    /// reached, raised to at least `retire_at_least`. The store keeps that
+    /// number after the namespace is gone, and every later incarnation of
+    /// the same id (explicit create, `ensure_namespace`, or a CAS
+    /// bootstrap) starts at `retired + 1`. Manifest versions therefore never
+    /// repeat across a delete and re-create, which is what keeps caches
+    /// keyed by `(namespace, version)` on query replicas from serving the
+    /// deleted incarnation's data.
+    ///
+    /// `NamespaceNotFound` if the namespace does not exist.
+    fn delete_namespace(
+        &mut self,
+        id: &NamespaceId,
+        retire_at_least: u64,
+    ) -> Result<(Manifest, u64), KoshaError> {
+        let _ = retire_at_least;
+        Err(KoshaError::NotFound(format!(
+            "this control store cannot delete namespace {}",
+            id.0
+        )))
+    }
+
+    /// Remove a namespace and its manifest from the registry, returning the
+    /// manifest it held (`Ok(None)` if there was no such namespace). Used by
+    /// branch deletion (#208); the caller reclaims the namespace's own
+    /// objects afterwards, keeping every one another manifest references
+    /// (see [`branch::References`]).
+    ///
+    /// The default refuses, so a store that cannot delete never silently
+    /// keeps a namespace the caller then reclaims the objects of.
+    fn remove_namespace(&mut self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
+        Err(KoshaError::ControlPlane(format!(
+            "this control store cannot remove namespace {}",
+            id.0
+        )))
+    }
+}
+
+/// The manifest version a new incarnation of a namespace starts at, given
+/// the version its last deleted incarnation retired at (`None` if it was
+/// never deleted). See [`ControlStore::delete_namespace`].
+pub fn initial_manifest_version(retired: Option<u64>) -> u64 {
+    retired.map_or(0, |v| v.saturating_add(1))
 }
 
 // ─── Identifiers ───────────────────────────────────────────────────────────
@@ -80,6 +175,11 @@ pub enum FieldType {
     Date,
     Boolean,
     Vector,
+    /// A latitude/longitude pair (issue #212). Accepted as `"lat,lon"`,
+    /// `{"lat": .., "lon": ..}` or GeoJSON `[lon, lat]`; stored as given and
+    /// copied into the filter columns as the canonical `"lat,lon"` text,
+    /// where `geo_distance` filters and geo decays read it.
+    GeoPoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +232,13 @@ impl Field {
             value: v.to_string(),
         }
     }
+    pub fn geo_point(n: impl Into<String>, lat: f64, lon: f64) -> Self {
+        Self {
+            name: n.into(),
+            field_type: FieldType::GeoPoint,
+            value: rank::canonical_geo(lat, lon),
+        }
+    }
     pub fn vector(n: impl Into<String>, v: Vec<f32>) -> Self {
         Self {
             name: n.into(),
@@ -171,6 +278,109 @@ impl Default for Bm25Params {
     }
 }
 
+/// Per-request BM25 overrides (`SearchQuery::bm25_params`).
+///
+/// Each parameter is optional. A parameter the request leaves out falls
+/// back to the value the segment was built with (`Footer::bm25_params`,
+/// 1.2 / 0.75 unless the namespace was built with other values), so a
+/// request that says nothing scores exactly as the segment's owner
+/// configured it, and `{"k1": 2.0}` changes `k1` alone.
+///
+/// Nothing on disk depends on these values: postings store raw term
+/// frequencies and block summaries store `max_tf` / `min_field_length`,
+/// so both the score and the block-max WAND ceiling are computed from the
+/// effective parameters at query time.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Bm25Overrides {
+    /// Term-frequency saturation. Must be finite and `>= 0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k1: Option<f64>,
+    /// Length normalization. Must be finite and within `[0, 1]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b: Option<f64>,
+    /// Where IDF and `avgdl` come from (issue #246). Omitted means the
+    /// engine default ([`Bm25StatsScope::Namespace`] unless the server
+    /// runs with `KOSHA_BM25_STATS=segment`). Not serialized when omitted,
+    /// so result-cache keys of requests that don't set it are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<Bm25StatsScope>,
+}
+
+/// Which corpus BM25's collection statistics (`N`, `df`, `avgdl`) are
+/// taken from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Bm25StatsScope {
+    /// Summed over every segment of the namespace's manifest, so a
+    /// document scores the same whichever segment it landed in and scores
+    /// from different segments can be merged by value.
+    #[default]
+    Namespace,
+    /// Each segment's own `N`, `df` and `avgdl` — the pre-#246 behavior,
+    /// kept as a debug / A-B switch. Scores from different segments are
+    /// not comparable under this scope.
+    Segment,
+}
+
+impl Bm25StatsScope {
+    /// Parse the wire / env spelling (`namespace` or `segment`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "namespace" => Some(Self::Namespace),
+            "segment" => Some(Self::Segment),
+            _ => None,
+        }
+    }
+}
+
+impl Bm25Overrides {
+    /// Both parameters set explicitly.
+    pub fn new(k1: f64, b: f64) -> Self {
+        Self {
+            k1: Some(k1),
+            b: Some(b),
+            stats: None,
+        }
+    }
+
+    /// Reject values BM25 is not defined for. A negative `k1` or a `b`
+    /// outside `[0, 1]` can make the length-normalization denominator zero
+    /// or negative, producing infinite / negative scores, and breaks the
+    /// monotonicity the block-max WAND upper bound relies on — so these
+    /// are refused rather than clamped.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(k1) = self.k1 {
+            if !k1.is_finite() || k1 < 0.0 {
+                return Err(format!(
+                    "bm25_params.k1 must be a finite number >= 0, got {k1}"
+                ));
+            }
+        }
+        if let Some(b) = self.b {
+            if !b.is_finite() || !(0.0..=1.0).contains(&b) {
+                return Err(format!(
+                    "bm25_params.b must be a finite number between 0 and 1, got {b}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The effective parameters for a segment built with `base`.
+    pub fn resolve(&self, base: &Bm25Params) -> Bm25Params {
+        Bm25Params {
+            k1: self.k1.unwrap_or(base.k1),
+            b: self.b.unwrap_or(base.b),
+        }
+    }
+}
+
+impl From<Bm25Params> for Bm25Overrides {
+    fn from(p: Bm25Params) -> Self {
+        Self::new(p.k1, p.b)
+    }
+}
+
 // ─── Filter types ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,6 +405,106 @@ pub enum FilterClause {
     Exists {
         exists: ExistsFilter,
     },
+    /// The field's value (or, for a list value, one of its elements)
+    /// starts with a given string. See [`PrefixFilter`].
+    Prefix {
+        prefix: PrefixFilter,
+    },
+    /// A `GeoPoint` field within `distance` of a point (issue #212).
+    GeoDistance {
+        geo_distance: GeoDistanceFilter,
+    },
+}
+
+/// Body of a `geo_distance` clause, in Elasticsearch's shape:
+/// `{"distance": "10km", "<field>": {"lat": .., "lon": ..}}`. The point may
+/// also be `"lat,lon"` or GeoJSON `[lon, lat]`; the distance a number of
+/// meters or a string with a unit (`m`, `km`, `mi`, ...).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeoDistanceFilter {
+    pub field: String,
+    pub lat: f64,
+    pub lon: f64,
+    /// Meters.
+    pub distance: f64,
+}
+
+impl Serialize for GeoDistanceFilter {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("distance", &self.distance)?;
+        map.serialize_entry(
+            &self.field,
+            &serde_json::json!({"lat": self.lat, "lon": self.lon}),
+        )?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for GeoDistanceFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut obj = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let distance = obj
+            .remove("distance")
+            .ok_or_else(|| D::Error::custom("geo_distance needs a \"distance\""))?;
+        let distance = rank::parse_distance_meters(&distance)
+            .filter(|d| d.is_finite() && *d >= 0.0)
+            .ok_or_else(|| {
+                D::Error::custom(format!(
+                    "geo_distance.distance {distance} is not a distance (e.g. \"10km\" or meters)"
+                ))
+            })?;
+        // Elasticsearch options that only change precision are accepted
+        // and ignored; everything else is the field.
+        obj.remove("distance_type");
+        obj.remove("validation_method");
+        let mut fields = obj.into_iter();
+        let (field, point) = fields
+            .next()
+            .ok_or_else(|| D::Error::custom("geo_distance needs a field and a point"))?;
+        if let Some((extra, _)) = fields.next() {
+            return Err(D::Error::custom(format!(
+                "geo_distance takes one field, found `{field}` and `{extra}`"
+            )));
+        }
+        let (lat, lon) = match &point {
+            serde_json::Value::String(s) => rank::parse_geo_str(s),
+            other => rank::parse_geo_json(other),
+        }
+        .ok_or_else(|| {
+            D::Error::custom(format!(
+                "geo_distance point for `{field}` must be {{\"lat\": .., \"lon\": ..}}, \"lat,lon\" or [lon, lat] within range"
+            ))
+        })?;
+        Ok(Self {
+            field,
+            lat,
+            lon,
+            distance,
+        })
+    }
+}
+
+impl FilterClause {
+    /// Call `f` with every field name this clause (recursively) reads.
+    pub fn for_each_field(&self, f: &mut impl FnMut(&str)) {
+        match self {
+            Self::Term { term } => term.keys().for_each(|k| f(k)),
+            Self::Terms { terms } => terms.keys().for_each(|k| f(k)),
+            Self::Range { range } => range.keys().for_each(|k| f(k)),
+            Self::Exists { exists } => f(&exists.field),
+            Self::GeoDistance { geo_distance } => f(&geo_distance.field),
+            Self::Prefix { prefix } => f(&prefix.field),
+            Self::MatchAll { .. } => {}
+            Self::Bool { bool } => {
+                for clause in bool.must.iter().chain(&bool.must_not).chain(&bool.should) {
+                    clause.for_each_field(f);
+                }
+            }
+        }
+    }
 }
 
 /// Body of an `exists` clause.
@@ -204,8 +514,137 @@ pub struct ExistsFilter {
     pub field: String,
 }
 
+/// Body of a `prefix` clause: one field and the prefix its value must
+/// start with.
+///
+/// Wire shape mirrors OpenSearch / Elasticsearch, in either form:
+///
+/// ```json
+/// {"prefix": {"path": "/matters/2026/"}}
+/// {"prefix": {"path": {"value": "/matters/2026/", "case_insensitive": true}}}
+/// ```
+///
+/// **Case-sensitive by default**, like `term` (and like OpenSearch's
+/// `prefix`). A filter decides which documents a search may return and
+/// which documents `delete_by_query` removes, so it is exact unless asked
+/// otherwise: `{"prefix": {"sku": "AB"}}` must not quietly also match
+/// `ab-…`. The `wildcard` *query* defaults the other way because it is a
+/// full-text convenience over analyzed (lowercased) terms; a filter runs
+/// against raw keyword values, where case is data. `case_insensitive: true`
+/// opts in, folding both sides with Unicode lowercase as `wildcard` does.
+///
+/// Parsing is strict (issue #170): exactly one field, a string prefix, and
+/// in the long form only `value` and `case_insensitive`. Anything else is
+/// an error rather than a clause that matches more than was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixFilter {
+    pub field: String,
+    pub value: String,
+    pub case_insensitive: bool,
+}
+
+impl Serialize for PrefixFilter {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(1))?;
+        if self.case_insensitive {
+            map.serialize_entry(
+                &self.field,
+                &serde_json::json!({"value": self.value, "case_insensitive": true}),
+            )?;
+        } else {
+            // The short form, so the default clause re-serializes to exactly
+            // what a client most likely sent.
+            map.serialize_entry(&self.field, &self.value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for PrefixFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value.as_object().ok_or_else(|| {
+            D::Error::custom(
+                "prefix clause must be an object with exactly one field, e.g. \
+                 {\"prefix\": {\"path\": \"/a/\"}}",
+            )
+        })?;
+        let mut entries = obj.iter();
+        let (field, body) = entries.next().ok_or_else(|| {
+            D::Error::custom("prefix clause names no field; expected exactly one")
+        })?;
+        if let Some((extra, _)) = entries.next() {
+            return Err(D::Error::custom(format!(
+                "prefix clause must name exactly one field, found `{field}` and \
+                 `{extra}`; wrap multiple clauses in a `bool`"
+            )));
+        }
+        let (prefix, case_insensitive) = match body {
+            serde_json::Value::String(s) => (s.clone(), false),
+            serde_json::Value::Object(opts) => {
+                let mut prefix = None;
+                let mut case_insensitive = false;
+                for (key, v) in opts {
+                    match key.as_str() {
+                        "value" => {
+                            prefix = Some(
+                                v.as_str()
+                                    .ok_or_else(|| {
+                                        D::Error::custom(format!(
+                                            "prefix `{field}`.value must be a string, got {v}"
+                                        ))
+                                    })?
+                                    .to_owned(),
+                            )
+                        }
+                        "case_insensitive" => {
+                            case_insensitive = v.as_bool().ok_or_else(|| {
+                                D::Error::custom(format!(
+                                    "prefix `{field}`.case_insensitive must be a boolean, got {v}"
+                                ))
+                            })?
+                        }
+                        other => {
+                            return Err(D::Error::custom(format!(
+                                "unknown prefix option `{other}` for field `{field}`, \
+                                 expected: value, case_insensitive"
+                            )))
+                        }
+                    }
+                }
+                let prefix = prefix.ok_or_else(|| {
+                    D::Error::custom(format!("prefix `{field}` is missing `value`"))
+                })?;
+                (prefix, case_insensitive)
+            }
+            other => {
+                return Err(D::Error::custom(format!(
+                    "prefix `{field}` must be a string or {{\"value\": ..., \
+                     \"case_insensitive\": ...}}, got {other}"
+                )))
+            }
+        };
+        Ok(PrefixFilter {
+            field: field.clone(),
+            value: prefix,
+            case_insensitive,
+        })
+    }
+}
+
 /// Clause keys `FilterClause` accepts, as reported in parse errors.
-const FILTER_CLAUSE_KEYS: [&str; 6] = ["term", "terms", "range", "bool", "match_all", "exists"];
+const FILTER_CLAUSE_KEYS: [&str; 8] = [
+    "term",
+    "terms",
+    "range",
+    "bool",
+    "match_all",
+    "exists",
+    "geo_distance",
+    "prefix",
+];
 
 /// Deserialized by dispatching on the clause's single key rather than with
 /// `#[serde(untagged)]`.
@@ -275,15 +714,22 @@ impl<'de> Deserialize<'de> for FilterClause {
             "exists" => Ok(FilterClause::Exists {
                 exists: body(inner)?,
             }),
+            "geo_distance" => Ok(FilterClause::GeoDistance {
+                geo_distance: body(inner)?,
+            }),
+            "prefix" => Ok(FilterClause::Prefix {
+                prefix: body(inner)?,
+            }),
             other => {
                 let hint = match other {
                     "filter" | "must" | "must_not" | "should" | "minimum_should_match" => {
                         " — these belong inside a `bool` clause, e.g. \
                          {\"bool\": {\"must\": [...]}}"
                     }
-                    "match" | "match_phrase" | "wildcard" | "prefix" => {
+                    "match" | "match_phrase" | "wildcard" | "regexp" => {
                         " — full-text and wildcard matching is not part of the \
-                         filter language; use the query text instead"
+                         filter language; use the query text instead (for a \
+                         keyword prefix, use the `prefix` filter clause)"
                     }
                     _ => "",
                 };
@@ -377,19 +823,269 @@ pub struct SortSpec {
     pub fields: std::collections::HashMap<String, SortOrder>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A search request's `highlight` clause (#195).
+///
+/// Two JSON shapes are accepted and normalised into this one struct:
+///
+/// * the OpenSearch/Elasticsearch shape, any number of fields, each with
+///   optional tags that fall back to the top-level tags and then to the
+///   defaults (`<b>` / `</b>`):
+///   `{"pre_tags"?, "post_tags"?, "fields": {"title": {}, "body": {"pre_tags": ["<em>"]}}}`
+///   (`fields` may also be ES's ordered array form, `[{"title": {}}, {"body": {}}]`);
+/// * the legacy single-field shape, `{"field": "body", "pre_tags"?, "post_tags"?}`.
+///
+/// Giving both `field` and `fields` is an error. Highlighter options Kosha
+/// does not implement (`fragment_size`, `type`, ...) are ignored, as they
+/// were before. Hits answer a `fields` request with the per-field
+/// `ScoredDocument::highlight` map, and a legacy request with the flat
+/// `ScoredDocument::highlights` list, exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HighlightConfig {
-    pub field: String,
-    #[serde(default = "default_pre_tag")]
-    pub pre_tags: Vec<String>,
-    #[serde(default = "default_post_tag")]
-    pub post_tags: Vec<String>,
+    /// Fields to highlight, in request order.
+    pub fields: Vec<HighlightField>,
+    /// Top-level tags: the fallback for a field that sets none.
+    pub pre_tags: Option<Vec<String>>,
+    pub post_tags: Option<Vec<String>>,
+    /// Parsed from the legacy `{"field": ...}` form: hits report the flat
+    /// `highlights` list rather than the per-field `highlight` map.
+    pub legacy_single_field: bool,
 }
-fn default_pre_tag() -> Vec<String> {
-    vec!["<b>".into()]
+
+/// One entry of `HighlightConfig::fields`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighlightField {
+    pub name: String,
+    pub pre_tags: Option<Vec<String>>,
+    pub post_tags: Option<Vec<String>>,
 }
-fn default_post_tag() -> Vec<String> {
-    vec!["</b>".into()]
+
+const DEFAULT_PRE_TAG: &str = "<b>";
+const DEFAULT_POST_TAG: &str = "</b>";
+
+fn first_tag(tags: Option<&Vec<String>>) -> Option<&str> {
+    tags.and_then(|t| t.first()).map(String::as_str)
+}
+
+impl HighlightConfig {
+    /// The legacy single-field request, `{"field": name}`.
+    pub fn single_field(name: impl Into<String>) -> Self {
+        Self {
+            fields: vec![HighlightField::new(name)],
+            pre_tags: None,
+            post_tags: None,
+            legacy_single_field: true,
+        }
+    }
+
+    /// An ES-shaped request for `names`, each with the default tags.
+    pub fn for_fields<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            fields: names.into_iter().map(HighlightField::new).collect(),
+            pre_tags: None,
+            post_tags: None,
+            legacy_single_field: false,
+        }
+    }
+
+    /// The opening tag for `field`: its own first tag, else the top-level
+    /// one, else `<b>`. An empty list counts as unset.
+    pub fn pre_tag<'a>(&'a self, field: &'a HighlightField) -> &'a str {
+        first_tag(field.pre_tags.as_ref())
+            .or_else(|| first_tag(self.pre_tags.as_ref()))
+            .unwrap_or(DEFAULT_PRE_TAG)
+    }
+
+    /// The closing tag for `field`; see [`HighlightConfig::pre_tag`].
+    pub fn post_tag<'a>(&'a self, field: &'a HighlightField) -> &'a str {
+        first_tag(field.post_tags.as_ref())
+            .or_else(|| first_tag(self.post_tags.as_ref()))
+            .unwrap_or(DEFAULT_POST_TAG)
+    }
+}
+
+impl HighlightField {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            pre_tags: None,
+            post_tags: None,
+        }
+    }
+}
+
+/// Per-field options inside `highlight.fields`. Unknown keys are ignored.
+#[derive(Default, Serialize, Deserialize)]
+struct HighlightFieldOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pre_tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_tags: Option<Vec<String>>,
+}
+
+/// `highlight.fields`, kept in request order: either an object
+/// (`{"title": {}, "body": {}}`) or ES's ordered array of single-key
+/// objects (`[{"title": {}}, {"body": {}}]`).
+struct HighlightFieldList(Vec<HighlightField>);
+
+impl<'de> Deserialize<'de> for HighlightFieldList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor;
+
+        fn push_entries<'de, A: serde::de::MapAccess<'de>>(
+            mut map: A,
+            out: &mut Vec<HighlightField>,
+        ) -> Result<(), A::Error> {
+            while let Some(name) = map.next_key::<String>()? {
+                // `"title": null` is accepted as "default options".
+                let options: Option<HighlightFieldOptions> = map.next_value()?;
+                let options = options.unwrap_or_default();
+                if out.iter().any(|f| f.name == name) {
+                    return Err(serde::de::Error::custom(format!(
+                        "highlight field `{name}` listed more than once"
+                    )));
+                }
+                out.push(HighlightField {
+                    name,
+                    pre_tags: options.pre_tags,
+                    post_tags: options.post_tags,
+                });
+            }
+            Ok(())
+        }
+
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = HighlightFieldList;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object of field name to highlight options, or an array of them")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                push_entries(map, &mut out)?;
+                Ok(HighlightFieldList(out))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(entry) = seq.next_element::<HighlightFieldList>()? {
+                    for field in entry.0 {
+                        if out.iter().any(|f: &HighlightField| f.name == field.name) {
+                            return Err(serde::de::Error::custom(format!(
+                                "highlight field `{}` listed more than once",
+                                field.name
+                            )));
+                        }
+                        out.push(field);
+                    }
+                }
+                Ok(HighlightFieldList(out))
+            }
+        }
+
+        deserializer.deserialize_any(FieldsVisitor)
+    }
+}
+
+/// The wire form both request shapes deserialize through.
+#[derive(Deserialize)]
+struct HighlightWire {
+    #[serde(default)]
+    field: Option<String>,
+    #[serde(default)]
+    fields: Option<HighlightFieldList>,
+    #[serde(default)]
+    pre_tags: Option<Vec<String>>,
+    #[serde(default)]
+    post_tags: Option<Vec<String>>,
+}
+
+impl<'de> Deserialize<'de> for HighlightConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = HighlightWire::deserialize(deserializer)?;
+        match (wire.field, wire.fields) {
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                "highlight: give either `fields` (a map of field name to options) or the legacy \
+                 single `field`, not both",
+            )),
+            (Some(name), None) => Ok(HighlightConfig {
+                fields: vec![HighlightField::new(name)],
+                pre_tags: wire.pre_tags,
+                post_tags: wire.post_tags,
+                legacy_single_field: true,
+            }),
+            (None, Some(fields)) => Ok(HighlightConfig {
+                fields: fields.0,
+                pre_tags: wire.pre_tags,
+                post_tags: wire.post_tags,
+                legacy_single_field: false,
+            }),
+            (None, None) => Err(serde::de::Error::custom(
+                "highlight: `fields` is required (e.g. {\"fields\": {\"body\": {}}})",
+            )),
+        }
+    }
+}
+
+impl Serialize for HighlightConfig {
+    /// Re-emits the shape the request used, so a serialized query (the CLI
+    /// client, the result-cache key) deserializes back to the same value.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        if self.legacy_single_field && self.fields.len() == 1 {
+            let only = &self.fields[0];
+            map.serialize_entry("field", &only.name)?;
+            // The legacy form has no per-field tags; fold them into the top
+            // level so they survive the round trip.
+            let pre = only.pre_tags.as_ref().or(self.pre_tags.as_ref());
+            let post = only.post_tags.as_ref().or(self.post_tags.as_ref());
+            if let Some(pre) = pre {
+                map.serialize_entry("pre_tags", pre)?;
+            }
+            if let Some(post) = post {
+                map.serialize_entry("post_tags", post)?;
+            }
+        } else {
+            if let Some(ref pre) = self.pre_tags {
+                map.serialize_entry("pre_tags", pre)?;
+            }
+            if let Some(ref post) = self.post_tags {
+                map.serialize_entry("post_tags", post)?;
+            }
+            map.serialize_entry("fields", &HighlightFieldsSer(&self.fields))?;
+        }
+        map.end()
+    }
+}
+
+struct HighlightFieldsSer<'a>(&'a [HighlightField]);
+
+impl Serialize for HighlightFieldsSer<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for field in self.0 {
+            map.serialize_entry(
+                &field.name,
+                &HighlightFieldOptions {
+                    pre_tags: field.pre_tags.clone(),
+                    post_tags: field.post_tags.clone(),
+                },
+            )?;
+        }
+        map.end()
+    }
 }
 
 // ─── Wildcard query ────────────────────────────────────────────────────────
@@ -409,20 +1105,420 @@ fn default_case_insensitive() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchPhraseQuery {
+    /// The field the phrase must occur in (#249). `_all`, `*` or empty
+    /// means any one `Text` field — never across two of them. Segments
+    /// written before #249 have no per-field index and match the phrase
+    /// in their combined index.
+    #[serde(default)]
     pub field: String,
     pub phrase: String,
     #[serde(default)]
     pub slop: u32,
+    /// Several fields the phrase may occur in (any one of them, scored
+    /// with the best). Overrides `field` when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
+impl MatchPhraseQuery {
+    /// The specific fields the phrase is restricted to, or `None` when it
+    /// may occur in any field (`_all`, `*`, or no field named).
+    pub fn restricted_fields(&self) -> Option<Vec<String>> {
+        let named: Vec<&str> = if self.fields.is_empty() {
+            vec![self.field.as_str()]
+        } else {
+            self.fields.iter().map(String::as_str).collect()
+        };
+        let mut out: Vec<String> = Vec::with_capacity(named.len());
+        for name in named {
+            let name = name.trim();
+            if name.is_empty() || name == "*" || name == fields::ALL_FIELD {
+                return None;
+            }
+            if !out.iter().any(|f| f == name) {
+                out.push(name.to_string());
+            }
+        }
+        Some(out)
+    }
 }
 
 // ─── Aggregation types ─────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One named aggregation of a search request.
+///
+/// Serialized untagged (each variant is an object keyed by its type, so the
+/// JSON of `terms`, `cardinality` and `composite` is unchanged), but
+/// deserialized by dispatching on the type key — see the `Deserialize` impl
+/// below — so a misspelled or unsupported type is an error rather than a
+/// silent mis-match.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Aggregation {
-    Terms { terms: AggTerms },
-    Cardinality { cardinality: AggCardinality },
-    Composite { composite: AggComposite },
+    Terms {
+        terms: AggTerms,
+        /// Metric sub-aggregations computed per bucket (ES `aggs`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aggs: Option<std::collections::HashMap<String, Aggregation>>,
+    },
+    Cardinality {
+        cardinality: AggCardinality,
+    },
+    Composite {
+        composite: AggComposite,
+        /// Metric sub-aggregations computed per bucket (ES `aggs`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aggs: Option<std::collections::HashMap<String, Aggregation>>,
+    },
+    /// Smallest value of the field over the matched documents.
+    Min {
+        min: AggMetric,
+    },
+    /// Largest value of the field over the matched documents.
+    Max {
+        max: AggMetric,
+    },
+    /// Sum of the field's values over the matched documents.
+    Sum {
+        sum: AggMetric,
+    },
+    /// Mean of the field's values over the matched documents.
+    Avg {
+        avg: AggMetric,
+    },
+    /// Number of values the field has over the matched documents.
+    ValueCount {
+        value_count: AggMetric,
+    },
+    /// Fixed-width numeric buckets (issue #219).
+    Histogram {
+        histogram: AggHistogram,
+        /// Metric sub-aggregations computed per bucket (ES `aggs`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aggs: Option<std::collections::HashMap<String, Aggregation>>,
+    },
+    /// Fixed-width date buckets over epoch milliseconds (issue #219).
+    DateHistogram {
+        date_histogram: AggDateHistogram,
+        /// Metric sub-aggregations computed per bucket (ES `aggs`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aggs: Option<std::collections::HashMap<String, Aggregation>>,
+    },
+}
+
+/// The single-value metric aggregations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetricKind {
+    Min,
+    Max,
+    Sum,
+    Avg,
+    ValueCount,
+}
+
+impl MetricKind {
+    /// The wire name of the aggregation type.
+    pub fn name(self) -> &'static str {
+        match self {
+            MetricKind::Min => "min",
+            MetricKind::Max => "max",
+            MetricKind::Sum => "sum",
+            MetricKind::Avg => "avg",
+            MetricKind::ValueCount => "value_count",
+        }
+    }
+}
+
+/// Body of a metric aggregation (`min`, `max`, `sum`, `avg`,
+/// `value_count`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AggMetric {
+    pub field: String,
+}
+
+/// Aggregation type keys `Aggregation` accepts, as reported in parse errors.
+const AGGREGATION_KEYS: [&str; 10] = [
+    "terms",
+    "cardinality",
+    "composite",
+    "histogram",
+    "date_histogram",
+    "min",
+    "max",
+    "sum",
+    "avg",
+    "value_count",
+];
+
+impl Aggregation {
+    /// The metric kind and body when this is a metric aggregation.
+    pub fn metric(&self) -> Option<(MetricKind, &AggMetric)> {
+        match self {
+            Aggregation::Min { min } => Some((MetricKind::Min, min)),
+            Aggregation::Max { max } => Some((MetricKind::Max, max)),
+            Aggregation::Sum { sum } => Some((MetricKind::Sum, sum)),
+            Aggregation::Avg { avg } => Some((MetricKind::Avg, avg)),
+            Aggregation::ValueCount { value_count } => Some((MetricKind::ValueCount, value_count)),
+            _ => None,
+        }
+    }
+
+    /// The type key this aggregation is written under.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Aggregation::Terms { .. } => "terms",
+            Aggregation::Cardinality { .. } => "cardinality",
+            Aggregation::Composite { .. } => "composite",
+            Aggregation::Histogram { .. } => "histogram",
+            Aggregation::DateHistogram { .. } => "date_histogram",
+            other => other.metric().map(|(kind, _)| kind.name()).unwrap_or(""),
+        }
+    }
+
+    /// Sub-aggregations of a bucket aggregation, if any.
+    pub fn sub_aggregations(&self) -> Option<&std::collections::HashMap<String, Aggregation>> {
+        match self {
+            Aggregation::Terms { aggs, .. }
+            | Aggregation::Composite { aggs, .. }
+            | Aggregation::Histogram { aggs, .. }
+            | Aggregation::DateHistogram { aggs, .. } => aggs.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Checks the parser enforces, repeated for values built in code: only
+    /// metric aggregations may be nested, and only under a bucket
+    /// aggregation.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        let in_agg = |e: String| format!("in aggregation `{name}`: {e}");
+        match self {
+            Aggregation::Histogram { histogram, .. } => histogram.validate().map_err(in_agg)?,
+            Aggregation::DateHistogram { date_histogram, .. } => {
+                date_histogram.validate().map_err(in_agg)?
+            }
+            _ => {}
+        }
+        if let Some(subs) = self.sub_aggregations() {
+            for (sub_name, sub) in subs {
+                if sub.metric().is_none() {
+                    return Err(nested_bucket_error(name, sub_name, sub.type_name()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Aggregation types that produce buckets and so may carry `aggs`.
+const BUCKET_AGGREGATION_KEYS: [&str; 4] = ["terms", "composite", "histogram", "date_histogram"];
+
+/// Elasticsearch histogram options Kosha does not implement yet. They get
+/// a specific message instead of serde's generic unknown-field one, so a
+/// caller knows the option is recognised but unsupported rather than
+/// misspelled.
+fn reject_unsupported_histogram_options(
+    kind: &str,
+    body: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(obj) = body.as_object() else {
+        return Ok(());
+    };
+    for option in [
+        "time_zone",
+        "extended_bounds",
+        "hard_bounds",
+        "keyed",
+        "order",
+        "missing",
+        "format",
+    ] {
+        if obj.contains_key(option) {
+            return Err(format!(
+                "in `{kind}` aggregation: `{option}` is not supported yet (bucket boundaries \
+                 are UTC, buckets are sorted by key ascending, and gaps are filled between \
+                 the lowest and highest non-empty bucket)"
+            ));
+        }
+    }
+    if kind == "date_histogram" && obj.contains_key("interval") {
+        return Err(
+            "in `date_histogram` aggregation: `interval` is deprecated in Elasticsearch and not \
+             accepted; use `fixed_interval` (e.g. \"1h\", \"7d\")"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn nested_bucket_error(parent: &str, name: &str, kind: &str) -> String {
+    format!(
+        "sub-aggregation `{name}` of `{parent}` is a `{kind}` aggregation; only metric \
+         aggregations (min, max, sum, avg, value_count) can be nested under a bucket \
+         aggregation"
+    )
+}
+
+/// Deserialized by dispatching on the aggregation's type key rather than
+/// with `#[serde(untagged)]`, for the same reason as [`FilterClause`]
+/// (issue #170): untagged tries each variant in turn, so a misspelled type
+/// or an unsupported one (`{"stats": ...}`) would at best produce serde's
+/// unhelpful "did not match any variant", and a new variant whose body
+/// happened to fit would silently capture another type's JSON.
+///
+/// The object holds exactly one type key, plus — for the bucket
+/// aggregations `terms`, `composite`, `histogram` and `date_histogram`
+/// only — an optional `aggs` (or `aggregations`) map of metric
+/// sub-aggregations, as in Elasticsearch.
+impl<'de> Deserialize<'de> for Aggregation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let expected = || AGGREGATION_KEYS.join(", ");
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let serde_json::Value::Object(mut obj) = value else {
+            return Err(D::Error::custom(format!(
+                "aggregation must be a JSON object with exactly one of: {}",
+                expected()
+            )));
+        };
+
+        let subs = match (obj.remove("aggs"), obj.remove("aggregations")) {
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "aggregation has both `aggs` and `aggregations`; use one",
+                ))
+            }
+            (Some(v), None) | (None, Some(v)) => Some(v),
+            (None, None) => None,
+        };
+
+        let mut keys = obj.keys();
+        let key = keys
+            .next()
+            .ok_or_else(|| {
+                D::Error::custom(format!(
+                    "aggregation has no type; expected exactly one of: {}",
+                    expected()
+                ))
+            })?
+            .clone();
+        if let Some(extra) = keys.next() {
+            return Err(D::Error::custom(format!(
+                "aggregation must have exactly one type, found `{key}` and `{extra}`; give \
+                 each aggregation its own name"
+            )));
+        }
+        let inner = obj.remove(&key).unwrap_or(serde_json::Value::Null);
+        fn body<T, E>(kind: &str, v: serde_json::Value) -> Result<T, E>
+        where
+            T: serde::de::DeserializeOwned,
+            E: serde::de::Error,
+        {
+            serde_json::from_value(v)
+                .map_err(|e| E::custom(format!("in `{kind}` aggregation: {e}")))
+        }
+
+        let subs: Option<std::collections::HashMap<String, Aggregation>> = match subs {
+            None => None,
+            Some(v) => {
+                if !BUCKET_AGGREGATION_KEYS.contains(&key.as_str()) {
+                    return Err(D::Error::custom(format!(
+                        "`{key}` aggregation cannot have sub-aggregations; only the bucket \
+                         aggregations ({}) take `aggs`",
+                        BUCKET_AGGREGATION_KEYS.join(", ")
+                    )));
+                }
+                let map: std::collections::HashMap<String, Aggregation> =
+                    serde_json::from_value(v).map_err(D::Error::custom)?;
+                for (name, sub) in &map {
+                    if sub.metric().is_none() {
+                        return Err(D::Error::custom(nested_bucket_error(
+                            &key,
+                            name,
+                            sub.type_name(),
+                        )));
+                    }
+                }
+                Some(map)
+            }
+        };
+
+        match key.as_str() {
+            "terms" => Ok(Aggregation::Terms {
+                terms: body(&key, inner)?,
+                aggs: subs,
+            }),
+            "cardinality" => Ok(Aggregation::Cardinality {
+                cardinality: body(&key, inner)?,
+            }),
+            "composite" => Ok(Aggregation::Composite {
+                composite: body(&key, inner)?,
+                aggs: subs,
+            }),
+            "min" => Ok(Aggregation::Min {
+                min: body(&key, inner)?,
+            }),
+            "max" => Ok(Aggregation::Max {
+                max: body(&key, inner)?,
+            }),
+            "sum" => Ok(Aggregation::Sum {
+                sum: body(&key, inner)?,
+            }),
+            "avg" => Ok(Aggregation::Avg {
+                avg: body(&key, inner)?,
+            }),
+            "value_count" => Ok(Aggregation::ValueCount {
+                value_count: body(&key, inner)?,
+            }),
+            "histogram" => {
+                reject_unsupported_histogram_options(&key, &inner).map_err(D::Error::custom)?;
+                let histogram: AggHistogram = body(&key, inner)?;
+                histogram
+                    .validate()
+                    .map_err(|e| D::Error::custom(format!("in `histogram` aggregation: {e}")))?;
+                Ok(Aggregation::Histogram {
+                    histogram,
+                    aggs: subs,
+                })
+            }
+            "date_histogram" => {
+                reject_unsupported_histogram_options(&key, &inner).map_err(D::Error::custom)?;
+                let date_histogram: AggDateHistogram = body(&key, inner)?;
+                date_histogram.validate().map_err(|e| {
+                    D::Error::custom(format!("in `date_histogram` aggregation: {e}"))
+                })?;
+                Ok(Aggregation::DateHistogram {
+                    date_histogram,
+                    aggs: subs,
+                })
+            }
+            other => {
+                let hint = match other {
+                    "stats"
+                    | "extended_stats"
+                    | "percentiles"
+                    | "auto_date_histogram"
+                    | "variable_width_histogram"
+                    | "range"
+                    | "top_hits"
+                    | "filter"
+                    | "filters" => " (not supported yet)",
+                    "count" => " — use `value_count`, or `total_hits` for the number of matches",
+                    "average" | "mean" => " — did you mean `avg`?",
+                    "minimum" => " — did you mean `min`?",
+                    "maximum" => " — did you mean `max`?",
+                    _ => "",
+                };
+                Err(D::Error::custom(format!(
+                    "unknown aggregation type `{other}`{hint}; expected one of: {}",
+                    expected()
+                )))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,10 +1583,19 @@ pub struct AggBucketResult {
     pub buckets: Vec<AggBucket>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AggBucket {
     pub key: String,
     pub doc_count: usize,
+    /// Results of the bucket aggregation's metric sub-aggregations, keyed
+    /// by sub-aggregation name and serialized inline next to `key` and
+    /// `doc_count`, as Elasticsearch does. Empty when none were asked for.
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub sub_aggregations: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,10 +1610,17 @@ pub struct AggCompositeResult {
     pub after_key: Option<std::collections::HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AggCompositeBucket {
     pub key: std::collections::HashMap<String, String>,
     pub doc_count: usize,
+    /// See [`AggBucket::sub_aggregations`].
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub sub_aggregations: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 // ─── Storage abstraction (local fs / S3 / etc.) ───────────────────────────
@@ -523,6 +1635,29 @@ pub trait StorageBackend: std::fmt::Debug + Send + Sync {
     fn delete(&self, path: &str) -> Result<(), KoshaError>;
     fn list(&self, path: &str) -> Result<Vec<String>, KoshaError>;
     fn create_dir_all(&self, path: &str) -> Result<(), KoshaError>;
+
+    /// Every object under `prefix`, recursively, with its size and
+    /// last-modified time. Paths are relative to the storage root, like the
+    /// ones the other methods take. Used by segment GC (#239), which must
+    /// see what the object store holds rather than what a manifest says.
+    /// Backends that cannot list return `Unsupported`.
+    fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectMeta>, KoshaError> {
+        let _ = prefix;
+        Err(KoshaError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this storage backend cannot list objects",
+        )))
+    }
+}
+
+/// One stored object, as [`StorageBackend::list_objects`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMeta {
+    /// Path relative to the storage root, `/`-separated.
+    pub path: String,
+    pub size: u64,
+    /// Unix epoch milliseconds.
+    pub last_modified_ms: u64,
 }
 
 /// Local filesystem implementation of StorageBackend.
@@ -617,6 +1752,45 @@ impl StorageBackend for LocalStorage {
     }
     fn create_dir_all(&self, path: &str) -> Result<(), KoshaError> {
         Ok(std::fs::create_dir_all(self.root.join(path))?)
+    }
+    fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectMeta>, KoshaError> {
+        fn walk(
+            dir: &std::path::Path,
+            root: &std::path::Path,
+            out: &mut Vec<ObjectMeta>,
+        ) -> std::io::Result<()> {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                let path = entry.path();
+                if meta.is_dir() {
+                    walk(&path, root, out)?;
+                } else if let Ok(rel) = path.strip_prefix(root) {
+                    let last_modified_ms = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_millis() as u64);
+                    out.push(ObjectMeta {
+                        path: rel.to_string_lossy().replace('\\', "/"),
+                        size: meta.len(),
+                        last_modified_ms,
+                    });
+                }
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        // A prefix names a directory here: `ns/` and `ns` list the same.
+        let start = self.root.join(prefix.trim_end_matches('/'));
+        walk(&start, &self.root, &mut out)?;
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
     }
 }
 
@@ -723,6 +1897,318 @@ pub struct Footer {
     /// before #243) means vectors are inline JSON in the doc store.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub doc_vectors: bool,
+    /// `true` when every `postings-*.bin` shard was written raw, never
+    /// zstd-wrapped (#245). A raw shard's bytes are exactly the logical
+    /// layout the `inverted.idx` TOC points into, so a query node can fetch
+    /// just its query terms' `(postings_off, postings_len)` spans with
+    /// ranged GETs instead of whole shards. `false` (the default, and every
+    /// segment written before #245) means a shard of 4 KiB or more may be
+    /// compressed as a whole file and must be fetched whole. Readers that
+    /// predate the flag read raw shards unchanged (the wrapper was always
+    /// optional), so a rollback still reads these segments.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub posting_blobs_raw: bool,
+    /// The columnar filter index directory (#244): one entry per filter
+    /// column, naming the `filters-NNN.col` file that holds it, plus its
+    /// per-segment stats. `Some` means the segment's filter values live in
+    /// `filters.toc` + those column files and it has **no** `filters.bin`;
+    /// `None` (the default, and every segment written before #244 or with
+    /// `KOSHA_FILTERS_WRITE_VERSION=1`) means they live in `filters.bin`.
+    /// This field is how readers and the hydration planner pick the
+    /// format: they never guess from which files happen to be local. It
+    /// is also what lets a query node fetch only the columns a query
+    /// touches without first fetching `filters.toc` to learn file names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_columns: Option<Vec<FilterColumnMeta>>,
+    /// The analysis chains this segment's `Text` fields were indexed with
+    /// (issues #220, #221). `None` — every segment written before
+    /// analyzers existed, and every segment written since with default
+    /// settings — means the legacy `standard@1` chain for every field.
+    /// Queries are analyzed per segment with these chains, so a segment
+    /// keeps matching the way it was written whatever the namespace's
+    /// current schema says. See [`analysis`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<SegmentAnalysis>,
+    /// Per-field postings and statistics (issue #249). `None` — every
+    /// segment written before per-field indexes existed, or with
+    /// `KOSHA_FIELD_INDEX=off` — means the segment has only the combined
+    /// index: a field-restricted query is answered from it (matching in
+    /// any field), never with zero hits. See [`fields`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_index: Option<FieldIndex>,
+    /// Bloom over the deletion neighbourhood of the combined-index terms
+    /// (each term and every string one character deletion away from it),
+    /// for pruning one-edit fuzzy queries (issue #201): see
+    /// [`fuzzy::build_fuzzy_bloom`]. `None` — segments written before
+    /// #201, and segments whose neighbourhood is too large for a useful
+    /// bloom — means fuzzy queries cannot prune the segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzzy_bloom: Option<BloomFilter>,
+    /// The vector columns this segment indexes, one ANN index each (#204).
+    ///
+    /// `None` — every segment written before vector columns existed — is a
+    /// *legacy* segment: its one `vector.idx` (if any) holds vectors of an
+    /// unknown field and answers a kNN on any field name (see
+    /// `kosha_segment::SegmentReader::vector_field`). `Some(list)` is
+    /// authoritative: a field not listed has no vectors in this segment,
+    /// and `Some([])` means the segment has no vector index at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_fields: Option<Vec<VectorFieldMeta>>,
+    /// Late-interaction (multi-vector) fields in this segment (#205): one
+    /// entry per `Vector` field whose values were bags of token vectors
+    /// (`[[f32; dim]; n]`). Entry `i`'s files are
+    /// `multivec.{i}.bags` and `multivec.{i}.ivf`. Empty — every segment
+    /// written before #205, and every segment without a bag — means no
+    /// late-interaction data; nothing is serialized then, so such footers
+    /// stay byte-identical to before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub multi_vectors: Vec<MultiVectorField>,
+}
+
+/// Value type of one filter column (#244). A field name can appear with
+/// more than one kind in one segment (documents disagree on its type), so
+/// a column is keyed by `(name, kind)`, exactly like [`FilterStore`]'s
+/// three maps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FilterColumnKind {
+    /// Keyword, Boolean, Date and (capped) Text values.
+    String,
+    Integer,
+    Float,
+}
+
+/// A min/max bound in [`FilterColumnStats`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FilterStatValue {
+    Integer(i64),
+    Float(f64),
+    String(String),
+}
+
+/// Per-segment statistics of one filter column (#244), recorded so later
+/// work can skip segments by range the way `filter_blooms` skips them by
+/// term. Every field is optional on the wire; `None` means "unknown", and
+/// a reader must then not skip on it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FilterColumnStats {
+    /// Number of `(doc, value)` entries.
+    #[serde(default)]
+    pub values: u64,
+    /// Number of distinct documents holding at least one value.
+    #[serde(default)]
+    pub docs: u64,
+    /// Number of distinct values. Exact (the dictionary size) for string
+    /// columns; exact for numeric ones too (`f64` by bit pattern).
+    #[serde(default)]
+    pub distinct: u64,
+    /// Smallest value. For floats only finite values count, and the bound
+    /// is omitted if the column holds none. For strings it is omitted when
+    /// longer than [`FILTER_STAT_MAX_STRING_BYTES`] (a truncated minimum
+    /// would still be a bound, but a truncated maximum would not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<FilterStatValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<FilterStatValue>,
+    /// `true` when a float column holds a NaN or infinite value, which
+    /// `min`/`max` do not describe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub non_finite: bool,
+}
+
+/// Longest string min/max kept in [`FilterColumnStats`].
+pub const FILTER_STAT_MAX_STRING_BYTES: usize = 64;
+
+/// One entry of the columnar filter directory (#244). See
+/// `Footer::filter_columns`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilterColumnMeta {
+    pub name: String,
+    pub kind: FilterColumnKind,
+    /// Column file id: the data lives in `filters-{id:03}.col`. Files are
+    /// numbered rather than named after the field because field names are
+    /// arbitrary strings (`/`, `..`, very long, non-ASCII).
+    pub id: u32,
+    /// Size of the column file in bytes.
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub stats: FilterColumnStats,
+}
+
+impl FilterColumnMeta {
+    /// Basename of this column's file inside the segment directory.
+    pub fn file_name(&self) -> String {
+        filter_column_file_name(self.id)
+    }
+}
+
+/// Name of the columnar filter directory file (#244).
+pub const FILTERS_TOC_FILE: &str = "filters.toc";
+/// Name of the legacy row-oriented filter file.
+pub const FILTERS_BIN_FILE: &str = "filters.bin";
+
+/// Basename of filter column file `id` (#244): `filters-007.col`.
+pub fn filter_column_file_name(id: u32) -> String {
+    format!("filters-{id:03}.col")
+}
+
+/// Whether `name` is a columnar filter file (`filters.toc` or a
+/// `filters-NNN.col`).
+pub fn is_filter_column_file(name: &str) -> bool {
+    name == FILTERS_TOC_FILE
+        || name.strip_prefix("filters-").is_some_and(|rest| {
+            rest.strip_suffix(".col")
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
+impl Footer {
+    /// The filter files a query touching `fields` needs locally (#244):
+    /// `filters.bin` for a legacy segment, otherwise `filters.toc` plus
+    /// the column of every `(name, kind)` whose name is in `fields`.
+    /// `fields == None` means every column (admin paths, compaction).
+    pub fn filter_files_for(
+        &self,
+        fields: Option<&std::collections::BTreeSet<String>>,
+    ) -> Vec<String> {
+        match &self.filter_columns {
+            None => vec![FILTERS_BIN_FILE.to_string()],
+            Some(columns) => {
+                let mut files = vec![FILTERS_TOC_FILE.to_string()];
+                files.extend(
+                    columns
+                        .iter()
+                        .filter(|c| fields.is_none_or(|f| f.contains(&c.name)))
+                        .map(FilterColumnMeta::file_name),
+                );
+                files
+            }
+        }
+    }
+}
+
+/// One vector column's ANN index inside a segment — an entry of
+/// [`Footer::vector_fields`] (#204).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorFieldMeta {
+    /// The document field name the vectors came from.
+    pub name: String,
+    /// Dimension of every vector indexed for this field in this segment.
+    pub dim: u32,
+    /// Number of vectors indexed.
+    pub count: u32,
+    /// Which pair of files holds the index: slot `0` is `vector.idx` +
+    /// `vector.offsets` (the single-column layout, byte-identical to what
+    /// segments have always had), slot `n` is `vector.<n>.idx` +
+    /// `vector.<n>.offsets`. Field names never appear in file names.
+    pub slot: u32,
+    /// Whether the writer emitted the `offsets` sidecar (false only for the
+    /// `KOSHA_VECTOR_WRITE_VERSION=1` flat format).
+    #[serde(default)]
+    pub offsets: bool,
+    /// How the column's posting entries are stored (#210). Omitted from
+    /// the JSON for `f32`, so a segment written without quantization has
+    /// exactly the footer it always had, and every footer written before
+    /// #210 reads as `f32`.
+    #[serde(default, skip_serializing_if = "VectorQuantization::is_f32")]
+    pub quantization: VectorQuantization,
+}
+
+/// Storage of a vector column's ANN posting entries (#210). Centroids and
+/// `doc_vectors.bin` stay `f32` either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorQuantization {
+    /// Full-precision `f32` entries.
+    #[default]
+    F32,
+    /// Scalar-quantized entries: one `f32` scale per vector and `dim`
+    /// signed bytes, ~4x smaller than `f32`.
+    I8,
+}
+
+impl VectorQuantization {
+    pub fn is_f32(&self) -> bool {
+        *self == VectorQuantization::F32
+    }
+
+    /// Parses `f32` / `i8` (case-insensitive); `None` for anything else.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "f32" => Some(Self::F32),
+            "i8" | "int8" => Some(Self::I8),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::I8 => "i8",
+        }
+    }
+}
+
+impl VectorFieldMeta {
+    /// File holding this field's vectors.
+    pub fn idx_file(&self) -> String {
+        vector_idx_file(self.slot)
+    }
+    /// File holding this field's posting centroids/ranges sidecar.
+    pub fn offsets_file(&self) -> String {
+        vector_offsets_file(self.slot)
+    }
+}
+
+/// `vector.idx` for slot 0, `vector.<slot>.idx` otherwise (#204).
+pub fn vector_idx_file(slot: u32) -> String {
+    if slot == 0 {
+        "vector.idx".to_string()
+    } else {
+        format!("vector.{slot}.idx")
+    }
+}
+
+/// `vector.offsets` for slot 0, `vector.<slot>.offsets` otherwise (#204).
+pub fn vector_offsets_file(slot: u32) -> String {
+    if slot == 0 {
+        "vector.offsets".to_string()
+    } else {
+        format!("vector.{slot}.offsets")
+    }
+}
+
+/// Whether `name` is one of a segment's vector-index files (any slot) —
+/// `vector.idx`, `vector.offsets`, `vector.<n>.idx` or `vector.<n>.offsets`.
+pub fn is_vector_index_file(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("vector.") else {
+        return false;
+    };
+    let tail = match rest.split_once('.') {
+        Some((slot, tail)) => {
+            if slot.is_empty() || !slot.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            tail
+        }
+        None => rest,
+    };
+    tail == "idx" || tail == "offsets"
+}
+
+/// One late-interaction field of a segment; see [`Footer::multi_vectors`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiVectorField {
+    /// The document field name the bags were read from.
+    pub name: String,
+    /// Dimensionality of every token vector in the field.
+    pub dim: u32,
+    /// Documents with a bag in this field.
+    pub docs: u32,
+    /// Token vectors across all of those bags.
+    pub tokens: u64,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -795,12 +2281,18 @@ impl BloomFilter {
     /// A filter that cannot be read (empty, or a bit that falls outside the
     /// text) cannot prune: the answer is `true`.
     pub fn may_contain(&self, value: &str) -> bool {
+        self.may_contain_hashed(bloom_key_hashes(value))
+    }
+
+    /// [`Self::may_contain`] for a value already hashed with
+    /// [`bloom_key_hashes`]: the hashes do not depend on the filter, so a
+    /// caller probing many blooms with many values hashes each value once.
+    pub fn may_contain_hashed(&self, (h1, h2): (u64, u64)) -> bool {
         if self.num_bits == 0 || self.bits_b64.is_empty() {
             return true;
         }
         let text = self.bits_b64.as_bytes();
         let m = self.num_bits as u64;
-        let (h1, h2) = bloom_hashes(value);
         for i in 0..self.k {
             let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) % m;
             match base64_byte(text, (bit / 8) as usize) {
@@ -919,9 +2411,12 @@ pub fn segment_may_contain_terms(
     let Some(bloom) = bloom else {
         return true; // legacy footer — cannot prune
     };
+    // A per-field key (#249) is checked as its plain term: the bloom
+    // holds only combined-index terms, and every field term is one.
+    let may_contain = |t: &String| bloom.may_contain(fields::bloom_term(t));
     match mode {
-        TermBloomMode::And => terms.iter().all(|t| bloom.may_contain(t)),
-        TermBloomMode::Or => terms.iter().any(|t| bloom.may_contain(t)),
+        TermBloomMode::And => terms.iter().all(may_contain),
+        TermBloomMode::Or => terms.iter().any(may_contain),
     }
 }
 
@@ -941,7 +2436,12 @@ fn bloom_num_hashes(num_bits: usize, n: usize) -> usize {
     ((num_bits as f64 / n as f64) * 2f64.ln()).round() as usize
 }
 
-/// Stable FNV-1a based double hash (not `DefaultHasher`, which is not portable).
+/// The two hashes a [`BloomFilter`] probes `value` with (stable FNV-1a
+/// double hash; not `DefaultHasher`, which is not portable).
+pub fn bloom_key_hashes(value: &str) -> (u64, u64) {
+    bloom_hashes(value)
+}
+
 fn bloom_hashes(value: &str) -> (u64, u64) {
     let h1 = fnv1a64(value.as_bytes(), 0x9e3779b97f4a7c15);
     let h2 = fnv1a64(value.as_bytes(), 0xbf58476d1ce4e5b9) | 1; // odd → full period
@@ -1103,10 +2603,14 @@ pub fn segment_may_match(
             true
         }
         // A field with no bloom may still be a numeric column, so the
-        // absence of a bloom cannot prove the field is absent.
+        // absence of a bloom cannot prove the field is absent. A bloom
+        // answers "is this exact value present?", which says nothing about
+        // values that merely start with a prefix, so `prefix` never prunes.
         FilterClause::Range { .. }
         | FilterClause::MatchAll { .. }
-        | FilterClause::Exists { .. } => true,
+        | FilterClause::Exists { .. }
+        | FilterClause::GeoDistance { .. }
+        | FilterClause::Prefix { .. } => true,
     }
 }
 
@@ -1165,9 +2669,125 @@ pub struct Manifest {
     /// readable for legacy manifests and is populated in memory by readers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub deletion_vectors: HashMap<SegmentId, deletes::DeletionVector>,
+    /// Namespace schema (`POST /v1/namespaces/{ns}/schema`). Read by the
+    /// segment writers (flush and compaction) for each field's analyzer.
+    /// Segments record the chains they actually used in their own footer,
+    /// so editing the schema never changes how an existing segment is
+    /// searched. `None` = no schema: every field uses `standard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<NamespaceSchema>,
+    /// Segments and deletion generations earlier versions referenced and
+    /// this one no longer does, with when they were dropped (#239). Segment
+    /// GC deletes their objects once they have been retired longer than
+    /// the grace window, then drops the record. Optional, so manifests
+    /// written before it existed still parse and older binaries ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<gc::RetiredObject>,
+    /// Fixed shard count (#207), set once when the namespace is created
+    /// sharded. `Some(n)` with `n > 1` marks a *root* manifest: it lists no
+    /// segments itself; documents live in the shard namespaces
+    /// [`sharding::shard_namespace`] names. `None` (every manifest written
+    /// before sharding existed) is an ordinary, unsharded namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shards: Option<u32>,
+    /// Set on a namespace created by `POST /v1/namespaces/{ns}/branch`
+    /// (#208): where it was branched from, and which of its segments live
+    /// in another namespace's storage prefix. `None` for every other
+    /// namespace (and every manifest written before branching existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<branch::BranchInfo>,
 }
 
 impl Manifest {
+    /// Namespace whose storage prefix (`{home}/{segment}/` on local disk
+    /// and in S3) holds `segment`'s files. A branch lists its parent's
+    /// segments without copying them (#208); everything else, and every
+    /// segment a branch writes itself, lives under the listing namespace.
+    pub fn segment_home<'a>(&'a self, ns: &'a NamespaceId, segment: &SegmentId) -> &'a NamespaceId {
+        self.branch
+            .as_ref()
+            .and_then(|branch| branch.segment_homes.get(segment))
+            .unwrap_or(ns)
+    }
+
+    /// Logical (data-dir / S3-key relative) directory of `segment`, as
+    /// listed by the manifest of `ns`: `{home}/{segment}`.
+    pub fn segment_rel_dir(&self, ns: &NamespaceId, segment: &SegmentId) -> String {
+        format!("{}/{}", self.segment_home(ns, segment).0, segment.0)
+    }
+
+    /// Local directory of `segment` under `data_dir`, as listed by the
+    /// manifest of `ns`.
+    pub fn segment_dir(
+        &self,
+        data_dir: &std::path::Path,
+        ns: &NamespaceId,
+        segment: &SegmentId,
+    ) -> std::path::PathBuf {
+        data_dir
+            .join(&self.segment_home(ns, segment).0)
+            .join(&segment.0)
+    }
+
+    /// Whether `segment` lives in another namespace's prefix (inherited
+    /// from a branch parent). Such a segment is already durable: the
+    /// listing namespace never uploads, rewrites or deletes it.
+    pub fn is_inherited_segment(&self, ns: &NamespaceId, segment: &SegmentId) -> bool {
+        self.segment_home(ns, segment) != ns
+    }
+
+    /// Drop branch bookkeeping for segments the manifest no longer lists
+    /// (compacted away). Keeps the row from growing with history.
+    pub fn retain_listed_segment_homes(&mut self) {
+        if let Some(branch) = self.branch.as_mut() {
+            if branch.segment_homes.is_empty() {
+                return;
+            }
+            let listed: std::collections::HashSet<&SegmentId> = self
+                .segments
+                .iter()
+                .map(|entry| &entry.segment_id)
+                .collect();
+            branch
+                .segment_homes
+                .retain(|segment, _| listed.contains(segment));
+        }
+    }
+
+    /// The analysis settings new segments of this namespace are written
+    /// with. A schema this binary cannot resolve (one set by a newer
+    /// version naming an analyzer this one lacks) falls back to the
+    /// default chain: the segments written are then recorded as such in
+    /// their footers, so they stay searchable either way.
+    pub fn analysis_config(&self) -> AnalysisConfig {
+        match self.schema.as_ref().map(NamespaceSchema::resolve) {
+            Some(Ok(config)) => config,
+            Some(Err(e)) => {
+                eprintln!("kosha: namespace schema not resolvable ({e}); using default analysis");
+                AnalysisConfig::default()
+            }
+            None => AnalysisConfig::default(),
+        }
+    }
+
+    /// A manifest with no segments, deletes or WAL checkpoint.
+    pub fn empty(version: u64) -> Self {
+        Self {
+            version,
+            segments: Vec::new(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+            branch: None,
+        }
+    }
+
     /// Semantic equality, independent of hash-map serialization order.
     pub fn same_contents(&self, other: &Self) -> bool {
         if self.tombstones != other.tombstones {
@@ -1261,13 +2881,96 @@ impl Manifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnnQuery {
     pub field: String,
+    /// The query vector for single-vector kNN. Empty (and omitted) for a
+    /// late-interaction query that sends `vectors` instead.
+    #[serde(default)]
     pub vector: Vec<f32>,
     #[serde(default = "default_knn_k")]
     pub k: usize,
+    /// Single-vector kNN: the whole-query posting probe budget. Late
+    /// interaction: how many candidate documents per segment are re-scored
+    /// with exact MaxSim (at least `k`).
     #[serde(default = "default_knn_num_candidates")]
     pub num_candidates: usize,
     #[serde(default)]
     pub filter: Option<FilterClause>,
+    /// Late interaction (#205): the query's bag of token vectors. Setting
+    /// it selects [`KnnScoring::LateInteraction`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<Vec<Vec<f32>>>,
+    /// How documents are scored against the query. `None` is inferred:
+    /// late interaction when `vectors` is set, single-vector cosine
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring: Option<KnnScoring>,
+}
+
+/// `knn.scoring`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnnScoring {
+    /// One query vector against one document vector, cosine similarity.
+    Cosine,
+    /// ColBERT-style MaxSim (#205): the query and each document are bags
+    /// of token vectors, and the score is the sum over query tokens of the
+    /// best cosine similarity against any of the document's tokens.
+    LateInteraction,
+}
+
+impl KnnQuery {
+    /// Whether this query is scored with late interaction (MaxSim).
+    pub fn is_late_interaction(&self) -> bool {
+        match self.scoring {
+            Some(KnnScoring::LateInteraction) => true,
+            Some(KnnScoring::Cosine) => false,
+            None => self.vectors.is_some(),
+        }
+    }
+
+    /// The query's token vectors for late interaction: `vectors`, or the
+    /// single `vector` as a one-token bag.
+    pub fn query_tokens(&self) -> Vec<&[f32]> {
+        match self.vectors {
+            Some(ref bag) => bag.iter().map(Vec::as_slice).collect(),
+            None if !self.vector.is_empty() => vec![self.vector.as_slice()],
+            None => Vec::new(),
+        }
+    }
+
+    /// Shape checks that need no segment. An `Err` is a client error.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.vectors.is_some() && !self.vector.is_empty() {
+            return Err("knn takes either vector or vectors, not both".into());
+        }
+        if self.scoring == Some(KnnScoring::Cosine) && self.vectors.is_some() {
+            return Err(
+                "knn.vectors is a bag of token vectors and needs scoring \"late_interaction\""
+                    .into(),
+            );
+        }
+        if !self.is_late_interaction() {
+            // `vector` used to be a required field; it may be omitted now
+            // only because `vectors` can stand in for it.
+            if self.vector.is_empty() {
+                return Err("knn needs a vector (or vectors, for late interaction)".into());
+            }
+            return Ok(());
+        }
+        let tokens = self.query_tokens();
+        let Some(first) = tokens.first() else {
+            return Err("late-interaction knn needs at least one query vector".into());
+        };
+        if first.is_empty() {
+            return Err("knn.vectors entries must not be empty".into());
+        }
+        if tokens.iter().any(|t| t.len() != first.len()) {
+            return Err("every knn.vectors entry must have the same dimension".into());
+        }
+        if tokens.iter().any(|t| t.iter().any(|x| !x.is_finite())) {
+            return Err("knn.vectors must hold finite numbers".into());
+        }
+        Ok(())
+    }
 }
 fn default_knn_k() -> usize {
     10
@@ -1292,8 +2995,10 @@ pub struct SearchQuery {
     pub max_results: usize,
     #[serde(default)]
     pub from: usize,
+    /// Per-request BM25 `k1` / `b`; unset parameters use the segment's
+    /// build-time values. Checked by [`SearchQuery::validate`].
     #[serde(default)]
-    pub bm25_params: Bm25Params,
+    pub bm25_params: Bm25Overrides,
     #[serde(default)]
     pub filter: Option<FilterClause>,
     #[serde(default)]
@@ -1309,6 +3014,13 @@ pub struct SearchQuery {
     pub aggs: std::collections::HashMap<String, Aggregation>,
     #[serde(default)]
     pub wildcard: Option<WildcardQuery>,
+    /// Typo-tolerant term matching (issue #201): each token of
+    /// `fuzzy.value` matches the terms within `fuzziness` edits of it. A
+    /// lexical retriever of its own, so it cannot be combined with
+    /// `query_text`, `wildcard` or `match_phrase`; it can be the lexical
+    /// leg of a hybrid request. See [`fuzzy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzzy: Option<FuzzyQuery>,
     #[serde(default)]
     pub match_phrase: Option<MatchPhraseQuery>,
     #[serde(default)]
@@ -1354,6 +3066,24 @@ pub struct SearchQuery {
     /// `total_hits` still counts matching documents, not groups.
     #[serde(default)]
     pub collapse: Option<CollapseSpec>,
+    /// Result diversification (issue #211): at most `max` hits per distinct
+    /// value of `field`, applied while the result list is collected, so the
+    /// page is filled from the next-best groups rather than cut short.
+    /// `collapse` is the `max: 1` special case with one difference:
+    /// documents with no value for the field are never capped here.
+    ///
+    /// The cap is a function of the result order alone: a hit is kept when
+    /// fewer than `max` hits of its group rank above it. A `search_after`
+    /// cursor therefore needs no extra state: each page is the same capped
+    /// list resumed after the cursor, so a document appears at most once
+    /// and a group spent on earlier pages is never refilled.
+    ///
+    /// `total_hits` (and aggregations) count matching documents before the
+    /// cap, as with `collapse`. A pure kNN request is the exception it
+    /// already was: there `total_hits` is the size of the returned
+    /// neighbour set, which is the diversified one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_per: Option<LimitPerSpec>,
     /// Return only these stored fields with each hit (OpenSearch
     /// `_source.includes`). `None` returns every field.
     #[serde(default)]
@@ -1363,12 +3093,144 @@ pub struct SearchQuery {
     /// is by far the largest field and almost never read back.
     #[serde(default)]
     pub source_excludes: Option<Vec<String>>,
-    /// Return a timing breakdown of this search in `SearchResult.profile`:
-    /// how long each stage took and the counts behind it. A profiled
-    /// request does not read or fill the whole-response cache, so what it
-    /// reports is always a real execution.
+    /// How a hybrid request (a lexical query plus `knn`) fuses its two
+    /// result lists. Elasticsearch's `"rank": {"rrf": {...}}` shape.
+    /// `None` on a hybrid request is RRF with the default parameters; on a
+    /// request that is not hybrid it must be `None` (see
+    /// [`SearchQuery::validate`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<RankSpec>,
+    /// Which retrievers the request intends to run (proto
+    /// `RetrievalMode`). `None` infers it from the clauses present. When
+    /// given it is checked against them, so a client that asks for
+    /// `hybrid` and forgot the vector gets a 400, not lexical-only hits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RetrievalMode>,
+    /// Restrict `query_text` to these `Text` fields, each optionally
+    /// boosted: `["title^2", "content"]` (issue #249; Elasticsearch
+    /// `multi_match` `most_fields`). A document's score is the sum over
+    /// fields of `boost × BM25` computed with that field's own length and
+    /// statistics. With the AND operator every query term has to match in
+    /// at least one of the fields. Empty (the default) searches the
+    /// combined index of every `Text` field, as before; `_all` names that
+    /// combined index and may be listed alongside real fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+    /// Score modifiers (issue #212): blend numeric, date and geo attributes
+    /// into the score with field-value boosts and linear / exp / gauss
+    /// decays. Applied in a rescore window: the query is ranked by its own
+    /// score first (BM25, fused RRF, or vector similarity, exactly as
+    /// without `rank_by`), the best `window_size` hits are rescored from
+    /// the filter columns and re-sorted, and only those are returned. See
+    /// [`rank::RankBySpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_by: Option<RankBySpec>,
+    /// Rerank the top `rerank.top_n` first-stage hits (the fused list for a
+    /// hybrid request) with an external model before paging. The searcher
+    /// itself never calls a provider: see `kosha_query::rerank`. Part of
+    /// the serialized query, so part of every result-cache key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<RerankSpec>,
+}
+
+/// See `SearchQuery.rerank`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RerankSpec {
+    /// A provider name the server has configured (e.g. `"cohere"`). An
+    /// unknown name is a 400.
+    pub provider: String,
+    /// Model id passed to the provider. `None` uses the provider's
+    /// configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Stored field whose text is sent as each candidate document.
+    pub field: String,
+    /// How many first-stage hits to rerank. Default `from + max_results`;
+    /// must be at least that, at most [`MAX_RERANK_TOP_N`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<usize>,
+    /// How long to wait for the provider before falling back to the
+    /// first-stage order. Default [`DEFAULT_RERANK_TIMEOUT_MS`], at most
+    /// [`MAX_RERANK_TIMEOUT_MS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Text the candidates are scored against. Default `query_text`, or
+    /// the `match_phrase` phrase; required when the request has neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+}
+
+/// Default `rerank.timeout_ms`.
+pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 2_000;
+/// Upper bound on `rerank.timeout_ms`.
+pub const MAX_RERANK_TIMEOUT_MS: u64 = 60_000;
+/// Upper bound on `rerank.top_n` (Cohere's per-request document limit).
+pub const MAX_RERANK_TOP_N: usize = 1_000;
+
+/// Proto `RetrievalMode`, as the JSON API spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RetrievalMode {
+    /// `query_text` / `wildcard` / `match_phrase` (or a filter alone); no `knn`.
+    Lexical,
+    /// `knn` only.
+    Semantic,
+    /// A lexical query and `knn`, fused by Reciprocal Rank Fusion.
+    Hybrid,
+}
+
+/// See `SearchQuery.rank`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RankSpec {
     #[serde(default)]
-    pub profile: Option<bool>,
+    pub rrf: Option<RrfSpec>,
+}
+
+/// Reciprocal Rank Fusion parameters (Elasticsearch-compatible names and
+/// defaults): `score(d) = Σ_r 1 / (rank_constant + rank_r(d))` over the
+/// retrievers `r` whose top-`rank_window_size` list contains `d`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RrfSpec {
+    /// How many results each retriever contributes, and how long the fused
+    /// list is. Defaults to `max_results` (Elasticsearch: `size`). Must be
+    /// at least `max_results`.
+    #[serde(default)]
+    pub rank_window_size: Option<usize>,
+    /// Damps the advantage of the very top ranks. Default 60; must be ≥ 1.
+    #[serde(default)]
+    pub rank_constant: Option<u32>,
+}
+
+/// Default `rank_constant` (Elasticsearch and the original RRF paper).
+pub const DEFAULT_RRF_RANK_CONSTANT: u32 = 60;
+
+/// Resolved RRF parameters for one request; see [`SearchQuery::rrf`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RrfParams {
+    pub rank_window_size: usize,
+    pub rank_constant: u32,
+}
+
+/// Per-retriever ranks of a fused hit (`ScoredDocument.rank_details`).
+/// Ranks are 1-based positions in each retriever's namespace-wide list;
+/// `None` means the hit was not in that retriever's window.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RankDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knn_rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knn_score: Option<f64>,
+    /// `rank_by` requests only: the hit's score before the modifiers (BM25,
+    /// fused RRF or vector score); `score` is the modified one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_score: Option<f64>,
 }
 
 /// See `SearchQuery.collapse`.
@@ -1377,7 +3239,352 @@ pub struct CollapseSpec {
     pub field: String,
 }
 
+/// See `SearchQuery.limit_per`. JSON: `"limit_per": {"field": "author", "max": 2}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitPerSpec {
+    /// A keyword (or other filterable) field. Documents without a value
+    /// for it are not capped.
+    pub field: String,
+    /// Hits allowed per distinct value; must be >= 1.
+    pub max: usize,
+}
+
 impl SearchQuery {
+    /// Request-level checks that do not need any segment: currently the
+    /// BM25 parameter ranges. An `Err` is a client error (HTTP 400).
+    pub fn validate(&self) -> Result<(), KoshaError> {
+        self.bm25_params
+            .validate()
+            .map_err(KoshaError::InvalidQuery)?;
+        if let Some(ref fuzzy) = self.fuzzy {
+            fuzzy.validate().map_err(KoshaError::InvalidQuery)?;
+            if !self.query_text.trim().is_empty()
+                || self.wildcard.is_some()
+                || self.match_phrase.is_some()
+                || !self.fields.is_empty()
+            {
+                return Err(KoshaError::InvalidQuery(
+                    "fuzzy is a lexical query of its own; it cannot be combined with \
+                     query_text, fields, wildcard or match_phrase (restrict it with \
+                     fuzzy.field)"
+                        .into(),
+                ));
+            }
+        }
+        if !self.fields.is_empty() {
+            fields::parse_field_boosts(&self.fields).map_err(KoshaError::InvalidQuery)?;
+            if self.match_phrase.is_some() || self.wildcard.is_some() {
+                return Err(KoshaError::InvalidQuery(
+                    "fields applies to query_text; restrict match_phrase with its own \
+                     field / fields, and wildcard with its field"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(ref phrase) = self.match_phrase {
+            for name in phrase.fields.iter().chain(std::iter::once(&phrase.field)) {
+                if name.contains('^') || (name.contains('*') && name.trim() != "*") {
+                    return Err(KoshaError::InvalidQuery(format!(
+                        "match_phrase field {name:?}: boosts and field patterns are not supported"
+                    )));
+                }
+            }
+        }
+        if let Some(ref limit) = self.limit_per {
+            if limit.max == 0 {
+                return Err(KoshaError::InvalidQuery(
+                    "limit_per.max must be >= 1".into(),
+                ));
+            }
+            let field = limit.field.trim();
+            if field.is_empty() || field == "_id" || field == "_score" {
+                return Err(KoshaError::InvalidQuery(format!(
+                    "limit_per.field must name a stored keyword field, not {:?}",
+                    limit.field
+                )));
+            }
+            if self.collapse.is_some() {
+                return Err(KoshaError::InvalidQuery(
+                    "collapse and limit_per cannot be combined; collapse is limit_per with max 1"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(ref rank_by) = self.rank_by {
+            rank_by
+                .compile(self.max_results, 0)
+                .map_err(KoshaError::InvalidQuery)?;
+            if !sort_is_by_score(&self.sort) {
+                return Err(KoshaError::InvalidQuery(
+                    "rank_by reorders by the modified score; it cannot be combined with a \
+                     sort other than [_score desc] / [_score desc, _id asc]"
+                        .into(),
+                ));
+            }
+            // The window is the best hits by the query's own score. A
+            // filter alone scores every document the same, so its "best"
+            // window would be an arbitrary cut that drops correct results.
+            if !self.has_lexical_query() && self.knn.is_none() {
+                return Err(KoshaError::InvalidQuery(
+                    "rank_by rescores the best hits of a query; it needs query_text, \
+                     wildcard, match_phrase, fuzzy or knn, not a filter alone"
+                        .into(),
+                ));
+            }
+        }
+        for (name, agg) in &self.aggs {
+            agg.validate(name).map_err(KoshaError::InvalidQuery)?;
+        }
+        if let Some(ref knn) = self.knn {
+            knn.validate().map_err(KoshaError::InvalidQuery)?;
+        }
+        let has_lexical = self.has_lexical_query();
+        let has_knn = self.knn.is_some();
+        match self.mode {
+            Some(RetrievalMode::Hybrid) if !(has_lexical && has_knn) => {
+                return Err(KoshaError::InvalidQuery(
+                    "mode \"hybrid\" needs both a lexical query (query_text, wildcard, \
+                     match_phrase or fuzzy) and knn"
+                        .into(),
+                ));
+            }
+            Some(RetrievalMode::Lexical) if has_knn => {
+                return Err(KoshaError::InvalidQuery(
+                    "mode \"lexical\" cannot have a knn clause".into(),
+                ));
+            }
+            Some(RetrievalMode::Semantic) if !has_knn || has_lexical => {
+                return Err(KoshaError::InvalidQuery(
+                    "mode \"semantic\" needs knn and no lexical query".into(),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(ref rerank) = self.rerank {
+            self.validate_rerank(rerank)?;
+        }
+        if let Some(ref rank) = self.rank {
+            let Some(ref rrf) = rank.rrf else {
+                return Err(KoshaError::InvalidQuery(
+                    "rank needs a method; only \"rrf\" is supported".into(),
+                ));
+            };
+            if !self.is_hybrid() {
+                return Err(KoshaError::InvalidQuery(
+                    "rank.rrf fuses a lexical query with knn; the request needs both \
+                     (query_text, wildcard, match_phrase or fuzzy, plus knn)"
+                        .into(),
+                ));
+            }
+            if rrf.rank_constant == Some(0) {
+                return Err(KoshaError::InvalidQuery(
+                    "rank.rrf.rank_constant must be >= 1".into(),
+                ));
+            }
+            if let Some(window) = rrf.rank_window_size {
+                if window == 0 || window < self.max_results {
+                    return Err(KoshaError::InvalidQuery(format!(
+                        "rank.rrf.rank_window_size ({window}) must be >= 1 and >= \
+                         max_results ({})",
+                        self.max_results
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The compiled `rank_by` for this request, `"now"` resolved to the
+    /// current time. `None` without `rank_by`; an invalid one is an error
+    /// ([`Self::validate`] reports it first).
+    pub fn compiled_rank_by(&self) -> Result<Option<CompiledRankBy>, KoshaError> {
+        let Some(ref rank_by) = self.rank_by else {
+            return Ok(None);
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        rank_by
+            .compile(self.max_results, now_ms)
+            .map(Some)
+            .map_err(KoshaError::InvalidQuery)
+    }
+
+    /// How many hits each segment must hand back, best first by the
+    /// query's own score, for the page to be right: `from + max_results`,
+    /// widened to the rescore window under `rank_by` (0 stays 0: nothing
+    /// is returned, so nothing is rescored).
+    pub fn collect_depth(&self) -> usize {
+        let page = self.from.saturating_add(self.max_results);
+        match self.rank_by {
+            Some(ref rank_by) if page > 0 => page.max(rank_by.window(self.max_results)),
+            _ => page,
+        }
+    }
+
+    fn validate_rerank(&self, rerank: &RerankSpec) -> Result<(), KoshaError> {
+        let bad = |msg: String| Err(KoshaError::InvalidQuery(msg));
+        if rerank.provider.trim().is_empty() {
+            return bad("rerank.provider must not be empty".into());
+        }
+        if rerank.field.trim().is_empty() {
+            return bad("rerank.field must not be empty".into());
+        }
+        if rerank.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+            return bad("rerank.model must not be empty when given".into());
+        }
+        let page_end = self.from.saturating_add(self.max_results);
+        let top_n = self.rerank_top_n().unwrap_or(page_end);
+        if top_n == 0 || top_n > MAX_RERANK_TOP_N {
+            return bad(format!(
+                "rerank.top_n ({top_n}) must be between 1 and {MAX_RERANK_TOP_N}"
+            ));
+        }
+        if top_n < page_end {
+            return bad(format!(
+                "rerank.top_n ({top_n}) must be >= from + max_results ({page_end}): only \
+                 reranked hits can be returned"
+            ));
+        }
+        if let Some(timeout) = rerank.timeout_ms {
+            if timeout == 0 || timeout > MAX_RERANK_TIMEOUT_MS {
+                return bad(format!(
+                    "rerank.timeout_ms ({timeout}) must be between 1 and {MAX_RERANK_TIMEOUT_MS}"
+                ));
+            }
+        }
+        if !self.sort.is_empty() || self.search_after.is_some() {
+            return bad(
+                "rerank orders hits by the reranker's score; it cannot be combined with \
+                 sort or search_after (page with from/max_results)"
+                    .into(),
+            );
+        }
+        if self.rerank_query_text().is_none() {
+            return bad(
+                "rerank needs query text: set rerank.query, or use query_text, \
+                 match_phrase or fuzzy"
+                    .into(),
+            );
+        }
+        if let Some(window) = self
+            .rank
+            .as_ref()
+            .and_then(|r| r.rrf.as_ref())
+            .and_then(|r| r.rank_window_size)
+        {
+            if window < top_n {
+                return bad(format!(
+                    "rerank.top_n ({top_n}) must be <= rank.rrf.rank_window_size ({window}): \
+                     the fused list is only that long"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolved `rerank.top_n` (default `from + max_results`), or `None`
+    /// when the request does not rerank.
+    pub fn rerank_top_n(&self) -> Option<usize> {
+        let rerank = self.rerank.as_ref()?;
+        Some(
+            rerank
+                .top_n
+                .unwrap_or_else(|| self.from.saturating_add(self.max_results)),
+        )
+    }
+
+    /// The text a reranker scores candidates against: `rerank.query`,
+    /// else `query_text`, else the `match_phrase` phrase, else the `fuzzy`
+    /// value.
+    pub fn rerank_query_text(&self) -> Option<&str> {
+        let rerank = self.rerank.as_ref()?;
+        [
+            rerank.query.as_deref(),
+            Some(self.query_text.as_str()),
+            self.match_phrase.as_ref().map(|p| p.phrase.as_str()),
+            self.fuzzy.as_ref().map(|f| f.value.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|t| !t.is_empty())
+    }
+
+    /// The query the searcher runs for a reranked request: the top
+    /// `top_n` hits from offset 0, with the rerank field returned even if
+    /// the source filter would drop it. `None` when the request does not
+    /// rerank. Totals, aggregations and fusion are those of this query;
+    /// for a hybrid request without an explicit `rank_window_size` the
+    /// fused window defaults to `top_n` rather than `max_results`.
+    pub fn first_stage_query(&self) -> Option<SearchQuery> {
+        let rerank = self.rerank.as_ref()?;
+        let top_n = self.rerank_top_n()?;
+        let mut first = self.clone();
+        first.rerank = None;
+        first.from = 0;
+        first.max_results = top_n;
+        if let Some(ref mut includes) = first.source_includes {
+            if !includes.contains(&rerank.field) {
+                includes.push(rerank.field.clone());
+            }
+        }
+        if let Some(ref mut excludes) = first.source_excludes {
+            excludes.retain(|f| f != &rerank.field);
+        }
+        Some(first)
+    }
+
+    /// True when the request has a lexical retriever: query text, a
+    /// wildcard or a phrase. A filter alone is not one.
+    pub fn has_lexical_query(&self) -> bool {
+        !self.query_text.trim().is_empty()
+            || self.wildcard.is_some()
+            || self.match_phrase.is_some()
+            || self.fuzzy.is_some()
+    }
+
+    /// The parsed `fields` list, or `None` when `query_text` searches the
+    /// combined index (no `fields`, or only `_all` unboosted). An invalid
+    /// list is `None` too; [`Self::validate`] rejects it first.
+    pub fn field_boosts(&self) -> Option<Vec<FieldBoost>> {
+        if self.fields.is_empty() {
+            return None;
+        }
+        let parsed = fields::parse_field_boosts(&self.fields).ok()?;
+        if parsed.len() == 1 && parsed[0].is_all() && parsed[0].boost == 1.0 {
+            return None;
+        }
+        Some(parsed)
+    }
+
+    /// True when the request has both a lexical retriever and `knn`: its
+    /// two result lists are fused with Reciprocal Rank Fusion.
+    pub fn is_hybrid(&self) -> bool {
+        self.knn.is_some() && self.has_lexical_query()
+    }
+
+    /// The RRF parameters for a hybrid request (defaults filled in), or
+    /// `None` when the request is not hybrid.
+    pub fn rrf(&self) -> Option<RrfParams> {
+        if !self.is_hybrid() {
+            return None;
+        }
+        let spec = self.rank.as_ref().and_then(|r| r.rrf.as_ref());
+        Some(RrfParams {
+            rank_window_size: spec
+                .and_then(|s| s.rank_window_size)
+                .unwrap_or(self.max_results)
+                .max(1),
+            rank_constant: spec
+                .and_then(|s| s.rank_constant)
+                .unwrap_or(DEFAULT_RRF_RANK_CONSTANT)
+                .max(1),
+        })
+    }
+
     /// True when the vector leg is the only thing that can produce a hit:
     /// no query text, wildcard, phrase or top-level filter.
     pub fn is_pure_knn(&self) -> bool {
@@ -1385,6 +3592,7 @@ impl SearchQuery {
             && self.query_text.trim().is_empty()
             && self.wildcard.is_none()
             && self.match_phrase.is_none()
+            && self.fuzzy.is_none()
             && self.filter.is_none()
     }
 
@@ -1422,10 +3630,13 @@ impl SearchQuery {
     }
 
     /// Whether answering needs a segment's filter columns (`filters.bin`):
-    /// any filter, any aggregation, a collapse, or a sort on a stored field.
+    /// any filter, any aggregation, a collapse or `limit_per`, `rank_by`
+    /// (its modifiers read the columns), or a sort on a stored field.
     pub fn needs_filter_columns(&self) -> bool {
         self.filter.is_some()
             || self.collapse.is_some()
+            || self.limit_per.is_some()
+            || self.rank_by.is_some()
             || self.knn.as_ref().is_some_and(|k| k.filter.is_some())
             || !self.aggs.is_empty()
             || self.sort.iter().any(|spec| {
@@ -1433,6 +3644,76 @@ impl SearchQuery {
                     .keys()
                     .any(|field| field != "_score" && field != "_id")
             })
+    }
+
+    /// The filter-column names answering this query can read (#244): every
+    /// field named by the filter, the kNN filter, a field sort, the
+    /// collapse, `limit_per`, `rank_by` and the aggregations. Each `x.keyword`/`x.raw` name also
+    /// adds its base `x`, because lookups fall back to it (see
+    /// [`lookup_field`]). Empty when [`Self::needs_filter_columns`] is
+    /// false. The query node hydrates only these columns of a columnar
+    /// segment.
+    pub fn filter_column_fields(&self) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut add = |field: &str| {
+            out.insert(field.to_string());
+            let base = base_field_name(field);
+            if base.len() != field.len() {
+                out.insert(base.to_string());
+            }
+        };
+        if let Some(filter) = &self.filter {
+            filter.for_each_field(&mut add);
+        }
+        if let Some(filter) = self.knn.as_ref().and_then(|k| k.filter.as_ref()) {
+            filter.for_each_field(&mut add);
+        }
+        if let Some(collapse) = &self.collapse {
+            add(&collapse.field);
+        }
+        // `limit_per` groups hits by a field's value and `rank_by` reads
+        // its modifiers' fields from the filter columns (#211, #212).
+        if let Some(limit_per) = &self.limit_per {
+            add(&limit_per.field);
+        }
+        if let Some(rank_by) = &self.rank_by {
+            rank_by.fields().for_each(&mut add);
+        }
+        for spec in &self.sort {
+            for field in spec.fields.keys() {
+                if field != "_score" && field != "_id" {
+                    add(field);
+                }
+            }
+        }
+        // Metric aggregations, and metric sub-aggregations under a bucket
+        // aggregation, read their fields from the filter columns too.
+        let subs = self
+            .aggs
+            .values()
+            .filter_map(Aggregation::sub_aggregations)
+            .flat_map(|subs| subs.values());
+        for agg in self.aggs.values().chain(subs) {
+            match agg {
+                Aggregation::Terms { terms, .. } => add(&terms.field),
+                Aggregation::Cardinality { cardinality } => add(&cardinality.field),
+                Aggregation::Composite { composite, .. } => {
+                    for source in &composite.sources {
+                        for terms in source.source.values() {
+                            add(&terms.terms.field);
+                        }
+                    }
+                }
+                Aggregation::Histogram { histogram, .. } => add(&histogram.field),
+                Aggregation::DateHistogram { date_histogram, .. } => add(&date_histogram.field),
+                _ => {
+                    if let Some((_, metric)) = agg.metric() {
+                        add(&metric.field);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Whether `field` should be returned with a hit, per
@@ -1446,6 +3727,20 @@ impl SearchQuery {
                 .as_ref()
                 .is_some_and(|unwanted| unwanted.iter().any(|f| f == field))
     }
+}
+
+/// True when `sort` orders by score, best first (ties by `_id`): no sort,
+/// `[_score desc]` or `[_score desc, _id asc]`.
+pub fn sort_is_by_score(sort: &[SortSpec]) -> bool {
+    let keys: Vec<(&str, &str)> = sort
+        .iter()
+        .flat_map(|spec| spec.fields.iter())
+        .map(|(field, order)| (field.as_str(), order.order.as_str()))
+        .collect();
+    matches!(
+        keys.as_slice(),
+        [] | [("_score", "desc")] | [("_score", "desc"), ("_id", "asc")]
+    )
 }
 
 /// See `SearchQuery.operator`.
@@ -1464,8 +3759,32 @@ pub struct ScoredDocument {
     pub doc_id: DocumentId,
     pub score: f64,
     pub fields: Vec<Field>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Legacy single-field highlight fragments: set only for a request
+    /// that used the legacy `{"highlight": {"field": ...}}` form.
+    /// Deprecated: request `highlight.fields` and read `highlight` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlights: Option<Vec<String>>,
+    /// Highlight fragments keyed by field name, ES-shaped
+    /// (`"highlight": {"title": ["..."], "body": ["..."]}`), for a request
+    /// that used `highlight.fields`. A requested field the hit lacks, or
+    /// that is not a text field, is left out; no matching field at all
+    /// leaves the map unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    /// Hybrid (RRF) requests only: where this hit ranked in each
+    /// retriever's list. `score` is then the fused RRF score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_details: Option<RankDetails>,
+    /// Reranked requests only: the first-stage score (the RRF score for a
+    /// hybrid request) before reranking. Set on every hit of a reranked
+    /// request, including when the rerank degraded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fused_score: Option<f64>,
+    /// Reranked requests only: the provider's relevance score. `score`
+    /// equals it. Absent when the rerank degraded (`score` is then the
+    /// first-stage score).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f64>,
 }
 
 /// Whether `SearchResult.total_hits` is the exact match count or a capped
@@ -1501,9 +3820,33 @@ pub struct SearchResult {
     /// told a degraded response from a healthy one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knn_degraded_segments: Option<u32>,
-    /// Timing breakdown, present only when the request set `profile`.
+    /// `None` when the request did not ask for a rerank. `Some(true)` when
+    /// the provider timed out or failed and the hits are in first-stage
+    /// order instead; `Some(false)` when the rerank applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile: Option<serde_json::Value>,
+    pub rerank_degraded: Option<bool>,
+    /// Why the rerank degraded (`"timeout after 500 ms"`, a provider
+    /// error). Never contains credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_degraded_reason: Option<String>,
+    /// How a kNN query that carries a filter searched (#252): `"ann"` when
+    /// every segment probed its vector postings, `"exact"` when every
+    /// segment scored each filter-passing document's vector (recall 1.0
+    /// over the filtered set), `"mixed"` when some did each. `None` for a
+    /// query without kNN; `"ann"` for an unfiltered kNN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn_mode: Option<String>,
+    /// For a filtered kNN query, how many documents passed the filter (and
+    /// were not deleted) across the segments searched — the set kNN chose
+    /// from. `None` when the query has no kNN or no filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn_filtered_candidates: Option<u64>,
+    /// Acknowledged-but-unindexed documents this search scored
+    /// exhaustively (#255): the namespace's unindexed tail under
+    /// `consistency: "strong"`, `0` under `"eventual"` or when everything
+    /// was already indexed.
+    #[serde(default)]
+    pub exhaustive_search_count: u64,
 }
 
 // ─── Indexing types ────────────────────────────────────────────────────────
@@ -1524,6 +3867,9 @@ pub struct IndexResponse {
 #[derive(Debug)]
 pub enum KoshaError {
     NamespaceNotFound(NamespaceId),
+    /// An explicit create named a namespace that already exists. Maps to
+    /// HTTP 409.
+    NamespaceExists(NamespaceId),
     ManifestConflict {
         namespace: NamespaceId,
         expected: u64,
@@ -1546,6 +3892,14 @@ pub enum KoshaError {
     /// Transient by construction — callers should retry with backoff, which
     /// the Python `kosha_client` already does. Maps to HTTP 429.
     Overloaded(String),
+    /// The control store (Postgres) could not be reached or returned an
+    /// error. Says nothing about whether a namespace or manifest exists —
+    /// callers that can (query replicas) keep serving their last-known-good
+    /// manifest instead of failing (DESIGN.md §17).
+    ControlPlane(String),
+    /// The request itself is malformed or out of range (e.g. BM25 `b`
+    /// outside `[0, 1]`). A client error: maps to HTTP 400.
+    InvalidQuery(String),
 }
 
 impl std::fmt::Display for KoshaError {
@@ -1554,6 +3908,7 @@ impl std::fmt::Display for KoshaError {
             Self::ManifestConflict { namespace, expected, actual } => write!(f,
                 "manifest conflict for {}: expected version {expected}, actual {actual:?}; stale writer must reload before publishing", namespace.0),
             Self::NamespaceNotFound(id) => write!(f, "namespace not found: {}", id.0),
+            Self::NamespaceExists(id) => write!(f, "namespace already exists: {}", id.0),
             Self::SegmentNotFound(id) => write!(f, "segment not found: {}", id.0),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Serde(e) => write!(f, "serialization error: {e}"),
@@ -1561,6 +3916,8 @@ impl std::fmt::Display for KoshaError {
             Self::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
             Self::CorruptSegment(msg) => write!(f, "corrupt segment data: {msg}"),
             Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
+            Self::ControlPlane(msg) => write!(f, "control plane unavailable: {msg}"),
+            Self::InvalidQuery(msg) => write!(f, "invalid query: {msg}"),
         }
     }
 }
@@ -1734,6 +4091,119 @@ mod filter_clause_parsing {
         }
     }
 
+    fn prefix_of(clause: FilterClause) -> PrefixFilter {
+        match clause {
+            FilterClause::Prefix { prefix } => prefix,
+            other => panic!("expected Prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_short_form_parses_case_sensitive() {
+        let p = prefix_of(parse(r#"{"prefix": {"path": "/matters/2026/"}}"#).unwrap());
+        assert_eq!(
+            p,
+            PrefixFilter {
+                field: "path".into(),
+                value: "/matters/2026/".into(),
+                case_insensitive: false,
+            }
+        );
+    }
+
+    #[test]
+    fn prefix_long_form_parses() {
+        let p = prefix_of(
+            parse(r#"{"prefix": {"sku": {"value": "ab", "case_insensitive": true}}}"#).unwrap(),
+        );
+        assert_eq!(p.field, "sku");
+        assert_eq!(p.value, "ab");
+        assert!(p.case_insensitive);
+        let p = prefix_of(parse(r#"{"prefix": {"sku": {"value": "ab"}}}"#).unwrap());
+        assert!(!p.case_insensitive, "long form defaults to case-sensitive");
+        let p = prefix_of(parse(r#"{"prefix": {"sku": ""}}"#).unwrap());
+        assert_eq!(
+            p.value, "",
+            "an empty prefix is allowed (behaves like exists)"
+        );
+    }
+
+    #[test]
+    fn prefix_round_trips_through_serde() {
+        for json in [
+            r#"{"prefix":{"path":"/a/b/"}}"#,
+            r#"{"prefix":{"sku":{"value":"AB","case_insensitive":true}}}"#,
+            r#"{"bool":{"must":[{"prefix":{"status":"arch"}}],"must_not":[],"should":[],"minimum_should_match":1}}"#,
+        ] {
+            let parsed = parse(json).unwrap();
+            let out = serde_json::to_string(&parsed).unwrap();
+            let expected: serde_json::Value = serde_json::from_str(json).unwrap();
+            let actual: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(actual, expected, "{json} re-serialized as {out}");
+            // And the re-serialized form parses back to the same clause.
+            assert_eq!(serde_json::to_string(&parse(&out).unwrap()).unwrap(), out);
+        }
+        // Long form without the flag normalizes to the short form.
+        let out =
+            serde_json::to_string(&parse(r#"{"prefix": {"p": {"value": "x"}}}"#).unwrap()).unwrap();
+        assert_eq!(out, r#"{"prefix":{"p":"x"}}"#);
+    }
+
+    #[test]
+    fn malformed_prefix_is_rejected_never_match_all() {
+        // Issue #170: each of these must be an error, not a clause that
+        // matches more than was asked for.
+        for (json, needle) in [
+            (r#"{"prefix": {"path": 7}}"#, "must be a string"),
+            (r#"{"prefix": {"path": null}}"#, "must be a string"),
+            (r#"{"prefix": {"path": ["a"]}}"#, "must be a string"),
+            (r#"{"prefix": {"a": "x", "b": "y"}}"#, "exactly one field"),
+            (r#"{"prefix": {}}"#, "no field"),
+            (r#"{"prefix": "path"}"#, "exactly one field"),
+            (r#"{"prefix": null}"#, "exactly one field"),
+            (r#"{"prefix": {"path": {"value": 1}}}"#, "must be a string"),
+            (r#"{"prefix": {"path": {}}}"#, "missing `value`"),
+            (
+                r#"{"prefix": {"path": {"case_insensitive": true}}}"#,
+                "missing `value`",
+            ),
+            (
+                r#"{"prefix": {"path": {"value": "a", "case_insensitive": "yes"}}}"#,
+                "must be a boolean",
+            ),
+            (
+                r#"{"prefix": {"path": {"value": "a", "boost": 2}}}"#,
+                "unknown prefix option `boost`",
+            ),
+            (
+                r#"{"bool": {"must": [{"prefix": {"path": {"value": "a", "rewrite": "x"}}}]}}"#,
+                "unknown prefix option `rewrite`",
+            ),
+        ] {
+            let err = parse(json).expect_err(json);
+            assert!(err.to_string().contains(needle), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn wildcard_filter_hint_points_at_prefix() {
+        let err = parse(r#"{"wildcard": {"a": "b*"}}"#).unwrap_err();
+        assert!(err.to_string().contains("`prefix`"), "{err}");
+    }
+
+    #[test]
+    fn prefix_never_prunes_a_segment_by_bloom() {
+        let blooms = HashMap::from([("path".to_string(), BloomFilter::build(["abc"]))]);
+        // A term on a value the bloom has never seen is pruned...
+        let term = parse(r#"{"term": {"path": "zzz"}}"#).unwrap();
+        assert!(!segment_may_match(&term, Some(&blooms)));
+        // ...but a prefix cannot be answered by an exact-value bloom.
+        let clause = parse(r#"{"prefix": {"path": "zzz"}}"#).unwrap();
+        assert!(segment_may_match(&clause, Some(&blooms)));
+        let clause = parse(r#"{"prefix": {"other": "zzz"}}"#).unwrap();
+        assert!(segment_may_match(&clause, Some(&blooms)));
+    }
+
     #[test]
     fn bool_defaults_are_unchanged() {
         match parse(r#"{"bool": {"must": [{"term": {"a": "b"}}]}}"#).unwrap() {
@@ -1764,6 +4234,75 @@ mod filter_clause_parsing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn highlight(json: serde_json::Value) -> Result<HighlightConfig, String> {
+        serde_json::from_value(json).map_err(|e| e.to_string())
+    }
+
+    /// #195: the ES `fields` map and the legacy `field` form normalise into
+    /// one struct; per-field tags fall back to the top level, then `<b>`.
+    #[test]
+    fn highlight_config_accepts_both_shapes_and_resolves_tags() {
+        // Parsed from text: `json!` would sort the keys.
+        let es: HighlightConfig = serde_json::from_str(
+            r#"{"pre_tags": ["<i>"], "fields": {
+                "title": {},
+                "body": {"pre_tags": ["<em>"], "post_tags": ["</em>"], "fragment_size": 150},
+                "summary": null}}"#,
+        )
+        .unwrap();
+        assert!(!es.legacy_single_field);
+        let names: Vec<_> = es.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["title", "body", "summary"], "request order kept");
+        let tags = |name: &str| {
+            let field = es.fields.iter().find(|f| f.name == name).unwrap();
+            (es.pre_tag(field), es.post_tag(field))
+        };
+        assert_eq!(tags("title"), ("<i>", "</b>"));
+        assert_eq!(tags("body"), ("<em>", "</em>"));
+
+        // ES's ordered array form.
+        let arr = highlight(serde_json::json!({"fields": [{"b": {}}, {"a": {}}]})).unwrap();
+        let names: Vec<_> = arr.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["b", "a"]);
+
+        let legacy = highlight(serde_json::json!({"field": "body", "pre_tags": []})).unwrap();
+        assert!(legacy.legacy_single_field);
+        assert_eq!(legacy.fields, vec![HighlightField::new("body")]);
+        // An empty tag list counts as unset, as it always did.
+        assert_eq!(legacy.pre_tag(&legacy.fields[0]), "<b>");
+
+        let err = highlight(serde_json::json!({"field": "a", "fields": {"b": {}}})).unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        assert!(highlight(serde_json::json!({})).is_err());
+        assert!(highlight(serde_json::json!({"fields": "body"})).is_err());
+        assert!(highlight(serde_json::json!({"fields": [{"a": {}}, {"a": {}}]})).is_err());
+    }
+
+    /// The serialized form deserializes back to the same value (the CLI
+    /// client and the result-cache key both serialize the query), and the
+    /// two shapes serialize differently since they answer differently.
+    #[test]
+    fn highlight_config_serde_round_trips() {
+        for json in [
+            serde_json::json!({"field": "body"}),
+            serde_json::json!({"field": "body", "pre_tags": ["<em>"], "post_tags": ["</em>"]}),
+            serde_json::json!({"fields": {"body": {}}}),
+            serde_json::json!({"pre_tags": ["<i>"], "fields": {"z": {"post_tags": ["]"]}, "a": {}}}),
+        ] {
+            let parsed = highlight(json.clone()).unwrap();
+            let again = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(
+                highlight(again.clone()).unwrap(),
+                parsed,
+                "{json} -> {again}"
+            );
+        }
+        assert_ne!(
+            serde_json::to_string(&HighlightConfig::single_field("body")).unwrap(),
+            serde_json::to_string(&HighlightConfig::for_fields(["body"])).unwrap()
+        );
+    }
 
     #[test]
     fn base64_byte_reads_any_byte_without_decoding_the_rest() {
@@ -1899,6 +4438,13 @@ mod tests {
             format_version: SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: Some(256),
             doc_vectors: false,
+            posting_blobs_raw: false,
+            filter_columns: None,
+            analysis: None,
+            field_index: None,
+            fuzzy_bloom: None,
+            vector_fields: None,
+            multi_vectors: Vec::new(),
         }
     }
 
@@ -1918,6 +4464,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
+            schema: None,
+            retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -2184,5 +4734,582 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod bm25_overrides {
+    //! Issue #247: per-request BM25 parameters.
+    use super::*;
+
+    fn query(json: &str) -> SearchQuery {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn absent_params_defer_to_the_segment() {
+        let q = query(r#"{"query_text": "x"}"#);
+        assert_eq!(q.bm25_params, Bm25Overrides::default());
+        let seg = Bm25Params { k1: 2.0, b: 0.2 };
+        let p = q.bm25_params.resolve(&seg);
+        assert_eq!((p.k1, p.b), (2.0, 0.2));
+    }
+
+    #[test]
+    fn full_and_partial_params_parse() {
+        // The pre-#247 wire shape (both keys) still parses unchanged.
+        let q = query(r#"{"query_text": "x", "bm25_params": {"k1": 1.2, "b": 0.75}}"#);
+        assert_eq!(q.bm25_params, Bm25Overrides::new(1.2, 0.75));
+        let q = query(r#"{"query_text": "x", "bm25_params": {"b": 0.0}}"#);
+        let p = q.bm25_params.resolve(&Bm25Params::default());
+        assert_eq!((p.k1, p.b), (1.2, 0.0));
+    }
+
+    #[test]
+    fn stats_scope_parses_and_defaults() {
+        let q = query(r#"{"query_text": "x"}"#);
+        assert_eq!(q.bm25_params.stats, None);
+        let q = query(r#"{"query_text": "x", "bm25_params": {"stats": "segment"}}"#);
+        assert_eq!(q.bm25_params.stats, Some(Bm25StatsScope::Segment));
+        let q = query(r#"{"query_text": "x", "bm25_params": {"stats": "namespace", "b": 0.5}}"#);
+        assert_eq!(q.bm25_params.stats, Some(Bm25StatsScope::Namespace));
+        assert_eq!(q.bm25_params.b, Some(0.5));
+        assert!(serde_json::from_str::<SearchQuery>(
+            r#"{"query_text": "x", "bm25_params": {"stats": "shard"}}"#
+        )
+        .is_err());
+        assert_eq!(
+            Bm25StatsScope::parse(" Segment "),
+            Some(Bm25StatsScope::Segment)
+        );
+        assert_eq!(Bm25StatsScope::parse("bogus"), None);
+        let v = serde_json::to_value(Bm25Overrides {
+            stats: Some(Bm25StatsScope::Segment),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(v, serde_json::json!({"stats": "segment"}));
+    }
+
+    #[test]
+    fn default_overrides_serialize_empty() {
+        // Keeps result-cache keys and fan-out payloads small, and an older
+        // node reading this falls back to its own 1.2 / 0.75 default.
+        let v = serde_json::to_value(Bm25Overrides::default()).unwrap();
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn ranges_are_validated() {
+        for ok in [
+            Bm25Overrides::default(),
+            Bm25Overrides::new(0.0, 0.0),
+            Bm25Overrides::new(0.0, 1.0),
+            Bm25Overrides::new(1e6, 0.5),
+        ] {
+            assert!(ok.validate().is_ok(), "{ok:?}");
+        }
+        for bad in [
+            Bm25Overrides::new(-1.0, 0.5),
+            Bm25Overrides::new(f64::NAN, 0.5),
+            Bm25Overrides::new(f64::INFINITY, 0.5),
+            Bm25Overrides::new(1.2, -0.1),
+            Bm25Overrides::new(1.2, 1.5),
+            Bm25Overrides {
+                k1: None,
+                b: Some(f64::NAN),
+                stats: None,
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        let q = query(r#"{"query_text": "x", "bm25_params": {"b": 2}}"#);
+        assert!(matches!(q.validate(), Err(KoshaError::InvalidQuery(_))));
+    }
+}
+
+#[cfg(test)]
+mod filter_column_field_tests {
+    //! #244: which filter columns a query reads decides which column files
+    //! a query node hydrates, so a field it misses would be filtered
+    //! against a column that was never fetched.
+    use super::*;
+
+    #[test]
+    fn filter_column_fields_covers_every_clause_that_reads_columns() {
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "x",
+            "filter": {"bool": {
+                "must": [{"term": {"a.keyword": "1"}}],
+                "must_not": [{"range": {"b": {"gte": "2"}}}],
+                "should": [{"exists": {"field": "c"}}, {"terms": {"d": ["e"]}}]}},
+            "knn": {"field": "v", "vector": [1.0], "filter": {"term": {"k": "1"}}},
+            "sort": [{"s": {"order": "asc"}}, {"_score": {"order": "desc"}}, {"_id": {"order": "asc"}}],
+            "collapse": {"field": "g"},
+            "aggs": {
+                "t": {"terms": {"field": "h"}},
+                "c": {"cardinality": {"field": "i"}},
+                "p": {"composite": {"size": 10, "sources": [{"x": {"terms": {"field": "j"}}}]}}
+            }
+        }))
+        .unwrap();
+        let got: Vec<String> = q.filter_column_fields().into_iter().collect();
+        assert_eq!(
+            got,
+            [
+                "a",
+                "a.keyword",
+                "b",
+                "c",
+                "d",
+                "g",
+                "h",
+                "i",
+                "j",
+                "k",
+                "s"
+            ]
+        );
+        let plain: SearchQuery =
+            serde_json::from_value(serde_json::json!({"query_text": "x"})).unwrap();
+        assert!(plain.filter_column_fields().is_empty());
+    }
+
+    /// `limit_per`, `rank_by` and `geo_distance` read filter columns too:
+    /// a query node that hydrated only the columns this set names must
+    /// still hold them, or they would silently read as absent.
+    #[test]
+    fn filter_column_fields_covers_limit_per_rank_by_and_geo() {
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "x",
+            "filter": {"geo_distance": {"distance": "10km", "loc": "0,0"}},
+            "limit_per": {"field": "author.keyword", "max": 1},
+            "rank_by": {"functions": [
+                {"field_value": {"field": "votes", "modifier": "log1p"}},
+                {"decay": {"field": "published", "function": "exp",
+                           "origin": "2026-01-01", "scale": "30d"}}
+            ]}
+        }))
+        .unwrap();
+        assert!(q.needs_filter_columns());
+        let got: Vec<String> = q.filter_column_fields().into_iter().collect();
+        assert_eq!(
+            got,
+            ["author", "author.keyword", "loc", "published", "votes"]
+        );
+    }
+
+    #[test]
+    fn column_file_names() {
+        assert_eq!(filter_column_file_name(7), "filters-007.col");
+        assert_eq!(filter_column_file_name(1234), "filters-1234.col");
+        for yes in ["filters.toc", "filters-000.col", "filters-1234.col"] {
+            assert!(is_filter_column_file(yes), "{yes}");
+        }
+        for no in [
+            "filters.bin",
+            "filters-.col",
+            "filters-a1.col",
+            "filters-001.col.tmp",
+        ] {
+            assert!(!is_filter_column_file(no), "{no}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod aggregation_parsing {
+    //! Issues #196 / #218 / #202: aggregations parse by their single type
+    //! key, so a misspelled or unsupported type is an error, the existing
+    //! JSON of `terms` / `cardinality` / `composite` is unchanged, and only
+    //! metric aggregations nest under a bucket aggregation.
+    use super::*;
+    use std::collections::HashMap;
+
+    fn parse(s: &str) -> Result<Aggregation, serde_json::Error> {
+        serde_json::from_str(s)
+    }
+
+    #[test]
+    fn existing_bucket_aggregations_round_trip_byte_for_byte() {
+        for json in [
+            r#"{"terms":{"field":"documentId","size":1000}}"#,
+            r#"{"cardinality":{"field":"documentId","precision_threshold":40000}}"#,
+            r#"{"composite":{"size":2,"sources":[{"label":{"terms":{"field":"color"}}}],"after":{"label":"x"}}}"#,
+            r#"{"composite":{"size":2,"sources":[{"label":{"terms":{"field":"color"}}}]}}"#,
+        ] {
+            let agg = parse(json).unwrap();
+            assert_eq!(serde_json::to_string(&agg).unwrap(), json);
+        }
+        // Defaults still apply.
+        let Aggregation::Terms { terms, aggs } = parse(r#"{"terms":{"field":"f"}}"#).unwrap()
+        else {
+            panic!("expected terms");
+        };
+        assert_eq!(terms.size, 10);
+        assert!(aggs.is_none());
+    }
+
+    #[test]
+    fn metric_aggregations_parse_and_round_trip() {
+        for (json, kind) in [
+            (r#"{"min":{"field":"price"}}"#, MetricKind::Min),
+            (r#"{"max":{"field":"price"}}"#, MetricKind::Max),
+            (r#"{"sum":{"field":"price"}}"#, MetricKind::Sum),
+            (r#"{"avg":{"field":"price"}}"#, MetricKind::Avg),
+            (
+                r#"{"value_count":{"field":"price"}}"#,
+                MetricKind::ValueCount,
+            ),
+        ] {
+            let agg = parse(json).unwrap();
+            let (parsed_kind, metric) = agg.metric().unwrap();
+            assert_eq!(parsed_kind, kind);
+            assert_eq!(metric.field, "price");
+            assert_eq!(agg.type_name(), kind.name());
+            assert_eq!(serde_json::to_string(&agg).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn unknown_or_misspelled_types_are_rejected_with_the_valid_list() {
+        for (json, needle) in [
+            (
+                r#"{"stats":{"field":"price"}}"#,
+                "unknown aggregation type `stats`",
+            ),
+            (r#"{"average":{"field":"price"}}"#, "did you mean `avg`"),
+            (
+                r#"{"term":{"field":"price"}}"#,
+                "unknown aggregation type `term`",
+            ),
+            (r#"{}"#, "aggregation has no type"),
+            (r#"[]"#, "must be a JSON object"),
+        ] {
+            let err = parse(json).unwrap_err().to_string();
+            assert!(err.contains(needle), "{json}: {err}");
+            if needle.starts_with("unknown") || needle.starts_with("did") {
+                assert!(err.contains("value_count"), "{json}: {err}");
+            }
+        }
+        let err = parse(r#"{"min":{"field":"a"},"max":{"field":"a"}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exactly one type"), "{err}");
+        let err = parse(r#"{"min":{"field":"a","missing":0}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("in `min` aggregation"), "{err}");
+    }
+
+    #[test]
+    fn metric_sub_aggregations_nest_under_terms_and_composite() {
+        let agg =
+            parse(r#"{"terms":{"field":"category"},"aggs":{"total":{"sum":{"field":"amount"}}}}"#)
+                .unwrap();
+        let subs = agg.sub_aggregations().unwrap();
+        assert_eq!(subs["total"].metric().unwrap().0, MetricKind::Sum);
+        let json = serde_json::to_value(&agg).unwrap();
+        assert_eq!(json["aggs"]["total"]["sum"]["field"], "amount");
+
+        let agg = parse(
+            r#"{"composite":{"size":5,"sources":[{"c":{"terms":{"field":"category"}}}]},
+                "aggregations":{"avg_amount":{"avg":{"field":"amount"}}}}"#,
+        )
+        .unwrap();
+        assert!(agg.sub_aggregations().unwrap().contains_key("avg_amount"));
+    }
+
+    #[test]
+    fn nested_bucket_aggregations_and_misplaced_aggs_are_rejected() {
+        let err = parse(r#"{"terms":{"field":"a"},"aggs":{"inner":{"terms":{"field":"b"}}}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only metric aggregations"), "{err}");
+        let err = parse(r#"{"min":{"field":"a"},"aggs":{"x":{"max":{"field":"b"}}}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot have sub-aggregations"), "{err}");
+        let err = parse(r#"{"terms":{"field":"a"},"aggs":{},"aggregations":{}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("both `aggs` and `aggregations`"), "{err}");
+        let err = parse(r#"{"terms":{"field":"a"},"aggs":{"x":{"bogus":{}}}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown aggregation type `bogus`"), "{err}");
+    }
+
+    #[test]
+    fn search_query_validate_rejects_nested_buckets_built_in_code() {
+        let mut query: SearchQuery = serde_json::from_str(r#"{"query_text":""}"#).unwrap();
+        query.aggs.insert(
+            "outer".into(),
+            Aggregation::Terms {
+                terms: AggTerms {
+                    field: "a".into(),
+                    size: 10,
+                },
+                aggs: Some(HashMap::from([(
+                    "inner".into(),
+                    Aggregation::Cardinality {
+                        cardinality: AggCardinality {
+                            field: "b".into(),
+                            precision_threshold: 10,
+                        },
+                    },
+                )])),
+            },
+        );
+        assert!(query.validate().is_err());
+    }
+
+    #[test]
+    fn histogram_aggregations_parse_round_trip_and_take_metric_sub_aggs() {
+        for json in [
+            r#"{"histogram":{"field":"bytes","interval":1024.0}}"#,
+            r#"{"histogram":{"field":"bytes","interval":0.5,"offset":-3.0,"min_doc_count":1}}"#,
+            r#"{"date_histogram":{"field":"sentAt","fixed_interval":"1h"}}"#,
+            r#"{"date_histogram":{"field":"sentAt","calendar_interval":"1w","offset":"+6h","min_doc_count":2}}"#,
+            r#"{"date_histogram":{"field":"sentAt","fixed_interval":"30s","offset":1500}}"#,
+        ] {
+            let agg = parse(json).unwrap();
+            assert_eq!(serde_json::to_string(&agg).unwrap(), json);
+            assert!(agg.validate("x").is_ok());
+        }
+        let agg = parse(r#"{"histogram":{"field":"bytes","interval":1024}}"#).unwrap();
+        assert_eq!(agg.type_name(), "histogram");
+        let Aggregation::Histogram { histogram, .. } = &agg else {
+            panic!("expected histogram");
+        };
+        assert_eq!((histogram.offset, histogram.min_doc_count), (0.0, 0));
+
+        let agg = parse(
+            r#"{"date_histogram":{"field":"sentAt","fixed_interval":"1d"},
+                "aggs":{"total":{"sum":{"field":"amount"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(agg.type_name(), "date_histogram");
+        assert!(agg.sub_aggregations().unwrap().contains_key("total"));
+        let err = parse(
+            r#"{"histogram":{"field":"b","interval":1},"aggs":{"x":{"histogram":{"field":"b","interval":1}}}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only metric aggregations"), "{err}");
+    }
+
+    #[test]
+    fn histogram_aggregations_reject_garbage() {
+        for (json, needle) in [
+            (
+                r#"{"histogram":{"field":"b","interval":0}}"#,
+                "greater than 0",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":-5}}"#,
+                "greater than 0",
+            ),
+            (r#"{"histogram":{"field":"b"}}"#, "missing field `interval`"),
+            (
+                r#"{"histogram":{"field":"b","interval":"1h"}}"#,
+                "in `histogram` aggregation",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"min_doc_count":-1}}"#,
+                "in `histogram` aggregation",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"extended_bounds":{"min":0,"max":9}}}"#,
+                "`extended_bounds` is not supported yet",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"hard_bounds":{"min":0,"max":9}}}"#,
+                "`hard_bounds` is not supported yet",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"bogus":1}}"#,
+                "unknown field `bogus`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1 banana"}}"#,
+                "invalid `fixed_interval` \"1 banana\"",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"0h"}}"#,
+                "greater than 0",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"-1h"}}"#,
+                "fixed_interval",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":0}}"#,
+                "in `date_histogram` aggregation",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","calendar_interval":"1M"}}"#,
+                "use `fixed_interval`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","calendar_interval":"1y"}}"#,
+                "use `fixed_interval`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","calendar_interval":"1q"}}"#,
+                "use `fixed_interval`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t"}}"#,
+                "needs `fixed_interval`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","interval":"1h"}}"#,
+                "use `fixed_interval`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","time_zone":"Europe/Paris"}}"#,
+                "`time_zone` is not supported yet",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","offset":"soon"}}"#,
+                "invalid `date_histogram` `offset`",
+            ),
+        ] {
+            let err = parse(json).unwrap_err().to_string();
+            assert!(err.contains(needle), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn bucket_sub_results_serialize_inline_and_round_trip() {
+        let bucket = AggBucket {
+            key: "k".into(),
+            doc_count: 2,
+            sub_aggregations: std::collections::BTreeMap::from([(
+                "total".to_string(),
+                serde_json::json!({"value": 3.5}),
+            )]),
+        };
+        let json = serde_json::to_value(&bucket).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"key":"k","doc_count":2,"total":{"value":3.5}})
+        );
+        let back: AggBucket = serde_json::from_value(json).unwrap();
+        assert_eq!(back.sub_aggregations["total"]["value"], 3.5);
+        // No sub-aggregations: the historical shape exactly.
+        let plain = AggBucket {
+            key: "k".into(),
+            doc_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"key":"k","doc_count":2}"#
+        );
+    }
+}
+
+#[cfg(test)]
+mod rerank_spec {
+    //! Issue #251: request-level checks and the first-stage query.
+    use super::*;
+
+    fn query(json: &str) -> SearchQuery {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn defaults_and_first_stage_query() {
+        let q = query(
+            r#"{"query_text": "breach", "from": 5, "max_results": 5,
+                "source_includes": ["title"], "source_excludes": ["body", "emb"],
+                "rerank": {"provider": "cohere", "field": "body"}}"#,
+        );
+        assert!(q.validate().is_ok());
+        assert_eq!(q.rerank_top_n(), Some(10));
+        assert_eq!(q.rerank_query_text(), Some("breach"));
+        let first = q.first_stage_query().unwrap();
+        assert!(first.rerank.is_none());
+        assert_eq!((first.from, first.max_results), (0, 10));
+        // The field is fetched for the reranker even when the caller's
+        // source filter drops it.
+        assert_eq!(first.source_includes.unwrap(), vec!["title", "body"]);
+        assert_eq!(first.source_excludes.unwrap(), vec!["emb"]);
+        assert!(query(r#"{"query_text": "x"}"#)
+            .first_stage_query()
+            .is_none());
+    }
+
+    #[test]
+    fn rerank_query_text_falls_back_to_phrase_then_needs_explicit_text() {
+        let q = query(
+            r#"{"query_text": "", "match_phrase": {"field": "t", "phrase": "material breach"},
+                "rerank": {"provider": "p", "field": "t"}}"#,
+        );
+        assert_eq!(q.rerank_query_text(), Some("material breach"));
+        let q = query(
+            r#"{"query_text": "", "knn": {"field": "e", "vector": [1.0]},
+                "rerank": {"provider": "p", "field": "t"}}"#,
+        );
+        assert!(matches!(q.validate(), Err(KoshaError::InvalidQuery(_))));
+        let q = query(
+            r#"{"query_text": "", "knn": {"field": "e", "vector": [1.0]},
+                "rerank": {"provider": "p", "field": "t", "query": "termination"}}"#,
+        );
+        assert!(q.validate().is_ok());
+        assert_eq!(q.rerank_query_text(), Some("termination"));
+    }
+
+    #[test]
+    fn invalid_rerank_requests_are_rejected() {
+        for bad in [
+            r#""rerank": {"provider": "", "field": "t"}"#,
+            r#""rerank": {"provider": "p", "field": ""}"#,
+            r#""rerank": {"provider": "p", "field": "t", "model": " "}"#,
+            r#""rerank": {"provider": "p", "field": "t", "top_n": 0}"#,
+            r#""rerank": {"provider": "p", "field": "t", "top_n": 5}"#,
+            r#""rerank": {"provider": "p", "field": "t", "top_n": 1001}"#,
+            r#""rerank": {"provider": "p", "field": "t", "timeout_ms": 0}"#,
+            r#""rerank": {"provider": "p", "field": "t", "timeout_ms": 60001}"#,
+            r#""rerank": {"provider": "p", "field": "t"}, "sort": [{"date": {"order": "asc"}}]"#,
+            r#""rerank": {"provider": "p", "field": "t"}, "search_after": ["a"]"#,
+            r#""rerank": {"provider": "p", "field": "t", "top_n": 50},
+               "knn": {"field": "e", "vector": [1.0]},
+               "rank": {"rrf": {"rank_window_size": 20}}"#,
+        ] {
+            let q = query(&format!(
+                r#"{{"query_text": "x", "max_results": 10, {bad}}}"#
+            ));
+            assert!(
+                matches!(q.validate(), Err(KoshaError::InvalidQuery(_))),
+                "{bad}"
+            );
+        }
+        // Unknown keys are a parse error (400), not silently ignored.
+        assert!(serde_json::from_str::<SearchQuery>(
+            r#"{"query_text": "x", "rerank": {"provider": "p", "field": "t", "topn": 5}}"#
+        )
+        .is_err());
+        let ok = query(
+            r#"{"query_text": "x", "max_results": 10,
+                "knn": {"field": "e", "vector": [1.0]},
+                "rank": {"rrf": {"rank_window_size": 50}},
+                "rerank": {"provider": "p", "field": "t", "top_n": 50, "timeout_ms": 60000}}"#,
+        );
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn absent_rerank_serializes_as_before() {
+        // A request without rerank keeps its pre-#251 JSON, so existing
+        // result-cache keys and fan-out payloads are unchanged.
+        let v = serde_json::to_value(query(r#"{"query_text": "x"}"#)).unwrap();
+        assert!(v.get("rerank").is_none());
+        let hit: ScoredDocument =
+            serde_json::from_str(r#"{"doc_id": "a", "score": 1.0, "fields": []}"#).unwrap();
+        let v = serde_json::to_value(hit).unwrap();
+        assert!(v.get("fused_score").is_none() && v.get("rerank_score").is_none());
     }
 }

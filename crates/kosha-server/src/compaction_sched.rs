@@ -125,6 +125,23 @@ pub struct PassOutcome {
     /// Segments the pass wanted but could not hydrate; they were left
     /// unmerged.
     pub not_hydrated: Vec<String>,
+    /// Merge groups published by this pass. A `tiered` pass merges at most
+    /// one; a `full` pass loops group by group until nothing more fits
+    /// under the cap (#242).
+    pub groups: usize,
+    /// Bytes downloaded to local disk to hydrate merge inputs.
+    pub bytes_hydrated: u64,
+    /// Bytes of superseded input segments removed from local disk after
+    /// their merge published.
+    pub bytes_evicted: u64,
+    /// Largest local working set of any one group: its hydrated inputs plus
+    /// its merged output, both on disk at once just before eviction. Under
+    /// a cap this stays at about `2 x max_segment_bytes`, independent of
+    /// namespace size.
+    pub peak_local_bytes: u64,
+    /// Merged inputs whose local copy was kept (a pin from an in-flight
+    /// hydration or warmup, or still referenced by the manifest).
+    pub not_evicted: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -142,6 +159,10 @@ pub struct JobRecord {
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<PassOutcome>,
+    /// What a running pass has done so far, updated after every published
+    /// merge group. Cleared once the job finishes (see `result`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<PassOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip)]
@@ -154,6 +175,12 @@ pub struct NamespaceStats {
     pub passes: u64,
     pub merges: u64,
     pub segments_merged_total: u64,
+    /// Bytes hydrated / evicted by every pass on this namespace.
+    pub bytes_hydrated_total: u64,
+    pub bytes_evicted_total: u64,
+    /// `peak_local_bytes` of the last successful pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_peak_local_bytes: Option<u64>,
     pub failures: u64,
     pub consecutive_failures: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -247,6 +274,7 @@ impl CompactionRegistry {
                 finished_at_ms: None,
                 duration_ms: None,
                 result: None,
+                progress: None,
                 error: None,
                 started: Some(now),
             },
@@ -292,6 +320,7 @@ impl CompactionRegistry {
                 job.error = Some(error.clone());
             }
         }
+        job.progress = None;
         let finished_at_ms = job.finished_at_ms;
         inner.running = inner.running.saturating_sub(1);
         inner.finished.push_back(job_id.to_string());
@@ -314,6 +343,9 @@ impl CompactionRegistry {
                 stats.consecutive_failures = 0;
                 stats.retry_after = None;
                 stats.last_error = None;
+                stats.bytes_hydrated_total += result.bytes_hydrated;
+                stats.bytes_evicted_total += result.bytes_evicted;
+                stats.last_peak_local_bytes = Some(result.peak_local_bytes);
                 if result.merged {
                     stats.merges += 1;
                     stats.segments_merged_total += result.segments_merged as u64;
@@ -331,6 +363,17 @@ impl CompactionRegistry {
                     .saturating_mul(1u32 << shift)
                     .min(MAX_FAILURE_BACKOFF);
                 stats.retry_after = Some(now + backoff);
+            }
+        }
+    }
+
+    /// Record a running job's progress (after each published merge group).
+    /// Ignored once the job has finished.
+    pub fn progress(&self, job_id: &str, progress: &PassOutcome) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(job) = inner.jobs.get_mut(job_id) {
+            if job.state == JobState::Running {
+                job.progress = Some(progress.clone());
             }
         }
     }
@@ -457,6 +500,11 @@ mod tests {
             segments_merged: n,
             max_segment_bytes: 0,
             not_hydrated: Vec::new(),
+            groups: 1,
+            bytes_hydrated: 100,
+            bytes_evicted: 90,
+            peak_local_bytes: 200,
+            not_evicted: Vec::new(),
         }
     }
 
@@ -468,6 +516,11 @@ mod tests {
             segments_merged: 0,
             max_segment_bytes: 0,
             not_hydrated: Vec::new(),
+            groups: 0,
+            bytes_hydrated: 0,
+            bytes_evicted: 0,
+            peak_local_bytes: 0,
+            not_evicted: Vec::new(),
         }
     }
 
@@ -623,7 +676,13 @@ mod tests {
             .try_start(&ns("a"), "tiered", Trigger::Scheduler, now)
             .unwrap();
         assert_eq!(r.job(&ok).unwrap().state, JobState::Running);
+        r.progress(&ok, &merged(3));
+        let running = serde_json::to_value(r.job(&ok).unwrap()).unwrap();
+        assert_eq!(running["progress"]["segments_merged"], 3);
+        assert_eq!(running["progress"]["peak_local_bytes"], 200);
         r.finish(&ok, Ok(merged(8)), 2, now + Duration::from_millis(1500));
+        r.progress(&ok, &merged(1));
+        assert!(r.job(&ok).unwrap().progress.is_none(), "cleared on finish");
         let rec = r.job(&ok).unwrap();
         assert_eq!(rec.state, JobState::Succeeded);
         assert_eq!(rec.duration_ms, Some(1500));
@@ -641,6 +700,15 @@ mod tests {
         assert_eq!(status["namespaces"][0]["segments"], 33);
         assert_eq!(status["namespaces"][0]["stats"]["merges"], 1);
         assert_eq!(status["namespaces"][0]["stats"]["segments_merged_total"], 8);
+        assert_eq!(
+            status["namespaces"][0]["stats"]["bytes_hydrated_total"],
+            100
+        );
+        assert_eq!(status["namespaces"][0]["stats"]["bytes_evicted_total"], 90);
+        assert_eq!(
+            status["namespaces"][0]["stats"]["last_peak_local_bytes"],
+            200
+        );
         assert_eq!(status["recent_jobs"].as_array().unwrap().len(), 2);
     }
 

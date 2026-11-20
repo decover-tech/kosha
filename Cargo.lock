@@ -790,6 +790,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19c9f1dde76b736e3681f28cec9d5a61299cbaae0fce80a68e43724ad56031eb"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -806,6 +815,16 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "clap_mangen"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d82842b45bf9f6a3be090dd860095ac30728042c08e0d6261ca7259b5d850f07"
+dependencies = [
+ "clap",
+ "roff",
+]
 
 [[package]]
 name = "cmake"
@@ -2001,6 +2020,8 @@ name = "kosha-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "clap_complete",
+ "clap_mangen",
  "dirs",
  "kosha-core",
  "reqwest",
@@ -2041,6 +2062,7 @@ dependencies = [
  "instant-distance",
  "kosha-core",
  "kosha-segment",
+ "kosha-write",
  "rayon",
  "serde",
  "serde_json",
@@ -2051,11 +2073,15 @@ name = "kosha-segment"
 version = "0.1.0"
 dependencies = [
  "cap",
+ "crc32fast",
  "instant-distance",
  "kosha-core",
  "kosha-vector-spfresh",
+ "roaring",
+ "rust-stemmers",
  "serde",
  "serde_json",
+ "unicode-segmentation",
  "zstd",
 ]
 
@@ -2098,7 +2124,9 @@ name = "kosha-write"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "criterion",
  "kosha-core",
+ "kosha-query",
  "kosha-segment",
  "serde",
  "serde_json",
@@ -2784,6 +2812,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "roff"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
+
+[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2801,6 +2835,16 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rust-stemmers"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
+dependencies = [
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -3793,6 +3837,12 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "untrusted"

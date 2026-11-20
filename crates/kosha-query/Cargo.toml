@@ -18,6 +18,9 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 cap = "0.1.2"
+# Test-only, one-directional (kosha-write never depends on kosha-query):
+# tests/lire_compaction_recall.rs compacts through the real Indexer.
+kosha-write = { path = "../kosha-write" }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
@@ -58,4 +61,24 @@ harness = false
 
 [[bench]]
 name = "knn_open_search"
+harness = false
+
+[[bench]]
+name = "filter_eval_1m"
+harness = false
+
+[[bench]]
+name = "field_bm25"
+harness = false
+
+[[bench]]
+name = "fuzzy_expansion"
+harness = false
+
+[[bench]]
+name = "filtered_knn"
+harness = false
+
+[[bench]]
+name = "late_interaction"
 harness = false

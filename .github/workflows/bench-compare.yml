@@ -100,6 +100,12 @@ jobs:
           KOSHA_BENCH_WARM_ITERS: "200"
         run: |
           set -euo pipefail
+          # The baseline was built later into the same target dir, so its
+          # outputs are newer than the head checkout's sources: cargo's
+          # mtime fingerprint would reuse the base's build of any workspace
+          # crate whose dependencies did not change. Make head's sources
+          # newer so every changed crate is rebuilt.
+          find crates -name '*.rs' -exec touch {} +
           KOSHA_BENCH_JSON="$RUNNER_TEMP/head.json" \
             cargo bench -p kosha-query --bench segment_memory
 

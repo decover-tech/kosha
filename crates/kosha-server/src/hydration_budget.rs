@@ -152,36 +152,6 @@ pub struct RequestHydration {
     ceiling: u64,
     shed: AtomicBool,
     wait_micros: AtomicU64,
-    /// Wall time spent inside fetch batches for this request.
-    fetch_micros: AtomicU64,
-    /// What this request made local, by kind of file: (files, bytes).
-    /// Written once per fetch batch, read once when a profile is built.
-    fetched_by_kind: std::sync::Mutex<std::collections::BTreeMap<&'static str, (u64, u64)>>,
-}
-
-/// The kind of segment file a name denotes, for the search profile. The
-/// kinds are what a reader of the profile needs to tell apart: a search that
-/// spent its time fetching posting shards is a first-seen term; one that
-/// fetched document bodies is a first-seen page.
-pub fn file_kind(name: &str) -> &'static str {
-    let name = name.rsplit('/').next().unwrap_or(name);
-    if name.starts_with("postings") {
-        "posting_shards"
-    } else if name == "filters.bin" {
-        "filter_columns"
-    } else if name == "doc_store.bin" {
-        "document_bodies"
-    } else if name == "doc_store.offsets" {
-        "document_offsets"
-    } else if name.starts_with("vector.") {
-        "vector_index"
-    } else if name == "inverted.idx" {
-        "term_table"
-    } else if name == "footer.json" {
-        "footers"
-    } else {
-        "other"
-    }
 }
 
 impl RequestHydration {
@@ -191,8 +161,6 @@ impl RequestHydration {
             ceiling,
             shed: AtomicBool::new(false),
             wait_micros: AtomicU64::new(0),
-            fetch_micros: AtomicU64::new(0),
-            fetched_by_kind: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -258,42 +226,6 @@ impl RequestHydration {
 
     pub fn fetched_bytes(&self) -> u64 {
         self.fetched_bytes.load(Ordering::Relaxed)
-    }
-
-    /// Record one fetch batch: how long it took and what it made local.
-    pub fn record_fetch(&self, took: Duration, landed: &[(&'static str, u64)]) {
-        self.fetch_micros
-            .fetch_add(took.as_micros() as u64, Ordering::Relaxed);
-        if landed.is_empty() {
-            return;
-        }
-        let mut by_kind = self.fetched_by_kind.lock().unwrap();
-        for (kind, bytes) in landed {
-            let entry = by_kind.entry(kind).or_insert((0, 0));
-            entry.0 += 1;
-            entry.1 += bytes;
-        }
-    }
-
-    pub fn fetch_ms(&self) -> f64 {
-        self.fetch_micros.load(Ordering::Relaxed) as f64 / 1e3
-    }
-
-    /// `{kind: {"files": n, "bytes": n}}` for everything this request made
-    /// local.
-    pub fn fetched_by_kind_json(&self) -> serde_json::Value {
-        let by_kind = self.fetched_by_kind.lock().unwrap();
-        serde_json::Value::Object(
-            by_kind
-                .iter()
-                .map(|(kind, (files, bytes))| {
-                    (
-                        kind.to_string(),
-                        serde_json::json!({"files": files, "bytes": bytes}),
-                    )
-                })
-                .collect(),
-        )
     }
 }
 

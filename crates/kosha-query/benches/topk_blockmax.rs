@@ -23,6 +23,8 @@
 //! # bigger corpus:
 //! KOSHA_BENCH_SEGS=8 KOSHA_BENCH_DOCS=2000 \
 //!   cargo bench -p kosha-query --bench topk_blockmax
+//! # the namespace-wide top-k floor A/B at the end (issue #248):
+//! KOSHA_BENCH_SEGS=200 KOSHA_BENCH_DOCS=3000 cargo bench -p kosha-query --bench topk_blockmax
 //! ```
 
 use std::collections::HashMap;
@@ -121,6 +123,10 @@ fn build_corpus(
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        branch: None,
+        schema: None,
+        retired: Default::default(),
+        shards: None,
     }
 }
 
@@ -129,13 +135,14 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         query_text: text.into(),
         max_results: topk,
         from: 0,
-        bm25_params: Bm25Params::default(),
+        bm25_params: Default::default(),
         filter: None,
         sort: vec![],
         search_after: None,
         highlight: None,
         aggs: HashMap::new(),
         wildcard: None,
+        fuzzy: None,
         match_phrase: None,
         knn: None,
         // This bench's entire point is the exact-count invariant across
@@ -145,9 +152,14 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         operator: None,
         no_cache: None,
         collapse: None,
+        limit_per: None,
+        rank_by: None,
         source_includes: None,
         source_excludes: None,
-        profile: None,
+        rank: None,
+        mode: None,
+        fields: Vec::new(),
+        rerank: None,
     }
 }
 
@@ -496,6 +508,113 @@ fn main() {
             );
         } else {
             println!("    ✓ total_hits identical across probe orders");
+        }
+    }
+
+    // ── Namespace-wide top-k floor A/B (issue #248) ─────────────────────
+    //
+    // Same corpus, same queries, same WAND paths; the only switch is
+    // whether segments share one top-k floor and are visited best-ceiling
+    // first (`on`, the default) or each prunes against its own k-th-best
+    // score only (`off`, the pre-#248 behavior). Pages must be identical.
+    // Reported: docs actually scored (summed over segments), segments
+    // skipped outright, and p50/p99 of end-to-end wall and of the scoring
+    // phase over `KOSHA_BENCH_GLOBAL_ITERS` warm runs. Run on a 200+
+    // segment namespace for the #248 acceptance numbers:
+    //   KOSHA_BENCH_SEGS=200 KOSHA_BENCH_DOCS=3000 \
+    //     cargo bench -p kosha-query --bench topk_blockmax
+    let global_iters = env_usize("KOSHA_BENCH_GLOBAL_ITERS", 60);
+    let pct = |samples: &[f64], p: f64| -> f64 {
+        let mut v = samples.to_vec();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[((v.len() as f64 - 1.0) * p).round() as usize]
+    };
+    let mk_capped = |text: &str, or: bool| {
+        let mut q = mk_query(text, topk);
+        q.exact_total_hits = Some(false);
+        if or {
+            q.operator = Some(kosha_core::QueryOperator::Or);
+        }
+        q
+    };
+    let global_cases: Vec<(&str, SearchQuery)> = vec![
+        ("\"the\" exact", mk_query("the", topk)),
+        ("\"contract\" exact", mk_query("contract", topk)),
+        ("\"the contract\" AND exact", mk_query(mt_text, topk)),
+        ("\"the contract\" AND capped", mk_capped(mt_text, false)),
+        ("\"the contract\" OR capped", mk_capped(mt_text, true)),
+        ("\"dispute w20\" OR capped", mk_capped("dispute w20", true)),
+    ];
+    // Two manifests over the same segments: this bench's, which carries
+    // no footers (every search reads each segment's `footer.json` from
+    // disk for its bloom checks, a fixed per-segment cost that dilutes
+    // any scoring difference), and one carrying every footer, as a
+    // production manifest does once its footers are cached.
+    let mut manifest_with_footers = manifest.clone();
+    for entry in &manifest.segments {
+        let footer =
+            kosha_segment::SegmentReader::read_footer(&work.join(&ns.0).join(&entry.segment_id.0))
+                .unwrap();
+        manifest_with_footers.remember_segment_footer(footer);
+    }
+    for (manifest_label, manifest) in [
+        ("footers read from disk", &manifest),
+        ("footers carried by the manifest", &manifest_with_footers),
+    ] {
+        println!();
+        println!(
+        "  Namespace-wide top-k floor A/B ({segs} segments, topk={topk}, {global_iters} warm runs each, {manifest_label}):"
+    );
+        for (label, q) in &global_cases {
+            let mut summary = Vec::new();
+            let mut pages = Vec::new();
+            for enabled in [false, true] {
+                searcher.set_global_wand_threshold(enabled);
+                let _ = searcher.search_with_stats(&ns, manifest, q, None).unwrap();
+                let mut walls = Vec::with_capacity(global_iters);
+                let mut scores = Vec::with_capacity(global_iters);
+                let mut bounds = Vec::with_capacity(global_iters);
+                let mut scored = 0usize;
+                let mut skipped = 0usize;
+                let mut page = Vec::new();
+                for _ in 0..global_iters {
+                    let t = Instant::now();
+                    let (r, stats) = searcher.search_with_stats(&ns, manifest, q, None).unwrap();
+                    walls.push(t.elapsed().as_secs_f64() * 1e3);
+                    scores.push(stats.score_wall_ms);
+                    scored = stats.wand_docs_scored;
+                    bounds.push(stats.wand_bounds_ms);
+                    skipped = stats.wand_segments_skipped;
+                    page = r
+                        .results
+                        .iter()
+                        .map(|d| (d.doc_id.0.clone(), d.score.to_bits()))
+                        .collect::<Vec<_>>();
+                    black_box(r.total_hits);
+                }
+                pages.push(page);
+                summary.push((enabled, scored, skipped, walls, scores, bounds));
+            }
+            searcher.set_global_wand_threshold(true);
+            println!("    {label}:");
+            for (enabled, scored, skipped, walls, scores, bounds) in &summary {
+                println!(
+                "      {}: docs scored {:>8} | segs skipped {:>4} | wall p50 {:>6.2} ms p99 {:>6.2} ms | score p50 {:>6.2} ms p99 {:>6.2} ms | ceiling pass p50 {:>5.2} ms",
+                if *enabled { "shared floor   " } else { "per-segment    " },
+                scored,
+                skipped,
+                pct(walls, 0.5),
+                pct(walls, 0.99),
+                pct(scores, 0.5),
+                pct(scores, 0.99),
+                pct(bounds, 0.5),
+            );
+            }
+            if pages[0] == pages[1] {
+                println!("      ✓ identical page (ids and score bits)");
+            } else {
+                println!("      ✗ BUG: pages differ between shared and per-segment floors");
+            }
         }
     }
 
