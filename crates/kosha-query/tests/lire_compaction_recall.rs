@@ -153,6 +153,8 @@ fn compacted_recall(mode: VectorCompactionMode, data_seed: u64, queries: &[Vec<f
         // `KOSHA_KNN_BUDGET_FRACTION` (5%) of all centroids — the same
         // relative cost for both indexes.
         query.knn = Some(KnnQuery {
+            query_text: None,
+            embedding_model: None,
             field: "emb".into(),
             vector: q.clone(),
             k: 10,
