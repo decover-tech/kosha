@@ -343,6 +343,8 @@ pub(crate) mod tests {
             knn_degraded_segments: None,
             rerank_degraded: None,
             rerank_degraded_reason: None,
+            knn_mode: None,
+            knn_filtered_candidates: None,
         }
     }
 

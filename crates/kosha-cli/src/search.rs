@@ -574,6 +574,8 @@ mod tests {
             knn_degraded_segments: None,
             rerank_degraded: Default::default(),
             rerank_degraded_reason: Default::default(),
+            knn_mode: None,
+            knn_filtered_candidates: None,
         }
     }
 

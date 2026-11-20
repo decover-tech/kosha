@@ -71,3 +71,7 @@ harness = false
 [[bench]]
 name = "fuzzy_expansion"
 harness = false
+
+[[bench]]
+name = "filtered_knn"
+harness = false

@@ -367,7 +367,7 @@ struct AppState {
     /// bytes are fast to open but nothing has opened them yet — the first
     /// wave of real kNN queries still pays for every first-touch
     /// `open_segment` itself, which at corpus scale (every segment, on
-    /// every query — see `global_probe_cutoff`) reproduces the same
+    /// every query — see `knn_plan`) reproduces the same
     /// cold-start convoy this field's sibling exists to prevent. Its own
     /// flag rather than folding into `warmup_posting_blobs`: this phase
     /// mutates the *live* `segment_cache`/`MemoryLedger` that concurrent
@@ -8639,7 +8639,8 @@ fn log_search_timing(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
          score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
-         open_total_ms={:.1} knn_postings={} knn_degraded={} hits={} page_gets={} \
+         open_total_ms={:.1} knn_postings={} knn_mode={} knn_exact_vectors={} \
+         knn_filtered={} knn_degraded={} hits={} page_gets={} \
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
          postings_whole_mb={:.1} vector_gets={} vector_ranged_kb={:.1} \
@@ -8659,6 +8660,11 @@ fn log_search_timing(
         phases.open_cached,
         phases.open_total_ms,
         phases.knn_postings_probed,
+        phases.knn_mode.map_or("-", |mode| mode.as_str()),
+        phases.knn_exact_vectors,
+        phases
+            .knn_filtered_candidates
+            .map_or_else(|| "-".to_string(), |n| n.to_string()),
         knn_degraded_segments.unwrap_or(0),
         total_hits,
         hydration.page.ranged_gets,
