@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod datetime;
 pub mod histogram;
-pub use histogram::{AggDateHistogram, AggHistogram, DurationValue};
+pub use histogram::{
+    AggDateHistogram, AggHistogram, DateHistogramBounds, DurationValue, HistogramBounds,
+};
 pub mod docset;
 pub mod nested;
 pub mod sharding;
@@ -1391,22 +1393,19 @@ fn reject_unsupported_histogram_options(
     let Some(obj) = body.as_object() else {
         return Ok(());
     };
-    for option in [
-        "time_zone",
-        "extended_bounds",
-        "hard_bounds",
-        "keyed",
-        "order",
-        "missing",
-        "format",
-    ] {
+    for option in ["keyed", "order", "missing", "format"] {
         if obj.contains_key(option) {
             return Err(format!(
-                "in `{kind}` aggregation: `{option}` is not supported yet (bucket boundaries \
-                 are UTC, buckets are sorted by key ascending, and gaps are filled between \
-                 the lowest and highest non-empty bucket)"
+                "in `{kind}` aggregation: `{option}` is not supported yet (buckets are sorted \
+                 by key ascending, documents without a value are not counted, and \
+                 `key_as_string` is RFC 3339)"
             ));
         }
+    }
+    if kind == "histogram" && obj.contains_key("time_zone") {
+        return Err(
+            "in `histogram` aggregation: `time_zone` applies only to `date_histogram`".into(),
+        );
     }
     if kind == "date_histogram" && obj.contains_key("interval") {
         return Err(
@@ -5254,12 +5253,20 @@ mod aggregation_parsing {
                 "in `histogram` aggregation",
             ),
             (
-                r#"{"histogram":{"field":"b","interval":1,"extended_bounds":{"min":0,"max":9}}}"#,
-                "`extended_bounds` is not supported yet",
+                r#"{"histogram":{"field":"b","interval":1,"extended_bounds":{"min":9,"max":0}}}"#,
+                "`extended_bounds` `min` (9) is greater than `max` (0)",
             ),
             (
-                r#"{"histogram":{"field":"b","interval":1,"hard_bounds":{"min":0,"max":9}}}"#,
-                "`hard_bounds` is not supported yet",
+                r#"{"histogram":{"field":"b","interval":1,"hard_bounds":{"min":"a"}}}"#,
+                "in `histogram` aggregation",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"time_zone":"UTC"}}"#,
+                "`time_zone` applies only to `date_histogram`",
+            ),
+            (
+                r#"{"histogram":{"field":"b","interval":1,"keyed":true}}"#,
+                "`keyed` is not supported yet",
             ),
             (
                 r#"{"histogram":{"field":"b","interval":1,"bogus":1}}"#,
@@ -5282,16 +5289,12 @@ mod aggregation_parsing {
                 "in `date_histogram` aggregation",
             ),
             (
-                r#"{"date_histogram":{"field":"t","calendar_interval":"1M"}}"#,
-                "use `fixed_interval`",
+                r#"{"date_histogram":{"field":"t","calendar_interval":"2M"}}"#,
+                "calendar intervals take a single unit",
             ),
             (
-                r#"{"date_histogram":{"field":"t","calendar_interval":"1y"}}"#,
-                "use `fixed_interval`",
-            ),
-            (
-                r#"{"date_histogram":{"field":"t","calendar_interval":"1q"}}"#,
-                "use `fixed_interval`",
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1M"}}"#,
+                "use `calendar_interval`",
             ),
             (
                 r#"{"date_histogram":{"field":"t"}}"#,
@@ -5302,8 +5305,20 @@ mod aggregation_parsing {
                 "use `fixed_interval`",
             ),
             (
-                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","time_zone":"Europe/Paris"}}"#,
-                "`time_zone` is not supported yet",
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","time_zone":"Europe/Atlantis"}}"#,
+                "unknown `time_zone` \"Europe/Atlantis\"",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","hard_bounds":{"min":"2024-02-01","max":"2024-01-01"}}}"#,
+                "`hard_bounds` `min` (2024-02-01T00:00:00.000Z) is after `max`",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","extended_bounds":{"min":"soon"}}}"#,
+                "`extended_bounds` `min` must be a date",
+            ),
+            (
+                r#"{"date_histogram":{"field":"t","fixed_interval":"1h","format":"yyyy"}}"#,
+                "`format` is not supported yet",
             ),
             (
                 r#"{"date_histogram":{"field":"t","fixed_interval":"1h","offset":"soon"}}"#,
