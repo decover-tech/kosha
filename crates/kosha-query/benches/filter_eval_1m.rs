@@ -164,6 +164,7 @@ fn main() {
             schema: None,
             retired: Default::default(),
             shards: None,
+            branch: None,
         };
         let query: SearchQuery = serde_json::from_value(serde_json::json!({
             "query_text": "", "max_results": 0,

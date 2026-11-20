@@ -23,6 +23,7 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 }
 
 mod auth;
+mod branching;
 mod compaction_sched;
 mod doc_spans;
 #[cfg(all(test, feature = "s3"))]
@@ -65,6 +66,10 @@ struct AppState {
     admin_auth_key: Option<String>,
     internal_service_key: Option<String>,
     publication_locks: Mutex<HashMap<NamespaceId, Arc<Mutex<()>>>>,
+    /// Serializes namespace branch creation and deletion (#208), so a
+    /// deletion's reference set cannot miss a branch being created from
+    /// the namespace it deletes.
+    branch_lock: Mutex<()>,
     /// Hydrated segment files that failed their `_COMMIT` size/CRC check
     /// (#231), counting refetch failures again. Reported in `/stats`.
     #[cfg(feature = "s3")]
@@ -896,8 +901,22 @@ fn segments_needing_sync<'a>(
     manifest
         .segments
         .iter()
-        .filter(|e| !synced.contains(&(ns.clone(), e.segment_id.clone())))
+        // A branch's inherited segment is durable by construction: it was
+        // listed by a published parent manifest (#208).
+        .filter(|e| !manifest.is_inherited_segment(ns, &e.segment_id))
+        .filter(|e| !synced.contains(&synced_key(manifest, ns, &e.segment_id)))
         .collect()
+}
+
+/// `synced_segments` key: the segment's *home* namespace and id, so a
+/// branch and its parent share one durability record per object (#208).
+#[cfg(feature = "s3")]
+fn synced_key(
+    manifest: &kosha_core::Manifest,
+    ns: &NamespaceId,
+    segment: &kosha_core::SegmentId,
+) -> (NamespaceId, kosha_core::SegmentId) {
+    (manifest.segment_home(ns, segment).clone(), segment.clone())
 }
 
 /// How many times one publish rebases onto a newer remote manifest before
@@ -1346,17 +1365,20 @@ impl AppState {
                     if is_ingest_role {
                         if let Some(ref s3) = s3_storage {
                             for entry in &manifest.segments {
-                                let rel = format!("{}/{}", ns.0, entry.segment_id.0);
+                                // A branch's inherited segment is checked
+                                // (and keyed) where it lives (#208).
+                                let rel = manifest.segment_rel_dir(&ns, &entry.segment_id);
+                                let key = synced_key(&manifest, &ns, &entry.segment_id);
                                 let durability = s3.segment_durability(&rel);
                                 if durability.is_durable() {
-                                    synced_segments.insert((ns.clone(), entry.segment_id.clone()));
+                                    synced_segments.insert(key);
                                     continue;
                                 }
-                                let seg_path = data_dir.join(&ns.0).join(&entry.segment_id.0);
+                                let seg_path =
+                                    manifest.segment_dir(&data_dir, &ns, &entry.segment_id);
                                 match sync_segment_dir_to_s3(s3, &data_dir, &seg_path) {
                                     Ok(()) => {
-                                        synced_segments
-                                            .insert((ns.clone(), entry.segment_id.clone()));
+                                        synced_segments.insert(key);
                                         reconciled_missing += 1;
                                         println!(
                                             "reconciliation: re-uploaded segment not durable in \
@@ -1548,6 +1570,7 @@ impl AppState {
                 .ok()
                 .filter(|k| !k.is_empty()),
             publication_locks: Mutex::new(HashMap::new()),
+            branch_lock: Mutex::new(()),
             #[cfg(feature = "s3")]
             segment_checksum_failures: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "s3")]
@@ -1877,10 +1900,62 @@ impl AppState {
         config: &kosha_core::gc::GcConfig,
     ) -> Vec<kosha_core::gc::NamespaceGcReport> {
         let _serial = self.gc_lock.lock().unwrap();
+        // No branch is created or deleted while GC decides what is still
+        // referenced (#208).
+        let _lineage = self.branch_lock.lock().unwrap();
         let all = self.controller.lock().unwrap().list_namespaces();
         let mut reports = Vec::new();
+        // Every manifest, read up front: a branch lists segments (and
+        // deletion bitmaps) under its parent's prefix, which the parent's
+        // GC must keep however long ago the parent itself dropped them.
+        // Fallible on purpose: a reference set that silently missed a
+        // manifest would reclaim live objects.
+        let mut manifests: Vec<(NamespaceId, kosha_core::Manifest)> = Vec::new();
+        for ns in &all {
+            match self.controller.lock().unwrap().try_manifest_cloned(ns) {
+                Ok(Some(manifest)) => manifests.push((ns.clone(), manifest)),
+                Ok(None) => {}
+                Err(e) => {
+                    return namespaces
+                        .iter()
+                        .map(|ns| kosha_core::gc::NamespaceGcReport {
+                            namespace: ns.0.clone(),
+                            dry_run: config.dry_run,
+                            aborted: Some(format!(
+                                "GC skipped: cannot read every manifest to find shared \
+                                 segments ({}: {e})",
+                                ns.0
+                            )),
+                            ..Default::default()
+                        })
+                        .collect();
+                }
+            }
+        }
         for ns in namespaces {
             let others: Vec<NamespaceId> = all.iter().filter(|n| *n != ns).cloned().collect();
+            let referenced = kosha_core::branch::References::collect(
+                manifests
+                    .iter()
+                    .filter(|(other, manifest)| other != ns && manifest.branch.is_some())
+                    .map(|(other, manifest)| (other, manifest)),
+            );
+            let config = match referenced {
+                Ok(refs) => kosha_core::gc::GcConfig {
+                    referenced_elsewhere: Some(Arc::new(refs)),
+                    ..config.clone()
+                },
+                Err(e) => {
+                    reports.push(kosha_core::gc::NamespaceGcReport {
+                        namespace: ns.0.clone(),
+                        dry_run: config.dry_run,
+                        aborted: Some(format!("GC skipped: cannot resolve branch references: {e}")),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            };
+            let config = &config;
             let mut load = || Ok(self.controller.lock().unwrap().manifest_cloned(ns));
             let mut commit = |expected: u64, manifest: kosha_core::Manifest| {
                 // Same lock as a local publish, so this node's writer sees
@@ -2237,14 +2312,7 @@ impl AppState {
         let Some(mut manifest) = self.controller.lock().unwrap().manifest_cloned(ns) else {
             return Ok(None);
         };
-        kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
-            let path = vector.path(ns, segment)?;
-            #[cfg(feature = "s3")]
-            if let Some(ref s3) = self.s3_storage {
-                return s3.read(&path);
-            }
-            Ok(std::fs::read(self.data_dir.join(path))?)
-        })?;
+        self.hydrate_deletes(ns, &mut manifest)?;
         Ok(Some(manifest))
     }
 
@@ -2287,7 +2355,7 @@ impl AppState {
             // upload for them.
             let mut synced = self.synced_segments.lock().unwrap();
             for entry in &manifest.segments {
-                synced.insert((ns.clone(), entry.segment_id.clone()));
+                synced.insert(synced_key(&manifest, ns, &entry.segment_id));
             }
         }
         self.indexer.restore_manifest(ns.clone(), manifest);
@@ -2469,7 +2537,7 @@ impl AppState {
                         // them and this node has nothing local to send.
                         let mut synced = self.synced_segments.lock().unwrap();
                         for entry in &remote.segments {
-                            synced.insert((ns.clone(), entry.segment_id.clone()));
+                            synced.insert(synced_key(&remote, ns, &entry.segment_id));
                         }
                     }
                     if self.indexer.rebase_onto(ns, remote)? == kosha_write::RebaseOutcome::Adopted
@@ -2522,7 +2590,7 @@ impl AppState {
             return Ok(());
         };
         for segment_id in pending {
-            let seg_path = self.data_dir.join(&ns.0).join(&segment_id.0);
+            let seg_path = manifest.segment_dir(&self.data_dir, ns, &segment_id);
             // Only mark synced once the segment is committed (`_COMMIT`
             // written last, #231). A partial upload must be retried by a
             // future publish call, never treated as durable.
@@ -2530,10 +2598,15 @@ impl AppState {
             self.synced_segments
                 .lock()
                 .unwrap()
-                .insert((ns.clone(), segment_id));
+                .insert(synced_key(manifest, ns, &segment_id));
         }
         if let Some(ref s3) = self.s3_storage {
             for (segment, vector) in &manifest.deletion_vectors {
+                // Inherited from a branch parent (#208): already durable in
+                // the parent's prefix, and not this namespace's to write.
+                if vector.is_inherited(ns) {
+                    continue;
+                }
                 let path = vector.path(ns, segment)?;
                 let bytes = std::fs::read(self.data_dir.join(&path))?;
                 s3.write(&path, &bytes)?;
@@ -3252,14 +3325,14 @@ impl AppState {
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
 
         let missing_manifest_footer_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
             .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
 
         // A footer rewritten after commit (bloom rebuild) is recorded by CRC
@@ -3272,10 +3345,8 @@ impl AppState {
             if manifest.segment_footer(&entry.segment_id).is_some() {
                 continue;
             }
-            let path = self
-                .data_dir
-                .join(&ns.0)
-                .join(&entry.segment_id.0)
+            let path = manifest
+                .segment_dir(&self.data_dir, ns, &entry.segment_id)
                 .join("footer.json");
             if let Ok(bytes) = std::fs::read(&path) {
                 if crc32fast::hash(&bytes) != expected {
@@ -3302,7 +3373,7 @@ impl AppState {
             .iter()
             .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
             .filter_map(|entry| {
-                let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
                 let bytes = std::fs::read(seg_path.join("footer.json")).ok()?;
                 // Still not the recorded rewrite (e.g. S3 fetch failed and
                 // left nothing usable): don't cache or prune with it.
@@ -3343,8 +3414,12 @@ impl AppState {
             .segments
             .iter()
             .filter_map(|entry| {
-                segment_footer(entry)
-                    .map(|footer| (self.data_dir.join(&ns.0).join(&entry.segment_id.0), footer))
+                segment_footer(entry).map(|footer| {
+                    (
+                        manifest.segment_dir(&self.data_dir, ns, &entry.segment_id),
+                        footer,
+                    )
+                })
             })
             .collect();
         let analyses: Vec<Option<&kosha_core::SegmentAnalysis>> = manifest
@@ -3384,7 +3459,7 @@ impl AppState {
         let mut filter_files: HashMap<PathBuf, Vec<String>> = HashMap::new();
         if let Some(fields) = &filter_fields {
             for entry in &manifest.segments {
-                let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
                 let footer = manifest
                     .segment_footer(&entry.segment_id)
                     .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
@@ -3952,7 +4027,7 @@ impl AppState {
             .segments
             .iter()
             .map(|entry| {
-                let dir = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
                 manifest
                     .footer_or_read(&entry.segment_id, || {
                         kosha_segment::SegmentReader::read_footer(&dir).ok()
@@ -3974,7 +4049,7 @@ impl AppState {
         let seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
         self.ensure_query_postings(
             ns,
@@ -5161,6 +5236,12 @@ fn is_write_path(request_line: &str) -> bool {
     if extract_namespace(request_line, "POST /v1/namespaces/", "/shards").is_some() {
         return true;
     }
+    // Branch create/delete (#208) write manifests and reclaim objects.
+    if extract_namespace(request_line, "POST /v1/namespaces/", "/branch").is_some()
+        || extract_namespace(request_line, "DELETE /v1/namespaces/", "/branch").is_some()
+    {
+        return true;
+    }
     // v1 admin routes — all mutate segment/manifest state.
     if request_line.starts_with("POST /v1/admin/") {
         return true;
@@ -5438,6 +5519,19 @@ fn route_inner(
 
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/shards") {
         return handle_put_shards_with_ns(&ns, tenant, body, state);
+    }
+
+    // ── Namespace branching (#208) ─────────────────────────────────────────
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/branch") {
+        return branching::handle_branch_create(&ns, tenant, body, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/branches") {
+        return branching::handle_branch_list(&ns, tenant, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "DELETE /v1/namespaces/", "/branch") {
+        return branching::handle_branch_delete(&ns, tenant, state);
     }
 
     if request_line.starts_with("GET /v1/stats") {
@@ -5814,6 +5908,45 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
     }))
 }
 
+/// Every other namespace whose manifest lists a segment or deletion
+/// bitmap stored under `id`'s prefix (a branch of it, or of one of its
+/// branches, #208).
+fn branches_referencing(
+    state: &AppState,
+    id: &NamespaceId,
+) -> Result<Vec<NamespaceId>, KoshaError> {
+    let below = format!("{}/", id.0);
+    let homed_here = |home: &NamespaceId| home == id || home.0.starts_with(&below);
+    let mut out = Vec::new();
+    let others = state.controller.lock().unwrap().list_namespaces();
+    for other in others {
+        if other == *id || other.0.starts_with(&below) {
+            continue;
+        }
+        let manifest = state
+            .controller
+            .lock()
+            .unwrap()
+            .try_manifest_cloned(&other)?;
+        let Some(manifest) = manifest else {
+            continue;
+        };
+        let refers = manifest
+            .branch
+            .as_ref()
+            .is_some_and(|branch| branch.segment_homes.values().any(homed_here))
+            || manifest
+                .deletion_vectors
+                .values()
+                .filter_map(|vector| vector.namespace.as_ref())
+                .any(homed_here);
+        if refers {
+            out.push(other);
+        }
+    }
+    Ok(out)
+}
+
 /// `DELETE /v1/namespaces/{ns}` — `DeleteNamespaceResponse`. 404 if the
 /// caller's tenant has no such namespace.
 ///
@@ -5838,6 +5971,30 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
 /// `run_manifest_refresh_tick`, or a search with `max_staleness_seconds: 0`).
 fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String {
     let id = NamespaceId(tenant_namespace(tenant, name));
+    // No branch is created from (or deleted under) this namespace while it
+    // goes (#208).
+    let _lineage = state.branch_lock.lock().unwrap();
+    // Deleting a namespace deletes everything under its prefix. A branch
+    // still listing segments or deletion bitmaps that live there would be
+    // left pointing at nothing, so the branches go first.
+    match branches_referencing(state, &id) {
+        Ok(branches) if branches.is_empty() => {}
+        Ok(branches) => {
+            return json_error(
+                409,
+                &format!(
+                    "namespace '{name}' has branches that share its segments ({}); delete \
+                     them first (DELETE /v1/namespaces/{{branch}}/branch)",
+                    branches
+                        .iter()
+                        .map(|b| b.0.split_once('/').map_or(b.0.as_str(), |(_, n)| n))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        }
+        Err(e) => return json_error(503, &format!("control store: {e}")),
+    }
     let lock = state.publication_lock(&id);
     let _guard = lock.lock().unwrap();
     let local_version = state.indexer.manifest_version(&id);
@@ -6065,7 +6222,7 @@ fn index_into(
             let paths: Vec<PathBuf> = manifest
                 .segments
                 .iter()
-                .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
+                .map(|entry| manifest.segment_dir(&state.data_dir, &ns, &entry.segment_id))
                 .collect();
             // Rewrite/lookup paths must see a segment's full fidelity,
             // including vectors — unlike the search path, there's no
@@ -6193,7 +6350,7 @@ fn existing_ids_in(
             let paths: Vec<PathBuf> = manifest
                 .segments
                 .iter()
-                .map(|entry| state.data_dir.join(&namespace.0).join(&entry.segment_id.0))
+                .map(|entry| manifest.segment_dir(&state.data_dir, namespace, &entry.segment_id))
                 .collect();
             // Rewrite/lookup paths must see a segment's full fidelity,
             // including vectors — unlike the search path, there's no
@@ -6251,7 +6408,7 @@ fn replace_into(
             let paths: Vec<PathBuf> = manifest
                 .segments
                 .iter()
-                .map(|entry| state.data_dir.join(&namespace.0).join(&entry.segment_id.0))
+                .map(|entry| manifest.segment_dir(&state.data_dir, &namespace, &entry.segment_id))
                 .collect();
             // Rewrite/lookup paths must see a segment's full fidelity,
             // including vectors — unlike the search path, there's no
@@ -6310,7 +6467,7 @@ fn flush_and_publish_namespace(state: &AppState, namespace: &NamespaceId) -> Res
             let paths: Vec<_> = manifest
                 .segments
                 .iter()
-                .map(|e| state.data_dir.join(&namespace.0).join(&e.segment_id.0))
+                .map(|e| manifest.segment_dir(&state.data_dir, namespace, &e.segment_id))
                 .collect();
             let outcome = state.ensure_segments_local(&paths, true);
             if let Some(error) = hydration_error_response(&outcome) {
@@ -6346,7 +6503,7 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
                 let paths: Vec<_> = manifest
                     .segments
                     .iter()
-                    .map(|e| state.data_dir.join(&namespace.0).join(&e.segment_id.0))
+                    .map(|e| manifest.segment_dir(&state.data_dir, &namespace, &e.segment_id))
                     .collect();
                 let outcome = state.ensure_segments_local(&paths, true);
                 if let Some(error) = hydration_error_response(&outcome) {
@@ -6493,7 +6650,7 @@ fn delete_in(
         let paths: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .map(|e| state.data_dir.join(&ns.0).join(&e.segment_id.0))
+            .map(|e| manifest.segment_dir(&state.data_dir, &ns, &e.segment_id))
             .collect();
         let outcome = state.ensure_segments_local(&paths, false);
         if let Some(error) = hydration_error_response(&outcome) {
@@ -7698,6 +7855,20 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
                 })
                 .collect::<Vec<_>>());
     }
+    // A branch (#208) reports its lineage and how much it still shares.
+    if let Some(branch) = &manifest.branch {
+        let ns = NamespaceId(scoped_ns.clone());
+        let shared = manifest
+            .segments
+            .iter()
+            .filter(|entry| manifest.is_inherited_segment(&ns, &entry.segment_id))
+            .count();
+        body["branch"] = serde_json::json!({
+            "parent": branch.parent.0.split_once('/').map_or(branch.parent.0.as_str(), |(_, n)| n),
+            "parent_version": branch.parent_version,
+            "shared_segments": shared,
+        });
+    }
     if state.ingest_host.is_some() {
         add_manifest_follow_stats(state, &NamespaceId(scoped_ns), &mut body);
     }
@@ -7757,7 +7928,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
     let seg_paths: Vec<PathBuf> = manifest
         .segments
         .iter()
-        .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
+        .map(|entry| manifest.segment_dir(&state.data_dir, &ns, &entry.segment_id))
         .collect();
     #[cfg(feature = "s3")]
     // Admin routes rewrite or merge segments — must preserve vectors.
@@ -7765,8 +7936,15 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
 
     let mut new_footers = Vec::new();
     let mut rebuilt = 0usize;
+    let mut inherited = 0usize;
     let mut errors = Vec::new();
     for (entry, seg_path) in manifest.segments.iter().zip(seg_paths.iter()) {
+        // A branch never rewrites a file in its parent's prefix (#208):
+        // run the rebuild on the namespace that owns the segment.
+        if manifest.is_inherited_segment(&ns, &entry.segment_id) {
+            inherited += 1;
+            continue;
+        }
         if !seg_path.exists() {
             errors.push(format!("{}: segment not local", entry.segment_id.0));
             continue;
@@ -7811,6 +7989,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
         "namespace": ns.0,
         "segments": manifest.segments.len(),
         "rebuilt": rebuilt,
+        "skipped_inherited": inherited,
         "errors": errors,
     }))
 }
@@ -7885,7 +8064,12 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
         let mut skipped = 0usize;
         let mut failed = 0usize;
         for (i, entry) in manifest.segments.iter().enumerate() {
-            let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
+            let seg_path = manifest.segment_dir(&state.data_dir, &ns, &entry.segment_id);
+            // A branch never writes into its parent's prefix (#208).
+            if manifest.is_inherited_segment(&ns, &entry.segment_id) {
+                skipped += 1;
+                continue;
+            }
 
             // Resumable: a segment whose sidecar already reached S3 is done —
             // re-running after a crash/restart only pays for the remainder.
@@ -7894,7 +8078,7 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
                 .s3_storage
                 .as_ref()
                 .map(|s3| {
-                    let rel = format!("{}/{}", ns.0, entry.segment_id.0);
+                    let rel = manifest.segment_rel_dir(&ns, &entry.segment_id);
                     s3.list_with_sizes(&rel)
                         .map(|files| files.iter().any(|(n, _)| n == "doc_store.offsets"))
                         .unwrap_or(false)
@@ -8024,6 +8208,7 @@ fn handle_segment_gc(body: &[u8], state: &AppState) -> String {
         grace_ms: grace.as_millis() as u64,
         orphan_grace_ms: orphan_grace.as_millis() as u64,
         now_ms: unix_millis(),
+        referenced_elsewhere: None,
     };
     let reports = state.run_segment_gc(&namespaces, &config);
     let sum = |f: fn(&kosha_core::gc::NamespaceGcReport) -> u64| reports.iter().map(f).sum::<u64>();
@@ -8387,7 +8572,6 @@ impl CompactionStorage for AppState {
                 ),
             }
         }
-        let ns_dir = self.data_dir.join(&ns.0);
         manifest
             .segments
             .iter()
@@ -8397,11 +8581,10 @@ impl CompactionStorage for AppState {
                 // lexical search hydrates without vector.idx). Local size
                 // only for segments S3 doesn't list, i.e. local-only mode
                 // or a flush not yet published.
-                let bytes = remote
-                    .get(&id.0)
-                    .copied()
-                    .filter(|b| *b > 0)
-                    .or_else(|| local_dir_bytes(&ns_dir.join(&id.0)))?;
+                let bytes =
+                    remote.get(&id.0).copied().filter(|b| *b > 0).or_else(|| {
+                        local_dir_bytes(&manifest.segment_dir(&self.data_dir, ns, id))
+                    })?;
                 Some((id.clone(), bytes))
             })
             .collect()
@@ -8505,11 +8688,8 @@ fn compaction_pass_with(
         peak_local_bytes: 0,
         not_evicted: Vec::new(),
     };
-    let group_bytes = |ids: &[kosha_core::SegmentId]| -> u64 {
-        ids.iter()
-            .filter_map(|id| local_dir_bytes(&ns_dir.join(&id.0)))
-            .sum()
-    };
+    let group_bytes =
+        |paths: &[PathBuf]| -> u64 { paths.iter().filter_map(|path| local_dir_bytes(path)).sum() };
 
     loop {
         let Some(manifest) = state.indexer.manifest_cloned(ns) else {
@@ -8521,16 +8701,21 @@ fn compaction_pass_with(
         else {
             break;
         };
-        drop(manifest);
         let ids = plan.input_ids();
+        // A branch's inherited inputs live under their home namespace's
+        // prefix (#208).
+        let paths: Vec<PathBuf> = ids
+            .iter()
+            .map(|id| manifest.segment_dir(&state.data_dir, ns, id))
+            .collect();
+        drop(manifest);
 
         // Hydrate only this group, in one fanned-out batch (see
         // `ensure_segments_local`). Compaction rewrites segments, so it
         // must preserve vectors.
-        let local_before = group_bytes(&ids);
-        let paths: Vec<PathBuf> = ids.iter().map(|id| ns_dir.join(&id.0)).collect();
+        let local_before = group_bytes(&paths);
         storage.hydrate(&paths);
-        let local_inputs = group_bytes(&ids);
+        let local_inputs = group_bytes(&paths);
         outcome.bytes_hydrated += local_inputs.saturating_sub(local_before);
         for path in &paths {
             if !path.exists() {
@@ -8716,6 +8901,7 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        branch: None,
         schema: None,
         retired: Default::default(),
         shards: None,
@@ -9461,6 +9647,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .delete_namespace(id, retire_at_least)
+        }
+        fn remove_namespace(
+            &mut self,
+            id: &NamespaceId,
+        ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
+            Ok(self.inner.lock().unwrap().remove_namespace(id))
         }
     }
 
@@ -10336,6 +10528,13 @@ mod tests {
         ) -> Result<(kosha_core::Manifest, u64), KoshaError> {
             self.inner.delete_namespace(id, retire_at_least)
         }
+        fn remove_namespace(
+            &mut self,
+            id: &NamespaceId,
+        ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
+            self.check()?;
+            self.inner.remove_namespace(id)
+        }
     }
 
     fn outage_store() -> OutageStore {
@@ -10440,6 +10639,42 @@ mod tests {
         assert_eq!(stats["manifest_refresh"]["interval_ms"], 20);
         // The ingest pod's stats carry no follower block.
         assert!(stats_json(&ingest)["manifest_refresh"].is_null());
+    }
+
+    /// #208: a query replica follows a branch like any namespace, and drops
+    /// it once the ingest pod deletes it, instead of serving a manifest
+    /// whose own objects were just reclaimed. The parent is unaffected.
+    #[test]
+    fn query_replica_follows_branches_and_forgets_deleted_ones() {
+        let store = outage_store();
+        let parent = NamespaceId("tenant/prod".into());
+        let child = NamespaceId("tenant/exp".into());
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_secs(3600)));
+        index_text_and_publish(&ingest, &parent, &["a", "b"]);
+        ingest.branch_namespace(&parent, &child).unwrap();
+        index_text_and_publish(&ingest, &child, &["c"]);
+        let search = |ns: &str| {
+            let body = format!(r#"{{"namespace":"{ns}","query_text":"hello"}}"#);
+            total_hits(&handle_search_post(body.as_bytes(), &query))
+        };
+        assert_eq!(search("tenant/exp"), 3);
+        assert_eq!(search("tenant/prod"), 2);
+        assert!(query
+            .indexer
+            .manifest_shared(&child)
+            .unwrap()
+            .branch
+            .is_some());
+
+        ingest.delete_branch(&child).unwrap();
+        query.run_manifest_refresh_tick();
+        assert!(query.indexer.manifest_version(&child).is_none());
+        assert_eq!(search("tenant/prod"), 2);
+        assert!(handle_search_post(
+            br#"{"namespace":"tenant/exp","query_text":"hello"}"#,
+            &query
+        )
+        .starts_with("HTTP/1.1 404"));
     }
 
     /// #232: `max_staleness_seconds` forces a synchronous refresh when the
@@ -10799,6 +11034,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
             shards: None,
@@ -12656,6 +12892,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
             shards: None,
@@ -13385,6 +13622,8 @@ mod tests {
             "POST /v1/namespaces/foo/delete HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/schema HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/shards HTTP/1.1\r\n",
+            "POST /v1/namespaces/foo/branch HTTP/1.1\r\n",
+            "DELETE /v1/namespaces/foo/branch HTTP/1.1\r\n",
             "POST /v1/admin/api-keys HTTP/1.1\r\n",
             "POST /v1/admin/rebuild-filter-blooms HTTP/1.1\r\n",
             "POST /v1/admin/backfill-offset-tables HTTP/1.1\r\n",
@@ -13412,6 +13651,7 @@ mod tests {
             "GET /v1/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/schema HTTP/1.1\r\n",
+            "GET /v1/namespaces/foo/branches HTTP/1.1\r\n",
             "GET /search?ns=foo&q=bar HTTP/1.1\r\n",
             "POST /search HTTP/1.1\r\n",
             "POST /exists HTTP/1.1\r\n",
@@ -13619,6 +13859,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
             shards: None,
@@ -13901,6 +14142,7 @@ mod tests {
             schema: None,
             retired: Default::default(),
             shards: None,
+            branch: None,
         };
         let ns = NamespaceId("ns".into());
         let partial = kosha_query::Searcher::new(local_root.clone())
@@ -13954,6 +14196,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
             shards: None,

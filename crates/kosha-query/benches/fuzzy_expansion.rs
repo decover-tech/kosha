@@ -86,6 +86,7 @@ fn build(root: &Path, docs: usize) -> Manifest {
         schema: None,
         retired: Default::default(),
         shards: None,
+        branch: None,
     };
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     let per_segment = docs / SEGMENTS;

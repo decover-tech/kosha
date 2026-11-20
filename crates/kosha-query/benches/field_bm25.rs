@@ -61,6 +61,7 @@ fn build(root: &Path, docs: usize, field_index: bool) -> (Manifest, f64, u64) {
         schema: None,
         retired: Default::default(),
         shards: None,
+        branch: None,
     };
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let start = Instant::now();

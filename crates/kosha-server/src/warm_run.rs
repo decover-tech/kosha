@@ -242,9 +242,11 @@ impl AppState {
         class: FileClass,
         segments: &[String],
     ) -> BatchOutcome {
+        // A branch's inherited segments live under their home namespace's
+        // prefix (#208).
         let seg_paths: Vec<PathBuf> = segments
             .iter()
-            .map(|s| self.data_dir.join(&ns.0).join(s))
+            .map(|s| manifest.segment_dir(&self.data_dir, ns, &kosha_core::SegmentId(s.clone())))
             .collect();
         let request = RequestHydration::unlimited();
         match class {
@@ -282,6 +284,7 @@ impl AppState {
                     schema: None,
                     retired: Default::default(),
                     shards: None,
+                    branch: None,
                 };
                 let o =
                     self.hydrate_segments_for_search(ns, &subset, &warmup_probe_query(), &request);

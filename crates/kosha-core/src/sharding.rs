@@ -131,6 +131,7 @@ pub fn merge_shard_manifests(root: &Manifest, shards: &[Option<Arc<Manifest>>]) 
         schema: root.schema.clone(),
         shards: root.shards,
         retired: Default::default(),
+        branch: None,
     };
     for (index, shard) in shards.iter().enumerate() {
         let Some(shard) = shard else { continue };
@@ -235,6 +236,7 @@ mod tests {
             schema: None,
             shards: Some(2),
             retired: Default::default(),
+            branch: None,
         };
         let mut shard = root.clone();
         shard.shards = None;

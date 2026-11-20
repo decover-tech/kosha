@@ -606,6 +606,7 @@ mod tests {
                 schema: None,
                 retired: Default::default(),
                 shards: None,
+                branch: None,
             },
             segs: seg_dirs,
         }

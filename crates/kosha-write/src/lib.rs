@@ -227,6 +227,7 @@ impl NamespaceState {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
                 schema: None,
                 retired: Default::default(),
                 shards: None,
@@ -619,7 +620,9 @@ impl Indexer {
         let mut changes = Vec::new();
         let mut deleted_ids = HashSet::new();
         for entry in &state.manifest.segments {
-            let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+            let seg_dir = state
+                .manifest
+                .segment_dir(&self.data_dir, namespace, &entry.segment_id);
             let reader = kosha_segment::SegmentReader::open(seg_dir)?;
             // The search path's evaluator (columnar or `filters.bin`), so a
             // delete matches exactly the documents a search would.
@@ -741,7 +744,9 @@ impl Indexer {
         let mut index: HashMap<DocumentId, Vec<(SegmentId, u32)>> = HashMap::new();
         if state.known {
             for entry in &state.manifest.segments {
-                let seg_dir = data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                let seg_dir = state
+                    .manifest
+                    .segment_dir(data_dir, namespace, &entry.segment_id);
                 if !seg_dir.exists() {
                     return Err(KoshaError::SegmentNotFound(entry.segment_id.clone()));
                 }
@@ -863,11 +868,23 @@ impl Indexer {
         let state = handle.state.lock().unwrap().clone();
         let mut dims = HashMap::new();
         for entry in &state.manifest.segments {
-            let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
-            let Ok(footer) = kosha_segment::SegmentReader::read_footer(&seg_dir) else {
-                continue;
+            // The manifest's cached footer when it has one; else the local
+            // footer.json, wherever the segment lives (a branch's inherited
+            // segments sit under their home namespace, #208).
+            let footer = match state.manifest.segment_footer(&entry.segment_id) {
+                Some(footer) => footer.vector_fields.clone(),
+                None => {
+                    let seg_dir =
+                        state
+                            .manifest
+                            .segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                    match kosha_segment::SegmentReader::read_footer(&seg_dir) {
+                        Ok(footer) => footer.vector_fields,
+                        Err(_) => continue,
+                    }
+                }
             };
-            for meta in footer.vector_fields.into_iter().flatten() {
+            for meta in footer.into_iter().flatten() {
                 dims.entry(meta.name).or_insert(meta.dim as usize);
             }
         }
@@ -1048,7 +1065,9 @@ impl Indexer {
                     Some(buffered.fields.clone())
                 } else if let Some((seg, seq)) = live.last() {
                     let reader = kosha_segment::SegmentReader::open_with_options(
-                        self.data_dir.join(&namespace.0).join(&seg.0),
+                        snapshot
+                            .manifest
+                            .segment_dir(&self.data_dir, &namespace, seg),
                         false,
                     )?;
                     Some(
@@ -1630,12 +1649,12 @@ impl Indexer {
         let vector_index = opts.vector_index;
         self.compact_with_selector(
             namespace,
-            |manifest, ns_dir| {
+            |manifest, seg_dir| {
                 select_merge_inputs(
                     manifest,
                     &opts,
-                    |seg_id| ns_dir.join(&seg_id.0).exists(),
-                    |seg_id| segment_dir_bytes(&ns_dir.join(&seg_id.0)),
+                    |seg_id| seg_dir(seg_id).exists(),
+                    |seg_id| segment_dir_bytes(&seg_dir(seg_id)),
                 )
             },
             vector_index,
@@ -1657,7 +1676,7 @@ impl Indexer {
     ) -> Result<CompactResult, KoshaError> {
         self.compact_with_selector(
             namespace,
-            |manifest, ns_dir| {
+            |manifest, seg_dir| {
                 let inputs: Vec<ManifestEntry> = plan
                     .inputs
                     .iter()
@@ -1667,7 +1686,7 @@ impl Indexer {
                             .iter()
                             .find(|e| e.segment_id == planned.segment_id)
                     })
-                    .filter(|e| ns_dir.join(&e.segment_id.0).exists())
+                    .filter(|e| seg_dir(&e.segment_id).exists())
                     .cloned()
                     .collect();
                 (inputs.len() >= 2).then_some(MergePlan { inputs })
@@ -1680,7 +1699,7 @@ impl Indexer {
     fn compact_with_selector(
         &self,
         namespace: &NamespaceId,
-        select: impl FnOnce(&Manifest, &Path) -> Option<MergePlan>,
+        select: impl FnOnce(&Manifest, &dyn Fn(&SegmentId) -> PathBuf) -> Option<MergePlan>,
         // How the merged vector indexes are built (#253); `None` reads
         // `KOSHA_VECTOR_COMPACTION`.
         vector_index: Option<kosha_segment::VectorCompactionMode>,
@@ -1689,14 +1708,18 @@ impl Indexer {
         let handle = self.ns_handle(namespace);
         let _compact_guard = handle.compact.lock().unwrap();
 
-        let (plan, tombstones, bm25_params, segments_before, analysis) = {
+        let (plan, tombstones, bm25_params, segments_before, analysis, input_dirs) = {
             let mut state = handle.state.lock().unwrap();
             if !state.known {
                 return Ok(CompactResult::unchanged(0));
             }
             let segments_before = state.manifest.segments.len();
-            let ns_dir = self.data_dir.join(&namespace.0);
-            let plan = match select(&state.manifest, &ns_dir) {
+            let manifest = &state.manifest;
+            // A branch's inherited segments live under their home
+            // namespace's prefix (#208).
+            let seg_dir =
+                |seg_id: &SegmentId| manifest.segment_dir(&self.data_dir, namespace, seg_id);
+            let plan = match select(manifest, &seg_dir) {
                 Some(p) => p,
                 None => return Ok(CompactResult::unchanged(segments_before)),
             };
@@ -1722,7 +1745,28 @@ impl Indexer {
             // *current* schema (#220): compaction is how segments written
             // with an older analyzer converge on the new one.
             let analysis = state.manifest.analysis_config();
-            (plan, tombstones, bm25_params, segments_before, analysis)
+            // Inputs are read where they live: a branch's inherited inputs
+            // stay in the parent's prefix (#208). The output always goes to
+            // this namespace's own prefix.
+            let input_dirs: HashMap<SegmentId, PathBuf> = plan
+                .inputs
+                .iter()
+                .map(|entry| {
+                    let dir =
+                        state
+                            .manifest
+                            .segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                    (entry.segment_id.clone(), dir)
+                })
+                .collect();
+            (
+                plan,
+                tombstones,
+                bm25_params,
+                segments_before,
+                analysis,
+                input_dirs,
+            )
         };
 
         after_plan();
@@ -1752,7 +1796,7 @@ impl Indexer {
         let mut next_new_seq: u32 = 0;
 
         for entry in &plan.inputs {
-            let reader = kosha_segment::SegmentReader::open(ns_dir.join(&entry.segment_id.0))?;
+            let reader = kosha_segment::SegmentReader::open(input_dirs[&entry.segment_id].clone())?;
             let ts = tombstones.get(&entry.segment_id);
             // This input's old doc_seq → merged doc_seq (`u32::MAX`: not
             // copied), for seeding the merged vector index (#253).
@@ -2000,6 +2044,60 @@ impl Indexer {
         state.manifest = manifest;
         state.shared_manifest = None;
         state.known = true;
+    }
+
+    /// Forget a namespace that has been removed from the control store
+    /// (branch deletion, #208).
+    ///
+    /// Waits for in-flight writes, flushes, upserts and compactions, then
+    /// refuses with `InvalidQuery` if the namespace holds anything not yet
+    /// published (buffered or WAL-recovered documents, deletes, or a
+    /// manifest newer than the published one): the caller flushes and
+    /// publishes first, and a write that slipped in between must not be
+    /// silently dropped. Otherwise runs `while_locked` (the control-store
+    /// removal and object reclamation) with every namespace lock held, so
+    /// no write, flush or publish can interleave, and only on its success
+    /// resets the namespace to unknown. A write that arrives afterwards
+    /// starts a new, empty namespace of the same name.
+    pub fn drop_branch_namespace(
+        &self,
+        namespace: &NamespaceId,
+        while_locked: impl FnOnce() -> Result<(), KoshaError>,
+    ) -> Result<(), KoshaError> {
+        let handle = self.ns_handle(namespace);
+        // The order every writer takes them: writes -> compact -> mutation
+        // -> state.
+        let _writes = handle.writes.lock().unwrap();
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        let mut state = handle.state.lock().unwrap();
+        let buffered = state.buffer.as_ref().map_or(0, |b| b.documents.len());
+        let unpublished_deletes = state.known
+            && PublishedBase::of(&state.manifest, &state.tombstones).tombstones
+                != state.published_base.tombstones;
+        if buffered > 0
+            || !state.recovered.is_empty()
+            || !state.recovered_deletes.is_empty()
+            || (state.known && state.manifest.version != state.published_version)
+            || unpublished_deletes
+        {
+            return Err(KoshaError::InvalidQuery(format!(
+                "namespace {} has writes that are not published yet; flush it and retry",
+                namespace.0
+            )));
+        }
+        while_locked()?;
+        let wal_sequence = state.wal_sequence;
+        *state = NamespaceState::new();
+        // WAL sequences are process-wide; never hand one out twice.
+        state.wal_sequence = wal_sequence;
+        drop(state);
+        // Everything was published, but WAL files can outlive their
+        // checkpoint; with the manifest gone nothing would skip them on
+        // replay, so discard the namespace's records (as `drop_namespace`
+        // does for `DELETE /v1/namespaces/{ns}`).
+        self.wal.discard_namespace(namespace)?;
+        Ok(())
     }
 
     /// Set the namespace schema (#220), creating the namespace if needed.
@@ -2308,6 +2406,7 @@ impl Indexer {
         manifest
             .footer_crc32
             .retain(|segment, _| listed.contains(segment));
+        manifest.retain_listed_segment_homes();
         Some((state.published_version, manifest))
     }
 
@@ -2367,7 +2466,7 @@ impl Indexer {
                 .clone();
             return Ok(Some((expected, manifest)));
         }
-        manifest.deletion_vectors.clear();
+        let previous = std::mem::take(&mut manifest.deletion_vectors);
         for entry in &manifest.segments {
             if let Some(ids) = manifest
                 .tombstones
@@ -2375,6 +2474,20 @@ impl Indexer {
                 .filter(|ids| !ids.is_empty())
             {
                 let (vector, bytes) = kosha_core::deletes::DeletionVector::encode(ids)?;
+                // A bitmap a branch inherited unchanged stays where it is,
+                // in the parent's prefix (#208): never copied, never
+                // written to. Any change produces a new generation, which
+                // goes to this namespace's own prefix.
+                if let Some(inherited) = previous
+                    .get(&entry.segment_id)
+                    .filter(|old| old.is_inherited(namespace))
+                    .filter(|old| old.generation == vector.generation)
+                {
+                    manifest
+                        .deletion_vectors
+                        .insert(entry.segment_id.clone(), inherited.clone());
+                    continue;
+                }
                 let path = self
                     .data_dir
                     .join(vector.path(namespace, &entry.segment_id)?);
@@ -2652,6 +2765,10 @@ impl Indexer {
                 tombstones: tombstones.clone(),
                 // Rebuilt from `tombstones` by `prepare_publication`.
                 deletion_vectors: Default::default(),
+                // Lineage is fixed at branch time; segment homes are the
+                // union (a segment id has one home wherever it is listed),
+                // pruned to the merged segment list below.
+                branch: merge_branch_info(remote.branch.as_ref(), state.manifest.branch.as_ref()),
                 // A schema set on this writer since its last publication
                 // wins (it is the newer admin action); otherwise keep the
                 // remote's, which may carry another writer's change.
@@ -2664,6 +2781,8 @@ impl Indexer {
                 // Fixed once set (#207): whichever side set it.
                 shards: state.manifest.shards.or(remote.shards),
             };
+            let mut manifest = manifest;
+            manifest.retain_listed_segment_homes();
             (manifest, tombstones, RebaseOutcome::Rebased)
         } else {
             let mut manifest = remote.clone();
@@ -3031,6 +3150,25 @@ fn segment_dir_bytes(dir: &std::path::Path) -> Option<u64> {
     Some(total)
 }
 
+/// The branch lineage of a rebased manifest: either side's lineage (they
+/// agree: it is fixed when the branch is created), with both sides' segment
+/// homes.
+fn merge_branch_info(
+    remote: Option<&kosha_core::branch::BranchInfo>,
+    local: Option<&kosha_core::branch::BranchInfo>,
+) -> Option<kosha_core::branch::BranchInfo> {
+    let mut merged = remote.or(local)?.clone();
+    if let (Some(_), Some(local)) = (remote, local) {
+        for (segment, home) in &local.segment_homes {
+            merged
+                .segment_homes
+                .entry(segment.clone())
+                .or_insert_with(|| home.clone());
+        }
+    }
+    Some(merged)
+}
+
 /// Standalone filter applier for delete operations (no Searcher dependency).
 pub fn apply_filter_delete(
     filter: &FilterClause,
@@ -3066,7 +3204,7 @@ mod tests {
             .segments
             .iter()
             .flat_map(|entry| {
-                kosha_segment::SegmentReader::open(dir.join(&ns.0).join(&entry.segment_id.0))
+                kosha_segment::SegmentReader::open(manifest.segment_dir(dir, ns, &entry.segment_id))
                     .unwrap()
                     .iter_doc_records()
                     .map(|r| r.unwrap())
@@ -3079,6 +3217,190 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// Every file under `root`, with its bytes.
+    fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    fn publish(idx: &Indexer, ns: &NamespaceId) -> Manifest {
+        let (_, manifest) = idx.prepare_publication(ns).unwrap().unwrap();
+        idx.acknowledge_manifest(ns, &manifest).unwrap();
+        manifest
+    }
+
+    fn live_ids(dir: &Path, ns: &NamespaceId, manifest: &Manifest) -> Vec<(String, String)> {
+        let mut ids: Vec<_> = live_records(dir, ns, manifest)
+            .into_iter()
+            .map(|r| (r.doc_id.0, r.fields[0].value.clone()))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// #208: a branch references its parent's segments and bitmaps in
+    /// place; its writes, deletes, upserts and compactions go to its own
+    /// prefix and leave every parent byte and the parent manifest as they
+    /// were.
+    #[test]
+    fn a_branch_writes_deletes_and_compacts_without_touching_its_parent() {
+        let dir = std::env::temp_dir().join(format!("kosha-branch-{}", uuid::Uuid::new_v4()));
+        let parent = NamespaceId("t/prod".into());
+        let child = NamespaceId("t/test".into());
+        let idx = Indexer::new(dir.clone());
+        let doc = |id: &str, text: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text), Field::keyword("id", id)],
+        };
+        idx.index_documents(parent.clone(), vec![doc("d1", "one"), doc("d2", "two")])
+            .unwrap();
+        idx.flush_namespace(&parent).unwrap();
+        idx.index_documents(parent.clone(), vec![doc("d3", "three"), doc("d4", "four")])
+            .unwrap();
+        idx.flush_namespace(&parent).unwrap();
+        let filter: FilterClause = serde_json::from_str(r#"{"term": {"id": "d2"}}"#).unwrap();
+        let m = idx.manifest(&parent).unwrap();
+        assert_eq!(idx.delete_by_query(&parent, &m, &filter).unwrap(), 1);
+        let published = publish(&idx, &parent);
+        assert_eq!(published.deletion_vectors.len(), 1);
+        let parent_files = tree_bytes(&dir.join(&parent.0));
+        let parent_manifest = idx.manifest(&parent).unwrap();
+
+        // Branch: the stored manifest references the parent's objects.
+        let mut branch = published.branch_from(&parent, 1);
+        kosha_core::deletes::hydrate(&mut branch, |segment, vector| {
+            Ok(std::fs::read(dir.join(vector.path(&child, segment)?))?)
+        })
+        .unwrap();
+        idx.restore_manifest(child.clone(), branch);
+        assert!(
+            !dir.join(&child.0).exists(),
+            "branching must not write a byte"
+        );
+        let child_manifest = idx.manifest(&child).unwrap();
+        assert_eq!(
+            live_ids(&dir, &child, &child_manifest),
+            live_ids(&dir, &parent, &parent_manifest)
+        );
+        // Publishing the untouched branch keeps the inherited bitmap.
+        let republished = publish(&idx, &child);
+        let vector = republished.deletion_vectors.values().next().unwrap();
+        assert_eq!(vector.namespace.as_ref(), Some(&parent));
+        assert!(!dir.join(&child.0).exists());
+
+        // Write, delete from an inherited segment, upsert an inherited doc.
+        idx.index_documents(child.clone(), vec![doc("d5", "five")])
+            .unwrap();
+        idx.flush_namespace(&child).unwrap();
+        let filter: FilterClause = serde_json::from_str(r#"{"term": {"id": "d1"}}"#).unwrap();
+        let m = idx.manifest(&child).unwrap();
+        assert_eq!(idx.delete_by_query(&child, &m, &filter).unwrap(), 1);
+        idx.replace_documents(child.clone(), vec![doc("d3", "THREE")])
+            .unwrap();
+        idx.flush_namespace(&child).unwrap();
+        let published_child = publish(&idx, &child);
+        for (segment, vector) in &published_child.deletion_vectors {
+            if !vector.is_inherited(&child) {
+                let path = vector.path(&child, segment).unwrap();
+                assert!(path.starts_with("t/test/"), "{path}");
+            }
+        }
+        for entry in &published_child.segments {
+            let home = published_child.segment_home(&child, &entry.segment_id);
+            assert!(
+                home == &parent || entry.segment_id.0.starts_with("t_test-"),
+                "{entry:?} in {home:?}"
+            );
+        }
+
+        // Full compaction merges inherited and own segments into the
+        // branch's prefix.
+        let result = idx
+            .compact_namespace_with_options(&child, CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
+        let compacted = publish(&idx, &child);
+        assert_eq!(compacted.segments.len(), 1);
+        assert!(!compacted.is_inherited_segment(&child, &compacted.segments[0].segment_id));
+        assert!(
+            compacted.branch.as_ref().unwrap().segment_homes.is_empty(),
+            "homes of compacted-away segments are pruned"
+        );
+        let expected_child = vec![
+            ("d3".to_string(), "THREE".to_string()),
+            ("d4".to_string(), "four".to_string()),
+            ("d5".to_string(), "five".to_string()),
+        ];
+        assert_eq!(
+            live_ids(&dir, &child, &idx.manifest(&child).unwrap()),
+            expected_child
+        );
+
+        // The parent: same bytes, same manifest, same documents.
+        assert_eq!(tree_bytes(&dir.join(&parent.0)), parent_files);
+        assert!(idx
+            .manifest(&parent)
+            .unwrap()
+            .same_contents(&parent_manifest));
+        assert_eq!(
+            live_ids(&dir, &parent, &idx.manifest(&parent).unwrap()),
+            vec![
+                ("d1".to_string(), "one".to_string()),
+                ("d3".to_string(), "three".to_string()),
+                ("d4".to_string(), "four".to_string()),
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn drop_namespace_refuses_unpublished_writes_and_forgets_published_ones() {
+        let dir = std::env::temp_dir().join(format!("kosha-drop-{}", uuid::Uuid::new_v4()));
+        let ns = NamespaceId("t/branch".into());
+        let idx = Indexer::new(dir.clone());
+        let doc = Document {
+            id: DocumentId("a".into()),
+            fields: vec![Field::text("text", "hello")],
+        };
+        idx.index_documents(ns.clone(), vec![doc.clone()]).unwrap();
+        let mut ran = false;
+        let refused = idx.drop_branch_namespace(&ns, || {
+            ran = true;
+            Ok(())
+        });
+        assert!(matches!(refused, Err(KoshaError::InvalidQuery(_))));
+        assert!(!ran, "nothing is removed while writes are unpublished");
+        idx.flush_namespace(&ns).unwrap();
+        publish(&idx, &ns);
+        // A failing removal leaves the namespace as it was.
+        assert!(idx
+            .drop_branch_namespace(&ns, || Err(KoshaError::ControlPlane("down".into())))
+            .is_err());
+        assert!(idx.manifest(&ns).is_some());
+        idx.drop_branch_namespace(&ns, || Ok(())).unwrap();
+        assert!(idx.manifest(&ns).is_none());
+        assert!(!idx.namespaces().contains(&ns));
+        // A restart has nothing to replay: the WAL was cleared on publish.
+        drop(idx);
+        let restarted = Indexer::new(dir.clone());
+        assert_eq!(restarted.pending_doc_count(&ns), 0);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

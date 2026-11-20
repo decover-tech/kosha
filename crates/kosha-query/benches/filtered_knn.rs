@@ -126,6 +126,7 @@ fn build_corpus(
         schema: None,
         retired: Default::default(),
         shards: None,
+        branch: None,
     };
     (manifest, vectors)
 }

@@ -264,6 +264,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - `GET /healthz` (liveness), `GET /readyz` (readiness), `GET /v1/stats` and per-namespace stats.
 - Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, warmup status, import a namespace.
 - Schema migrations via `kosha-server migrate`.
+- Namespace branching (copy-on-write). `POST /v1/namespaces/{ns}/branch` with `{"name": "<branch>"}` creates a new namespace whose manifest lists the parent's segments and deletion bitmaps where they already are, so it takes the same time for 1M documents as for 10 and copies nothing. Writes, deletes, upserts and compactions on the branch go to the branch's own prefix; the parent's files and query results do not change. `GET /v1/namespaces/{ns}/branches` lists a namespace's branches (`GET .../stats` on a branch shows its parent and how many segments it still shares). `DELETE /v1/namespaces/{ns}/branch` deletes a branch and removes only the objects in its own prefix that no remaining manifest lists: segments a branch of the branch still uses are kept. Only branches can be deleted this way. Admin rewrites (`rebuild-filter-blooms`, `backfill-offset-tables`) on a branch skip the segments it shares with its parent. Segment GC never deletes an object a branch still lists, and `DELETE /v1/namespaces/{ns}` refuses (409) a namespace whose segments a branch still shares: delete the branches first. A sharded namespace cannot be branched yet.
 
 ### API and clients
 
@@ -395,10 +396,11 @@ the routes marked *write* to the ingest pod.
 | Method and path | Body → response | Notes |
 |---|---|---|
 | `POST /v1/namespaces` | `CreateNamespaceRequest` → `CreateNamespaceResponse` | *write*. 409 if it exists, 400 for an invalid name or schema. Optional: namespaces still auto-create on first write. A `schema` is validated, echoed back and stored as the namespace schema, as `POST /v1/namespaces/{ns}/schema` would (see [Analyzers](#analyzers)). |
-| `DELETE /v1/namespaces/{ns}` | → `DeleteNamespaceResponse` | *write*. 404 if it does not exist. Permanent; see below. |
+| `DELETE /v1/namespaces/{ns}` | → `DeleteNamespaceResponse` | *write*. 404 if it does not exist, 409 while a branch still shares its segments. Permanent; see below. |
 | `POST /v1/namespaces/{ns}/documents` | `IndexDocumentsRequest` → `IndexDocumentsResponse` | *write*. Upsert by id. |
 | `POST /v1/namespaces/{ns}/flush` | → `FlushResponse` | *write*. Make buffered writes searchable. |
 | `POST /v1/namespaces/{ns}/delete` | `DeleteByQueryRequest` → `DeleteByQueryResponse` | *write*. Delete by query. |
+| `POST /v1/namespaces/{ns}/branch`, `GET /v1/namespaces/{ns}/branches`, `DELETE /v1/namespaces/{ns}/branch` | `{"name": "<branch>"}` → the branch; → its branches; → what was reclaimed | Create (*write*), list and delete (*write*) copy-on-write branches (#208). 409 if the name is taken, or for deleting a namespace that is not a branch. |
 | `POST /v1/namespaces/{ns}/shards` | `{"shards": N}` → `{"namespace", "shards", "changed"}` | *write*. Create the namespace sharded (#207); see [Namespace sharding](#namespace-sharding). |
 | `POST /v1/namespaces/{ns}/schema`, `GET /v1/namespaces/{ns}/schema` | `NamespaceSchema` | Set (*write*) or read the namespace schema; see [Analyzers](#analyzers). |
 | `POST /v1/namespaces/{ns}/search` | `SearchRequest` → `SearchResponse` | 404 for a missing namespace. |

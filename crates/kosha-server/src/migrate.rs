@@ -539,6 +539,7 @@ impl Publisher {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
                 // The rebuilt segments were analyzed with this schema.
                 schema: existing.schema.clone(),
                 retired: Default::default(),
@@ -688,6 +689,7 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
             shards: None,
@@ -840,6 +842,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
             shards: None,

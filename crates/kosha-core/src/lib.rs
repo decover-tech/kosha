@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod branch;
 pub mod deletes;
 pub mod fields;
 pub mod fuzzy;
@@ -127,6 +128,21 @@ pub trait ControlStore: Send + Sync {
         let _ = retire_at_least;
         Err(KoshaError::NotFound(format!(
             "this control store cannot delete namespace {}",
+            id.0
+        )))
+    }
+
+    /// Remove a namespace and its manifest from the registry, returning the
+    /// manifest it held (`Ok(None)` if there was no such namespace). Used by
+    /// branch deletion (#208); the caller reclaims the namespace's own
+    /// objects afterwards, keeping every one another manifest references
+    /// (see [`branch::References`]).
+    ///
+    /// The default refuses, so a store that cannot delete never silently
+    /// keeps a namespace the caller then reclaims the objects of.
+    fn remove_namespace(&mut self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
+        Err(KoshaError::ControlPlane(format!(
+            "this control store cannot remove namespace {}",
             id.0
         )))
     }
@@ -2674,9 +2690,70 @@ pub struct Manifest {
     /// before sharding existed) is an ordinary, unsharded namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shards: Option<u32>,
+    /// Set on a namespace created by `POST /v1/namespaces/{ns}/branch`
+    /// (#208): where it was branched from, and which of its segments live
+    /// in another namespace's storage prefix. `None` for every other
+    /// namespace (and every manifest written before branching existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<branch::BranchInfo>,
 }
 
 impl Manifest {
+    /// Namespace whose storage prefix (`{home}/{segment}/` on local disk
+    /// and in S3) holds `segment`'s files. A branch lists its parent's
+    /// segments without copying them (#208); everything else, and every
+    /// segment a branch writes itself, lives under the listing namespace.
+    pub fn segment_home<'a>(&'a self, ns: &'a NamespaceId, segment: &SegmentId) -> &'a NamespaceId {
+        self.branch
+            .as_ref()
+            .and_then(|branch| branch.segment_homes.get(segment))
+            .unwrap_or(ns)
+    }
+
+    /// Logical (data-dir / S3-key relative) directory of `segment`, as
+    /// listed by the manifest of `ns`: `{home}/{segment}`.
+    pub fn segment_rel_dir(&self, ns: &NamespaceId, segment: &SegmentId) -> String {
+        format!("{}/{}", self.segment_home(ns, segment).0, segment.0)
+    }
+
+    /// Local directory of `segment` under `data_dir`, as listed by the
+    /// manifest of `ns`.
+    pub fn segment_dir(
+        &self,
+        data_dir: &std::path::Path,
+        ns: &NamespaceId,
+        segment: &SegmentId,
+    ) -> std::path::PathBuf {
+        data_dir
+            .join(&self.segment_home(ns, segment).0)
+            .join(&segment.0)
+    }
+
+    /// Whether `segment` lives in another namespace's prefix (inherited
+    /// from a branch parent). Such a segment is already durable: the
+    /// listing namespace never uploads, rewrites or deletes it.
+    pub fn is_inherited_segment(&self, ns: &NamespaceId, segment: &SegmentId) -> bool {
+        self.segment_home(ns, segment) != ns
+    }
+
+    /// Drop branch bookkeeping for segments the manifest no longer lists
+    /// (compacted away). Keeps the row from growing with history.
+    pub fn retain_listed_segment_homes(&mut self) {
+        if let Some(branch) = self.branch.as_mut() {
+            if branch.segment_homes.is_empty() {
+                return;
+            }
+            let listed: std::collections::HashSet<&SegmentId> = self
+                .segments
+                .iter()
+                .map(|entry| &entry.segment_id)
+                .collect();
+            branch
+                .segment_homes
+                .retain(|segment, _| listed.contains(segment));
+        }
+    }
+
     /// The analysis settings new segments of this namespace are written
     /// with. A schema this binary cannot resolve (one set by a newer
     /// version naming an analyzer this one lacks) falls back to the
@@ -2707,6 +2784,7 @@ impl Manifest {
             schema: None,
             retired: Default::default(),
             shards: None,
+            branch: None,
         }
     }
 
@@ -4380,6 +4458,7 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
             shards: None,
