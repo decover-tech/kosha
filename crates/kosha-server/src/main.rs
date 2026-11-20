@@ -31,6 +31,7 @@ mod manifest_follow;
 #[cfg(feature = "migrate")]
 mod migrate;
 mod posting_spans;
+mod rerank;
 #[cfg(feature = "s3")]
 mod s3_storage;
 #[cfg(feature = "s3")]
@@ -258,6 +259,9 @@ struct AppState {
     completed_hydrations: Mutex<HashMap<(String, u64), HydrationVerdict>>,
     /// Whole-response cache for POST /search — see [`ResultCache`].
     result_cache: Mutex<ResultCache>,
+    /// Rerank providers (`SearchQuery.rerank`) and their metrics; see
+    /// [`rerank`].
+    rerankers: rerank::RerankRegistry,
     /// Posting-blob presence cache (Tier 1 O3), the sibling optimization to
     /// `completed_hydrations` above: that verdict can never cover posting
     /// blobs (PR #89 — they're fetched per query term, not per segment), so
@@ -1461,6 +1465,7 @@ impl AppState {
             gc_lock: Mutex::new(()),
             completed_hydrations: Mutex::new(HashMap::new()),
             result_cache: Mutex::new(ResultCache::new(result_cache_budget())),
+            rerankers: rerank::RerankRegistry::from_env(),
             posting_blob_presence: Mutex::new(HashMap::new()),
             // Warmup starts ready; `spawn_warmup` flips `false` only when
             // there's configured work to do (and back to `true` on
@@ -4235,6 +4240,7 @@ fn warmup_probe_query() -> kosha_core::SearchQuery {
         rank: None,
         mode: None,
         fields: Vec::new(),
+        rerank: Default::default(),
     }
 }
 
@@ -5443,6 +5449,7 @@ fn handle_stats(state: &AppState) -> String {
             state.indexer.retired_segment_count(),
             state.indexer.local_retired_count(),
         ),
+        "rerank": state.rerankers.stats_json(),
     }))
 }
 
@@ -5490,6 +5497,29 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     if let Err(e) = query.validate() {
         return search_error_response(&e);
     }
+    // A reranked request searches for its first stage (top `top_n` from
+    // offset 0) and is reranked and paged after scoring; see
+    // `kosha_query::rerank`. Unknown providers are a 400 before any work.
+    let reranker = match query.rerank {
+        Some(ref spec) => match state.rerankers.get(&spec.provider) {
+            Some(provider) => Some(Arc::clone(provider)),
+            None => {
+                return json_error(
+                    400,
+                    &format!(
+                        "unknown rerank provider '{}'; configured: {:?}",
+                        spec.provider,
+                        state.rerankers.names()
+                    ),
+                )
+            }
+        },
+        None => None,
+    };
+    let first_stage = query.first_stage_query();
+    // What hydration and the searcher see. The cache key below uses the
+    // full request, so rerank parameters are part of it.
+    let search_query = first_stage.as_ref().unwrap_or(&query);
 
     if let Err(e) = state.ensure_query_manifest_fresh(&ns, max_staleness) {
         return search_error_response(&e);
@@ -5541,7 +5571,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             state.record_search_access(
                 &ns,
                 manifest,
-                &query,
+                search_query,
                 &kosha_query::SearchPhaseStats::default(),
                 &HydrationOutcome::default(),
             );
@@ -5576,8 +5606,8 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         // or warmup's own probe) must not be trusted by a query that does
         // need one of them; `covers` enforces that per-file-class check
         // instead of trusting a flat "namespace hydrated" bool.
-        let needs_filters = query_filter_fields(&query);
-        let needs_vectors = query.knn.is_some();
+        let needs_filters = query_filter_fields(search_query);
+        let needs_vectors = search_query.knn.is_some();
         let cached_covers = state
             .completed_hydrations
             .lock()
@@ -5594,10 +5624,10 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             // shards as zero hits (non-deterministically per pod). It is
             // sub-ms when the shards are already local: one metadata stat
             // per term-shard per split segment.
-            state.ensure_query_posting_blobs(&ns, manifest, &query, &hydration_request)
+            state.ensure_query_posting_blobs(&ns, manifest, search_query, &hydration_request)
         } else {
             let outcome =
-                state.hydrate_segments_for_search(&ns, manifest, &query, &hydration_request);
+                state.hydrate_segments_for_search(&ns, manifest, search_query, &hydration_request);
             // Cache what this pass verified: the static scoring set is
             // local for this manifest version, so future warm queries with
             // matching-or-lesser needs skip the per-segment static checks
@@ -5644,7 +5674,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // Acquired after hydration (which has its own ceiling) so a search
     // waiting on S3 doesn't also hold a scoring slot.
     let t_queue = Instant::now();
-    let Some(_slot) = state.search_semaphore.acquire_or_shed() else {
+    let Some(slot) = state.search_semaphore.acquire_or_shed() else {
         // Shed rather than queue: see `Semaphore::acquire_or_shed`.
         return json_error(
             429,
@@ -5689,12 +5719,15 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     match state.searcher.search_with_hydrators(
         &ns,
         manifest,
-        &query,
+        search_query,
         tombstones,
         doc_store_hydrator,
         vector_fetch,
     ) {
-        Ok((result, phases)) => {
+        Ok((mut result, phases)) => {
+            // Scoring is done; a reranker round trip must not hold a
+            // scoring slot.
+            drop(slot);
             #[cfg(feature = "s3")]
             let hydration = HydrationOutcome {
                 page: *page_fetch.lock().unwrap(),
@@ -5710,7 +5743,15 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
                 result.total_hits,
                 result.knn_degraded_segments,
             );
-            state.record_search_access(&ns, manifest, &query, &phases, &hydration);
+            state.record_search_access(&ns, manifest, search_query, &phases, &hydration);
+            if let Some(ref provider) = reranker {
+                let (reranked, call) = kosha_query::rerank::apply(&query, result, provider);
+                result = reranked;
+                if let Some(call) = call {
+                    log_rerank(&ns, &call);
+                    state.rerankers.record(&call);
+                }
+            }
             let resp = json_ok(&result);
             // Only successful responses enter the cache, after the search
             // proved every needed file readable. A search that fell back to
@@ -5718,8 +5759,11 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             // segment's footer or postings weren't local isn't cached
             // either: the miss is usually transient (best-effort stats
             // hydration), and caching it would pin the degraded scores for
-            // the rest of this manifest version.
-            let cacheable = phases.bm25_stats != kosha_query::Bm25StatsUsed::SegmentFallback;
+            // the rest of this manifest version. Nor is a degraded rerank
+            // (a transient fallback that would serve the unreranked order
+            // until the namespace next changes).
+            let cacheable = phases.bm25_stats != kosha_query::Bm25StatsUsed::SegmentFallback
+                && result.rerank_degraded != Some(true);
             if let Some(key) = cache_key.filter(|_| cacheable) {
                 state.result_cache.lock().unwrap().insert(key, &resp);
             }
@@ -5996,6 +6040,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
                     .collect()
             })
             .unwrap_or_default(),
+        rerank: None,
     };
     if let Err(e) = query.validate() {
         return search_error_response(&e);
@@ -7799,6 +7844,24 @@ fn log_search_timing(
     );
 }
 
+/// One line per provider call, next to `search timing:`. Greppable as
+/// `rerank:`.
+fn log_rerank(ns: &NamespaceId, call: &kosha_query::rerank::RerankCall) {
+    let outcome = match call.outcome {
+        kosha_query::rerank::RerankOutcome::Ok => "ok".to_string(),
+        kosha_query::rerank::RerankOutcome::Timeout => "timeout".to_string(),
+        kosha_query::rerank::RerankOutcome::Error(ref e) => format!("error ({e})"),
+    };
+    println!(
+        "rerank: ns={} provider={} docs={} ms={:.1} billed_units={} outcome={outcome}",
+        ns.0,
+        call.provider,
+        call.documents,
+        call.latency.as_secs_f64() * 1e3,
+        call.billed_units.unwrap_or(0.0),
+    );
+}
+
 /// Map a search failure onto the right HTTP status: load-shedding
 /// (`KoshaError::Overloaded`, see `kosha_query::MemoryLedger`) is a
 /// transient 429 the client should retry with backoff, not a 500; a
@@ -9397,6 +9460,186 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     }
 
+    /// Scores a document by how often `term` occurs in it, after `delay`.
+    struct CountingReranker {
+        name: &'static str,
+        term: &'static str,
+        delay: Duration,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl kosha_query::rerank::RerankProvider for CountingReranker {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn rerank(
+            &self,
+            request: &kosha_query::rerank::RerankRequest,
+            _timeout: Duration,
+        ) -> Result<kosha_query::rerank::RerankResponse, kosha_query::rerank::RerankError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(self.delay);
+            Ok(kosha_query::rerank::RerankResponse {
+                scores: request
+                    .documents
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| (i, d.matches(self.term).count() as f64))
+                    .collect(),
+                billed_units: Some(1.0),
+            })
+        }
+    }
+
+    #[test]
+    fn hybrid_search_reranks_over_http() {
+        // Issue #251: rerank after RRF over HTTP — reorder, both scores,
+        // timeout fallback with `rerank_degraded`, cache keyed on rerank
+        // params (and degraded responses not cached), metrics in /stats.
+        let mut state = test_state();
+        let fast = Arc::new(CountingReranker {
+            name: "mock",
+            term: "notice",
+            delay: Duration::ZERO,
+            calls: Default::default(),
+        });
+        let slow = Arc::new(CountingReranker {
+            name: "slow",
+            term: "notice",
+            delay: Duration::from_millis(1_500),
+            calls: Default::default(),
+        });
+        state.rerankers = rerank::RerankRegistry::with_providers(vec![fast.clone(), slow.clone()]);
+        let ns = NamespaceId("rerankns".into());
+        let doc = |id: &str, text: &str, v: [f32; 2]| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text), Field::vector("emb", v.to_vec())],
+        };
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    doc("lex_top", "breach breach breach breach", [-1.0, 0.1]),
+                    doc("both", "breach breach notice", [0.99, 0.05]),
+                    doc("vec_top", "unrelated", [1.0, 0.0]),
+                    doc("weak", "breach notice notice notice and words", [0.0, 1.0]),
+                ],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |rerank: &str| {
+            let body = format!(
+                r#"{{"namespace":"rerankns","query_text":"breach","max_results":2,
+                    "source_excludes":["text","emb"],
+                    "knn":{{"field":"emb","vector":[1.0,0.0],"k":2,"num_candidates":1000}},
+                    "rank":{{"rrf":{{"rank_window_size":4}}}}{rerank}}}"#
+            );
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let parse = |resp: &str| -> serde_json::Value {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            serde_json::from_str(&resp[resp.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+        };
+        let ids = |v: &serde_json::Value| -> Vec<String> {
+            v["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let fused = parse(&post(""));
+        assert_eq!(ids(&fused), ["both", "lex_top"], "{fused}");
+        assert!(fused.get("rerank_degraded").is_none());
+
+        let rerank = r#","rerank":{"provider":"mock","field":"text","top_n":4}"#;
+        for round in 0..2 {
+            let v = parse(&post(rerank));
+            // "weak" has three "notice"s; RRF had it last.
+            assert_eq!(ids(&v), ["weak", "both"], "{v}");
+            assert_eq!(v["rerank_degraded"], false);
+            let top = &v["results"][0];
+            assert_eq!(top["score"], 3.0);
+            assert_eq!(top["rerank_score"], 3.0);
+            assert!(top["fused_score"].as_f64().unwrap() < 1.0 / 61.0, "{v}");
+            assert!(top["rank_details"]["lexical_rank"].is_u64(), "{v}");
+            assert_eq!(
+                v["results"][1]["fused_score"], fused["results"][0]["score"],
+                "{v}"
+            );
+            // The field was read by the reranker but stays excluded.
+            assert!(top["fields"].as_array().unwrap().is_empty(), "{v}");
+            // The second round is served from the result cache.
+            let calls = fast.calls.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(calls, 1, "round {round}");
+        }
+        // Different rerank params: a different cache key, a new call.
+        let v = parse(&post(
+            r#","rerank":{"provider":"mock","field":"text","top_n":3}"#,
+        ));
+        assert_eq!(fast.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(v["rerank_degraded"], false);
+
+        // Timeout: fused order, flagged, and not cached.
+        let timeout = r#","rerank":{"provider":"slow","field":"text","top_n":4,"timeout_ms":50}"#;
+        for expected_calls in 1..=2 {
+            let started = Instant::now();
+            let v = parse(&post(timeout));
+            assert!(started.elapsed() < Duration::from_millis(1_000));
+            assert_eq!(ids(&v), ids(&fused), "{v}");
+            assert_eq!(v["rerank_degraded"], true);
+            assert_eq!(v["rerank_degraded_reason"], "timeout after 50 ms");
+            assert_eq!(v["results"][0]["score"], fused["results"][0]["score"]);
+            assert_eq!(v["results"][0]["fused_score"], fused["results"][0]["score"]);
+            assert!(v["results"][0].get("rerank_score").is_none());
+            assert_eq!(
+                slow.calls.load(std::sync::atomic::Ordering::Relaxed),
+                expected_calls
+            );
+        }
+
+        for (bad, why) in [
+            (
+                r#","rerank":{"provider":"nope","field":"text"}"#,
+                "unknown rerank provider",
+            ),
+            (
+                r#","rerank":{"provider":"mock","field":"text","top_n":1}"#,
+                "top_n",
+            ),
+            (
+                r#","rerank":{"provider":"mock","field":"text","top_n":10}"#,
+                "rank_window_size",
+            ),
+            (r#","rerank":{"provider":"mock"}"#, "field"),
+        ] {
+            let resp = post(bad);
+            assert!(
+                resp.starts_with("HTTP/1.1 400") && resp.contains(why),
+                "{bad}: {resp}"
+            );
+        }
+
+        let stats = handle_stats(&state);
+        let stats: serde_json::Value =
+            serde_json::from_str(&stats[stats.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        let m = &stats["rerank"]["metrics"];
+        assert_eq!(m["mock"]["calls"], 2, "{stats}");
+        assert_eq!(m["mock"]["ok"], 2);
+        assert_eq!(m["mock"]["documents"], 7);
+        assert_eq!(m["mock"]["billed_units"], 2.0);
+        assert_eq!(m["slow"]["timeouts"], 2);
+        assert_eq!(
+            stats["rerank"]["providers"],
+            serde_json::json!(["mock", "slow"])
+        );
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn filter_pruned_segments_still_hydrate_for_namespace_bm25_stats() {
@@ -10849,6 +11092,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         };
 
         let unfiltered = state.hydrate_segments_for_search(
@@ -11173,6 +11417,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         };
         let verdict_key = (ns.0.clone(), manifest.version);
 
@@ -13180,6 +13425,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         };
         let with_vec = |v: Vec<f32>, k: usize| {
             let mut q = base.clone();

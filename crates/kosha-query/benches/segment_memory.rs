@@ -234,6 +234,7 @@ fn mk_query(text: &str) -> SearchQuery {
         rank: None,
         mode: None,
         fields: Vec::new(),
+        rerank: None,
     }
 }
 

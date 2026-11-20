@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+pub mod rerank;
+
 use kosha_core::fields::{field_norms_key, field_term_key, segment_field_chain};
 use kosha_core::fuzzy::{ExpandStats, FuzzyQuery, MAX_FUZZY_EDITS};
 use kosha_core::{
@@ -4887,6 +4889,27 @@ impl Searcher {
         )
     }
 
+    /// A request with `rerank`: run its first-stage query, then
+    /// [`rerank::apply`] with `provider`. Returns the call made, if any,
+    /// for metrics. `query.rerank` must be set.
+    pub fn search_reranked(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
+        provider: &Arc<dyn rerank::RerankProvider>,
+    ) -> Result<(SearchResult, Option<rerank::RerankCall>), KoshaError> {
+        query.validate()?;
+        let first = query.first_stage_query().ok_or_else(|| {
+            KoshaError::InvalidQuery("search_reranked needs a request with rerank".into())
+        })?;
+        let (result, _) = self.search_inner(namespace, manifest, &first, tombstones, None, None)?;
+        Ok(rerank::apply(query, result, provider))
+    }
+
     fn search_inner(
         &self,
         namespace: &NamespaceId,
@@ -4901,6 +4924,16 @@ impl Searcher {
         // Out-of-range BM25 parameters are a client error, not something
         // to clamp: every entry point funnels through here.
         query.validate()?;
+        if query.rerank.is_some() {
+            // The searcher never calls a provider; ignoring the field would
+            // silently return an unreranked page.
+            return Err(KoshaError::InvalidQuery(
+                "rerank is applied after the search: use Searcher::search_reranked, or \
+                 search SearchQuery::first_stage_query() and pass the result to \
+                 kosha_query::rerank::apply"
+                    .into(),
+            ));
+        }
         let mut hydrated;
         let manifest = if manifest
             .deletion_vectors
@@ -4929,6 +4962,8 @@ impl Searcher {
                     // No segments existed to search, degraded or otherwise —
                     // distinct from "searched N segments, 0 degraded".
                     knn_degraded_segments: None,
+                    rerank_degraded: None,
+                    rerank_degraded_reason: None,
                 },
                 phase_stats,
             ));
@@ -5413,6 +5448,8 @@ impl Searcher {
                 highlights: None,
                 highlight: None,
                 rank_details: cand.rank_details.clone(),
+                fused_score: None,
+                rerank_score: None,
             };
             if let Some(ref highlight) = query.highlight {
                 if !query_terms.is_empty() {
@@ -5438,6 +5475,8 @@ impl Searcher {
                 total_hits_relation,
                 aggregations: merged_aggs,
                 knn_degraded_segments: query.knn.as_ref().map(|_| knn_degraded_segments),
+                rerank_degraded: None,
+                rerank_degraded_reason: None,
             },
             phase_stats,
         ))
@@ -7788,6 +7827,8 @@ mod tests {
             highlights: None,
             highlight: None,
             rank_details: None,
+            fused_score: Default::default(),
+            rerank_score: Default::default(),
         };
         let terms = vec!["contract".to_string(), "breach".to_string()];
         let config: HighlightConfig = serde_json::from_value(serde_json::json!({
@@ -7842,6 +7883,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         }
     }
 
@@ -9977,6 +10019,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 2);
@@ -12681,6 +12724,7 @@ mod tests {
                     rank: None,
                     mode: None,
                     fields: Vec::new(),
+                    rerank: None,
                 },
                 None,
             )
@@ -12794,6 +12838,7 @@ mod tests {
                     rank: None,
                     mode: None,
                     fields: Vec::new(),
+                    rerank: None,
                 },
                 None,
             )
@@ -12882,6 +12927,7 @@ mod tests {
                     rank: None,
                     mode: None,
                     fields: Vec::new(),
+                    rerank: None,
                 },
                 None,
             )
@@ -12920,6 +12966,7 @@ mod tests {
                     rank: None,
                     mode: None,
                     fields: Vec::new(),
+                    rerank: None,
                 },
                 None,
             )
@@ -13214,6 +13261,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -13311,6 +13359,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         };
 
         let first = searcher.search(&ns, &manifest, &q, None).unwrap();
@@ -13399,6 +13448,7 @@ mod tests {
             rank: None,
             mode: None,
             fields: Vec::new(),
+            rerank: None,
         };
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
@@ -15801,6 +15851,99 @@ mod rrf_tests {
         let r = searcher.search(&ns(), &manifest, &q, None).unwrap();
         assert_eq!(r.results[0].doc_id.0, "lex_top");
         assert!(r.results[0].rank_details.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Issue #251: rerank after fusion, end to end over a real segment.
+    #[test]
+    fn rerank_reorders_the_fused_list_and_falls_back_on_timeout() {
+        use crate::rerank::{tests::MockProvider, RerankOutcome, RerankProvider};
+        let dir = scratch("rerank");
+        let (manifest, _) = write(&dir, "s", &[agreement_corpus()]);
+        let searcher = Searcher::new(dir.clone());
+
+        let fused = searcher
+            .search(
+                &ns(),
+                &manifest,
+                &hybrid("breach", 20, 10, rrf(Some(20), None)),
+                None,
+            )
+            .unwrap();
+        let fused_ids = ids(&fused);
+        // The mock scores by occurrences of "padding". The fused hit with
+        // the most is a long, weak lexical match that RRF put far down.
+        let paddings = |d: &ScoredDocument| {
+            d.fields
+                .iter()
+                .find(|f| f.name == "content")
+                .map_or(0, |f| f.value.matches("padding").count())
+        };
+        let pos = (0..fused.results.len())
+            .max_by_key(|&i| (paddings(&fused.results[i]), std::cmp::Reverse(i)))
+            .unwrap();
+        let expected = fused_ids[pos].clone();
+        let expected_paddings = paddings(&fused.results[pos]) as f64;
+        assert!(
+            expected.starts_with("lexfill") && pos >= 3,
+            "{expected} at {pos}: {fused_ids:?}"
+        );
+
+        let mut q = hybrid("breach", 3, 10, rrf(Some(20), None));
+        q.rerank = Some(kosha_core::RerankSpec {
+            provider: "mock".into(),
+            model: None,
+            field: "content".into(),
+            top_n: Some(20),
+            timeout_ms: Some(2_000),
+            query: None,
+        });
+        // The plain search entry points refuse rather than ignore it.
+        assert!(matches!(
+            searcher.search(&ns(), &manifest, &q, None),
+            Err(KoshaError::InvalidQuery(_))
+        ));
+
+        let mock = Arc::new(MockProvider::counting("padding"));
+        let provider: Arc<dyn RerankProvider> = mock.clone();
+        let (r, call) = searcher
+            .search_reranked(&ns(), &manifest, &q, None, &provider)
+            .unwrap();
+        assert_eq!(r.results[0].doc_id.0, expected, "{:?}", ids(&r));
+        assert_eq!(r.results.len(), 3);
+        assert_eq!(r.rerank_degraded, Some(false));
+        assert_eq!(r.total_hits, fused.total_hits);
+        let top = &r.results[0];
+        assert_eq!(top.rerank_score, Some(expected_paddings));
+        assert_eq!(top.score, expected_paddings);
+        assert_eq!(top.fused_score, Some(fused.results[pos].score));
+        assert_eq!(
+            top.rank_details, fused.results[pos].rank_details,
+            "per-retriever ranks are still reported"
+        );
+        let seen = mock.seen.lock().unwrap();
+        assert_eq!(seen[0].query, "breach");
+        assert_eq!(seen[0].documents.len(), fused_ids.len().min(20));
+        assert_eq!(call.unwrap().outcome, RerankOutcome::Ok);
+        drop(seen);
+
+        // Timeout: the fused order, flagged.
+        q.rerank.as_mut().unwrap().timeout_ms = Some(30);
+        let slow: Arc<dyn RerankProvider> = Arc::new(MockProvider {
+            delay: std::time::Duration::from_secs(3),
+            ..MockProvider::counting("padding")
+        });
+        let (r, call) = searcher
+            .search_reranked(&ns(), &manifest, &q, None, &slow)
+            .unwrap();
+        assert_eq!(ids(&r), fused_ids[..3]);
+        assert_eq!(r.rerank_degraded, Some(true));
+        for (hit, f) in r.results.iter().zip(&fused.results) {
+            assert_eq!(hit.score, f.score);
+            assert_eq!(hit.fused_score, Some(f.score));
+            assert_eq!(hit.rerank_score, None);
+        }
+        assert_eq!(call.unwrap().outcome, RerankOutcome::Timeout);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

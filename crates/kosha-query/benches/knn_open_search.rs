@@ -166,6 +166,7 @@ fn mk_query(text: &str, knn: Option<KnnQuery>) -> SearchQuery {
         rank: None,
         mode: None,
         fields: Vec::new(),
+        rerank: None,
     }
 }
 

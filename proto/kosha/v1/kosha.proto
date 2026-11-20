@@ -313,6 +313,20 @@ message SearchRequest {
   // Typo-tolerant term matching (HTTP "fuzzy"). A lexical query of its own:
   // not combinable with query_text / fields / wildcard / match_phrase.
   optional FuzzyQuery fuzzy = 19;
+
+  // Rerank the top hits (the fused list for a hybrid request) with an
+  // external model. HTTP: "rerank": {"provider": "cohere", "field": "content",
+  // "model": "rerank-v3.5", "top_n": 50, "timeout_ms": 2000}.
+  optional Rerank rerank = 20;
+}
+
+message Rerank {
+  string provider = 1;           // a provider the server has configured
+  optional string model = 2;     // default: the provider's configured model
+  string field = 3;              // stored field sent as each document's text
+  optional int32 top_n = 4;      // default from + max_results; >= that, <= 1000
+  optional int64 timeout_ms = 5; // default 2000, <= 60000
+  optional string query = 6;     // default query_text, then match_phrase.phrase, then fuzzy.value
 }
 
 message LimitPer {
@@ -416,11 +430,15 @@ message SearchResponse {
   repeated ScoredDocument results = 1;
   int64 total_hits = 2;
   google.protobuf.Struct aggregations = 3;
+  // Reranked requests only: true when the provider timed out or failed and
+  // results are in first-stage order.
+  optional bool rerank_degraded = 4;
+  optional string rerank_degraded_reason = 5;
 }
 
 message ScoredDocument {
   string doc_id = 1;
-  double score = 2;  // the fused RRF score for a hybrid request
+  double score = 2;  // the fused RRF score for a hybrid request; the rerank score when reranked
   repeated Field fields = 3;
   // Deprecated: set only for the legacy single-field HighlightConfig.field
   // request; use `highlight`.
@@ -431,6 +449,10 @@ message ScoredDocument {
   // request (ES "highlight" shape). Fields the hit lacks, or that are not
   // text, are absent.
   map<string, HighlightFragments> highlight = 6;
+  // Reranked requests only: the first-stage (fused) score, and the
+  // provider's score (= score; unset when the rerank degraded).
+  optional double fused_score = 7;
+  optional double rerank_score = 8;
 }
 
 // 1-based ranks in each retriever's namespace-wide list; unset when the hit

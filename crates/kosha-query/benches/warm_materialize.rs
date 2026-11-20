@@ -149,6 +149,7 @@ fn mk_query(text: &str, topk: usize) -> SearchQuery {
         rank: None,
         mode: None,
         fields: Vec::new(),
+        rerank: None,
     }
 }
 

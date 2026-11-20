@@ -2528,7 +2528,48 @@ pub struct SearchQuery {
     /// [`rank::RankBySpec`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank_by: Option<RankBySpec>,
+    /// Rerank the top `rerank.top_n` first-stage hits (the fused list for a
+    /// hybrid request) with an external model before paging. The searcher
+    /// itself never calls a provider: see `kosha_query::rerank`. Part of
+    /// the serialized query, so part of every result-cache key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<RerankSpec>,
 }
+
+/// See `SearchQuery.rerank`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RerankSpec {
+    /// A provider name the server has configured (e.g. `"cohere"`). An
+    /// unknown name is a 400.
+    pub provider: String,
+    /// Model id passed to the provider. `None` uses the provider's
+    /// configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Stored field whose text is sent as each candidate document.
+    pub field: String,
+    /// How many first-stage hits to rerank. Default `from + max_results`;
+    /// must be at least that, at most [`MAX_RERANK_TOP_N`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<usize>,
+    /// How long to wait for the provider before falling back to the
+    /// first-stage order. Default [`DEFAULT_RERANK_TIMEOUT_MS`], at most
+    /// [`MAX_RERANK_TIMEOUT_MS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Text the candidates are scored against. Default `query_text`, or
+    /// the `match_phrase` phrase; required when the request has neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+}
+
+/// Default `rerank.timeout_ms`.
+pub const DEFAULT_RERANK_TIMEOUT_MS: u64 = 2_000;
+/// Upper bound on `rerank.timeout_ms`.
+pub const MAX_RERANK_TIMEOUT_MS: u64 = 60_000;
+/// Upper bound on `rerank.top_n` (Cohere's per-request document limit).
+pub const MAX_RERANK_TOP_N: usize = 1_000;
 
 /// Proto `RetrievalMode`, as the JSON API spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2720,6 +2761,9 @@ impl SearchQuery {
             }
             _ => {}
         }
+        if let Some(ref rerank) = self.rerank {
+            self.validate_rerank(rerank)?;
+        }
         if let Some(ref rank) = self.rank {
             let Some(ref rrf) = rank.rrf else {
                 return Err(KoshaError::InvalidQuery(
@@ -2778,6 +2822,119 @@ impl SearchQuery {
             Some(ref rank_by) if page > 0 => page.max(rank_by.window(self.max_results)),
             _ => page,
         }
+    }
+
+    fn validate_rerank(&self, rerank: &RerankSpec) -> Result<(), KoshaError> {
+        let bad = |msg: String| Err(KoshaError::InvalidQuery(msg));
+        if rerank.provider.trim().is_empty() {
+            return bad("rerank.provider must not be empty".into());
+        }
+        if rerank.field.trim().is_empty() {
+            return bad("rerank.field must not be empty".into());
+        }
+        if rerank.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+            return bad("rerank.model must not be empty when given".into());
+        }
+        let page_end = self.from.saturating_add(self.max_results);
+        let top_n = self.rerank_top_n().unwrap_or(page_end);
+        if top_n == 0 || top_n > MAX_RERANK_TOP_N {
+            return bad(format!(
+                "rerank.top_n ({top_n}) must be between 1 and {MAX_RERANK_TOP_N}"
+            ));
+        }
+        if top_n < page_end {
+            return bad(format!(
+                "rerank.top_n ({top_n}) must be >= from + max_results ({page_end}): only \
+                 reranked hits can be returned"
+            ));
+        }
+        if let Some(timeout) = rerank.timeout_ms {
+            if timeout == 0 || timeout > MAX_RERANK_TIMEOUT_MS {
+                return bad(format!(
+                    "rerank.timeout_ms ({timeout}) must be between 1 and {MAX_RERANK_TIMEOUT_MS}"
+                ));
+            }
+        }
+        if !self.sort.is_empty() || self.search_after.is_some() {
+            return bad(
+                "rerank orders hits by the reranker's score; it cannot be combined with \
+                 sort or search_after (page with from/max_results)"
+                    .into(),
+            );
+        }
+        if self.rerank_query_text().is_none() {
+            return bad(
+                "rerank needs query text: set rerank.query, or use query_text, \
+                 match_phrase or fuzzy"
+                    .into(),
+            );
+        }
+        if let Some(window) = self
+            .rank
+            .as_ref()
+            .and_then(|r| r.rrf.as_ref())
+            .and_then(|r| r.rank_window_size)
+        {
+            if window < top_n {
+                return bad(format!(
+                    "rerank.top_n ({top_n}) must be <= rank.rrf.rank_window_size ({window}): \
+                     the fused list is only that long"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolved `rerank.top_n` (default `from + max_results`), or `None`
+    /// when the request does not rerank.
+    pub fn rerank_top_n(&self) -> Option<usize> {
+        let rerank = self.rerank.as_ref()?;
+        Some(
+            rerank
+                .top_n
+                .unwrap_or_else(|| self.from.saturating_add(self.max_results)),
+        )
+    }
+
+    /// The text a reranker scores candidates against: `rerank.query`,
+    /// else `query_text`, else the `match_phrase` phrase, else the `fuzzy`
+    /// value.
+    pub fn rerank_query_text(&self) -> Option<&str> {
+        let rerank = self.rerank.as_ref()?;
+        [
+            rerank.query.as_deref(),
+            Some(self.query_text.as_str()),
+            self.match_phrase.as_ref().map(|p| p.phrase.as_str()),
+            self.fuzzy.as_ref().map(|f| f.value.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|t| !t.is_empty())
+    }
+
+    /// The query the searcher runs for a reranked request: the top
+    /// `top_n` hits from offset 0, with the rerank field returned even if
+    /// the source filter would drop it. `None` when the request does not
+    /// rerank. Totals, aggregations and fusion are those of this query;
+    /// for a hybrid request without an explicit `rank_window_size` the
+    /// fused window defaults to `top_n` rather than `max_results`.
+    pub fn first_stage_query(&self) -> Option<SearchQuery> {
+        let rerank = self.rerank.as_ref()?;
+        let top_n = self.rerank_top_n()?;
+        let mut first = self.clone();
+        first.rerank = None;
+        first.from = 0;
+        first.max_results = top_n;
+        if let Some(ref mut includes) = first.source_includes {
+            if !includes.contains(&rerank.field) {
+                includes.push(rerank.field.clone());
+            }
+        }
+        if let Some(ref mut excludes) = first.source_excludes {
+            excludes.retain(|f| f != &rerank.field);
+        }
+        Some(first)
     }
 
     /// True when the request has a lexical retriever: query text, a
@@ -3016,6 +3173,16 @@ pub struct ScoredDocument {
     /// retriever's list. `score` is then the fused RRF score.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank_details: Option<RankDetails>,
+    /// Reranked requests only: the first-stage score (the RRF score for a
+    /// hybrid request) before reranking. Set on every hit of a reranked
+    /// request, including when the rerank degraded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fused_score: Option<f64>,
+    /// Reranked requests only: the provider's relevance score. `score`
+    /// equals it. Absent when the rerank degraded (`score` is then the
+    /// first-stage score).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f64>,
 }
 
 /// Whether `SearchResult.total_hits` is the exact match count or a capped
@@ -3051,6 +3218,15 @@ pub struct SearchResult {
     /// told a degraded response from a healthy one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knn_degraded_segments: Option<u32>,
+    /// `None` when the request did not ask for a rerank. `Some(true)` when
+    /// the provider timed out or failed and the hits are in first-stage
+    /// order instead; `Some(false)` when the rerank applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_degraded: Option<bool>,
+    /// Why the rerank degraded (`"timeout after 500 ms"`, a provider
+    /// error). Never contains credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_degraded_reason: Option<String>,
 }
 
 // ─── Indexing types ────────────────────────────────────────────────────────
@@ -4174,5 +4350,108 @@ mod aggregation_parsing {
             serde_json::to_string(&plain).unwrap(),
             r#"{"key":"k","doc_count":2}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod rerank_spec {
+    //! Issue #251: request-level checks and the first-stage query.
+    use super::*;
+
+    fn query(json: &str) -> SearchQuery {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn defaults_and_first_stage_query() {
+        let q = query(
+            r#"{"query_text": "breach", "from": 5, "max_results": 5,
+                "source_includes": ["title"], "source_excludes": ["body", "emb"],
+                "rerank": {"provider": "cohere", "field": "body"}}"#,
+        );
+        assert!(q.validate().is_ok());
+        assert_eq!(q.rerank_top_n(), Some(10));
+        assert_eq!(q.rerank_query_text(), Some("breach"));
+        let first = q.first_stage_query().unwrap();
+        assert!(first.rerank.is_none());
+        assert_eq!((first.from, first.max_results), (0, 10));
+        // The field is fetched for the reranker even when the caller's
+        // source filter drops it.
+        assert_eq!(first.source_includes.unwrap(), vec!["title", "body"]);
+        assert_eq!(first.source_excludes.unwrap(), vec!["emb"]);
+        assert!(query(r#"{"query_text": "x"}"#)
+            .first_stage_query()
+            .is_none());
+    }
+
+    #[test]
+    fn rerank_query_text_falls_back_to_phrase_then_needs_explicit_text() {
+        let q = query(
+            r#"{"query_text": "", "match_phrase": {"field": "t", "phrase": "material breach"},
+                "rerank": {"provider": "p", "field": "t"}}"#,
+        );
+        assert_eq!(q.rerank_query_text(), Some("material breach"));
+        let q = query(
+            r#"{"query_text": "", "knn": {"field": "e", "vector": [1.0]},
+                "rerank": {"provider": "p", "field": "t"}}"#,
+        );
+        assert!(matches!(q.validate(), Err(KoshaError::InvalidQuery(_))));
+        let q = query(
+            r#"{"query_text": "", "knn": {"field": "e", "vector": [1.0]},
+                "rerank": {"provider": "p", "field": "t", "query": "termination"}}"#,
+        );
+        assert!(q.validate().is_ok());
+        assert_eq!(q.rerank_query_text(), Some("termination"));
+    }
+
+    #[test]
+    fn invalid_rerank_requests_are_rejected() {
+        for bad in [
+            r#""rerank": {"provider": "", "field": "t"}"#,
+            r#""rerank": {"provider": "p", "field": ""}"#,
+            r#""rerank": {"provider": "p", "field": "t", "model": " "}"#,
+            r#""rerank": {"provider": "p", "field": "t", "top_n": 0}"#,
+            r#""rerank": {"provider": "p", "field": "t", "top_n": 5}"#,
+            r#""rerank": {"provider": "p", "field": "t", "top_n": 1001}"#,
+            r#""rerank": {"provider": "p", "field": "t", "timeout_ms": 0}"#,
+            r#""rerank": {"provider": "p", "field": "t", "timeout_ms": 60001}"#,
+            r#""rerank": {"provider": "p", "field": "t"}, "sort": [{"date": {"order": "asc"}}]"#,
+            r#""rerank": {"provider": "p", "field": "t"}, "search_after": ["a"]"#,
+            r#""rerank": {"provider": "p", "field": "t", "top_n": 50},
+               "knn": {"field": "e", "vector": [1.0]},
+               "rank": {"rrf": {"rank_window_size": 20}}"#,
+        ] {
+            let q = query(&format!(
+                r#"{{"query_text": "x", "max_results": 10, {bad}}}"#
+            ));
+            assert!(
+                matches!(q.validate(), Err(KoshaError::InvalidQuery(_))),
+                "{bad}"
+            );
+        }
+        // Unknown keys are a parse error (400), not silently ignored.
+        assert!(serde_json::from_str::<SearchQuery>(
+            r#"{"query_text": "x", "rerank": {"provider": "p", "field": "t", "topn": 5}}"#
+        )
+        .is_err());
+        let ok = query(
+            r#"{"query_text": "x", "max_results": 10,
+                "knn": {"field": "e", "vector": [1.0]},
+                "rank": {"rrf": {"rank_window_size": 50}},
+                "rerank": {"provider": "p", "field": "t", "top_n": 50, "timeout_ms": 60000}}"#,
+        );
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn absent_rerank_serializes_as_before() {
+        // A request without rerank keeps its pre-#251 JSON, so existing
+        // result-cache keys and fan-out payloads are unchanged.
+        let v = serde_json::to_value(query(r#"{"query_text": "x"}"#)).unwrap();
+        assert!(v.get("rerank").is_none());
+        let hit: ScoredDocument =
+            serde_json::from_str(r#"{"doc_id": "a", "score": 1.0, "fields": []}"#).unwrap();
+        let v = serde_json::to_value(hit).unwrap();
+        assert!(v.get("fused_score").is_none() && v.get("rerank_score").is_none());
     }
 }

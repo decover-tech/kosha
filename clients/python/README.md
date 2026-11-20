@@ -117,6 +117,26 @@ schema lists without a type appears as `{}`; the client never guesses a type.
 `client.indices.get_settings(index=...)` reports only `{"index": {"provided_name": "<index>"}}`.
 Kosha has no shards, replicas or refresh interval per namespace, so none are reported.
 
+## Rerank
+
+A Cohere rerank over the top search hits, which Sage runs today as
+
+```python
+hits = client.search(index, body)["hits"]["hits"]
+co.rerank(model="rerank-v3.5", query=q, documents=[h["_source"]["content"] for h in hits], top_n=50)
+```
+
+becomes one call; the server calls the provider and holds the API key:
+
+```python
+resp = client.search(index, body, rerank=KoshaClient.rerank_spec("content", model="rerank-v3.5", top_n=50))
+```
+
+`rerank` can also go in the body (Cohere's `rank_fields: ["content"]` is accepted for `field`).
+Each hit's `_score` is the rerank score, with `_fused_score` (search stage) and `_rerank_score`
+alongside. If the provider times out or fails, hits come back in search order and
+`resp["rerank"] == {"degraded": True, "reason": ...}`.
+
 ## Changelog
 
 ### 0.2.15
