@@ -18,7 +18,7 @@ pub use analysis::{
     AnalysisConfig, AnalyzerSpec, FieldSchema, NamespaceSchema, SegmentAnalysis, TokenFilterSpec,
     TokenizerKind,
 };
-pub use docset::{evaluate_filter, DocSet};
+pub use docset::{check_filter, evaluate_filter, DocSet};
 pub use fields::{FieldBoost, FieldIndex, FieldStats, ALL_FIELD};
 pub use fuzzy::{Fuzziness, FuzzyQuery};
 pub use rank::{CompiledRankBy, RankBySpec};
@@ -353,6 +353,11 @@ pub enum FilterClause {
     Exists {
         exists: ExistsFilter,
     },
+    /// The field's value (or, for a list value, one of its elements)
+    /// starts with a given string. See [`PrefixFilter`].
+    Prefix {
+        prefix: PrefixFilter,
+    },
     /// A `GeoPoint` field within `distance` of a point (issue #212).
     GeoDistance {
         geo_distance: GeoDistanceFilter,
@@ -439,6 +444,7 @@ impl FilterClause {
             Self::Range { range } => range.keys().for_each(|k| f(k)),
             Self::Exists { exists } => f(&exists.field),
             Self::GeoDistance { geo_distance } => f(&geo_distance.field),
+            Self::Prefix { prefix } => f(&prefix.field),
             Self::MatchAll { .. } => {}
             Self::Bool { bool } => {
                 for clause in bool.must.iter().chain(&bool.must_not).chain(&bool.should) {
@@ -456,8 +462,128 @@ pub struct ExistsFilter {
     pub field: String,
 }
 
+/// Body of a `prefix` clause: one field and the prefix its value must
+/// start with.
+///
+/// Wire shape mirrors OpenSearch / Elasticsearch, in either form:
+///
+/// ```json
+/// {"prefix": {"path": "/matters/2026/"}}
+/// {"prefix": {"path": {"value": "/matters/2026/", "case_insensitive": true}}}
+/// ```
+///
+/// **Case-sensitive by default**, like `term` (and like OpenSearch's
+/// `prefix`). A filter decides which documents a search may return and
+/// which documents `delete_by_query` removes, so it is exact unless asked
+/// otherwise: `{"prefix": {"sku": "AB"}}` must not quietly also match
+/// `ab-…`. The `wildcard` *query* defaults the other way because it is a
+/// full-text convenience over analyzed (lowercased) terms; a filter runs
+/// against raw keyword values, where case is data. `case_insensitive: true`
+/// opts in, folding both sides with Unicode lowercase as `wildcard` does.
+///
+/// Parsing is strict (issue #170): exactly one field, a string prefix, and
+/// in the long form only `value` and `case_insensitive`. Anything else is
+/// an error rather than a clause that matches more than was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixFilter {
+    pub field: String,
+    pub value: String,
+    pub case_insensitive: bool,
+}
+
+impl Serialize for PrefixFilter {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(1))?;
+        if self.case_insensitive {
+            map.serialize_entry(
+                &self.field,
+                &serde_json::json!({"value": self.value, "case_insensitive": true}),
+            )?;
+        } else {
+            // The short form, so the default clause re-serializes to exactly
+            // what a client most likely sent.
+            map.serialize_entry(&self.field, &self.value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for PrefixFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value.as_object().ok_or_else(|| {
+            D::Error::custom(
+                "prefix clause must be an object with exactly one field, e.g. \
+                 {\"prefix\": {\"path\": \"/a/\"}}",
+            )
+        })?;
+        let mut entries = obj.iter();
+        let (field, body) = entries.next().ok_or_else(|| {
+            D::Error::custom("prefix clause names no field; expected exactly one")
+        })?;
+        if let Some((extra, _)) = entries.next() {
+            return Err(D::Error::custom(format!(
+                "prefix clause must name exactly one field, found `{field}` and \
+                 `{extra}`; wrap multiple clauses in a `bool`"
+            )));
+        }
+        let (prefix, case_insensitive) = match body {
+            serde_json::Value::String(s) => (s.clone(), false),
+            serde_json::Value::Object(opts) => {
+                let mut prefix = None;
+                let mut case_insensitive = false;
+                for (key, v) in opts {
+                    match key.as_str() {
+                        "value" => {
+                            prefix = Some(
+                                v.as_str()
+                                    .ok_or_else(|| {
+                                        D::Error::custom(format!(
+                                            "prefix `{field}`.value must be a string, got {v}"
+                                        ))
+                                    })?
+                                    .to_owned(),
+                            )
+                        }
+                        "case_insensitive" => {
+                            case_insensitive = v.as_bool().ok_or_else(|| {
+                                D::Error::custom(format!(
+                                    "prefix `{field}`.case_insensitive must be a boolean, got {v}"
+                                ))
+                            })?
+                        }
+                        other => {
+                            return Err(D::Error::custom(format!(
+                                "unknown prefix option `{other}` for field `{field}`, \
+                                 expected: value, case_insensitive"
+                            )))
+                        }
+                    }
+                }
+                let prefix = prefix.ok_or_else(|| {
+                    D::Error::custom(format!("prefix `{field}` is missing `value`"))
+                })?;
+                (prefix, case_insensitive)
+            }
+            other => {
+                return Err(D::Error::custom(format!(
+                    "prefix `{field}` must be a string or {{\"value\": ..., \
+                     \"case_insensitive\": ...}}, got {other}"
+                )))
+            }
+        };
+        Ok(PrefixFilter {
+            field: field.clone(),
+            value: prefix,
+            case_insensitive,
+        })
+    }
+}
+
 /// Clause keys `FilterClause` accepts, as reported in parse errors.
-const FILTER_CLAUSE_KEYS: [&str; 7] = [
+const FILTER_CLAUSE_KEYS: [&str; 8] = [
     "term",
     "terms",
     "range",
@@ -465,6 +591,7 @@ const FILTER_CLAUSE_KEYS: [&str; 7] = [
     "match_all",
     "exists",
     "geo_distance",
+    "prefix",
 ];
 
 /// Deserialized by dispatching on the clause's single key rather than with
@@ -538,15 +665,19 @@ impl<'de> Deserialize<'de> for FilterClause {
             "geo_distance" => Ok(FilterClause::GeoDistance {
                 geo_distance: body(inner)?,
             }),
+            "prefix" => Ok(FilterClause::Prefix {
+                prefix: body(inner)?,
+            }),
             other => {
                 let hint = match other {
                     "filter" | "must" | "must_not" | "should" | "minimum_should_match" => {
                         " — these belong inside a `bool` clause, e.g. \
                          {\"bool\": {\"must\": [...]}}"
                     }
-                    "match" | "match_phrase" | "wildcard" | "prefix" => {
+                    "match" | "match_phrase" | "wildcard" | "regexp" => {
                         " — full-text and wildcard matching is not part of the \
-                         filter language; use the query text instead"
+                         filter language; use the query text instead (for a \
+                         keyword prefix, use the `prefix` filter clause)"
                     }
                     _ => "",
                 };
@@ -2178,11 +2309,14 @@ pub fn segment_may_match(
             true
         }
         // A field with no bloom may still be a numeric column, so the
-        // absence of a bloom cannot prove the field is absent.
+        // absence of a bloom cannot prove the field is absent. A bloom
+        // answers "is this exact value present?", which says nothing about
+        // values that merely start with a prefix, so `prefix` never prunes.
         FilterClause::Range { .. }
         | FilterClause::MatchAll { .. }
         | FilterClause::Exists { .. }
-        | FilterClause::GeoDistance { .. } => true,
+        | FilterClause::GeoDistance { .. }
+        | FilterClause::Prefix { .. } => true,
     }
 }
 
@@ -3465,6 +3599,119 @@ mod filter_clause_parsing {
             }
             other => panic!("expected Bool, got {other:?}"),
         }
+    }
+
+    fn prefix_of(clause: FilterClause) -> PrefixFilter {
+        match clause {
+            FilterClause::Prefix { prefix } => prefix,
+            other => panic!("expected Prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_short_form_parses_case_sensitive() {
+        let p = prefix_of(parse(r#"{"prefix": {"path": "/matters/2026/"}}"#).unwrap());
+        assert_eq!(
+            p,
+            PrefixFilter {
+                field: "path".into(),
+                value: "/matters/2026/".into(),
+                case_insensitive: false,
+            }
+        );
+    }
+
+    #[test]
+    fn prefix_long_form_parses() {
+        let p = prefix_of(
+            parse(r#"{"prefix": {"sku": {"value": "ab", "case_insensitive": true}}}"#).unwrap(),
+        );
+        assert_eq!(p.field, "sku");
+        assert_eq!(p.value, "ab");
+        assert!(p.case_insensitive);
+        let p = prefix_of(parse(r#"{"prefix": {"sku": {"value": "ab"}}}"#).unwrap());
+        assert!(!p.case_insensitive, "long form defaults to case-sensitive");
+        let p = prefix_of(parse(r#"{"prefix": {"sku": ""}}"#).unwrap());
+        assert_eq!(
+            p.value, "",
+            "an empty prefix is allowed (behaves like exists)"
+        );
+    }
+
+    #[test]
+    fn prefix_round_trips_through_serde() {
+        for json in [
+            r#"{"prefix":{"path":"/a/b/"}}"#,
+            r#"{"prefix":{"sku":{"value":"AB","case_insensitive":true}}}"#,
+            r#"{"bool":{"must":[{"prefix":{"status":"arch"}}],"must_not":[],"should":[],"minimum_should_match":1}}"#,
+        ] {
+            let parsed = parse(json).unwrap();
+            let out = serde_json::to_string(&parsed).unwrap();
+            let expected: serde_json::Value = serde_json::from_str(json).unwrap();
+            let actual: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(actual, expected, "{json} re-serialized as {out}");
+            // And the re-serialized form parses back to the same clause.
+            assert_eq!(serde_json::to_string(&parse(&out).unwrap()).unwrap(), out);
+        }
+        // Long form without the flag normalizes to the short form.
+        let out =
+            serde_json::to_string(&parse(r#"{"prefix": {"p": {"value": "x"}}}"#).unwrap()).unwrap();
+        assert_eq!(out, r#"{"prefix":{"p":"x"}}"#);
+    }
+
+    #[test]
+    fn malformed_prefix_is_rejected_never_match_all() {
+        // Issue #170: each of these must be an error, not a clause that
+        // matches more than was asked for.
+        for (json, needle) in [
+            (r#"{"prefix": {"path": 7}}"#, "must be a string"),
+            (r#"{"prefix": {"path": null}}"#, "must be a string"),
+            (r#"{"prefix": {"path": ["a"]}}"#, "must be a string"),
+            (r#"{"prefix": {"a": "x", "b": "y"}}"#, "exactly one field"),
+            (r#"{"prefix": {}}"#, "no field"),
+            (r#"{"prefix": "path"}"#, "exactly one field"),
+            (r#"{"prefix": null}"#, "exactly one field"),
+            (r#"{"prefix": {"path": {"value": 1}}}"#, "must be a string"),
+            (r#"{"prefix": {"path": {}}}"#, "missing `value`"),
+            (
+                r#"{"prefix": {"path": {"case_insensitive": true}}}"#,
+                "missing `value`",
+            ),
+            (
+                r#"{"prefix": {"path": {"value": "a", "case_insensitive": "yes"}}}"#,
+                "must be a boolean",
+            ),
+            (
+                r#"{"prefix": {"path": {"value": "a", "boost": 2}}}"#,
+                "unknown prefix option `boost`",
+            ),
+            (
+                r#"{"bool": {"must": [{"prefix": {"path": {"value": "a", "rewrite": "x"}}}]}}"#,
+                "unknown prefix option `rewrite`",
+            ),
+        ] {
+            let err = parse(json).expect_err(json);
+            assert!(err.to_string().contains(needle), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn wildcard_filter_hint_points_at_prefix() {
+        let err = parse(r#"{"wildcard": {"a": "b*"}}"#).unwrap_err();
+        assert!(err.to_string().contains("`prefix`"), "{err}");
+    }
+
+    #[test]
+    fn prefix_never_prunes_a_segment_by_bloom() {
+        let blooms = HashMap::from([("path".to_string(), BloomFilter::build(["abc"]))]);
+        // A term on a value the bloom has never seen is pruned...
+        let term = parse(r#"{"term": {"path": "zzz"}}"#).unwrap();
+        assert!(!segment_may_match(&term, Some(&blooms)));
+        // ...but a prefix cannot be answered by an exact-value bloom.
+        let clause = parse(r#"{"prefix": {"path": "zzz"}}"#).unwrap();
+        assert!(segment_may_match(&clause, Some(&blooms)));
+        let clause = parse(r#"{"prefix": {"other": "zzz"}}"#).unwrap();
+        assert!(segment_may_match(&clause, Some(&blooms)));
     }
 
     #[test]

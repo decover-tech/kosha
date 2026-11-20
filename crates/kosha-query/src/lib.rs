@@ -319,10 +319,14 @@ impl TrackedSegment {
     /// column fails the request instead of matching nothing. The set is
     /// also the segment's pre-filter for a filtered vector probe (#252):
     /// [`DocSet::to_bitmap`] gives it as a roaring bitmap.
+    /// Fails, and caches nothing, when the clause cannot apply to this
+    /// segment's columns (see [`kosha_core::check_filter`]).
     fn filter_set(&self, key: &str, clause: &FilterClause) -> Result<Arc<DocSet>, KoshaError> {
         if let Some(set) = self.filter_sets.lock().unwrap().get(key) {
             return Ok(Arc::clone(set));
         }
+        let store = self.reader.filter_store();
+        kosha_core::check_filter(clause, &store).map_err(KoshaError::InvalidQuery)?;
         // Evaluated outside the lock: two requests racing on a new filter
         // both compute it, and one result is dropped. That is cheaper than
         // making every other request for this segment wait behind a scan.
@@ -1785,6 +1789,7 @@ impl FilterApplier {
         store: &FilterStore,
         candidates: &HashSet<u32>,
     ) -> Result<HashSet<u32>, KoshaError> {
+        kosha_core::check_filter(clause, store).map_err(KoshaError::InvalidQuery)?;
         let doc_count = candidates.iter().max().map_or(0, |max| max + 1);
         let passing = kosha_core::evaluate_filter(clause, store, doc_count);
         Ok(candidates
@@ -19676,5 +19681,218 @@ mod nested_attribute_tests {
         assert_eq!(names, vec!["k", "tags"]);
         assert!(store.float_fields.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// The `prefix` filter clause (#199, #217) end to end through the
+/// searcher, over a namespace of two segments, on every path a filter is
+/// applied: lexical scoring, filter-only, and `knn.filter`.
+#[cfg(test)]
+mod prefix_filter_tests {
+    use super::*;
+    use kosha_core::{DocumentId, Field, KnnQuery, ManifestEntry, SegmentId};
+    use kosha_segment::SegmentWriter;
+
+    /// `(segment, doc id, path or None)`; every document says "contract",
+    /// has a `page` and a vector a little further round the circle.
+    const DOCS: &[(&str, &str, Option<&str>)] = &[
+        ("s1", "d0", Some("/matters/2026/a")),
+        ("s1", "d1", Some("/matters/2025/b")),
+        ("s1", "d2", Some("/Matters/2026/c")),
+        ("s1", "d3", Some(r#"["/x","/matters/2026/l"]"#)),
+        ("s2", "d4", Some("/matters/2026/z")),
+        ("s2", "d5", Some("/other")),
+        ("s2", "d6", None),
+        ("s2", "d7", Some("/matters/2026/q")),
+    ];
+
+    fn corpus(name: &str) -> (std::path::PathBuf, NamespaceId, Manifest) {
+        let dir = std::env::temp_dir().join(format!("kosha-test-prefix-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let mut segments = Vec::new();
+        for seg in ["s1", "s2"] {
+            let mut w = SegmentWriter::new(SegmentId(seg.into()), dir.join("test").join(seg));
+            let mut count = 0;
+            for (i, (s, id, path)) in DOCS.iter().enumerate() {
+                if *s != seg {
+                    continue;
+                }
+                let angle = i as f32 * 0.1;
+                let mut fields = vec![
+                    Field::text("content", "contract"),
+                    Field::integer("page", i as i64),
+                    Field::vector("contentEmbedding", vec![angle.cos(), angle.sin(), 0.0, 0.0]),
+                ];
+                if let Some(path) = path {
+                    fields.push(Field::keyword("path", *path));
+                }
+                w.add_document(DocumentId((*id).into()), fields);
+                count += 1;
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            segments.push(ManifestEntry {
+                segment_id: SegmentId(seg.into()),
+                doc_count: count,
+            });
+        }
+        let manifest = Manifest {
+            version: 1,
+            segments,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            retired: Default::default(),
+            schema: Default::default(),
+        };
+        (dir, ns, manifest)
+    }
+
+    fn query(text: &str, filter: &str) -> SearchQuery {
+        SearchQuery {
+            query_text: text.into(),
+            max_results: 100,
+            from: 0,
+            bm25_params: Default::default(),
+            filter: Some(serde_json::from_str(filter).unwrap()),
+            sort: vec![],
+            search_after: None,
+            highlight: None,
+            aggs: HashMap::new(),
+            wildcard: None,
+            match_phrase: None,
+            knn: None,
+            exact_total_hits: None,
+            total_hits_cap: None,
+            operator: None,
+            no_cache: None,
+            collapse: None,
+            source_includes: None,
+            source_excludes: None,
+            fields: Default::default(),
+            fuzzy: Default::default(),
+            limit_per: Default::default(),
+            mode: Default::default(),
+            rank: Default::default(),
+            rank_by: Default::default(),
+            rerank: Default::default(),
+        }
+    }
+
+    fn ids(searcher: &Searcher, ns: &NamespaceId, m: &Manifest, q: &SearchQuery) -> Vec<String> {
+        let r = searcher.search(ns, m, q, None).unwrap();
+        let mut ids: Vec<String> = r.results.iter().map(|h| h.doc_id.0.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    const IN_2026: &str = r#"{"prefix": {"path": "/matters/2026/"}}"#;
+
+    #[test]
+    fn prefix_filters_lexical_and_filter_only_search_across_segments() {
+        let (dir, ns, manifest) = corpus("lexical");
+        let searcher = Searcher::new(dir.clone());
+        let expected = vec!["d0", "d3", "d4", "d7"];
+        for text in ["contract", ""] {
+            assert_eq!(
+                ids(&searcher, &ns, &manifest, &query(text, IN_2026)),
+                expected,
+                "query_text={text:?}"
+            );
+        }
+        // Case-insensitive also takes /Matters/.
+        let ci = r#"{"prefix": {"path": {"value": "/MATTERS/2026/", "case_insensitive": true}}}"#;
+        assert_eq!(
+            ids(&searcher, &ns, &manifest, &query("contract", ci)),
+            vec!["d0", "d2", "d3", "d4", "d7"]
+        );
+        // The default is case-sensitive.
+        assert_eq!(
+            ids(
+                &searcher,
+                &ns,
+                &manifest,
+                &query("contract", r#"{"prefix": {"path": "/MATTERS"}}"#)
+            ),
+            Vec::<String>::new()
+        );
+        // Empty prefix: everything that has a path (all but d6).
+        assert_eq!(
+            ids(
+                &searcher,
+                &ns,
+                &manifest,
+                &query("", r#"{"prefix": {"path": ""}}"#)
+            ),
+            vec!["d0", "d1", "d2", "d3", "d4", "d5", "d7"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_composes_in_bool_across_segments() {
+        let (dir, ns, manifest) = corpus("bool");
+        let searcher = Searcher::new(dir.clone());
+        // must, together with a numeric range (page = index in DOCS).
+        let must = r#"{"bool": {"must": [{"prefix": {"path": "/matters/2026/"}},
+                                          {"range": {"page": {"gte": "3"}}}]}}"#;
+        assert_eq!(
+            ids(&searcher, &ns, &manifest, &query("contract", must)),
+            vec!["d3", "d4", "d7"]
+        );
+        let must_not = r#"{"bool": {"must_not": [{"prefix": {"path": "/matters/"}}]}}"#;
+        assert_eq!(
+            ids(&searcher, &ns, &manifest, &query("contract", must_not)),
+            vec!["d2", "d5", "d6"]
+        );
+        let should = r#"{"bool": {"should": [{"prefix": {"path": "/other"}},
+                                            {"prefix": {"path": "/Matters"}}]}}"#;
+        assert_eq!(
+            ids(&searcher, &ns, &manifest, &query("", should)),
+            vec!["d2", "d5"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_works_as_a_knn_filter() {
+        let (dir, ns, manifest) = corpus("knn");
+        let searcher = Searcher::new(dir.clone());
+        let mut q = query("", r#"{"match_all": {}}"#);
+        q.filter = None;
+        q.knn = Some(KnnQuery {
+            field: "contentEmbedding".into(),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            k: 8,
+            num_candidates: 8,
+            filter: Some(serde_json::from_str(IN_2026).unwrap()),
+        });
+        assert_eq!(
+            ids(&searcher, &ns, &manifest, &q),
+            vec!["d0", "d3", "d4", "d7"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_on_a_numeric_field_is_a_query_error() {
+        let (dir, ns, manifest) = corpus("numeric");
+        let searcher = Searcher::new(dir.clone());
+        for filter in [
+            r#"{"prefix": {"page": "1"}}"#,
+            r#"{"bool": {"must_not": [{"prefix": {"page": "1"}}]}}"#,
+        ] {
+            let err = searcher
+                .search(&ns, &manifest, &query("contract", filter), None)
+                .expect_err(filter);
+            assert!(
+                matches!(&err, KoshaError::InvalidQuery(msg) if msg.contains("numeric field")),
+                "{filter}: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

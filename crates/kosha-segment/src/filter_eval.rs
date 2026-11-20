@@ -102,6 +102,34 @@ pub fn evaluate_filter_columns(
             set
         }
         FilterClause::Bool { bool: b } => evaluate_bool(b, source, doc_count)?,
+        FilterClause::Prefix { prefix } => {
+            // `kosha_core::docset`'s rule over the dictionary: each distinct
+            // term is tested once (list terms on their elements) and its
+            // documents taken from the term's bitmap. A numeric field is a
+            // client error, as `kosha_core::check_filter` reports it.
+            let mut set = DocSet::empty(doc_count);
+            match string_column(source, &prefix.field)? {
+                Some(column) => {
+                    if let FilterColumn::String(c) = &*column {
+                        for ord in 0..c.term_count() as u32 {
+                            if kosha_core::docset::prefix_matches(prefix, c.term(ord)) {
+                                c.for_each_doc(ord, |doc| set.insert(doc));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    for kind in [FilterColumnKind::Integer, FilterColumnKind::Float] {
+                        if resolve_column(source, &prefix.field, kind)?.is_some() {
+                            return Err(KoshaError::InvalidQuery(
+                                kosha_core::docset::prefix_on_numeric_error(&prefix.field),
+                            ));
+                        }
+                    }
+                }
+            }
+            set
+        }
         FilterClause::MatchAll { .. } => DocSet::full(doc_count),
         FilterClause::Exists { exists } => {
             let mut set = DocSet::empty(doc_count);

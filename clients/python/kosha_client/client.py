@@ -341,8 +341,8 @@ class KoshaClient:
     def _to_filter(cls, clause: Any) -> dict:
         """Translate an OpenSearch filter clause into a Kosha filter.
 
-        Handles ``term``, ``terms``, ``range``, ``exists``, ``match_all``
-        and ``bool`` at any depth. Anything else raises.
+        Handles ``term``, ``terms``, ``range``, ``exists``, ``prefix``,
+        ``match_all`` and ``bool`` at any depth. Anything else raises.
 
         ``bool`` follows OpenSearch's rules for ``should``: with no
         ``minimum_should_match``, the clauses are required (at least one)
@@ -405,6 +405,9 @@ class KoshaClient:
                 raise cls._unsupported(f"exists clause {clause!r}")
             return {"exists": {"field": field}}
 
+        if kind == "prefix":
+            return cls._prefix_filter(clause, spec)
+
         if kind == "bool":
             spec = spec or {}
             unknown = set(spec) - {
@@ -433,6 +436,39 @@ class KoshaClient:
             return {"bool": out}
 
         raise cls._unsupported(f"'{kind}' as a filter")
+
+    # Options of OpenSearch's long-form ``prefix`` that only affect scoring
+    # or query rewriting, never which documents match.
+    _IGNORED_PREFIX_KEYS = frozenset({"boost", "rewrite"})
+
+    @classmethod
+    def _prefix_filter(cls, clause: dict, spec: Any) -> dict:
+        """OpenSearch ``prefix`` (short or long form) → Kosha's ``prefix``.
+
+        Kosha's ``prefix`` is case-sensitive by default, as OpenSearch's is,
+        so ``case_insensitive`` is only sent when the caller set it.
+        """
+        fields = {f: v for f, v in (spec or {}).items() if f != "boost"}
+        if len(fields) != 1:
+            raise cls._unsupported(f"prefix clause {clause!r}")
+        field, value = next(iter(fields.items()))
+        if field == "_id":
+            raise cls._unsupported("a prefix filter on _id")
+        if isinstance(value, dict):
+            unknown = set(value) - {"value", "case_insensitive"} - cls._IGNORED_PREFIX_KEYS
+            if unknown:
+                raise cls._unsupported(f"prefix option(s) {sorted(unknown)}")
+            prefix = value.get("value")
+            case_insensitive = value.get("case_insensitive", False)
+            if not isinstance(case_insensitive, bool):
+                raise cls._unsupported(f"prefix case_insensitive={case_insensitive!r}")
+        else:
+            prefix, case_insensitive = value, False
+        if not isinstance(prefix, str):
+            raise cls._unsupported(f"a non-string prefix {prefix!r}")
+        if case_insensitive:
+            return {"prefix": {field: {"value": prefix, "case_insensitive": True}}}
+        return {"prefix": {field: prefix}}
 
     @classmethod
     def _should_need(cls, bool_spec: dict, has_required: bool) -> int:

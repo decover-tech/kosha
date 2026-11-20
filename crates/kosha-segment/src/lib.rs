@@ -5443,9 +5443,11 @@ impl SegmentReader {
             fields.insert(f.to_string());
             fields.insert(kosha_core::base_field_name(f).to_string());
         });
+        let store = self.filter_store_for(&fields)?;
+        kosha_core::check_filter(clause, &store).map_err(KoshaError::InvalidQuery)?;
         Ok(kosha_core::evaluate_filter(
             clause,
-            &*self.filter_store_for(&fields)?,
+            &store,
             self.doc_count(),
         ))
     }
