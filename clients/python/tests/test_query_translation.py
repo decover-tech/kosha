@@ -437,6 +437,39 @@ def test_knn_filter_is_carried_into_the_vector_search():
     }
 
 
+def test_knn_query_text_is_passed_through_for_server_side_embedding():
+    kosha = translate(
+        {
+            "size": 5,
+            "query": {
+                "knn": {
+                    "contentEmbedding": {
+                        "query_text": "termination for convenience",
+                        "k": 5,
+                        "filter": {"bool": {"must": [scope_filter()]}},
+                    }
+                }
+            },
+        }
+    )
+    knn = kosha["knn"]
+    assert knn["field"] == "contentEmbedding"
+    assert knn["query_text"] == "termination for convenience"
+    assert "vector" not in knn
+    assert knn["k"] == 5 and knn["filter"] == {"bool": {"must": [SCOPE_KOSHA]}}
+
+    message = refused(
+        {
+            "query": {
+                "knn": {
+                    "contentEmbedding": {"vector": [0.1] * 4, "query_text": "x"}
+                }
+            }
+        }
+    )
+    assert "query_text" in message
+
+
 def test_knn_filter_that_cannot_be_expressed_refuses_the_search():
     message = refused(
         {

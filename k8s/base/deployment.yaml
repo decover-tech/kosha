@@ -56,6 +56,11 @@ spec:
           env:
             - name: KOSHA_ROLE
               value: ingest
+            # Compaction runs on the kosha-indexer Deployment (#254). An
+            # overlay that drops the indexer must set this back to "true", or
+            # nothing bounds segment counts.
+            - name: KOSHA_COMPACTION_ON_INGEST
+              value: "false"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

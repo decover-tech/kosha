@@ -145,6 +145,7 @@ fn single_column_segment_is_byte_identical_to_the_pre_columns_writer() {
                 slot: 0,
                 offsets: true,
                 quantization: Default::default(),
+                embedding_model: None,
             }])
         );
         let expected = files(&fixture(name));
