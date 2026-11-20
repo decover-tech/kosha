@@ -107,6 +107,10 @@ impl PgStore {
         let migration = include_str!("../migrations/001_create_kosha_tables.sql");
         rt.block_on(sqlx::raw_sql(migration).execute(&pool))
             .map_err(|e| format!("migration failed: {e}"))?;
+        // Writer leases (#254): additive, idempotent, same pattern as 001.
+        let migration = include_str!("../migrations/003_writer_leases.sql");
+        rt.block_on(sqlx::raw_sql(migration).execute(&pool))
+            .map_err(|e| format!("migration 003 failed: {e}"))?;
 
         Ok(Self { pool, rt })
     }
@@ -439,12 +443,60 @@ impl ControlStore for PgStore {
         expected_version: u64,
         new_manifest: Manifest,
     ) -> Result<(), KoshaError> {
+        self.compare_and_swap_manifest_fenced(id, expected_version, new_manifest, None)
+    }
+
+    fn acquire_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        ttl: Duration,
+    ) -> Result<Option<u64>, KoshaError> {
+        self.rt
+            .block_on(crate::writer_lease::acquire(&self.pool, id, holder, ttl))
+    }
+
+    fn renew_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        token: u64,
+        ttl: Duration,
+    ) -> Result<bool, KoshaError> {
+        self.rt.block_on(crate::writer_lease::renew(
+            &self.pool, id, holder, token, ttl,
+        ))
+    }
+
+    fn release_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        token: u64,
+    ) -> Result<(), KoshaError> {
+        self.rt
+            .block_on(crate::writer_lease::release(&self.pool, id, holder, token))
+    }
+
+    /// The plain CAS plus, with a token, the fencing check in the same
+    /// transaction, before the `UPDATE` (see `writer_lease::check_fencing`).
+    fn compare_and_swap_manifest_fenced(
+        &mut self,
+        id: &NamespaceId,
+        expected_version: u64,
+        new_manifest: Manifest,
+        token: Option<u64>,
+    ) -> Result<(), KoshaError> {
         let id_str = id.0.clone();
         let segments_json = serde_json::to_string(&new_manifest)?;
 
         self.rt.block_on(async {
             let io_error = |e: sqlx::Error| KoshaError::NotFound(e.to_string());
             let mut tx = self.pool.begin().await.map_err(io_error)?;
+            if let Some(token) = token {
+                // Dropping `tx` on the error path rolls it back.
+                crate::writer_lease::check_fencing(&mut tx, id, token).await?;
+            }
             // Bootstrap is transactional and never replaces an existing row.
             // A missing namespace is bootstrapped by a writer that knows
             // nothing (expected 0) or one that knows the version a deleted

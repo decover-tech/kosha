@@ -5,8 +5,9 @@ namespace. Manifests stay product-generic: no customer account names,
 bucket names, or IAM role ARNs are committed here.
 
     k8s/
-      base/     Namespace, ServiceAccount, ConfigMap, two Deployments
-                (kosha = ingest, kosha-query = query), two Services
+      base/     Namespace, ServiceAccount, ConfigMap, three Deployments
+                (kosha = ingest, kosha-query = query, kosha-indexer =
+                compaction), two Services
                 (kosha-service, kosha-ingest-service), an HPA for the query
                 tier — env-agnostic defaults only (includes kosha NVMe
                 node-pool scheduling for the ingest Deployment; see below)
@@ -15,16 +16,31 @@ bucket names, or IAM role ARNs are committed here.
 
 ## Query/ingest split and request routing
 
-Kosha runs as two Deployments sharing one binary, differentiated by
+Kosha runs as three Deployments sharing one binary, differentiated by
 `KOSHA_ROLE` (set explicitly per-Deployment, overriding the shared
-ConfigMap):
+ConfigMap). The role is validated at startup (#254): `query` requires
+`KOSHA_INGEST_HOST`, `ingest`/`indexer` must not set it, `indexer` requires
+`DATABASE_URL`, and a contradiction exits the pod with a clear message. See
+`docs/configuration.md#roles`.
 
 - **`kosha`** (`role: ingest`) — the single, pinned write target. Exactly
-  one replica, on the dedicated NVMe pool (see below). Two pods writing the
-  same namespace concurrently could each pick the same next segment ID and
-  silently clobber each other's data (`kosha-write::Indexer`'s segment
-  counter has no cross-pod coordination) — this Deployment must never scale
-  beyond 1.
+  one replica, on the dedicated NVMe pool (see below), `Recreate` strategy.
+  Since #254 it holds a per-namespace writer lease in Postgres
+  (`kosha.writer_leases`) and every manifest CAS checks the lease's fencing
+  token, so a second writer started by mistake is refused (503) instead of
+  silently rebasing onto the first. Keep `replicas: 1` + `Recreate` anyway:
+  the lease makes a second writer safe, not useful, and binaries from before
+  #254 do not check fencing (roll every writer to a fencing build before
+  relying on it). A restarted pod that did not release its lease waits up to
+  `KOSHA_WRITER_LEASE_TTL_MS` (30 s) before it accepts writes for a
+  namespace the old pod held. It sets `KOSHA_COMPACTION_ON_INGEST=false`.
+- **`kosha-indexer`** (`role: indexer`) — compaction only
+  (`deployment-indexer.yaml`, #254). One replica, `Recreate`. Runs the
+  compaction scheduler, follows the Postgres manifests, merges segments it
+  hydrates from S3 and publishes by manifest CAS + rebase. Serves only
+  probes, `POST /v1/admin/compact*` and `GET /v1/admin/compaction-*`
+  (everything else is 404); no Service routes to it. Stage/prod overlays for
+  its resources are left to ops.
 - **`kosha-query`** (`role: query`) — stateless, horizontally-scaled reads.
   No hostPath, no NVMe pinning, an `emptyDir` cache that cold-starts from
   the Postgres manifest + S3 segments (bounded, ~15-20s for a full
@@ -39,9 +55,8 @@ exactly like a single OpenSearch cluster endpoint. `kosha-service` selects
 write-path requests (`/index`, `/flush`, `/replace`, `/delete`,
 `/v1/admin/*`) to `kosha-ingest-service` (which selects `role: ingest`),
 relaying the response back verbatim. See `crates/kosha-server/src/main.rs`'s
-`is_write_path`/`forward_to_ingest` for the implementation — `KOSHA_ROLE`
-being decorative (read but never branched on) was true until this existed;
-now it gates this one thing. `kosha-ingest-service` is not meant for direct
+`is_write_path`/`forward_to_ingest` for the implementation.
+`kosha-ingest-service` is not meant for direct
 client use; it exists as the forwarding target and an optional bypass for
 admin/migration scripts.
 
