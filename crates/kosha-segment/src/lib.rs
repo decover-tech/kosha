@@ -4006,6 +4006,22 @@ fn vector_postings_cache_max_bytes() -> usize {
     })
 }
 
+/// Per-segment byte budget for the decoded late-interaction (`.ivf`)
+/// postings LRU (`KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`, default
+/// 32 MiB, `0` disables) — #205. Separate from the single-vector budget so
+/// a token-index working set (query tokens x `nprobe` postings per query)
+/// does not evict the single-vector one. Entries report to the same
+/// live-bytes account as every other postings cache.
+fn late_interaction_postings_cache_max_bytes() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32 * 1024 * 1024)
+    })
+}
+
 /// Optional live-memory account the segment's per-segment postings LRU
 /// reports its resident bytes to (Tier 1 O6). The decoded form of postings
 /// lives outside the on-disk format (the per-query `PostingsCache`), so
@@ -5728,6 +5744,11 @@ pub struct SegmentReader {
     /// Late-interaction fields (#205) opened so far, by footer index. Only
     /// success is cached, as for `doc_vectors`.
     multi_vectors: Mutex<HashMap<usize, Arc<multivec::MultiVectorIndex>>>,
+    /// Decoded `.ivf` postings of every late-interaction field, keyed by
+    /// `(field index, posting)` — the late-interaction twin of
+    /// `vector_cache`, budgeted by
+    /// `KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`.
+    multi_vector_cache: multivec::IvfPostingCache,
 }
 
 /// Default of [`SegmentReader::with_vector_rescore_factor`]:
@@ -5819,11 +5840,18 @@ impl SegmentReader {
             inverted: Self::read_inverted(&segment_dir, postings_account.clone(), posting_spans)?,
             filters,
             vector_slots,
-            vector_cache: PostingsCache::new(vector_postings_cache_max_bytes(), postings_account),
+            vector_cache: PostingsCache::new(
+                vector_postings_cache_max_bytes(),
+                postings_account.clone(),
+            ),
             doc_vectors: Mutex::new(None),
             field_lengths: Mutex::new(HashMap::new()),
             vector_rescore_factor: vector_rescore_factor(),
             multi_vectors: Mutex::new(HashMap::new()),
+            multi_vector_cache: PostingsCache::new(
+                late_interaction_postings_cache_max_bytes(),
+                postings_account,
+            ),
         })
     }
 
@@ -5840,6 +5868,22 @@ impl SegmentReader {
     /// measurement; also what it reports to the live-bytes account).
     pub fn vector_cache_resident_bytes(&self) -> usize {
         self.vector_cache.state.lock().unwrap().total_bytes
+    }
+
+    /// Override the byte budget of the decoded late-interaction posting
+    /// cache (#205); `0` disables it. Readers default to
+    /// `KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`. Call before the
+    /// first search: whatever the cache already holds is dropped.
+    pub fn with_late_interaction_postings_cache_max_bytes(mut self, max_bytes: usize) -> Self {
+        let account = self.multi_vector_cache.account.clone();
+        self.multi_vector_cache = PostingsCache::new(max_bytes, account);
+        self
+    }
+
+    /// Bytes the decoded late-interaction posting cache holds right now
+    /// (#205; also what it reports to the live-bytes account).
+    pub fn late_interaction_cache_resident_bytes(&self) -> usize {
+        self.multi_vector_cache.state.lock().unwrap().total_bytes
     }
 
     /// The vector columns `footer` declares, or the single unnamed legacy
@@ -5915,7 +5959,7 @@ impl SegmentReader {
                 q
             })
             .collect();
-        index.search(&normalized, k, params, accept)
+        index.search(&normalized, k, params, accept, &self.multi_vector_cache)
     }
 
     fn doc_vectors(&self) -> Result<Arc<DocVectors>, KoshaError> {

@@ -2093,6 +2093,19 @@ pub fn segment_embedding_model_mismatch(footer: &Footer, knn: &kosha_core::KnnQu
         .any(|recorded| recorded != model)
 }
 
+/// Whether `query` reads the segments' single-vector columns
+/// (`vector[.n].idx`, `vector[.n].offsets`, and `doc_vectors.bin` for a
+/// legacy footer): a kNN scored by cosine. A late-interaction kNN (#205)
+/// reads only its field's `multivec.{i}` files, so it opens segments as a
+/// lexical query does (sharing their cache entries, and charging no vector
+/// bytes at admission), and the server hydrates no vector column for it.
+pub fn query_reads_vector_columns(query: &SearchQuery) -> bool {
+    query
+        .knn
+        .as_ref()
+        .is_some_and(|knn| !knn.is_late_interaction())
+}
+
 fn late_interaction_params(knn: &kosha_core::KnnQuery) -> kosha_segment::LateInteractionParams {
     kosha_segment::LateInteractionParams {
         nprobe: late_interaction_nprobe(),
@@ -3178,7 +3191,7 @@ impl Searcher {
                     // use for this segment, so the two passes share one
                     // cache entry. A segment the filter prunes is never
                     // opened by the scoring pass, so it is opened lexical-only.
-                    let load_vectors = query.knn.is_some()
+                    let load_vectors = query_reads_vector_columns(query)
                         && query.segment_may_match_filters(footer.filter_blooms.as_ref());
                     let reader = self
                         .open_segment(
@@ -3613,12 +3626,14 @@ impl Searcher {
 
         // Lexical/BM25 queries (no query.knn) never touch vectors or the
         // HNSW graph — skip loading both so keyword search latency stops
-        // scaling with embedding volume/segment count.
+        // scaling with embedding volume/segment count. Neither does a
+        // late-interaction kNN (#205): it reads the multivec files, which
+        // need no vector columns (see `query_reads_vector_columns`).
         let reader = self.open_segment(
             &namespace.0,
             &entry.segment_id.0,
             seg_dir,
-            query.knn.is_some(),
+            query_reads_vector_columns(query),
             manifest_footer,
             Some(permit),
             Some(open_stats),
@@ -5610,7 +5625,7 @@ impl Searcher {
         // permit drops at the end of this search. The broad, unfiltered
         // queries this gate exists for prune nothing, so for exactly the
         // dangerous case the estimate is accurate.
-        let load_vectors = query.knn.is_some();
+        let load_vectors = query_reads_vector_columns(query);
         let estimate: u64 = manifest
             .segments
             .iter()

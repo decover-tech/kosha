@@ -466,7 +466,11 @@ token, unit-normalized f32, with a per-document offsets table so one bag is one 
 index; each posting holds its tokens' doc ids and int8 codes). For every query token the
 `KOSHA_LATE_INTERACTION_NPROBE` (default 16) nearest postings are scored from the int8 codes,
 the best `num_candidates` documents by that approximate MaxSim are re-scored exactly from their
-bags, and the top `k` are kept. With enough probes and candidates the result is exact MaxSim
+bags, and the top `k` are kept. Probed postings are kept decoded in a per-segment LRU
+(`KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`, default 32 MiB, `0` disables), so a warm
+query reads only bags from disk. A late-interaction query reads no single-vector column: the
+searcher opens its segments as for a lexical query, and the server hydrates only the field's
+`multivec` files for it, never `vector*.idx` or `vector*.offsets`. With enough probes and candidates the result is exact MaxSim
 (tested against a brute-force reference). The source JSON stays in the doc store, so documents
 read back as sent and compaction rebuilds the files from it; a binary older than this change
 reads these segments normally, just without late-interaction hits, and its compactions drop the
@@ -481,6 +485,25 @@ tokens). Queries: 8,000 documents x 64 tokens, 32 query tokens: warm p50 15.3 ms
 against brute-force MaxSim 1.000 (single-vector kNN over mean-pooled tokens: 1.1 ms, but only
 0.40 of the MaxSim top 10). 4,000 x 32 tokens at 64 dim, 16 query tokens: 1.9 ms. Single-vector
 kNN is unchanged when the feature is unused (`knn_open_search` p50s identical to main).
+
+**Relevance on a real corpus.** `kosha-late-interaction-eval` (in `kosha-build-segments`)
+indexes a token-embedding corpus into in-process segments and reports recall@10 and nDCG@10
+against qrels for three rankings: Kosha's late interaction, exact MaxSim (every posting probed,
+every bag re-scored), and single-vector kNN over mean-pooled tokens, plus each one's overlap with
+the exact MaxSim top 10 and p50 latency. Its input is a directory of `docs.jsonl` and
+`queries.jsonl` (`{"id": ..., "tokens": [[f32; dim], ...]}` per line) and `qrels.tsv` (BEIR's
+`query-id corpus-id score`, or TREC's four columns). Use the BEIR **SciFact** test split (5,183
+passages, 300 queries with qrels; small enough to run on a laptop) or a slice of the
+**MS MARCO** passage dev set (`qrels.dev.small.tsv` over a sample of passages that includes the
+judged ones), encoded with **ColBERTv2** (`colbert-ir/colbertv2.0`, 128-dim tokens): each
+passage's token matrix without padding, and each query's (32 tokens, mask-augmented) matrix.
+
+```text
+cargo run --release -p kosha-build-segments --bin kosha-late-interaction-eval -- \
+  eval --corpus /data/scifact-colbertv2 --nprobe 16 --num-candidates 100 --json scifact.json
+# try the harness without real embeddings:
+cargo run --release -p kosha-build-segments --bin kosha-late-interaction-eval -- gen --out /tmp/li
+```
 
 ## Native embedding
 

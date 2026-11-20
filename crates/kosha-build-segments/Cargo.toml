@@ -14,6 +14,12 @@ path = "src/main.rs"
 name = "kosha-vector-quant-eval"
 path = "src/bin/vector_quant_eval.rs"
 
+# Recall / nDCG of late-interaction retrieval (#205) on a token-embedding
+# corpus with qrels, against exact MaxSim and mean-pooled single vectors.
+[[bin]]
+name = "kosha-late-interaction-eval"
+path = "src/bin/late_interaction_eval.rs"
+
 [lints]
 workspace = true
 

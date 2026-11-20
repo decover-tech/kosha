@@ -37,7 +37,8 @@
 //! ```
 //!
 //! The posting table (centroids and ranges) is resident once the field is
-//! opened; a probed posting is one ranged read.
+//! opened; a probed posting is one ranged read, unless the segment's
+//! decoded-posting cache already holds it (see [`IvfPostingCache`]).
 //!
 //! # Search
 //!
@@ -60,6 +61,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use kosha_core::{Footer, KoshaError, MultiVectorField, StorageBackend};
 
@@ -316,12 +318,63 @@ pub struct LateInteractionHits {
     pub postings_probed: usize,
     /// Bags read and scored exactly.
     pub docs_rescored: usize,
+    /// Postings read from `.ivf` on disk: the probes the segment's posting
+    /// cache did not serve. `0` on a query whose probes were all cached.
+    pub postings_read: usize,
+}
+
+/// One `.ivf` posting, decoded: what a probe scores, and what the segment's
+/// late-interaction posting cache holds (#205 follow-up).
+#[derive(Debug, Default)]
+pub(crate) struct IvfPosting {
+    doc_seqs: Vec<u32>,
+    scales: Vec<f32>,
+    /// `dim` int8 codes per entry, flat.
+    codes: Vec<i8>,
+}
+
+impl IvfPosting {
+    fn decode(buf: &[u8], dim: usize) -> Self {
+        let entry_len = ivf_entry_len(dim);
+        let n = buf.len() / entry_len;
+        let mut out = Self {
+            doc_seqs: Vec::with_capacity(n),
+            scales: Vec::with_capacity(n),
+            codes: Vec::with_capacity(n * dim),
+        };
+        for entry in buf.chunks_exact(entry_len) {
+            out.doc_seqs.push(u32_at(entry, 0).unwrap_or(0));
+            out.scales
+                .push(f32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]));
+            out.codes.extend(entry[8..].iter().map(|&b| b as i8));
+        }
+        out
+    }
+
+    /// Bytes this posting holds, as the cache accounts them.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.doc_seqs.len() * 8 + self.codes.len()
+    }
+}
+
+/// The segment's cache of decoded `.ivf` postings: the same
+/// [`crate::PostingsCache`] (LRU, byte budget, live-bytes account) as the
+/// single-vector postings, with its own budget
+/// (`KOSHA_LATE_INTERACTION_POSTINGS_CACHE_MAX_BYTES`). Keys come from
+/// [`ivf_cache_key`].
+pub(crate) type IvfPostingCache = crate::PostingsCache<Arc<IvfPosting>>;
+
+/// Cache key of posting `posting` of late-interaction field `field`.
+fn ivf_cache_key(field: usize, posting: usize) -> usize {
+    ((field as u64) << 32 | posting as u64) as usize
 }
 
 /// One field's opened late-interaction files: the bag offsets table and
 /// the posting table are resident; postings and bags are ranged reads.
 #[derive(Debug)]
 pub(crate) struct MultiVectorIndex {
+    /// Position in `Footer::multi_vectors`; part of every cache key.
+    field: usize,
     bags_path: PathBuf,
     ivf_path: PathBuf,
     dim: usize,
@@ -442,6 +495,7 @@ impl MultiVectorIndex {
             ));
         }
         Ok(Self {
+            field: i,
             bags_path,
             ivf_path,
             dim,
@@ -487,14 +541,52 @@ impl MultiVectorIndex {
         Ok(out)
     }
 
+    /// Posting `posting`, from `cache` when it holds it, else read from
+    /// `.ivf` (opening it into `file` on the first read of this query) and
+    /// cached. `reads` counts the disk reads.
+    ///
+    /// Every read is admitted to the cache, unlike the text and
+    /// single-vector caches' second-touch rule: one late-interaction query
+    /// probes `query tokens x nprobe` postings (hundreds) of a small table,
+    /// which would cycle a 256-entry miss ring before any posting came
+    /// round a second time, and there is no wildcard-style one-shot
+    /// expansion here for that rule to filter out. The byte budget and LRU
+    /// eviction still bound what stays.
+    fn posting(
+        &self,
+        posting: usize,
+        cache: &IvfPostingCache,
+        file: &mut Option<fs::File>,
+        reads: &mut usize,
+    ) -> Result<Arc<IvfPosting>, KoshaError> {
+        let key = ivf_cache_key(self.field, posting);
+        if let Some(hit) = cache.get(key) {
+            return Ok(hit);
+        }
+        let (offset, count) = self.postings[posting];
+        let mut buf = vec![0u8; count as usize * ivf_entry_len(self.dim)];
+        let f = match file {
+            Some(f) => f,
+            None => file.insert(fs::File::open(&self.ivf_path)?),
+        };
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_exact(&mut buf)?;
+        *reads += 1;
+        let decoded = Arc::new(IvfPosting::decode(&buf, self.dim));
+        cache.insert(key, Arc::clone(&decoded), decoded.resident_bytes());
+        Ok(decoded)
+    }
+
     /// Late-interaction top `k` over this field. `query` holds
-    /// unit-normalized tokens of this field's dimension.
+    /// unit-normalized tokens of this field's dimension. Postings are read
+    /// through `cache`.
     pub(crate) fn search(
         &self,
         query: &[Vec<f32>],
         k: usize,
         params: LateInteractionParams,
         accept: Option<&dyn Fn(u32) -> bool>,
+        cache: &IvfPostingCache,
     ) -> Result<LateInteractionHits, KoshaError> {
         let posting_count = self.postings.len();
         if k == 0 || query.is_empty() || posting_count == 0 {
@@ -515,9 +607,8 @@ impl MultiVectorIndex {
             })
             .collect();
 
-        let mut file = fs::File::open(&self.ivf_path)?;
-        let entry_len = ivf_entry_len(self.dim);
-        let mut buf: Vec<u8> = Vec::new();
+        let mut file: Option<fs::File> = None;
+        let mut reads = 0usize;
         let mut code: Vec<f32> = vec![0.0; self.dim];
         // Per candidate document, the best approximate similarity each
         // query token reached (NEG_INFINITY = none of its tokens probed).
@@ -531,19 +622,19 @@ impl MultiVectorIndex {
         loop {
             for (qi, q) in query.iter().enumerate() {
                 for &posting in &ranked[qi][from..nprobe] {
-                    let (offset, count) = self.postings[posting];
-                    buf.resize(count as usize * entry_len, 0);
-                    file.seek(SeekFrom::Start(offset))?;
-                    file.read_exact(&mut buf)?;
+                    let entries = self.posting(posting, cache, &mut file, &mut reads)?;
                     probed += 1;
-                    for entry in buf.chunks_exact(entry_len) {
-                        let doc_seq = u32_at(entry, 0).unwrap_or(0);
+                    for ((&doc_seq, &scale), codes) in entries
+                        .doc_seqs
+                        .iter()
+                        .zip(&entries.scales)
+                        .zip(entries.codes.chunks_exact(self.dim))
+                    {
                         if accept.is_some_and(|accept| !accept(doc_seq)) {
                             continue;
                         }
-                        let scale = f32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
-                        for (c, &b) in code.iter_mut().zip(&entry[8..]) {
-                            *c = b as i8 as f32;
+                        for (c, &b) in code.iter_mut().zip(codes) {
+                            *c = b as f32;
                         }
                         let sim = scale * kosha_vector_spfresh::dot(q, &code);
                         floor[qi] = floor[qi].min(sim);
@@ -596,6 +687,7 @@ impl MultiVectorIndex {
             hits,
             postings_probed: probed,
             docs_rescored,
+            postings_read: reads,
         })
     }
 }
