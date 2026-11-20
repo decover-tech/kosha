@@ -1,0 +1,8 @@
+{
+  "description": "Synthetic topic/key-term fixture; see generate.py",
+  "keyword_fields": [
+    "lang",
+    "topic"
+  ],
+  "seed": 258
+}
