@@ -1011,15 +1011,41 @@ fn exact_knn_wants_doc_vectors_header(footer: Option<&kosha_core::Footer>, field
 /// `None` without kNN.
 #[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn knn_verdict_key(query: &SearchQuery) -> Option<String> {
-    query.knn.as_ref().map(|knn| {
-        if knn.is_late_interaction() {
-            format!("late_interaction:{}", knn.field)
-        } else if query.needs_filter_columns() {
-            format!("filtered:{}", knn.field)
+    if let Some(field) = single_vector_knn_field(query) {
+        return Some(if query.needs_filter_columns() {
+            format!("filtered:{field}")
         } else {
-            knn.field.clone()
-        }
-    })
+            field.to_string()
+        });
+    }
+    late_interaction_knn_field(query).map(|field| format!("late_interaction:{field}"))
+}
+
+/// The single-vector column a search scores against: `knn.field` of a
+/// cosine kNN. Only then does its hydration pass fetch vector-column files
+/// (`vector[.n].idx`, `vector[.n].offsets`, a legacy footer's
+/// `doc_vectors.bin`). `None` for a query without kNN, and for late
+/// interaction (#205) — hybrid or not — which reads the field's multivec
+/// files instead (see [`late_interaction_knn_field`]). Mirrors the
+/// searcher's [`kosha_query::query_reads_vector_columns`], which opens such
+/// a query's segments without their vector columns.
+fn single_vector_knn_field(query: &SearchQuery) -> Option<&str> {
+    query
+        .knn
+        .as_ref()
+        .filter(|_| kosha_query::query_reads_vector_columns(query))
+        .map(|knn| knn.field.as_str())
+}
+
+/// The late-interaction field (#205) a search scores against, whose
+/// `multivec.{i}.bags` / `.ivf` its hydration pass fetches. `None` unless
+/// the query's kNN is scored with late interaction.
+fn late_interaction_knn_field(query: &SearchQuery) -> Option<&str> {
+    query
+        .knn
+        .as_ref()
+        .filter(|knn| knn.is_late_interaction())
+        .map(|knn| knn.field.as_str())
 }
 
 /// Filter column names a query reads (`SearchQuery::filter_column_fields`).
@@ -4746,12 +4772,9 @@ impl AppState {
         let needs_bloom_check =
             query.has_prunable_filter() || kosha_query::term_bloom_prune_mode(query).is_some();
         // Single-vector kNN reads its column's index; late interaction
-        // (#205) reads the field's multivec files instead (below).
-        let knn_field = query
-            .knn
-            .as_ref()
-            .filter(|knn| !knn.is_late_interaction())
-            .map(|knn| knn.field.as_str());
+        // (#205) reads the field's multivec files instead (below), and no
+        // vector column at all.
+        let knn_field = single_vector_knn_field(query);
         let filter_fields = query_filter_fields(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
@@ -4861,7 +4884,7 @@ impl AppState {
         // Late interaction (#205) reads the queried field's bag store and
         // token index, which only some segments have (their footers say
         // which); single-vector kNN never fetches them.
-        if let Some(knn) = query.knn.as_ref().filter(|k| k.is_late_interaction()) {
+        if let Some(li_field) = late_interaction_knn_field(query) {
             let scoring: std::collections::HashSet<&PathBuf> = to_hydrate.iter().collect();
             let mut by_file: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
             for (entry, seg_path) in manifest.segments.iter().zip(&all_seg_paths) {
@@ -4869,7 +4892,7 @@ impl AppState {
                     continue;
                 }
                 let Some(i) = segment_footer(entry)
-                    .and_then(|f| f.multi_vectors.iter().position(|m| m.name == knn.field))
+                    .and_then(|f| f.multi_vectors.iter().position(|m| m.name == li_field))
                 else {
                     continue;
                 };
@@ -17393,6 +17416,115 @@ mod tests {
                 "{f} must always be fetched regardless of needs_vectors"
             );
         }
+    }
+
+    fn knn_query(json: serde_json::Value) -> SearchQuery {
+        let q: SearchQuery = serde_json::from_value(json).unwrap();
+        q.validate().unwrap();
+        q
+    }
+
+    /// #205: a late-interaction kNN — alone or hybrid — needs no
+    /// single-vector column, so its search pass hydrates none; a cosine
+    /// kNN (alone or hybrid) still names its column.
+    #[test]
+    fn late_interaction_knn_needs_no_vector_column() {
+        let li = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0], [0.0, 1.0]]}}));
+        assert_eq!(single_vector_knn_field(&li), None);
+        assert_eq!(late_interaction_knn_field(&li), Some("tokens"));
+        assert_eq!(
+            knn_verdict_key(&li).as_deref(),
+            Some("late_interaction:tokens")
+        );
+
+        let hybrid_li = knn_query(serde_json::json!({"query_text": "breach",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0]]}}));
+        assert_eq!(single_vector_knn_field(&hybrid_li), None);
+        assert_eq!(late_interaction_knn_field(&hybrid_li), Some("tokens"));
+
+        // `scoring: late_interaction` with a single `vector` is a one-token
+        // bag: still no vector column.
+        let one_token = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "tokens", "vector": [1.0, 0.0], "scoring": "late_interaction"}}));
+        assert_eq!(single_vector_knn_field(&one_token), None);
+        assert_eq!(late_interaction_knn_field(&one_token), Some("tokens"));
+
+        for text in ["", "breach"] {
+            let cosine = knn_query(serde_json::json!({"query_text": text,
+                "knn": {"field": "emb", "vector": [1.0, 0.0]}}));
+            assert_eq!(single_vector_knn_field(&cosine), Some("emb"), "{text:?}");
+            assert_eq!(late_interaction_knn_field(&cosine), None);
+            assert_eq!(knn_verdict_key(&cosine).as_deref(), Some("emb"));
+        }
+
+        let lexical = knn_query(serde_json::json!({"query_text": "breach"}));
+        assert_eq!(single_vector_knn_field(&lexical), None);
+        assert_eq!(late_interaction_knn_field(&lexical), None);
+        assert_eq!(knn_verdict_key(&lexical), None);
+
+        // A verdict earned by one kind of pass never covers the other.
+        let mut verdict = HydrationVerdict::default();
+        verdict.merge(None, knn_verdict_key(&li).as_deref());
+        assert!(verdict.covers(None, Some("late_interaction:tokens")));
+        assert!(!verdict.covers(None, Some("tokens")));
+        assert!(!verdict.covers(None, Some("emb")));
+    }
+
+    /// #205: a segment whose single-vector files were never hydrated is
+    /// scoring-complete for a late-interaction kNN (the pass checks the
+    /// multivec files separately), and not for a cosine kNN on its column.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn late_interaction_scoring_set_has_no_single_vector_files() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-li-scoring-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut w =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("s".into()), dir.clone());
+        for i in 0..4 {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![
+                    Field::text("text", "x"),
+                    Field::vector("emb", vec![1.0, i as f32]),
+                    Field {
+                        name: "tokens".into(),
+                        field_type: kosha_core::FieldType::Vector,
+                        value: serde_json::to_string(&[[1.0, i as f32], [0.0, 1.0]]).unwrap(),
+                    },
+                ],
+            );
+        }
+        let footer = w.finalize(Default::default()).unwrap();
+        assert_eq!(footer.multi_vectors.len(), 1);
+        for f in kosha_segment::vector_index_files(&dir) {
+            fs::remove_file(dir.join(f)).unwrap();
+        }
+        let _ = fs::remove_file(dir.join(kosha_segment::DOC_VECTORS_FILE));
+        // The multivec files are still there; the full-segment hydration
+        // fetches them whatever `needs_vectors` says.
+        for f in kosha_segment::multivec::multivec_files(&footer) {
+            assert!(dir.join(&f).exists(), "{f}");
+            assert!(hydration_wants_file(&f, false), "{f}");
+        }
+
+        let li = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0]]}}));
+        let hybrid_li = knn_query(serde_json::json!({"query_text": "x",
+            "knn": {"field": "tokens", "vectors": [[1.0, 0.0]]}}));
+        let cosine = knn_query(serde_json::json!({"query_text": "",
+            "knn": {"field": "emb", "vector": [1.0, 0.0]}}));
+        let complete = |q: &SearchQuery| {
+            AppState::segment_is_scoring_complete(&dir, single_vector_knn_field(q), false, None)
+        };
+        assert!(complete(&li));
+        assert!(complete(&hybrid_li));
+        assert!(
+            !complete(&cosine),
+            "a cosine kNN still needs its column's files"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Core regression for the presence-cache optimization: a
