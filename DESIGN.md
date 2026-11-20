@@ -314,14 +314,17 @@ Quantization is chosen at write time by `KOSHA_VECTOR_QUANTIZATION` /
 `KOSHA_VECTOR_QUANTIZATION_FIELDS`, not by the namespace schema.
 
 **Compaction merges postings instead of re-clustering (#253).** A flush clusters its vectors from
-scratch (`ClusterIndex::build`, recursive balanced 2-means). Compaction does not: for each vector
+scratch (`ClusterIndex::build`, recursive balanced 2-means, then a few rounds of bounded
+nearest-centroid refinement and a LIRE rebalance that tighten the postings' radii;
+`KOSHA_VECTOR_BUILD_REFINE=off` skips the refinement). Compaction does not: for each vector
 column, the largest input whose column has at least `LIRE_ADOPT_MIN_VECTORS` (1,024) vectors and a
 clustered index has its postings adopted as they are — centroid and members, read from
 `vector.offsets` and the ids in `vector.idx`, with members remapped to merged doc_seqs and
 tombstoned or deleted ones dropped (a posting that lost members gets its centroid recomputed).
 Every other input's postings are then absorbed into those: each absorbed posting's centroid picks
 its 8 nearest adopted postings and each member moves into the nearest of them. Vectors of inputs
-too small to adopt are absorbed one by one into their nearest posting. Finally LIRE (SPFresh's
+too small to adopt are absorbed one by one into their nearest posting (looked up through a coarse
+index over the adopted centroids, not a scan of all of them). Finally LIRE (SPFresh's
 split / merge / bounded reassign, `kosha-vector-spfresh`) splits every posting over 128 members,
 merges every one under 16 into its neighbour, and reassigns the vectors those events displace.
 Postings nothing touched keep their centroid and members, so the cost follows how much changed

@@ -9,13 +9,21 @@
 //! Keeping both (concatenation) would split every query's neighbours
 //! across both partitions' postings, and a fixed probe budget would then
 //! reach fewer of them. So `p`'s members move into this index's postings:
-//! `p`'s centroid picks `candidates` nearby postings (one centroid scan
-//! per absorbed *posting*, not per vector), and each member goes to the
+//! `p`'s centroid picks `candidates` nearby postings (one lookup per
+//! absorbed *posting*, not per vector), and each member goes to the
 //! nearest of those.
+//!
+//! The lookup goes through a `CentroidIndex` built once per call over this
+//! index's centroids, which do not change until the end of the call: a
+//! coarse index (about `sqrt(P)` cells, a quarter of them probed) once
+//! there are 256 postings or more, so absorbing many loose vectors costs
+//! about `changed * P / 4` centroid comparisons instead of `changed * P`,
+//! each a single dot product against a pre-normalized centroid rather than
+//! a full cosine distance.
 
 use std::collections::BTreeSet;
 
-use crate::centroid_probe::probe;
+use crate::centroid_index::CentroidIndex;
 use crate::error::VectorIndexError;
 use crate::point::{cosine_distance, mean_vector};
 use crate::posting::{Posting, PostingEntry, PostingId};
@@ -58,11 +66,14 @@ pub(crate) fn absorb(
 
     let mut grown: BTreeSet<PostingId> = BTreeSet::new();
     let mut absorbed = 0;
+    // Built on first use. An empty index takes its first posting whole
+    // first, so the index then covers that posting.
+    let mut centroids: Option<CentroidIndex> = None;
     for p in postings {
         if p.entries.is_empty() {
             continue;
         }
-        if index.active_posting_count() == 0 {
+        if centroids.is_none() && index.active_posting_count() == 0 {
             // Nothing to absorb into: the posting comes over whole.
             let pid = index.alloc_slot(Posting {
                 centroid: p.centroid,
@@ -74,7 +85,16 @@ pub(crate) fn absorb(
             }
             continue;
         }
-        let near = probe(&index.postings, &p.centroid, candidates.max(1));
+        let near =
+            centroids
+                .get_or_insert_with(|| {
+                    CentroidIndex::build(
+                        index.postings.iter().enumerate().filter_map(|(pid, p)| {
+                            p.as_ref().map(|p| (pid, p.centroid.as_slice()))
+                        }),
+                    )
+                })
+                .nearest(&p.centroid, candidates.max(1));
         for (id, vector) in p.entries {
             let target = near
                 .iter()
@@ -85,7 +105,7 @@ pub(crate) fn absorb(
                 })
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
                 .map(|(pid, _)| pid)
-                .expect("probe over a non-empty index returns a posting");
+                .expect("a lookup over a non-empty index returns a posting");
             push(index, target, id, vector);
             grown.insert(target);
             absorbed += 1;

@@ -35,8 +35,25 @@ ANN structure when a segment is opened.
 
 - **Flush** clusters the segment's vectors from scratch with
   [`ClusterIndex::build`]: recursive balanced 2-means until every posting holds
-  at most `max_posting_size` (128) vectors, then undersized postings are merged
-  away.
+  at most `max_posting_size` (128) vectors. Bisection's balance pass leaves far
+  members in postings (loose radii), so the build then refines (#253):
+  `build_refine_rounds` (2) rounds in which every vector moves to the nearest
+  centroid among its posting's `build_refine_candidates` (16) nearest postings
+  and centroids are recomputed, followed by [`ClusterIndex::rebalance`] (LIRE
+  Split / Merge / Reassign) to restore the 16..128 size bounds. A stray that
+  bisection pushed into an unrelated region can be farther from all of its
+  posting's neighbours than from some other posting; in the first round a
+  vector the candidates cannot be shown to cover (an angular
+  triangle-inequality test against the farthest candidate) looks up its own
+  nearest posting. On 10k unit-norm 128-d vectors this lifts radius-aware
+  recall@10 at a 5% probe budget from 0.44 to 1.00 (median radius 0.87 to
+  0.45) for about 23% more build time; at 200k, p90 radius drops from 0.83 to
+  0.19 for about 11%.
+  `build_refine_rounds = 0` (kosha: `KOSHA_VECTOR_BUILD_REFINE=off`) is the
+  plain bisection build, with undersized postings merged away, exactly as
+  before. The same build serves `KOSHA_VECTOR_COMPACTION=rebuild` and the
+  compaction fallback. Late-interaction `.ivf` clustering keeps the plain
+  build.
 - **Compaction** (#253) does not re-cluster. Per vector column:
   1. The largest input whose column has at least 1,024 vectors and a clustered
      index has its postings adopted with [`ClusterIndex::from_postings`]:
@@ -46,6 +63,10 @@ ANN structure when a segment is opened.
   2. Every other input's postings are folded in with
      [`ClusterIndex::absorb_postings`]: an absorbed posting's centroid picks its
      8 nearest adopted postings, and each member moves to the nearest of them.
+     The lookup goes through a coarse index over the adopted centroids
+     (`centroid_index.rs`: about `sqrt(P)` cells, the nearest quarter of them
+     probed, an exact scan under 256 postings), so absorbing `c` loose vectors
+     costs about `c * P / 4` centroid comparisons instead of `c * P`.
      The inputs each partitioned the same space on their own, so keeping their
      postings side by side would split a query's neighbours across overlapping
      postings. Vectors of inputs too small to adopt are absorbed one by one.
@@ -88,7 +109,9 @@ ANN structure when a segment is opened.
   #254). Today every segment carries its own postings, so the number of
   centroids a query ranks grows with segment count; compaction only reduces it
   by producing fewer, larger segments.
-- LIRE on flush: a flush still clusters from scratch.
+- LIRE on flush: a flush has no seed (every vector is new), so it still
+  clusters from scratch; the post-build refinement above is what gives its
+  postings LIRE-like radii.
 - `insert` / `delete` on a live index. Segments are immutable; deletes are
   document tombstones filtered at query time, and LIRE runs only inside
   compaction.
@@ -99,7 +122,7 @@ ANN structure when a segment is opened.
 |---|---|
 | A posting (partition): centroid + assigned vectors | `posting::Posting` |
 | NPA (nearest partition assignment), the invariant LIRE maintains | doc comment on `posting::Posting` |
-| SPTAG (centroid index for probing) | `centroid_probe.rs`, a flat linear scan (see below) |
+| SPTAG (centroid index for probing) | `centroid_probe.rs`, a flat linear scan (see below); `centroid_index.rs`, a coarse two-level index for batch lookups (absorb, build refinement) |
 | Multi-constraint balanced clustering (build + Split's clusterer) | `kmeans::balanced_bisect` |
 | LIRE: Insert | `ops::insert::insert` |
 | LIRE: Delete (tombstone) | `ops::delete::delete` |
@@ -127,15 +150,19 @@ vectors, rewritten by compaction, which shapes these choices:
   inline. The paper's Local Rebuilder thread pool amortizes cost across an
   index that never stops taking writes; compaction is already a batch job.
 - **Flat centroid probing, not SPTAG.** A segment has tens to a few thousand
-  postings, so a linear scan plus a partial sort is cheap.
+  postings, so a linear scan plus a partial sort is cheap per lookup. Batches
+  of lookups against centroids that do not move (absorbing thousands of loose
+  vectors, a build refinement round) use `centroid_index.rs`, a static
+  two-level index built per batch; LIRE's per-event lookups still scan,
+  because every event moves centroids.
 - **`balanced_bisect` stands in for multi-constraint balanced clustering.**
   Farthest-pair seeding, Lloyd iterations, then a pass that moves the larger
   side's farthest members to the smaller side until the size ratio is within
   `max_cluster_size_ratio`. That last pass can leave a far member in a
-  posting, which inflates its radius. Absorb plus Reassign tends to produce
-  tighter postings than a from-scratch build, which is why
-  `tests/compaction_merge.rs` and `tests/churn_ablation.rs` both see merged or
-  incrementally maintained indexes match or beat a fresh build.
+  posting, which inflates its radius. `build` therefore refines the leaves by
+  bounded nearest-centroid reassignment and rebalances them (see "Building an
+  index"); with `build_refine_rounds = 0` absorb plus Reassign produces tighter
+  postings than a from-scratch build.
 - **`deleted: bool` plus an informational `version: u8`, no CAS.** There is
   one writer thread, so nothing races. The version is bumped on every
   tombstone so a concurrent design has somewhere to put real conflict
@@ -148,7 +175,7 @@ vectors, rewritten by compaction, which shapes these choices:
 
 `ClusterIndexConfig::new(dim)`: `target_posting_size: 64`,
 `max_posting_size: 128`, `min_posting_size: 16`, `reassign_radius: 8`,
-`nprobe: 16`. These are scaled to kosha segments, not to the paper's
+`nprobe: 16`, `build_refine_rounds: 2`, `build_refine_candidates: 16`. These are scaled to kosha segments, not to the paper's
 billion-scale defaults (it uses `reassign_radius = 64`). `nprobe` applies only
 to this crate's own `search`; kosha-query uses the global budget above.
 
@@ -157,14 +184,19 @@ to this crate's own `search`; kosha-query uses the global budget above.
 - `tests/compaction_merge.rs`: compaction-shaped merges (one big input plus
   flush-sized updates, four equal inputs, six churn cycles) compared against a
   from-scratch build at the same relative probe budget. Recall@10 must not be
-  more than 0.5 points below the build's. The ignored `compaction_cost_report`
-  prints wall-clock rebuild vs lire times
+  more than 0.5 points below the build's. Build refinement must tighten the
+  median radius and lift radius-aware recall@10 at 5% to 0.95 or more, and
+  absorption through the centroid index must place 97%+ of loose vectors in
+  their exact nearest posting. The ignored `compaction_cost_report` prints
+  build time, median radius and recall with refinement off and on, and
+  wall-clock rebuild vs lire times
   (`cargo test --release -p kosha-vector-spfresh --test compaction_merge -- --ignored --nocapture`).
 - `tests/churn_ablation.rs`: the paper's Figure 10 ablation on one
   insert/delete/drift sequence.
 - `tests/invariants.rs`, `tests/recall.rs`: structural invariants and recall
   floors.
-- `benches/build_query_cost.rs`: build, incremental update and query cost, and
+- `benches/build_query_cost.rs`: build, incremental update and query cost,
+  (`build_refine`) build time with refinement off and on, and
   (`compaction_vector_index`) compaction's index step, `rebuild` against
   `lire`. Run with
   `cargo bench -p kosha-vector-spfresh --bench build_query_cost -- compaction_vector_index`.

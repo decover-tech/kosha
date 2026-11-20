@@ -4441,7 +4441,15 @@ mod tests {
                     "lire reused only {reused} of {} input postings",
                     input.len()
                 ),
-                VectorCompactionMode::Rebuild => assert_eq!(reused, 0),
+                // A from-scratch build re-clusters everything. Its
+                // refinement (#253) converges to cluster means, so a posting
+                // that is exactly one of these 16 well-separated clusters
+                // in both builds can come out with the same centroid; the
+                // postings the updates touched cannot.
+                VectorCompactionMode::Rebuild => assert!(
+                    reused < input.len(),
+                    "rebuild kept all {reused} input postings"
+                ),
             }
 
             // doc_seqs were remapped right: each doc's (current) vector

@@ -3,12 +3,26 @@
 //! `balanced_bisect` primitive the runtime `Split` operation uses — the
 //! paper treats "split cascades during a rebuild" and "a runtime split" as
 //! the same mechanism, and this implementation makes that literal.
+//!
+//! Bisection's balance pass moves the larger half's *farthest* members into
+//! the smaller half to meet `max_cluster_size_ratio`, so a leaf can hold
+//! members far from its centroid: loose postings, large radii, and a
+//! radius-aware probe (kosha-query ranks postings by `max(0, d - r)`) that
+//! cannot rule them out. Unless `build_refine_rounds` is 0, the leaves are
+//! then refined: each round moves every vector to the nearest centroid among
+//! its posting's `build_refine_candidates` nearest postings (found with a
+//! `CentroidIndex`, not a scan of all of them) and recomputes centroids;
+//! in the first round a stray the candidates may not cover looks up its
+//! own nearest posting,
+//! and a final `ClusterIndex::rebalance` restores the size bounds with
+//! LIRE's own Split/Merge/Reassign.
 
 use std::collections::{HashMap, HashSet};
 
+use crate::centroid_index::CentroidIndex;
 use crate::error::VectorIndexError;
 use crate::kmeans::balanced_bisect;
-use crate::point::mean_vector;
+use crate::point::{dot, mean_vector, normalize_in_place};
 use crate::posting::{Posting, PostingEntry};
 use crate::rng::DeterministicRng;
 use crate::{validate_config, ClusterIndex, ClusterIndexConfig};
@@ -63,6 +77,11 @@ pub(crate) fn build(
         stack.push(result.right_ids);
     }
 
+    let refine = config.build_refine_rounds > 0;
+    if refine {
+        refine_postings(&mut postings, &config);
+    }
+
     let owner_map = postings
         .iter()
         .enumerate()
@@ -77,6 +96,14 @@ pub(crate) fn build(
         rng,
         defer_cascade_splits: false,
     };
+
+    if refine {
+        // Refinement moved vectors without regard to size: Split what grew
+        // past `max_posting_size`, Merge what fell under
+        // `min_posting_size`, each with LIRE's bounded Reassign.
+        index.rebalance();
+        return Ok(index);
+    }
 
     // The recursive bisection above only enforces the *upper* bound
     // (max_posting_size); it has no reason to keep every leaf above
@@ -97,6 +124,103 @@ pub(crate) fn build(
     }
 
     Ok(index)
+}
+
+/// Bounded nearest-centroid refinement of freshly bisected leaves: up to
+/// `build_refine_rounds` rounds, each moving every vector to the nearest
+/// centroid among its posting's `build_refine_candidates` nearest postings
+/// (its own included; ties stay put), then recomputing every centroid. In
+/// the first round, a vector that the candidates cannot be shown to cover
+/// (see the triangle-inequality test below) also looks up its own nearest
+/// posting through the `CentroidIndex`.
+/// Postings that end a round empty are dropped. Stops early once a round
+/// moves nothing. Sizes are not bounded here; the caller rebalances.
+fn refine_postings(postings: &mut Vec<Posting>, config: &ClusterIndexConfig) {
+    let candidates = config.build_refine_candidates.max(1);
+    for round in 0..config.build_refine_rounds {
+        if postings.len() < 2 {
+            return;
+        }
+        let units: Vec<Vec<f32>> = postings
+            .iter()
+            .map(|p| {
+                let mut u = p.centroid.clone();
+                normalize_in_place(&mut u);
+                u
+            })
+            .collect();
+        let centroids = CentroidIndex::build(
+            postings
+                .iter()
+                .enumerate()
+                .map(|(pid, p)| (pid, p.centroid.as_slice())),
+        );
+        let mut next: Vec<Vec<PostingEntry>> = (0..postings.len()).map(|_| Vec::new()).collect();
+        let mut moved = 0usize;
+        for (pid, posting) in postings.iter_mut().enumerate() {
+            let near = centroids.nearest(&units[pid], candidates);
+            // Every posting outside `near` is at least `reach` (an angle)
+            // from this posting's centroid.
+            let reach = match near.last() {
+                Some(&far) if near.len() < units.len() => angle(dot(&units[pid], &units[far])),
+                _ => f32::INFINITY,
+            };
+            for entry in posting.entries.drain(..) {
+                let v = &entry.vector;
+                // For a fixed vector, `dot(v, unit centroid)` orders
+                // centroids exactly as cosine distance does.
+                let own_score = dot(v, &units[pid]);
+                let mut best = pid;
+                let mut best_score = own_score;
+                for &q in &near {
+                    if q != pid {
+                        let s = dot(v, &units[q]);
+                        if s > best_score {
+                            best_score = s;
+                            best = q;
+                        }
+                    }
+                }
+                // A stray (bisection's balance pass can push a member far
+                // from its centroid, into an unrelated region) may belong
+                // to a posting outside `near`. By the triangle inequality
+                // on angles, any such posting is at least
+                // `reach - angle(v, own)` from `v`; only when `best` is
+                // farther than that does `v` need a lookup of its own.
+                // Strays come from bisection, so the first round catches
+                // them; later rounds only move vectors between neighbours.
+                let norm = dot(v, v).sqrt();
+                if round == 0
+                    && norm > 0.0
+                    && angle(best_score / norm) > reach - angle(own_score / norm)
+                {
+                    if let Some(&q) = centroids.nearest(v, 1).first() {
+                        if dot(v, &units[q]) > best_score {
+                            best = q;
+                        }
+                    }
+                }
+                moved += usize::from(best != pid);
+                next[best].push(entry);
+            }
+        }
+        *postings = next
+            .into_iter()
+            .filter(|entries| !entries.is_empty())
+            .map(|entries| Posting {
+                centroid: mean_vector(entries.iter().map(|e| e.vector.as_slice()), config.dim),
+                entries,
+            })
+            .collect();
+        if moved == 0 {
+            return;
+        }
+    }
+}
+
+/// The angle (radians) whose cosine is `cos`, clamped into range.
+fn angle(cos: f32) -> f32 {
+    cos.clamp(-1.0, 1.0).acos()
 }
 
 fn leaf_posting(group: &[u32], by_id: &HashMap<u32, &Vec<f32>>, dim: usize) -> Posting {

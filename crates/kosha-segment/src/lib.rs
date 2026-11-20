@@ -1214,7 +1214,10 @@ impl SegmentWriter {
         } else {
             column
         };
-        let config = kosha_vector_spfresh::ClusterIndexConfig::new(dim);
+        let mut config = kosha_vector_spfresh::ClusterIndexConfig::new(dim);
+        if !vector_build_refine() {
+            config.build_refine_rounds = 0;
+        }
         let seeded = match seeds {
             Some(seeds) if !seeds.is_empty() => seed_cluster_index(vectors, seeds, config.clone()),
             _ => None,
@@ -3640,6 +3643,29 @@ impl DocVectors {
 /// Reads the local `footer.json`; `false` if it can't be read.
 pub fn segment_uses_doc_vectors(segment_dir: &Path) -> bool {
     SegmentReader::read_footer(segment_dir).is_ok_and(|footer| footer.doc_vectors)
+}
+
+/// `KOSHA_VECTOR_BUILD_REFINE`, read once: whether a from-scratch vector
+/// index build (every flush, and compaction when it does not seed from
+/// postings) refines bisection's postings by nearest-centroid reassignment
+/// and rebalances them (#253). `off` builds exactly as before. The on-disk
+/// format is the same either way.
+fn vector_build_refine() -> bool {
+    static REFINE: OnceLock<bool> = OnceLock::new();
+    *REFINE.get_or_init(|| {
+        parse_vector_build_refine(std::env::var("KOSHA_VECTOR_BUILD_REFINE").ok().as_deref())
+    })
+}
+
+fn parse_vector_build_refine(raw: Option<&str>) -> bool {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("on") | Some("true") | Some("1") => true,
+        Some("off") | Some("false") | Some("0") => false,
+        Some(other) => {
+            eprintln!("WARN: KOSHA_VECTOR_BUILD_REFINE={other} not on|off — using on");
+            true
+        }
+    }
 }
 
 /// The vector-index version `finalize` writes — `KOSHA_VECTOR_WRITE_VERSION`,
@@ -8241,6 +8267,24 @@ mod tests {
     // bug this test exists to catch.
     #[global_allocator]
     static ALLOC: cap::Cap<std::alloc::System> = cap::Cap::new(std::alloc::System, usize::MAX);
+
+    #[test]
+    fn vector_build_refine_parses_on_off_and_defaults_on() {
+        for raw in [
+            None,
+            Some(""),
+            Some("on"),
+            Some(" ON "),
+            Some("true"),
+            Some("1"),
+        ] {
+            assert!(parse_vector_build_refine(raw), "{raw:?}");
+        }
+        for raw in [Some("off"), Some("Off"), Some("false"), Some("0")] {
+            assert!(!parse_vector_build_refine(raw), "{raw:?}");
+        }
+        assert!(parse_vector_build_refine(Some("bogus")));
+    }
 
     /// Serialize an inverted index in the legacy v1 stream layout — the
     /// exact bytes `write_inverted_index` produced before v2 — so the
