@@ -23,7 +23,7 @@ use crate::centroid_index::CentroidIndex;
 use crate::error::VectorIndexError;
 use crate::kmeans::balanced_bisect;
 use crate::point::{dot, mean_vector, normalize_in_place};
-use crate::posting::{Posting, PostingEntry};
+use crate::posting::{Posting, PostingEntry, PostingId};
 use crate::rng::DeterministicRng;
 use crate::{validate_config, ClusterIndex, ClusterIndexConfig};
 
@@ -126,13 +126,22 @@ pub(crate) fn build(
     Ok(index)
 }
 
+/// How far beyond its posting's median best-candidate angle a vector must
+/// be before refinement treats it as a possible stray and looks up its own
+/// nearest posting. Lower catches more strays at more lookups: on dense,
+/// tightly clustered data 1.0 adds ~30% build time at 100k vectors, 1.25
+/// about 3%; on overlapping mixtures 1.25 keeps nearly all of the recall
+/// gain of looking up every uncovered vector (see `compaction_cost_report`).
+const STRAY_FACTOR: f32 = 1.25;
+
 /// Bounded nearest-centroid refinement of freshly bisected leaves: up to
 /// `build_refine_rounds` rounds, each moving every vector to the nearest
 /// centroid among its posting's `build_refine_candidates` nearest postings
 /// (its own included; ties stay put), then recomputing every centroid. In
-/// the first round, a vector that the candidates cannot be shown to cover
-/// (see the triangle-inequality test below) also looks up its own nearest
-/// posting through the `CentroidIndex`.
+/// the first round, a stray — far from every candidate, which the
+/// candidates cannot be shown to cover (see the triangle-inequality test
+/// below) — also looks up its own nearest posting through the
+/// `CentroidIndex`.
 /// Postings that end a round empty are dropped. Stops early once a round
 /// moves nothing. Sizes are not bounded here; the caller rebalances.
 fn refine_postings(postings: &mut Vec<Posting>, config: &ClusterIndexConfig) {
@@ -165,37 +174,54 @@ fn refine_postings(postings: &mut Vec<Posting>, config: &ClusterIndexConfig) {
                 Some(&far) if near.len() < units.len() => angle(dot(&units[pid], &units[far])),
                 _ => f32::INFINITY,
             };
-            for entry in posting.entries.drain(..) {
-                let v = &entry.vector;
-                // For a fixed vector, `dot(v, unit centroid)` orders
-                // centroids exactly as cosine distance does.
-                let own_score = dot(v, &units[pid]);
-                let mut best = pid;
-                let mut best_score = own_score;
-                for &q in &near {
-                    if q != pid {
-                        let s = dot(v, &units[q]);
-                        if s > best_score {
-                            best_score = s;
-                            best = q;
+            // Pass 1: the best of the candidates, and its angle to `v`.
+            let picks: Vec<(PostingId, f32, f32)> = posting
+                .entries
+                .iter()
+                .map(|entry| {
+                    let v = &entry.vector;
+                    // For a fixed vector, `dot(v, unit centroid)` orders
+                    // centroids exactly as cosine distance does.
+                    let own_score = dot(v, &units[pid]);
+                    let mut best = pid;
+                    let mut best_score = own_score;
+                    for &q in &near {
+                        if q != pid {
+                            let s = dot(v, &units[q]);
+                            if s > best_score {
+                                best_score = s;
+                                best = q;
+                            }
                         }
                     }
-                }
-                // A stray (bisection's balance pass can push a member far
-                // from its centroid, into an unrelated region) may belong
-                // to a posting outside `near`. By the triangle inequality
-                // on angles, any such posting is at least
-                // `reach - angle(v, own)` from `v`; only when `best` is
-                // farther than that does `v` need a lookup of its own.
-                // Strays come from bisection, so the first round catches
-                // them; later rounds only move vectors between neighbours.
-                let norm = dot(v, v).sqrt();
-                if round == 0
-                    && norm > 0.0
-                    && angle(best_score / norm) > reach - angle(own_score / norm)
-                {
-                    if let Some(&q) = centroids.nearest(v, 1).first() {
-                        if dot(v, &units[q]) > best_score {
+                    let norm = dot(v, v).sqrt().max(f32::MIN_POSITIVE);
+                    (best, angle(best_score / norm), angle(own_score / norm))
+                })
+                .collect();
+            // A stray (bisection's balance pass can push a member far from
+            // its centroid, into an unrelated region) may belong to a
+            // posting outside `near`. By the triangle inequality on
+            // angles, any such posting is at least `reach - angle(v, own)`
+            // from `v`, so only a vector whose best candidate is farther
+            // than that can be misplaced. In a dense region that bound is
+            // loose for many ordinary members; a stray is also far from
+            // every candidate, so only vectors beyond `STRAY_FACTOR` times
+            // the posting's median best-candidate angle look up their own
+            // nearest posting. Strays come from bisection, so the first
+            // round catches them; later rounds only move vectors between
+            // neighbours.
+            let stray_floor = if round == 0 {
+                let mut a: Vec<f32> = picks.iter().map(|p| p.1).collect();
+                let mid = a.len() / 2;
+                a.select_nth_unstable_by(mid, f32::total_cmp);
+                STRAY_FACTOR * a[mid]
+            } else {
+                f32::INFINITY
+            };
+            for (entry, (mut best, best_angle, own_angle)) in posting.entries.drain(..).zip(picks) {
+                if best_angle > stray_floor && best_angle > reach - own_angle {
+                    if let Some(&q) = centroids.nearest(&entry.vector, 1).first() {
+                        if dot(&entry.vector, &units[q]) > dot(&entry.vector, &units[best]) {
                             best = q;
                         }
                     }
