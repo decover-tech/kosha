@@ -131,6 +131,13 @@ spec:
             # Total residency is still bounded by KOSHA_SEGMENT_LIVE_MAX_BYTES.
             - name: KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES
               value: "2147483648"
+            # A semantic query examines at least 32% of the namespace's vector
+            # groups (default 5%). Measured on a 489K-chunk matter (5,020
+            # groups, 100 queries against exact neighbours): 5% gives recall@10
+            # 0.82, 16% gives 0.97, 32% gives 0.996 with the top hit right
+            # every time, at 76 ms p50 with the cache above.
+            - name: KOSHA_KNN_BUDGET_FRACTION
+              value: "0.32"
           resources:
             requests:
               cpu: "2"
