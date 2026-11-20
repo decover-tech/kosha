@@ -128,6 +128,13 @@ pub struct SegmentWriter {
     /// `(doc_seq, field_idx, where the vector is buffered)` for each vector
     /// moved to the sidecar, in doc_seq then field order.
     doc_vector_entries: Vec<(u32, u32, VectorRef)>,
+    /// Postings of compaction inputs to seed each vector column's index
+    /// from, by field name, one group per input (#253). See
+    /// [`Self::seed_vector_postings`].
+    vector_seeds: HashMap<String, Vec<Vec<VectorSeedPosting>>>,
+    /// How each column's index was built by `finalize`, for tests and
+    /// diagnostics. See [`VectorIndexBuild`].
+    vector_index_builds: Arc<Mutex<Vec<VectorIndexBuild>>>,
     /// Chain for `Text` fields without their own (#220).
     default_analyzer: Analyzer,
     /// Per-field chains that differ from `default_analyzer`.
@@ -236,6 +243,8 @@ impl SegmentWriter {
             doc_vector_fields: Vec::new(),
             vector_quantization: VectorQuantizationConfig::from_env().clone(),
             doc_vector_entries: Vec::new(),
+            vector_seeds: HashMap::new(),
+            vector_index_builds: Arc::new(Mutex::new(Vec::new())),
             default_analyzer: Analyzer::new(&AnalyzerSpec::legacy()),
             field_analyzers: HashMap::new(),
             analyzed_fields: BTreeMap::new(),
@@ -327,6 +336,43 @@ impl SegmentWriter {
     pub fn with_vector_quantization(mut self, config: VectorQuantizationConfig) -> Self {
         self.vector_quantization = config;
         self
+    }
+
+    /// Seed `field`'s vector index with existing postings instead of
+    /// clustering its vectors from scratch (#253). Compaction calls this
+    /// once per input segment with that input's postings, `doc_seqs`
+    /// already remapped to this writer's doc_seqs (see
+    /// [`SegmentReader::vector_posting_layout`]).
+    ///
+    /// The vectors themselves still come from [`Self::add_document`]:
+    /// `doc_vectors.bin` needs them anyway, and the exact values are what
+    /// an i8 column requantizes from and what radii are computed from. A
+    /// seed only says which documents share a posting and where its
+    /// centroid is. At `finalize` the largest input's postings seed the
+    /// column's index
+    /// ([`kosha_vector_spfresh::ClusterIndex::from_postings`]), every other
+    /// input's postings — and vectors no seed covers — are absorbed into
+    /// them ([`kosha_vector_spfresh::ClusterIndex::absorb_postings`]), and
+    /// LIRE's split / merge / reassign repairs the postings that changed.
+    /// If most of a column's vectors are not covered, or a seed's
+    /// dimension disagrees with the column, the column is clustered from
+    /// scratch as usual. Seeds are ignored when
+    /// `KOSHA_VECTOR_WRITE_VERSION=1` (flat, unclustered).
+    pub fn seed_vector_postings(
+        &mut self,
+        field: &str,
+        postings: impl IntoIterator<Item = VectorSeedPosting>,
+    ) {
+        self.vector_seeds
+            .entry(field.to_string())
+            .or_default()
+            .push(postings.into_iter().collect());
+    }
+
+    /// A handle to how `finalize` built each vector column's index — read
+    /// it after `finalize` (which consumes the writer).
+    pub fn vector_index_builds(&self) -> Arc<Mutex<Vec<VectorIndexBuild>>> {
+        Arc::clone(&self.vector_index_builds)
     }
 
     /// Override the `Text` → filter-column cap for this writer (`None`
@@ -1091,8 +1137,16 @@ impl SegmentWriter {
                 offsets: true,
                 quantization,
             };
-            let (idx_bytes, offsets_bytes) =
-                Self::encode_vector_column(&column.vectors, quantization)?;
+            let seeds = self.vector_seeds.get(&column.name);
+            let (idx_bytes, offsets_bytes, build) =
+                Self::encode_vector_column(&column.vectors, seeds, quantization)?;
+            self.vector_index_builds
+                .lock()
+                .unwrap()
+                .push(VectorIndexBuild {
+                    field: column.name.clone(),
+                    ..build
+                });
             self.backend.write(&meta.idx_file(), &idx_bytes)?;
             self.backend.write(&meta.offsets_file(), &offsets_bytes)?;
             metas.push(meta);
@@ -1102,11 +1156,15 @@ impl SegmentWriter {
 
     /// Cluster one column's vectors and encode `(vector.idx bytes,
     /// vector.offsets bytes)` for it. Every vector must share one
-    /// dimension (`buffer_vector` guarantees it).
+    /// dimension (`buffer_vector` guarantees it). With `seeds`, the index
+    /// is seeded from them and repaired by LIRE when they cover enough of
+    /// the column (see [`Self::seed_vector_postings`]); otherwise it is
+    /// clustered from scratch.
     fn encode_vector_column(
         column: &[(u32, Vec<f32>)],
+        seeds: Option<&Vec<Vec<VectorSeedPosting>>>,
         quantization: VectorQuantization,
-    ) -> Result<(Vec<u8>, Vec<u8>), KoshaError> {
+    ) -> Result<(Vec<u8>, Vec<u8>, VectorIndexBuild), KoshaError> {
         let dim = column[0].1.len();
         // Unit-norm (write version 3, on-disk header version 2): normalize
         // once here so the read path can score with a bare dot product.
@@ -1131,15 +1189,28 @@ impl SegmentWriter {
             column
         };
         let config = kosha_vector_spfresh::ClusterIndexConfig::new(dim);
-        let index = kosha_vector_spfresh::ClusterIndex::build(vectors, config).map_err(|e| {
-            // A real ClusterIndex::build failure here (practically always
-            // DimensionMismatch — inconsistent vector dimensionality across
-            // documents in the same segment) means the legacy writer above
-            // would have silently written ragged, unparseable bytes instead.
-            // Fail loud rather than emit a corrupt vector.idx.
-            KoshaError::CorruptSegment(format!("failed to build vector index: {e}"))
-        })?;
+        let seeded = match seeds {
+            Some(seeds) if !seeds.is_empty() => seed_cluster_index(vectors, seeds, config.clone()),
+            _ => None,
+        };
+        let (index, mut build) = match seeded {
+            Some(seeded) => seeded,
+            None => {
+                let index =
+                    kosha_vector_spfresh::ClusterIndex::build(vectors, config).map_err(|e| {
+                        // A real ClusterIndex::build failure here (practically
+                        // always DimensionMismatch — inconsistent vector
+                        // dimensionality across documents in the same
+                        // segment) means the legacy writer above would have
+                        // silently written ragged, unparseable bytes instead.
+                        // Fail loud rather than emit a corrupt vector.idx.
+                        KoshaError::CorruptSegment(format!("failed to build vector index: {e}"))
+                    })?;
+                (index, VectorIndexBuild::default())
+            }
+        };
         let mut postings = index.snapshot();
+        build.postings = postings.len();
         let format_version = if unit_norm {
             for p in &mut postings {
                 kosha_vector_spfresh::normalize_in_place(&mut p.centroid);
@@ -1171,11 +1242,8 @@ impl SegmentWriter {
         } else {
             VECTOR_INDEX_VERSION
         };
-        Ok(encode_vector_index_v2(
-            dim as u32,
-            &postings,
-            format_version,
-        ))
+        let (idx, offsets) = encode_vector_index_v2(dim as u32, &postings, format_version);
+        Ok((idx, offsets, build))
     }
 
     fn write_footer(
@@ -1236,6 +1304,200 @@ enum VectorRef {
     Column(u32, u32),
     /// Index into `unindexed_vectors`.
     Unindexed(u32),
+}
+
+/// One posting of a compaction input, handed to
+/// [`SegmentWriter::seed_vector_postings`] (#253).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorSeedPosting {
+    /// The input posting's stored centroid.
+    pub centroid: Vec<f32>,
+    /// Its members that survive into the output, as output doc_seqs.
+    pub doc_seqs: Vec<u32>,
+    /// Whether any member was dropped (deleted or tombstoned) on the way:
+    /// the centroid is then recomputed from the survivors.
+    pub dropped: bool,
+}
+
+/// How [`SegmentWriter::finalize`] built one vector column's index.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorIndexBuild {
+    pub field: String,
+    /// Seeded from compaction inputs' postings and repaired by LIRE
+    /// (`false`: clustered from scratch).
+    pub lire: bool,
+    /// Postings adopted as-is from the largest input (non-empty ones).
+    pub seeded_postings: usize,
+    /// Adopted postings whose centroid was recomputed (members dropped).
+    pub recentred_postings: usize,
+    /// Postings of the other inputs folded into the adopted ones.
+    pub absorbed_postings: usize,
+    /// Vectors no seed covered, absorbed one by one.
+    pub inserted_vectors: usize,
+    /// LIRE work done by the final rebalance.
+    pub postings_split: usize,
+    pub postings_merged: usize,
+    /// Postings written.
+    pub postings: usize,
+}
+
+/// Compaction inputs with fewer indexed vectors in a column than this
+/// contribute no postings: their vectors are absorbed into the merged
+/// index one by one (#253). A small segment's postings are clustered over
+/// too few points to be useful — a 50-vector segment is one posting whose
+/// centroid is the mean of everything — and its few vectors are cheap to
+/// place individually. Eight postings' worth at the default
+/// `max_posting_size` (128).
+pub const LIRE_ADOPT_MIN_VECTORS: usize = 1024;
+
+/// How compaction builds a merged segment's vector indexes (#253):
+/// `KOSHA_VECTOR_COMPACTION=lire` (the default) seeds each column from its
+/// inputs' postings and repairs them with LIRE; `rebuild` clusters every
+/// vector from scratch, as before. Either way the output is the same
+/// on-disk format every reader already reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorCompactionMode {
+    #[default]
+    Lire,
+    Rebuild,
+}
+
+impl VectorCompactionMode {
+    /// `KOSHA_VECTOR_COMPACTION`, read once.
+    pub fn from_env() -> Self {
+        static MODE: OnceLock<VectorCompactionMode> = OnceLock::new();
+        *MODE.get_or_init(|| Self::parse(std::env::var("KOSHA_VECTOR_COMPACTION").ok().as_deref()))
+    }
+
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("lire") => Self::Lire,
+            Some("rebuild") => Self::Rebuild,
+            Some(other) => {
+                eprintln!("WARN: KOSHA_VECTOR_COMPACTION={other} not lire|rebuild — using lire");
+                Self::Lire
+            }
+        }
+    }
+}
+
+/// How many of the largest input's postings each absorbed posting is
+/// matched against (by centroid) before its members pick the nearest. The
+/// default `reassign_radius`: the neighbourhood LIRE already treats as
+/// "nearby".
+const LIRE_ABSORB_CANDIDATES: usize = 8;
+
+/// Seeds a column's [`kosha_vector_spfresh::ClusterIndex`] from compaction
+/// inputs' postings (see [`SegmentWriter::seed_vector_postings`]):
+/// `vectors` is the column (doc_seq ascending, already normalized when the
+/// index is unit-norm), `groups` one list of seeds per input. `None` when
+/// the seeds cannot be used — a dimension mismatch, or fewer than half of
+/// the column's vectors covered (absorbing the rest one by one would then
+/// cost about as much as clustering, for worse postings) — and the caller
+/// clusters from scratch.
+fn seed_cluster_index(
+    vectors: &[(u32, Vec<f32>)],
+    groups: &[Vec<VectorSeedPosting>],
+    config: kosha_vector_spfresh::ClusterIndexConfig,
+) -> Option<(kosha_vector_spfresh::ClusterIndex, VectorIndexBuild)> {
+    use kosha_vector_spfresh::PostingSnapshot;
+    let dim = config.dim;
+    if groups.iter().flatten().any(|s| s.centroid.len() != dim) {
+        return None;
+    }
+    let position = |doc_seq: u32| vectors.binary_search_by_key(&doc_seq, |(id, _)| *id).ok();
+    let mut covered = vec![false; vectors.len()];
+    let mut recentred = vec![0usize; groups.len()];
+    // Per input: its non-empty postings, members resolved to vectors.
+    let mut snapshots: Vec<Vec<PostingSnapshot>> = Vec::with_capacity(groups.len());
+    for (g, seeds) in groups.iter().enumerate() {
+        let mut group = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let mut entries = Vec::with_capacity(seed.doc_seqs.len());
+            for &doc_seq in &seed.doc_seqs {
+                // A doc_seq the column does not hold (its vector was not
+                // indexed) or one an earlier seed already claimed is
+                // dropped.
+                if let Some(i) = position(doc_seq) {
+                    if !std::mem::replace(&mut covered[i], true) {
+                        entries.push((doc_seq, vectors[i].1.clone()));
+                    }
+                }
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            let centroid = if seed.dropped || entries.len() != seed.doc_seqs.len() {
+                recentred[g] += 1;
+                kosha_vector_spfresh::mean_vector(entries.iter().map(|(_, v)| v.as_slice()), dim)
+            } else {
+                seed.centroid.clone()
+            };
+            group.push(PostingSnapshot {
+                centroid,
+                entries,
+                radius: 0.0,
+            });
+        }
+        snapshots.push(group);
+    }
+    let uncovered: Vec<usize> = (0..vectors.len()).filter(|&i| !covered[i]).collect();
+    if uncovered.len() * 2 > vectors.len() {
+        return None;
+    }
+    // The largest input's postings are adopted as they are; the others'
+    // overlap them (each input partitioned the same space on its own), so
+    // they are absorbed rather than kept side by side.
+    let members = |g: &Vec<PostingSnapshot>| g.iter().map(|p| p.entries.len()).sum::<usize>();
+    let base = (0..snapshots.len()).max_by_key(|&g| members(&snapshots[g]))?;
+    let mut build = VectorIndexBuild {
+        lire: true,
+        seeded_postings: snapshots[base].len(),
+        recentred_postings: recentred[base],
+        inserted_vectors: uncovered.len(),
+        ..VectorIndexBuild::default()
+    };
+    let adopted = snapshots.swap_remove(base);
+    let mut index = kosha_vector_spfresh::ClusterIndex::from_postings(adopted, config).ok()?;
+    for group in snapshots {
+        build.absorbed_postings += group.len();
+        index.absorb_postings(group, LIRE_ABSORB_CANDIDATES).ok()?;
+    }
+    // A loose vector is a one-posting partition centred on itself: it goes
+    // to its exact nearest posting.
+    let loose = uncovered
+        .into_iter()
+        .map(|i| {
+            let (doc_seq, v) = &vectors[i];
+            PostingSnapshot {
+                centroid: v.clone(),
+                entries: vec![(*doc_seq, v.clone())],
+                radius: 0.0,
+            }
+        })
+        .collect();
+    index.absorb_postings(loose, LIRE_ABSORB_CANDIDATES).ok()?;
+    let stats = index.rebalance();
+    build.postings_split = stats.postings_split;
+    build.postings_merged = stats.postings_merged;
+    Some((index, build))
+}
+
+/// One vector column's posting structure as stored: each posting's
+/// centroid and member doc_seqs, in `vector.offsets` order. See
+/// [`SegmentReader::vector_posting_layout`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorPostingLayout {
+    pub dim: usize,
+    /// The index's header version (see [`is_known_vector_index_version`]).
+    pub version: u32,
+    pub postings: Vec<VectorPostingMembers>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorPostingMembers {
+    pub centroid: Vec<f32>,
+    pub doc_seqs: Vec<u32>,
 }
 
 // ─── Vector index format (v2: posting-based, LIRE) ──────────────────────────
@@ -3035,7 +3297,7 @@ pub fn doc_vectors_header_len(prefix: &[u8]) -> Result<Result<u64, u64>, KoshaEr
 /// turn it off and compact before rolling back past one. With it off (the default) segments are byte-identical to those
 /// written before #210. `doc_vectors.bin` keeps full-precision vectors
 /// either way: it is the document's own value, rescoring reads it, and
-/// compaction rebuilds every index from it.
+/// compaction re-encodes every index from it (#253).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VectorQuantizationConfig {
     pub default: VectorQuantization,
@@ -5939,6 +6201,52 @@ impl SegmentReader {
     /// valid v2 header) — see [`VectorFieldIndex::degraded`].
     pub fn vector_index_degraded(&self) -> bool {
         self.default_vector_field().is_some_and(|f| f.degraded())
+    }
+
+    /// `field`'s posting structure — each posting's centroid and member
+    /// doc_seqs — for compaction to seed its output's index from (#253).
+    /// Reads `vector.idx` once, sequentially, keeping only ids (not
+    /// vectors). `Ok(None)` when the column is not served by a clustered
+    /// index: absent, the legacy flat format, a missing or invalid
+    /// `vector.offsets`, or a degraded body.
+    pub fn vector_posting_layout(
+        &self,
+        field: &str,
+    ) -> Result<Option<VectorPostingLayout>, KoshaError> {
+        let Some(index) = self.vector_field(field)? else {
+            return Ok(None);
+        };
+        let Some(vi) = index.lazy.as_ref() else {
+            return Ok(None);
+        };
+        let entry_size = vector_entry_size(vi.dim as u32, vi.version);
+        let mut file = std::io::BufReader::new(fs::File::open(&vi.vector_idx_path)?);
+        let mut buf = Vec::new();
+        let mut postings = Vec::with_capacity(vi.ranges.len());
+        for (centroid, &(offset, length)) in vi.centroids.iter().zip(&vi.ranges) {
+            if !(length as usize).is_multiple_of(entry_size) {
+                return Err(KoshaError::CorruptSegment(format!(
+                    "{}: posting at {offset} is {length} bytes, not a multiple of {entry_size}",
+                    vi.vector_idx_path.display()
+                )));
+            }
+            file.seek(SeekFrom::Start(offset))?;
+            buf.resize(length as usize, 0);
+            file.read_exact(&mut buf)?;
+            let doc_seqs = buf
+                .chunks_exact(entry_size)
+                .map(|entry| u32::from_le_bytes(entry[..4].try_into().unwrap()))
+                .collect();
+            postings.push(VectorPostingMembers {
+                centroid: centroid.clone(),
+                doc_seqs,
+            });
+        }
+        Ok(Some(VectorPostingLayout {
+            dim: vi.dim,
+            version: vi.version,
+            postings,
+        }))
     }
 
     /// The flat (legacy / missing-sidecar) vectors of this segment's first

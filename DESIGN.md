@@ -294,9 +294,28 @@ as the legacy format. The footer's `vector_fields[].quantization` records the ch
 f32). i8 entries score as `scale * Σ q_i·code_i` against the normalized query, without
 dequantizing, and the posting cache holds them as i8. Each segment then rescores its best
 `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates with the f32 vectors in `doc_vectors.bin`, which is
-never quantized: it is the document's own value, and compaction rebuilds every index from it.
+never quantized: it is the document's own value, and compaction re-encodes every index from it.
 Quantization is chosen at write time by `KOSHA_VECTOR_QUANTIZATION` /
 `KOSHA_VECTOR_QUANTIZATION_FIELDS`, not by the namespace schema.
+
+**Compaction merges postings instead of re-clustering (#253).** A flush clusters its vectors from
+scratch (`ClusterIndex::build`, recursive balanced 2-means). Compaction does not: for each vector
+column, the largest input whose column has at least `LIRE_ADOPT_MIN_VECTORS` (1,024) vectors and a
+clustered index has its postings adopted as they are — centroid and members, read from
+`vector.offsets` and the ids in `vector.idx`, with members remapped to merged doc_seqs and
+tombstoned or deleted ones dropped (a posting that lost members gets its centroid recomputed).
+Every other input's postings are then absorbed into those: each absorbed posting's centroid picks
+its 8 nearest adopted postings and each member moves into the nearest of them. Vectors of inputs
+too small to adopt are absorbed one by one into their nearest posting. Finally LIRE (SPFresh's
+split / merge / bounded reassign, `kosha-vector-spfresh`) splits every posting over 128 members,
+merges every one under 16 into its neighbour, and reassigns the vectors those events displace.
+Postings nothing touched keep their centroid and members, so the cost follows how much changed
+rather than the column's size. Entries are re-encoded from the exact f32 vectors, so an i8 column
+is requantized from `doc_vectors.bin` (or the doc store), never from its i8 copy, and radii are
+computed from exact vectors as on flush. The output is the same on-disk format; nothing about
+reading it changes. A column falls back to clustering from scratch when no input qualifies, when
+fewer than half its vectors come from adopted or absorbed postings, or on a dimension mismatch.
+`KOSHA_VECTOR_COMPACTION=rebuild` turns the whole mechanism off (default `lire`).
 
 **Analysis is versioned per segment (#220, #221).** `inverted.idx` holds whatever terms the
 analyzer produced at write time, so a segment's `footer.json` records the exact analysis chains its
@@ -366,7 +385,8 @@ Iceberg/Delta Lake use for tables, applied to a search index.
    first), the ingest node builds inverted + vector + filter indices for the buffered documents,
    writes a new segment to S3, and publishes an updated manifest that adds the new segment.
 4. **Compaction**: a background worker merges *small / recent* segments (and drops
-   tombstoned/deleted docs) into fewer, larger ones under a size-tiered policy (§7.1), publishing
+   tombstoned/deleted docs) into fewer, larger ones under a size-tiered policy (§7.1), merging the
+   inputs' vector postings rather than re-clustering them (#253, §6), publishing
    a new manifest and marking old segments for GC after a grace period (bounded by the longest
    manifest a query node might still be holding). Compaction never holds a process-wide lock
    across merge I/O, and never re-merges already-large segments on every pass.

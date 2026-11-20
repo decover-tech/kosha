@@ -18,6 +18,9 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 cap = "0.1.2"
+# Test-only, one-directional (kosha-write never depends on kosha-query):
+# tests/lire_compaction_recall.rs compacts through the real Indexer.
+kosha-write = { path = "../kosha-write" }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

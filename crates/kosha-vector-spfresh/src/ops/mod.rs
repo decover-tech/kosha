@@ -3,6 +3,7 @@
 //! `ClusterIndex::rebalance`) trigger to keep the index balanced and
 //! NPA-compliant — mirrors the paper's §3.2 breakdown.
 
+pub(crate) mod absorb;
 pub(crate) mod delete;
 pub(crate) mod insert;
 pub(crate) mod merge;

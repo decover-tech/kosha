@@ -1601,6 +1601,7 @@ impl Indexer {
         opts: CompactOptions,
         after_plan: impl FnOnce(),
     ) -> Result<CompactResult, KoshaError> {
+        let vector_index = opts.vector_index;
         self.compact_with_selector(
             namespace,
             |manifest, ns_dir| {
@@ -1611,6 +1612,7 @@ impl Indexer {
                     |seg_id| segment_dir_bytes(&ns_dir.join(&seg_id.0)),
                 )
             },
+            vector_index,
             after_plan,
         )
     }
@@ -1644,6 +1646,7 @@ impl Indexer {
                     .collect();
                 (inputs.len() >= 2).then_some(MergePlan { inputs })
             },
+            None,
             || {},
         )
     }
@@ -1652,6 +1655,9 @@ impl Indexer {
         &self,
         namespace: &NamespaceId,
         select: impl FnOnce(&Manifest, &Path) -> Option<MergePlan>,
+        // How the merged vector indexes are built (#253); `None` reads
+        // `KOSHA_VECTOR_COMPACTION`.
+        vector_index: Option<kosha_segment::VectorCompactionMode>,
         after_plan: impl FnOnce(),
     ) -> Result<CompactResult, KoshaError> {
         let handle = self.ns_handle(namespace);
@@ -1707,6 +1713,9 @@ impl Indexer {
             kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir).with_analysis(&analysis);
         let mut any_docs = false;
         let old_segment_ids = plan.input_ids();
+        let seed_vectors = vector_index
+            .unwrap_or_else(kosha_segment::VectorCompactionMode::from_env)
+            == kosha_segment::VectorCompactionMode::Lire;
         // (old segment_id, old doc_seq) → the doc's doc_seq in the merged
         // output, for every doc actually copied. `SegmentWriter::add_document`
         // assigns doc_seq as `self.doc_records.len()` at call time (strictly
@@ -1719,6 +1728,9 @@ impl Indexer {
         for entry in &plan.inputs {
             let reader = kosha_segment::SegmentReader::open(ns_dir.join(&entry.segment_id.0))?;
             let ts = tombstones.get(&entry.segment_id);
+            // This input's old doc_seq → merged doc_seq (`u32::MAX`: not
+            // copied), for seeding the merged vector index (#253).
+            let mut input_remap: Vec<u32> = Vec::new();
             // `?` here is deliberate: a doc that fails to read must abort
             // the whole compaction, not just be skipped from the merge
             // output — see `iter_doc_records`'s doc comment for the
@@ -1740,9 +1752,19 @@ impl Indexer {
                     continue;
                 }
                 seq_remap.insert((entry.segment_id.clone(), doc_rec.doc_seq), next_new_seq);
+                if seed_vectors {
+                    let old = doc_rec.doc_seq as usize;
+                    if input_remap.len() <= old {
+                        input_remap.resize(old + 1, u32::MAX);
+                    }
+                    input_remap[old] = next_new_seq;
+                }
                 next_new_seq += 1;
                 writer.add_document_with_vectors(doc_rec.doc_id, doc_rec.fields, vectors);
                 any_docs = true;
+            }
+            if seed_vectors {
+                seed_merged_vector_index(&reader, &input_remap, &mut writer);
             }
         }
 
@@ -2841,6 +2863,61 @@ fn dedupe_documents_last_wins(documents: Vec<Document>) -> Vec<Document> {
         .collect()
 }
 
+/// Hands one compaction input's vector postings to the merged segment's
+/// writer (#253), so the merged index is seeded from them and repaired
+/// with LIRE instead of re-clustering every vector. `remap[old_doc_seq]`
+/// is the doc's merged doc_seq, `u32::MAX` (or out of range) when it was
+/// not copied (deleted or tombstoned) — those members are dropped here.
+///
+/// Columns too small to have useful postings (fewer than
+/// [`kosha_segment::LIRE_ADOPT_MIN_VECTORS`] vectors), without a clustered
+/// index (legacy flat format, missing sidecar) or that fail to read are
+/// skipped: the writer then absorbs their vectors one by one, or
+/// clusters the column from scratch when most of it is uncovered. A
+/// legacy footer, which does not name its vector column, is skipped too.
+fn seed_merged_vector_index(
+    reader: &kosha_segment::SegmentReader,
+    remap: &[u32],
+    writer: &mut kosha_segment::SegmentWriter,
+) {
+    let Some(fields) = reader.footer().vector_fields.clone() else {
+        return;
+    };
+    for meta in fields {
+        if !meta.offsets || (meta.count as usize) < kosha_segment::LIRE_ADOPT_MIN_VECTORS {
+            continue;
+        }
+        let layout = match reader.vector_posting_layout(&meta.name) {
+            Ok(Some(layout)) => layout,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!(
+                    "WARN: compaction: cannot read the vector postings of {} field '{}' ({e}) \
+                     — its vectors are re-clustered instead",
+                    reader.segment_dir().display(),
+                    meta.name
+                );
+                continue;
+            }
+        };
+        let seeds = layout.postings.into_iter().map(|p| {
+            let before = p.doc_seqs.len();
+            let doc_seqs: Vec<u32> = p
+                .doc_seqs
+                .into_iter()
+                .filter_map(|old| remap.get(old as usize).copied())
+                .filter(|&new| new != u32::MAX)
+                .collect();
+            kosha_segment::VectorSeedPosting {
+                centroid: p.centroid,
+                dropped: doc_seqs.len() != before,
+                doc_seqs,
+            }
+        });
+        writer.seed_vector_postings(&meta.name, seeds);
+    }
+}
+
 fn segment_flush_counter(segment_id: &SegmentId) -> Option<u64> {
     let suffix = segment_id.0.rsplit('-').next()?;
     if suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -3317,6 +3394,123 @@ mod tests {
         }
         assert_eq!(seen, 3);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #253: `lire` compaction seeds the merged vector index from the
+    /// inputs' postings (remapped to merged doc_seqs, tombstoned members
+    /// dropped); `rebuild` clusters from scratch. Both stay searchable by
+    /// the current reader and hold every live vector exactly once.
+    #[test]
+    fn lire_compaction_reuses_input_postings_and_remaps_doc_seqs() {
+        use kosha_segment::VectorCompactionMode;
+        fn vector(i: u64) -> Vec<f32> {
+            let mut s = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            };
+            let c = (i % 16) as f32;
+            (0..16)
+                .map(|d| if d as f32 == c { 3.0 } else { 0.0 } + next() * 0.5)
+                .collect()
+        }
+        fn layout(
+            dir: &std::path::Path,
+            ns: &NamespaceId,
+            seg: &SegmentId,
+        ) -> Vec<(Vec<f32>, Vec<u32>)> {
+            let reader = kosha_segment::SegmentReader::open(dir.join(&ns.0).join(&seg.0)).unwrap();
+            reader
+                .vector_posting_layout("emb")
+                .unwrap()
+                .unwrap()
+                .postings
+                .into_iter()
+                .map(|p| (p.centroid, p.doc_seqs))
+                .collect()
+        }
+        for mode in [VectorCompactionMode::Lire, VectorCompactionMode::Rebuild] {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-lire-compact-{mode:?}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            // One 2,000-doc input: big enough to have its postings adopted.
+            let idx = Indexer::new(dir.clone())
+                .with_flush_threshold(10_000)
+                .with_max_concurrent_flush_writers(1);
+            let ns = NamespaceId("lire".into());
+            let doc = |id: u64, v: Vec<f32>| Document {
+                id: DocumentId(format!("d{id}")),
+                fields: vec![
+                    Field::text("text", format!("doc {id}")),
+                    Field::vector("emb", v),
+                ],
+            };
+            idx.index_documents(ns.clone(), (0..2_000).map(|i| doc(i, vector(i))).collect())
+                .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+            let big = idx.manifest(&ns).unwrap().segments[0].segment_id.clone();
+            let input = layout(&dir, &ns, &big);
+            // Update 4 docs (tombstones in `big`) with new vectors: at most
+            // 8 of the input's postings change.
+            let updated: Vec<u64> = (0..4).map(|k| k * 397).collect();
+            idx.index_documents(
+                ns.clone(),
+                updated
+                    .iter()
+                    .map(|&i| doc(i, vector(10_000 + i)))
+                    .collect(),
+            )
+            .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+
+            let result = idx
+                .compact_namespace_with_options(&ns, CompactOptions::full().with_vector_index(mode))
+                .unwrap();
+            assert!(result.merged);
+            let manifest = idx.manifest(&ns).unwrap();
+            assert_eq!(manifest.segments.len(), 1);
+            let merged_id = manifest.segments[0].segment_id.clone();
+            let merged = layout(&dir, &ns, &merged_id);
+
+            let mut seqs: Vec<u32> = merged.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+            seqs.sort_unstable();
+            assert_eq!(seqs, (0..2_000).collect::<Vec<u32>>(), "{mode:?}");
+
+            // Re-normalizing a stored (unit) centroid may move its last bit.
+            let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+            let reused = input
+                .iter()
+                .filter(|(c, _)| merged.iter().any(|(m, _)| same(m, c)))
+                .count();
+            match mode {
+                VectorCompactionMode::Lire => assert!(
+                    reused * 2 >= input.len(),
+                    "lire reused only {reused} of {} input postings",
+                    input.len()
+                ),
+                VectorCompactionMode::Rebuild => assert_eq!(reused, 0),
+            }
+
+            // doc_seqs were remapped right: each doc's (current) vector
+            // finds that doc.
+            let reader =
+                kosha_segment::SegmentReader::open(dir.join(&ns.0).join(&merged_id.0)).unwrap();
+            for i in (0..2_000u64).step_by(41).chain(updated.iter().copied()) {
+                let v = if updated.contains(&i) {
+                    vector(10_000 + i)
+                } else {
+                    vector(i)
+                };
+                let hits = reader.knn_search(&v, 1, 1_000).unwrap().unwrap();
+                let rec = reader.doc_record_full(hits[0].0).unwrap().unwrap();
+                assert_eq!(rec.doc_id.0, format!("d{i}"), "{mode:?}");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// #204: each vector column keeps its own index across a compaction,

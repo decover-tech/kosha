@@ -55,6 +55,10 @@ pub enum CompactMode {
 pub struct CompactOptions {
     pub mode: CompactMode,
     pub policy: CompactionPolicy,
+    /// How the merged segment's vector indexes are built (#253); `None`
+    /// reads `KOSHA_VECTOR_COMPACTION` (see
+    /// [`kosha_segment::VectorCompactionMode`]).
+    pub vector_index: Option<kosha_segment::VectorCompactionMode>,
 }
 
 impl CompactOptions {
@@ -62,13 +66,22 @@ impl CompactOptions {
         Self {
             mode: CompactMode::Tiered,
             policy,
+            vector_index: None,
         }
+    }
+
+    /// `self`, building merged vector indexes with `mode` regardless of
+    /// `KOSHA_VECTOR_COMPACTION`.
+    pub fn with_vector_index(mut self, mode: kosha_segment::VectorCompactionMode) -> Self {
+        self.vector_index = Some(mode);
+        self
     }
 
     pub fn full() -> Self {
         Self {
             mode: CompactMode::Full,
             policy: CompactionPolicy::default(),
+            vector_index: None,
         }
     }
 }
@@ -287,6 +300,7 @@ mod tests {
                 trigger_mergeable_segments: 8,
                 ..CompactionPolicy::default()
             },
+            vector_index: None,
         };
         let plan = select_merge_inputs(&m, &opts, |_| true, |_| Some(1)).expect("plan");
         assert_eq!(plan.inputs.len(), 2);
