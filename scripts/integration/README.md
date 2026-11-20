@@ -84,7 +84,10 @@ c and h share one namespace: at every step the conformance query set (BM25,
 filters, sorts, pagination) runs on **both** pods and every answer must match
 the model exactly. Before checking, the runner waits up to 30 s for the query
 pod to catch up (`:converged`), using searches only. `stats` would force a
-refresh and hide a broken refresher.
+refresh and hide a broken refresher. Catching up must take at most `--max-lag`
+seconds (default 1, `:refresher-lag`). The refresher polls every 200 ms. The
+re-warm poller (every 5 s) also installs new versions of hot namespaces, so
+without this bound a dead refresher would only make the query pod slower.
 
 | | Scenario | What it does | Issues |
 | --- | --- | --- | --- |

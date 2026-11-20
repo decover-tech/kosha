@@ -11,7 +11,8 @@ Scenarios, in order (each check id starts with the scenario name):
   a  ingest-publish   index + flush on ingest -> exact answers on the query
                       pod (S3 upload, _COMMIT marker, CAS publish: #230,
                       #231); further flushes reach the already-loaded query
-                      pod through the manifest refresher alone (#232)
+                      pod through the manifest refresher alone (#232), each
+                      within --max-lag seconds
   b  forwarded-writes index, upsert, delete-by-query and flush sent to the
                       query pod are forwarded to ingest; a strong search on
                       the query pod reads the unflushed tail (#255)
@@ -273,6 +274,16 @@ class Suite:
             took is not None,
             "caught up in %.2fs" % took if took is not None else "after %ss: probe totals %s, want %s" % (CONVERGE_TIMEOUT, last, want),
         )
+        if self.split and pod is self.query:
+            # The refresher polls every KOSHA_MANIFEST_REFRESH_MS (200 ms in
+            # the overlay). The re-warm poller (KOSHA_REWARM_INTERVAL_MS,
+            # 5 s) also installs new versions of hot namespaces, so without
+            # this bound a dead refresher would only show up as slowness.
+            self.record(
+                "%s@%s:refresher-lag" % (name, pod.name),
+                took is not None and took <= self.args.max_lag,
+                "caught up in %s, bound %.1fs" % ("%.2fs" % took if took is not None else "never", self.args.max_lag),
+            )
 
     def checkpoint(self, name: str, pods: Optional[List[Pod]] = None) -> None:
         """Exact BM25 + filter answers (the conformance query set) on each
@@ -662,6 +673,7 @@ def main() -> int:
     p.add_argument("--docs", type=int, default=4000, help="documents in the main lifecycle")
     p.add_argument("--loaders", type=int, default=8, help="concurrent bulk loader threads")
     p.add_argument("--loader-docs", type=int, default=500, help="documents per loader")
+    p.add_argument("--max-lag", type=float, default=1.0, help="seconds the query pod may take to show a new version (refresher bound)")
     p.add_argument("--only", help="comma-separated scenario letters to run, e.g. a,g")
     p.add_argument("--out", help="write a JSON report here")
     p.add_argument("--keep", action="store_true", help="keep the --spawn data dir and log")
