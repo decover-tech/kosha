@@ -35,6 +35,7 @@ mod posting_spans;
 mod s3_storage;
 #[cfg(feature = "s3")]
 mod segment_commit;
+mod segment_gc;
 mod warm;
 mod warm_run;
 
@@ -42,10 +43,9 @@ mod warm_run;
 use hydration_budget::{HydrationBudget, RequestHydration};
 use kosha_cache::Cache;
 #[cfg(feature = "s3")]
-use kosha_core::StorageBackend;
-#[cfg(feature = "s3")]
 use kosha_core::{segment_may_contain_terms, TermBloomMode};
 use kosha_core::{ControlStore, IndexRequest, IndexResponse, KoshaError, NamespaceId, SearchQuery};
+use kosha_core::{LocalStorage, StorageBackend};
 use kosha_query::DocStoreHydrator;
 #[cfg(feature = "s3")]
 use kosha_query::PageSegment;
@@ -216,6 +216,12 @@ struct AppState {
     /// scheduled or requested through the API, is registered here, so the
     /// global concurrency budget and one-pass-per-namespace hold across both.
     compaction: compaction_sched::CompactionRegistry,
+    /// Segment GC settings (`KOSHA_GC_GRACE`, `KOSHA_LOCAL_GC_GRACE`, …)
+    /// and counters (#239).
+    gc_settings: segment_gc::GcSettings,
+    gc_stats: segment_gc::GcStats,
+    /// Serializes `POST /v1/admin/gc` runs.
+    gc_lock: Mutex<()>,
     /// Namespace-level cached hydration verdict (Tier 1 O2). Keyed by
     /// `(namespace, manifest_version)`: every search request currently
     /// pays per-segment freshness/existence checks inside
@@ -792,6 +798,13 @@ fn segments_needing_sync<'a>(
 /// How many times one publish rebases onto a newer remote manifest before
 /// giving up with `ManifestConflict` (HTTP 409).
 const MANIFEST_REBASE_ATTEMPTS: u32 = 3;
+
+/// Wall-clock Unix epoch milliseconds.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
 
 /// Pause before rebase attempt `attempt` (2..): a few milliseconds, growing,
 /// with jitter so two writers that keep colliding fall out of step.
@@ -1443,6 +1456,9 @@ impl AppState {
             compaction: compaction_sched::CompactionRegistry::new(
                 compaction_sched::SchedulerConfig::from_env(),
             ),
+            gc_settings: segment_gc::GcSettings::from_env(),
+            gc_stats: segment_gc::GcStats::default(),
+            gc_lock: Mutex::new(()),
             completed_hydrations: Mutex::new(HashMap::new()),
             result_cache: Mutex::new(ResultCache::new(result_cache_budget())),
             posting_blob_presence: Mutex::new(HashMap::new()),
@@ -1589,6 +1605,138 @@ impl AppState {
                 run_compaction_scheduler_tick(&state, Instant::now());
             })
             .expect("failed to spawn compaction scheduler thread");
+    }
+
+    /// Start local segment reclamation (#239) on every pod. Every
+    /// `KOSHA_LOCAL_GC_INTERVAL_MS` (default 60 s, `0` disables) it removes
+    /// the local files of segments and deletion generations this node's
+    /// manifest dropped, once `KOSHA_LOCAL_GC_GRACE` (default 5 min) has
+    /// passed and no search can still read them. See [`Self::run_local_gc`].
+    fn spawn_local_gc(self: &Arc<Self>) {
+        let Some(interval) = self.gc_settings.local_interval else {
+            println!("local segment GC disabled (KOSHA_LOCAL_GC_INTERVAL_MS=0)");
+            return;
+        };
+        println!(
+            "local segment GC: every {} ms, grace {} s",
+            interval.as_millis(),
+            self.gc_settings.local_grace.as_secs()
+        );
+        let state = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("kosha-local-gc".into())
+            .spawn(move || loop {
+                std::thread::sleep(interval);
+                state.run_local_gc(state.gc_settings.local_grace);
+            })
+            .expect("failed to spawn local GC thread");
+    }
+
+    /// One local reclamation pass. A segment's directory is removed only
+    /// when the indexer's checks pass (grace, committed, no live search
+    /// snapshot) *and* the searcher holds no open reader of it; the removal
+    /// goes through the disk cache so its size accounting and
+    /// `eviction_generation` (which invalidates posting-blob presence
+    /// verdicts) stay right.
+    fn run_local_gc(&self, grace: Duration) -> kosha_write::LocalReclaimReport {
+        let report = self.indexer.reclaim_local(
+            grace,
+            |ns, seg| self.searcher.release_segment(&ns.0, &seg.0),
+            |rel| self.cache.evict(rel),
+        );
+        self.gc_stats.record_local(&report);
+        if report.segments_removed + report.deletion_vectors_removed > 0 {
+            println!(
+                "local GC: removed {} segment(s) and {} deletion generation(s), {:.1} MB; \
+                 {} still waiting",
+                report.segments_removed,
+                report.deletion_vectors_removed,
+                report.bytes_removed as f64 / (1024.0 * 1024.0),
+                report.pending
+            );
+        }
+        report
+    }
+
+    /// The object store segment GC sweeps: S3 when configured, otherwise
+    /// the local data directory (single-node deployments, tests).
+    fn with_gc_store<T>(&self, f: impl FnOnce(&dyn StorageBackend) -> T) -> T {
+        #[cfg(feature = "s3")]
+        if let Some(ref s3) = self.s3_storage {
+            return f(&s3_storage::S3GcStore(s3));
+        }
+        f(&LocalStorage::new(self.data_dir.clone()))
+    }
+
+    /// Object-store GC over `namespaces` (#239): see `kosha_core::gc`.
+    fn run_segment_gc(
+        &self,
+        namespaces: &[NamespaceId],
+        config: &kosha_core::gc::GcConfig,
+    ) -> Vec<kosha_core::gc::NamespaceGcReport> {
+        let _serial = self.gc_lock.lock().unwrap();
+        let all = self.controller.lock().unwrap().list_namespaces();
+        let mut reports = Vec::new();
+        for ns in namespaces {
+            let others: Vec<NamespaceId> = all.iter().filter(|n| *n != ns).cloned().collect();
+            let mut load = || Ok(self.controller.lock().unwrap().manifest_cloned(ns));
+            let mut commit = |expected: u64, manifest: kosha_core::Manifest| {
+                // Same lock as a local publish, so this node's writer sees
+                // the pruned version as an ordinary concurrent commit.
+                let lock = self.publication_lock(ns);
+                let _guard = lock.lock().unwrap();
+                self.controller
+                    .lock()
+                    .unwrap()
+                    .compare_and_swap_manifest(ns, expected, manifest)
+            };
+            let report = self.with_gc_store(|store| {
+                kosha_core::gc::collect_namespace(
+                    store,
+                    ns,
+                    &others,
+                    &mut load,
+                    &mut commit,
+                    config,
+                )
+            });
+            let report = match report {
+                Ok(report) => report,
+                Err(e) => kosha_core::gc::NamespaceGcReport {
+                    namespace: ns.0.clone(),
+                    dry_run: config.dry_run,
+                    aborted: Some(format!("GC failed: {e}")),
+                    ..Default::default()
+                },
+            };
+            self.gc_stats.record_run(&report);
+            if !config.dry_run {
+                println!(
+                    "segment GC: ns={} version={} deleted {} segment(s), {} deletion \
+                     generation(s), {} object(s), {:.1} MB; pruned {} record(s){}",
+                    report.namespace,
+                    report.manifest_version,
+                    report.segments_deleted,
+                    report.deletion_vectors_deleted,
+                    report.objects_deleted,
+                    report.bytes_reclaimed as f64 / (1024.0 * 1024.0),
+                    report.records_pruned,
+                    report
+                        .aborted
+                        .as_deref()
+                        .map(|a| format!("; aborted: {a}"))
+                        .unwrap_or_default()
+                );
+            }
+            reports.push(report);
+        }
+        self.gc_stats
+            .runs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.gc_stats
+            .last_run_ms
+            .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
+        reports
     }
 
     /// Readiness-gate predicate used by the `/readyz` handler: true when no
@@ -1876,6 +2024,15 @@ impl AppState {
             .unwrap_or(0);
         let local = self.indexer.manifest_version(ns).unwrap_or(0);
         manifest.version = manifest.version.max(expected.max(local) + 1);
+        // Whatever the replaced manifest referenced is now garbage (#239).
+        if let Some(previous) = self.controller.lock().unwrap().manifest_cloned(ns) {
+            let now = unix_millis();
+            kosha_core::gc::record_retirements(
+                &kosha_core::gc::CommittedRefs::of(&previous),
+                &mut manifest,
+                |_, _| now,
+            );
+        }
         self.controller.lock().unwrap().compare_and_swap_manifest(
             ns,
             expected,
@@ -4141,6 +4298,7 @@ fn main() {
     state.spawn_idle_flush_timer();
     state.spawn_compaction_scheduler();
     state.spawn_manifest_refresher();
+    state.spawn_local_gc();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
     println!("kosha-server role={role} listening on {addr} data_dir={data_dir}");
 
@@ -4695,6 +4853,12 @@ fn route_inner(
 
     if request_line.starts_with("POST /v1/admin/import-namespace") {
         return handle_import_namespace(body, tenant, state);
+    }
+
+    if request_line.starts_with("POST /v1/admin/gc ")
+        || request_line.starts_with("POST /v1/admin/gc?")
+    {
+        return handle_segment_gc(body, state);
     }
 
     // ── Internal, pod-to-pod only ────────────────────────────────────────
@@ -5275,6 +5439,10 @@ fn handle_stats(state: &AppState) -> String {
             .ingest_host
             .is_some()
             .then(|| state.manifest_follow.summary_json(Instant::now())),
+        "gc": state.gc_stats.to_json(
+            state.indexer.retired_segment_count(),
+            state.indexer.local_retired_count(),
+        ),
     }))
 }
 
@@ -6418,6 +6586,79 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
     }))
 }
 
+/// POST /v1/admin/gc — garbage-collect superseded segments and deletion
+/// generations from the object store (#239).
+///
+/// Request body (all optional):
+///   {"namespace": "tenant/ns",       // default: every namespace
+///    "dry_run": true,                // default true: report only
+///    "grace_seconds": 3600,          // default KOSHA_GC_GRACE
+///    "orphan_grace_seconds": 86400}  // default KOSHA_GC_ORPHAN_GRACE
+///
+/// A dry run lists every object a real run would delete and the bytes it
+/// would reclaim. A real run deletes each segment's `_COMMIT` first, then
+/// its data files, and drops the deleted objects' retirement records from
+/// the manifest. Anything the current manifest references is never a
+/// candidate, and a namespace whose manifest version moves during the run
+/// is left alone. Local copies are removed separately by each pod's local
+/// GC, once no search can still read them.
+fn handle_segment_gc(body: &[u8], state: &AppState) -> String {
+    let req: segment_gc::GcRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        match serde_json::from_str("{}") {
+            Ok(r) => r,
+            Err(e) => return json_error(500, &e.to_string()),
+        }
+    } else {
+        match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return json_error(400, &format!("invalid GC request: {e}")),
+        }
+    };
+    let all = state.controller.lock().unwrap().list_namespaces();
+    let namespaces = match &req.namespace {
+        Some(name) => {
+            let ns = NamespaceId(name.clone());
+            if !all.contains(&ns) {
+                return json_error(404, &format!("namespace '{name}' not found"));
+            }
+            vec![ns]
+        }
+        None => all,
+    };
+    let grace = req
+        .grace_seconds
+        .map(Duration::from_secs)
+        .unwrap_or(state.gc_settings.grace);
+    let orphan_grace = req
+        .orphan_grace_seconds
+        .map(Duration::from_secs)
+        .unwrap_or(state.gc_settings.orphan_grace);
+    let config = kosha_core::gc::GcConfig {
+        dry_run: req.dry_run,
+        grace_ms: grace.as_millis() as u64,
+        orphan_grace_ms: orphan_grace.as_millis() as u64,
+        now_ms: unix_millis(),
+    };
+    let reports = state.run_segment_gc(&namespaces, &config);
+    let sum = |f: fn(&kosha_core::gc::NamespaceGcReport) -> u64| reports.iter().map(f).sum::<u64>();
+    json_ok(&serde_json::json!({
+        "dry_run": req.dry_run,
+        "grace_seconds": grace.as_secs(),
+        "orphan_grace_seconds": orphan_grace.as_secs(),
+        "candidates": sum(|r| r.candidates.len() as u64),
+        "reclaimable_bytes": sum(|r| r.reclaimable_bytes),
+        "segments_deleted": sum(|r| r.segments_deleted as u64),
+        "deletion_vectors_deleted": sum(|r| r.deletion_vectors_deleted as u64),
+        "bytes_reclaimed": sum(|r| r.bytes_reclaimed),
+        "aborted_namespaces": reports.iter().filter(|r| r.aborted.is_some()).count(),
+        "namespaces": reports,
+        "stats": state.gc_stats.to_json(
+            state.indexer.retired_segment_count(),
+            state.indexer.local_retired_count(),
+        ),
+    }))
+}
+
 /// POST /v1/admin/compact-namespace — run one compaction pass on a namespace.
 ///
 /// Defaults to size-tiered compaction (DESIGN.md §7.1): only small segments
@@ -7042,6 +7283,7 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        retired: Default::default(),
     }
 }
 
@@ -8434,6 +8676,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         state.import_manifest(&ns, manifest(1, "seed")).unwrap();
         assert_eq!(shared.manifest_cloned(&ns).unwrap().version, 1);
@@ -9843,6 +10086,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         // Simulate: an earlier publish call already confirmed seg-2
         // synced (e.g. it was "last" at the time it ran), but seg-1 and
@@ -10577,6 +10821,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
@@ -10845,6 +11090,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let ns = NamespaceId("ns".into());
         let partial = kosha_query::Searcher::new(local_root.clone())
@@ -10899,6 +11145,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
@@ -11424,6 +11671,248 @@ mod tests {
                 "doc{i} missing after compaction: {search}"
             );
         }
+    }
+
+    #[test]
+    fn gc_endpoint_dry_runs_then_collects_compaction_retired_segments() {
+        let state = test_state();
+        let ns = NamespaceId(tenant_namespace("test", "gc-ns"));
+        for i in 0..3 {
+            let req = IndexRequest {
+                namespace: NamespaceId("gc-ns".into()),
+                documents: vec![Document {
+                    id: DocumentId(format!("doc{i}")),
+                    fields: vec![Field::text("title", format!("segment number {i}"))],
+                }],
+            };
+            route(
+                "POST /index HTTP/1.1\r\n",
+                &HashMap::new(),
+                &serde_json::to_vec(&req).unwrap(),
+                "test",
+                &state,
+            );
+            route(
+                "POST /flush HTTP/1.1\r\n",
+                &HashMap::new(),
+                br#"{"namespace":"gc-ns"}"#,
+                "test",
+                &state,
+            );
+        }
+        let inputs: Vec<String> = state
+            .indexer
+            .manifest_cloned(&ns)
+            .unwrap()
+            .segments
+            .iter()
+            .map(|e| e.segment_id.0.clone())
+            .collect();
+        assert_eq!(inputs.len(), 3);
+        let response =
+            handle_compact_namespace(br#"{"namespace":"gc-ns","mode":"full"}"#, "test", &state);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let published = state
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_cloned(&ns)
+            .unwrap();
+        assert_eq!(published.retired.len(), 3, "compaction records its inputs");
+
+        // Admin-only.
+        let denied = route(
+            "POST /v1/admin/gc HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"{}",
+            "test",
+            &state,
+        );
+        assert!(denied.contains("403"), "{denied}");
+
+        // Default grace: everything is too fresh to collect.
+        let body = serde_json::json!({"namespace": ns.0}).to_string();
+        let response = handle_segment_gc(body.as_bytes(), &state);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let json: serde_json::Value =
+            serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(json["dry_run"], true);
+        assert_eq!(json["candidates"], 0);
+
+        // Zero grace, dry run: exactly the three inputs, nothing deleted.
+        let body = serde_json::json!({"namespace": ns.0, "grace_seconds": 0}).to_string();
+        let response = handle_segment_gc(body.as_bytes(), &state);
+        let json: serde_json::Value =
+            serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let mut listed: Vec<String> = json["namespaces"][0]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["segment_id"].as_str().unwrap().to_string())
+            .collect();
+        listed.sort();
+        let mut expected = inputs.clone();
+        expected.sort();
+        assert_eq!(listed, expected);
+        assert!(json["reclaimable_bytes"].as_u64().unwrap() > 0);
+        for id in &inputs {
+            assert!(state.data_dir.join(&ns.0).join(id).exists());
+        }
+
+        // Real run.
+        let body = serde_json::json!({"namespace": ns.0, "grace_seconds": 0, "dry_run": false})
+            .to_string();
+        let response = handle_segment_gc(body.as_bytes(), &state);
+        let json: serde_json::Value =
+            serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(json["segments_deleted"], 3, "{json}");
+        assert_eq!(json["aborted_namespaces"], 0, "{json}");
+        assert!(
+            json["stats"]["kosha_gc_bytes_reclaimed_total"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(json["stats"]["kosha_gc_segments_deleted_total"], 3);
+        for id in &inputs {
+            assert!(!state
+                .data_dir
+                .join(&ns.0)
+                .join(id)
+                .join("doc_store.bin")
+                .exists());
+        }
+        let pruned = state
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_cloned(&ns)
+            .unwrap();
+        assert!(pruned.retired.is_empty());
+        assert_eq!(pruned.version, published.version + 1);
+
+        // Local GC has nothing left to remove; the queue drains.
+        state.run_local_gc(Duration::ZERO);
+        assert_eq!(state.indexer.local_retired_count(), 0);
+
+        // The writer rebases onto the pruned version on its next publish,
+        // and every document is still searchable.
+        let req = IndexRequest {
+            namespace: NamespaceId("gc-ns".into()),
+            documents: vec![Document {
+                id: DocumentId("doc9".into()),
+                fields: vec![Field::text("title", "segment number 9")],
+            }],
+        };
+        route(
+            "POST /index HTTP/1.1\r\n",
+            &HashMap::new(),
+            &serde_json::to_vec(&req).unwrap(),
+            "test",
+            &state,
+        );
+        let flushed = route(
+            "POST /flush HTTP/1.1\r\n",
+            &HashMap::new(),
+            br#"{"namespace":"gc-ns"}"#,
+            "test",
+            &state,
+        );
+        assert!(flushed.starts_with("HTTP/1.1 200 OK"), "{flushed}");
+        for i in [0, 1, 2, 9] {
+            let search = route(
+                &format!("GET /search?ns=gc-ns&q=segment+number+{i} HTTP/1.1\r\n"),
+                &HashMap::new(),
+                b"",
+                "test",
+                &state,
+            );
+            assert!(search.contains(&format!("\"doc{i}\"")), "doc{i}: {search}");
+        }
+        let stats = handle_stats(&state);
+        assert!(stats.contains("kosha_retired_segments"), "{stats}");
+        assert!(stats.contains("kosha_gc_bytes_reclaimed_total"), "{stats}");
+    }
+
+    #[test]
+    fn local_gc_keeps_compacted_inputs_until_searches_release_them() {
+        let state = test_state();
+        let ns = NamespaceId(tenant_namespace("test", "lgc-ns"));
+        for i in 0..2 {
+            let req = IndexRequest {
+                namespace: NamespaceId("lgc-ns".into()),
+                documents: vec![Document {
+                    id: DocumentId(format!("doc{i}")),
+                    fields: vec![Field::text("title", format!("segment number {i}"))],
+                }],
+            };
+            route(
+                "POST /index HTTP/1.1\r\n",
+                &HashMap::new(),
+                &serde_json::to_vec(&req).unwrap(),
+                "test",
+                &state,
+            );
+            route(
+                "POST /flush HTTP/1.1\r\n",
+                &HashMap::new(),
+                br#"{"namespace":"lgc-ns"}"#,
+                "test",
+                &state,
+            );
+        }
+        // An in-flight search: its snapshot, taken before compaction.
+        let snapshot = state.indexer.manifest_shared(&ns).unwrap();
+        let inputs: Vec<kosha_core::SegmentId> = snapshot
+            .segments
+            .iter()
+            .map(|e| e.segment_id.clone())
+            .collect();
+        let query: SearchQuery =
+            serde_json::from_value(serde_json::json!({"query_text": "segment"})).unwrap();
+        assert_eq!(
+            state
+                .searcher
+                .search(&ns, &snapshot, &query, None)
+                .unwrap()
+                .results
+                .len(),
+            2
+        );
+        let response =
+            handle_compact_namespace(br#"{"namespace":"lgc-ns","mode":"full"}"#, "test", &state);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let generation = state.cache.eviction_generation();
+
+        let report = state.run_local_gc(Duration::ZERO);
+        assert_eq!((report.segments_removed, report.pending), (0, 2));
+        assert_eq!(
+            state
+                .searcher
+                .search(&ns, &snapshot, &query, None)
+                .unwrap()
+                .results
+                .len(),
+            2,
+            "a search on the pre-compaction snapshot still works after local GC"
+        );
+        drop(snapshot);
+        let report = state.run_local_gc(Duration::ZERO);
+        assert_eq!((report.segments_removed, report.pending), (2, 0));
+        for id in &inputs {
+            assert!(!state.data_dir.join(&ns.0).join(&id.0).exists());
+        }
+        assert!(state.cache.eviction_generation() > generation);
+        let fresh = state.indexer.manifest_shared(&ns).unwrap();
+        assert_eq!(
+            state
+                .searcher
+                .search(&ns, &fresh, &query, None)
+                .unwrap()
+                .results
+                .len(),
+            2
+        );
     }
 
     /// `test_state`, but behind the `Arc` `main` uses, so `self_ref`

@@ -52,6 +52,7 @@ fn main() {
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        retired: Default::default(),
     };
     manifest.remember_segment_footer(footer);
     let idx = Indexer::new(dir.clone());

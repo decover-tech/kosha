@@ -139,6 +139,7 @@ fn build_corpus(root: &Path, ns: &NamespaceId, segs: usize, docs: usize, vocab: 
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        retired: Default::default(),
     }
 }
 

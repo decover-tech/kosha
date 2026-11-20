@@ -58,6 +58,7 @@ impl Controller {
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
                 schema: None,
+                retired: Default::default(),
             },
         );
         Ok(())
@@ -79,6 +80,7 @@ impl Controller {
                     tombstones: Default::default(),
                     deletion_vectors: Default::default(),
                     schema: None,
+                    retired: Default::default(),
                 },
             );
         }
@@ -230,6 +232,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         ctrl.compare_and_swap_manifest(&ns, 0, candidate.clone())
             .unwrap();
@@ -318,6 +321,7 @@ mod tests {
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
                 schema: None,
+                retired: Default::default(),
             },
         )
         .unwrap();
@@ -338,6 +342,7 @@ mod tests {
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
                 schema: None,
+                retired: Default::default(),
             },
         )
         .unwrap();
@@ -367,6 +372,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
 
         // CAS with version 0 → should succeed (initial version is 0).
@@ -388,6 +394,7 @@ mod tests {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         };
         assert!(ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2).is_err());
     }

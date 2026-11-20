@@ -2104,6 +2104,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "kosha-core",
+ "kosha-query",
  "kosha-segment",
  "serde",
  "serde_json",

@@ -295,25 +295,35 @@ impl Cache {
         self.account(key, 0, new_len);
     }
 
-    /// Remove a file from the cache.
-    pub fn evict(&self, key: &str) -> Result<(), KoshaError> {
+    /// Remove a file, or a whole directory such as a segment, from the
+    /// cache. Returns the bytes removed.
+    pub fn evict(&self, key: &str) -> Result<u64, KoshaError> {
         let path = self.path_for(key)?;
+        let mut removed = 0;
         if path.is_file() {
-            let len = path.metadata().map(|m| m.len()).unwrap_or(0);
+            removed = path.metadata().map(|m| m.len()).unwrap_or(0);
             std::fs::remove_file(&path)?;
-            self.total_bytes.fetch_sub(len, Ordering::Relaxed);
             self.eviction_generation.fetch_add(1, Ordering::Relaxed);
         } else if path.is_dir() {
-            let len = dir_size(&path);
+            removed = dir_size(&path);
             std::fs::remove_dir_all(&path)?;
-            self.total_bytes.fetch_sub(len, Ordering::Relaxed);
             self.eviction_generation.fetch_add(1, Ordering::Relaxed);
         }
-        let mut recency = self.recency.lock().unwrap();
-        if let Some(pos) = recency.iter().position(|k| k == key) {
-            recency.remove(pos);
+        // Saturating: a directory can hold files written by something that
+        // never reported them (an ingest pod's own flushes).
+        let mut total = self.total_bytes.load(Ordering::Relaxed);
+        while let Err(actual) = self.total_bytes.compare_exchange_weak(
+            total,
+            total.saturating_sub(removed),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            total = actual;
         }
-        Ok(())
+        let mut recency = self.recency.lock().unwrap();
+        let nested = format!("{}/", key.trim_end_matches('/'));
+        recency.retain(|k| k != key && !k.starts_with(&nested));
+        Ok(removed)
     }
 
     /// Remove a whole directory (a superseded segment) and every file under
@@ -506,6 +516,21 @@ mod tests {
 
         cache.evict("key.bin").unwrap();
         assert!(cache.get("key.bin").is_none());
+
+        // A whole segment directory, including bytes the cache never saw.
+        cache.put("ns/seg/a.bin", &src).unwrap();
+        fs::write(dir.join("ns/seg/unreported.bin"), b"0123456789").unwrap();
+        let before = cache.eviction_generation();
+        assert_eq!(cache.evict("ns/seg").unwrap(), 14);
+        assert!(!dir.join("ns/seg").exists());
+        assert_eq!(cache.eviction_generation(), before + 1);
+        assert_eq!(cache.total_size(), 0, "never underflows");
+        assert!(cache
+            .recency
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|k| !k.starts_with("ns/seg")));
 
         let _ = fs::remove_dir_all(&dir);
     }

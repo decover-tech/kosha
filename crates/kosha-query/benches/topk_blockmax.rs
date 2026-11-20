@@ -124,6 +124,7 @@ fn build_corpus(
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        retired: Default::default(),
     }
 }
 
