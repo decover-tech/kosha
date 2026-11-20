@@ -4718,10 +4718,7 @@ impl SegmentReader {
         } else {
             (VectorStore::default(), None, None, false)
         };
-        let footer = match footer {
-            Some(footer) => footer,
-            None => Self::read_footer(&segment_dir)?,
-        };
+        let footer = resolve_open_footer(&segment_dir, footer)?;
         let posting_spans = footer.posting_blobs_raw;
         let filters = LazyFilters {
             segment_dir: segment_dir.clone(),
@@ -4734,7 +4731,7 @@ impl SegmentReader {
                 doc_store_path: segment_dir.join("doc_store.bin"),
                 index,
             },
-            None => DocStoreAccess::Eager(Self::read_doc_store(&segment_dir)?),
+            None => DocStoreAccess::Eager(Self::read_doc_store_for_fallback(&segment_dir)?),
         };
         Ok(Self {
             segment_dir: segment_dir.clone(),
@@ -5998,6 +5995,30 @@ impl SegmentReader {
         Ok(footer)
     }
 
+    /// [`SegmentReader::read_doc_store`] for the open path's eager
+    /// fallback, with an error that says what actually went wrong when the
+    /// bulk file is not local. Hydration fetches only `doc_store.offsets`
+    /// for a Lazy segment, so a sidecar that is then rejected used to
+    /// surface as a bare "I/O error: No such file or directory" 500 with no
+    /// hint which file or why (#184). The server's hydration planner now
+    /// validates the sidecar and fetches `doc_store.bin` before this can
+    /// happen; this keeps the failure legible if some other caller doesn't.
+    fn read_doc_store_for_fallback(segment_dir: &Path) -> Result<Vec<DocRecord>, KoshaError> {
+        match Self::read_doc_store(segment_dir) {
+            Err(KoshaError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(KoshaError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "{}: doc_store.offsets is missing or failed its sanity check, and the \
+                         eager fallback needs doc_store.bin, which is not present locally",
+                        segment_dir.display()
+                    ),
+                )))
+            }
+            other => other,
+        }
+    }
+
     /// Legacy full-parse path (`DocStoreAccess::Eager`) — reads the whole
     /// `doc_store.bin` at once. Used only when the `doc_store.offsets`
     /// sidecar is missing or fails its sanity check (see
@@ -6276,6 +6297,86 @@ fn parse_one_doc_record(cursor: &mut &[u8], doc_seq: u32) -> DocRecord {
         doc_seq,
         field_length,
         fields,
+    }
+}
+
+/// The footer a segment is opened with. With no caller-supplied footer,
+/// that is the segment's own `footer.json`.
+///
+/// A caller-supplied footer (search passes the manifest's cached copy so a
+/// cold open needn't fetch `footer.json`) is trusted unless the
+/// `doc_store.offsets` header disagrees with its `doc_count`. Then the
+/// segment's own `footer.json`, when it is on local disk, decides: if it
+/// disagrees with the supplied copy, the supplied copy is the stale one and
+/// is replaced. Issue #184 found manifest footers claiming 6, 25 and 36 docs
+/// for segments whose `footer.json` and `doc_store.offsets` both said 1 or 2;
+/// trusting the manifest made the sanity check reject a correct sidecar and
+/// fall back to a `doc_store.bin` that was never hydrated.
+fn resolve_open_footer(segment_dir: &Path, supplied: Option<Footer>) -> Result<Footer, KoshaError> {
+    let Some(supplied) = supplied else {
+        return SegmentReader::read_footer(segment_dir);
+    };
+    match doc_store_offsets_header_count(segment_dir) {
+        Some(declared) if declared != supplied.doc_count => {}
+        _ => return Ok(supplied),
+    }
+    match SegmentReader::read_footer(segment_dir) {
+        Ok(own) if own.segment_id == supplied.segment_id && own.doc_count != supplied.doc_count => {
+            eprintln!(
+                "WARN: {}: the manifest's cached footer says {} doc(s) but the segment's own \
+                 footer.json says {}; using footer.json",
+                segment_dir.display(),
+                supplied.doc_count,
+                own.doc_count
+            );
+            Ok(own)
+        }
+        _ => Ok(supplied),
+    }
+}
+
+/// The doc count `doc_store.offsets` declares in its 4-byte header, or
+/// `None` when the sidecar is absent or shorter than a header. Reads only
+/// the header, never the entries.
+fn doc_store_offsets_header_count(segment_dir: &Path) -> Option<u32> {
+    let mut header = [0u8; 4];
+    fs::File::open(segment_dir.join("doc_store.offsets"))
+        .and_then(|mut f| f.read_exact(&mut header))
+        .ok()?;
+    Some(u32::from_le_bytes(header))
+}
+
+/// Whether [`SegmentReader::open_with_footer_options`], given the same
+/// `footer`, would open this segment's doc store lazily from
+/// `doc_store.offsets`. `false` means the open would take the eager path
+/// and read `doc_store.bin`, so a caller that hydrates files before opening
+/// (the server's search path) must make sure that file is local.
+///
+/// Runs the reader's own sanity check (same footer resolution, same full
+/// parse of the sidecar), so the two cannot disagree. Costs one read of
+/// the sidecar, which is small next to the S3 fetch that just landed it.
+pub fn doc_store_opens_lazily(segment_dir: &Path, footer: Option<&Footer>) -> bool {
+    let Ok(footer) = resolve_open_footer(segment_dir, footer.cloned()) else {
+        return false;
+    };
+    try_read_doc_index(segment_dir, footer.doc_count).is_some()
+}
+
+/// Cheap, header-only version of [`doc_store_opens_lazily`] for checks that
+/// run on every search: the sidecar exists and its declared doc count
+/// matches the footer the reader would use. It does not parse the entries,
+/// so a sidecar truncated mid-record still passes; the hydration planner's
+/// full check catches that when the file is first fetched.
+pub fn doc_store_offsets_plausible(segment_dir: &Path, footer: Option<&Footer>) -> bool {
+    let Some(declared) = doc_store_offsets_header_count(segment_dir) else {
+        return false;
+    };
+    match footer {
+        Some(f) if f.doc_count == declared => true,
+        // Mismatch with the supplied footer (or none supplied): resolve the
+        // way the reader would. Reads footer.json only on this slow path.
+        _ => resolve_open_footer(segment_dir, footer.cloned())
+            .is_ok_and(|resolved| resolved.doc_count == declared),
     }
 }
 
@@ -8152,6 +8253,99 @@ mod tests {
         assert!(bloom.may_contain("dispute"));
         assert!(!bloom.may_contain("absent-term-xyz"));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn three_doc_segment(tag: &str) -> (PathBuf, Footer) {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-seg-footer-reconcile-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut w = SegmentWriter::new(SegmentId("seg".into()), dir.clone());
+        for i in 0..3 {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![Field::text("content", "hello")],
+            );
+        }
+        let footer = w.finalize(Bm25Params::default()).unwrap();
+        (dir, footer)
+    }
+
+    /// #184: a manifest-supplied footer with a stale doc count must not make
+    /// the reader reject a correct sidecar when the segment's own
+    /// footer.json is there to settle it.
+    #[test]
+    fn stale_supplied_footer_is_reconciled_against_footer_json() {
+        let (dir, footer) = three_doc_segment("stale");
+        let mut stale = footer.clone();
+        stale.doc_count = 6;
+        fs::remove_file(dir.join("doc_store.bin")).unwrap();
+
+        assert!(doc_store_opens_lazily(&dir, Some(&footer)));
+        assert!(doc_store_offsets_plausible(&dir, Some(&footer)));
+        assert!(
+            doc_store_opens_lazily(&dir, Some(&stale)),
+            "footer.json agrees with the sidecar, so the stale copy is replaced"
+        );
+        assert!(doc_store_offsets_plausible(&dir, Some(&stale)));
+        let reader =
+            SegmentReader::open_with_footer_options(dir.clone(), false, Some(stale.clone()), None)
+                .expect("opens lazily without doc_store.bin");
+        assert_eq!(
+            reader.footer().doc_count,
+            3,
+            "uses the segment's own footer"
+        );
+        assert!(matches!(reader.doc_store, DocStoreAccess::Lazy { .. }));
+
+        // Without footer.json there is nothing to reconcile against: the
+        // sidecar is rejected, and the eager fallback names what is missing
+        // instead of a bare "No such file or directory".
+        fs::remove_file(dir.join("footer.json")).unwrap();
+        assert!(!doc_store_opens_lazily(&dir, Some(&stale)));
+        assert!(!doc_store_offsets_plausible(&dir, Some(&stale)));
+        let err = SegmentReader::open_with_footer_options(dir.clone(), false, Some(stale), None)
+            .err()
+            .expect("cannot open: sidecar rejected and doc_store.bin absent")
+            .to_string();
+        assert!(err.contains("doc_store.bin"), "{err}");
+        assert!(err.contains("not present locally"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A sidecar that really is wrong stays rejected even when footer.json
+    /// agrees with the supplied footer, and a header-only check cannot see
+    /// a mid-record truncation (the full check can).
+    #[test]
+    fn genuinely_bad_sidecar_is_rejected() {
+        let (dir, footer) = three_doc_segment("bad");
+        let offsets = fs::read(dir.join("doc_store.offsets")).unwrap();
+
+        let mut wrong_count = offsets.clone();
+        wrong_count[..4].copy_from_slice(&9u32.to_le_bytes());
+        fs::write(dir.join("doc_store.offsets"), &wrong_count).unwrap();
+        assert!(!doc_store_opens_lazily(&dir, Some(&footer)));
+        assert!(!doc_store_offsets_plausible(&dir, Some(&footer)));
+        assert!(!doc_store_offsets_plausible(&dir, None));
+        let reader =
+            SegmentReader::open_with_footer_options(dir.clone(), false, Some(footer.clone()), None)
+                .unwrap();
+        assert!(
+            matches!(reader.doc_store, DocStoreAccess::Eager(_)),
+            "doc_store.bin is local, so the eager fallback works"
+        );
+
+        let mut truncated = offsets.clone();
+        truncated.truncate(offsets.len() - 3);
+        fs::write(dir.join("doc_store.offsets"), &truncated).unwrap();
+        assert!(!doc_store_opens_lazily(&dir, Some(&footer)));
+        assert!(doc_store_offsets_plausible(&dir, Some(&footer)));
+
+        fs::remove_file(dir.join("doc_store.offsets")).unwrap();
+        assert!(!doc_store_opens_lazily(&dir, Some(&footer)));
+        assert!(!doc_store_offsets_plausible(&dir, Some(&footer)));
         let _ = fs::remove_dir_all(&dir);
     }
 
