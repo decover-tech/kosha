@@ -723,8 +723,9 @@ impl HydrationVerdict {
 /// sidecar where one exists — a legacy segment's only for the clustered
 /// format: a clustered column without it is served by exact scan of every
 /// vector (seconds on a large segment). A legacy segment that stores its
-/// vectors in `doc_vectors.bin` also needs that file, whose field table
-/// binds its unnamed index.
+/// vectors in `doc_vectors.bin` also needs that file's header, whose field
+/// table binds its unnamed index — the whole file or just the header span
+/// in the span cache.
 #[cfg(feature = "s3")]
 fn knn_files_complete(
     seg_path: &Path,
@@ -751,8 +752,7 @@ fn knn_files_complete(
             return false;
         }
     }
-    !kosha_segment::knn_needs_doc_vectors(footer)
-        || file_present_nonempty(&seg_path.join(kosha_segment::DOC_VECTORS_FILE))
+    !kosha_segment::knn_needs_doc_vectors(footer) || doc_spans::doc_vectors_header_local(seg_path)
 }
 
 /// The vector key a query's [`HydrationVerdict`] records and checks: its
@@ -1879,9 +1879,32 @@ impl AppState {
     /// `eviction_generation` (which invalidates posting-blob presence
     /// verdicts) stay right.
     fn run_local_gc(&self, grace: Duration) -> kosha_write::LocalReclaimReport {
-        let report = self.indexer.reclaim_local(
+        if self.indexer.local_retired_count() == 0 {
+            return kosha_write::LocalReclaimReport::default();
+        }
+        // Objects a branch still reads through its ancestor's prefix stay
+        // (#208). Without every manifest there is no telling which, so the
+        // pass is skipped rather than guessing.
+        let branches = match self.branch_references() {
+            Ok(refs) => refs,
+            Err(e) => {
+                eprintln!("WARN: local GC skipped: {e}");
+                return kosha_write::LocalReclaimReport {
+                    pending: self.indexer.local_retired_count(),
+                    ..Default::default()
+                };
+            }
+        };
+        let report = self.indexer.reclaim_local_shared(
             grace,
-            |ns, seg| self.searcher.release_segment(&ns.0, &seg.0),
+            |ns, seg| {
+                // A shard's segment (#207) is also cached under the root
+                // namespace, by its merged-view id: release both.
+                let merged = merged_view_alias(ns, seg)
+                    .is_some_and(|(root, id)| self.searcher.release_segment(&root.0, &id.0));
+                self.searcher.release_segment(&ns.0, &seg.0) | merged
+            },
+            |rel| branches.holds_segment_dir(rel) || branches.holds_file(rel),
             |rel| self.cache.evict(rel),
         );
         self.gc_stats.record_local(&report);
@@ -1896,6 +1919,56 @@ impl AppState {
             );
         }
         report
+    }
+
+    /// Every namespace and every manifest, for GC's reference sets (#208):
+    /// a branch lists segments (and deletion bitmaps) under its parent's
+    /// prefix, which the parent's GC must keep however long ago the parent
+    /// itself dropped them. Fallible on purpose: a reference set that
+    /// silently missed a manifest would reclaim live objects, so the
+    /// namespace list comes from the fallible `manifest_versions` (a
+    /// failed `list_namespaces` reads as empty), and any unreadable
+    /// manifest fails the whole call. Call with `branch_lock` held.
+    fn every_manifest(&self) -> Result<(Vec<NamespaceId>, NamespaceManifests), String> {
+        let mut all = self
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_versions()
+            .map_err(|e| format!("cannot list manifests: {e}"))?
+            .into_iter()
+            .map(|(ns, _)| ns)
+            .collect::<Vec<_>>();
+        for ns in self.controller.lock().unwrap().list_namespaces() {
+            if !all.contains(&ns) {
+                all.push(ns);
+            }
+        }
+        let mut manifests = Vec::new();
+        for ns in &all {
+            match self.controller.lock().unwrap().try_manifest_cloned(ns) {
+                Ok(Some(manifest)) => manifests.push((ns.clone(), manifest)),
+                Ok(None) => {}
+                Err(e) => return Err(format!("{}: {e}", ns.0)),
+            }
+        }
+        Ok((all, manifests))
+    }
+
+    /// What every branch manifest references (#208), for local GC: a
+    /// copy-on-write branch reads segments and deletion bitmaps under its
+    /// ancestors' prefixes, so an ancestor dropping them from its own
+    /// manifest does not free their local files.
+    fn branch_references(&self) -> Result<kosha_core::branch::References, String> {
+        let _lineage = self.branch_lock.lock().unwrap();
+        let (_, manifests) = self.every_manifest()?;
+        kosha_core::branch::References::collect(
+            manifests
+                .iter()
+                .filter(|(_, manifest)| manifest.branch.is_some())
+                .map(|(ns, manifest)| (ns, manifest)),
+        )
+        .map_err(|e| format!("cannot resolve branch references: {e}"))
     }
 
     /// The object store segment GC sweeps: S3 when configured, otherwise
@@ -1918,35 +1991,24 @@ impl AppState {
         // No branch is created or deleted while GC decides what is still
         // referenced (#208).
         let _lineage = self.branch_lock.lock().unwrap();
-        let all = self.controller.lock().unwrap().list_namespaces();
         let mut reports = Vec::new();
-        // Every manifest, read up front: a branch lists segments (and
-        // deletion bitmaps) under its parent's prefix, which the parent's
-        // GC must keep however long ago the parent itself dropped them.
-        // Fallible on purpose: a reference set that silently missed a
-        // manifest would reclaim live objects.
-        let mut manifests: Vec<(NamespaceId, kosha_core::Manifest)> = Vec::new();
-        for ns in &all {
-            match self.controller.lock().unwrap().try_manifest_cloned(ns) {
-                Ok(Some(manifest)) => manifests.push((ns.clone(), manifest)),
-                Ok(None) => {}
-                Err(e) => {
-                    return namespaces
-                        .iter()
-                        .map(|ns| kosha_core::gc::NamespaceGcReport {
-                            namespace: ns.0.clone(),
-                            dry_run: config.dry_run,
-                            aborted: Some(format!(
-                                "GC skipped: cannot read every manifest to find shared \
-                                 segments ({}: {e})",
-                                ns.0
-                            )),
-                            ..Default::default()
-                        })
-                        .collect();
-                }
+        let (all, manifests) = match self.every_manifest() {
+            Ok(found) => found,
+            Err(e) => {
+                return namespaces
+                    .iter()
+                    .map(|ns| kosha_core::gc::NamespaceGcReport {
+                        namespace: ns.0.clone(),
+                        dry_run: config.dry_run,
+                        aborted: Some(format!(
+                            "GC skipped: cannot read every manifest to find shared segments \
+                             ({e})"
+                        )),
+                        ..Default::default()
+                    })
+                    .collect();
             }
-        }
+        };
         for ns in namespaces {
             let others: Vec<NamespaceId> = all.iter().filter(|n| *n != ns).cloned().collect();
             let referenced = kosha_core::branch::References::collect(
@@ -3739,6 +3801,9 @@ impl AppState {
             // from S3 or that the reader would reject falls back to
             // `doc_store.bin` (#179, #184).
             let mut lazy_segments: Vec<&PathBuf> = Vec::new();
+            // Legacy segments whose `doc_vectors.bin` header a kNN needs,
+            // with their object prefix: fetched by range after this round.
+            let mut doc_vector_headers: Vec<(&Path, String)> = Vec::new();
             for (seg_path, _) in &owned {
                 let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
                     continue;
@@ -3829,13 +3894,13 @@ impl AppState {
                             }
                         }
                     }
+                    // Only the header of a legacy `doc_vectors.bin` (its
+                    // field table binds the unnamed index), by range below:
+                    // the whole file is as large as the index itself.
                     if kosha_segment::knn_needs_doc_vectors(footer)
-                        && !file_present_nonempty(&seg_path.join(kosha_segment::DOC_VECTORS_FILE))
+                        && !doc_spans::doc_vectors_header_local(seg_path)
                     {
-                        logical_paths.push((
-                            format!("{s3_prefix}/{}", kosha_segment::DOC_VECTORS_FILE),
-                            0,
-                        ));
+                        doc_vector_headers.push((seg_path.as_path(), s3_prefix.clone()));
                     }
                 }
             }
@@ -3862,6 +3927,30 @@ impl AppState {
                     if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
                         outcome.files_fetched += 1;
                         outcome.bytes_fetched += m.len();
+                    }
+                }
+            }
+
+            // Legacy `doc_vectors.bin` headers, by range into the span
+            // cache (the reader binds the unnamed index from that span).
+            if !doc_vector_headers.is_empty() && !request.is_shed() {
+                let fetcher = doc_spans::S3RangeFetcher {
+                    s3,
+                    concurrency: self.scoring_hydrate_concurrency,
+                    budget: &self.hydration_budget,
+                    request,
+                };
+                let targets: Vec<(&Path, &str)> = doc_vector_headers
+                    .iter()
+                    .map(|(dir, rel)| (*dir, rel.as_str()))
+                    .collect();
+                let fetched = doc_spans::fetch_doc_vectors_headers(&targets, &fetcher, &self.cache);
+                outcome.rounds += fetched.rounds;
+                outcome.shed |= fetched.shed;
+                for seg in &fetched.segments {
+                    outcome.bytes_fetched += seg.bytes;
+                    if seg.status == doc_spans::HeaderStatus::Cached {
+                        outcome.files_fetched += 1;
                     }
                 }
             }
@@ -4688,6 +4777,24 @@ fn doc_store_fallback_reason(
         return Some(DocStoreFallbackReason::Rejected);
     }
     None
+}
+
+/// Namespaces with their manifests (see `AppState::every_manifest`).
+type NamespaceManifests = Vec<(NamespaceId, kosha_core::Manifest)>;
+
+/// For a shard namespace's segment (#207): the root namespace and the
+/// merged-view id a search of the sharded root caches its reader under.
+/// `None` for an ordinary namespace.
+pub(crate) fn merged_view_alias(
+    ns: &NamespaceId,
+    segment: &kosha_core::SegmentId,
+) -> Option<(NamespaceId, kosha_core::SegmentId)> {
+    let index = kosha_core::sharding::shard_index_of(ns)?;
+    let (root, _) = ns.0.rsplit_once('/')?;
+    Some((
+        NamespaceId(root.to_string()),
+        kosha_core::sharding::merged_segment_id(index, segment),
+    ))
 }
 
 /// Redact the password portion of a Postgres URL for logs.
@@ -6003,6 +6110,22 @@ fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String
         }
         Err(e) => return json_error(503, &format!("control store: {e}")),
     }
+    // A branch goes through DELETE .../branch, which also reclaims the
+    // prefixes of deleted ancestor branches only it kept alive; deleting
+    // it here would leak those for good.
+    match state.controller.lock().unwrap().try_manifest_cloned(&id) {
+        Ok(Some(manifest)) if manifest.branch.is_some() => {
+            return json_error(
+                409,
+                &format!(
+                    "namespace '{name}' is a branch; delete it with \
+                     DELETE /v1/namespaces/{name}/branch"
+                ),
+            )
+        }
+        Ok(_) => {}
+        Err(e) => return json_error(503, &format!("control store: {e}")),
+    }
     let lock = state.publication_lock(&id);
     let _guard = lock.lock().unwrap();
     let local_version = state.indexer.manifest_version(&id);
@@ -7088,6 +7211,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             // scoring slot.
             drop(slot);
             result.exhaustive_search_count = view.exhaustive_search_count();
+            result.consistency_fallback = view.fallback.clone();
             #[cfg(feature = "s3")]
             let hydration = HydrationOutcome {
                 page: *page_fetch.lock().unwrap(),
@@ -7572,6 +7696,7 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     ) {
         Ok((mut result, phases)) => {
             result.exhaustive_search_count = view.exhaustive_search_count();
+            result.consistency_fallback = view.fallback.clone();
             #[cfg(feature = "s3")]
             let hydration = HydrationOutcome {
                 page: *page_fetch.lock().unwrap(),
@@ -10517,10 +10642,13 @@ mod tests {
     /// poll and manifest fetches fail with `ControlPlane` while `down`, the
     /// way `PgStore` reports an unreachable Postgres (#232).
     #[derive(Clone)]
-    struct OutageStore {
+    pub(crate) struct OutageStore {
         inner: SharedManifestStore,
         down: Arc<std::sync::atomic::AtomicBool>,
         reads: Arc<std::sync::atomic::AtomicU64>,
+        /// `list_namespaces` reads as empty, the way `PgStore` reports a
+        /// failed query there (it has no error to return).
+        pub(crate) list_fails: Arc<std::sync::atomic::AtomicBool>,
     }
     impl OutageStore {
         fn check(&self) -> Result<(), KoshaError> {
@@ -10581,6 +10709,9 @@ mod tests {
             self.inner.compare_and_swap_manifest(id, expected, manifest)
         }
         fn list_namespaces(&self) -> Vec<NamespaceId> {
+            if self.list_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Vec::new();
+            }
             self.inner.list_namespaces()
         }
         fn namespace_count(&self) -> usize {
@@ -10602,11 +10733,12 @@ mod tests {
         }
     }
 
-    fn outage_store() -> OutageStore {
+    pub(crate) fn outage_store() -> OutageStore {
         OutageStore {
             inner: shared_store(),
             down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            list_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -16814,6 +16946,51 @@ mod tests {
         assert_eq!(raced["total_hits"], 2);
         assert_eq!(hit_ids(&raced).len(), 2);
         assert_eq!(raced["exhaustive_search_count"], 0, "both now indexed");
+    }
+
+    /// Local GC and tail eviction release a shard's segment under the
+    /// sharded root's merged-view id too (#207).
+    #[test]
+    fn shard_segments_alias_to_the_merged_view() {
+        let seg = kosha_core::SegmentId("S".into());
+        let shard = kosha_core::sharding::shard_namespace(&NamespaceId("t/ns".into()), 3);
+        let (root, merged) = merged_view_alias(&shard, &seg).unwrap();
+        assert_eq!(root.0, "t/ns");
+        assert_eq!(merged, kosha_core::sharding::merged_segment_id(3, &seg));
+        assert!(merged_view_alias(&NamespaceId("t/ns".into()), &seg).is_none());
+    }
+
+    /// #255: a writer that flushed but has not published (an upload in
+    /// flight, or publication failing) is ahead of every manifest a query
+    /// pod can read. A strong search there is served from the published
+    /// manifest, flagged, instead of failing with 503 for the whole window.
+    #[test]
+    fn strong_search_falls_back_to_eventual_while_publication_is_pending() {
+        let store = outage_store();
+        let (ingest, query) = read_your_writes_pods(&store, |_, _| {});
+        let ns = "tenant/ryw-pending";
+        let ns_id = NamespaceId(ns.into());
+        ryw_index(&ingest, ns, vec![ryw_doc("a", "pending words", "x")]);
+        flush_and_publish_namespace(&ingest, &ns_id).unwrap();
+        ryw_index(&ingest, ns, vec![ryw_doc("b", "pending words", "x")]);
+        // Flushed locally, not published.
+        ingest.indexer.flush_namespace(&ns_id).unwrap();
+
+        let pending = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "pending"}),
+        );
+        assert_eq!(hit_ids(&pending), ["a"]);
+        let reason = pending["consistency_fallback"].as_str().unwrap();
+        assert!(reason.starts_with("eventual"), "{reason}");
+
+        flush_and_publish_namespace(&ingest, &ns_id).unwrap();
+        let published = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "pending"}),
+        );
+        assert_eq!(published["total_hits"], 2);
+        assert!(published.get("consistency_fallback").is_none());
     }
 
     /// #255: under strong consistency a tail that cannot be read fails the

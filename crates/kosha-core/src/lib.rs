@@ -2215,6 +2215,20 @@ pub struct MultiVectorField {
 /// `Footer::format_version`.
 pub const SEGMENT_FORMAT_VERSION: u32 = 2;
 
+/// Prefix of the transient segment ids (and directories) a strong-
+/// consistency search builds from a namespace's unindexed tail (#255).
+/// Never published in a manifest.
+pub const TAIL_SEGMENT_PREFIX: &str = "_tail-";
+
+/// Whether `segment_id` names a transient tail segment, including a shard's
+/// tail in a sharded namespace's merged view (`_shard-0000/_tail-…`).
+pub fn is_tail_segment_id(segment_id: &str) -> bool {
+    segment_id
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with(TAIL_SEGMENT_PREFIX))
+}
+
 // ─── Bloom filter (segment pruning) ────────────────────────────────────────
 
 /// Target false-positive rate when sizing blooms at write time.
@@ -3847,6 +3861,13 @@ pub struct SearchResult {
     /// was already indexed.
     #[serde(default)]
     pub exhaustive_search_count: u64,
+    /// Set when a `consistency: "strong"` search was answered as
+    /// `"eventual"` instead (#255): the writer is ahead of every manifest
+    /// this node can read, because a publication is in progress or
+    /// failing, so its unindexed tail cannot be combined with any of them.
+    /// Says why. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consistency_fallback: Option<String>,
 }
 
 // ─── Indexing types ────────────────────────────────────────────────────────

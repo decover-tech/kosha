@@ -348,6 +348,36 @@ struct FlushCoord {
     last_round_error: Option<String>,
 }
 
+/// `(field name, is a late-interaction bag)`: see
+/// [`NamespaceHandle::vector_dims`].
+type VectorDimKey = (String, bool);
+
+/// The dimension a `Vector` field value carries, for the write-time check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorValueDim {
+    /// A flat vector of this many dimensions.
+    Flat(usize),
+    /// A late-interaction bag (#205) whose tokens all have this dimension.
+    Bag(usize),
+    /// A bag whose tokens disagree in dimension, or include an empty one.
+    RaggedBag,
+}
+
+/// `None` for an empty vector or a value that is neither a vector nor a
+/// bag: nothing indexes those, and they are stored as given.
+fn vector_value_dim(value: &str) -> Option<VectorValueDim> {
+    if let Ok(v) = serde_json::from_str::<Vec<f32>>(value) {
+        return (!v.is_empty()).then_some(VectorValueDim::Flat(v.len()));
+    }
+    let bag = serde_json::from_str::<Vec<Vec<f32>>>(value).ok()?;
+    let dim = bag.first()?.len();
+    Some(if dim > 0 && bag.iter().all(|t| t.len() == dim) {
+        VectorValueDim::Bag(dim)
+    } else {
+        VectorValueDim::RaggedBag
+    })
+}
+
 struct NamespaceHandle {
     mutation: Mutex<()>,
     writes: Mutex<()>,
@@ -410,8 +440,10 @@ struct NamespaceHandle {
     /// Dimension of each vector field written to this namespace (#204),
     /// learned lazily from segment footers and the write buffer on the
     /// first write, then from every accepted batch. See
-    /// [`Indexer::check_vector_dims`].
-    vector_dims: Mutex<Option<HashMap<String, usize>>>,
+    /// [`Indexer::check_vector_dims`]. Keyed by field and kind: a flat
+    /// vector column and a late-interaction bag field (#205, whose
+    /// dimension is its tokens') are tracked apart.
+    vector_dims: Mutex<Option<HashMap<VectorDimKey, usize>>>,
 }
 
 /// Bounded counting semaphore backing `NamespaceHandle::writer_slots`. Not a
@@ -896,6 +928,13 @@ impl Indexer {
     /// mismatched document would land in the buffer and could only be
     /// dropped from the index at flush time, silently.
     ///
+    /// Late-interaction bags (#205) are held to the same rule for their
+    /// token dimension, and a ragged bag (tokens of different lengths) is
+    /// rejected outright: a segment indexes a bag field at the dimension of
+    /// the first bag it sees and leaves every other bag out of the index,
+    /// and a segment whose dimension differs from the query's fails every
+    /// late-interaction search of the namespace.
+    ///
     /// Called with the namespace's `writes` lock held, so accepted batches
     /// update the map in order.
     fn check_vector_dims(
@@ -904,18 +943,30 @@ impl Indexer {
         handle: &NamespaceHandle,
         documents: &[Document],
     ) -> Result<(), KoshaError> {
-        let vectors: Vec<(&DocumentId, &str, usize)> = documents
-            .iter()
-            .flat_map(|doc| {
-                doc.fields
-                    .iter()
-                    .filter(|f| f.field_type == kosha_core::FieldType::Vector)
-                    .filter_map(move |f| {
-                        let v = serde_json::from_str::<Vec<f32>>(&f.value).ok()?;
-                        (!v.is_empty()).then_some((&doc.id, f.name.as_str(), v.len()))
-                    })
-            })
-            .collect();
+        let mut vectors: Vec<(&DocumentId, VectorDimKey, usize)> = Vec::new();
+        for doc in documents {
+            for f in &doc.fields {
+                if f.field_type != kosha_core::FieldType::Vector {
+                    continue;
+                }
+                match vector_value_dim(&f.value) {
+                    Some(VectorValueDim::Flat(dim)) => {
+                        vectors.push((&doc.id, (f.name.clone(), false), dim))
+                    }
+                    Some(VectorValueDim::Bag(dim)) => {
+                        vectors.push((&doc.id, (f.name.clone(), true), dim))
+                    }
+                    Some(VectorValueDim::RaggedBag) => {
+                        return Err(KoshaError::InvalidQuery(format!(
+                            "document '{}': late-interaction field '{}' holds token vectors \
+                             of different dimensions",
+                            doc.id.0, f.name
+                        )));
+                    }
+                    None => {}
+                }
+            }
+        }
         if vectors.is_empty() {
             return Ok(());
         }
@@ -924,61 +975,78 @@ impl Indexer {
             *guard = Some(self.known_vector_dims(namespace, handle));
         }
         let known = guard.as_mut().unwrap();
-        let mut batch: HashMap<&str, usize> = HashMap::new();
-        for (id, field, dim) in &vectors {
-            let expected = known
-                .get(*field)
-                .copied()
-                .or_else(|| batch.get(field).copied());
+        let mut batch: HashMap<&VectorDimKey, usize> = HashMap::new();
+        for (id, key, dim) in &vectors {
+            let expected = known.get(key).copied().or_else(|| batch.get(key).copied());
             match expected {
                 Some(expected) if expected != *dim => {
-                    return Err(KoshaError::InvalidQuery(format!(
-                        "document '{}': vector field '{field}' has {dim} dimensions, but \
-                         '{field}' vectors in namespace '{}' have {expected}",
-                        id.0, namespace.0
-                    )));
+                    let (field, bag) = (&key.0, key.1);
+                    return Err(KoshaError::InvalidQuery(if bag {
+                        format!(
+                            "document '{}': late-interaction field '{field}' has \
+                             {dim}-dimensional token vectors, but '{field}' tokens in \
+                             namespace '{}' have {expected}",
+                            id.0, namespace.0
+                        )
+                    } else {
+                        format!(
+                            "document '{}': vector field '{field}' has {dim} dimensions, but \
+                             '{field}' vectors in namespace '{}' have {expected}",
+                            id.0, namespace.0
+                        )
+                    }));
                 }
                 Some(_) => {}
                 None => {
-                    batch.insert(field, *dim);
+                    batch.insert(key, *dim);
                 }
             }
         }
-        for (field, dim) in batch {
-            known.insert(field.to_string(), dim);
+        for (key, dim) in batch {
+            known.insert(key.clone(), dim);
         }
         Ok(())
     }
 
     /// Vector field dimensions already in the namespace: from the footers
-    /// of its segments (those written since #204 list their columns) and
-    /// from documents still in the write buffer.
+    /// of its segments (those written since #204 list their columns, and
+    /// every segment lists its late-interaction fields) and from documents
+    /// still in the write buffer.
     fn known_vector_dims(
         &self,
         namespace: &NamespaceId,
         handle: &NamespaceHandle,
-    ) -> HashMap<String, usize> {
+    ) -> HashMap<VectorDimKey, usize> {
         let state = handle.state.lock().unwrap().clone();
         let mut dims = HashMap::new();
         for entry in &state.manifest.segments {
             // The manifest's cached footer when it has one; else the local
             // footer.json, wherever the segment lives (a branch's inherited
             // segments sit under their home namespace, #208).
+            let local;
             let footer = match state.manifest.segment_footer(&entry.segment_id) {
-                Some(footer) => footer.vector_fields.clone(),
+                Some(footer) => footer,
                 None => {
                     let seg_dir =
                         state
                             .manifest
                             .segment_dir(&self.data_dir, namespace, &entry.segment_id);
                     match kosha_segment::SegmentReader::read_footer(&seg_dir) {
-                        Ok(footer) => footer.vector_fields,
+                        Ok(footer) => {
+                            local = footer;
+                            &local
+                        }
                         Err(_) => continue,
                     }
                 }
             };
-            for meta in footer.into_iter().flatten() {
-                dims.entry(meta.name).or_insert(meta.dim as usize);
+            for meta in footer.vector_fields.iter().flatten() {
+                dims.entry((meta.name.clone(), false))
+                    .or_insert(meta.dim as usize);
+            }
+            for meta in &footer.multi_vectors {
+                dims.entry((meta.name.clone(), true))
+                    .or_insert(meta.dim as usize);
             }
         }
         let buffered = state.buffer.iter().flat_map(|buf| &buf.documents);
@@ -986,10 +1054,14 @@ impl Indexer {
             if field.field_type != kosha_core::FieldType::Vector {
                 continue;
             }
-            if let Ok(v) = serde_json::from_str::<Vec<f32>>(&field.value) {
-                if !v.is_empty() {
-                    dims.entry(field.name.clone()).or_insert(v.len());
+            match vector_value_dim(&field.value) {
+                Some(VectorValueDim::Flat(dim)) => {
+                    dims.entry((field.name.clone(), false)).or_insert(dim);
                 }
+                Some(VectorValueDim::Bag(dim)) => {
+                    dims.entry((field.name.clone(), true)).or_insert(dim);
+                }
+                _ => {}
             }
         }
         dims
@@ -3105,6 +3177,19 @@ impl Indexer {
         in_use: impl Fn(&NamespaceId, &SegmentId) -> bool,
         remove: impl Fn(&str) -> Result<u64, KoshaError>,
     ) -> LocalReclaimReport {
+        self.reclaim_local_shared(grace, in_use, |_| false, remove)
+    }
+
+    /// [`Indexer::reclaim_local`], keeping (queued, not done) any object
+    /// for which `shared(relative_path)` is true: a copy-on-write branch
+    /// (#208) still lists it under the namespace that retired it.
+    pub fn reclaim_local_shared(
+        &self,
+        grace: Duration,
+        in_use: impl Fn(&NamespaceId, &SegmentId) -> bool,
+        shared: impl Fn(&str) -> bool,
+        remove: impl Fn(&str) -> Result<u64, KoshaError>,
+    ) -> LocalReclaimReport {
         let queued: Vec<LocalRetirement> = self.local_retired.lock().unwrap().clone();
         let mut report = LocalReclaimReport::default();
         let mut done: Vec<LocalRetirement> = Vec::new();
@@ -3161,6 +3246,10 @@ impl Indexer {
             let rel = entry.relative_path();
             if !self.data_dir.join(&rel).exists() {
                 done.push(entry);
+                continue;
+            }
+            if shared(&rel) {
+                report.pending += 1;
                 continue;
             }
             match remove(&rel) {
@@ -4353,6 +4442,71 @@ mod tests {
         ));
         restarted
             .index_documents(ns.clone(), vec![doc("g", "other", 8), doc("h", "emb", 4)])
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #205: a late-interaction bag is held to its field's token
+    /// dimension at write time like a flat vector, and a ragged bag is
+    /// rejected. A wrong-dimension bag used to be accepted and, first in a
+    /// flush, made that segment drop every correct bag from its index.
+    #[test]
+    fn late_interaction_bag_of_the_wrong_dimension_is_rejected_at_write() {
+        let dir = std::env::temp_dir().join(format!("kosha-bag-dims-{}", uuid::Uuid::new_v4()));
+        let ns = NamespaceId("bags".into());
+        let bag = |id: &str, field: &str, dims: &[usize]| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field {
+                name: field.into(),
+                field_type: kosha_core::FieldType::Vector,
+                value: serde_json::to_string(
+                    &dims.iter().map(|&d| vec![0.5f32; d]).collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            }],
+        };
+        let rejected = |r: Result<usize, KoshaError>, what: &str| matches!(r, Err(KoshaError::InvalidQuery(ref m)) if m.contains(what));
+
+        let idx = Indexer::new(dir.clone());
+        idx.index_documents(ns.clone(), vec![bag("a", "tokens", &[4, 4, 4])])
+            .unwrap();
+        // Fixed by the buffered bag; within one batch; ragged.
+        assert!(rejected(
+            idx.index_documents(ns.clone(), vec![bag("b", "tokens", &[3, 3])]),
+            "token vectors"
+        ));
+        assert!(rejected(
+            idx.index_documents(
+                ns.clone(),
+                vec![bag("c", "other", &[2]), bag("d", "other", &[5])]
+            ),
+            "token vectors"
+        ));
+        assert!(rejected(
+            idx.index_documents(ns.clone(), vec![bag("e", "tokens", &[4, 3])]),
+            "different dimensions"
+        ));
+        // A flat vector field of the same name is tracked apart from bags.
+        idx.index_documents(
+            ns.clone(),
+            vec![Document {
+                id: DocumentId("f".into()),
+                fields: vec![Field::vector("emb", vec![0.5; 6])],
+            }],
+        )
+        .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+
+        // Fixed by a flushed segment's footer, for a fresh process.
+        let manifest = idx.manifest(&ns).unwrap();
+        let restarted = Indexer::new(dir.clone());
+        restarted.restore_manifest(ns.clone(), manifest);
+        assert!(rejected(
+            restarted.index_documents(ns.clone(), vec![bag("g", "tokens", &[8])]),
+            "token vectors"
+        ));
+        restarted
+            .index_documents(ns.clone(), vec![bag("h", "tokens", &[4, 4])])
             .unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }

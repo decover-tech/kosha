@@ -6106,12 +6106,19 @@ impl SegmentReader {
         // column, and a ranged query node only its `vector[.<n>].offsets`)
         // is not cached as empty: it may be hydrated after this segment was
         // opened.
-        if slot.meta.is_some() && !index.has_lazy_index() && !slot.idx_path.exists() {
-            return Err(KoshaError::NotFound(format!(
-                "{} missing from segment {:?}, whose footer lists it",
-                slot.idx_path.display(),
-                self.segment_dir
-            )));
+        if !index.has_lazy_index() && !slot.idx_path.exists() {
+            if slot.meta.is_some() {
+                return Err(KoshaError::NotFound(format!(
+                    "{} missing from segment {:?}, whose footer lists it",
+                    slot.idx_path.display(),
+                    self.segment_dir
+                )));
+            }
+            // A legacy (unnamed) slot with neither file local is served as
+            // empty but not cached either: a segment that never had vectors
+            // costs two failed stats per load, while one whose vector files
+            // simply were not hydrated yet sees them once they are.
+            return Ok(index);
         }
         *loaded = Some(Arc::clone(&index));
         Ok(index)
