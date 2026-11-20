@@ -121,6 +121,8 @@ jobs:
           aws_role_arn: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
           database_url: ${{ secrets.KOSHA_DATABASE_URL }}
           kosha_api_key: ${{ secrets.KOSHA_API_KEY }}
+          admin_api_key: ${{ secrets.KOSHA_ADMIN_API_KEY }}
+          internal_api_key: ${{ secrets.KOSHA_INTERNAL_API_KEY }}
           eks_cluster_name: ${{ secrets.EKS_CLUSTER_NAME }}
           s3_bucket: ${{ secrets.KOSHA_S3_BUCKET }}
           s3_prefix: ${{ secrets.KOSHA_S3_PREFIX }}

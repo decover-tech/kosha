@@ -63,6 +63,13 @@ spec:
                 secretKeyRef:
                   name: kosha-secret
                   key: bootstrap-api-key
+            # Admin routes (compaction, segment GC) are refused without it.
+            - name: KOSHA_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: admin-api-key
+                  optional: true
             # A synchronous full compaction can run for a long time; see the
             # same setting on deployment.yaml.
             - name: KOSHA_HTTP_IO_TIMEOUT_SECS

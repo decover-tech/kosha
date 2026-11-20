@@ -36,6 +36,14 @@ inputs:
     description: "AWS region for kubeconfig + ConfigMap"
     required: false
     default: us-east-1
+  admin_api_key:
+    description: Credential for /v1/admin routes (compaction, segment GC). Empty leaves them refused.
+    required: false
+    default: ""
+  internal_api_key:
+    description: Credential pods use to call each other (peer segment fetch, read-your-writes). Empty disables both.
+    required: false
+    default: ""
   image_repository:
     description: "Full image repository without tag (e.g. 123.dkr.ecr.us-east-1.amazonaws.com/decover/kosha). If empty, staging uses ECR login output + /decover/kosha; production uses ravidecoverai/kosha."
     required: false
@@ -123,6 +131,8 @@ runs:
       env:
         DATABASE_URL: ${{ inputs.database_url }}
         KOSHA_API_KEY: ${{ inputs.kosha_api_key }}
+        KOSHA_ADMIN_API_KEY: ${{ inputs.admin_api_key }}
+        KOSHA_INTERNAL_API_KEY: ${{ inputs.internal_api_key }}
         IMAGE_TAG: ${{ steps.cfg.outputs.image_tag }}
         KOSHA_S3_BUCKET: ${{ inputs.s3_bucket }}
         KOSHA_S3_PREFIX: ${{ inputs.s3_prefix }}
@@ -140,9 +150,11 @@ runs:
           image="ravidecoverai/kosha:${IMAGE_TAG}"
         fi
         kustomize edit set image "kosha=${image}"
-        kustomize edit add secret kosha-secret \
-          --from-literal=database-url="$DATABASE_URL" \
-          --from-literal=bootstrap-api-key="$KOSHA_API_KEY"
+        secret=(--from-literal=database-url="$DATABASE_URL" --from-literal=bootstrap-api-key="$KOSHA_API_KEY")
+        # Optional: the pods read these keys as optional and start without them.
+        [[ -n "$KOSHA_ADMIN_API_KEY" ]] && secret+=(--from-literal=admin-api-key="$KOSHA_ADMIN_API_KEY")
+        [[ -n "$KOSHA_INTERNAL_API_KEY" ]] && secret+=(--from-literal=internal-api-key="$KOSHA_INTERNAL_API_KEY")
+        kustomize edit add secret kosha-secret "${secret[@]}"
 
         # Wire account-specific S3 + IRSA without committing them to git.
         cat > env-wire-patch.yaml <<EOF
