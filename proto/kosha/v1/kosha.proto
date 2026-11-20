@@ -313,6 +313,18 @@ message SearchRequest {
   // Typo-tolerant term matching (HTTP "fuzzy"). A lexical query of its own:
   // not combinable with query_text / fields / wildcard / match_phrase.
   optional FuzzyQuery fuzzy = 19;
+
+  // Read-your-writes (#255). STRONG also scans the namespace's
+  // acknowledged-but-unindexed writes; EVENTUAL searches indexed segments
+  // only. UNSPECIFIED uses the server default (KOSHA_DEFAULT_CONSISTENCY,
+  // itself strong). HTTP: "consistency": "strong" | "eventual".
+  Consistency consistency = 20;
+}
+
+enum Consistency {
+  CONSISTENCY_UNSPECIFIED = 0;
+  CONSISTENCY_STRONG = 1;
+  CONSISTENCY_EVENTUAL = 2;
 }
 
 message LimitPer {
@@ -416,6 +428,8 @@ message SearchResponse {
   repeated ScoredDocument results = 1;
   int64 total_hits = 2;
   google.protobuf.Struct aggregations = 3;
+  // Unindexed documents scanned exhaustively (strong consistency, #255).
+  int64 exhaustive_search_count = 4;
 }
 
 message ScoredDocument {

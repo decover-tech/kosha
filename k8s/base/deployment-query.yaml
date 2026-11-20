@@ -83,6 +83,16 @@ spec:
                 secretKeyRef:
                   name: kosha-secret
                   key: bootstrap-api-key
+            # Pod-to-pod credential for /internal/* routes. Query pods use it
+            # to read the ingest pod's unindexed writes for strong-consistency
+            # searches (#255); without it they default to eventual
+            # consistency. Optional so clusters without the key still start.
+            - name: KOSHA_INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: internal-api-key
+                  optional: true
           readinessProbe:
             httpGet:
               path: /readyz

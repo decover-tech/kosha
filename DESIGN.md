@@ -440,11 +440,11 @@ calls.
 - GC of superseded segments after the manifest-staleness window (§11).
 
 **Durability/visibility tradeoff**: a document is durable (survives any single node failure) as
-soon as its WAL append to S3 acknowledges. It becomes *queryable* once its segment is flushed and
-the manifest updated — bounded by the flush interval above. This is a deliberate, tunable relaxation
-versus ES's near-real-time (~1s) visibility; for Decover's ingestion pattern (batch document
-processing via Pandora, not live chat-style writes) this is an acceptable and, in fact, currently
-true in practice since ES refresh intervals are already tuned up for indexing throughput.
+soon as its WAL append to S3 acknowledges. It becomes *indexed* once its segment is flushed and
+the manifest updated — bounded by the flush interval above. It is *queryable* earlier: a search
+with `consistency: "strong"` (the default, #255) also scans the writer's unindexed tail
+exhaustively, so a write is searchable as soon as `/index` returns; `"eventual"` searches only
+indexed segments, with the flush-interval lag. See §11.
 
 ## 8. Read Path
 
@@ -688,9 +688,27 @@ existing org/user auth context Bach already establishes.
 
 - **Durability**: WAL append to S3 acks before the ingest RPC returns → data survives node loss
   immediately. Segment + manifest writes are the durable "committed" state for query visibility.
-- **Read consistency**: each query snapshots one manifest version for its whole execution —
-  read-your-writes is bounded by the flush interval (§7), not immediate, which matches the
-  approach we already accept operationally with ES refresh tuning.
+- **Read consistency**: each query snapshots one manifest version for its whole execution.
+  Read-your-writes (#255) is a per-request option, `consistency`:
+  - `strong` (default; `KOSHA_DEFAULT_CONSISTENCY` changes it): the query also reads the
+    namespace's *unindexed tail* — the writer's buffered documents, a flush round in progress and
+    WAL-recovered deletes awaiting replay — relative to the same manifest version, from the
+    ingest pod's memory (`GET /internal/namespaces/{ns}/unindexed?manifest_version=V`,
+    internal credential) when it runs on a query pod. The tail is built into a transient local
+    segment with the normal segment writer and searched together with the
+    manifest's segments in one pass, so BM25 (with the tail folded into the namespace
+    statistics), kNN, filters, aggregations, `search_after` and capped `total_hits` behave
+    exactly as after a flush. Indexed copies the tail supersedes are masked like deletes, so the
+    newest version wins. A tail relative to another manifest version than the query's (a flush
+    published in between) is refused; the query pod refreshes its manifest and retries a few
+    times, then fails with 503 rather than miss or double-count documents. Responses report
+    `exhaustive_search_count`, the number of unindexed documents scanned.
+  - `eventual`: indexed segments only; visibility is bounded by the flush interval (§7).
+
+  The unindexed backlog per namespace is capped (`KOSHA_MAX_UNINDEXED_BYTES`, default 2 GiB;
+  `KOSHA_MAX_UNINDEXED_DOCS`, unset by default): past it `/index` and `/replace` return 429 with
+  `retry-after` until flushes catch up. The WAL itself is still on the ingest pod's disk (#236),
+  so the tail is served from the ingest pod's memory, not read from S3.
 - **Manifest updates**: conditional (compare-and-swap) writes prevent lost updates from concurrent
   flush/compaction; a losing writer retries against the new base.
 - **Garbage collection**: superseded segments are deleted only after the max manifest-staleness
@@ -852,7 +870,7 @@ one-time batch job reading from the existing Postgres/S3 document store and repl
 | Node loss | Shard relocation, potential temporary reduced replication | Cache rewarm only, no data risk |
 | Query surface | Full ES DSL (mostly unused by Sage) | Purpose-built hybrid retrieval + filters |
 | **Cost of data** | ~$0.16–0.24/GB-month (SSD-backed EBS volumes, 2–3× replication for HA), and sized for peak so effective utilization of provisioned storage is often only 30–50% | ~$0.023/GB-month (S3 Standard, single durable copy — no manual replication). SSD cache cost is decoupled from total corpus size: it scales with *active* data, not total stored data |
-| **Read / Write Latency** | Read: p50 ~50–100ms, p99 ~200–500ms (shard-size dependent). Write: near-real-time, ~1s refresh-to-visibility | Read: p50 ≤80ms / p99 ≤300ms warm-cache, p99 ≤1.5s cold-cache (§4). Write: WAL-ack durability <100ms, but visibility is bounded by the flush interval (default 60s, §7) — a deliberate regression on write-visibility latency, traded for storage/compute separation |
+| **Read / Write Latency** | Read: p50 ~50–100ms, p99 ~200–500ms (shard-size dependent). Write: near-real-time, ~1s refresh-to-visibility | Read: p50 ≤80ms / p99 ≤300ms warm-cache, p99 ≤1.5s cold-cache (§4). Write: WAL-ack durability <100ms, but indexing is bounded by the flush interval (§7); `strong` searches (the default) also scan unindexed writes, so visibility is immediate (#255) |
 | **Read / Write Throughput** | Bounded by shard count — max query/index parallelism is fixed at shard-creation time; adding capacity requires rebalancing | Read: scales ~linearly by adding stateless query nodes, no data movement required. Write: batched segment builds generally exceed ES's per-document bulk-index overhead, bounded mainly by S3 PUT throughput per ingest node |
 
 *Cost and throughput figures above are directional planning targets, not measured benchmarks — see §17 for the validation this design still needs before these numbers can be treated as commitments.*

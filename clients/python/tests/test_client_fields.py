@@ -478,3 +478,48 @@ def test_indices_refresh_flushes_namespace(monkeypatch):
     client, requests = _recording_client(monkeypatch)
     client.indices.refresh(index="a")
     assert requests == [("POST", "flush", {"namespace": "a"})]
+
+
+# ─── Read-your-writes (#255) ─────────────────────────────────────────────
+
+
+def test_consistency_is_sent_with_every_search(monkeypatch):
+    client = KoshaClient(hosts="http://kosha.invalid", api_key="k", consistency="strong")
+    requests = []
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda method, path, body=None: requests.append((method, path, body))
+        or {"results": [], "total_hits": 0},
+    )
+    client.search(index="a", body={"query": {"match": {"content": "x"}}})
+    client.get(index="a", id="1")
+    searches = [body for _, path, body in requests if path == "search"]
+    assert len(searches) == 2
+    assert all(body["consistency"] == "strong" for body in searches)
+
+
+def test_consistency_defaults_to_the_server(monkeypatch):
+    client, requests = _recording_client(monkeypatch)
+    client.search(index="a", body={"query": {"match": {"content": "x"}}})
+    assert "consistency" not in requests[0][2]
+
+
+def test_strong_consistency_makes_wait_for_flush_free(monkeypatch):
+    client = KoshaClient(hosts="http://kosha.invalid", api_key="k", consistency="strong")
+    requests = []
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda method, path, body=None: requests.append((method, path, body)) or {},
+    )
+    client.index(index="a", id="1", body={"content": "x"}, refresh="wait_for")
+    assert [path for _, path, _ in requests] == ["index"]
+    # An explicit refresh still flushes.
+    client.index(index="a", id="2", body={"content": "y"}, refresh=True)
+    assert [path for _, path, _ in requests] == ["index", "index", "flush"]
+
+
+def test_consistency_is_validated():
+    with pytest.raises(ValueError):
+        KoshaClient(hosts="http://kosha.invalid", api_key="k", consistency="sometimes")
