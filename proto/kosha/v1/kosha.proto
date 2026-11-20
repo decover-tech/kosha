@@ -402,6 +402,12 @@ message SearchRequest {
   // external model. HTTP: "rerank": {"provider": "cohere", "field": "content",
   // "model": "rerank-v3.5", "top_n": 50, "timeout_ms": 2000}.
   optional Rerank rerank = 20;
+
+  // Read-your-writes (#255). STRONG also scans the namespace's
+  // acknowledged-but-unindexed writes; EVENTUAL searches indexed segments
+  // only. UNSPECIFIED uses the server default (KOSHA_DEFAULT_CONSISTENCY,
+  // itself strong). HTTP: "consistency": "strong" | "eventual".
+  Consistency consistency = 21;
 }
 
 message Rerank {
@@ -411,6 +417,12 @@ message Rerank {
   optional int32 top_n = 4;      // default from + max_results; >= that, <= 1000
   optional int64 timeout_ms = 5; // default 2000, <= 60000
   optional string query = 6;     // default query_text, then match_phrase.phrase, then fuzzy.value
+}
+
+enum Consistency {
+  CONSISTENCY_UNSPECIFIED = 0;
+  CONSISTENCY_STRONG = 1;
+  CONSISTENCY_EVENTUAL = 2;
 }
 
 message LimitPer {
@@ -518,6 +530,8 @@ message SearchResponse {
   // results are in first-stage order.
   optional bool rerank_degraded = 4;
   optional string rerank_degraded_reason = 5;
+  // Unindexed documents scanned exhaustively (strong consistency, #255).
+  int64 exhaustive_search_count = 6;
 }
 
 message ScoredDocument {

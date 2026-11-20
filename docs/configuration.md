@@ -114,6 +114,10 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | `KOSHA_KNN_EXACT_FRACTION` | A segment where at most this fraction of documents pass the filter is searched exactly too (#252) | `0.01` | fraction |
 | `KOSHA_KNN_FILTER_BUDGET_MAX_SCALE` | Most a filtered kNN widens the global probe budget by (`1 / selectivity`, #252) | `8` | multiplier |
 | `KOSHA_LATE_INTERACTION_NPROBE` | Token-index postings probed per query token by a late-interaction (`knn.vectors`) search, before candidates are re-scored exactly (#205) | `16` | postings |
+| `KOSHA_DEFAULT_CONSISTENCY` | Consistency of a search that does not ask for one: `strong` (also search acknowledged but unindexed writes) or `eventual` (indexed segments only), #255. Unset: `strong`, except on a query pod without `KOSHA_INTERNAL_API_KEY`, which defaults to `eventual` | unset | enum |
+| `KOSHA_TAIL_FETCH_TIMEOUT_MS` | Query pods: timeout of the fetch of the ingest pod's unindexed tail for a strong search (#255) | `10000` | ms |
+| `KOSHA_MAX_UNINDEXED_BYTES` | Per-namespace cap on acknowledged but unindexed writes; past it `/index` and `/replace` return 429 with `retry-after` (#255). `0` disables | `2147483648` (2 GiB) | bytes |
+| `KOSHA_MAX_UNINDEXED_DOCS` | Per-namespace cap on unindexed documents, as above (#255) | unset | documents |
 
 ## Warmup
 

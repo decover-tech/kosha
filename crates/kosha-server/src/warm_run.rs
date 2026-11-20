@@ -433,6 +433,11 @@ impl AppState {
         }
         for dir in &phases.page_segments {
             if let Some(seg) = dir.file_name().and_then(|n| n.to_str()) {
+                // A strong search's transient tail segment (#255) is local,
+                // never published and gone once the tail changes.
+                if seg.starts_with(crate::unindexed::TAIL_SEGMENT_PREFIX) {
+                    continue;
+                }
                 reads.push((seg, FileClass::DocStore));
             }
         }

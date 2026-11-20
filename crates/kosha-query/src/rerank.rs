@@ -345,6 +345,7 @@ pub(crate) mod tests {
             rerank_degraded_reason: None,
             knn_mode: None,
             knn_filtered_candidates: None,
+            exhaustive_search_count: Default::default(),
         }
     }
 

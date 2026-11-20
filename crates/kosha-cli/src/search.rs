@@ -578,6 +578,7 @@ mod tests {
             rerank_degraded_reason: Default::default(),
             knn_mode: None,
             knn_filtered_candidates: None,
+            exhaustive_search_count: 0,
         }
     }
 

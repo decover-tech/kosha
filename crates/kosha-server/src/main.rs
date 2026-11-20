@@ -42,6 +42,7 @@ mod s3_wal;
 #[cfg(feature = "s3")]
 mod segment_commit;
 mod segment_gc;
+mod unindexed;
 mod warm;
 mod warm_run;
 
@@ -403,6 +404,13 @@ struct AppState {
     /// while every one of those is still the indexer's current shared
     /// manifest — see [`AppState::sharded_view`].
     shard_views: Mutex<HashMap<NamespaceId, ShardView>>,
+    /// `KOSHA_DEFAULT_CONSISTENCY` (#255); `None` = the built-in default,
+    /// see `AppState::default_consistency`.
+    default_consistency: Option<unindexed::Consistency>,
+    /// `KOSHA_MAX_UNINDEXED_BYTES` / `KOSHA_MAX_UNINDEXED_DOCS` (#255).
+    unindexed_cap: unindexed::UnindexedCap,
+    /// Strong-consistency search state: built tails, the tail HTTP client.
+    unindexed: unindexed::UnindexedState,
 }
 
 /// One cached merged manifest over a sharded namespace (#207).
@@ -1093,6 +1101,9 @@ impl AppState {
 
     fn with_options(data_dir: PathBuf, options: StateOptions) -> Self {
         std::fs::create_dir_all(&data_dir).ok();
+        // Before the disk cache scans `data_dir`: transient tail segments of
+        // an earlier process are never reused (#255).
+        unindexed::remove_stale_tail_segments(&data_dir);
         // Segment files must live under data_dir (indexer/searcher paths).
         // KOSHA_CACHE_DIR is accepted for deploy overlays but Phase 1 always
         // materializes segments in KOSHA_DATA_DIR so paths stay consistent.
@@ -1426,6 +1437,7 @@ impl AppState {
         let ingest_host = std::env::var("KOSHA_INGEST_HOST")
             .ok()
             .filter(|h| !h.is_empty());
+        let query_role = ingest_host.is_some();
         let write_http_client = ingest_host.as_ref().map(|h| {
             println!("write-path requests will be forwarded to ingest at {h}");
             reqwest::blocking::Client::builder()
@@ -1700,6 +1712,9 @@ impl AppState {
                 manifest_follow::refresh_interval_from_env(),
             ),
             shard_views: Mutex::new(HashMap::new()),
+            default_consistency: unindexed::Consistency::from_env(),
+            unindexed_cap: unindexed::UnindexedCap::from_env(),
+            unindexed: unindexed::UnindexedState::new(query_role),
         }
     }
 
@@ -2383,6 +2398,9 @@ impl AppState {
         self.result_cache.lock().unwrap().forget_namespace(&ns.0);
         self.posting_blob_presence.lock().unwrap().remove(&ns.0);
         self.shard_views.lock().unwrap().remove(ns);
+        // A deleted namespace's built unindexed tail (#255) and its
+        // transient segment go too.
+        self.drop_cached_tail(ns);
         #[cfg(feature = "s3")]
         self.synced_segments
             .lock()
@@ -2399,29 +2417,6 @@ impl AppState {
             let _ = manifest;
             Ok(())
         })
-    }
-
-    /// The manifest a search of `ns` reads: its own for an ordinary
-    /// namespace, or the merged view over every shard for a sharded root
-    /// (#207). On a query replica each manifest involved is first brought
-    /// within `max_staleness` of the control store. `Ok(None)`: no such
-    /// namespace.
-    fn search_snapshot(
-        &self,
-        ns: &NamespaceId,
-        max_staleness: Option<Duration>,
-    ) -> Result<Option<Arc<kosha_core::Manifest>>, KoshaError> {
-        self.ensure_query_manifest_fresh(ns, max_staleness)?;
-        let Some(root) = self.indexer.manifest_shared(ns) else {
-            return Ok(None);
-        };
-        let Some(shards) = root.shards.filter(|&n| n > 1) else {
-            return Ok(Some(root));
-        };
-        for shard in kosha_core::sharding::shard_namespaces(ns, shards) {
-            self.ensure_query_manifest_fresh(&shard, max_staleness)?;
-        }
-        Ok(Some(self.sharded_view(ns, root)))
     }
 
     /// Merged manifest over the shards of sharded root `ns` (#207), whose
@@ -5602,6 +5597,19 @@ fn route_inner(
         }
     }
 
+    // A query pod's strong-consistency search reads the ingest pod's
+    // unindexed tail (#255). Authorized like the segment route above.
+    if let Some(rest) = request_line.strip_prefix("GET /internal/namespaces/") {
+        let target = rest.split(' ').next().unwrap_or("");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        return match path.strip_suffix("/unindexed") {
+            Some(ns) if !ns.is_empty() => {
+                unindexed::handle_internal_unindexed(&url_decode(ns), query, state)
+            }
+            _ => json_error(404, "not found"),
+        };
+    }
+
     // ── Legacy Phase 1 routes (backward compat) ────────────────────────────
     // These will be removed after DecoverAI cuts over to the v1 paths.
     if request_line.starts_with("GET /healthz") {
@@ -6205,6 +6213,11 @@ fn index_into(
     documents: Vec<kosha_core::Document>,
 ) -> Result<usize, String> {
     let ns = ns.clone();
+    // Unindexed backlog at its cap (#255): refuse before buffering more.
+    // Per written namespace, so a sharded namespace caps each shard.
+    if let Some(response) = state.unindexed_backpressure(&ns) {
+        return Err(response);
+    }
 
     // Upsert may rewrite immutable segments that hold prior versions of the
     // same ids, so materialize any S3-backed segment directories first.
@@ -6393,6 +6406,9 @@ fn replace_into(
     documents: Vec<kosha_core::Document>,
 ) -> Result<usize, String> {
     let namespace = namespace.clone();
+    if let Some(response) = state.unindexed_backpressure(&namespace) {
+        return Err(response);
+    }
 
     // Replacement scans immutable segments, so materialize any S3-backed
     // segment directories before entering the indexer lock. Batched across
@@ -6713,6 +6729,8 @@ fn handle_stats(state: &AppState) -> String {
             }
             if state.ingest_host.is_some() {
                 add_manifest_follow_stats(state, &ns, &mut entry);
+            } else {
+                add_unindexed_stats(state, &ns, &mut entry);
             }
             namespaces.push(entry);
         }
@@ -6770,6 +6788,14 @@ fn handle_stats(state: &AppState) -> String {
     }))
 }
 
+/// The writer's unindexed backlog of a namespace (#255): what strong
+/// searches scan exhaustively and what `KOSHA_MAX_UNINDEXED_*` caps.
+fn add_unindexed_stats(state: &AppState, ns: &NamespaceId, entry: &mut serde_json::Value) {
+    let (docs, bytes) = state.indexer.unindexed_usage(ns);
+    entry["unindexed_documents"] = serde_json::json!(docs);
+    entry["unindexed_bytes"] = serde_json::json!(bytes);
+}
+
 /// Per-namespace manifest-following fields for a query replica's stats
 /// (#232): the stored version last seen, when the local manifest was last
 /// confirmed current, and how long ago that was (`manifest_lag_seconds`,
@@ -6804,6 +6830,12 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             Ok(v) => v,
             Err(e) => return json_error(400, &e),
         };
+
+    // Read-your-writes (#255): whether to also search unindexed writes.
+    let consistency = match unindexed::Consistency::from_json(body_val.get("consistency")) {
+        Ok(c) => c.unwrap_or_else(|| state.default_consistency()),
+        Err(e) => return json_error(400, &e),
+    };
 
     let query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
         Ok(q) => q,
@@ -6840,13 +6872,18 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
 
     // Shared, not copied: see `Indexer::manifest_shared`. A sharded
     // namespace (#207) is searched through one merged view of its shards.
-    let snapshot = match state.search_snapshot(&ns, max_staleness) {
-        Ok(Some(snapshot)) => snapshot,
+    // Under strong consistency `view.search` is the manifest plus the
+    // namespace's (or each shard's) unindexed tail (#255); hydration and
+    // every manifest-version keyed cache use the plain snapshot,
+    // `view.base`.
+    let view = match state.search_view(&ns, consistency, max_staleness) {
+        Ok(Some(view)) => view,
         Ok(None) => return json_error(404, &format!("namespace '{}' not found", ns.0)),
-        Err(e) => return search_error_response(&e),
+        Err(response) => return response,
     };
-    let manifest: &kosha_core::Manifest = &snapshot;
-    let tombstones = Some(&manifest.tombstones);
+    let manifest: &kosha_core::Manifest = &view.base;
+    let searched: &kosha_core::Manifest = &view.search;
+    let tombstones = Some(&searched.tombstones);
 
     // ── Whole-response result cache ─────────────────────────────────────
     // Real query traffic is Zipfian in queries too; identical requests
@@ -6865,21 +6902,26 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         .rank_by
         .as_ref()
         .is_some_and(|rank_by| rank_by.is_time_dependent());
-    let cache_key =
-        if result_cache_budget() > 0 && !query.no_cache.unwrap_or(false) && !time_dependent {
-            canonical_query_for_cache(&query).map(|mut canonical| {
-                let mut generations: Vec<_> = manifest
-                    .deletion_vectors
-                    .iter()
-                    .map(|(segment, vector)| (&segment.0, &vector.generation))
-                    .collect();
-                generations.sort_unstable();
-                canonical.push_str(&serde_json::to_string(&generations).unwrap());
-                (ns.0.clone(), manifest.version, canonical)
-            })
-        } else {
-            None
-        };
+    // A search that included unindexed writes (#255) answers for more than
+    // `manifest.version`, so it neither reads nor fills the cache.
+    let cache_key = if result_cache_budget() > 0
+        && !query.no_cache.unwrap_or(false)
+        && !time_dependent
+        && view.is_plain()
+    {
+        canonical_query_for_cache(&query).map(|mut canonical| {
+            let mut generations: Vec<_> = manifest
+                .deletion_vectors
+                .iter()
+                .map(|(segment, vector)| (&segment.0, &vector.generation))
+                .collect();
+            generations.sort_unstable();
+            canonical.push_str(&serde_json::to_string(&generations).unwrap());
+            (ns.0.clone(), manifest.version, canonical)
+        })
+    } else {
+        None
+    };
     if let Some(ref key) = cache_key {
         if let Some(resp) = state.result_cache.lock().unwrap().lookup(key) {
             // Still demand for this namespace (#213): a cached response is
@@ -7035,7 +7077,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
 
     match state.searcher.search_with_hydrators(
         &ns,
-        manifest,
+        searched,
         search_query,
         tombstones,
         doc_store_hydrator,
@@ -7045,6 +7087,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             // Scoring is done; a reranker round trip must not hold a
             // scoring slot.
             drop(slot);
+            result.exhaustive_search_count = view.exhaustive_search_count();
             #[cfg(feature = "s3")]
             let hydration = HydrationOutcome {
                 page: *page_fetch.lock().unwrap(),
@@ -7387,6 +7430,18 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     if let Err(e) = query.validate() {
         return search_error_response(&e);
     }
+    let consistency = match params.get("consistency") {
+        None => state.default_consistency(),
+        Some(raw) => match unindexed::Consistency::parse(raw) {
+            Some(c) => c,
+            None => {
+                return json_error(
+                    400,
+                    &format!("'consistency' must be 'strong' or 'eventual', got '{raw}'"),
+                )
+            }
+        },
+    };
 
     let max_staleness = match manifest_follow::parse_max_staleness(
         params
@@ -7399,13 +7454,18 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     };
     // Shared, not copied: see `Indexer::manifest_shared`. A sharded
     // namespace (#207) is searched through one merged view of its shards.
-    let snapshot = match state.search_snapshot(&ns, max_staleness) {
-        Ok(Some(snapshot)) => snapshot,
+    // Under strong consistency `view.search` is the manifest plus the
+    // namespace's (or each shard's) unindexed tail (#255); hydration and
+    // every manifest-version keyed cache use the plain snapshot,
+    // `view.base`.
+    let view = match state.search_view(&ns, consistency, max_staleness) {
+        Ok(Some(view)) => view,
         Ok(None) => return json_error(404, &format!("namespace '{}' not found", ns.0)),
-        Err(e) => return search_error_response(&e),
+        Err(response) => return response,
     };
-    let manifest: &kosha_core::Manifest = &snapshot;
-    let tombstones = Some(&manifest.tombstones);
+    let manifest: &kosha_core::Manifest = &view.base;
+    let searched: &kosha_core::Manifest = &view.search;
+    let tombstones = Some(&searched.tombstones);
 
     // One accountant for everything this request hydrates — footer prefetch,
     // scoring set, posting blobs, and the page's doc stores all share it, so
@@ -7504,13 +7564,14 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
 
     match state.searcher.search_with_hydrators(
         &ns,
-        manifest,
+        searched,
         &query,
         tombstones,
         doc_store_hydrator,
         vector_fetch,
     ) {
-        Ok((result, phases)) => {
+        Ok((mut result, phases)) => {
+            result.exhaustive_search_count = view.exhaustive_search_count();
             #[cfg(feature = "s3")]
             let hydration = HydrationOutcome {
                 page: *page_fetch.lock().unwrap(),
@@ -7871,6 +7932,8 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
     }
     if state.ingest_host.is_some() {
         add_manifest_follow_stats(state, &NamespaceId(scoped_ns), &mut body);
+    } else {
+        add_unindexed_stats(state, &NamespaceId(scoped_ns), &mut body);
     }
     json_ok(&body)
 }
@@ -9856,7 +9919,9 @@ mod tests {
                 serde_json::json!({"query_text": "quick"}),
             )
         };
-        assert_eq!(ok(search())["total_hits"], 1);
+        // Strong consistency (#255, the default) sees the buffered write
+        // too.
+        assert_eq!(ok(search())["total_hits"], 2);
         let old_version = state
             .controller
             .lock()
@@ -9882,7 +9947,7 @@ mod tests {
             serde_json::json!({"query_text": "quick"}),
         );
         assert_eq!(status_of(&foreign_search), 404, "{foreign_search}");
-        assert_eq!(ok(search())["total_hits"], 1);
+        assert_eq!(ok(search())["total_hits"], 2);
 
         let deleted = ok(v1(
             &state,
@@ -16132,7 +16197,9 @@ mod tests {
         assert!(hit.get("highlight").is_none(), "{hit}");
     }
 
-    const LEGACY_HIGHLIGHT_SNAPSHOT: &str = r#"{"results":[{"doc_id":"d1","score":0.39556284962119864,"fields":[{"name":"title","field_type":"Text","value":"Contract law basics"},{"name":"body","field_type":"Text","value":"A contract needs an offer"},{"name":"tag","field_type":"Keyword","value":"contract"}],"highlights":["A <em>contract</em> needs an offer"]}],"total_hits":1,"total_hits_relation":"eq"}"#;
+    // Only change since capture: the additive top-level
+    // `exhaustive_search_count` (#255), present on every search response.
+    const LEGACY_HIGHLIGHT_SNAPSHOT: &str = r#"{"results":[{"doc_id":"d1","score":0.39556284962119864,"fields":[{"name":"title","field_type":"Text","value":"Contract law basics"},{"name":"body","field_type":"Text","value":"A contract needs an offer"},{"name":"tag","field_type":"Keyword","value":"contract"}],"highlights":["A <em>contract</em> needs an offer"]}],"total_hits":1,"total_hits_relation":"eq","exhaustive_search_count":0}"#;
 
     /// #195: two fields in one request, each with its own tags (falling
     /// back to the top-level tags, then the defaults); a requested field the
@@ -16427,6 +16494,467 @@ mod tests {
         let mut c = ResultCache::new(0);
         c.insert(rc_key("ns", 1, "q"), "resp");
         assert!(c.lookup(&rc_key("ns", 1, "q")).is_none(), "0 disables");
+    }
+
+    // ─── Read-your-writes (#255) ─────────────────────────────────────────
+
+    /// An ingest pod and a query pod over one control store and data
+    /// directory. The query pod reads the ingest pod's unindexed tail through
+    /// the real internal route (`route`, internal credential included); only
+    /// the HTTP hop is replaced. `before_fetch` runs on every fetch, before
+    /// the route is called (to inject a race).
+    fn read_your_writes_pods(
+        store: &OutageStore,
+        before_fetch: impl Fn(&AppState, &NamespaceId) + Send + Sync + 'static,
+    ) -> (Arc<AppState>, AppState) {
+        let (mut ingest, mut query) = ingest_and_query(store, Some(Duration::from_secs(3600)));
+        ingest.internal_service_key = Some("tail-key".into());
+        let ingest = Arc::new(ingest);
+        let writer = Arc::clone(&ingest);
+        query.unindexed.fetcher = Some(Box::new(move |ns, version, known| {
+            before_fetch(&writer, ns);
+            let mut line = format!(
+                "GET /internal/namespaces/{}/unindexed?manifest_version={version}",
+                unindexed::encode_path_segment(&ns.0)
+            );
+            if let Some(known) = known {
+                line.push_str("&if_none_match=");
+                line.push_str(&unindexed::encode_path_segment(known));
+            }
+            line.push_str(" HTTP/1.1");
+            let headers =
+                HashMap::from([("authorization".to_string(), "Bearer tail-key".to_string())]);
+            let response = route(&line, &headers, b"", "service", &writer);
+            if !response.starts_with("HTTP/1.1 200") {
+                return Err(KoshaError::Io(std::io::Error::other(response)));
+            }
+            let body = &response[response.find("\r\n\r\n").unwrap() + 4..];
+            Ok(serde_json::from_str(body).unwrap())
+        }));
+        (ingest, query)
+    }
+
+    fn ryw_doc(id: &str, text: &str, status: &str) -> Document {
+        Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text), Field::keyword("status", status)],
+        }
+    }
+
+    fn ryw_index(state: &AppState, ns: &str, docs: Vec<Document>) -> String {
+        let body = serde_json::to_vec(&IndexRequest {
+            namespace: NamespaceId(ns.into()),
+            documents: docs,
+        })
+        .unwrap();
+        handle_index(&body, state)
+    }
+
+    fn ryw_search(state: &AppState, body: serde_json::Value) -> serde_json::Value {
+        let response = handle_search_post(body.to_string().as_bytes(), state);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        serde_json::from_str(&response[response.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+    }
+
+    fn hit_ids(result: &serde_json::Value) -> Vec<String> {
+        result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["doc_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// #255 acceptance: `/index` then an immediate strong search on a query
+    /// pod returns the document, with no flush; eventual does not.
+    #[test]
+    fn strong_search_on_query_pod_sees_unflushed_write() {
+        let store = outage_store();
+        let (ingest, query) = read_your_writes_pods(&store, |_, _| {});
+        let ns = "tenant/ryw-index";
+        let response = ryw_index(&ingest, ns, vec![ryw_doc("a", "hello world", "x")]);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let ns_id = NamespaceId(ns.into());
+        assert_eq!(ingest.indexer.pending_doc_count(&ns_id), 1, "not flushed");
+
+        let strong = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "hello", "consistency": "strong"}),
+        );
+        assert_eq!(hit_ids(&strong), ["a"]);
+        assert_eq!(strong["total_hits"], 1);
+        assert_eq!(strong["exhaustive_search_count"], 1);
+        // Fields come back from the transient segment like any hit.
+        assert_eq!(strong["results"][0]["fields"][0]["value"], "hello world");
+
+        // The default is strong (the pod can read the tail).
+        let default = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "hello"}),
+        );
+        assert_eq!(hit_ids(&default), ["a"]);
+
+        let eventual = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "hello", "consistency": "eventual"}),
+        );
+        assert_eq!(eventual["total_hits"], 0);
+        assert_eq!(eventual["exhaustive_search_count"], 0);
+
+        // The ingest pod reads its own tail.
+        let local = ryw_search(
+            &ingest,
+            serde_json::json!({"namespace": ns, "query_text": "hello"}),
+        );
+        assert_eq!(hit_ids(&local), ["a"]);
+        assert_eq!(local["exhaustive_search_count"], 1);
+
+        // The GET route takes it as a query parameter.
+        let get = handle_search_get(
+            "GET /search?ns=tenant/ryw-index&q=hello&consistency=strong HTTP/1.1",
+            &query,
+        );
+        assert_eq!(total_hits(&get), 1);
+        let get = handle_search_get(
+            "GET /search?ns=tenant/ryw-index&q=hello&consistency=eventual HTTP/1.1",
+            &query,
+        );
+        assert_eq!(total_hits(&get), 0);
+        let bad = handle_search_get(
+            "GET /search?ns=tenant/ryw-index&q=hello&consistency=sometimes HTTP/1.1",
+            &query,
+        );
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        let bad = handle_search_post(
+            br#"{"namespace":"tenant/ryw-index","query_text":"hello","consistency":"weak"}"#,
+            &query,
+        );
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+
+        // A second write changes the tail; the next search sees both, and
+        // after a flush the documents come from the segment instead.
+        ryw_index(&ingest, ns, vec![ryw_doc("b", "hello again", "x")]);
+        let both = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "hello"}),
+        );
+        assert_eq!(both["total_hits"], 2);
+        assert_eq!(both["exhaustive_search_count"], 2);
+        flush_and_publish_namespace(&ingest, &ns_id).unwrap();
+        let flushed = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "hello"}),
+        );
+        assert_eq!(flushed["total_hits"], 2, "no double count after the flush");
+        assert_eq!(flushed["exhaustive_search_count"], 0);
+    }
+
+    /// #255 acceptance: an upsert shows only the newest version, whether
+    /// the old one is unindexed or indexed.
+    #[test]
+    fn strong_search_returns_only_the_newest_version() {
+        let store = outage_store();
+        let (ingest, query) = read_your_writes_pods(&store, |_, _| {});
+        let ns = "tenant/ryw-upsert";
+        // Both versions unindexed.
+        ryw_index(&ingest, ns, vec![ryw_doc("a", "alpha original", "x")]);
+        ryw_index(&ingest, ns, vec![ryw_doc("a", "beta rewritten", "x")]);
+        for state in [&*ingest, &query] {
+            let all = ryw_search(
+                state,
+                serde_json::json!({"namespace": ns, "query_text": "", "filter": {"match_all": {}}}),
+            );
+            assert_eq!(hit_ids(&all), ["a"]);
+            assert_eq!(all["results"][0]["fields"][0]["value"], "beta rewritten");
+            let old = ryw_search(
+                state,
+                serde_json::json!({"namespace": ns, "query_text": "original"}),
+            );
+            assert_eq!(old["total_hits"], 0);
+        }
+        // Indexed old version, then an upsert.
+        flush_and_publish_namespace(&ingest, &NamespaceId(ns.into())).unwrap();
+        ryw_index(&ingest, ns, vec![ryw_doc("a", "gamma third", "x")]);
+        let all = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "", "filter": {"match_all": {}}}),
+        );
+        assert_eq!(hit_ids(&all), ["a"]);
+        assert_eq!(all["total_hits"], 1);
+        assert_eq!(all["results"][0]["fields"][0]["value"], "gamma third");
+    }
+
+    /// #255: the tail's masks hide the indexed copies it supersedes (the
+    /// WAL-replay case, where an unindexed write replaces or deletes a
+    /// document that is still live in a segment).
+    #[test]
+    fn tail_masks_hide_superseded_indexed_copies() {
+        let store = outage_store();
+        let (ingest, mut query) = ingest_and_query(&store, Some(Duration::from_secs(3600)));
+        let ns = NamespaceId("tenant/ryw-mask".into());
+        ingest
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    ryw_doc("a", "old words", "x"),
+                    ryw_doc("b", "other words", "x"),
+                ],
+            )
+            .unwrap();
+        ingest.indexer.flush_namespace(&ns).unwrap();
+        ingest.publish_namespace(&ns).unwrap();
+        let manifest = ingest.indexer.manifest(&ns).unwrap();
+        let segment = manifest.segments[0].segment_id.clone();
+        let version = manifest.version;
+        query.unindexed.fetcher = Some(Box::new(move |_, asked, known| {
+            let mut tail = kosha_write::UnindexedTail {
+                manifest_version: version,
+                fingerprint: "crafted".into(),
+                ..Default::default()
+            };
+            assert_eq!(asked, version);
+            if known == Some("crafted") {
+                tail.not_modified = true;
+                return Ok(tail);
+            }
+            tail.documents = vec![ryw_doc("a", "new words", "x")];
+            tail.deleted_ids = vec![DocumentId("b".into())];
+            tail.masked = HashMap::from([(segment.clone(), vec![0, 1])]);
+            Ok(tail)
+        }));
+        let body = serde_json::json!({"namespace": "tenant/ryw-mask", "query_text": "words"});
+        for _ in 0..2 {
+            // The second search reuses the built tail (`not_modified`).
+            let strong = ryw_search(&query, body.clone());
+            assert_eq!(hit_ids(&strong), ["a"]);
+            assert_eq!(strong["total_hits"], 1);
+            assert_eq!(strong["results"][0]["fields"][0]["value"], "new words");
+        }
+        let mut eventual = body.clone();
+        eventual["consistency"] = "eventual".into();
+        let eventual = ryw_search(&query, eventual);
+        assert_eq!(eventual["total_hits"], 2);
+        assert!(eventual["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["fields"][0]["value"] == "old words"));
+    }
+
+    /// #255 acceptance: deletes (by query, of unindexed and indexed
+    /// documents) take effect for strong searches immediately.
+    #[test]
+    fn strong_search_hides_deleted_documents() {
+        let store = outage_store();
+        let (ingest, query) = read_your_writes_pods(&store, |_, _| {});
+        let ns = "tenant/ryw-delete";
+        ryw_index(&ingest, ns, vec![ryw_doc("old", "kept words", "drop")]);
+        flush_and_publish_namespace(&ingest, &NamespaceId(ns.into())).unwrap();
+        ryw_index(
+            &ingest,
+            ns,
+            vec![
+                ryw_doc("a", "kept words", "drop"),
+                ryw_doc("b", "kept words", "keep"),
+            ],
+        );
+        let before = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "kept"}),
+        );
+        assert_eq!(before["total_hits"], 3);
+        let delete = handle_delete(
+            br#"{"namespace":"tenant/ryw-delete","filter":{"term":{"status":"drop"}}}"#,
+            &ingest,
+        );
+        assert!(delete.starts_with("HTTP/1.1 200"), "{delete}");
+        for state in [&*ingest, &query] {
+            let after = ryw_search(
+                state,
+                serde_json::json!({"namespace": ns, "query_text": "kept"}),
+            );
+            assert_eq!(hit_ids(&after), ["b"]);
+            assert_eq!(after["total_hits"], 1);
+        }
+    }
+
+    /// #255: a flush that publishes between the query pod's manifest
+    /// snapshot and its tail fetch is neither missed nor double-counted:
+    /// the stale tail is refused, the manifest refreshed and the tail
+    /// fetched again.
+    #[test]
+    fn strong_search_survives_a_flush_racing_the_tail_fetch() {
+        let store = outage_store();
+        let race = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let armed = Arc::clone(&race);
+        let (ingest, query) = read_your_writes_pods(&store, move |writer, ns| {
+            if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                flush_and_publish_namespace(writer, ns).unwrap();
+            }
+        });
+        let ns = "tenant/ryw-race";
+        ryw_index(&ingest, ns, vec![ryw_doc("a", "racing words", "x")]);
+        // Load the namespace on the query pod at the pre-flush version.
+        let first = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "racing"}),
+        );
+        assert_eq!(first["total_hits"], 1);
+        ryw_index(&ingest, ns, vec![ryw_doc("b", "racing words", "x")]);
+        race.store(true, std::sync::atomic::Ordering::SeqCst);
+        let raced = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "racing"}),
+        );
+        assert!(
+            !race.load(std::sync::atomic::Ordering::SeqCst),
+            "the race ran"
+        );
+        assert_eq!(raced["total_hits"], 2);
+        assert_eq!(hit_ids(&raced).len(), 2);
+        assert_eq!(raced["exhaustive_search_count"], 0, "both now indexed");
+    }
+
+    /// #255: under strong consistency a tail that cannot be read fails the
+    /// search; it never silently degrades to eventual.
+    #[test]
+    fn strong_search_fails_when_the_tail_is_unreadable() {
+        let store = outage_store();
+        let (ingest, mut query) = ingest_and_query(&store, Some(Duration::from_secs(3600)));
+        index_text_and_publish(&ingest, &NamespaceId("tenant/ryw-down".into()), &["a"]);
+        // No internal credential and no fetcher: the default is eventual,
+        // an explicit strong request is refused with the reason.
+        let plain = br#"{"namespace":"tenant/ryw-down","query_text":"hello"}"#;
+        assert_eq!(total_hits(&handle_search_post(plain, &query)), 1);
+        let strong =
+            br#"{"namespace":"tenant/ryw-down","query_text":"hello","consistency":"strong"}"#;
+        let refused = handle_search_post(strong, &query);
+        assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+        assert!(refused.contains("KOSHA_INTERNAL_API_KEY"), "{refused}");
+        // A failing fetch is a 503 too.
+        query.unindexed.fetcher = Some(Box::new(|_, _, _| {
+            Err(KoshaError::Io(std::io::Error::other("ingest down")))
+        }));
+        let failed = handle_search_post(strong, &query);
+        assert!(failed.starts_with("HTTP/1.1 503"), "{failed}");
+        assert!(failed.contains("ingest down"), "{failed}");
+        let eventual =
+            br#"{"namespace":"tenant/ryw-down","query_text":"hello","consistency":"eventual"}"#;
+        assert_eq!(total_hits(&handle_search_post(eventual, &query)), 1);
+        // The internal route needs the internal credential.
+        let denied = route(
+            "GET /internal/namespaces/tenant%2Fryw-down/unindexed HTTP/1.1",
+            &HashMap::new(),
+            b"",
+            "tenant",
+            &ingest,
+        );
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+    }
+
+    /// #255 acceptance: past the unindexed cap `/index` and `/replace`
+    /// answer 429 with a retry hint until a flush drains the backlog.
+    #[test]
+    fn unindexed_backlog_cap_backpressures_writes() {
+        let mut state = test_state();
+        state.unindexed_cap = unindexed::UnindexedCap {
+            max_bytes: 0,
+            max_docs: Some(2),
+        };
+        let ns = "tenant/ryw-cap";
+        let ok = ryw_index(
+            &state,
+            ns,
+            vec![ryw_doc("a", "one", "x"), ryw_doc("b", "two", "x")],
+        );
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        let refused = ryw_index(&state, ns, vec![ryw_doc("c", "three", "x")]);
+        assert!(refused.starts_with("HTTP/1.1 429"), "{refused}");
+        assert!(refused.contains("\r\nretry-after: 1\r\n"), "{refused}");
+        assert!(refused.contains("KOSHA_MAX_UNINDEXED_DOCS"), "{refused}");
+        let replace = serde_json::to_vec(&IndexRequest {
+            namespace: NamespaceId(ns.into()),
+            documents: vec![ryw_doc("a", "patched", "x")],
+        })
+        .unwrap();
+        assert!(handle_replace(&replace, &state).starts_with("HTTP/1.1 429"));
+        let stats = stats_json(&state);
+        let entry = stats["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["namespace"] == ns)
+            .unwrap()
+            .clone();
+        assert_eq!(entry["unindexed_documents"], 2);
+        assert!(entry["unindexed_bytes"].as_u64().unwrap() > 0);
+
+        flush_and_publish_namespace(&state, &NamespaceId(ns.into())).unwrap();
+        let accepted = ryw_index(&state, ns, vec![ryw_doc("c", "three", "x")]);
+        assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
+
+        // The byte cap works the same way.
+        state.unindexed_cap = unindexed::UnindexedCap {
+            max_bytes: 1,
+            max_docs: None,
+        };
+        assert!(ryw_index(&state, ns, vec![ryw_doc("d", "four", "x")]).starts_with("HTTP/1.1 429"));
+    }
+
+    /// #255 acceptance: `search_after` pages and capped `total_hits` stay
+    /// coherent when unindexed hits are merged with indexed ones.
+    #[test]
+    fn strong_search_paginates_across_indexed_and_unindexed_hits() {
+        let store = outage_store();
+        let (ingest, query) = read_your_writes_pods(&store, |_, _| {});
+        let ns = "tenant/ryw-page";
+        let docs = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| ryw_doc(id, "page words", "x"))
+                .collect()
+        };
+        ryw_index(&ingest, ns, docs(&["d01", "d03", "d05", "d07", "d09"]));
+        flush_and_publish_namespace(&ingest, &NamespaceId(ns.into())).unwrap();
+        ryw_index(&ingest, ns, docs(&["d02", "d04", "d06", "d08", "d10"]));
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut body = serde_json::json!({
+                "namespace": ns,
+                "query_text": "page",
+                "max_results": 3,
+                "sort": [{"_id": {"order": "asc"}}],
+            });
+            if let Some(ref after) = cursor {
+                body["search_after"] = serde_json::json!([after]);
+            }
+            let page = ryw_search(&query, body);
+            assert_eq!(page["total_hits"], 10);
+            assert_eq!(page["exhaustive_search_count"], 5);
+            let ids = hit_ids(&page);
+            if ids.is_empty() {
+                break;
+            }
+            cursor = ids.last().cloned();
+            seen.extend(ids);
+        }
+        let expected: Vec<String> = (1..=10).map(|i| format!("d{i:02}")).collect();
+        assert_eq!(seen, expected, "every document once, in order");
+
+        let capped = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "page", "total_hits_cap": 7}),
+        );
+        assert_eq!(capped["total_hits"], 7);
+        assert_eq!(capped["total_hits_relation"], "gte");
+        let exact = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "page", "exact_total_hits": true}),
+        );
+        assert_eq!(exact["total_hits"], 10);
+        assert_eq!(exact["total_hits_relation"], "eq");
     }
 
     #[test]
@@ -17108,6 +17636,60 @@ mod tests {
             assert_eq!(seen.len(), 200, "every live document exactly once: {sort}");
             assert_eq!(seen, plain_seen);
         }
+    }
+
+    /// Read-your-writes (#255) over a sharded namespace (#207): every
+    /// shard's unindexed tail is searched, relative to its own manifest.
+    #[test]
+    fn strong_search_sees_unflushed_writes_in_every_shard() {
+        let state = test_state();
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/live/shards",
+            serde_json::json!({"shards": 4}),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/live/documents",
+            sharding_corpus(0..20),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/live/flush",
+            serde_json::json!({}),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/live/documents",
+            sharding_corpus(20..40),
+        );
+        let count = |consistency: &str| {
+            shard_v1(
+                &state,
+                "POST /v1/namespaces/live/search",
+                serde_json::json!({"query_text": "", "max_results": 100,
+                                   "filter": {"terms": {"kind": ["memo", "brief", "order"]}},
+                                   "consistency": consistency}),
+            )["total_hits"]
+                .as_u64()
+                .unwrap()
+        };
+        let strong = shard_v1(
+            &state,
+            "POST /v1/namespaces/live/search",
+            serde_json::json!({"query_text": "", "max_results": 100,
+                               "filter": {"terms": {"kind": ["memo", "brief", "order"]}}}),
+        );
+        assert_eq!(strong["total_hits"], 40, "{strong}");
+        assert_eq!(strong["exhaustive_search_count"], 20, "{strong}");
+        assert_eq!(count("eventual"), 20);
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/live/flush",
+            serde_json::json!({}),
+        );
+        assert_eq!(count("strong"), 40);
+        assert_eq!(count("eventual"), 40);
     }
 
     #[test]

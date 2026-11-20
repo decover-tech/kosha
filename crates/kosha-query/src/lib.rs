@@ -1362,8 +1362,11 @@ impl CorpusStatsCache {
     fn insert(&self, key: CorpusKey, entry: Arc<CorpusEntry>) -> Arc<CorpusEntry> {
         let mut entries = self.entries.lock().unwrap();
         // Older versions of the same namespace are dead once a newer one is
-        // being queried.
-        entries.retain(|k, _| k.0 != key.0 || k.1 > key.1);
+        // being queried. Other segment sets at the same version are not: a
+        // strong-consistency search (#255) adds the unindexed tail's
+        // transient segment to the manifest it searches, and must not evict
+        // the plain version's entry (nor the other way around).
+        entries.retain(|k, _| k.0 != key.0 || k.1 >= key.1);
         if entries.len() >= CORPUS_STATS_MAX_ENTRIES {
             entries.clear();
         }
@@ -1473,7 +1476,7 @@ impl CeilingCache {
 
     fn insert(&self, key: CorpusKey, entry: Arc<CeilingEntry>) -> Arc<CeilingEntry> {
         let mut entries = self.entries.lock().unwrap();
-        entries.retain(|k, _| k.0 != key.0 || k.1 > key.1);
+        entries.retain(|k, _| k.0 != key.0 || k.1 >= key.1);
         if entries.len() >= CEILING_CACHE_MAX_ENTRIES {
             entries.clear();
         }
@@ -2455,6 +2458,16 @@ impl Searcher {
     /// much gets scored differs — so this is a test/bench hook for
     /// measuring that, not a production knob.
     #[doc(hidden)]
+    /// Forget a segment that will never be searched again: the transient
+    /// segment a strong-consistency search built from a namespace's
+    /// unindexed tail (#255), once that tail has changed. Its directory may
+    /// be removed afterwards; searches already holding it finish on their
+    /// copy.
+    pub fn forget_segment(&self, namespace: &NamespaceId, segment_id: &kosha_core::SegmentId) {
+        self.segment_cache
+            .remove_segment(&namespace.0, &segment_id.0);
+    }
+
     pub fn set_global_wand_threshold(&self, enabled: bool) {
         self.global_wand.store(enabled, Ordering::Relaxed);
     }
@@ -5524,6 +5537,7 @@ impl Searcher {
                     rerank_degraded_reason: None,
                     knn_mode: None,
                     knn_filtered_candidates: None,
+                    exhaustive_search_count: 0,
                 },
                 phase_stats,
             ));
@@ -6059,6 +6073,7 @@ impl Searcher {
                 rerank_degraded_reason: None,
                 knn_mode: phase_stats.knn_mode.map(|mode| mode.as_str().to_string()),
                 knn_filtered_candidates: phase_stats.knn_filtered_candidates,
+                exhaustive_search_count: 0,
             },
             phase_stats,
         ))

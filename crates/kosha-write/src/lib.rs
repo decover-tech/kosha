@@ -55,6 +55,16 @@ struct NamespaceState {
     known: bool,
     wal_sequence: u64,
     flushing_ids: HashSet<DocumentId>,
+    /// The documents of the flush round in progress (#255): taken out of
+    /// the buffer but not yet in a committed segment, so still part of the
+    /// namespace's unindexed tail. Shared with the writer threads, not
+    /// copied.
+    flushing_docs: Vec<Arc<Vec<Document>>>,
+    /// Bumped whenever the unindexed tail (buffer, flushing documents,
+    /// pending deletes) may have changed without a manifest version bump.
+    /// With the manifest version and [`Indexer::instance`] it names one
+    /// tail state — see [`UnindexedTail::fingerprint`].
+    tail_epoch: u64,
     recovered: Vec<(u64, kosha_core::WalRecord)>,
     recovered_deletes: HashSet<DocumentId>,
     replay_required: bool,
@@ -174,6 +184,76 @@ impl PublishedBase {
     }
 }
 
+/// The writes a namespace has acknowledged but not yet indexed into a
+/// segment of its manifest (#255): what a strong-consistency search scans
+/// exhaustively on top of the indexed segments.
+///
+/// It is relative to one local manifest version, `manifest_version`: the
+/// documents and deletes here are exactly what that version is missing.
+/// A reader whose own manifest has another version must not combine the
+/// two (it would double-count a flush that published in between, or miss
+/// one) — it refreshes its manifest and asks again.
+///
+/// Served by the ingest pod as `GET /internal/namespaces/{ns}/unindexed`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct UnindexedTail {
+    /// The local manifest version the tail applies on top of.
+    pub manifest_version: u64,
+    /// That manifest's `wal_checkpoint`: every WAL record after it is in
+    /// the tail (informational; the version is what readers compare).
+    #[serde(default)]
+    pub wal_checkpoint: u64,
+    /// Names this exact tail state (writer process, manifest version and a
+    /// tail change counter). Equal fingerprints mean equal tails, so a
+    /// reader can keep what it built from one and ask with
+    /// `if_none_match` next time.
+    #[serde(default)]
+    pub fingerprint: String,
+    /// The newest unindexed version of each upserted document, oldest
+    /// first. Each one supersedes any indexed copy of its id.
+    #[serde(default)]
+    pub documents: Vec<Document>,
+    /// Ids deleted since `manifest_version` whose deletes are not in the
+    /// manifest yet (WAL-recovered deletes awaiting replay).
+    #[serde(default)]
+    pub deleted_ids: Vec<DocumentId>,
+    /// The live indexed copies (segment, doc seq) that the documents and
+    /// deletes above supersede: treated as deleted by a search over
+    /// `manifest_version`, so the newest version wins and deletes apply.
+    #[serde(default)]
+    pub masked: HashMap<SegmentId, Vec<u32>>,
+    /// The reader already has this tail (`known_fingerprint` matched):
+    /// documents, deletes and masks are left out.
+    #[serde(default)]
+    pub not_modified: bool,
+    /// The reader asked for a tail relative to another manifest version
+    /// than the writer's current one: documents, deletes and masks are left
+    /// out, and the reader should refresh its manifest and ask again.
+    #[serde(default)]
+    pub stale: bool,
+}
+
+impl UnindexedTail {
+    /// Nothing to scan and nothing to hide.
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty()
+            && self.deleted_ids.is_empty()
+            && self.masked.values().all(Vec::is_empty)
+    }
+}
+
+/// Approximate in-memory size of a buffered document, the unit of
+/// `KOSHA_MAX_UNINDEXED_BYTES` (#255): its id and every field's name and
+/// value, plus a small per-field overhead.
+pub fn approx_document_bytes(doc: &Document) -> u64 {
+    let fields: usize = doc
+        .fields
+        .iter()
+        .map(|field| field.name.len() + field.value.len() + 8)
+        .sum();
+    (doc.id.0.len() + fields) as u64
+}
+
 /// What [`Indexer::rebase_onto`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebaseOutcome {
@@ -240,6 +320,8 @@ impl NamespaceState {
             known: false,
             wal_sequence: 0,
             flushing_ids: HashSet::new(),
+            flushing_docs: Vec::new(),
+            tail_epoch: 0,
             recovered: Vec::new(),
             recovered_deletes: HashSet::new(),
             replay_required: false,
@@ -400,6 +482,10 @@ pub struct Indexer {
     /// Lock order: may be taken while a namespace `state` lock is held,
     /// never the other way round.
     local_retired: Mutex<Vec<LocalRetirement>>,
+    /// Random per-process id: part of every [`UnindexedTail::fingerprint`],
+    /// so a restarted writer never hands out a fingerprint an earlier
+    /// process used for a different tail.
+    instance: String,
 }
 
 impl Indexer {
@@ -449,6 +535,7 @@ impl Indexer {
             // segment; only a >= 2x backlog splits (#241).
             min_docs_per_flush_writer: 1000,
             local_retired: Mutex::new(Vec::new()),
+            instance: uuid::Uuid::new_v4().simple().to_string(),
         };
 
         // Recover un-flushed documents from WAL on startup.
@@ -466,6 +553,7 @@ impl Indexer {
 
     fn apply_recovered_record(&self, state: &mut NamespaceState, record: &kosha_core::WalRecord) {
         let deleted: HashSet<_> = record.deleted_ids.iter().cloned().collect();
+        state.tail_epoch += 1;
         state.recovered_deletes.extend(deleted.iter().cloned());
         for doc in &record.documents {
             state.recovered_deletes.remove(&doc.id);
@@ -495,6 +583,11 @@ impl Indexer {
     pub fn with_bm25_params(mut self, params: Bm25Params) -> Self {
         self.bm25_params = params;
         self
+    }
+
+    /// The BM25 parameters new segments are built with.
+    pub fn bm25_params(&self) -> &Bm25Params {
+        &self.bm25_params
     }
 
     pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
@@ -971,6 +1064,7 @@ impl Indexer {
                 buf.documents.retain(|doc| !id_set.contains(&doc.id));
             }
             state.known = true;
+            state.tail_epoch += 1;
             let flush_threshold = self.flush_threshold;
             let buf = Self::buffer_mut_in(
                 &mut state,
@@ -1120,6 +1214,7 @@ impl Indexer {
         if let Some(buffer) = state.buffer.as_mut() {
             buffer.documents.retain(|doc| !ids.contains(&doc.id));
         }
+        state.tail_epoch += 1;
         for (segment, seq) in locations {
             state.tombstones.entry(segment).or_default().insert(seq);
         }
@@ -1181,6 +1276,7 @@ impl Indexer {
             }
             state.manifest.tombstones = state.tombstones.clone();
             state.manifest.version += 1;
+            state.tail_epoch += 1;
             state.recovered_deletes.clear();
             state.replay_required = false;
         }
@@ -1334,11 +1430,17 @@ impl Indexer {
                 .as_ref()
                 .map(|b| b.documents.iter().map(|doc| doc.id.clone()).collect())
                 .unwrap_or_default();
-            let chunks = Self::take_flush_chunks_in(
+            let chunks: Vec<_> = Self::take_flush_chunks_in(
                 &mut state,
                 self.max_concurrent_flush_writers,
                 self.min_docs_per_flush_writer,
-            );
+            )
+            .into_iter()
+            .map(|(docs, seg_id, params)| (Arc::new(docs), seg_id, params))
+            .collect();
+            // Still unindexed until phase 3 commits them (#255).
+            state.flushing_docs = chunks.iter().map(|(docs, _, _)| Arc::clone(docs)).collect();
+            state.tail_epoch += 1;
             (chunks, checkpoint, analysis)
         };
         if chunks.is_empty() {
@@ -1363,11 +1465,7 @@ impl Indexer {
         // <= its capacity by construction, so this is the structural
         // backstop, not the primary bound.
         let ns_dir = self.data_dir.join(&namespace.0);
-        let results: Vec<(
-            SegmentId,
-            Vec<Document>,
-            Result<kosha_core::Footer, KoshaError>,
-        )> = if chunks.len() == 1 {
+        let results: Vec<FlushChunkOutcome> = if chunks.len() == 1 {
             let (docs, seg_id, bm25_params) = chunks.into_iter().next().unwrap();
             vec![Self::write_flush_chunk(
                 &ns_dir,
@@ -1408,9 +1506,9 @@ impl Indexer {
         // silently dropped -- so "every buffered document ends up in
         // exactly one segment" still holds on partial failure, same as it
         // held (trivially, with only one chunk) before this change.
-        let mut failed_docs: Vec<Document> = Vec::new();
+        let mut failed_docs: Vec<Arc<Vec<Document>>> = Vec::new();
         let mut first_err: Option<KoshaError> = None;
-        let mut succeeded: Vec<(SegmentId, Vec<Document>, kosha_core::Footer)> = Vec::new();
+        let mut succeeded: Vec<(SegmentId, Arc<Vec<Document>>, kosha_core::Footer)> = Vec::new();
         for (seg_id, docs, result) in results {
             match result {
                 Ok(footer) => succeeded.push((seg_id, docs, footer)),
@@ -1418,7 +1516,7 @@ impl Indexer {
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
-                    failed_docs.extend(docs);
+                    failed_docs.push(docs);
                 }
             }
         }
@@ -1427,9 +1525,14 @@ impl Indexer {
         // in the WAL and restore it ahead of newer buffered writes.
         if let Some(error) = first_err {
             for (_, docs, _) in succeeded {
-                failed_docs.extend(docs);
+                failed_docs.push(docs);
             }
             let mut state = handle.state.lock().unwrap();
+            // Released first so the chunks below unwrap without a copy.
+            state.flushing_docs.clear();
+            state.tail_epoch += 1;
+            let mut failed_docs: Vec<Document> =
+                failed_docs.into_iter().flat_map(unshare_docs).collect();
             let buf = Self::buffer_mut_in(
                 &mut state,
                 namespace.clone(),
@@ -1453,6 +1556,8 @@ impl Indexer {
             let mut state = handle.state.lock().unwrap();
             Self::commit_recovery(&mut state, recovery);
             state.flushing_ids.clear();
+            state.flushing_docs.clear();
+            state.tail_epoch += 1;
             state.manifest.wal_checkpoint = state.manifest.wal_checkpoint.max(checkpoint);
             state.manifest.wal_origin = Some(origin);
             for (seg_id, docs, footer) in succeeded {
@@ -1472,7 +1577,8 @@ impl Indexer {
                     &self.data_dir,
                     &self.bm25_params,
                 );
-                buf.documents.extend(failed_docs);
+                buf.documents
+                    .extend(failed_docs.into_iter().flat_map(unshare_docs));
             }
         }
 
@@ -1490,19 +1596,15 @@ impl Indexer {
     fn write_flush_chunk(
         ns_dir: &Path,
         handle: &NamespaceHandle,
-        docs: Vec<Document>,
+        docs: Arc<Vec<Document>>,
         seg_id: SegmentId,
         bm25_params: Bm25Params,
         analysis: &kosha_core::AnalysisConfig,
-    ) -> (
-        SegmentId,
-        Vec<Document>,
-        Result<kosha_core::Footer, KoshaError>,
-    ) {
+    ) -> FlushChunkOutcome {
         let _permit = handle.writer_slots.acquire();
         let seg_dir = ns_dir.join(seg_id.0.as_str());
         let mut writer = SegmentWriter::new(seg_id.clone(), seg_dir).with_analysis(analysis);
-        for doc in &docs {
+        for doc in docs.iter() {
             writer.add_document(doc.id.clone(), doc.fields.clone());
         }
         let result = writer.finalize(bm25_params);
@@ -1596,6 +1698,7 @@ impl Indexer {
 
         // WAL reclamation waits for durable manifest publication.
         let _ = (wal_enabled, wal);
+        state.tail_epoch += 1;
         state.manifest.wal_checkpoint = state.wal_sequence;
         state.manifest.wal_origin = Some(wal.origin().to_owned());
 
@@ -2032,6 +2135,7 @@ impl Indexer {
             state.replay_required = !buf.documents.is_empty() && !manifest.segments.is_empty();
         }
         state.tombstones = manifest.tombstones.clone();
+        state.tail_epoch += 1;
         state.published_version = manifest.version;
         state.published_base = PublishedBase::of(&manifest, &manifest.tombstones);
         state.pending_bases.clear();
@@ -2430,6 +2534,123 @@ impl Indexer {
             .map(|(_, record)| record.documents.len() + record.deleted_ids.len())
             .sum();
         buffered + recovered
+    }
+
+    /// Documents and approximate bytes ([`approx_document_bytes`]) written
+    /// to `namespace` but not yet in a committed segment: the write buffer
+    /// plus a flush round in progress. The backlog `KOSHA_MAX_UNINDEXED_*`
+    /// caps (#255). `(0, 0)` for an unknown namespace.
+    pub fn unindexed_usage(&self, namespace: &NamespaceId) -> (usize, u64) {
+        let map = self.namespaces.lock().unwrap();
+        let Some(handle) = map.get(namespace) else {
+            return (0, 0);
+        };
+        let state = handle.state.lock().unwrap();
+        let flushing = state.flushing_docs.iter().flat_map(|chunk| chunk.iter());
+        let buffered = state.buffer.iter().flat_map(|b| b.documents.iter());
+        flushing.chain(buffered).fold((0, 0), |(docs, bytes), doc| {
+            (docs + 1, bytes + approx_document_bytes(doc))
+        })
+    }
+
+    /// The namespace's unindexed tail (#255): every acknowledged write that
+    /// is not in a segment of the current local manifest, with the indexed
+    /// copies it supersedes. See [`UnindexedTail`].
+    ///
+    /// `expected_version`: the manifest version the caller searches. When
+    /// the local version differs, the result is only a `stale` marker
+    /// carrying the local version. `known_fingerprint`: the fingerprint of
+    /// a tail the caller already holds; when it is still current the result
+    /// is only a `not_modified` marker. Both skip copying the documents.
+    ///
+    /// `None` for a namespace this writer does not know. Computing the
+    /// masks needs the id index (built on the first write anyway); building
+    /// it reads every segment's doc metadata and fails if one is not local.
+    pub fn unindexed_tail(
+        &self,
+        namespace: &NamespaceId,
+        expected_version: Option<u64>,
+        known_fingerprint: Option<&str>,
+    ) -> Result<Option<UnindexedTail>, KoshaError> {
+        let Some(handle) = self.namespaces.lock().unwrap().get(namespace).cloned() else {
+            return Ok(None);
+        };
+        loop {
+            {
+                let state = handle.state.lock().unwrap();
+                if !state.known {
+                    return Ok(None);
+                }
+                let mut tail = UnindexedTail {
+                    manifest_version: state.manifest.version,
+                    wal_checkpoint: state.manifest.wal_checkpoint,
+                    fingerprint: format!(
+                        "{}-{}-{}",
+                        self.instance, state.manifest.version, state.tail_epoch
+                    ),
+                    ..UnindexedTail::default()
+                };
+                if expected_version.is_some_and(|v| v != tail.manifest_version) {
+                    tail.stale = true;
+                    return Ok(Some(tail));
+                }
+                if known_fingerprint == Some(tail.fingerprint.as_str()) {
+                    tail.not_modified = true;
+                    return Ok(Some(tail));
+                }
+                // Oldest first: a flush round in progress holds older
+                // writes than the buffer that kept filling behind it.
+                let documents: Vec<Document> = state
+                    .flushing_docs
+                    .iter()
+                    .flat_map(|chunk| chunk.iter())
+                    .chain(state.buffer.iter().flat_map(|b| b.documents.iter()))
+                    .cloned()
+                    .collect();
+                let documents = dedupe_documents_last_wins(documents);
+                let upserted: HashSet<&DocumentId> = documents.iter().map(|d| &d.id).collect();
+                let mut deleted_ids: Vec<DocumentId> = state
+                    .recovered_deletes
+                    .iter()
+                    .filter(|id| !upserted.contains(id))
+                    .cloned()
+                    .collect();
+                deleted_ids.sort_by(|a, b| a.0.cmp(&b.0));
+                if documents.is_empty() && deleted_ids.is_empty() {
+                    return Ok(Some(tail));
+                }
+                if let Some(index) = state.id_index.as_ref() {
+                    let listed: HashSet<&SegmentId> = state
+                        .manifest
+                        .segments
+                        .iter()
+                        .map(|entry| &entry.segment_id)
+                        .collect();
+                    let mut masked: HashMap<SegmentId, Vec<u32>> = HashMap::new();
+                    for id in upserted.iter().copied().chain(deleted_ids.iter()) {
+                        for (segment, seq) in index.get(id).into_iter().flatten() {
+                            let dead = state
+                                .tombstones
+                                .get(segment)
+                                .is_some_and(|set| set.contains(seq));
+                            if listed.contains(segment) && !dead {
+                                masked.entry(segment.clone()).or_default().push(*seq);
+                            }
+                        }
+                    }
+                    for seqs in masked.values_mut() {
+                        seqs.sort_unstable();
+                        seqs.dedup();
+                    }
+                    drop(upserted);
+                    tail.documents = documents;
+                    tail.deleted_ids = deleted_ids;
+                    tail.masked = masked;
+                    return Ok(Some(tail));
+                }
+            }
+            self.ensure_id_index(namespace, &handle)?;
+        }
     }
 
     /// Materialize immutable sidecars for precisely the snapshot being
@@ -3054,6 +3275,19 @@ fn merge_fields(
     base
 }
 
+/// One flush chunk's segment id, documents and `finalize` outcome.
+type FlushChunkOutcome = (
+    SegmentId,
+    Arc<Vec<Document>>,
+    Result<kosha_core::Footer, KoshaError>,
+);
+
+/// A flush chunk's documents back as an owned list: moved out when this is
+/// the last reference (the usual case), copied otherwise.
+fn unshare_docs(docs: Arc<Vec<Document>>) -> Vec<Document> {
+    Arc::try_unwrap(docs).unwrap_or_else(|shared| (*shared).clone())
+}
+
 /// Last occurrence of each `doc_id` wins (OpenSearch bulk last-write-wins).
 fn dedupe_documents_last_wins(documents: Vec<Document>) -> Vec<Document> {
     let mut last_by_id: HashMap<String, Document> = HashMap::new();
@@ -3656,6 +3890,93 @@ mod tests {
             .existing_ids(&ns, &[DocumentId("buffered".into())])
             .unwrap()
             .contains(&DocumentId("buffered".into())));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #255: the unindexed tail is the buffer, relative to the local
+    /// manifest version, with a fingerprint that changes with it.
+    #[test]
+    fn unindexed_tail_follows_buffer_and_flushes() {
+        let dir = std::env::temp_dir().join(format!("kosha-tail-buffer-{}", uuid::Uuid::new_v4()));
+        let idx = Indexer::new(dir.clone()).with_flush_threshold(100);
+        let ns = NamespaceId("ns".into());
+        let doc = |id: &str, text: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text)],
+        };
+        assert!(idx.unindexed_tail(&ns, None, None).unwrap().is_none());
+        idx.index_documents(ns.clone(), vec![doc("a", "one"), doc("b", "two")])
+            .unwrap();
+        idx.index_documents(ns.clone(), vec![doc("a", "three")])
+            .unwrap();
+        let tail = idx.unindexed_tail(&ns, None, None).unwrap().unwrap();
+        assert_eq!(tail.manifest_version, 0);
+        let ids: Vec<_> = tail.documents.iter().map(|d| d.id.0.as_str()).collect();
+        assert_eq!(ids, ["b", "a"], "newest version of each id, oldest first");
+        assert_eq!(tail.documents[1].fields[0].value, "three");
+        assert!(tail.masked.is_empty() && tail.deleted_ids.is_empty());
+        assert_eq!(idx.unindexed_usage(&ns).0, 2);
+        assert!(idx.unindexed_usage(&ns).1 > 0);
+
+        // Same state: the caller's copy is still current.
+        let same = idx
+            .unindexed_tail(&ns, Some(0), Some(&tail.fingerprint))
+            .unwrap()
+            .unwrap();
+        assert!(same.not_modified && same.documents.is_empty());
+        // Another manifest version: only a stale marker.
+        let stale = idx.unindexed_tail(&ns, Some(7), None).unwrap().unwrap();
+        assert!(stale.stale && stale.documents.is_empty());
+        assert_eq!(stale.manifest_version, 0);
+
+        idx.index_documents(ns.clone(), vec![doc("c", "four")])
+            .unwrap();
+        let grown = idx.unindexed_tail(&ns, None, None).unwrap().unwrap();
+        assert_ne!(grown.fingerprint, tail.fingerprint);
+        assert_eq!(grown.documents.len(), 3);
+
+        idx.flush_namespace(&ns).unwrap();
+        let flushed = idx.unindexed_tail(&ns, None, None).unwrap().unwrap();
+        assert!(flushed.is_empty());
+        assert_eq!(flushed.manifest_version, idx.manifest_version(&ns).unwrap());
+        assert_eq!(idx.unindexed_usage(&ns), (0, 0));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #255: WAL-recovered writes awaiting replay are in the tail, with
+    /// masks for the indexed copies they replace or delete.
+    #[test]
+    fn unindexed_tail_masks_replayed_upserts_and_deletes() {
+        let dir = std::env::temp_dir().join(format!("kosha-tail-replay-{}", uuid::Uuid::new_v4()));
+        let ns = NamespaceId("ns".into());
+        let doc = |id: &str, text: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![
+                Field::text("text", text),
+                Field::keyword("status", "remove"),
+            ],
+        };
+        let idx = Indexer::new(dir.clone());
+        idx.index_documents(ns.clone(), vec![doc("same", "old"), doc("gone", "x")])
+            .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let committed = idx.manifest(&ns).unwrap();
+        idx.acknowledge_manifest(&ns, &committed).unwrap();
+        // Crash after WAL appends that never reached a segment.
+        idx.wal.append(&ns, &[doc("same", "new")]).unwrap();
+        idx.wal
+            .append_delete(&ns, vec![DocumentId("gone".into())])
+            .unwrap();
+        drop(idx);
+        let restart = Indexer::new(dir.clone());
+        restart.restore_manifest(ns.clone(), committed.clone());
+        let tail = restart.unindexed_tail(&ns, None, None).unwrap().unwrap();
+        assert_eq!(tail.manifest_version, committed.version);
+        assert_eq!(tail.documents.len(), 1);
+        assert_eq!(tail.documents[0].fields[0].value, "new");
+        assert_eq!(tail.deleted_ids, vec![DocumentId("gone".into())]);
+        let segment = &committed.segments[0].segment_id;
+        assert_eq!(tail.masked.get(segment), Some(&vec![0, 1]));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

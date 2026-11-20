@@ -135,7 +135,7 @@ Consequences worth knowing:
 |--------|---------|
 | `AWS_GITHUB_ROLE_ARN` | OIDC deploy role |
 | `KOSHA_DATABASE_URL` | Postgres URL for control plane. Staging points at the in-cluster Postgres StatefulSet in `decoverai-services` (`postgres-service.decoverai-services.svc.cluster.local:5432/kosha`, not the old RDS instance) — see backend's `deployments/k8s/base/postgres.yaml`. Cross-namespace, so the FQDN is required; the bare `postgres-service` short name won't resolve from the `kosha` namespace. |
-| `KOSHA_API_KEY` | Bootstrap tenant API key (tenant `default`). Admin and peer access use the separate `KOSHA_ADMIN_API_KEY` / `KOSHA_INTERNAL_API_KEY`. The server refuses to start when no credential is configured at all. |
+| `KOSHA_API_KEY` | Bootstrap tenant API key (tenant `default`). Admin and peer access use the separate `KOSHA_ADMIN_API_KEY` / `KOSHA_INTERNAL_API_KEY`. The base Deployments read `KOSHA_INTERNAL_API_KEY` from the optional `kosha-secret` key `internal-api-key`; until it is set, query pods serve searches with `eventual` consistency (#255). The server refuses to start when no credential is configured at all. |
 | `KOSHA_S3_BUCKET` | Segment bucket name |
 | `KOSHA_GC_GRACE` / `KOSHA_GC_ORPHAN_GRACE` | Segment GC (#239): how long a retired segment (default `1h`) or a never-referenced orphan (default `24h`) stays in S3 before `POST /v1/admin/gc` deletes it. `KOSHA_LOCAL_GC_GRACE` (default `5m`) is the same for local disk. |
 | `KOSHA_S3_PREFIX` | Key prefix (e.g. `segments/`) |

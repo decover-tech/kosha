@@ -3841,6 +3841,12 @@ pub struct SearchResult {
     /// from. `None` when the query has no kNN or no filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knn_filtered_candidates: Option<u64>,
+    /// Acknowledged-but-unindexed documents this search scored
+    /// exhaustively (#255): the namespace's unindexed tail under
+    /// `consistency: "strong"`, `0` under `"eventual"` or when everything
+    /// was already indexed.
+    #[serde(default)]
+    pub exhaustive_search_count: u64,
 }
 
 // ─── Indexing types ────────────────────────────────────────────────────────
