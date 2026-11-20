@@ -106,7 +106,7 @@ spec:
             # bypasses the per-request budget by construction rather than
             # raising it for every query on the pod.
             - name: KOSHA_WARMUP_NAMESPACES
-              value: "paragraph_index_hnsw"
+              value: "default/paragraph_index_hnsw"
             # Posting blobs OFF, against the code default.
             #
             # Bytes are not the reason — measured against the live manifest,
