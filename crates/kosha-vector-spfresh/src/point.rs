@@ -62,7 +62,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// both operands at compare time, so the centroid's raw magnitude doesn't
 /// bias results — a plain mean is an adequate stand-in for a true "cosine
 /// centroid" here (see README.md).
-pub(crate) fn mean_vector<'a>(vectors: impl Iterator<Item = &'a [f32]>, dim: usize) -> Vec<f32> {
+pub fn mean_vector<'a>(vectors: impl Iterator<Item = &'a [f32]>, dim: usize) -> Vec<f32> {
     let mut sum = vec![0.0f32; dim];
     let mut count = 0usize;
     for v in vectors {

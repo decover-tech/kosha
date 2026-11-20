@@ -6185,7 +6185,11 @@ fn compact_options(
     if let Some(n) = request_max_segment_bytes {
         policy.max_merged_segment_bytes = n;
     }
-    kosha_write::CompactOptions { mode, policy }
+    kosha_write::CompactOptions {
+        mode,
+        policy,
+        vector_index: None,
+    }
 }
 
 /// Run one registered compaction pass and record its outcome. The caller

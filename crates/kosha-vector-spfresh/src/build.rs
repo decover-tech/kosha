@@ -75,6 +75,7 @@ pub(crate) fn build(
         free_slots: Vec::new(),
         owner_map,
         rng,
+        defer_cascade_splits: false,
     };
 
     // The recursive bisection above only enforces the *upper* bound
