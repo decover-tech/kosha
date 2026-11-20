@@ -7550,13 +7550,17 @@ fn aggregate_matches_columnar(
     Ok(state)
 }
 
+/// Metric sub-aggregation partials by name, each keyed by index into a
+/// columnar segment's sorted candidate list.
+type ColumnarSubPartials<'a> = Vec<(&'a String, HashMap<usize, MetricPartial>)>;
+
 /// [`metric_sub_partials`] over a columnar segment's filter columns, keyed
 /// by index into `wanted`.
 fn metric_sub_partials_columnar<'a>(
     reader: &SegmentReader,
     wanted: &[u32],
     agg: &'a Aggregation,
-) -> Result<Vec<(&'a String, HashMap<usize, MetricPartial>)>, KoshaError> {
+) -> Result<ColumnarSubPartials<'a>, KoshaError> {
     let mut subs = Vec::new();
     for (name, sub) in agg.sub_aggregations().into_iter().flatten() {
         let Some((kind, metric)) = sub.metric() else {

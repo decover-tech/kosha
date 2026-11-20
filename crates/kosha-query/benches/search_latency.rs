@@ -483,6 +483,7 @@ fn build_many_segment_corpus(dir: &PathBuf) -> (NamespaceId, Manifest) {
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
             schema: None,
+            retired: Default::default(),
         },
     )
 }

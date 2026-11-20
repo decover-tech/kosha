@@ -231,5 +231,6 @@ fn bench_query() -> SearchQuery {
         rank: None,
         mode: None,
         fields: Vec::new(),
+        rerank: Default::default(),
     }
 }

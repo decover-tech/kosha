@@ -59,6 +59,7 @@ fn build(root: &Path, docs: usize, field_index: bool) -> (Manifest, f64, u64) {
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
         schema: None,
+        retired: Default::default(),
     };
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let start = Instant::now();
