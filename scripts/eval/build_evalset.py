@@ -17,7 +17,10 @@ OpenSearch-style body, exactly what the backend sends. `expect` holds any of:
   value        {"agg": name, "value": n} for a metric aggregation
   groups       number of distinct documents on a collapsed page
   ordered_ids  the exact first hits, in order
-  neighbours   exact nearest neighbours [[id, cosine], ...], best first
+  neighbours   exact nearest neighbours [[id, cosine], ...], best first: the
+               top 30 plus every chunk tied with the 10th (duplicate and
+               padded chunks share a vector). "ambiguous": true marks a case
+               with more ties than are stored; it is timed but not scored
 Tier "quick" marks the small subset run after every change.
 
 Text rules (the contract being tested): split on whitespace, trim ASCII
@@ -49,7 +52,7 @@ QUICK = {"matter": 9, "word": 10, "word_per_document": 5, "word_grouped": 5, "an
 ap = argparse.ArgumentParser()
 ap.add_argument("export_dir")
 ap.add_argument("out_dir")
-ap.add_argument("--version", default="v1")
+ap.add_argument("--version", default="v2")
 args = ap.parse_args()
 os.makedirs(args.out_dir, exist_ok=True)
 random.seed(11)
@@ -209,7 +212,10 @@ Q = np.stack([v / (np.linalg.norm(v) or 1.0) for _, v in knn_cases])
 in_format = np.array(vec_format, dtype=bool)
 
 
-def all_neighbours(queries, mask=None, k=30):
+TIE_SCAN = 500  # how deep to look for chunks tied with the 10th neighbour
+
+
+def all_neighbours(queries, mask=None, k=TIE_SCAN):
     best_sim = np.full((len(queries), k), -2.0, dtype=np.float32)
     best_row = np.zeros((len(queries), k), dtype=np.int64)
     for a in range(0, n_vec, 50000):
@@ -223,8 +229,12 @@ def all_neighbours(queries, mask=None, k=30):
         best_sim, best_row = np.take_along_axis(sims, keep, 1), np.take_along_axis(rows, keep, 1)
     order = np.argsort(-best_sim, axis=1)
     best_sim, best_row = np.take_along_axis(best_sim, order, 1), np.take_along_axis(best_row, order, 1)
-    return [[[vec_ids[r], round(float(x), 6)] for r, x in zip(rows, sims) if x > -2.0]
-            for rows, sims in zip(best_row, best_sim)]
+    found = []
+    for rows, sims in zip(best_row, best_sim):
+        ranked = [[vec_ids[r], round(float(x), 6)] for r, x in zip(rows, sims) if x > -2.0]
+        tied = sum(1 for _, x in ranked if x >= ranked[min(9, len(ranked) - 1)][1] - 1e-5)
+        found.append((ranked[: max(30, tied)], tied >= len(ranked) and len(ranked) == k))
+    return found
 
 
 exact = all_neighbours(Q)
@@ -316,10 +326,15 @@ def knn_body(vector, knn_filter):
         "vector": [float(x) for x in vector], "k": 30, "filter": knn_filter}}}}
 
 
+def knn_case(area, cid, vector, knn_filter, found):
+    neighbours, ambiguous = found
+    case(area, knn_body(vector, knn_filter), neighbours=neighbours, query_chunk=cid, **({"ambiguous": True} if ambiguous else {}))
+
+
 for (cid, vector), found in zip(knn_cases, exact):
-    case("knn", knn_body(vector, M), neighbours=found, query_chunk=cid)
+    knn_case("knn", cid, vector, M, found)
 for (cid, vector), found in zip(knn_cases, exact_in_format):
-    case("knn_filtered", knn_body(vector, scoped({"term": {"fileFormats": FORMATS[0]}})), neighbours=found, query_chunk=cid)
+    knn_case("knn_filtered", cid, vector, scoped({"term": {"fileFormats": FORMATS[0]}}), found)
 
 with gzip.open(os.path.join(args.out_dir, "cases.jsonl.gz"), "wt") as fh:
     for c in cases:
