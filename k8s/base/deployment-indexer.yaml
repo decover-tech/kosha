@@ -1,0 +1,117 @@
+# Compaction-only pod (#254): KOSHA_ROLE=indexer.
+#
+# Runs the background compaction scheduler off the ingest pod, which sets
+# KOSHA_COMPACTION_ON_INGEST=false (deployment.yaml). It accepts no writes
+# and serves only /healthz, /readyz, POST /v1/admin/compact* and
+# GET /v1/admin/compaction-*; every other route answers 404. It follows the
+# Postgres manifests, hydrates the segments it merges from S3, uploads the
+# merged segment and publishes it by manifest CAS, rebasing onto whatever
+# the ingest pod committed meanwhile. It holds no writer lease and no WAL.
+#
+# No Service selects it: nothing routes client traffic here. Admin
+# compaction calls through kosha-service still reach the ingest pod, which
+# keeps serving them.
+#
+# Stage and prod overlays (resources, node placement) are left to ops.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kosha-indexer
+  namespace: kosha
+  labels:
+    app: kosha
+    role: indexer
+spec:
+  # One indexer: two would race each other's merges (the CAS + rebase keeps
+  # that safe, but it wastes the losing merge).
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kosha
+      role: indexer
+  # Never two indexers at once, even during a rollout.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: kosha
+        role: indexer
+      annotations:
+        # Scraped by annotation-based Prometheus pod discovery (#223). See
+        # docs/metrics.md.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: kosha
+      containers:
+        - name: kosha
+          image: kosha
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: kosha-config
+          env:
+            - name: KOSHA_ROLE
+              value: indexer
+            # Required: the indexer publishes into the shared control plane.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: database-url
+            - name: KOSHA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: bootstrap-api-key
+            # A synchronous full compaction can run for a long time; see the
+            # same setting on deployment.yaml.
+            - name: KOSHA_HTTP_IO_TIMEOUT_SECS
+              value: "1800"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # Restoring every manifest at boot can take minutes on a large
+          # corpus (see deployment.yaml).
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 60
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            # Placeholder, like the other base Deployments. A merge group
+            # peaks at about 2 x KOSHA_COMPACT_MAX_SEGMENT_BYTES of local
+            # disk; size ephemeral storage for it in the overlays.
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+              ephemeral-storage: "1Gi"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+              ephemeral-storage: "16Gi"
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/kosha
+      volumes:
+        # Merge scratch and hydrated inputs only; S3 + Postgres are the
+        # source of truth.
+        - name: cache
+          emptyDir: {}

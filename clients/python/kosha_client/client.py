@@ -758,27 +758,36 @@ class KoshaClient:
 
     @classmethod
     def _knn(cls, spec: dict) -> dict:
-        """``{"knn": {field: {vector, k, filter}}}`` → Kosha's kNN.
+        """``{"knn": {field: {vector | query_text, k, filter}}}`` → Kosha's kNN.
 
         The filter is carried into the vector search itself. It used to be
         dropped here, so a project-scoped semantic search returned the
         nearest chunks of every project in the index.
+
+        ``query_text`` instead of ``vector`` asks the server to embed the
+        text with the model the namespace schema declares for the field
+        (native embedding, #209).
         """
         for field, options in (spec or {}).items():
             if not isinstance(options, dict):
                 continue
             unknown = set(options) - {
-                "vector", "k", "filter", "num_candidates", "boost",
+                "vector", "query_text", "k", "filter", "num_candidates", "boost",
             }
             if unknown:
                 raise cls._unsupported(f"knn option(s) {sorted(unknown)}")
             k = int(options.get("k", 10))
-            knn = {
-                "field": field,
-                "vector": options.get("vector", []),
-                "k": k,
-                "num_candidates": int(options.get("num_candidates", max(100, k))),
-            }
+            knn = {"field": field}
+            if options.get("query_text") is not None:
+                if options.get("vector"):
+                    raise cls._unsupported(
+                        "knn with both vector and query_text"
+                    )
+                knn["query_text"] = str(options["query_text"])
+            else:
+                knn["vector"] = options.get("vector", [])
+            knn["k"] = k
+            knn["num_candidates"] = int(options.get("num_candidates", max(100, k)))
             if options.get("filter"):
                 translated = cls._to_filter(options["filter"])
                 if translated != {"match_all": {}}:

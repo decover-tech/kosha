@@ -177,3 +177,83 @@ fn postgres_branch_manifest_round_trips_and_remove_namespace() {
     // The parent is untouched.
     assert_eq!(store.manifest_version(&parent).unwrap(), Some(4));
 }
+
+/// #254: two writers race for one namespace's lease and publish
+/// concurrently with their tokens. Exactly one holds the lease and
+/// commits; the other is refused the lease and its fenced CAS is rejected.
+/// After the winner's lease expires, a takeover bumps the token and the
+/// old holder's CAS is fenced even over the right version.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_fenced_cas_race_and_takeover() {
+    use kosha_control::PgWriterLeaseStore;
+    use std::time::Duration;
+
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let observer = PgStore::new(&url).unwrap();
+    let a = PgStore::new(&url).unwrap();
+    let b = PgStore::new(&url).unwrap();
+    let ns = NamespaceId(format!("fence-test-{}", uuid::Uuid::new_v4()));
+    let ttl = Duration::from_millis(500);
+    let barrier = Arc::new(Barrier::new(2));
+    let outcomes = std::thread::scope(|scope| {
+        let spawn = |mut store: PgStore, holder: &'static str| {
+            let ns = ns.clone();
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                barrier.wait();
+                let token = store.acquire_writer_lease(&ns, holder, ttl).unwrap();
+                // A writer refused the lease still tries with a guess: it
+                // must be fenced, not committed.
+                let presented = token.unwrap_or(1) + u64::from(token.is_none());
+                let result = store.compare_and_swap_manifest_fenced(
+                    &ns,
+                    0,
+                    candidate(holder, 1),
+                    Some(presented),
+                );
+                (store, token, result)
+            })
+        };
+        let first = spawn(a, "a");
+        let second = spawn(b, "b");
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    let ((mut a, ta, ra), (mut b, tb, rb)) = outcomes;
+    assert_eq!(usize::from(ta.is_some()) + usize::from(tb.is_some()), 1);
+    assert_eq!(usize::from(ra.is_ok()) + usize::from(rb.is_ok()), 1);
+    let (winner, winner_token, loser, loser_holder) = if ra.is_ok() {
+        assert_eq!(ta, Some(1));
+        assert!(matches!(rb, Err(KoshaError::Fenced { .. })), "{rb:?}");
+        (&mut a, ta.unwrap(), &mut b, "b")
+    } else {
+        assert_eq!(tb, Some(1));
+        assert!(matches!(ra, Err(KoshaError::Fenced { .. })), "{ra:?}");
+        (&mut b, tb.unwrap(), &mut a, "a")
+    };
+    assert_eq!(observer.manifest_cloned(&ns).unwrap().version, 1);
+
+    // The winner stalls past its TTL; the loser takes over through the
+    // dedicated lease pool, with token + 1.
+    std::thread::sleep(ttl + Duration::from_millis(300));
+    let leases = PgWriterLeaseStore::new(&url).unwrap();
+    let taken = leases.acquire(&ns, loser_holder, ttl).unwrap().unwrap();
+    assert_eq!(taken, winner_token + 1);
+    assert!(!leases
+        .renew(&ns, "a-stale-holder", winner_token, ttl)
+        .unwrap());
+    let stale =
+        winner.compare_and_swap_manifest_fenced(&ns, 1, candidate("late", 2), Some(winner_token));
+    assert!(
+        matches!(stale, Err(KoshaError::Fenced { token, current, .. }) if token == winner_token && current == taken),
+        "{stale:?}"
+    );
+    loser
+        .compare_and_swap_manifest_fenced(&ns, 1, candidate("new", 2), Some(taken))
+        .unwrap();
+    // Unfenced CAS (old binaries, KOSHA_WRITER_LEASE=off) is unchanged.
+    winner
+        .compare_and_swap_manifest(&ns, 2, candidate("plain", 3))
+        .unwrap();
+    leases.release(&ns, loser_holder, taken).unwrap();
+}

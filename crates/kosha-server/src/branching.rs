@@ -693,6 +693,12 @@ mod tests {
         let (status, body) = call(&state, "DELETE /v1/namespaces/prod", serde_json::json!({}));
         assert_eq!(status, 409, "{body}");
         assert_eq!(search(&state, "test", ALL), before);
+        // A branch is deleted through its own route, which reclaims what
+        // only it kept alive.
+        let (status, body) = call(&state, "DELETE /v1/namespaces/test", serde_json::json!({}));
+        assert_eq!(status, 409, "{body}");
+        assert!(body.to_string().contains("/branch"), "{body}");
+        assert_eq!(search(&state, "test", ALL), before);
 
         // Once the branch is gone the parent can go, and the name is free
         // for a new branch, whose versions start above the deleted one's.
@@ -712,6 +718,109 @@ mod tests {
         );
         assert_eq!(status, 200, "{body}");
         assert_eq!(ids(&search(&state, "test", ALL)), ["d"]);
+    }
+
+    /// Local GC (#239) must not remove a segment directory or deletion
+    /// generation the parent retired while a branch still lists it: on a
+    /// node without an object store the local copy is the only one.
+    #[test]
+    fn local_gc_keeps_what_a_branch_references() {
+        let state = test_state();
+        index(&state, "prod", &[("a", "alpha"), ("b", "beta")]);
+        index(&state, "prod", &[("c", "gamma")]);
+        delete(&state, "prod", "b");
+        let (status, body) = call(
+            &state,
+            "POST /v1/namespaces/prod/branch",
+            serde_json::json!({"name": "test"}),
+        );
+        assert_eq!(status, 200, "{body}");
+        let before = search(&state, "test", ALL);
+        assert_eq!(ids(&before), ["a", "c"]);
+
+        let prod = NamespaceId("acme/prod".into());
+        let inherited: Vec<_> = state
+            .indexer
+            .manifest(&prod)
+            .unwrap()
+            .segments
+            .iter()
+            .map(|e| state.data_dir.join(&prod.0).join(&e.segment_id.0))
+            .collect();
+        compaction_pass(&state, &prod, kosha_write::CompactOptions::full(), "test").unwrap();
+        let report = state.run_local_gc(Duration::ZERO);
+        assert_eq!(report.segments_removed, 0, "{report:?}");
+        assert_eq!(report.deletion_vectors_removed, 0, "{report:?}");
+        for dir in &inherited {
+            assert!(dir.exists(), "{} removed under the branch", dir.display());
+        }
+        assert_eq!(search(&state, "test", ALL), before);
+        // The branch can still compact the inputs it inherited.
+        let test_ns = NamespaceId("acme/test".into());
+        compaction_pass(
+            &state,
+            &test_ns,
+            kosha_write::CompactOptions::full(),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(ids(&search(&state, "test", ALL)), ["a", "c"]);
+
+        // With the branch gone, the parent's retired objects are freed.
+        let (status, body) = call(
+            &state,
+            "DELETE /v1/namespaces/test/branch",
+            serde_json::json!({}),
+        );
+        assert_eq!(status, 200, "{body}");
+        state.run_local_gc(Duration::ZERO);
+        for dir in &inherited {
+            assert!(
+                !dir.exists(),
+                "{} kept after the branch went",
+                dir.display()
+            );
+        }
+        assert_eq!(ids(&search(&state, "prod", ALL)), ["a", "c"]);
+    }
+
+    /// Object-store GC's reference set must not come from a namespace
+    /// listing that can fail silently (`PgStore::list_namespaces` reads a
+    /// failed query as no namespaces): it would hold no branch, and the
+    /// parent's GC would delete what the branch still lists.
+    #[test]
+    fn gc_keeps_branch_references_when_the_namespace_listing_fails() {
+        let state = test_state();
+        let store = crate::tests::outage_store();
+        *state.controller.lock().unwrap() = Box::new(store.clone());
+        index(&state, "prod", &[("a", "alpha"), ("b", "beta")]);
+        index(&state, "prod", &[("c", "gamma")]);
+        let (status, body) = call(
+            &state,
+            "POST /v1/namespaces/prod/branch",
+            serde_json::json!({"name": "test"}),
+        );
+        assert_eq!(status, 200, "{body}");
+        let before = search(&state, "test", ALL);
+        let prod = NamespaceId("acme/prod".into());
+        compaction_pass(&state, &prod, kosha_write::CompactOptions::full(), "test").unwrap();
+
+        store
+            .list_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let config = kosha_core::gc::GcConfig {
+            dry_run: false,
+            grace_ms: 0,
+            orphan_grace_ms: 0,
+            now_ms: u64::MAX / 2,
+            referenced_elsewhere: None,
+        };
+        let reports = state.run_segment_gc(std::slice::from_ref(&prod), &config);
+        assert_eq!(reports[0].segments_deleted, 0, "{:?}", reports[0]);
+        store
+            .list_fails
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(search(&state, "test", ALL), before);
     }
 
     #[test]

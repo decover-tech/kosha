@@ -165,6 +165,11 @@ is additive on top of a working BM25 engine, not a prerequisite for it.
                                     └──────────────────────┘
 ```
 
+`KOSHA_ROLE` selects the node type (`query`, `ingest`, `indexer` for compaction, or `standalone`
+for a single pod that does everything; see `docs/configuration.md#roles`). Every writer pod holds a
+per-namespace writer lease whose fencing token each manifest CAS checks (#254), so a second writer
+started by mistake is refused instead of rebasing onto the first.
+
 All three node types (ingest, query, compaction) are stateless w.r.t. durability: local disk is
 only ever a cache or a not-yet-flushed buffer that's also mirrored to a WAL segment in S3 on a
 short interval. Any node can be killed and replaced without data loss.
@@ -281,8 +286,18 @@ that no segment indexes and no legacy segment could answer, or a query vector wh
 differs from the field's, is a 400. The writer fixes each field's dimension per namespace at the
 first vector written to it (from segment footers and the write buffer) and rejects a document that
 disagrees with a 400; a segment writer that still meets one stores it without indexing it rather
-than failing the flush. There is no namespace schema for vector fields: everything above is read
-from segment footers.
+than failing the flush. Dimensions are read from segment footers, not the namespace schema.
+
+**Native embedding (#209).** A vector field may declare `embedding: {model, dims, provider}` in
+the namespace schema. The HTTP layer embeds text values of such a field before the write reaches
+the indexer (so the WAL, doc store, replay and compaction see vectors only and never need a
+provider), and turns `knn.query_text` into `knn.vector` plus `knn.embedding_model` before the
+result-cache key and the searcher. The segment writer records the declared model in
+`vector_fields[].embedding_model` (omitted when none, so other footers are unchanged). A schema
+edit that changes a field's model or dims while a segment or the write buffer holds vectors for it
+is refused (409), and a segment whose recorded model differs from the query's contributes no kNN
+hits and counts in `knn_degraded_segments`. Providers live in `kosha-server/src/embedding.rs`:
+an OpenAI-compatible HTTP client and a deterministic mock; a local model runtime is follow-up work.
 
 **i8 posting entries (#210).** A column's `vector.idx` entries are `[id][f32 x dim]` or, at
 on-disk version 4, `[id][scale: f32][i8 x dim]`: the unit-normalized vector scaled by
@@ -490,8 +505,13 @@ calls.
   #242) calls `needs_compaction(ns)` every `KOSHA_COMPACTION_INTERVAL_MS` (default 30 s, `0`
   disables) and runs one tiered pass per due namespace, at most
   `KOSHA_COMPACTION_MAX_CONCURRENT` at a time, oldest-compacted namespace first. A failed pass
-  backs off exponentially; a pass that merged nothing waits for the manifest to change. A
-  separate compaction node role is still future work.
+  backs off exponentially; a pass that merged nothing waits for the manifest to change.
+- **Indexer role (#254).** `KOSHA_ROLE=indexer` runs the scheduler on its own pod, serving only
+  the probes and the compaction admin API. It follows the control store's manifests (no writes, no
+  WAL, no writer lease), merges, and publishes by CAS + `rebase_onto`, which keeps the ingest
+  writer's `wal_checkpoint`/`wal_origin`. The ingest pod then runs no scheduler
+  (`KOSHA_COMPACTION_ON_INGEST=false`, set in k8s base) and rebases its next flush onto the
+  compaction. An indexer that dies mid-pass leaves only an unreferenced output segment for GC.
 - Merged segments are capped at `max_merged_segment_bytes` (default 5 GiB,
   `KOSHA_COMPACT_MAX_SEGMENT_BYTES`); larger segments are never merge inputs again.
 - The `POST /v1/admin/compact-namespace` route remains the emergency lever; default body mode is
@@ -508,7 +528,8 @@ calls.
 
 **What this deliberately leaves to the compaction node role (§5)**
 
-- Running merges on separate compute so ingest/query pods never pay merge CPU/IO.
+- Autoscaled indexers that turn S3 WAL ranges into segments behind stateless API pods (the rest
+  of #254). Today one indexer only compacts.
 - Fair multi-tenant scheduling and cost controls across namespaces.
 - Off-pod segment GC. Today GC runs on the write pod (`POST /v1/admin/gc`, §11).
 
@@ -804,8 +825,12 @@ existing org/user auth context Bach already establishes.
     exactly as after a flush. Indexed copies the tail supersedes are masked like deletes, so the
     newest version wins. A tail relative to another manifest version than the query's (a flush
     published in between) is refused; the query pod refreshes its manifest and retries a few
-    times, then fails with 503 rather than miss or double-count documents. Responses report
-    `exhaustive_search_count`, the number of unindexed documents scanned.
+    times, then fails with 503 rather than miss or double-count documents. The exception is a
+    writer *ahead* of the newest stored manifest (it flushed or compacted and the publication is
+    still uploading, or failing): no reader can have its version, so the query is answered from
+    the last published manifest, as `eventual`, with `consistency_fallback` in the response
+    saying why. Responses report `exhaustive_search_count`, the number of unindexed documents
+    scanned.
   - `eventual`: indexed segments only; visibility is bounded by the flush interval (§7).
 
   The unindexed backlog per namespace is capped (`KOSHA_MAX_UNINDEXED_BYTES`, default 2 GiB;

@@ -1,6 +1,7 @@
 //! Kosha node binary.
 //!
-//! One binary, three roles (DESIGN.md §5): `ingest`, `query`, `compaction`.
+//! One binary, four roles (`KOSHA_ROLE`, see `role.rs` and DESIGN.md §5):
+//! `query`, `ingest`, `indexer` and `standalone`.
 //! Phase 1 HTTP/JSON API:
 //!   - `GET  /healthz`           → 200 OK (liveness probe)
 //!   - `GET  /metrics`           → Prometheus text format (docs/metrics.md)
@@ -29,6 +30,9 @@ mod compaction_sched;
 mod doc_spans;
 #[cfg(all(test, feature = "s3"))]
 mod doc_store_fallback_tests;
+mod embedding;
+#[cfg(test)]
+mod embedding_server_tests;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 mod manifest_follow;
@@ -37,6 +41,7 @@ mod metrics;
 mod migrate;
 mod posting_spans;
 mod rerank;
+mod role;
 #[cfg(feature = "s3")]
 mod s3_storage;
 #[cfg(feature = "s3")]
@@ -47,6 +52,9 @@ mod segment_gc;
 mod unindexed;
 mod warm;
 mod warm_run;
+mod writer_lease;
+#[cfg(test)]
+mod writer_lease_tests;
 
 #[cfg(feature = "s3")]
 use hydration_budget::{HydrationBudget, RequestHydration};
@@ -66,6 +74,15 @@ use kosha_write::Indexer;
 
 struct AppState {
     controller: Mutex<Box<dyn ControlStore>>,
+    /// `KOSHA_ROLE`, resolved and validated (#254, `role.rs`).
+    role: role::Role,
+    /// Writer leases this process holds and namespaces it was fenced from
+    /// (#254). Disabled on query and indexer pods and with
+    /// `KOSHA_WRITER_LEASE=off`.
+    writer_leases: writer_lease::WriterLeases,
+    /// `KOSHA_COMPACTION_ON_INGEST` (#254): whether a writer pod also runs
+    /// the compaction scheduler.
+    compaction_on_ingest: bool,
     admin_auth_key: Option<String>,
     internal_service_key: Option<String>,
     publication_locks: Mutex<HashMap<NamespaceId, Arc<Mutex<()>>>>,
@@ -282,6 +299,9 @@ struct AppState {
     /// Rerank providers (`SearchQuery.rerank`) and their metrics; see
     /// [`rerank`].
     rerankers: rerank::RerankRegistry,
+    /// Native embedding providers (#209): embed text sent for a vector
+    /// field whose schema declares a model, and `knn.query_text`.
+    embedders: embedding::EmbedderRegistry,
     /// Posting-blob presence cache (Tier 1 O3), the sibling optimization to
     /// `completed_hydrations` above: that verdict can never cover posting
     /// blobs (PR #89 — they're fetched per query term, not per segment), so
@@ -738,8 +758,9 @@ impl HydrationVerdict {
 /// sidecar where one exists — a legacy segment's only for the clustered
 /// format: a clustered column without it is served by exact scan of every
 /// vector (seconds on a large segment). A legacy segment that stores its
-/// vectors in `doc_vectors.bin` also needs that file, whose field table
-/// binds its unnamed index.
+/// vectors in `doc_vectors.bin` also needs that file's header, whose field
+/// table binds its unnamed index — the whole file or just the header span
+/// in the span cache.
 #[cfg(feature = "s3")]
 fn knn_files_complete(
     seg_path: &Path,
@@ -766,8 +787,7 @@ fn knn_files_complete(
             return false;
         }
     }
-    !kosha_segment::knn_needs_doc_vectors(footer)
-        || file_present_nonempty(&seg_path.join(kosha_segment::DOC_VECTORS_FILE))
+    !kosha_segment::knn_needs_doc_vectors(footer) || doc_spans::doc_vectors_header_local(seg_path)
 }
 
 /// The vector key a query's [`HydrationVerdict`] records and checks: its
@@ -968,12 +988,30 @@ fn rebase_backoff(attempt: u32) -> Duration {
 /// writer caused (and a rebase could not resolve) is a 409 the client can
 /// retry; anything else is a server error.
 fn publication_error(context: &str, error: &KoshaError) -> String {
-    let status = if matches!(error, KoshaError::ManifestConflict { .. }) {
-        409
-    } else {
-        500
+    let status = match error {
+        KoshaError::ManifestConflict { .. } => 409,
+        // Another writer owns the namespace (#254): retry, by when its
+        // lease would have lapsed, against whichever pod owns it now.
+        KoshaError::Fenced { .. } => {
+            let ttl =
+                writer_lease::ttl_from(std::env::var("KOSHA_WRITER_LEASE_TTL_MS").ok().as_deref());
+            return retry_after(
+                json_error(503, &format!("{context}: {error}")),
+                ttl.as_secs().max(1),
+            );
+        }
+        _ => 500,
     };
     json_error(status, &format!("{context}: {error}"))
+}
+
+/// Add a `Retry-After` header to a ready-made response.
+fn retry_after(response: String, secs: u64) -> String {
+    response.replacen(
+        "\r\nconnection: close\r\n",
+        &format!("\r\nretry-after: {secs}\r\nconnection: close\r\n"),
+        1,
+    )
 }
 
 /// Upload a segment directory to S3 and commit it: every data file first,
@@ -1039,6 +1077,13 @@ struct StateOptions {
     wal_store: Option<Arc<dyn kosha_write::wal::WalStore>>,
     /// Control store instead of `DATABASE_URL`.
     control_store: Option<Box<dyn ControlStore>>,
+    /// Role instead of `KOSHA_ROLE`.
+    role: Option<role::Role>,
+    /// Writer lease TTL instead of `KOSHA_WRITER_LEASE_TTL_MS`.
+    writer_lease_ttl: Option<Duration>,
+    /// Writer leases on or off instead of `KOSHA_WRITER_LEASE` (still off
+    /// on a role that accepts no writes).
+    writer_lease: Option<bool>,
 }
 
 fn fatal(message: &str) -> ! {
@@ -1052,6 +1097,7 @@ fn fatal(message: &str) -> ! {
 /// acknowledged write survives losing the node. Only a node that accepts
 /// writes uses it: a query pod forwards writes to ingest.
 fn wal_store_from_env(
+    role: role::Role,
     #[cfg(feature = "s3")] s3: Option<&s3_storage::S3Storage>,
 ) -> Option<Arc<dyn kosha_write::wal::WalStore>> {
     let mode = std::env::var("KOSHA_WAL_MODE")
@@ -1066,8 +1112,15 @@ fn wal_store_from_env(
             None
         }
         "s3" => {
-            if std::env::var("KOSHA_INGEST_HOST").is_ok_and(|h| !h.is_empty()) {
+            if role == role::Role::Query {
                 println!("WAL: writes are forwarded to ingest; KOSHA_WAL_MODE=s3 applies there");
+                return None;
+            }
+            // An indexer accepts no writes. Opening the S3 WAL would recover
+            // (and could flush) the ingest writer's records if both shared
+            // a KOSHA_WAL_WRITER_ID, so it keeps an empty local WAL.
+            if role == role::Role::Indexer {
+                println!("WAL: indexer role accepts no writes; KOSHA_WAL_MODE=s3 ignored");
                 return None;
             }
             #[cfg(feature = "s3")]
@@ -1115,6 +1168,11 @@ impl AppState {
     }
 
     fn with_options(data_dir: PathBuf, options: StateOptions) -> Self {
+        let role = options.role.unwrap_or_else(|| {
+            role::resolve_role(&role::RoleEnv::from_process())
+                .unwrap_or_else(|e| fatal(&e))
+                .role
+        });
         std::fs::create_dir_all(&data_dir).ok();
         // Before the disk cache scans `data_dir`: transient tail segments of
         // an earlier process are never reused (#255).
@@ -1220,6 +1278,7 @@ impl AppState {
 
         let wal_store = options.wal_store.or_else(|| {
             wal_store_from_env(
+                role,
                 #[cfg(feature = "s3")]
                 s3_storage.as_ref(),
             )
@@ -1363,10 +1422,7 @@ impl AppState {
         // would work directly against the "gate readiness on actual
         // warmth" goal.
         #[cfg(feature = "s3")]
-        let is_ingest_role = std::env::var("KOSHA_INGEST_HOST")
-            .ok()
-            .filter(|h| !h.is_empty())
-            .is_none();
+        let is_ingest_role = role.accepts_writes();
         #[cfg(feature = "s3")]
         let mut synced_segments = std::collections::HashSet::new();
         let mut restored = 0usize;
@@ -1387,6 +1443,16 @@ impl AppState {
                     // ground-truth S3 check here rather than waiting for
                     // this namespace's *next* flush to notice — which, for
                     // an otherwise-idle namespace, might be never.
+                    // An indexer publishes compactions over manifests the
+                    // ingest writer committed: their segments are durable
+                    // by the publish protocol, and reconciling them is the
+                    // ingest pod's job.
+                    #[cfg(feature = "s3")]
+                    if role == role::Role::Indexer {
+                        for entry in &manifest.segments {
+                            synced_segments.insert(synced_key(&manifest, &ns, &entry.segment_id));
+                        }
+                    }
                     #[cfg(feature = "s3")]
                     if is_ingest_role {
                         if let Some(ref s3) = s3_storage {
@@ -1449,10 +1515,45 @@ impl AppState {
             );
         }
 
+        // The forwarding target. `resolve_role` guarantees it is set
+        // exactly when the role is `query`.
         let ingest_host = std::env::var("KOSHA_INGEST_HOST")
             .ok()
-            .filter(|h| !h.is_empty());
-        let query_role = ingest_host.is_some();
+            .filter(|h| !h.is_empty() && role == role::Role::Query);
+        let query_role = role == role::Role::Query;
+
+        // ── Writer lease (#254) ───────────────────────────────────────────
+        let lease_ttl = options.writer_lease_ttl.unwrap_or_else(|| {
+            writer_lease::ttl_from(std::env::var("KOSHA_WRITER_LEASE_TTL_MS").ok().as_deref())
+        });
+        let lease_enabled = role.accepts_writes()
+            && options.writer_lease.unwrap_or_else(|| {
+                writer_lease::enabled_from(std::env::var("KOSHA_WRITER_LEASE").ok().as_deref())
+            });
+        #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+        let mut lease_backend = writer_lease::LeaseBackend::ControlStore;
+        #[cfg(feature = "postgres")]
+        if lease_enabled && control_plane_kind == "postgres" {
+            if let Ok(db_url) = std::env::var("DATABASE_URL") {
+                match kosha_control::PgWriterLeaseStore::new(&db_url) {
+                    Ok(store) => lease_backend = writer_lease::LeaseBackend::Postgres(store),
+                    Err(e) => fatal(&format!("cannot connect the writer lease pool: {e}")),
+                }
+            }
+        }
+        let writer_leases =
+            writer_lease::WriterLeases::new(lease_enabled, lease_ttl, lease_backend);
+        if lease_enabled {
+            println!(
+                "writer lease: on (holder {}, ttl {} ms)",
+                writer_leases.holder(),
+                lease_ttl.as_millis()
+            );
+        } else if role.accepts_writes() {
+            println!("writer lease: off (KOSHA_WRITER_LEASE=off); manifest CAS is unfenced");
+        }
+        let compaction_on_ingest =
+            role::compaction_on_ingest(std::env::var("KOSHA_COMPACTION_ON_INGEST").ok().as_deref());
         let write_http_client = ingest_host.as_ref().map(|h| {
             println!("write-path requests will be forwarded to ingest at {h}");
             reqwest::blocking::Client::builder()
@@ -1590,6 +1691,9 @@ impl AppState {
 
         Self {
             controller: Mutex::new(control_store),
+            role,
+            writer_leases,
+            compaction_on_ingest,
             admin_auth_key: std::env::var("KOSHA_ADMIN_API_KEY")
                 .ok()
                 .filter(|k| !k.is_empty()),
@@ -1713,6 +1817,7 @@ impl AppState {
             completed_hydrations: Mutex::new(HashMap::new()),
             result_cache: Mutex::new(ResultCache::new(result_cache_budget())),
             rerankers: rerank::RerankRegistry::from_env(),
+            embedders: embedding::EmbedderRegistry::from_env(),
             posting_blob_presence: Mutex::new(HashMap::new()),
             // Warmup starts ready; `spawn_warmup` flips `false` only when
             // there's configured work to do (and back to `true` on
@@ -1736,9 +1841,25 @@ impl AppState {
 
     /// Construct inside an `Arc` with `self_ref` wired up — the constructor
     /// `main` uses so handlers can spawn background jobs that own the state.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new_shared(data_dir: PathBuf) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
             let mut state = Self::new(data_dir);
+            state.self_ref = weak.clone();
+            state
+        })
+    }
+
+    /// [`Self::new_shared`] with the role `main` already resolved.
+    fn new_shared_as(data_dir: PathBuf, role: role::Role) -> Arc<Self> {
+        Arc::new_cyclic(|weak| {
+            let mut state = Self::with_options(
+                data_dir,
+                StateOptions {
+                    role: Some(role),
+                    ..Default::default()
+                },
+            );
             state.self_ref = weak.clone();
             state
         })
@@ -1805,10 +1926,7 @@ impl AppState {
     /// buffers, so they never start it. An explicit `/flush` stays an
     /// immediate visibility barrier.
     fn spawn_idle_flush_timer(self: &Arc<Self>) {
-        let forwards_writes = std::env::var("KOSHA_INGEST_HOST")
-            .ok()
-            .is_some_and(|h| !h.is_empty());
-        if forwards_writes {
+        if !self.role.accepts_writes() {
             return;
         }
         let Some(max_age) = flush_max_age_from_env() else {
@@ -1836,12 +1954,17 @@ impl AppState {
     /// cuts a segment per interval for slowly written namespaces; this is
     /// what keeps their segment count bounded without anyone calling
     /// `/v1/admin/compact-namespace`. Selection, fairness and backoff are in
-    /// `compaction_sched`. Query-role pods own no segments and never start it.
+    /// `compaction_sched`. Runs on `indexer` and `standalone` pods, and on
+    /// `ingest` unless `KOSHA_COMPACTION_ON_INGEST=false` (#254); query
+    /// pods own no segments and never start it.
     fn spawn_compaction_scheduler(self: &Arc<Self>) {
-        let forwards_writes = std::env::var("KOSHA_INGEST_HOST")
-            .ok()
-            .is_some_and(|h| !h.is_empty());
-        if forwards_writes {
+        if !self.runs_compaction_scheduler() {
+            if self.role == role::Role::Ingest {
+                println!(
+                    "compaction scheduler: off on ingest (KOSHA_COMPACTION_ON_INGEST=false); \
+                     an indexer pod compacts"
+                );
+            }
             return;
         }
         let Some(interval) = self.compaction.config().interval else {
@@ -1861,6 +1984,171 @@ impl AppState {
                 run_compaction_scheduler_tick(&state, Instant::now());
             })
             .expect("failed to spawn compaction scheduler thread");
+    }
+
+    /// Whether this pod runs the background compaction scheduler (#254).
+    fn runs_compaction_scheduler(&self) -> bool {
+        self.role
+            .runs_compaction_scheduler(self.compaction_on_ingest)
+    }
+
+    /// Renew this writer's leases every TTL/3 (#254). A lease another
+    /// writer took over fences its namespace (see [`Self::fence_namespace`]).
+    fn spawn_writer_lease_renewer(self: &Arc<Self>) {
+        if !self.writer_leases.enabled() {
+            return;
+        }
+        let every = (self.writer_leases.ttl() / 3).max(Duration::from_millis(100));
+        let weak = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("kosha-writer-lease".into())
+            .spawn(move || loop {
+                std::thread::sleep(every);
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                state.renew_writer_leases();
+            })
+            .expect("failed to spawn writer lease thread");
+    }
+
+    /// One renewal pass over every held writer lease.
+    fn renew_writer_leases(&self) {
+        for ns in self.writer_leases.renew_all(&self.controller) {
+            let lock = self.publication_lock(&ns);
+            let _guard = lock.lock().unwrap();
+            self.fence_namespace(&ns, "its writer lease was taken over");
+        }
+    }
+
+    /// The fencing token this writer presents for `ns` (#254), taking the
+    /// lease if it holds none. `Ok(None)` when leases are off. A refused
+    /// acquire of a lease this writer held before means another writer
+    /// took it over: the namespace is fenced.
+    fn writer_token(&self, ns: &NamespaceId) -> Result<Option<u64>, KoshaError> {
+        let held_before = self.writer_leases.held_before(ns);
+        match self.writer_leases.token(ns, &self.controller) {
+            Err(fenced @ KoshaError::Fenced { .. }) => {
+                if held_before {
+                    let lock = self.publication_lock(ns);
+                    let _guard = lock.lock().unwrap();
+                    self.fence_namespace(ns, "another writer took its lease over");
+                }
+                Err(fenced)
+            }
+            other => other,
+        }
+    }
+
+    /// Refuse a write to `ns` this writer does not own (#254): `Err` is a
+    /// ready-to-send 503 + `Retry-After`. Takes the lease when it is free,
+    /// so the first write to a namespace claims it.
+    fn ensure_writable(&self, ns: &NamespaceId) -> Result<(), String> {
+        match self.writer_token(ns) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.write_refusal(&error)),
+        }
+    }
+
+    /// 503 + `Retry-After` for a write this writer may not make.
+    fn write_refusal(&self, error: &KoshaError) -> String {
+        retry_after(
+            json_error(503, &format!("write refused: {error}")),
+            self.writer_leases.retry_after_secs(),
+        )
+    }
+
+    /// Another writer owns `ns` (#254). Stop accepting writes for it and
+    /// drop this writer's unpublished local state the way a query replica
+    /// installs a manifest: forget the namespace, then restore the
+    /// committed one. Writes this writer acknowledged but never published
+    /// stay in its WAL (they are not replayed while the namespace's WAL
+    /// checkpoint belongs to the other writer). The caller holds `ns`'s
+    /// publication lock.
+    fn fence_namespace(&self, ns: &NamespaceId, why: &str) {
+        if self.writer_leases.lost(ns) {
+            self.metrics.record_writer_fenced();
+            eprintln!(
+                "WARN: writer lease: ns={} fenced ({why}); refusing writes for it and dropping \
+                 unpublished local state",
+                ns.0
+            );
+        }
+        self.indexer.forget_namespace(ns);
+        self.forget_namespace_caches(ns);
+        match self.hydrated_remote_manifest(ns) {
+            Ok(Some(remote)) => {
+                #[cfg(feature = "s3")]
+                {
+                    let mut synced = self.synced_segments.lock().unwrap();
+                    for entry in &remote.segments {
+                        synced.insert(synced_key(&remote, ns, &entry.segment_id));
+                    }
+                }
+                self.indexer.restore_manifest(ns.clone(), remote);
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "WARN: writer lease: cannot reload ns={} after fencing: {error}; it reloads on \
+                 the next successful write",
+                ns.0
+            ),
+        }
+    }
+
+    /// Indexer role (#254): bring `ns` up to the committed manifest before
+    /// planning a compaction. A namespace with nothing unpublished here
+    /// installs the committed version the way a query replica does; one
+    /// with an unpublished compaction keeps it, and its publish rebases.
+    fn indexer_follow_namespace(&self, ns: &NamespaceId) -> Result<(), KoshaError> {
+        let lock = self.publication_lock(ns);
+        let _guard = lock.lock().unwrap();
+        let clean = self
+            .indexer
+            .publication_snapshot(ns)
+            .is_none_or(|(published, local)| published == local.version);
+        let local = self.indexer.manifest_version(ns);
+        let Some(remote) = self.hydrated_remote_manifest(ns)? else {
+            if local.is_some() && clean {
+                self.indexer.forget_namespace(ns);
+                self.forget_namespace_caches(ns);
+            }
+            return Ok(());
+        };
+        if !clean || local.is_some_and(|v| v >= remote.version) {
+            return Ok(());
+        }
+        #[cfg(feature = "s3")]
+        {
+            let mut synced = self.synced_segments.lock().unwrap();
+            for entry in &remote.segments {
+                synced.insert(synced_key(&remote, ns, &entry.segment_id));
+            }
+        }
+        self.indexer.restore_manifest(ns.clone(), remote);
+        Ok(())
+    }
+
+    /// Indexer role: learn every namespace the control store lists (and
+    /// newer versions of the known ones), skipping namespaces a pass is
+    /// compacting right now. Runs before each scheduler tick.
+    fn indexer_follow_all(&self) {
+        let versions = match self.controller.lock().unwrap().manifest_versions() {
+            Ok(versions) => versions,
+            Err(error) => {
+                eprintln!("WARN: indexer: control store version poll failed: {error}");
+                return;
+            }
+        };
+        let running = self.compaction.running_namespaces();
+        for (ns, stored) in versions {
+            if running.contains(&ns) || self.indexer.manifest_version(&ns) == Some(stored) {
+                continue;
+            }
+            if let Err(error) = self.indexer_follow_namespace(&ns) {
+                eprintln!("WARN: indexer: cannot follow ns={}: {error}", ns.0);
+            }
+        }
     }
 
     /// Start local segment reclamation (#239) on every pod. Every
@@ -1895,9 +2183,32 @@ impl AppState {
     /// `eviction_generation` (which invalidates posting-blob presence
     /// verdicts) stay right.
     fn run_local_gc(&self, grace: Duration) -> kosha_write::LocalReclaimReport {
-        let report = self.indexer.reclaim_local(
+        if self.indexer.local_retired_count() == 0 {
+            return kosha_write::LocalReclaimReport::default();
+        }
+        // Objects a branch still reads through its ancestor's prefix stay
+        // (#208). Without every manifest there is no telling which, so the
+        // pass is skipped rather than guessing.
+        let branches = match self.branch_references() {
+            Ok(refs) => refs,
+            Err(e) => {
+                eprintln!("WARN: local GC skipped: {e}");
+                return kosha_write::LocalReclaimReport {
+                    pending: self.indexer.local_retired_count(),
+                    ..Default::default()
+                };
+            }
+        };
+        let report = self.indexer.reclaim_local_shared(
             grace,
-            |ns, seg| self.searcher.release_segment(&ns.0, &seg.0),
+            |ns, seg| {
+                // A shard's segment (#207) is also cached under the root
+                // namespace, by its merged-view id: release both.
+                let merged = merged_view_alias(ns, seg)
+                    .is_some_and(|(root, id)| self.searcher.release_segment(&root.0, &id.0));
+                self.searcher.release_segment(&ns.0, &seg.0) | merged
+            },
+            |rel| branches.holds_segment_dir(rel) || branches.holds_file(rel),
             |rel| self.cache.evict(rel),
         );
         self.gc_stats.record_local(&report);
@@ -1912,6 +2223,56 @@ impl AppState {
             );
         }
         report
+    }
+
+    /// Every namespace and every manifest, for GC's reference sets (#208):
+    /// a branch lists segments (and deletion bitmaps) under its parent's
+    /// prefix, which the parent's GC must keep however long ago the parent
+    /// itself dropped them. Fallible on purpose: a reference set that
+    /// silently missed a manifest would reclaim live objects, so the
+    /// namespace list comes from the fallible `manifest_versions` (a
+    /// failed `list_namespaces` reads as empty), and any unreadable
+    /// manifest fails the whole call. Call with `branch_lock` held.
+    fn every_manifest(&self) -> Result<(Vec<NamespaceId>, NamespaceManifests), String> {
+        let mut all = self
+            .controller
+            .lock()
+            .unwrap()
+            .manifest_versions()
+            .map_err(|e| format!("cannot list manifests: {e}"))?
+            .into_iter()
+            .map(|(ns, _)| ns)
+            .collect::<Vec<_>>();
+        for ns in self.controller.lock().unwrap().list_namespaces() {
+            if !all.contains(&ns) {
+                all.push(ns);
+            }
+        }
+        let mut manifests = Vec::new();
+        for ns in &all {
+            match self.controller.lock().unwrap().try_manifest_cloned(ns) {
+                Ok(Some(manifest)) => manifests.push((ns.clone(), manifest)),
+                Ok(None) => {}
+                Err(e) => return Err(format!("{}: {e}", ns.0)),
+            }
+        }
+        Ok((all, manifests))
+    }
+
+    /// What every branch manifest references (#208), for local GC: a
+    /// copy-on-write branch reads segments and deletion bitmaps under its
+    /// ancestors' prefixes, so an ancestor dropping them from its own
+    /// manifest does not free their local files.
+    fn branch_references(&self) -> Result<kosha_core::branch::References, String> {
+        let _lineage = self.branch_lock.lock().unwrap();
+        let (_, manifests) = self.every_manifest()?;
+        kosha_core::branch::References::collect(
+            manifests
+                .iter()
+                .filter(|(_, manifest)| manifest.branch.is_some())
+                .map(|(ns, manifest)| (ns, manifest)),
+        )
+        .map_err(|e| format!("cannot resolve branch references: {e}"))
     }
 
     /// The object store segment GC sweeps: S3 when configured, otherwise
@@ -1934,35 +2295,24 @@ impl AppState {
         // No branch is created or deleted while GC decides what is still
         // referenced (#208).
         let _lineage = self.branch_lock.lock().unwrap();
-        let all = self.controller.lock().unwrap().list_namespaces();
         let mut reports = Vec::new();
-        // Every manifest, read up front: a branch lists segments (and
-        // deletion bitmaps) under its parent's prefix, which the parent's
-        // GC must keep however long ago the parent itself dropped them.
-        // Fallible on purpose: a reference set that silently missed a
-        // manifest would reclaim live objects.
-        let mut manifests: Vec<(NamespaceId, kosha_core::Manifest)> = Vec::new();
-        for ns in &all {
-            match self.controller.lock().unwrap().try_manifest_cloned(ns) {
-                Ok(Some(manifest)) => manifests.push((ns.clone(), manifest)),
-                Ok(None) => {}
-                Err(e) => {
-                    return namespaces
-                        .iter()
-                        .map(|ns| kosha_core::gc::NamespaceGcReport {
-                            namespace: ns.0.clone(),
-                            dry_run: config.dry_run,
-                            aborted: Some(format!(
-                                "GC skipped: cannot read every manifest to find shared \
-                                 segments ({}: {e})",
-                                ns.0
-                            )),
-                            ..Default::default()
-                        })
-                        .collect();
-                }
+        let (all, manifests) = match self.every_manifest() {
+            Ok(found) => found,
+            Err(e) => {
+                return namespaces
+                    .iter()
+                    .map(|ns| kosha_core::gc::NamespaceGcReport {
+                        namespace: ns.0.clone(),
+                        dry_run: config.dry_run,
+                        aborted: Some(format!(
+                            "GC skipped: cannot read every manifest to find shared segments \
+                             ({e})"
+                        )),
+                        ..Default::default()
+                    })
+                    .collect();
             }
-        }
+        };
         for ns in namespaces {
             let others: Vec<NamespaceId> = all.iter().filter(|n| *n != ns).cloned().collect();
             let referenced = kosha_core::branch::References::collect(
@@ -2244,7 +2594,10 @@ impl AppState {
     /// advanced (`follow_stored_version`). The ingest pod never starts it.
     /// The thread holds only a `Weak` and exits when the state is dropped.
     fn spawn_manifest_refresher(self: &Arc<Self>) {
-        if self.ingest_host.is_none() {
+        // DELIBERATELY BROKEN (#256 acceptance): no refresher, so a query
+        // pod never sees versions published after it loaded a namespace.
+        // Reverted in the next commit.
+        if self.ingest_host.is_none() || std::env::var("KOSHA_ROLE").is_ok() {
             return;
         }
         let Some(interval) = self.manifest_follow.interval else {
@@ -2498,6 +2851,10 @@ impl AppState {
     /// [`MANIFEST_REBASE_ATTEMPTS`] times with a short jittered pause. A
     /// conflict the rebase cannot resolve (see `rebase_onto`) is returned
     /// as `ManifestConflict`, which the HTTP layer maps to 409.
+    ///
+    /// A writer pod presents its writer-lease token on the CAS (#254). A
+    /// `Fenced` rejection is never rebased: the namespace is fenced
+    /// ([`Self::fence_namespace`]) and the error returned (HTTP 503).
     fn publish_namespace_with(
         &self,
         ns: &NamespaceId,
@@ -2511,12 +2868,25 @@ impl AppState {
                 return Ok(());
             };
             let started = Instant::now();
+            // Before the upload: a writer that cannot own the namespace
+            // uploads nothing.
+            let held_before = self.writer_leases.held_before(ns);
+            let token = match self.writer_leases.token(ns, &self.controller) {
+                Ok(token) => token,
+                Err(fenced @ KoshaError::Fenced { .. }) => {
+                    if held_before {
+                        self.fence_namespace(ns, "another writer took its lease over");
+                    }
+                    return Err(fenced);
+                }
+                Err(error) => return Err(error),
+            };
             upload(&manifest)?;
-            let committed = self.controller.lock().unwrap().compare_and_swap_manifest(
-                ns,
-                expected_version,
-                manifest.clone(),
-            );
+            let committed = self
+                .controller
+                .lock()
+                .unwrap()
+                .compare_and_swap_manifest_fenced(ns, expected_version, manifest.clone(), token);
             match committed {
                 Ok(()) => {
                     self.indexer.acknowledge_manifest(ns, &manifest)?;
@@ -2558,6 +2928,10 @@ impl AppState {
                     if rebases > 1 {
                         std::thread::sleep(rebase_backoff(rebases));
                     }
+                }
+                Err(fenced @ KoshaError::Fenced { .. }) => {
+                    self.fence_namespace(ns, "a manifest commit was fenced");
+                    return Err(fenced);
                 }
                 Err(e) => return Err(e),
             }
@@ -3765,6 +4139,9 @@ impl AppState {
             // from S3 or that the reader would reject falls back to
             // `doc_store.bin` (#179, #184).
             let mut lazy_segments: Vec<&PathBuf> = Vec::new();
+            // Legacy segments whose `doc_vectors.bin` header a kNN needs,
+            // with their object prefix: fetched by range after this round.
+            let mut doc_vector_headers: Vec<(&Path, String)> = Vec::new();
             for (seg_path, _) in &owned {
                 let Ok(rel_path) = seg_path.strip_prefix(&self.data_dir) else {
                     continue;
@@ -3855,13 +4232,13 @@ impl AppState {
                             }
                         }
                     }
+                    // Only the header of a legacy `doc_vectors.bin` (its
+                    // field table binds the unnamed index), by range below:
+                    // the whole file is as large as the index itself.
                     if kosha_segment::knn_needs_doc_vectors(footer)
-                        && !file_present_nonempty(&seg_path.join(kosha_segment::DOC_VECTORS_FILE))
+                        && !doc_spans::doc_vectors_header_local(seg_path)
                     {
-                        logical_paths.push((
-                            format!("{s3_prefix}/{}", kosha_segment::DOC_VECTORS_FILE),
-                            0,
-                        ));
+                        doc_vector_headers.push((seg_path.as_path(), s3_prefix.clone()));
                     }
                 }
             }
@@ -3888,6 +4265,30 @@ impl AppState {
                     if let Ok(m) = std::fs::metadata(self.data_dir.join(path)) {
                         outcome.files_fetched += 1;
                         outcome.bytes_fetched += m.len();
+                    }
+                }
+            }
+
+            // Legacy `doc_vectors.bin` headers, by range into the span
+            // cache (the reader binds the unnamed index from that span).
+            if !doc_vector_headers.is_empty() && !request.is_shed() {
+                let fetcher = doc_spans::S3RangeFetcher {
+                    s3,
+                    concurrency: self.scoring_hydrate_concurrency,
+                    budget: &self.hydration_budget,
+                    request,
+                };
+                let targets: Vec<(&Path, &str)> = doc_vector_headers
+                    .iter()
+                    .map(|(dir, rel)| (*dir, rel.as_str()))
+                    .collect();
+                let fetched = doc_spans::fetch_doc_vectors_headers(&targets, &fetcher, &self.cache);
+                outcome.rounds += fetched.rounds;
+                outcome.shed |= fetched.shed;
+                for seg in &fetched.segments {
+                    outcome.bytes_fetched += seg.bytes;
+                    if seg.status == doc_spans::HeaderStatus::Cached {
+                        outcome.files_fetched += 1;
                     }
                 }
             }
@@ -4716,6 +5117,24 @@ fn doc_store_fallback_reason(
     None
 }
 
+/// Namespaces with their manifests (see `AppState::every_manifest`).
+type NamespaceManifests = Vec<(NamespaceId, kosha_core::Manifest)>;
+
+/// For a shard namespace's segment (#207): the root namespace and the
+/// merged-view id a search of the sharded root caches its reader under.
+/// `None` for an ordinary namespace.
+pub(crate) fn merged_view_alias(
+    ns: &NamespaceId,
+    segment: &kosha_core::SegmentId,
+) -> Option<(NamespaceId, kosha_core::SegmentId)> {
+    let index = kosha_core::sharding::shard_index_of(ns)?;
+    let (root, _) = ns.0.rsplit_once('/')?;
+    Some((
+        NamespaceId(root.to_string()),
+        kosha_core::sharding::merged_segment_id(index, segment),
+    ))
+}
+
 /// Redact the password portion of a Postgres URL for logs.
 /// Whether a segment artifact is present *and usable* on local disk. Bare
 /// existence is not enough for hydration decisions: interrupted non-atomic
@@ -4958,7 +5377,17 @@ fn main() {
     // pod exits instead of serving unauthenticated traffic.
     auth::init_global();
 
-    let role = std::env::var("KOSHA_ROLE").unwrap_or_else(|_| "query".into());
+    // Before anything else reads the environment: a pod whose KOSHA_ROLE
+    // contradicts the rest of its configuration exits here (#254).
+    let role = match role::resolve_role(&role::RoleEnv::from_process()) {
+        Ok(resolved) => {
+            if let Some(warning) = resolved.warning {
+                eprintln!("WARN: {warning}");
+            }
+            resolved.role
+        }
+        Err(message) => fatal(&message),
+    };
     let port = std::env::var("KOSHA_HTTP_PORT").unwrap_or_else(|_| "8080".into());
     let data_dir = std::env::var("KOSHA_DATA_DIR").unwrap_or_else(|_| "/var/lib/kosha/data".into());
     // `set_read_timeout`/`set_write_timeout` (see `serve`) are per-syscall,
@@ -4985,7 +5414,7 @@ fn main() {
         .unwrap_or(300);
     let addr = format!("0.0.0.0:{port}");
 
-    let state = AppState::new_shared(PathBuf::from(data_dir.clone()));
+    let state = AppState::new_shared_as(PathBuf::from(data_dir.clone()), role);
     // Bind the listener first so a slow warmup doesn't delay the port;
     // `/readyz` keeps HPA/kube endpoints from sending traffic while it
     // runs (Tier 1 O2). Liveness (`/healthz`) is unaffected.
@@ -4996,6 +5425,7 @@ fn main() {
     state.spawn_posting_promoter();
     state.spawn_idle_flush_timer();
     state.spawn_compaction_scheduler();
+    state.spawn_writer_lease_renewer();
     state.spawn_manifest_refresher();
     state.spawn_local_gc();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
@@ -5127,7 +5557,8 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
 
     // `/metrics` (#223): Prometheus scrapes, unauthenticated by default like
     // the probes above. Never forwarded to the ingest pod (see
-    // `is_write_path`): each pod reports its own process.
+    // `is_write_path`) and answered ahead of the indexer's route gate
+    // (#254): each pod, whatever its role, reports its own process.
     if request_line.starts_with("GET /metrics ") || request_line.starts_with("GET /metrics?") {
         let resp = handle_metrics(state, &headers);
         stream.write_all(resp.as_bytes()).ok();
@@ -5155,6 +5586,16 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         &state.write_http_client,
     ) {
         (Err(resp), _, _) => resp.clone(),
+        // An indexer (#254) serves only the compaction admin API.
+        (Ok(_), _, _)
+            if state.role == role::Role::Indexer && !role::Role::indexer_serves(&request_line) =>
+        {
+            json_error(
+                404,
+                "not served by an indexer pod (KOSHA_ROLE=indexer): it serves only \
+                 /v1/admin/compact* and /v1/admin/compaction-*",
+            )
+        }
         (Ok(_), Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
             forward_to_ingest(client, ingest_host, &request_line, &headers, &body)
         }
@@ -6118,6 +6559,22 @@ fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String
         }
         Err(e) => return json_error(503, &format!("control store: {e}")),
     }
+    // A branch goes through DELETE .../branch, which also reclaims the
+    // prefixes of deleted ancestor branches only it kept alive; deleting
+    // it here would leak those for good.
+    match state.controller.lock().unwrap().try_manifest_cloned(&id) {
+        Ok(Some(manifest)) if manifest.branch.is_some() => {
+            return json_error(
+                409,
+                &format!(
+                    "namespace '{name}' is a branch; delete it with \
+                     DELETE /v1/namespaces/{name}/branch"
+                ),
+            )
+        }
+        Ok(_) => {}
+        Err(e) => return json_error(503, &format!("control store: {e}")),
+    }
     let lock = state.publication_lock(&id);
     let _guard = lock.lock().unwrap();
     let local_version = state.indexer.manifest_version(&id);
@@ -6271,7 +6728,11 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     }
 
     let ns = request.namespace;
-    match write_routed(state, &ns, request.documents, index_into) {
+    let mut documents = request.documents;
+    if let Err(response) = embed_documents(state, &ns, &mut documents) {
+        return response;
+    }
+    match write_routed(state, &ns, documents, index_into) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
             json_ok(&IndexResponse {
@@ -6281,6 +6742,129 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
         }
         Err(response) => response,
     }
+}
+
+/// Native embedding at ingest (#209). For each field the namespace schema
+/// declares an `embedding` for, a value that is text (not a JSON number
+/// array) is embedded with the declared model and replaced by the vector,
+/// typed `Vector`. Runs before the write reaches the indexer, so the WAL,
+/// the doc store, replay and compaction only ever see vectors and never
+/// need an embedder. A supplied number array must have the declared
+/// dimension. One provider call per field per request (the provider
+/// batches further).
+///
+/// A namespace whose schema declares no model returns at once: the cost is
+/// the lookup [`kosha_write::Indexer::embedded_fields`] documents.
+/// `Err` carries a ready-to-send error response.
+fn embed_documents(
+    state: &AppState,
+    ns: &NamespaceId,
+    documents: &mut [kosha_core::Document],
+) -> Result<(), String> {
+    let Some(fields) = state.indexer.embedded_fields(ns) else {
+        return Ok(());
+    };
+    for (field, spec) in &fields {
+        // (document, field) positions of the texts to embed.
+        let mut positions: Vec<(usize, usize)> = Vec::new();
+        for (d, doc) in documents.iter().enumerate() {
+            for (f, value) in doc.fields.iter().enumerate() {
+                if value.name != *field {
+                    continue;
+                }
+                match embedding::supplied_vector(&value.value) {
+                    Some(Ok(vector)) if vector.len() != spec.dims as usize => {
+                        return Err(json_error(
+                            400,
+                            &format!(
+                                "document {:?}: field {field:?} has a {}-dimensional vector, \
+                                 but its embedding model {} has {} dimensions",
+                                doc.id.0,
+                                vector.len(),
+                                spec.model,
+                                spec.dims
+                            ),
+                        ));
+                    }
+                    // A vector already, or a bag of them: the vector path
+                    // takes it as it always has.
+                    Some(_) => {}
+                    None => positions.push((d, f)),
+                }
+            }
+        }
+        if positions.is_empty() {
+            continue;
+        }
+        let embedder = state
+            .embedders
+            .get(spec)
+            .map_err(|e| json_error(e.status(), e.message()))?;
+        let texts: Vec<&str> = positions
+            .iter()
+            .map(|&(d, f)| documents[d].fields[f].value.as_str())
+            .collect();
+        let vectors = embedding::embed_checked(embedder.as_ref(), spec, &texts)
+            .map_err(|e| json_error(e.status(), e.message()))?;
+        for ((d, f), vector) in positions.into_iter().zip(vectors) {
+            let value = &mut documents[d].fields[f];
+            value.value = serde_json::to_string(&vector).unwrap_or_default();
+            value.field_type = kosha_core::FieldType::Vector;
+        }
+    }
+    Ok(())
+}
+
+/// Native embedding at query time (#209): replace `knn.query_text` with
+/// the vector of the model the namespace schema declares for `knn.field`,
+/// and record the model so segments written under another one are skipped
+/// (see `kosha_query::segment_embedding_model_mismatch`). Only a kNN that
+/// carries `query_text` reaches the schema or an embedder. `Err` carries a
+/// ready-to-send error response.
+fn resolve_knn_query_text(
+    state: &AppState,
+    ns: &NamespaceId,
+    max_staleness: Option<Duration>,
+    query: &mut kosha_core::SearchQuery,
+) -> Result<(), String> {
+    let Some(knn) = query.knn.as_mut() else {
+        return Ok(());
+    };
+    let Some(text) = knn.query_text.take() else {
+        return Ok(());
+    };
+    // A query replica embeds with the schema it follows: bring it current
+    // first (the search below does the same and is then a no-op).
+    state
+        .ensure_query_manifest_fresh(ns, max_staleness)
+        .map_err(|e| search_error_response(&e))?;
+    let Some(manifest) = state.indexer.manifest_shared(ns) else {
+        return Err(json_error(404, &format!("namespace '{}' not found", ns.0)));
+    };
+    let Some(spec) = manifest
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.embedding_for(&knn.field))
+        .cloned()
+    else {
+        return Err(json_error(
+            400,
+            &format!(
+                "knn.query_text needs an embedding model for field '{}', and the namespace \
+                 schema declares none; send knn.vector instead",
+                knn.field
+            ),
+        ));
+    };
+    let embedder = state
+        .embedders
+        .get(&spec)
+        .map_err(|e| json_error(e.status(), e.message()))?;
+    let mut vectors = embedding::embed_checked(embedder.as_ref(), &spec, &[text.as_str()])
+        .map_err(|e| json_error(e.status(), e.message()))?;
+    knn.vector = vectors.pop().unwrap_or_default();
+    knn.embedding_model = Some(spec.model);
+    Ok(())
 }
 
 /// Group documents by the shard their id routes to (#207), keeping each
@@ -6331,6 +6915,8 @@ fn index_into(
     documents: Vec<kosha_core::Document>,
 ) -> Result<usize, String> {
     let ns = ns.clone();
+    // Only the namespace's writer-lease holder accepts writes (#254).
+    state.ensure_writable(&ns)?;
     // Unindexed backlog at its cap (#255): refuse before buffering more.
     // Per written namespace, so a sharded namespace caps each shard.
     if let Some(response) = state.unindexed_backpressure(&ns) {
@@ -6507,7 +7093,11 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
         Err(error) => return json_error(400, &format!("invalid JSON: {error}")),
     };
     let namespace = request.namespace;
-    match write_routed(state, &namespace, request.documents, replace_into) {
+    let mut documents = request.documents;
+    if let Err(response) = embed_documents(state, &namespace, &mut documents) {
+        return response;
+    }
+    match write_routed(state, &namespace, documents, replace_into) {
         Ok(count) => {
             state.metrics.record_indexed(count as u64);
             json_ok(&IndexResponse {
@@ -6527,6 +7117,7 @@ fn replace_into(
     documents: Vec<kosha_core::Document>,
 ) -> Result<usize, String> {
     let namespace = namespace.clone();
+    state.ensure_writable(&namespace)?;
     if let Some(response) = state.unindexed_backpressure(&namespace) {
         return Err(response);
     }
@@ -6786,6 +7377,7 @@ fn delete_in(
     ns: &NamespaceId,
     filter: &kosha_core::FilterClause,
 ) -> Result<usize, String> {
+    state.ensure_writable(ns)?;
     #[cfg(feature = "s3")]
     if let Some(manifest) = state.indexer.manifest_cloned(ns) {
         let paths: Vec<PathBuf> = manifest
@@ -6910,6 +7502,7 @@ fn handle_stats(state: &AppState) -> String {
             state.indexer.local_retired_count(),
         ),
         "rerank": state.rerankers.stats_json(),
+        "embedding_providers": state.embedders.providers(),
     }))
 }
 
@@ -6967,7 +7560,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
         Err(e) => return json_error(400, &e),
     };
 
-    let query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
+    let mut query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
         Ok(q) => q,
         Err(e) => return json_error(400, &format!("invalid search query: {e}")),
     };
@@ -6976,6 +7569,12 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     if let Err(e) = query.validate() {
         return search_error_response(&e);
     }
+    // `knn.query_text` becomes `knn.vector` here (#209), before the cache
+    // key and the searcher see the query.
+    if let Err(response) = resolve_knn_query_text(state, &ns, max_staleness, &mut query) {
+        return response;
+    }
+    let query = query;
     // A reranked request searches for its first stage (top `top_n` from
     // offset 0) and is reranked and paged after scoring; see
     // `kosha_query::rerank`. Unknown providers are a 400 before any work.
@@ -7218,6 +7817,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // scoring slot.
             drop(slot);
             result.exhaustive_search_count = view.exhaustive_search_count();
+            result.consistency_fallback = view.fallback.clone();
             #[cfg(feature = "s3")]
             let hydration = HydrationOutcome {
                 page: *page_fetch.lock().unwrap(),
@@ -7713,6 +8313,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     ) {
         Ok((mut result, phases)) => {
             result.exhaustive_search_count = view.exhaustive_search_count();
+            result.consistency_fallback = view.fallback.clone();
             #[cfg(feature = "s3")]
             let hydration = HydrationOutcome {
                 page: *page_fetch.lock().unwrap(),
@@ -7779,9 +8380,12 @@ fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppS
 /// `POST /v1/namespaces/{ns}/schema` — set the namespace schema (#220).
 /// The body is a proto `NamespaceSchema` (`{"fields": {...}}`), or one
 /// wrapped as `{"schema": {...}}` like `CreateNamespaceRequest`. Only the
-/// analysis settings are honored. New segments use it; existing segments
-/// keep the analysis their footer records and stay searchable with it, so
-/// the change reaches old documents when compaction rewrites them.
+/// analysis settings and vector fields' `embedding` (#209) are honored. New
+/// segments use it; existing segments keep the analysis their footer
+/// records and stay searchable with it, so the change reaches old
+/// documents when compaction rewrites them. Changing the embedding model of
+/// a field that already holds vectors is a 409 (see
+/// `kosha_write::Indexer::embedding_conflict`).
 fn handle_put_schema_with_ns(
     namespace: &str,
     tenant: &str,
@@ -7801,6 +8405,21 @@ fn handle_put_schema_with_ns(
         Ok(schema) => schema,
         Err(e) => return json_error(400, &format!("invalid schema: {e}")),
     };
+    if let Err(e) = schema.validate_embeddings() {
+        return json_error(400, &format!("invalid schema: {e}"));
+    }
+    // Model pinning (#209): a field's embedding model cannot change while
+    // vectors of the old one are indexed. Checked on every shard before
+    // any manifest changes, so a refused change leaves none half-applied.
+    let mut pinned = vec![ns.clone()];
+    if let Some(shards) = state.indexer.shard_count(&ns) {
+        pinned.extend(kosha_core::sharding::shard_namespaces(&ns, shards));
+    }
+    for target in &pinned {
+        if let Some(conflict) = state.indexer.embedding_conflict(target, &schema) {
+            return json_error(409, &conflict);
+        }
+    }
     let changed = match state.indexer.set_schema(&ns, schema.clone()) {
         Ok(changed) => changed,
         Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
@@ -8504,6 +9123,10 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
         }
     };
     let run_async = req.get("async").and_then(|v| v.as_bool()).unwrap_or(false);
+    // An indexer (#254) may not have seen the namespace yet.
+    if state.role == role::Role::Indexer {
+        state.indexer_follow_all();
+    }
     // Prefer the name as given (migration uses bare index names); fall back
     // to tenant-scoped lookup used by v1 routes.
     let ns = {
@@ -8664,8 +9287,7 @@ fn handle_compaction_status(state: &AppState) -> String {
             ))
         })
         .collect();
-    let forwards_writes = state.ingest_host.is_some();
-    let enabled = !forwards_writes && state.compaction.config().interval.is_some();
+    let enabled = state.runs_compaction_scheduler() && state.compaction.config().interval.is_some();
     json_ok(&state.compaction.status_json(enabled, &live))
 }
 
@@ -8892,6 +9514,13 @@ fn compaction_pass_with(
     opts: kosha_write::CompactOptions,
     mut on_group: impl FnMut(&compaction_sched::PassOutcome),
 ) -> Result<compaction_sched::PassOutcome, String> {
+    // An indexer plans on the latest committed manifest (#254); its
+    // publish still rebases onto anything committed during the merge.
+    if state.role == role::Role::Indexer {
+        state
+            .indexer_follow_namespace(ns)
+            .map_err(|e| format!("cannot read the committed manifest: {e}"))?;
+    }
     let segments_before = state
         .indexer
         .manifest_cloned(ns)
@@ -9055,6 +9684,11 @@ fn evict_superseded_inputs(
 /// registry pick the due ones under the global budget, and start a tiered
 /// pass on a background thread for each. Never blocks on a merge.
 fn run_compaction_scheduler_tick(state: &Arc<AppState>, now: Instant) -> Vec<NamespaceId> {
+    // An indexer (#254) learns namespaces and their new segments from the
+    // control store, not from writes.
+    if state.role == role::Role::Indexer {
+        state.indexer_follow_all();
+    }
     let policy = state.indexer.compaction_policy().clone();
     let candidates: Vec<compaction_sched::Candidate> = state
         .indexer
@@ -9708,6 +10342,7 @@ fn json_error(status_code: u16, message: &str) -> String {
         413 => "413 Payload Too Large",
         429 => "429 Too Many Requests",
         500 => "500 Internal Server Error",
+        502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     };
@@ -10568,6 +11203,7 @@ mod tests {
             StateOptions {
                 wal_store: Some(Arc::new(store)),
                 control_store: Some(Box::new(control.clone())),
+                ..Default::default()
             },
         )
     }
@@ -10678,10 +11314,13 @@ mod tests {
     /// poll and manifest fetches fail with `ControlPlane` while `down`, the
     /// way `PgStore` reports an unreachable Postgres (#232).
     #[derive(Clone)]
-    struct OutageStore {
+    pub(crate) struct OutageStore {
         inner: SharedManifestStore,
         down: Arc<std::sync::atomic::AtomicBool>,
         reads: Arc<std::sync::atomic::AtomicU64>,
+        /// `list_namespaces` reads as empty, the way `PgStore` reports a
+        /// failed query there (it has no error to return).
+        pub(crate) list_fails: Arc<std::sync::atomic::AtomicBool>,
     }
     impl OutageStore {
         fn check(&self) -> Result<(), KoshaError> {
@@ -10742,6 +11381,9 @@ mod tests {
             self.inner.compare_and_swap_manifest(id, expected, manifest)
         }
         fn list_namespaces(&self) -> Vec<NamespaceId> {
+            if self.list_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Vec::new();
+            }
             self.inner.list_namespaces()
         }
         fn namespace_count(&self) -> usize {
@@ -10763,11 +11405,12 @@ mod tests {
         }
     }
 
-    fn outage_store() -> OutageStore {
+    pub(crate) fn outage_store() -> OutageStore {
         OutageStore {
             inner: shared_store(),
             down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            list_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -13875,6 +14518,25 @@ mod tests {
         assert!(!is_write_path("GET /metrics?x=1 HTTP/1.1\r\n"));
     }
 
+    /// An indexer (#254) serves only the compaction admin API, but
+    /// `/metrics` is per-pod and answered ahead of that gate.
+    #[test]
+    fn indexer_pod_serves_metrics() {
+        let mut state = test_state();
+        state.role = role::Role::Indexer;
+        let addr = serve_state(state);
+        let samples = scrape_samples(addr);
+        assert!(
+            samples
+                .iter()
+                .any(|s| s.name == "kosha_search_requests_total"),
+            "{} samples",
+            samples.len()
+        );
+        let other = http(addr, "GET /v1/stats HTTP/1.1\r\nhost: x\r\n\r\n");
+        assert!(other.starts_with("HTTP/1.1 404"), "{other}");
+    }
+
     /// Send one raw HTTP request to a live `serve` and return the response.
     fn http(addr: std::net::SocketAddr, request: &str) -> String {
         let mut s = TcpStream::connect(addr).unwrap();
@@ -16697,6 +17359,8 @@ mod tests {
         let with_vec = |v: Vec<f32>, k: usize| {
             let mut q = base.clone();
             q.knn = Some(kosha_core::KnnQuery {
+                query_text: None,
+                embedding_model: None,
                 field: "text_emb".into(),
                 vector: v,
                 k,
@@ -17200,6 +17864,51 @@ mod tests {
         assert_eq!(raced["total_hits"], 2);
         assert_eq!(hit_ids(&raced).len(), 2);
         assert_eq!(raced["exhaustive_search_count"], 0, "both now indexed");
+    }
+
+    /// Local GC and tail eviction release a shard's segment under the
+    /// sharded root's merged-view id too (#207).
+    #[test]
+    fn shard_segments_alias_to_the_merged_view() {
+        let seg = kosha_core::SegmentId("S".into());
+        let shard = kosha_core::sharding::shard_namespace(&NamespaceId("t/ns".into()), 3);
+        let (root, merged) = merged_view_alias(&shard, &seg).unwrap();
+        assert_eq!(root.0, "t/ns");
+        assert_eq!(merged, kosha_core::sharding::merged_segment_id(3, &seg));
+        assert!(merged_view_alias(&NamespaceId("t/ns".into()), &seg).is_none());
+    }
+
+    /// #255: a writer that flushed but has not published (an upload in
+    /// flight, or publication failing) is ahead of every manifest a query
+    /// pod can read. A strong search there is served from the published
+    /// manifest, flagged, instead of failing with 503 for the whole window.
+    #[test]
+    fn strong_search_falls_back_to_eventual_while_publication_is_pending() {
+        let store = outage_store();
+        let (ingest, query) = read_your_writes_pods(&store, |_, _| {});
+        let ns = "tenant/ryw-pending";
+        let ns_id = NamespaceId(ns.into());
+        ryw_index(&ingest, ns, vec![ryw_doc("a", "pending words", "x")]);
+        flush_and_publish_namespace(&ingest, &ns_id).unwrap();
+        ryw_index(&ingest, ns, vec![ryw_doc("b", "pending words", "x")]);
+        // Flushed locally, not published.
+        ingest.indexer.flush_namespace(&ns_id).unwrap();
+
+        let pending = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "pending"}),
+        );
+        assert_eq!(hit_ids(&pending), ["a"]);
+        let reason = pending["consistency_fallback"].as_str().unwrap();
+        assert!(reason.starts_with("eventual"), "{reason}");
+
+        flush_and_publish_namespace(&ingest, &ns_id).unwrap();
+        let published = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "pending"}),
+        );
+        assert_eq!(published["total_hits"], 2);
+        assert!(published.get("consistency_fallback").is_none());
     }
 
     /// #255: under strong consistency a tail that cannot be read fails the

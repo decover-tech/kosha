@@ -224,6 +224,7 @@ fn schema_fields_that_never_occur_are_not_recorded() {
             "absent".to_string(),
             AnalyzerSpec::resolve(&["keyword".to_string()], None).unwrap(),
         )]),
+        embedding_models: Default::default(),
     };
     let dir = temp_dir("absent");
     let footer = write(&dir, Some(&config));

@@ -153,6 +153,9 @@ pub struct SegmentWriter {
     field_stats: BTreeMap<String, kosha_core::FieldStats>,
     /// Late-interaction bags (#205), written to `multivec.*` at finalize.
     multi_vectors: multivec::MultiVectorBuilder,
+    /// Vector fields the namespace schema embeds server-side, with their
+    /// model id (#209), recorded in the columns' footer entries.
+    embedding_models: BTreeMap<String, String>,
 }
 
 /// Whether new segments get per-field indexes (#249):
@@ -256,6 +259,7 @@ impl SegmentWriter {
             field_index: field_index_enabled(),
             field_stats: BTreeMap::new(),
             multi_vectors: multivec::MultiVectorBuilder::default(),
+            embedding_models: BTreeMap::new(),
         }
     }
 
@@ -279,6 +283,7 @@ impl SegmentWriter {
             .filter(|(_, spec)| **spec != config.default)
             .map(|(name, spec)| (name.clone(), Analyzer::new(spec)))
             .collect();
+        self.embedding_models = config.embedding_models.clone();
         self
     }
 
@@ -1112,6 +1117,7 @@ impl SegmentWriter {
                 slot: slot as u32,
                 offsets: false,
                 quantization: VectorQuantization::F32,
+                embedding_model: self.embedding_models.get(&column.name).cloned(),
             };
             self.backend.write(&meta.idx_file(), &buf)?;
             metas.push(meta);
@@ -1155,6 +1161,7 @@ impl SegmentWriter {
                 slot: slot as u32,
                 offsets: true,
                 quantization,
+                embedding_model: self.embedding_models.get(&column.name).cloned(),
             };
             let seeds = self.vector_seeds.get(&column.name);
             let (idx_bytes, offsets_bytes, build) =
@@ -6106,12 +6113,19 @@ impl SegmentReader {
         // column, and a ranged query node only its `vector[.<n>].offsets`)
         // is not cached as empty: it may be hydrated after this segment was
         // opened.
-        if slot.meta.is_some() && !index.has_lazy_index() && !slot.idx_path.exists() {
-            return Err(KoshaError::NotFound(format!(
-                "{} missing from segment {:?}, whose footer lists it",
-                slot.idx_path.display(),
-                self.segment_dir
-            )));
+        if !index.has_lazy_index() && !slot.idx_path.exists() {
+            if slot.meta.is_some() {
+                return Err(KoshaError::NotFound(format!(
+                    "{} missing from segment {:?}, whose footer lists it",
+                    slot.idx_path.display(),
+                    self.segment_dir
+                )));
+            }
+            // A legacy (unnamed) slot with neither file local is served as
+            // empty but not cached either: a segment that never had vectors
+            // costs two failed stats per load, while one whose vector files
+            // simply were not hydrated yet sees them once they are.
+            return Ok(index);
         }
         *loaded = Some(Arc::clone(&index));
         Ok(index)

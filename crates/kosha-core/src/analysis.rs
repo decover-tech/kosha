@@ -208,12 +208,78 @@ pub struct FieldSchema {
     /// field's `stop` filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopwords: Option<Vec<String>>,
+    /// Kosha extension (#209): the server embeds text sent for this
+    /// `Vector` field (and `knn.query_text` against it) with this model.
+    /// Absent = the client supplies vectors, as always.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<EmbeddingSpec>,
+}
+
+/// Largest `embedding.dims` a schema may declare.
+pub const MAX_EMBEDDING_DIMS: u32 = 4096;
+
+/// A vector field's server-side embedding model (#209).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EmbeddingSpec {
+    /// Model id, as the embedding provider names it. Recorded in each
+    /// segment's footer so vectors of two models are never compared.
+    pub model: String,
+    /// Dimension of the model's vectors.
+    pub dims: u32,
+    /// Which configured provider serves the model (`mock`, `http`).
+    /// `None` = whichever provider this pod registered the model with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
+impl EmbeddingSpec {
+    /// Shape checks: a non-empty model and `dims` in `1..=4096`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.trim().is_empty() {
+            return Err("embedding.model must not be empty".into());
+        }
+        if self.dims == 0 || self.dims > MAX_EMBEDDING_DIMS {
+            return Err(format!(
+                "embedding.dims must be in 1..={MAX_EMBEDDING_DIMS}, got {}",
+                self.dims
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether vectors of `self` and `other` live in the same space.
+    pub fn same_space(&self, other: &EmbeddingSpec) -> bool {
+        self.model == other.model && self.dims == other.dims
+    }
 }
 
 impl NamespaceSchema {
+    /// The fields that declare an embedding model. Empty for every schema
+    /// that does not opt in.
+    pub fn embedded_fields(&self) -> impl Iterator<Item = (&String, &EmbeddingSpec)> {
+        self.fields
+            .iter()
+            .filter_map(|(name, field)| field.embedding.as_ref().map(|spec| (name, spec)))
+    }
+
+    /// The embedding model declared for `field`, if any.
+    pub fn embedding_for(&self, field: &str) -> Option<&EmbeddingSpec> {
+        self.fields.get(field)?.embedding.as_ref()
+    }
+
+    /// Check every field's `embedding` (#209).
+    pub fn validate_embeddings(&self) -> Result<(), String> {
+        for (name, spec) in self.embedded_fields() {
+            spec.validate()
+                .map_err(|e| format!("field {name:?}: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Resolve every analyzer name now, so a bad schema is rejected when
     /// it is set rather than when a segment is written.
     pub fn resolve(&self) -> Result<AnalysisConfig, String> {
+        self.validate_embeddings()?;
         let default =
             AnalyzerSpec::resolve(&self.default_analyzer, self.default_stopwords.as_deref())
                 .map_err(|e| format!("default_analyzer: {e}"))?;
@@ -226,7 +292,15 @@ impl NamespaceSchema {
                 .map_err(|e| format!("field {name:?}: {e}"))?;
             fields.insert(name.clone(), spec);
         }
-        Ok(AnalysisConfig { default, fields })
+        let embedding_models = self
+            .embedded_fields()
+            .map(|(name, spec)| (name.clone(), spec.model.clone()))
+            .collect();
+        Ok(AnalysisConfig {
+            default,
+            fields,
+            embedding_models,
+        })
     }
 }
 
@@ -237,6 +311,10 @@ pub struct AnalysisConfig {
     pub default: AnalyzerSpec,
     /// Per-field chains.
     pub fields: BTreeMap<String, AnalyzerSpec>,
+    /// Vector fields the schema embeds server-side, with their model id
+    /// (#209). The segment writer records the model in each such column's
+    /// [`crate::VectorFieldMeta::embedding_model`].
+    pub embedding_models: BTreeMap<String, String>,
 }
 
 impl Default for AnalysisConfig {
@@ -244,6 +322,7 @@ impl Default for AnalysisConfig {
         Self {
             default: AnalyzerSpec::legacy(),
             fields: BTreeMap::new(),
+            embedding_models: BTreeMap::new(),
         }
     }
 }
@@ -356,6 +435,32 @@ mod tests {
         assert_eq!(config.fields.len(), 2, "body has no analyzer: default");
         assert_eq!(config.spec_for("sku").tokenizer, TokenizerKind::Keyword);
         assert!(config.spec_for("body").is_legacy());
+    }
+
+    #[test]
+    fn embedding_spec_parses_validates_and_stays_optional() {
+        let schema: NamespaceSchema = serde_json::from_str(
+            r#"{"fields": {"emb": {"type": "FIELD_TYPE_VECTOR",
+                "embedding": {"model": "mock-1", "dims": 8, "provider": "mock"}},
+                "title": {"analyzer": ["standard"]}}}"#,
+        )
+        .unwrap();
+        let config = schema.resolve().unwrap();
+        assert_eq!(config.embedding_models.get("emb").unwrap(), "mock-1");
+        assert_eq!(schema.embedding_for("emb").unwrap().dims, 8);
+        assert!(schema.embedding_for("title").is_none());
+        // Fields without one serialize exactly as before.
+        let title = serde_json::to_string(&schema.fields["title"]).unwrap();
+        assert!(!title.contains("embedding"), "{title}");
+        for bad in [
+            r#"{"model": "", "dims": 8}"#,
+            r#"{"model": "m", "dims": 0}"#,
+            r#"{"model": "m", "dims": 4097}"#,
+        ] {
+            let json = format!(r#"{{"fields": {{"emb": {{"embedding": {bad}}}}}}}"#);
+            let schema: NamespaceSchema = serde_json::from_str(&json).unwrap();
+            assert!(schema.resolve().is_err(), "{bad}");
+        }
     }
 
     #[test]

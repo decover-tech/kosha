@@ -1077,6 +1077,7 @@ mod tests {
             knn_mode: None,
             knn_filtered_candidates: None,
             exhaustive_search_count: 0,
+            consistency_fallback: None,
         };
         assert_eq!(
             format_total_hits_line(&mk(3, kosha_core::TotalHitsRelation::Eq)),

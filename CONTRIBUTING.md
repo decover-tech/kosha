@@ -89,6 +89,7 @@ Outside `crates/`:
   here (`make proto-lint`), then goes into `kosha-core` and `kosha-server`.
 - `clients/python/` is the OpenSearch-compatible Python client (`kosha-client` on PyPI).
 - `scripts/conformance/` is the end-to-end BM25 and filter correctness suite;
+  `scripts/integration/` runs an ingest pod and a query pod over MinIO + Postgres;
   `scripts/bench/` holds the large-scale benchmark harness.
 - `docs/` has the configuration reference and integration guides.
 
@@ -146,7 +147,8 @@ What needs the stack:
 | `cargo test --all-features` | nothing |
 | Conformance suite, `scripts/conformance/run.py --spawn target/release/kosha-server` | nothing (in-memory control plane; the restart checkpoint is skipped) |
 | Conformance suite as CI runs it (with a cold restart) | `docker compose -f docker-compose.yml -f scripts/conformance/docker-compose.conformance.yml up --build -d`; see [scripts/conformance/README.md](scripts/conformance/README.md) |
-| `postgres_cas` integration test (`#[ignore]`d) | a **disposable** Postgres: `KOSHA_TEST_DATABASE_URL=postgres://... cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored` |
+| Integration suite (ingest + query pods, restarts, tenants) | `docker compose -f docker-compose.yml -f scripts/integration/docker-compose.integration.yml up --build -d`; see [scripts/integration/README.md](scripts/integration/README.md). `run.py --spawn` runs the single-process subset without Docker |
+| `postgres_cas` integration test (`#[ignore]`d; CI runs it in the integration job) | a **disposable** Postgres: `KOSHA_TEST_DATABASE_URL=postgres://... cargo test -p kosha-control --features postgres --test postgres_cas -- --ignored` |
 | Quickstart (`kosha` CLI or `make quickstart`) | `docker compose up --build` |
 
 The conformance suite and the `scripts/bench/` harness set `KOSHA_COMPACTION_INTERVAL_MS=0`
@@ -164,7 +166,9 @@ All of these are CI gates. Run them locally first:
     docker build -t kosha:ci .   # if you touched the Dockerfile or build config
 
 CI also runs `buf lint` on `proto/` (`make proto-lint`), the bench-hook script tests
-(`make bench-hook-test`) and the conformance suite against the Docker Compose stack.
+(`make bench-hook-test`), the conformance suite against the Docker Compose stack, and the
+integration suite (`.github/workflows/integration.yml`: ingest + query pods, then the
+`postgres_cas` tests).
 
 ## Benchmarks
 
@@ -172,7 +176,7 @@ Microbenchmarks are ordinary `cargo bench` targets:
 
 | Location | Benches |
 | --- | --- |
-| `crates/kosha-query/benches/` | `search_latency`, `scoring_profile`, `topk_blockmax`, `filtered_broad_query`, `segment_memory`, `warm_materialize`, `clone_vs_sort`, `knn_open_search`, `vector_segment_open`, `vector_segment_accounting` |
+| `crates/kosha-query/benches/` | `search_latency`, `scoring_profile`, `topk_blockmax`, `filtered_broad_query`, `segment_memory`, `warm_materialize`, `clone_vs_sort`, `knn_open_search`, `vector_segment_open`, `vector_segment_accounting`, `relevance` |
 | `crates/kosha-write/benches/` | `upsert_write_amplification`, `sustained_concurrent_flush`, `wal_group_commit` |
 | `crates/kosha-segment/benches/` | `tokenizer` |
 | `crates/kosha-vector-spfresh/benches/` | `build_query_cost` |
@@ -198,6 +202,14 @@ include before/after numbers from the relevant bench in the PR description: the 
 the machine, and the result. Correctness fixes and docs do not need them. For same-repo
 branches, the `bench-compare` workflow also posts a `segment_memory` before/after comment on
 every PR to `main`. Use it as a smoke signal, not as proof.
+
+**Relevance and recall.** `cargo bench -p kosha-query --bench relevance` measures nDCG@10 and
+recall@100 (lexical, vector, hybrid) against judged qrels, and filtered-kNN recall@10 against
+brute force at 100% to 0.1% selectivity. It is deterministic. PRs touching `kosha-query`,
+`kosha-segment`, `kosha-vector-spfresh`, `kosha-core` or `kosha-write` get a
+`relevance-compare` comment and fail when a metric drops by more than its threshold; a PR
+that moves the numbers on purpose regenerates `scripts/relevance/baseline.json`. See
+[scripts/relevance/README.md](scripts/relevance/README.md).
 
 ## The `---kosha-bench---` commit section
 

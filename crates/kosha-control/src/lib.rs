@@ -6,6 +6,7 @@
 //! production via the `postgres` feature and a `DATABASE_URL` env var.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
 
@@ -21,6 +22,12 @@ mod hydration_lease;
 #[cfg(feature = "postgres")]
 pub use hydration_lease::{HydrationLease, HydrationLeaseStore};
 
+#[cfg(feature = "postgres")]
+mod writer_lease;
+
+#[cfg(feature = "postgres")]
+pub use writer_lease::PgWriterLeaseStore;
+
 /// In-memory namespace registry and manifest store.
 ///
 /// Tracks namespaces and their current segment manifests. Not internally
@@ -34,6 +41,18 @@ pub struct Controller {
     /// re-created namespace continues above it (see
     /// [`ControlStore::delete_namespace`]).
     retired: HashMap<NamespaceId, u64>,
+    /// Writer leases (#254), the in-memory twin of `kosha.writer_leases`.
+    /// Rows are never removed: a released lease only expires, keeping its
+    /// token for the next holder to exceed.
+    writer_leases: HashMap<NamespaceId, WriterLease>,
+}
+
+/// One namespace's writer lease.
+#[derive(Debug, Clone)]
+struct WriterLease {
+    holder: String,
+    token: u64,
+    expires_at: Instant,
 }
 
 fn empty_manifest(version: u64) -> Manifest {
@@ -46,6 +65,7 @@ impl Controller {
             manifests: HashMap::new(),
             namespaces: Vec::new(),
             retired: HashMap::new(),
+            writer_leases: HashMap::new(),
         }
     }
 
@@ -170,6 +190,91 @@ impl Controller {
         Ok(())
     }
 
+    /// See [`ControlStore::acquire_writer_lease`].
+    pub fn acquire_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        ttl: Duration,
+    ) -> Option<u64> {
+        let now = Instant::now();
+        match self.writer_leases.get_mut(id) {
+            Some(lease) if lease.holder == holder => {
+                lease.expires_at = now + ttl;
+                Some(lease.token)
+            }
+            Some(lease) if lease.expires_at > now => None,
+            Some(lease) => {
+                lease.holder = holder.to_owned();
+                lease.token += 1;
+                lease.expires_at = now + ttl;
+                Some(lease.token)
+            }
+            None => {
+                self.writer_leases.insert(
+                    id.clone(),
+                    WriterLease {
+                        holder: holder.to_owned(),
+                        token: 1,
+                        expires_at: now + ttl,
+                    },
+                );
+                Some(1)
+            }
+        }
+    }
+
+    /// See [`ControlStore::renew_writer_lease`].
+    pub fn renew_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        token: u64,
+        ttl: Duration,
+    ) -> bool {
+        match self.writer_leases.get_mut(id) {
+            Some(lease) if lease.holder == holder && lease.token == token => {
+                lease.expires_at = Instant::now() + ttl;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// See [`ControlStore::release_writer_lease`].
+    pub fn release_writer_lease(&mut self, id: &NamespaceId, holder: &str, token: u64) {
+        if let Some(lease) = self.writer_leases.get_mut(id) {
+            if lease.holder == holder && lease.token == token {
+                lease.expires_at = Instant::now();
+            }
+        }
+    }
+
+    /// The current lease token on `id`, if any writer ever took one.
+    pub fn writer_lease_token(&self, id: &NamespaceId) -> Option<u64> {
+        self.writer_leases.get(id).map(|lease| lease.token)
+    }
+
+    /// See [`ControlStore::compare_and_swap_manifest_fenced`].
+    pub fn compare_and_swap_manifest_fenced(
+        &mut self,
+        id: &NamespaceId,
+        expected_version: u64,
+        new_manifest: Manifest,
+        token: Option<u64>,
+    ) -> Result<(), KoshaError> {
+        if let (Some(token), Some(current)) = (token, self.writer_lease_token(id)) {
+            if token != current {
+                return Err(KoshaError::Fenced {
+                    namespace: id.clone(),
+                    token,
+                    current,
+                });
+            }
+        }
+        self.compare_and_swap_manifest(id, expected_version, new_manifest)
+    }
+
     /// Remove a namespace and its manifest; `None` if it did not exist.
     pub fn remove_namespace(&mut self, id: &NamespaceId) -> Option<Manifest> {
         let at = self.namespaces.iter().position(|ns| ns == id)?;
@@ -260,12 +365,131 @@ impl ControlStore for Controller {
     fn remove_namespace(&mut self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
         Ok(self.remove_namespace(id))
     }
+    fn acquire_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        ttl: Duration,
+    ) -> Result<Option<u64>, KoshaError> {
+        Ok(self.acquire_writer_lease(id, holder, ttl))
+    }
+    fn renew_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        token: u64,
+        ttl: Duration,
+    ) -> Result<bool, KoshaError> {
+        Ok(self.renew_writer_lease(id, holder, token, ttl))
+    }
+    fn release_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        token: u64,
+    ) -> Result<(), KoshaError> {
+        self.release_writer_lease(id, holder, token);
+        Ok(())
+    }
+    fn compare_and_swap_manifest_fenced(
+        &mut self,
+        id: &NamespaceId,
+        expected_version: u64,
+        new_manifest: Manifest,
+        token: Option<u64>,
+    ) -> Result<(), KoshaError> {
+        self.compare_and_swap_manifest_fenced(id, expected_version, new_manifest, token)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use kosha_core::ManifestEntry;
+
+    fn manifest_at(version: u64, segment: &str) -> Manifest {
+        let mut manifest = Manifest::empty(version);
+        manifest.segments.push(ManifestEntry {
+            segment_id: kosha_core::SegmentId(segment.into()),
+            doc_count: 1,
+        });
+        manifest
+    }
+
+    /// #254: one holder at a time; a takeover after expiry bumps the token
+    /// and the stale holder can neither renew nor commit.
+    #[test]
+    fn writer_lease_takeover_bumps_the_token_and_fences_the_stale_holder() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("leased".into());
+        let ttl = Duration::from_millis(40);
+
+        let a = ctrl.acquire_writer_lease(&ns, "writer-a", ttl).unwrap();
+        assert_eq!(a, 1);
+        // The holder re-acquires under the same token; a second holder is
+        // refused while the lease is live.
+        assert_eq!(ctrl.acquire_writer_lease(&ns, "writer-a", ttl), Some(1));
+        assert_eq!(ctrl.acquire_writer_lease(&ns, "writer-b", ttl), None);
+        ctrl.compare_and_swap_manifest_fenced(&ns, 0, manifest_at(1, "a1"), Some(a))
+            .unwrap();
+
+        // Writer A stalls past its TTL; B takes over with token 2.
+        std::thread::sleep(ttl + Duration::from_millis(20));
+        let b = ctrl.acquire_writer_lease(&ns, "writer-b", ttl).unwrap();
+        assert_eq!(b, a + 1);
+        assert!(!ctrl.renew_writer_lease(&ns, "writer-a", a, ttl));
+        assert!(ctrl.renew_writer_lease(&ns, "writer-b", b, ttl));
+
+        // A's late publish, over the right version, is fenced and changes
+        // nothing.
+        let late = ctrl
+            .compare_and_swap_manifest_fenced(&ns, 1, manifest_at(2, "a2"), Some(a))
+            .unwrap_err();
+        assert!(
+            matches!(
+                late,
+                KoshaError::Fenced {
+                    token: 1,
+                    current: 2,
+                    ..
+                }
+            ),
+            "{late}"
+        );
+        assert_eq!(ctrl.manifest(&ns).unwrap().segments[0].segment_id.0, "a1");
+        ctrl.compare_and_swap_manifest_fenced(&ns, 1, manifest_at(2, "b2"), Some(b))
+            .unwrap();
+        // Version conflicts stay conflicts, not fencing.
+        assert!(matches!(
+            ctrl.compare_and_swap_manifest_fenced(&ns, 1, manifest_at(3, "b3"), Some(b)),
+            Err(KoshaError::ManifestConflict { .. })
+        ));
+        // An unfenced writer (no token) behaves exactly as before.
+        ctrl.compare_and_swap_manifest_fenced(&ns, 2, manifest_at(3, "x3"), None)
+            .unwrap();
+    }
+
+    #[test]
+    fn released_writer_lease_hands_over_and_tokens_only_grow() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("handover".into());
+        let ttl = Duration::from_secs(60);
+        let a = ctrl.acquire_writer_lease(&ns, "a", ttl).unwrap();
+        // A release under a stale token is a no-op.
+        ctrl.release_writer_lease(&ns, "a", a + 7);
+        assert_eq!(ctrl.acquire_writer_lease(&ns, "b", ttl), None);
+        ctrl.release_writer_lease(&ns, "a", a);
+        let b = ctrl.acquire_writer_lease(&ns, "b", ttl).unwrap();
+        assert!(b > a);
+        ctrl.release_writer_lease(&ns, "b", b);
+        let a2 = ctrl.acquire_writer_lease(&ns, "a", ttl).unwrap();
+        assert!(a2 > b);
+        // A namespace nobody leased accepts any token: there is no row to
+        // compare it with.
+        let free = NamespaceId("free".into());
+        ctrl.compare_and_swap_manifest_fenced(&free, 0, manifest_at(1, "f"), Some(9))
+            .unwrap();
+    }
 
     #[test]
     fn cas_bootstrap_retries_and_rejects_nonadvancing_snapshots() {

@@ -179,13 +179,42 @@ key, no Postgres keys) unless `KOSHA_AUTH=disabled`.
 
 ## Roles
 
-There is no role switch. A pod forwards writes when `KOSHA_INGEST_HOST` is set.
+`KOSHA_ROLE` decides what a pod does (#254, `crates/kosha-server/src/role.rs`). An explicit role
+is checked against the rest of the environment, and a pod whose configuration contradicts it exits
+with status 1 at startup.
+
+| Role | Writes | Compaction scheduler | Routes | Requires |
+| --- | --- | --- | --- | --- |
+| `query` | forwarded to `KOSHA_INGEST_HOST` | never | all (mutating routes forwarded) | `KOSHA_INGEST_HOST` |
+| `ingest` | executed, under the writer lease | when `KOSHA_COMPACTION_ON_INGEST` is true | all | no `KOSHA_INGEST_HOST` |
+| `indexer` | none | always | `/healthz`, `/readyz`, `POST /v1/admin/compact*`, `GET /v1/admin/compaction-*`; everything else 404 | `DATABASE_URL`, no `KOSHA_INGEST_HOST` |
+| `standalone` | executed, under the writer lease | when `KOSHA_COMPACTION_ON_INGEST` is true | all | no `KOSHA_INGEST_HOST` |
+
+An unset `KOSHA_ROLE` keeps the pre-#254 rule and logs a warning: `KOSHA_INGEST_HOST` set means
+`query`, unset means `standalone`. The legacy value `compaction` is refused (it used to start a
+second, uncoordinated writer); use `indexer`. An indexer publishes compaction results with manifest
+CAS and rebase, without a WAL (`KOSHA_WAL_MODE=s3` is ignored there) and without a writer lease.
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_INGEST_HOST` | Set on query pods: every mutating route is forwarded to this base URL, and the idle-flush timer and compaction scheduler do not run. Unset = this pod accepts writes | unset (writer) | URL |
+| `KOSHA_ROLE` | `query`, `ingest`, `indexer` or `standalone` (see above). `query` and `ingest` also name the persisted warm set | inferred from `KOSHA_INGEST_HOST` | enum |
+| `KOSHA_INGEST_HOST` | Query pods: the base URL every mutating route is forwarded to. Must be set exactly when the role is `query` | unset | URL |
 | `KOSHA_INGEST_PROXY_TIMEOUT_SECS` | Timeout for a forwarded write | `300` | seconds |
-| `KOSHA_ROLE` | Label printed in the startup log line. Has no other effect | `query` | string |
+
+## Writer lease and fencing
+
+A writer pod (`ingest`, `standalone`) takes a per-namespace lease in the control store
+(`kosha.writer_leases`, migration 003) before it accepts writes for a namespace, renews it every
+TTL/3 in the background, and presents the lease's fencing token on every manifest CAS. A takeover
+after the TTL raises the token, and the CAS of a writer holding an older token is rejected
+(`Fenced`, HTTP 503 with `Retry-After`). A fenced writer stops accepting writes for the namespace
+and drops its unpublished local state; it takes the lease again only once the other writer's lease
+has lapsed. Writes it acknowledged but never published stay in its WAL.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_WRITER_LEASE` | `off` disables leases and fencing: plain CAS, the pre-#254 behaviour | on | flag |
+| `KOSHA_WRITER_LEASE_TTL_MS` | Lease lifetime; renewed every TTL/3. Minimum 300. Also the `Retry-After` of a refused write | `30000` | milliseconds |
 
 ## Write path and flush
 
@@ -213,7 +242,8 @@ Read in `GroupCommitConfig::from_env` (`crates/kosha-write/src/wal.rs`).
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_COMPACTION_INTERVAL_MS` | Background compaction scheduler period on writer pods; `0` disables it (`compaction_sched.rs`). Benchmarks and the conformance suite set `0` | `30000` | milliseconds |
+| `KOSHA_COMPACTION_INTERVAL_MS` | Background compaction scheduler period on pods that run it (`indexer`, `standalone`, and `ingest` unless `KOSHA_COMPACTION_ON_INGEST=false`); `0` disables it (`compaction_sched.rs`). Benchmarks and the conformance suite set `0` | `30000` | milliseconds |
+| `KOSHA_COMPACTION_ON_INGEST` | Whether a writer pod (`ingest`, `standalone`) runs the compaction scheduler. Set `false` once an `indexer` pod compacts (k8s base does). The admin compaction API still works either way | `true` | flag |
 | `KOSHA_COMPACTION_MAX_CONCURRENT` | Compaction passes at once, including API jobs. Must be > 0 | `1` | passes |
 | `KOSHA_COMPACT_MAX_SEGMENT_BYTES` | Largest merged segment; `0` removes the cap. A request's own value overrides it (`compact_options`) | `5368709120` (5 GiB) | bytes |
 
@@ -264,6 +294,25 @@ provider named `my-model`. Keys are never logged or returned.
 | `KOSHA_RERANK_N_API_KEY` | Sent as `Authorization: Bearer ...`. `cohere` also reads `COHERE_API_KEY`, and is registered only when it has a key | unset | string |
 | `KOSHA_RERANK_N_MODEL` | Model used when a request names none | `cohere`: `rerank-v3.5` | string |
 
+## Native embedding
+
+Read in `EmbedderRegistry::from_env` (`crates/kosha-server/src/embedding.rs`, #209). A vector
+field opts in through the namespace schema
+(`{"fields": {"emb": {"embedding": {"model": "...", "dims": 384, "provider": "http"}}}}`); the server
+then embeds text sent for that field at ingest and `knn.query_text` at query time. Ingest and
+query pods need the same settings; an `indexer` pod needs none (compaction copies vectors and
+never embeds). A schema naming a model this pod has no provider for answers
+`503` to text writes and `query_text` searches; namespaces without a declared model never call a
+provider. The API key is never logged or returned.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_EMBEDDING_PROVIDERS` | Enabled providers: `http` (OpenAI-compatible server) and/or `mock` (deterministic hashed bag of words, for tests and local development only) | unset (no native embedding) | list |
+| `KOSHA_EMBEDDING_URL` | Base URL of the OpenAI-compatible server; `/embeddings` is appended. Required for `http` | unset | URL |
+| `KOSHA_EMBEDDING_API_KEY` | Sent as `Authorization: Bearer ...` | unset | string |
+| `KOSHA_EMBEDDING_TIMEOUT_MS` | Timeout of one provider request | `10000` | ms |
+| `KOSHA_EMBEDDING_BATCH_SIZE` | Texts per provider request | `64` | count |
+
 ## CLI and Python client
 
 Read by `kosha` (`crates/kosha-cli`). The Python client (`clients/python`) reads
@@ -297,6 +346,9 @@ bench's header comment documents its own knobs. The common ones:
 | `KOSHA_BENCH_DIM`, `KOSHA_BENCH_K`, `KOSHA_BENCH_TOPK` | Vector and top-k query shape |
 | `KOSHA_BENCH_COLD_ITERS`, `KOSHA_BENCH_WARM_ITERS`, `KOSHA_BENCH_DURATION_SECS`, `KOSHA_BENCH_THREADS`, `KOSHA_BENCH_TIMEOUT_MS` | Run length and concurrency |
 | `KOSHA_BENCH_S3_MS` | Simulated S3 latency |
+| `KOSHA_RELEVANCE_JSON` | Write the `relevance` bench's report (used by the `relevance-compare` CI job and for `scripts/relevance/baseline.json`) |
+| `KOSHA_RELEVANCE_FIXTURE` | Fixture directory for the `relevance` bench when no argument is given (default `scripts/relevance/fixtures/synthetic`) |
+| `KOSHA_RELEVANCE_NUM_CANDIDATES` | kNN `num_candidates` in the `relevance` bench (default 1: the engine's `KOSHA_KNN_BUDGET_FRACTION` floor sets the probe budget) |
 | `KOSHA_BENCH_BATCH_SIZE`, `KOSHA_BENCH_BACKLOG_DOCS`, `KOSHA_BENCH_FLUSH_THRESHOLD`, `KOSHA_BENCH_MAX_CONCURRENT_FLUSH_WRITERS`, `KOSHA_BENCH_MIN_DOCS_PER_FLUSH_WRITER`, `KOSHA_BENCH_WAL_APPENDS`, `KOSHA_BENCH_WAL_ENABLED` | Write-path benches (`kosha-write`) |
 
 ## Other environment variables
