@@ -19,8 +19,8 @@ pub mod docset;
 pub mod nested;
 pub mod sharding;
 pub use analysis::{
-    AnalysisConfig, AnalyzerSpec, FieldSchema, NamespaceSchema, SegmentAnalysis, TokenFilterSpec,
-    TokenizerKind,
+    AnalysisConfig, AnalyzerSpec, EmbeddingSpec, FieldSchema, NamespaceSchema, SegmentAnalysis,
+    TokenFilterSpec, TokenizerKind,
 };
 pub use docset::{check_filter, evaluate_filter, DocSet};
 pub use fields::{FieldBoost, FieldIndex, FieldStats, ALL_FIELD};
@@ -105,6 +105,73 @@ pub trait ControlStore: Send + Sync {
     ) -> Result<(), KoshaError>;
     fn list_namespaces(&self) -> Vec<NamespaceId>;
     fn namespace_count(&self) -> usize;
+
+    // ── Writer lease and fencing (#254) ───────────────────────────────────
+    //
+    // One writer process owns a namespace at a time. It takes the lease
+    // before it publishes, renews it in the background, and presents the
+    // lease's fencing token on every manifest CAS. A takeover after expiry
+    // raises the token, so a writer that lost its lease (a long pause, a
+    // partition, a second writer pod started by mistake) cannot commit
+    // over its successor. The defaults keep a store without lease support
+    // working exactly as before: every writer is granted token 0 and the
+    // fenced CAS is the plain CAS.
+
+    /// Take the writer lease on `id` for `holder`, valid for `ttl`, and
+    /// return its fencing token. Succeeds when there is no lease, the
+    /// lease expired, or `holder` already holds it (same token, extended).
+    /// A takeover sets the token one above the previous one. `Ok(None)`:
+    /// another holder's lease is live.
+    fn acquire_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        ttl: std::time::Duration,
+    ) -> Result<Option<u64>, KoshaError> {
+        let _ = (id, holder, ttl);
+        Ok(Some(0))
+    }
+
+    /// Extend `holder`'s lease on `id` to `ttl` from now. `Ok(false)` when
+    /// the lease is no longer `holder`'s under `token` (taken over).
+    fn renew_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        token: u64,
+        ttl: std::time::Duration,
+    ) -> Result<bool, KoshaError> {
+        let _ = (id, holder, token, ttl);
+        Ok(true)
+    }
+
+    /// Expire `holder`'s lease now so a successor need not wait out the
+    /// TTL. Keeps the row, and so the token. A no-op when the lease is no
+    /// longer `holder`'s under `token`.
+    fn release_writer_lease(
+        &mut self,
+        id: &NamespaceId,
+        holder: &str,
+        token: u64,
+    ) -> Result<(), KoshaError> {
+        let _ = (id, holder, token);
+        Ok(())
+    }
+
+    /// [`ControlStore::compare_and_swap_manifest`] that also checks the
+    /// writer's fencing token, atomically with the swap: when a lease row
+    /// exists for `id` with a different token, nothing is written and the
+    /// result is [`KoshaError::Fenced`]. `token: None` is the plain CAS.
+    fn compare_and_swap_manifest_fenced(
+        &mut self,
+        id: &NamespaceId,
+        expected_version: u64,
+        new_manifest: Manifest,
+        token: Option<u64>,
+    ) -> Result<(), KoshaError> {
+        let _ = token;
+        self.compare_and_swap_manifest(id, expected_version, new_manifest)
+    }
 
     /// Remove a namespace and its manifest (`DELETE /v1/namespaces/{ns}`).
     ///
@@ -2114,6 +2181,14 @@ pub struct VectorFieldMeta {
     /// #210 reads as `f32`.
     #[serde(default, skip_serializing_if = "VectorQuantization::is_f32")]
     pub quantization: VectorQuantization,
+    /// The embedding model the namespace schema declared for this field
+    /// when the segment was written (#209). A kNN whose vector the server
+    /// embedded with a different model skips this column (and counts it in
+    /// `knn_degraded_segments`) rather than compare two vector spaces.
+    /// `None` — client-supplied vectors, and every footer written before
+    /// #209 — is omitted, so such footers stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
 }
 
 /// Storage of a vector column's ANN posting entries (#210). Centroids and
@@ -2917,6 +2992,16 @@ pub struct KnnQuery {
     /// otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoring: Option<KnnScoring>,
+    /// Native embedding (#209): text the server embeds into `vector` with
+    /// the model the namespace schema declares for `field`. Resolved by
+    /// the HTTP layer before the query reaches the searcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_text: Option<String>,
+    /// The embedding model `vector` came from. Set by the server when it
+    /// embeds `query_text`; a segment whose column records another model
+    /// contributes no kNN hits and is counted in `knn_degraded_segments`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
 }
 
 /// `knn.scoring`.
@@ -2953,6 +3038,19 @@ impl KnnQuery {
 
     /// Shape checks that need no segment. An `Err` is a client error.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(ref text) = self.query_text {
+            // Exactly one of vector / vectors / query_text.
+            if !self.vector.is_empty() || self.vectors.is_some() {
+                return Err("knn takes exactly one of vector, vectors or query_text".into());
+            }
+            if text.trim().is_empty() {
+                return Err("knn.query_text must not be empty".into());
+            }
+            if self.scoring == Some(KnnScoring::LateInteraction) {
+                return Err("knn.query_text cannot be used with late_interaction scoring".into());
+            }
+            return Ok(());
+        }
         if self.vectors.is_some() && !self.vector.is_empty() {
             return Err("knn takes either vector or vectors, not both".into());
         }
@@ -3921,6 +4019,18 @@ pub enum KoshaError {
     /// The request itself is malformed or out of range (e.g. BM25 `b`
     /// outside `[0, 1]`). A client error: maps to HTTP 400.
     InvalidQuery(String),
+    /// This writer no longer owns the namespace (#254): another writer
+    /// holds its writer lease under a newer fencing token. Nothing was
+    /// published. The fenced writer stops accepting writes for the
+    /// namespace. Maps to HTTP 503 with `Retry-After`, so a client retries
+    /// against whichever pod owns the namespace now.
+    Fenced {
+        namespace: NamespaceId,
+        /// The token this writer presented (0: it held none).
+        token: u64,
+        /// The lease's current token (0: unknown).
+        current: u64,
+    },
 }
 
 impl std::fmt::Display for KoshaError {
@@ -3939,6 +4049,9 @@ impl std::fmt::Display for KoshaError {
             Self::Overloaded(msg) => write!(f, "overloaded: {msg}"),
             Self::ControlPlane(msg) => write!(f, "control plane unavailable: {msg}"),
             Self::InvalidQuery(msg) => write!(f, "invalid query: {msg}"),
+            Self::Fenced { namespace, token, current } => write!(f,
+                "writer fenced for {}: presented fencing token {token}, current token {current}; \
+                 another writer owns this namespace", namespace.0),
         }
     }
 }
@@ -5332,5 +5445,41 @@ mod rerank_spec {
             serde_json::from_str(r#"{"doc_id": "a", "score": 1.0, "fields": []}"#).unwrap();
         let v = serde_json::to_value(hit).unwrap();
         assert!(v.get("fused_score").is_none() && v.get("rerank_score").is_none());
+    }
+}
+
+#[cfg(test)]
+mod knn_query_text {
+    use super::*;
+
+    fn knn(json: &str) -> KnnQuery {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn exactly_one_of_vector_vectors_or_query_text() {
+        assert!(knn(r#"{"field": "e", "query_text": "red shoes"}"#)
+            .validate()
+            .is_ok());
+        for bad in [
+            r#"{"field": "e", "query_text": "x", "vector": [1.0]}"#,
+            r#"{"field": "e", "query_text": "x", "vectors": [[1.0]]}"#,
+            r#"{"field": "e", "query_text": "  "}"#,
+            r#"{"field": "e", "query_text": "x", "scoring": "late_interaction"}"#,
+            r#"{"field": "e"}"#,
+        ] {
+            assert!(knn(bad).validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn absent_fields_serialize_as_before() {
+        let v = serde_json::to_value(knn(r#"{"field": "e", "vector": [1.0]}"#)).unwrap();
+        assert!(v.get("query_text").is_none() && v.get("embedding_model").is_none());
+        let meta: VectorFieldMeta =
+            serde_json::from_str(r#"{"name": "e", "dim": 4, "count": 1, "slot": 0}"#).unwrap();
+        assert_eq!(meta.embedding_model, None);
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("embedding_model"), "{json}");
     }
 }

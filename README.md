@@ -44,6 +44,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | Multiple vector columns | A namespace can hold several `Vector` fields (e.g. a 384-dim `title_emb` and a 1536-dim `body_emb`); each segment builds one index per field and `knn.field` picks the one searched. Each field has one dimension per namespace, fixed by the first vector written to it: a document whose vector disagrees is rejected with a 400, and so is a `knn` naming a field no segment indexes or a query vector of the wrong dimension. Segments written before this change keep serving any `knn.field` from their single index, unless their `doc_vectors.bin` names exactly one field (#204) |
 | i8 vector quantization | `KOSHA_VECTOR_QUANTIZATION=i8` (or per field, `KOSHA_VECTOR_QUANTIZATION_FIELDS=body_emb:i8,title_emb:f32`) stores each segment's ANN posting entries as one f32 scale plus `dim` signed bytes instead of `dim` f32s: `vector.idx`, the bytes a cold kNN hydrates and the warm posting cache all shrink ~4x (measured 3.96x at 768 dims). The probe scores with an i8 dot product, then rescores its best `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates (default 4, `0` disables) with the full-precision vectors in `doc_vectors.bin`, so final scores are exact cosine. f32 and i8 segments mix freely in a namespace. Default `f32`; see the rollout note below (#210) |
 | Late-interaction (ColBERT-style) vectors | A `Vector` field whose value is a bag of token vectors (`[[f32; dim]; n]`) is indexed for MaxSim: `"knn": {"field": "tokens", "vectors": [[...], [...]], "k": 10}` scores `Σ over query tokens of max cosine over the document's tokens`. See [Late interaction](#late-interaction) |
+| Native embedding | A vector field may declare `"embedding": {"model", "dims", "provider"}` in the namespace schema; the server then embeds text sent for it and `"knn": {"field": "emb", "query_text": "..."}` with that model (OpenAI-compatible HTTP provider or a deterministic mock). Changing the model of an indexed field is a 409. See [Native embedding](#native-embedding) |
 | kNN-scoped filters | `knn.filter` restricts only the vector list; the top-level `filter` restricts both the lexical and the vector list |
 | Filtered kNN | Filters are applied inside the probe, and a filtered kNN always returns `min(k, documents passing)` hits. When at most 50,000 documents pass namespace-wide (`KOSHA_KNN_EXACT_THRESHOLD`; `0` disables), every passing document's vector is scored exactly instead of probing centroids, so recall is 1.0. A segment where at most 1% of documents pass (`KOSHA_KNN_EXACT_FRACTION`) is searched exactly too. Otherwise the global probe budget is widened by the inverse of the filter's selectivity (at most 8x, `KOSHA_KNN_FILTER_BUDGET_MAX_SCALE`). The response reports `knn_mode` (`ann` / `exact` / `mixed`) and `knn_filtered_candidates` (documents passing the filter). Unfiltered kNN is unchanged and reports `ann` |
 | Sorting | Multi-field `sort` over stored fields and [nested dotted paths](#nested-attributes), plus `_id`. A multi-valued field sorts by its smallest value for `asc` and its largest for `desc` (Elasticsearch's default `mode`) |
@@ -238,7 +239,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - Write-ahead log for buffered documents, replayed on restart.
 - Auto-flush at a configurable document threshold (`KOSHA_FLUSH_THRESHOLD`), plus an explicit `flush` that indexes writes immediately. A buffer that stays below the threshold is flushed and published once it has been pending for `KOSHA_FLUSH_MAX_AGE_MS` (default 1000; `0` disables), similar to Elasticsearch's `refresh_interval`. The Python client flushes only on `refresh=True` / `"wait_for"` or `indices.refresh()`, not after every bulk batch.
 - Read-your-writes without a flush (#255): searches default to `"consistency": "strong"` (body field, or `consistency=` on `GET /search`), which also scans the namespace's acknowledged-but-unindexed writes exhaustively — on a query pod by reading them from the ingest pod over `GET /internal/namespaces/{ns}/unindexed` (needs `KOSHA_INTERNAL_API_KEY` on both; without it a query pod defaults to `eventual` and refuses an explicit `strong` with 503). Upserts show only the newest version and deletes apply immediately; `exhaustive_search_count` in the response is how many unindexed documents were scanned. While the ingest pod has flushed but not yet published a new manifest (an upload in flight, or publication failing), a strong search on a query pod is answered from the last published manifest instead of failing, and the response carries `consistency_fallback` saying why; otherwise the field is absent. `"eventual"` searches indexed segments only. `KOSHA_DEFAULT_CONSISTENCY` sets the default. The unindexed backlog per namespace is capped by `KOSHA_MAX_UNINDEXED_BYTES` (default 2 GiB, `0` disables) and `KOSHA_MAX_UNINDEXED_DOCS` (unset by default): past either, `/index` and `/replace` return 429 with `retry-after: 1`. The ingest pod's `GET /v1/stats` reports `unindexed_documents` / `unindexed_bytes` per namespace.
-- Size-tiered compaction with a cap on merged-segment size (5 GiB default). A background scheduler on the write pod runs a tiered pass on any namespace past the segment trigger every `KOSHA_COMPACTION_INTERVAL_MS` (default 30000; `0` disables), at most `KOSHA_COMPACTION_MAX_CONCURRENT` passes at a time (default 1). Every pass plans its merge group from S3 object sizes before downloading anything, hydrates only that group, and evicts the superseded inputs from local disk once the merge is published, so a pass needs about 2 x the cap of local disk rather than the whole namespace. A `full` pass loops capped groups inside one job until none fits; job results report `groups`, `bytes_hydrated`, `bytes_evicted` and `peak_local_bytes`. `POST /v1/admin/compact-namespace` also accepts `"async": true` and returns `202` with a job id; poll `GET /v1/admin/compaction-jobs/{id}`, or see scheduler state in `GET /v1/admin/compaction-status`. Building a segment (flush or merge) keeps at most `KOSHA_SEGMENT_BUILD_MEMORY_BYTES` (default 256 MiB) of postings in memory: stored documents stream to disk as they're added, and postings over the budget spill to sorted runs that are merged on disk when the segment is finished. That final merge streams each term's postings through the encoder, so a term that appears in every document doesn't need its posting list in memory, and compaction passes vectors through as f32. A merge's peak heap is about the budget plus ~35 B per merged document (doc-store offsets and field lengths) plus the vocabulary, not counting short filter values and vectors (#253).
+- Size-tiered compaction with a cap on merged-segment size (5 GiB default). A background scheduler (on the `indexer` pod, or on the write pod unless `KOSHA_COMPACTION_ON_INGEST=false`) runs a tiered pass on any namespace past the segment trigger every `KOSHA_COMPACTION_INTERVAL_MS` (default 30000; `0` disables), at most `KOSHA_COMPACTION_MAX_CONCURRENT` passes at a time (default 1). Every pass plans its merge group from S3 object sizes before downloading anything, hydrates only that group, and evicts the superseded inputs from local disk once the merge is published, so a pass needs about 2 x the cap of local disk rather than the whole namespace. A `full` pass loops capped groups inside one job until none fits; job results report `groups`, `bytes_hydrated`, `bytes_evicted` and `peak_local_bytes`. `POST /v1/admin/compact-namespace` also accepts `"async": true` and returns `202` with a job id; poll `GET /v1/admin/compaction-jobs/{id}`, or see scheduler state in `GET /v1/admin/compaction-status`. Building a segment (flush or merge) keeps at most `KOSHA_SEGMENT_BUILD_MEMORY_BYTES` (default 256 MiB) of postings in memory: stored documents stream to disk as they're added, and postings over the budget spill to sorted runs that are merged on disk when the segment is finished. That final merge streams each term's postings through the encoder, so a term that appears in every document doesn't need its posting list in memory, and compaction passes vectors through as f32. A merge's peak heap is about the budget plus ~35 B per merged document (doc-store offsets and field lengths) plus the vocabulary, not counting short filter values and vectors (#253).
 - Segment garbage collection. Every publish records the segments and deletion generations it stops referencing in the manifest (`retired`). Each pod removes its local copies once `KOSHA_LOCAL_GC_GRACE` (default 5m) has passed and no in-flight search can still read them, checked every `KOSHA_LOCAL_GC_INTERVAL_MS` (default 60000; `0` disables). `POST /v1/admin/gc` `{"namespace"?, "dry_run": true}` lists (dry run, the default) or deletes the S3 objects no current manifest references: retired ones after `KOSHA_GC_GRACE` (default 1h), never-recorded orphans after `KOSHA_GC_ORPHAN_GRACE` (default 24h). A segment's `_COMMIT` is deleted before its data. Counters (`kosha_gc_bytes_reclaimed_total`, `kosha_gc_segments_deleted_total`, `kosha_retired_segments`, local equivalents) are under `gc` in `GET /v1/stats`. `k8s/base/cronjob-segment-gc.yaml` runs it daily, shipped suspended and in dry-run mode.
 
 ### Storage and caching
@@ -253,6 +254,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - Cross-replica hydration leases in Postgres: one pod fetches a cold segment from S3, its peers stream the bytes from it over `GET /internal/segment/...` rather than stampeding S3.
 - Bloom filters over terms and filter fields, so a segment that cannot match is skipped without being read.
 - Columnar filter index (#244, `KOSHA_FILTERS_WRITE_VERSION=2`; default `1` keeps the row-oriented `filters.bin`): one file per filter column plus a small `filters.toc`, with dictionary + roaring-bitmap string columns, zone-mapped numeric columns, and per-column stats in the footer. A query node fetches only the TOC and the columns the query's filter, sort, collapse and aggregations name — about 3.6% of the filter bytes for a one-field filter in the `filtered_broad_query` bench. Columnar segments evaluate filters from term bitmaps, zone maps and presence bitmaps, and aggregate and sort from the column arrays: `term`/`terms`/`range` filters are 40x+ faster on a 1M-document segment (`filter_eval_1m` bench). Readers handle both formats; see DESIGN.md §6.2 for the rollout and rollback rules.
+- Explicit roles and single-writer fencing (#254). `KOSHA_ROLE` is `query`, `ingest`, `indexer` or `standalone`, validated at startup (unset keeps the old inference from `KOSHA_INGEST_HOST`; `compaction` is refused in favour of `indexer`). Writer pods take a per-namespace writer lease in the control store (`kosha.writer_leases`, migration 003), renew it every TTL/3 (`KOSHA_WRITER_LEASE_TTL_MS`, default 30000) and present its fencing token on every manifest CAS. A second writer is refused with 503 + `Retry-After`; a writer whose lease was taken over stops accepting writes for the namespace and drops its unpublished state instead of rebasing. `KOSHA_WRITER_LEASE=off` restores plain CAS. The `indexer` role runs compaction off the ingest pod (`KOSHA_COMPACTION_ON_INGEST=false` there) and serves only probes and the compaction admin API. Rollout: binaries from before #254 do not check fencing, so keep ingest at `replicas: 1` with `Recreate` and roll every writer to a fencing build.
 - Namespace warmup on boot, gated behind `/readyz` so traffic is not routed to a cold pod. Warming is usage-driven (#213): pods count reads per namespace, segment and file class, persist the hot set to `_warmset/<role>.json` in S3, and warm it at the next boot alongside the explicit `KOSHA_WARMUP_NAMESPACES`. Query pods poll the manifest version of hot namespaces (`KOSHA_REWARM_INTERVAL_MS`, default 5000) and fetch the segments a flush or compaction adds before the next query. `KOSHA_WARMUP_BUDGET_BYTES` caps what warming keeps local (hottest first); `GET /v1/admin/warmup-status` reports what was warmed and skipped. `KOSHA_WARMUP_USAGE=0` turns the usage-driven part off.
 
 ### Control plane and operations
@@ -280,6 +282,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - Multi-field scoring other than a boosted sum (`dis_max` / `best_fields` tie-breakers, turbopuffer `Product` / `Max` of fields), field-name patterns in `fields`, and block-max WAND for `fields` queries.
 - Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document.
 - Fuzzy: block-max WAND over expansions (fuzzy queries score every posting of every expansion), highlighting of fuzzy matches, fuzzy inside `fields` / `match_phrase`, bloom pruning for two-edit tokens.
+- Native embedding with a local model runtime (ONNX / candle): only the HTTP and mock providers exist. A model change does not reindex automatically, late-interaction bags are not embedded, and the original text of an embedded field is not kept.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
 - A namespace-level centroid index shared across segments and updated from the WAL (#253 step 2): each segment still carries its own postings, and a kNN probes every segment's centroids under the global budget.
 
@@ -478,6 +481,49 @@ tokens). Queries: 8,000 documents x 64 tokens, 32 query tokens: warm p50 15.3 ms
 against brute-force MaxSim 1.000 (single-vector kNN over mean-pooled tokens: 1.1 ms, but only
 0.40 of the MaxSim top 10). 4,000 x 32 tokens at 64 dim, 16 query tokens: 1.9 ms. Single-vector
 kNN is unchanged when the feature is unused (`knn_open_search` p50s identical to main).
+
+## Native embedding
+
+Opt-in server-side embedding (issue #209). Declare a model on a vector field in the namespace
+schema, then send text for that field and `knn.query_text` instead of vectors. Both are embedded
+with the same model, so the write path and the query path cannot drift apart:
+
+```json
+POST /v1/namespaces/shop/schema
+{"fields": {"emb": {"type": "FIELD_TYPE_VECTOR",
+                    "embedding": {"model": "text-embedding-3-small", "dims": 1536, "provider": "http"}}}}
+
+POST /v1/namespaces/shop/documents
+{"documents": [{"id": "p1", "fields": [{"name": "emb", "field_type": "Text", "value": "red trail running shoes"}]}]}
+
+POST /v1/namespaces/shop/search
+{"query_text": "", "knn": {"field": "emb", "query_text": "shoes for running", "k": 10}}
+```
+
+- **Providers** are configured per pod (`KOSHA_EMBEDDING_PROVIDERS`, see
+  [configuration](docs/configuration.md#native-embedding)): `http` calls any OpenAI-compatible
+  `POST {KOSHA_EMBEDDING_URL}/embeddings` in batches, and `mock` is a deterministic hashed bag of
+  words for tests. Query pods need the same settings as ingest pods;
+  an `indexer` pod needs none (compaction copies vectors and never embeds). `provider` may be omitted
+  (`http` when enabled, else `mock`).
+- **Ingest.** A value of an embedded field that is text (not a JSON number array) is embedded
+  and replaced by its vector before the write reaches the WAL, so replay, compaction and the doc
+  store hold vectors only (the text is not kept; a document reads back with its vector). A
+  number array is accepted as is when it has the declared `dims`, otherwise 400. A model this
+  pod has no provider for is a 503, an unreachable or timed-out provider a 503, and a provider
+  that answers with an error or the wrong dimension a 502. Nothing is written on any of them.
+- **Query.** `knn` takes exactly one of `vector`, `vectors` or `query_text`. `query_text` against
+  a field with no declared model is a 400. Non-kNN queries, and namespaces that declare no model,
+  never touch a provider.
+- **Model pinning.** Each segment records the model in its footer
+  (`vector_fields[].embedding_model`). Changing a field's model or `dims` while the namespace
+  holds vectors for it (in a segment or still buffered) is a 409 (`field "emb" is indexed with
+  model A; changing to B requires a reindex`); with no data it is allowed. Should a segment of
+  another model still be searched, it contributes no kNN hits and is counted in
+  `knn_degraded_segments`, so two vector spaces are never compared.
+- **Rollback.** All new keys are optional and omitted when unused, so old manifests, footers and
+  WAL records read unchanged. An older binary ignores `embedding` in a schema; text sent to it
+  for a vector field fails vector parsing as it always has.
 
 ## Namespace sharding
 
@@ -713,6 +759,7 @@ back requires converting both formats. The SQL column needs no schema change.
     gen/                    generated stubs + OpenAPI spec (git-ignored)
     tools/codegen/          code generation scripts and docs
     scripts/conformance/    end-to-end BM25 + filter correctness suite
+    scripts/integration/    ingest + query pods over MinIO + Postgres (CI job)
     scripts/bench/          large-scale benchmark harness
     docs/                   configuration reference, development guides
     DESIGN.md               architecture document

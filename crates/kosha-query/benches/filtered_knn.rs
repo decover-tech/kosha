@@ -138,6 +138,8 @@ fn query(vector: Vec<f32>, k: usize, num_candidates: usize, field: &str) -> Sear
     }))
     .unwrap();
     q.knn = Some(KnnQuery {
+        query_text: None,
+        embedding_model: None,
         field: "embedding".into(),
         vector,
         k,

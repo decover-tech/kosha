@@ -178,5 +178,7 @@ runs:
           kubectl -n kosha rollout restart "deployment/$d"
         done
         for d in kosha kosha-query; do
-          kubectl -n kosha rollout status "deployment/$d" --timeout=5m
+          # A query pod is ready only after warming its namespaces (minutes for
+          # a few GB), and pods roll one at a time.
+          kubectl -n kosha rollout status "deployment/$d" --timeout=20m
         done

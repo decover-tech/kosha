@@ -243,6 +243,18 @@ impl CompactionRegistry {
         &self.config
     }
 
+    /// Namespaces with a pass running right now.
+    pub fn running_namespaces(&self) -> std::collections::HashSet<NamespaceId> {
+        self.inner
+            .lock()
+            .unwrap()
+            .namespaces
+            .iter()
+            .filter(|(_, stats)| stats.running_job.is_some())
+            .map(|(ns, _)| ns.clone())
+            .collect()
+    }
+
     /// Register a running job for `namespace`. Returns `Err(job_id)` of the
     /// job already running there; the caller must not start another.
     pub fn try_start(

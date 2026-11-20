@@ -9,18 +9,16 @@
 # /v1/admin/compaction-jobs/{id} rather than holding a 3-hour request open.
 # The comments below predate the scheduler.
 #
-# There is no "compaction pod" to deploy, despite DESIGN.md §5 describing
-# three node types: `KOSHA_ROLE` is read once (main.rs:2921) and used only
-# in a log line (main.rs:2954). The behavioural split is `KOSHA_INGEST_HOST`
-# — set means "forward writes to the ingest", unset means "execute them
-# locally". A pod started with KOSHA_ROLE=compaction and no
-# KOSHA_INGEST_HOST would therefore come up as a *second write-executing
-# ingest*, mutating the same manifests as the real one with no coordination
-# between them, and would compact nothing anyway because no code path
-# triggers compaction at startup.
+# Since #254 the compaction pod exists: the kosha-indexer Deployment
+# (KOSHA_ROLE=indexer, k8s/base/deployment-indexer.yaml) runs the scheduler
+# and the ingest pod sets KOSHA_COMPACTION_ON_INGEST=false. KOSHA_ROLE is now
+# validated at startup; the old value `compaction` is refused (it used to
+# start a second, uncoordinated writer) with a pointer to `indexer`, and
+# every writer holds a per-namespace writer lease whose fencing token each
+# manifest CAS checks.
 #
-# The only thing that actually compacts is POST /v1/admin/compact-namespace
-# on the existing ingest, so that is what this calls.
+# This CronJob calls POST /v1/admin/compact-namespace through the ingest
+# service, which still serves the admin compaction API.
 #
 # Why it is needed: paragraph_index_hnsw reached 1,529 segments at manifest
 # version ~5460 with a 12MB manifest, because KoshaClient.bulk() issues an
