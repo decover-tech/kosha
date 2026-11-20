@@ -115,6 +115,49 @@ impl DocSet {
         }
     }
 
+    /// Adds every member of `bitmap` (a roaring bitmap of `doc_seq`s, as a
+    /// columnar filter index stores per term). Members outside `0..len`
+    /// are ignored, as by [`Self::insert`].
+    pub fn insert_bitmap(&mut self, bitmap: &roaring::RoaringBitmap) {
+        for doc_seq in bitmap.range(..self.len) {
+            self.words[(doc_seq / 64) as usize] |= 1u64 << (doc_seq % 64);
+        }
+    }
+
+    /// Removes every `doc_seq` in `doc_seqs` (e.g. a segment's deleted
+    /// documents). Ones outside `0..len` are ignored.
+    pub fn remove_all<'a>(&mut self, doc_seqs: impl IntoIterator<Item = &'a u32>) {
+        for &doc_seq in doc_seqs {
+            if doc_seq < self.len {
+                self.words[(doc_seq / 64) as usize] &= !(1u64 << (doc_seq % 64));
+            }
+        }
+    }
+
+    /// Whether any member lies in `first..=last`. A scoring loop asks this
+    /// per postings block to skip blocks the filter rules out entirely.
+    pub fn any_in_range(&self, first: u32, last: u32) -> bool {
+        let last = last.min(self.len.saturating_sub(1));
+        if first > last || self.len == 0 {
+            return false;
+        }
+        let (fw, lw) = ((first / 64) as usize, (last / 64) as usize);
+        let low_mask = u64::MAX << (first % 64);
+        let high_mask = u64::MAX >> (63 - last % 64);
+        if fw == lw {
+            return self.words[fw] & low_mask & high_mask != 0;
+        }
+        self.words[fw] & low_mask != 0
+            || self.words[fw + 1..lw].iter().any(|w| *w != 0)
+            || self.words[lw] & high_mask != 0
+    }
+
+    /// The members as a roaring bitmap, for consumers that want the
+    /// compressed form (e.g. a filtered vector probe, #252).
+    pub fn to_bitmap(&self) -> roaring::RoaringBitmap {
+        roaring::RoaringBitmap::from_sorted_iter(self.iter()).expect("iter is ascending")
+    }
+
     /// The members, in ascending `doc_seq` order.
     pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
         self.words.iter().enumerate().flat_map(|(index, &word)| {
@@ -395,6 +438,36 @@ mod tests {
         assert!(!rest.contains(64));
         assert_eq!(DocSet::full(0).count(), 0);
         assert_eq!(DocSet::full(64).count(), 64);
+    }
+
+    #[test]
+    fn docset_ranges_bitmaps_and_removal() {
+        let mut set = DocSet::empty(200);
+        for d in [3, 64, 130, 199] {
+            set.insert(d);
+        }
+        assert!(set.any_in_range(0, 3));
+        assert!(!set.any_in_range(4, 63));
+        assert!(set.any_in_range(4, 64));
+        assert!(set.any_in_range(65, 500), "last clamps to the universe");
+        assert!(!set.any_in_range(65, 129));
+        assert!(!set.any_in_range(10, 5));
+        assert!(!DocSet::empty(0).any_in_range(0, 0));
+        // Brute force against contains on every window.
+        for first in 0..200 {
+            for last in first..200 {
+                let want = (first..=last).any(|d| set.contains(d));
+                assert_eq!(set.any_in_range(first, last), want, "{first}..={last}");
+            }
+        }
+
+        let bitmap = set.to_bitmap();
+        assert_eq!(bitmap.iter().collect::<Vec<_>>(), vec![3, 64, 130, 199]);
+        let mut copy = DocSet::empty(150);
+        copy.insert_bitmap(&bitmap);
+        assert_eq!(copy.iter().collect::<Vec<_>>(), vec![3, 64, 130]);
+        copy.remove_all(&[64, 999]);
+        assert_eq!(copy.iter().collect::<Vec<_>>(), vec![3, 130]);
     }
 
     #[test]

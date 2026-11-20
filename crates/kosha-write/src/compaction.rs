@@ -80,6 +80,26 @@ pub struct CompactResult {
     pub segments_before: usize,
     pub segments_after: usize,
     pub segments_merged: usize,
+    /// The segments this merge consumed (empty when nothing merged). They
+    /// are gone from the manifest once the merge publishes, so the caller
+    /// may evict their local copies (#242).
+    pub merged_inputs: Vec<SegmentId>,
+    /// The segment the merge produced, if it merged.
+    pub output: Option<SegmentId>,
+}
+
+impl CompactResult {
+    /// A pass that merged nothing.
+    pub fn unchanged(segments: usize) -> Self {
+        Self {
+            merged: false,
+            segments_before: segments,
+            segments_after: segments,
+            segments_merged: 0,
+            merged_inputs: Vec::new(),
+            output: None,
+        }
+    }
 }
 
 /// Planned merge inputs (segment ids + doc counts at selection time).
@@ -197,6 +217,30 @@ where
             Some(MergePlan { inputs: candidates })
         }
     }
+}
+
+/// Plan one merge group *before* anything is hydrated (#242).
+///
+/// Same selection as [`select_merge_inputs`], but every manifest segment is
+/// a candidate whether or not it is on local disk: `segment_bytes` reports
+/// its size from object storage (S3 object sizes), so a `full` pass no
+/// longer has to download the whole namespace just to learn which segments
+/// fit under `max_merged_segment_bytes`. The caller hydrates only the
+/// returned group, merges it with [`crate::Indexer::compact_planned`], and
+/// evicts the inputs once the merge is published. Peak local disk for one
+/// group is then its inputs plus its output, about `2 x cap`.
+///
+/// An unknown size (`None`) never joins a capped group, exactly as in
+/// `select_merge_inputs`.
+pub fn plan_merge_group<G>(
+    manifest: &Manifest,
+    opts: &CompactOptions,
+    segment_bytes: G,
+) -> Option<MergePlan>
+where
+    G: FnMut(&SegmentId) -> Option<u64>,
+{
+    select_merge_inputs(manifest, opts, |_| true, segment_bytes)
 }
 
 #[cfg(test)]
@@ -352,6 +396,60 @@ mod tests {
         // make 30 > 25 → prefix stops at two inputs.
         let plan = select_merge_inputs(&m, &opts, |_| true, |_| Some(10)).expect("plan");
         assert_eq!(plan.inputs.len(), 2);
+    }
+
+    /// #242: planning from remote sizes. Nothing is local; the plan must
+    /// still pick the smallest-first group under the cap, never let a
+    /// segment of unknown size join it, and terminate once nothing fits.
+    #[test]
+    fn plan_merge_group_uses_remote_sizes_and_skips_unknown() {
+        let m = manifest(vec![
+            entry("s1", 1),
+            entry("s2", 1),
+            entry("unknown", 1),
+            entry("s3", 1),
+            entry("s4", 1),
+            entry("huge", 1),
+        ]);
+        let remote = |id: &SegmentId| -> Option<u64> {
+            match id.0.as_str() {
+                "s1" => Some(30),
+                "s2" => Some(10),
+                "s3" => Some(40),
+                "s4" => Some(25),
+                "huge" => Some(1_000),
+                _ => None, // S3 listed nothing for it
+            }
+        };
+        let mut opts = CompactOptions::full();
+        opts.policy.max_merged_segment_bytes = 70;
+        let plan = plan_merge_group(&m, &opts, remote).expect("plan");
+        let ids: Vec<&str> = plan
+            .inputs
+            .iter()
+            .map(|e| e.segment_id.0.as_str())
+            .collect();
+        // 10 + 25 + 30 = 65 fits; adding s3 (40) would exceed 70.
+        assert_eq!(ids, vec!["s2", "s4", "s1"]);
+        assert!(!ids.contains(&"unknown"));
+
+        // Even with an uncapped-looking budget, an unknown size stays out.
+        opts.policy.max_merged_segment_bytes = u64::MAX - 1;
+        let plan = plan_merge_group(&m, &opts, remote).expect("plan");
+        assert!(plan.inputs.iter().all(|e| e.segment_id.0 != "unknown"));
+
+        // Only unknown sizes left: no group, so a looping pass stops.
+        let m2 = manifest(vec![entry("u1", 1), entry("u2", 1)]);
+        assert!(plan_merge_group(&m2, &opts, |_| None).is_none());
+
+        // Tiered planning works from remote sizes too.
+        let tiered = CompactOptions::tiered(CompactionPolicy {
+            max_merged_segment_bytes: 70,
+            ..CompactionPolicy::default()
+        });
+        let plan = plan_merge_group(&m, &tiered, remote).expect("plan");
+        assert!(plan.inputs.len() >= 2);
+        assert!(plan.inputs.iter().all(|e| e.segment_id.0 != "unknown"));
     }
 
     #[test]

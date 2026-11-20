@@ -1,4 +1,7 @@
 pub mod analysis;
+pub mod filter_columns;
+pub mod filter_eval;
+pub mod span_cache;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -9,8 +12,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use instant_distance::{Builder, HnswMap, Point, Search};
 use kosha_core::{
     build_filter_blooms, build_term_bloom, AggBucket, AggBucketResult, AggMetricResult,
-    AggregationResults, Bm25Params, DocRecord, DocumentId, Field, FieldType, FilterStore, Footer,
-    KoshaError, LocalStorage, Posting, SegmentId, StorageBackend, VectorStore,
+    AggregationResults, Bm25Params, DocRecord, DocSet, DocumentId, Field, FieldType, FilterClause,
+    FilterStore, Footer, KoshaError, LocalStorage, Posting, SegmentId, StorageBackend, VectorStore,
 };
 use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 
@@ -69,6 +72,13 @@ pub struct SegmentWriter {
     /// Spill `inverted_index` to a sorted run once `inverted_bytes` passes
     /// this. See [`segment_build_memory_bytes`].
     build_memory_bytes: usize,
+    /// Inverted-index version `finalize` writes; see
+    /// [`postings_write_version`].
+    postings_write_version: u32,
+    /// Leave every `postings-*.bin` shard raw (no zstd wrapper) so query
+    /// nodes can range-read single terms (#245); recorded as
+    /// `Footer::posting_blobs_raw`. See [`posting_blobs_raw`].
+    posting_blobs_raw: bool,
     /// Sorted posting runs spilled so far, oldest (lowest doc_seq) first.
     runs: Vec<PathBuf>,
     /// First I/O error from streaming in `add_document`, which can't return
@@ -87,6 +97,12 @@ pub struct SegmentWriter {
     filter_string: HashMap<String, Vec<(u32, String)>>,
     filter_integer: HashMap<String, Vec<(u32, i64)>>,
     filter_float: HashMap<String, Vec<(u32, f64)>>,
+    /// Filter index format `finalize` writes: `1` = `filters.bin`, `2` =
+    /// columnar (#244). See [`filter_columns::filters_write_version`].
+    filters_write_version: u32,
+    /// The column directory `write_filters` produced in columnar mode,
+    /// recorded as `Footer::filter_columns`.
+    filter_columns_meta: Option<Vec<kosha_core::FilterColumnMeta>>,
     vectors: Vec<(u32, Vec<f32>)>,
     /// See [`text_filter_ignore_above`]. Captured per writer so tests can
     /// override it without touching the process-wide env.
@@ -187,6 +203,8 @@ impl SegmentWriter {
             inverted_bytes: 0,
             peak_inverted_bytes: 0,
             build_memory_bytes: segment_build_memory_bytes(),
+            postings_write_version: postings_write_version(),
+            posting_blobs_raw: posting_blobs_raw(),
             runs: Vec::new(),
             io_error: None,
             finalized: false,
@@ -196,6 +214,8 @@ impl SegmentWriter {
             filter_string: HashMap::new(),
             filter_integer: HashMap::new(),
             filter_float: HashMap::new(),
+            filters_write_version: filter_columns::filters_write_version(),
+            filter_columns_meta: None,
             vectors: Vec::new(),
             text_filter_ignore_above: text_filter_ignore_above(),
             vector_store_mode: VectorStoreMode::from_env(),
@@ -255,6 +275,30 @@ impl SegmentWriter {
         self
     }
 
+    /// Override the inverted-index version (tests; production uses
+    /// `KOSHA_POSTINGS_WRITE_VERSION`).
+    #[cfg(test)]
+    fn with_postings_write_version(mut self, version: u32) -> Self {
+        self.postings_write_version = version;
+        self
+    }
+
+    /// Override whether posting shards are written raw (#245). Production
+    /// writers use `KOSHA_POSTINGS_RAW_BLOBS`; see [`posting_blobs_raw`].
+    pub fn with_raw_posting_blobs(mut self, raw: bool) -> Self {
+        self.posting_blobs_raw = raw;
+        self
+    }
+
+    /// Override the filter index format (#244): `1` writes `filters.bin`,
+    /// `2` the columnar `filters.toc` + `filters-NNN.col`. Production
+    /// writers use `KOSHA_FILTERS_WRITE_VERSION`; see
+    /// [`filter_columns::filters_write_version`].
+    pub fn with_filters_write_version(mut self, version: u32) -> Self {
+        self.filters_write_version = version;
+        self
+    }
+
     /// Override where this writer stores parsed vector values (#243).
     /// Production writers use `KOSHA_VECTOR_STORE`; see [`VectorStoreMode`].
     pub fn with_vector_store_mode(mut self, mode: VectorStoreMode) -> Self {
@@ -271,12 +315,34 @@ impl SegmentWriter {
         self
     }
 
-    pub fn add_document(&mut self, doc_id: DocumentId, mut fields: Vec<Field>) {
+    pub fn add_document(&mut self, doc_id: DocumentId, fields: Vec<Field>) {
+        self.add_document_with_vectors(doc_id, fields, Vec::new());
+    }
+
+    /// [`Self::add_document`] with some `Vector` fields' values supplied
+    /// already parsed, as `(index into fields, vector)`. Compaction uses
+    /// this with [`SegmentReader::iter_doc_records_raw`] so sidecar vectors
+    /// pass through as f32 instead of being printed to JSON by the reader
+    /// and parsed back here (#242). A supplied vector is used as is, so it
+    /// stays bit-identical; the field's own value is ignored, and may be
+    /// the empty sidecar placeholder. If the vector ends up stored inline
+    /// (`KOSHA_VECTOR_STORE=inline`, or an empty vector) and the field's
+    /// value is empty, the writer fills in its JSON, exactly as
+    /// `SegmentReader::doc_record_full` would have.
+    pub fn add_document_with_vectors(
+        &mut self,
+        doc_id: DocumentId,
+        mut fields: Vec<Field>,
+        mut vectors: Vec<(usize, Vec<f32>)>,
+    ) {
         let doc_seq = self.field_lengths.len() as u32;
         let mut field_length: u32 = 0;
         // Vector fields whose value moves to `doc_vectors.bin` (#243); their
         // doc-store value is blanked after the loop below.
         let mut moved_to_sidecar: Vec<usize> = Vec::new();
+        // Supplied vectors stored inline in place of an empty value:
+        // `(field index, index into self.vectors)`.
+        let mut needs_json: Vec<(usize, usize)> = Vec::new();
         // Position of the next `Text` value's first token (#249): each
         // value starts `position_gap` past the previous one's last token,
         // so no phrase spans two values. Always 0 without a field index.
@@ -402,7 +468,16 @@ impl SegmentWriter {
                     }
                 }
                 FieldType::Vector => {
-                    if let Ok(vec) = serde_json::from_str::<Vec<f32>>(&field.value) {
+                    let supplied = vectors
+                        .iter_mut()
+                        .find(|(i, _)| *i == index)
+                        .map(|(_, v)| std::mem::take(v));
+                    let was_supplied = supplied.is_some();
+                    let parsed = match supplied {
+                        Some(vec) => Some(vec),
+                        None => serde_json::from_str::<Vec<f32>>(&field.value).ok(),
+                    };
+                    if let Some(vec) = parsed {
                         // An empty value is the sidecar placeholder; a
                         // literal `[]` would be indistinguishable from it
                         // once blanked, so it stays inline.
@@ -424,6 +499,8 @@ impl SegmentWriter {
                                 self.vectors.len() as u32,
                             ));
                             moved_to_sidecar.push(index);
+                        } else if was_supplied && field.value.is_empty() {
+                            needs_json.push((index, self.vectors.len()));
                         }
                         self.vectors.push((doc_seq, vec));
                     }
@@ -456,6 +533,14 @@ impl SegmentWriter {
         }
         for index in moved_to_sidecar {
             fields[index].value.clear();
+        }
+        for (index, v) in needs_json {
+            match serde_json::to_string(&self.vectors[v].1) {
+                Ok(json) => fields[index].value = json,
+                Err(e) => {
+                    self.io_error.get_or_insert(e.into());
+                }
+            }
         }
 
         self.total_field_length += field_length as u64;
@@ -615,8 +700,9 @@ impl SegmentWriter {
         // Every spilled run plus what's still in memory, merged in term
         // order. Sorted term order is load-bearing: the reader
         // binary-searches the term table (see `LazyInvertedIndex::find`).
-        // Memory: one term's postings at a time plus the term table, not the
-        // whole index (#242).
+        // Memory: the term table plus a bounded per-term encoder; a term's
+        // postings stream from the runs into it and are never all resident,
+        // however many documents contain the term (#242).
         let mut sources: Vec<PostingSource> = Vec::with_capacity(self.runs.len() + 1);
         for path in &self.runs {
             sources.push(PostingSource::Run(RunReader::open(path)?));
@@ -625,7 +711,7 @@ impl SegmentWriter {
             .into_iter()
             .collect();
         in_memory.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        sources.push(PostingSource::Memory(in_memory.into_iter()));
+        sources.push(PostingSource::memory(in_memory));
         self.inverted_bytes = 0;
 
         // Postings go straight to one raw file per shard; query nodes can
@@ -639,26 +725,17 @@ impl SegmentWriter {
         let mut pool: Vec<u8> = Vec::new();
         // (term_off_in_pool, term_len, blob_id, postings_off_in_blob, postings_len)
         let mut entries: Vec<(u64, u32, u32, u64, u32)> = Vec::new();
-        let write_version = postings_write_version();
-        let mut encoded: Vec<u8> = Vec::new();
+        let write_version = self.postings_write_version;
+        // Rollout/rollback compatibility: v4 (`KOSHA_POSTINGS_WRITE_VERSION=4`)
+        // streams through the same encoder; see `postings_write_version`.
+        let mut encoder = TermEncoder::new(
+            write_version,
+            &build_dir,
+            term_spill_limit(self.build_memory_bytes),
+        );
 
         let mut merger = TermMerger::new(sources)?;
-        while let Some((term, postings)) = merger.next_term()? {
-            encoded.clear();
-            if write_version == SPLIT_INVERTED_VERSION {
-                // Rollout/rollback compatibility mode — see
-                // `postings_write_version`.
-                write_postings_varint_delta(&mut encoded, &postings);
-            } else if kosha_core::fields::is_field_key(&term) {
-                // Per-field postings (#249) carry no per-field length in
-                // their block summaries: `min_field_length` 0 is a valid,
-                // if loose, ceiling. Only the combined index is scored on
-                // the block-max WAND paths.
-                write_postings_skip_split(&mut encoded, &postings, &[]);
-            } else {
-                write_postings_skip_split(&mut encoded, &postings, &self.field_lengths);
-            }
-            drop(postings);
+        while let Some(term) = merger.next_term(&mut encoder, &self.field_lengths)? {
             let blob_id = posting_blob_id_for_term(&term);
             let blob = match &mut blobs[blob_id] {
                 Some(blob) => blob,
@@ -667,9 +744,15 @@ impl SegmentWriter {
                     slot.insert(std::io::BufWriter::new(file))
                 }
             };
-            std::io::Write::write_all(blob, &encoded)?;
+            let encoded_len = encoder.finish(blob)?;
+            let encoded_len = u32::try_from(encoded_len).map_err(|_| {
+                KoshaError::Io(std::io::Error::other(format!(
+                    "postings for term {term:?} encode to {encoded_len} bytes, over the \
+                     4 GiB per-term limit of the inverted index format"
+                )))
+            })?;
             let p_off = blob_lens[blob_id];
-            blob_lens[blob_id] += encoded.len() as u64;
+            blob_lens[blob_id] += encoded_len as u64;
             let term_off = pool.len() as u64;
             pool.extend_from_slice(term.as_bytes());
             entries.push((
@@ -677,9 +760,10 @@ impl SegmentWriter {
                 term.len() as u32,
                 blob_id as u32,
                 p_off,
-                encoded.len() as u32,
+                encoded_len,
             ));
         }
+        drop(encoder);
 
         // Every term is in `pool` exactly once, sorted (no duplicates).
         // Per-field keys stay out of the bloom: each is also a combined
@@ -727,7 +811,12 @@ impl SegmentWriter {
             drop(file);
             let raw = build_dir.join(format!("blob-{blob_id}"));
             let final_path = self.output_dir.join(posting_blob_file_for_id(blob_id));
-            maybe_compress_inverted_file(&raw, &final_path, blob_lens[blob_id])?;
+            if self.posting_blobs_raw {
+                // Rangeable: the TOC's spans index these exact bytes.
+                fs::rename(&raw, &final_path)?;
+            } else {
+                maybe_compress_inverted_file(&raw, &final_path, blob_lens[blob_id])?;
+            }
         }
         for run in self.runs.drain(..) {
             let _ = fs::remove_file(run);
@@ -735,7 +824,10 @@ impl SegmentWriter {
         Ok(())
     }
 
-    fn write_filters(&self) -> Result<(), KoshaError> {
+    fn write_filters(&mut self) -> Result<(), KoshaError> {
+        if self.filters_write_version >= 2 {
+            return self.write_filter_columns();
+        }
         let mut buf = Vec::new();
         let total_fields =
             self.filter_string.len() + self.filter_integer.len() + self.filter_float.len();
@@ -789,6 +881,31 @@ impl SegmentWriter {
         }
 
         self.backend.write("filters.bin", &buf)?;
+        Ok(())
+    }
+
+    /// Columnar filter index (#244): one `filters-NNN.col` per `(field,
+    /// kind)` and `filters.toc`, written last so a TOC on disk implies its
+    /// columns are. See [`filter_columns`] for the layout. Always writes the
+    /// TOC, even with zero columns, so "TOC absent" only ever means "not
+    /// hydrated yet".
+    fn write_filter_columns(&mut self) -> Result<(), KoshaError> {
+        let doc_count = self.field_lengths.len() as u32;
+        let backend = &self.backend;
+        let metas = filter_columns::build_columns(
+            doc_count,
+            &self.filter_string,
+            &self.filter_integer,
+            &self.filter_float,
+            |meta, bytes| backend.write(&meta.file_name(), bytes),
+        )?;
+        let toc = filter_columns::FiltersToc {
+            doc_count,
+            columns: metas,
+        };
+        self.backend
+            .write(kosha_core::FILTERS_TOC_FILE, &toc.encode())?;
+        self.filter_columns_meta = Some(toc.columns);
         Ok(())
     }
 
@@ -919,6 +1036,8 @@ impl SegmentWriter {
             format_version: kosha_core::SEGMENT_FORMAT_VERSION,
             text_filter_ignore_above: self.text_filter_ignore_above,
             doc_vectors: !self.doc_vector_entries.is_empty(),
+            posting_blobs_raw: self.posting_blobs_raw,
+            filter_columns: self.filter_columns_meta.clone(),
             analysis: self.segment_analysis(),
             field_index: self.field_index.then(|| kosha_core::FieldIndex {
                 position_gap: kosha_core::fields::DEFAULT_POSITION_GAP,
@@ -968,6 +1087,19 @@ impl SegmentWriter {
 
 /// Magic prefix of a v2 `vector.idx` ("KVE2", little-endian u32).
 pub const VECTOR_MAGIC: u32 = u32::from_le_bytes(*b"KVE2");
+/// File name of the clustered vector index.
+pub const VECTOR_IDX_FILE: &str = "vector.idx";
+
+/// Callback a reader calls with byte ranges of `{segment_dir}/vector.idx`
+/// it is about to read but does not hold locally (#245). After it returns,
+/// those ranges should be readable from the whole file or the span cache
+/// (`span_cache`); any still missing fail the search as an IO error.
+pub type VectorSpanFetch<'a> = &'a (dyn Fn(&Path, &[(u64, u64)]) + Sync);
+
+/// Postings fetched per call when a restricted kNN probe runs past its
+/// budget (see `knn_search_within_filtered`).
+const VECTOR_PREFETCH_CHUNK: usize = 8;
+
 /// Magic prefix of the `vector.offsets` sidecar ("KVOF", little-endian u32).
 pub const VECTOR_OFFSETS_MAGIC: u32 = u32::from_le_bytes(*b"KVOF");
 /// Version 1: vectors and centroids stored exactly as ingested (raw
@@ -1560,6 +1692,38 @@ fn postings_write_version() -> u32 {
     })
 }
 
+/// Whether `SegmentWriter` leaves `postings-*.bin` shards raw —
+/// `KOSHA_POSTINGS_RAW_BLOBS`, `1`/`true` (default) or `0`/`false`.
+///
+/// Raw shards let a cold query fetch only its terms' posting spans with
+/// ranged GETs (#245) instead of whole shards, at the cost of skipping the
+/// whole-file zstd wrapper (`maybe_compress_inverted_file`). The postings
+/// are already varint/delta coded, so that wrapper saved little. No reader
+/// change is needed: the wrapper was always optional and every reader
+/// passes raw bytes through, so a rollback still reads raw segments. Set
+/// `0` to keep compressing shards; such segments are fetched whole as
+/// before. Compaction writes through `SegmentWriter`, so its output
+/// follows the same setting. Read once.
+fn posting_blobs_raw() -> bool {
+    static RAW: OnceLock<bool> = OnceLock::new();
+    *RAW.get_or_init(|| {
+        match std::env::var("KOSHA_POSTINGS_RAW_BLOBS")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("1") | Some("true") => true,
+            Some("0") | Some("false") => false,
+            Some(other) => {
+                eprintln!(
+                    "WARN: KOSHA_POSTINGS_RAW_BLOBS={other} not 0|1 — writing raw posting shards"
+                );
+                true
+            }
+        }
+    })
+}
+
 /// Default for [`text_filter_ignore_above`]: Elasticsearch's dynamic-mapping
 /// `keyword` subfield cap, so data backfilled from ES keeps exactly the
 /// exact-match filterability it had there.
@@ -1623,8 +1787,11 @@ fn text_value_within_cap(value: &str, cap: Option<u32>) -> bool {
 //   per document the writer keeps only its field length and offsets entry.
 // - Once the in-memory postings pass `KOSHA_SEGMENT_BUILD_MEMORY_BYTES`,
 //   they are written to a sorted run file and freed. `finalize` k-way
-//   merges the runs and what's left in memory by term, one term at a time,
-//   and streams each term's encoded postings to its shard file.
+//   merges the runs and what's left in memory by term. A term's postings
+//   stream from the runs, posting by posting, into a `TermEncoder` that
+//   writes the encoded span to its shard file; the encoder's sections
+//   spill to scratch files past `term_spill_limit`, so even a term in
+//   every document is never resident in full.
 // - Each posting shard is compressed file-to-file.
 //
 // Output bytes are unchanged; `.build/` is removed before `finalize`
@@ -1761,6 +1928,9 @@ fn write_run_entry(
     Ok(())
 }
 
+/// Reads a run file entry by entry. A term's postings are read one posting
+/// at a time ([`RunReader::read_posting`]) straight into the encoder, so a
+/// stopword's run slice is never materialized as a `Vec<Posting>`.
 struct RunReader {
     input: std::io::BufReader<fs::File>,
 }
@@ -1778,7 +1948,9 @@ impl RunReader {
         Ok(u32::from_le_bytes(b))
     }
 
-    fn next_entry(&mut self) -> Result<Option<(String, Vec<Posting>)>, KoshaError> {
+    /// The next entry's term and posting count, or `None` at end of run.
+    /// The caller must read exactly `count` postings before asking again.
+    fn next_header(&mut self) -> Result<Option<(String, u32)>, KoshaError> {
         let mut b = [0u8; 4];
         match self.input.read_exact(&mut b) {
             Ok(()) => {}
@@ -1789,98 +1961,399 @@ impl RunReader {
         self.input.read_exact(&mut term)?;
         let term = String::from_utf8(term)
             .map_err(|_| KoshaError::CorruptSegment("posting run: non-UTF-8 term".into()))?;
-        let count = self.read_u32()? as usize;
-        let mut postings = Vec::with_capacity(count);
-        for _ in 0..count {
-            let doc_id = self.read_u32()?;
-            let term_frequency = self.read_u32()?;
-            let n = self.read_u32()? as usize;
-            let mut positions = Vec::with_capacity(n);
-            for _ in 0..n {
-                positions.push(self.read_u32()?);
-            }
-            postings.push(Posting {
-                doc_id,
-                term_frequency,
-                positions,
-            });
+        let count = self.read_u32()?;
+        Ok(Some((term, count)))
+    }
+
+    /// One posting of the current entry: `(doc_id, tf)`, with its
+    /// positions written into `positions` (cleared first).
+    fn read_posting(&mut self, positions: &mut Vec<u32>) -> Result<(u32, u32), KoshaError> {
+        let doc_id = self.read_u32()?;
+        let term_frequency = self.read_u32()?;
+        let n = self.read_u32()? as usize;
+        positions.clear();
+        for _ in 0..n {
+            positions.push(self.read_u32()?);
         }
-        Ok(Some((term, postings)))
+        Ok((doc_id, term_frequency))
     }
 }
 
 enum PostingSource {
     Run(RunReader),
-    Memory(std::vec::IntoIter<(String, Vec<Posting>)>),
+    /// What was still in memory at `finalize` (at most the build budget).
+    /// `current` holds the postings of the entry last returned by
+    /// `next_header` until they are drained.
+    Memory {
+        entries: std::vec::IntoIter<(String, Vec<Posting>)>,
+        current: Vec<Posting>,
+    },
 }
 
 impl PostingSource {
-    fn next_entry(&mut self) -> Result<Option<(String, Vec<Posting>)>, KoshaError> {
-        match self {
-            Self::Run(run) => run.next_entry(),
-            Self::Memory(it) => Ok(it.next()),
+    fn memory(entries: Vec<(String, Vec<Posting>)>) -> Self {
+        Self::Memory {
+            entries: entries.into_iter(),
+            current: Vec::new(),
         }
+    }
+
+    fn next_header(&mut self) -> Result<Option<(String, u32)>, KoshaError> {
+        match self {
+            Self::Run(run) => run.next_header(),
+            Self::Memory { entries, current } => Ok(entries.next().map(|(term, postings)| {
+                let count = postings.len() as u32;
+                *current = postings;
+                (term, count)
+            })),
+        }
+    }
+
+    /// Feed the current entry's `count` postings to `encoder`.
+    fn drain_into(
+        &mut self,
+        count: u32,
+        encoder: &mut TermEncoder,
+        field_lengths: &[u32],
+        positions: &mut Vec<u32>,
+    ) -> Result<(), KoshaError> {
+        match self {
+            Self::Run(run) => {
+                for _ in 0..count {
+                    let (doc_id, tf) = run.read_posting(positions)?;
+                    encoder.push(doc_id, tf, positions, field_lengths)?;
+                }
+            }
+            Self::Memory { current, .. } => {
+                for p in std::mem::take(current) {
+                    encoder.push(p.doc_id, p.term_frequency, &p.positions, field_lengths)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
 /// K-way merge of term-sorted sources. Sources are given in doc_seq order
 /// (each covers a later doc range than the one before), so one term's
 /// postings are the concatenation of its sources' postings in source order.
+///
+/// Only each source's head *term* and posting count are resident; the
+/// postings themselves stream from the sources into a [`TermEncoder`]
+/// (#242), so a term in every document costs no more memory than a rare
+/// one.
 struct TermMerger {
     sources: Vec<PostingSource>,
-    heads: Vec<Option<Vec<Posting>>>,
+    /// Posting count of each source's head entry.
+    head_counts: Vec<u32>,
     heap: std::collections::BinaryHeap<std::cmp::Reverse<(String, usize)>>,
+    positions: Vec<u32>,
 }
 
 impl TermMerger {
     fn new(mut sources: Vec<PostingSource>) -> Result<Self, KoshaError> {
-        let mut heads = Vec::with_capacity(sources.len());
+        let mut head_counts = vec![0; sources.len()];
         let mut heap = std::collections::BinaryHeap::new();
         for (i, source) in sources.iter_mut().enumerate() {
-            match source.next_entry()? {
-                Some((term, postings)) => {
-                    heap.push(std::cmp::Reverse((term, i)));
-                    heads.push(Some(postings));
-                }
-                None => heads.push(None),
+            if let Some((term, count)) = source.next_header()? {
+                heap.push(std::cmp::Reverse((term, i)));
+                head_counts[i] = count;
             }
         }
         Ok(Self {
             sources,
-            heads,
+            head_counts,
             heap,
+            positions: Vec::new(),
         })
     }
 
-    fn advance(&mut self, i: usize) -> Result<(), KoshaError> {
-        match self.sources[i].next_entry()? {
-            Some((term, postings)) => {
-                self.heap.push(std::cmp::Reverse((term, i)));
-                self.heads[i] = Some(postings);
-            }
-            None => self.heads[i] = None,
+    /// Stream source `i`'s head postings into `encoder`, then move it on.
+    fn drain_and_advance(
+        &mut self,
+        i: usize,
+        encoder: &mut TermEncoder,
+        field_lengths: &[u32],
+    ) -> Result<(), KoshaError> {
+        self.sources[i].drain_into(
+            self.head_counts[i],
+            encoder,
+            field_lengths,
+            &mut self.positions,
+        )?;
+        if let Some((term, count)) = self.sources[i].next_header()? {
+            self.heap.push(std::cmp::Reverse((term, i)));
+            self.head_counts[i] = count;
         }
         Ok(())
     }
 
-    fn next_term(&mut self) -> Result<Option<(String, Vec<Posting>)>, KoshaError> {
+    /// Encode the next term's postings, from every source that has it, into
+    /// `encoder`. Returns the term, or `None` when every source is done.
+    fn next_term(
+        &mut self,
+        encoder: &mut TermEncoder,
+        field_lengths: &[u32],
+    ) -> Result<Option<String>, KoshaError> {
         let Some(std::cmp::Reverse((term, i))) = self.heap.pop() else {
             return Ok(None);
         };
-        let mut postings = self.heads[i].take().unwrap_or_default();
-        self.advance(i)?;
-        // Equal terms pop in ascending source index: doc_seq order.
+        // Per-field postings (#249) carry no per-field length in their
+        // block summaries: `min_field_length` 0 is a valid, if loose,
+        // ceiling. Only the combined index is scored on the block-max WAND
+        // paths. Same rule as the in-memory encoder.
+        let field_lengths = if kosha_core::fields::is_field_key(&term) {
+            &[][..]
+        } else {
+            field_lengths
+        };
+        self.drain_and_advance(i, encoder, field_lengths)?;
+        // Equal terms pop in ascending source index: doc_seq order. A
+        // source's next term is strictly greater (runs hold each term
+        // once), so advancing never re-queues `term`.
         while self
             .heap
             .peek()
             .is_some_and(|std::cmp::Reverse((t, _))| *t == term)
         {
             let std::cmp::Reverse((_, j)) = self.heap.pop().unwrap();
-            postings.extend(self.heads[j].take().unwrap_or_default());
-            self.advance(j)?;
+            self.drain_and_advance(j, encoder, field_lengths)?;
         }
-        Ok(Some((term, postings)))
+        Ok(Some(term))
     }
+}
+
+/// An append-only byte buffer that moves to a scratch file once it holds
+/// `limit` bytes, so one term's encoded section never needs to be resident
+/// in full. Reused across terms.
+struct SpillBuf {
+    mem: Vec<u8>,
+    path: PathBuf,
+    file: Option<fs::File>,
+    /// Bytes already written to `file` for the current term.
+    spilled: u64,
+    limit: usize,
+    /// Total bytes ever moved to `file` (tests and diagnostics).
+    spilled_total: u64,
+}
+
+impl SpillBuf {
+    fn new(path: PathBuf, limit: usize) -> Self {
+        Self {
+            mem: Vec::new(),
+            path,
+            file: None,
+            spilled: 0,
+            limit: limit.max(1),
+            spilled_total: 0,
+        }
+    }
+
+    fn len(&self) -> u64 {
+        self.spilled + self.mem.len() as u64
+    }
+
+    fn maybe_spill(&mut self) -> Result<(), KoshaError> {
+        if self.mem.len() < self.limit {
+            return Ok(());
+        }
+        let file = match &mut self.file {
+            Some(file) => file,
+            slot => slot.insert(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&self.path)?,
+            ),
+        };
+        std::io::Write::write_all(file, &self.mem)?;
+        self.spilled += self.mem.len() as u64;
+        self.spilled_total += self.mem.len() as u64;
+        self.mem.clear();
+        Ok(())
+    }
+
+    /// Append everything buffered for this term to `out`, in order, and
+    /// reset for the next term.
+    fn drain_to(&mut self, out: &mut impl std::io::Write) -> Result<(), KoshaError> {
+        if self.spilled > 0 {
+            let file = self.file.as_mut().expect("spilled bytes have a file");
+            file.seek(SeekFrom::Start(0))?;
+            let copied = std::io::copy(&mut Read::by_ref(file).take(self.spilled), out)?;
+            if copied != self.spilled {
+                return Err(KoshaError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "term spill file shorter than written",
+                )));
+            }
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            self.spilled = 0;
+        }
+        out.write_all(&self.mem)?;
+        self.mem.clear();
+        Ok(())
+    }
+}
+
+/// Encodes one term's postings incrementally, as they arrive in doc_seq
+/// order, into exactly the bytes [`write_postings_skip_split`] (v5) or
+/// [`write_postings_varint_delta`] (v4) would produce from the whole list
+/// (#242). Memory per term: the v5 skip table (a few bytes per 128
+/// postings) plus two [`SpillBuf`]s capped at their limit; everything past
+/// that goes to scratch files and is copied to the shard on `finish`.
+///
+/// Both layouts put the posting count (and for v5 the skip table) before
+/// the posting bytes, which is why the bytes are buffered rather than
+/// written straight to the shard.
+struct TermEncoder {
+    version: u32,
+    count: u32,
+    /// v5 skip-table entries so far.
+    skip: Vec<u8>,
+    /// v5: scoring section. v4: the whole body.
+    scoring: SpillBuf,
+    /// v5 positions section (unused by v4).
+    positions: SpillBuf,
+    prev_doc: u32,
+    // Current v5 block.
+    in_block: usize,
+    block_start: u64,
+    block_max_tf: u32,
+    block_min_fl: u32,
+    block_last: u32,
+    prev_block_last: u32,
+}
+
+impl TermEncoder {
+    fn new(version: u32, scratch_dir: &Path, spill_limit: usize) -> Self {
+        Self {
+            version,
+            count: 0,
+            skip: Vec::new(),
+            scoring: SpillBuf::new(scratch_dir.join("term-scoring"), spill_limit),
+            positions: SpillBuf::new(scratch_dir.join("term-positions"), spill_limit),
+            prev_doc: 0,
+            in_block: 0,
+            block_start: 0,
+            block_max_tf: 0,
+            block_min_fl: u32::MAX,
+            block_last: 0,
+            prev_block_last: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        doc_id: u32,
+        term_frequency: u32,
+        positions: &[u32],
+        field_lengths: &[u32],
+    ) -> Result<(), KoshaError> {
+        self.count += 1;
+        if self.version == SPLIT_INVERTED_VERSION {
+            // v4: [doc delta][tf][n_positions][position deltas] per posting.
+            let out = &mut self.scoring.mem;
+            put_var_u32(out, doc_id.wrapping_sub(self.prev_doc));
+            self.prev_doc = doc_id;
+            put_var_u32(out, term_frequency);
+            put_var_u32(out, positions.len() as u32);
+            let mut prev_pos = 0u32;
+            for &pos in positions {
+                put_var_u32(out, pos.wrapping_sub(prev_pos));
+                prev_pos = pos;
+            }
+            return self.scoring.maybe_spill();
+        }
+
+        if self.in_block == 0 {
+            self.block_start = self.scoring.len();
+            self.block_max_tf = 0;
+            self.block_min_fl = u32::MAX;
+        }
+        put_var_u32(&mut self.scoring.mem, doc_id.wrapping_sub(self.prev_doc));
+        self.prev_doc = doc_id;
+        put_var_u32(&mut self.scoring.mem, term_frequency);
+        self.block_max_tf = self.block_max_tf.max(term_frequency);
+        if let Some(&field_length) = field_lengths.get(doc_id as usize) {
+            self.block_min_fl = self.block_min_fl.min(field_length);
+        }
+        self.block_last = doc_id;
+        self.in_block += 1;
+        if self.in_block == SCORING_BLOCK_LEN {
+            self.close_block();
+        }
+
+        let out = &mut self.positions.mem;
+        put_var_u32(out, positions.len() as u32);
+        let mut prev_pos = 0u32;
+        for &pos in positions {
+            put_var_u32(out, pos.wrapping_sub(prev_pos));
+            prev_pos = pos;
+        }
+        self.scoring.maybe_spill()?;
+        self.positions.maybe_spill()
+    }
+
+    /// Append the current block's skip entry (same fields and order as
+    /// `write_postings_skip_split`).
+    fn close_block(&mut self) {
+        put_var_u32(
+            &mut self.skip,
+            self.block_last.wrapping_sub(self.prev_block_last),
+        );
+        self.prev_block_last = self.block_last;
+        put_var_u32(
+            &mut self.skip,
+            (self.scoring.len() - self.block_start) as u32,
+        );
+        put_var_u32(&mut self.skip, self.block_max_tf);
+        put_var_u32(
+            &mut self.skip,
+            if self.block_min_fl == u32::MAX {
+                0
+            } else {
+                self.block_min_fl
+            },
+        );
+        self.in_block = 0;
+    }
+
+    /// Write the finished term span to `out` and reset for the next term.
+    /// Returns the span's length.
+    fn finish(&mut self, out: &mut impl std::io::Write) -> Result<u64, KoshaError> {
+        if self.in_block > 0 {
+            self.close_block();
+        }
+        let mut header = Vec::with_capacity(5);
+        put_var_u32(&mut header, self.count);
+        let len = header.len() as u64
+            + self.skip.len() as u64
+            + self.scoring.len()
+            + self.positions.len();
+        out.write_all(&header)?;
+        out.write_all(&self.skip)?;
+        self.scoring.drain_to(out)?;
+        self.positions.drain_to(out)?;
+        self.count = 0;
+        self.skip.clear();
+        self.prev_doc = 0;
+        self.prev_block_last = 0;
+        Ok(len)
+    }
+
+    #[cfg(test)]
+    fn spilled_total(&self) -> u64 {
+        self.scoring.spilled_total + self.positions.spilled_total
+    }
+}
+
+/// Per-buffer cap of a [`TermEncoder`]'s in-memory bytes: a sixteenth of
+/// the build budget, between 4 KiB and 8 MiB.
+fn term_spill_limit(build_memory_bytes: usize) -> usize {
+    (build_memory_bytes / 16).clamp(4 * 1024, 8 * 1024 * 1024)
 }
 
 /// File-to-file version of [`maybe_compress_inverted`]: the same output
@@ -1950,6 +2423,14 @@ impl Drop for SegmentWriter {
 
 /// File name of the doc-vectors sidecar.
 pub const DOC_VECTORS_FILE: &str = "doc_vectors.bin";
+/// File name of the document store.
+pub const DOC_STORE_FILE: &str = "doc_store.bin";
+
+/// Whether a local file is present, non-empty and at least `complete_len`
+/// bytes long — the "whole file, not a torn write" check.
+fn file_is_complete(path: &Path, complete_len: u64) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.len() > 0 && m.len() >= complete_len)
+}
 /// Magic prefix of `doc_vectors.bin` ("KDV1", little-endian u32).
 pub const DOC_VECTORS_MAGIC: u32 = u32::from_le_bytes(*b"KDV1");
 
@@ -1985,101 +2466,225 @@ impl VectorStoreMode {
     }
 }
 
+/// How many bytes of `doc_vectors.bin` a header read asks for first. The
+/// header is 12 bytes per entry plus the field names; one probe of this
+/// size covers ~5k entries, and a larger header costs one more read of
+/// exactly the missing bytes (see [`doc_vectors_header_len`]).
+pub const DOC_VECTORS_HEADER_PROBE: u64 = 64 * 1024;
+
+/// Header of `doc_vectors.bin` parsed from a prefix of the file.
+struct DocVectorsHeader {
+    fields: Vec<String>,
+    entries: Vec<(u32, u32, u32)>,
+    offsets: Vec<u64>,
+    /// File length the header implies (end of the last vector).
+    file_len: u64,
+}
+
+/// Outcome of parsing a `doc_vectors.bin` prefix.
+enum HeaderParse {
+    /// The prefix ends inside the header; at least this many bytes are
+    /// needed.
+    Need(u64),
+    Done(DocVectorsHeader),
+}
+
+fn parse_doc_vectors_header(prefix: &[u8], what: &Path) -> Result<HeaderParse, KoshaError> {
+    let corrupt = |why: &str| KoshaError::CorruptSegment(format!("{}: {why}", what.display()));
+    let u32_at = |at: u64| -> Option<u32> {
+        let at = at as usize;
+        prefix
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let Some(magic) = u32_at(0) else {
+        return Ok(HeaderParse::Need(8));
+    };
+    if magic != DOC_VECTORS_MAGIC {
+        return Err(corrupt("bad magic"));
+    }
+    let Some(field_count) = u32_at(4) else {
+        return Ok(HeaderParse::Need(8));
+    };
+    let mut at: u64 = 8;
+    let mut fields = Vec::with_capacity((field_count as usize).min(1024));
+    for _ in 0..field_count {
+        let Some(len) = u32_at(at) else {
+            return Ok(HeaderParse::Need(at + 4));
+        };
+        let start = at + 4;
+        let end = start + len as u64;
+        let Some(name) = prefix.get(start as usize..end as usize) else {
+            return Ok(HeaderParse::Need(end));
+        };
+        fields.push(String::from_utf8_lossy(name).into_owned());
+        at = end;
+    }
+    let Some(entry_count) = u32_at(at) else {
+        return Ok(HeaderParse::Need(at + 4));
+    };
+    at += 4;
+    let header_len = at + entry_count as u64 * 12;
+    if (prefix.len() as u64) < header_len {
+        return Ok(HeaderParse::Need(header_len));
+    }
+    let mut entries = Vec::with_capacity(entry_count as usize);
+    let mut offsets = Vec::with_capacity(entry_count as usize);
+    let mut next = header_len;
+    let mut last_seq = 0u32;
+    for i in 0..entry_count as u64 {
+        let base = at + i * 12;
+        let (doc_seq, field_idx, dim) = (
+            u32_at(base).unwrap(),
+            u32_at(base + 4).unwrap(),
+            u32_at(base + 8).unwrap(),
+        );
+        if field_idx as usize >= fields.len() {
+            return Err(corrupt("entry names an unknown field"));
+        }
+        if doc_seq < last_seq {
+            return Err(corrupt("entries not sorted by doc_seq"));
+        }
+        last_seq = doc_seq;
+        entries.push((doc_seq, field_idx, dim));
+        offsets.push(next);
+        next += dim as u64 * 4;
+    }
+    Ok(HeaderParse::Done(DocVectorsHeader {
+        fields,
+        entries,
+        offsets,
+        file_len: next,
+    }))
+}
+
+/// How many leading bytes of `doc_vectors.bin` hold its header, given a
+/// prefix of the file: `Ok(Ok(len))` once the prefix contains the whole
+/// header (`len` may be shorter than the prefix), `Ok(Err(need))` when at
+/// least `need` bytes are required to find out. A remote reader fetches
+/// [`DOC_VECTORS_HEADER_PROBE`] bytes, then the rest if asked to.
+pub fn doc_vectors_header_len(prefix: &[u8]) -> Result<Result<u64, u64>, KoshaError> {
+    match parse_doc_vectors_header(prefix, Path::new(DOC_VECTORS_FILE))? {
+        HeaderParse::Need(n) => Ok(Err(n)),
+        HeaderParse::Done(h) => Ok(Ok(h.offsets.first().copied().unwrap_or(h.file_len))),
+    }
+}
+
 /// Parsed `doc_vectors.bin` header: field names, entries and where each
 /// entry's vector starts in the file. Vectors themselves are read on
-/// demand.
+/// demand, from the local file when it is whole, otherwise from the sparse
+/// span cache (#245, see [`span_cache`]).
 #[derive(Debug)]
 pub struct DocVectors {
-    path: PathBuf,
+    segment_dir: PathBuf,
     fields: Vec<String>,
     /// `(doc_seq, field_idx, dim)`, sorted by doc_seq.
     entries: Vec<(u32, u32, u32)>,
     /// Absolute byte offset of each entry's vector.
     offsets: Vec<u64>,
+    /// Length of the complete file.
+    file_len: u64,
 }
 
 impl DocVectors {
+    /// Open a whole local `doc_vectors.bin`, checking its length against
+    /// the header.
     pub fn open(path: PathBuf) -> Result<Self, KoshaError> {
         let corrupt = |why: &str| KoshaError::CorruptSegment(format!("{}: {why}", path.display()));
         let file_len = fs::metadata(&path)?.len();
-        let mut reader = std::io::BufReader::new(fs::File::open(&path)?);
-        let mut u32_buf = [0u8; 4];
-        let mut next_u32 = |r: &mut std::io::BufReader<fs::File>| -> Result<u32, KoshaError> {
-            r.read_exact(&mut u32_buf)
-                .map_err(|e| KoshaError::CorruptSegment(format!("truncated header: {e}")))?;
-            Ok(u32::from_le_bytes(u32_buf))
+        let mut file = fs::File::open(&path)?;
+        let mut prefix = Vec::new();
+        let mut want = DOC_VECTORS_HEADER_PROBE.min(file_len);
+        let header = loop {
+            if want > prefix.len() as u64 {
+                let mut more = vec![0u8; (want - prefix.len() as u64) as usize];
+                file.read_exact(&mut more)
+                    .map_err(|e| KoshaError::CorruptSegment(format!("truncated header: {e}")))?;
+                prefix.extend_from_slice(&more);
+            }
+            match parse_doc_vectors_header(&prefix, &path)? {
+                HeaderParse::Done(header) => break header,
+                HeaderParse::Need(n) if n > file_len || n <= prefix.len() as u64 => {
+                    return Err(corrupt("truncated header"));
+                }
+                HeaderParse::Need(n) => want = n,
+            }
         };
-        if next_u32(&mut reader)? != DOC_VECTORS_MAGIC {
-            return Err(corrupt("bad magic"));
-        }
-        let field_count = next_u32(&mut reader)? as usize;
-        let mut header_len: u64 = 8;
-        let mut fields = Vec::with_capacity(field_count.min(1024));
-        for _ in 0..field_count {
-            let len = next_u32(&mut reader)? as u64;
-            if len > file_len {
-                return Err(corrupt("field name length past end of file"));
-            }
-            let mut name = vec![0u8; len as usize];
-            reader
-                .read_exact(&mut name)
-                .map_err(|_| corrupt("truncated field name"))?;
-            fields.push(String::from_utf8_lossy(&name).into_owned());
-            header_len += 4 + len;
-        }
-        let entry_count = next_u32(&mut reader)? as u64;
-        header_len += 4;
-        if header_len + entry_count * 12 > file_len {
-            return Err(corrupt("entry table past end of file"));
-        }
-        let mut entries = Vec::with_capacity(entry_count as usize);
-        let mut offsets = Vec::with_capacity(entry_count as usize);
-        let mut next = header_len + entry_count * 12;
-        let mut last_seq = 0u32;
-        for _ in 0..entry_count {
-            let doc_seq = next_u32(&mut reader)?;
-            let field_idx = next_u32(&mut reader)?;
-            let dim = next_u32(&mut reader)?;
-            if field_idx as usize >= fields.len() {
-                return Err(corrupt("entry names an unknown field"));
-            }
-            if doc_seq < last_seq {
-                return Err(corrupt("entries not sorted by doc_seq"));
-            }
-            last_seq = doc_seq;
-            entries.push((doc_seq, field_idx, dim));
-            offsets.push(next);
-            next += dim as u64 * 4;
-        }
-        if next != file_len {
+        if header.file_len != file_len {
+            let header_len = header.offsets.first().copied().unwrap_or(header.file_len);
             return Err(corrupt(&format!(
                 "vector data is {} bytes, header says {}",
-                file_len.saturating_sub(header_len + entry_count * 12),
-                next - header_len - entry_count * 12
+                file_len.saturating_sub(header_len),
+                header.file_len - header_len
             )));
         }
-        Ok(Self {
-            path,
-            fields,
-            entries,
-            offsets,
+        let segment_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        Ok(Self::from_header(segment_dir, header))
+    }
+
+    /// Build from a cached prefix of the file (the sparse span cache's
+    /// header span). `Ok(None)` when the prefix ends inside the header.
+    pub fn from_prefix(segment_dir: PathBuf, prefix: &[u8]) -> Result<Option<Self>, KoshaError> {
+        match parse_doc_vectors_header(prefix, &segment_dir.join(DOC_VECTORS_FILE))? {
+            HeaderParse::Need(_) => Ok(None),
+            HeaderParse::Done(header) => Ok(Some(Self::from_header(segment_dir, header))),
+        }
+    }
+
+    fn from_header(segment_dir: PathBuf, header: DocVectorsHeader) -> Self {
+        Self {
+            segment_dir,
+            fields: header.fields,
+            entries: header.entries,
+            offsets: header.offsets,
+            file_len: header.file_len,
+        }
+    }
+
+    /// Length of the complete file, as the header describes it.
+    pub fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    fn entry_range(&self, doc_seq: u32) -> (usize, usize) {
+        let start = self.entries.partition_point(|e| e.0 < doc_seq);
+        let end = self.entries.partition_point(|e| e.0 <= doc_seq);
+        (start, end)
+    }
+
+    /// The `[start, end)` byte range of `doc_seq`'s vectors in the file;
+    /// `None` when the document has none.
+    pub fn doc_span(&self, doc_seq: u32) -> Option<(u64, u64)> {
+        let (start, end) = self.entry_range(doc_seq);
+        (start < end).then(|| {
+            (
+                self.offsets[start],
+                self.offsets[end - 1] + self.entries[end - 1].2 as u64 * 4,
+            )
         })
     }
 
     /// `(field name, vector)` for every vector stored for `doc_seq`, in the
-    /// document's field order. One seek+read.
+    /// document's field order. One local read.
     pub fn vectors_for(&self, doc_seq: u32) -> Result<Vec<(&str, Vec<f32>)>, KoshaError> {
-        let start = self.entries.partition_point(|e| e.0 < doc_seq);
-        let end = self.entries.partition_point(|e| e.0 <= doc_seq);
-        if start == end {
+        let (start, end) = self.entry_range(doc_seq);
+        let Some((span_start, span_end)) = self.doc_span(doc_seq) else {
             return Ok(Vec::new());
-        }
-        let span_start = self.offsets[start];
-        let span_end = self.offsets[end - 1] + self.entries[end - 1].2 as u64 * 4;
-        let mut buf = vec![0u8; (span_end - span_start) as usize];
-        let mut file = fs::File::open(&self.path)?;
-        file.seek(SeekFrom::Start(span_start))?;
-        file.read_exact(&mut buf)?;
+        };
+        let buf = span_cache::read_local_range(
+            &self.segment_dir,
+            DOC_VECTORS_FILE,
+            self.file_len,
+            span_start,
+            span_end - span_start,
+        )
+        .ok_or_else(|| {
+            KoshaError::NotFound(format!(
+                "{DOC_VECTORS_FILE} bytes {span_start}..{span_end} for doc_seq {doc_seq} are not \
+                 local in segment {:?}",
+                self.segment_dir
+            ))
+        })?;
         let mut out = Vec::with_capacity(end - start);
         for i in start..end {
             let (_, field_idx, dim) = self.entries[i];
@@ -2189,6 +2794,45 @@ pub fn posting_blob_inventory(
         .collect())
 }
 
+/// One query term's postings span in a split segment: bytes
+/// `[start, start + len)` of shard `file`, from the `inverted.idx` TOC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermSpan {
+    pub term: String,
+    pub file: String,
+    pub start: u64,
+    pub len: u64,
+}
+
+/// The TOC spans of each of `terms` this split segment contains, in
+/// `terms` order (terms it does not contain are left out, duplicates
+/// once). Reads only the local `inverted.idx`, never a shard. The spans
+/// index the shard's logical bytes, which are the stored bytes only when
+/// the segment's footer says `posting_blobs_raw` — a caller range-reading
+/// the stored file must check that first (#245).
+pub fn posting_term_spans(
+    segment_dir: &Path,
+    terms: &[String],
+) -> Result<Vec<TermSpan>, KoshaError> {
+    let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
+    let index = SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None)?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(terms
+        .iter()
+        .filter(|t| seen.insert(t.as_str()))
+        .filter_map(|term| {
+            let i = index.find(term)?;
+            let (_, _, blob_id, off, len) = index.raw_entry(i);
+            Some(TermSpan {
+                term: term.clone(),
+                file: posting_blob_file_for_id(blob_id),
+                start: off as u64,
+                len: len as u64,
+            })
+        })
+        .collect())
+}
+
 pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
     let Some(header) = read_inverted_header(&segment_dir.join("inverted.idx")) else {
         return false;
@@ -2287,6 +2931,34 @@ pub struct SplitInvertedIndex {
     /// [`SegmentReader::take_blob_read_failure`] and must surface an error
     /// instead of returning results that silently omit the term.
     blob_read_failure: std::sync::atomic::AtomicBool,
+    /// Shards are raw (`Footer::posting_blobs_raw`), so a term whose shard
+    /// is not local may be served from the sparse span cache
+    /// (`postings-XX.bin.spans/`, see [`span_cache`]) that a query node
+    /// fills with ranged GETs of just the query terms' spans (#245).
+    posting_spans: bool,
+}
+
+/// Where one shard's term spans are read from for a batch of terms.
+enum BlobSource {
+    /// The whole shard (logical, decompressed bytes).
+    Whole(Vec<u8>),
+    /// Only fetched spans of a raw shard are local.
+    Spans(span_cache::SpanIndex),
+}
+
+impl BlobSource {
+    /// The `[off, off + len)` bytes of the shard's logical layout. `None`
+    /// when they are not local: out of bounds for the whole shard (corrupt
+    /// TOC/shard) or not covered by any span (never fetched, or evicted).
+    fn term_bytes(&self, off: usize, len: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+        let end = off.checked_add(len)?;
+        match self {
+            Self::Whole(blob) => blob.get(off..end).map(std::borrow::Cow::Borrowed),
+            Self::Spans(index) => index
+                .read(off as u64, end as u64)
+                .map(std::borrow::Cow::Owned),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2813,8 +3485,8 @@ fn decode_postings_bytes(mut buf: &[u8]) -> Option<(Vec<Posting>, usize)> {
 /// order so the batched decode can emit deterministically.
 type PendingBlobReads<'a> = Vec<(usize, usize, &'a str, usize, usize, bool)>;
 
-/// v4 span codec, retained for reading fixtures/tests — the production
-/// writer moved to [`write_postings_skip_split`] (v5).
+/// v4 span codec, retained for fixtures/tests and as the byte-identity
+/// reference for [`TermEncoder`]'s v4 mode (`KOSHA_POSTINGS_WRITE_VERSION=4`).
 #[cfg_attr(not(test), allow(dead_code))]
 fn write_postings_varint_delta(out: &mut Vec<u8>, postings: &[Posting]) {
     put_var_u32(out, postings.len() as u32);
@@ -2904,6 +3576,11 @@ pub struct ScoringBlockSummary {
 /// positions bytes: per posting (same ordinal order), n_positions +
 ///                  position deltas — read only by the full-postings path
 /// ```
+///
+/// The production writer encodes the same bytes incrementally with
+/// [`TermEncoder`] (#242); this whole-list version is the reference the
+/// byte-identity tests compare against.
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_postings_skip_split(out: &mut Vec<u8>, postings: &[Posting], field_lengths: &[u32]) {
     put_var_u32(out, postings.len() as u32);
 
@@ -3173,6 +3850,7 @@ impl SplitInvertedIndex {
             cache: PostingsCache::new(postings_cache_max_bytes(), account.clone()),
             scoring_cache: PostingsCache::new(postings_cache_max_bytes(), account),
             blob_read_failure: std::sync::atomic::AtomicBool::new(false),
+            posting_spans: false,
         };
         for i in 0..term_count {
             let (term_off, term_len, blob_id, _, _) = index.raw_entry(i);
@@ -3275,28 +3953,18 @@ impl SplitInvertedIndex {
         }
 
         for (blob_id, spans) in by_blob {
-            let Some(blob) = self.read_posting_blob(blob_id) else {
+            let Some(blob) = self.open_posting_blob(blob_id) else {
                 // Every term queued on this shard was TOC-present; the
                 // shard itself is unreadable (evicted/corrupt).
                 self.note_blob_read_failure();
                 continue;
             };
             for (i, slot, term, p_off, p_len, admit) in spans {
-                let Some(p_end) = p_off.checked_add(p_len).filter(|&e| e <= blob.len()) else {
+                let Some(bytes) = self.term_bytes(&blob, blob_id, p_off, p_len) else {
                     self.note_blob_read_failure();
                     continue;
                 };
-                let decoded = match self.encoding {
-                    SplitPostingsEncoding::Fixed32 => decode_postings_bytes(&blob[p_off..p_end]),
-                    SplitPostingsEncoding::VarintDelta => {
-                        decode_postings_varint_delta_bytes(&blob[p_off..p_end])
-                    }
-                    SplitPostingsEncoding::SkipSplit => {
-                        BlockedTermPostings::parse(Arc::new(blob[p_off..p_end].to_vec()))
-                            .and_then(|b| b.decode_full())
-                    }
-                };
-                let Some((postings, approx_bytes)) = decoded else {
+                let Some((postings, approx_bytes)) = self.decode_term(&bytes) else {
                     self.note_blob_read_failure();
                     continue;
                 };
@@ -3325,16 +3993,18 @@ impl SplitInvertedIndex {
 
     fn decode_postings_inner(&self, i: usize) -> Option<(Vec<Posting>, usize)> {
         let (_, _, blob_id, p_off, p_len) = self.raw_entry(i);
-        let blob = self.read_posting_blob(blob_id)?;
-        let p_end = p_off.checked_add(p_len).filter(|&e| e <= blob.len())?;
+        let blob = self.open_posting_blob(blob_id)?;
+        let bytes = self.term_bytes(&blob, blob_id, p_off, p_len)?;
+        self.decode_term(&bytes)
+    }
+
+    /// Full decode of one term's span, in this index's encoding.
+    fn decode_term(&self, bytes: &[u8]) -> Option<(Vec<Posting>, usize)> {
         match self.encoding {
-            SplitPostingsEncoding::Fixed32 => decode_postings_bytes(&blob[p_off..p_end]),
-            SplitPostingsEncoding::VarintDelta => {
-                decode_postings_varint_delta_bytes(&blob[p_off..p_end])
-            }
+            SplitPostingsEncoding::Fixed32 => decode_postings_bytes(bytes),
+            SplitPostingsEncoding::VarintDelta => decode_postings_varint_delta_bytes(bytes),
             SplitPostingsEncoding::SkipSplit => {
-                BlockedTermPostings::parse(Arc::new(blob[p_off..p_end].to_vec()))
-                    .and_then(|b| b.decode_full())
+                BlockedTermPostings::parse(Arc::new(bytes.to_vec())).and_then(|b| b.decode_full())
             }
         }
     }
@@ -3392,20 +4062,18 @@ impl SplitInvertedIndex {
         }
 
         for (blob_id, spans) in by_blob {
-            let Some(blob) = self.read_posting_blob(blob_id) else {
+            let Some(blob) = self.open_posting_blob(blob_id) else {
                 // Every term queued on this shard was TOC-present; the
                 // shard itself is unreadable (evicted/corrupt).
                 self.note_blob_read_failure();
                 continue;
             };
             for (i, slot, term, p_off, p_len, admit) in spans {
-                let Some(p_end) = p_off.checked_add(p_len).filter(|&e| e <= blob.len()) else {
+                let Some(bytes) = self.term_bytes(&blob, blob_id, p_off, p_len) else {
                     self.note_blob_read_failure();
                     continue;
                 };
-                let Some(parsed) =
-                    BlockedTermPostings::parse(Arc::new(blob[p_off..p_end].to_vec()))
-                else {
+                let Some(parsed) = BlockedTermPostings::parse(Arc::new(bytes.into_owned())) else {
                     self.note_blob_read_failure();
                     continue;
                 };
@@ -3425,6 +4093,47 @@ impl SplitInvertedIndex {
         // Spans in the TOC refer to the uncompressed shard layout.
         let raw = fs::read(self.segment_dir.join(posting_blob_file_for_id(blob_id))).ok()?;
         read_inverted_payload(raw).ok()
+    }
+
+    /// The shard as a [`BlobSource`]: the whole local file when there is
+    /// one (it always wins), otherwise — raw-shard segments only — the
+    /// spans cached for it. `None` when neither exists.
+    fn open_posting_blob(&self, blob_id: usize) -> Option<BlobSource> {
+        if let Some(blob) = self.read_posting_blob(blob_id) {
+            return Some(BlobSource::Whole(blob));
+        }
+        if !self.posting_spans {
+            return None;
+        }
+        let spans =
+            span_cache::SpanIndex::load(&self.segment_dir, &posting_blob_file_for_id(blob_id));
+        if spans.is_empty() {
+            // A promotion may have landed the whole shard and dropped the
+            // spans between the two looks.
+            return self.read_posting_blob(blob_id).map(BlobSource::Whole);
+        }
+        Some(BlobSource::Spans(spans))
+    }
+
+    /// One term's bytes from `blob`. On a span miss, looks for the whole
+    /// shard once more: a background promotion lands the whole file before
+    /// it drops the spans, so a span that vanished meanwhile is there.
+    fn term_bytes<'b>(
+        &self,
+        blob: &'b BlobSource,
+        blob_id: usize,
+        off: usize,
+        len: usize,
+    ) -> Option<std::borrow::Cow<'b, [u8]>> {
+        if let Some(bytes) = blob.term_bytes(off, len) {
+            return Some(bytes);
+        }
+        if !matches!(blob, BlobSource::Spans(_)) {
+            return None;
+        }
+        let whole = self.read_posting_blob(blob_id)?;
+        let end = off.checked_add(len).filter(|&e| e <= whole.len())?;
+        Some(std::borrow::Cow::Owned(whole[off..end].to_vec()))
     }
 }
 
@@ -3553,6 +4262,14 @@ struct DocIndex {
 }
 
 impl DocIndex {
+    /// The length `doc_store.bin` has when complete: the last record's end.
+    fn complete_len(&self) -> u64 {
+        self.entries
+            .last()
+            .map(|e| e.offset + e.length as u64)
+            .unwrap_or(0)
+    }
+
     fn id(&self, doc_seq: usize) -> Option<&str> {
         let e = self.entries.get(doc_seq)?;
         self.ids_pool
@@ -3604,9 +4321,35 @@ pub struct DocMetaRef<'a> {
 /// later hydration landed the real file (see `get()`'s doc comment for the
 /// incident this caused in production: a cached reader silently matched
 /// zero documents forever, on a file later confirmed byte-correct on disk).
+///
+/// Columnar segments (#244, `Footer::filter_columns` is `Some`) follow the
+/// same rule per file: `filters.toc` and each `filters-NNN.col` is cached
+/// only once a read found it present. A query node hydrates only the
+/// columns its queries touch, so [`Self::store_for`] adds columns to the
+/// cached compatibility [`FilterStore`] as they land, and a column that
+/// is still missing is simply retried on the next call.
 struct LazyFilters {
     segment_dir: PathBuf,
-    state: Mutex<Option<Arc<FilterStore>>>,
+    doc_count: u32,
+    /// `Footer::filter_columns.is_some()`: the format comes from the
+    /// footer, never from which files are on disk.
+    columnar: bool,
+    state: Mutex<FilterState>,
+}
+
+#[derive(Default)]
+struct FilterState {
+    /// Legacy: parsed `filters.bin`, once seen present.
+    legacy: Option<Arc<FilterStore>>,
+    /// Columnar: parsed `filters.toc`, once seen present.
+    toc: Option<Arc<filter_columns::FiltersToc>>,
+    /// Columnar: the compatibility store built from the columns loaded so
+    /// far, and their ids.
+    merged: Arc<FilterStore>,
+    merged_ids: std::collections::BTreeSet<u32>,
+    /// `filter_column` cache, by column id (columnar) or `(name, kind)`
+    /// position in the legacy store.
+    columns: HashMap<(String, kosha_core::FilterColumnKind), Arc<filter_columns::FilterColumn>>,
 }
 
 impl LazyFilters {
@@ -3632,9 +4375,8 @@ impl LazyFilters {
     /// non-empty (just a zero-entry header) and caches normally on first
     /// read, so this retry loop only ever runs during the brief hydration
     /// race, not on every query against a filter-less segment.
-    fn get(&self) -> Arc<FilterStore> {
-        let mut guard = self.state.lock().unwrap();
-        if let Some(store) = guard.as_ref() {
+    fn legacy(&self, state: &mut FilterState) -> Arc<FilterStore> {
+        if let Some(store) = state.legacy.as_ref() {
             return Arc::clone(store);
         }
         let raw = SegmentReader::read_filters_raw(&self.segment_dir);
@@ -3643,14 +4385,161 @@ impl LazyFilters {
                 "WARN: filters.bin missing/empty at first use for {} — filtered queries against this segment will match nothing until it hydrates; retrying on next use",
                 self.segment_dir.display()
             );
-            // Deliberately not cached — leave `guard` as `None` so the
-            // next call re-reads instead of trusting this premature empty
-            // parse forever.
+            // Deliberately not cached — leave `state.legacy` as `None` so
+            // the next call re-reads instead of trusting this premature
+            // empty parse forever.
             return Arc::new(SegmentReader::parse_filters(&raw));
         }
         let store = Arc::new(SegmentReader::parse_filters(&raw));
-        *guard = Some(Arc::clone(&store));
+        state.legacy = Some(Arc::clone(&store));
         store
+    }
+
+    /// `filters.toc`, or `None` while it is not local (not cached).
+    fn toc(
+        &self,
+        state: &mut FilterState,
+    ) -> Result<Option<Arc<filter_columns::FiltersToc>>, KoshaError> {
+        if let Some(toc) = state.toc.as_ref() {
+            return Ok(Some(Arc::clone(toc)));
+        }
+        let path = self.segment_dir.join(kosha_core::FILTERS_TOC_FILE);
+        let Some(bytes) = filter_columns::read_present(&path)? else {
+            eprintln!(
+                "WARN: filters.toc missing/empty at first use for {} — filtered queries against this segment will match nothing until it hydrates; retrying on next use",
+                self.segment_dir.display()
+            );
+            return Ok(None);
+        };
+        let toc = filter_columns::FiltersToc::decode(&bytes).map_err(|e| {
+            KoshaError::CorruptSegment(format!("{}: {e}", self.segment_dir.display()))
+        })?;
+        if toc.doc_count != self.doc_count {
+            return Err(KoshaError::CorruptSegment(format!(
+                "{}: filters.toc is for {} documents, footer says {}",
+                self.segment_dir.display(),
+                toc.doc_count,
+                self.doc_count
+            )));
+        }
+        let toc = Arc::new(toc);
+        state.toc = Some(Arc::clone(&toc));
+        Ok(Some(toc))
+    }
+
+    /// Read and decode one column file; `Ok(None)` while it is not local.
+    /// A present but damaged file is an error: it fails the query rather
+    /// than quietly matching nothing.
+    fn read_column(
+        &self,
+        meta: &kosha_core::FilterColumnMeta,
+    ) -> Result<Option<filter_columns::FilterColumn>, KoshaError> {
+        let file = meta.file_name();
+        let Some(bytes) = filter_columns::read_present(&self.segment_dir.join(&file))? else {
+            return Ok(None);
+        };
+        let what = format!("{}/{file} ({:?})", self.segment_dir.display(), meta.name);
+        filter_columns::decode_column(&bytes, meta.kind, self.doc_count, &what).map(Some)
+    }
+
+    /// The compatibility [`FilterStore`] holding at least every column
+    /// named in `fields` (all columns for `None`) that is local. Legacy
+    /// segments ignore `fields`: `filters.bin` holds every column.
+    fn store_for(
+        &self,
+        fields: Option<&std::collections::BTreeSet<String>>,
+    ) -> Result<Arc<FilterStore>, KoshaError> {
+        let mut state = self.state.lock().unwrap();
+        if !self.columnar {
+            return Ok(self.legacy(&mut state));
+        }
+        let Some(toc) = self.toc(&mut state)? else {
+            return Ok(Arc::new(FilterStore::default()));
+        };
+        let wanted: Vec<&kosha_core::FilterColumnMeta> = toc
+            .columns
+            .iter()
+            .filter(|c| !state.merged_ids.contains(&c.id))
+            .filter(|c| fields.is_none_or(|f| f.contains(&c.name)))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(Arc::clone(&state.merged));
+        }
+        let mut loaded = Vec::new();
+        for meta in wanted {
+            match self.read_column(meta)? {
+                Some(column) => loaded.push((meta, column)),
+                None => eprintln!(
+                    "WARN: filter column {} ({:?}) missing at use for {} — filters on it match nothing until it hydrates; retrying on next use",
+                    meta.file_name(),
+                    meta.name,
+                    self.segment_dir.display()
+                ),
+            }
+        }
+        if loaded.is_empty() {
+            return Ok(Arc::clone(&state.merged));
+        }
+        // Copy-on-grow: readers holding the previous Arc keep it. Rare —
+        // only when a query touches a column this segment has not loaded.
+        let mut store = (*state.merged).clone();
+        for (meta, column) in loaded {
+            column.append_to(&meta.name, &mut store);
+            state.merged_ids.insert(meta.id);
+        }
+        state.merged = Arc::new(store);
+        Ok(Arc::clone(&state.merged))
+    }
+
+    /// One column, decoded and cached. `Ok(None)` when the segment has no
+    /// such column, or (columnar) its file is not local yet — not cached.
+    fn column(
+        &self,
+        name: &str,
+        kind: kosha_core::FilterColumnKind,
+    ) -> Result<Option<Arc<filter_columns::FilterColumn>>, KoshaError> {
+        use filter_columns::{FilterColumn, NumericColumn, StringColumn};
+        let key = (name.to_string(), kind);
+        let mut state = self.state.lock().unwrap();
+        if let Some(column) = state.columns.get(&key) {
+            return Ok(Some(Arc::clone(column)));
+        }
+        let column = if self.columnar {
+            let Some(toc) = self.toc(&mut state)? else {
+                return Ok(None);
+            };
+            let Some(meta) = toc.find(name, kind) else {
+                return Ok(None);
+            };
+            match self.read_column(meta)? {
+                Some(column) => column,
+                None => return Ok(None),
+            }
+        } else {
+            let store = self.legacy(&mut state);
+            let column = match kind {
+                kosha_core::FilterColumnKind::String => store
+                    .string_fields
+                    .get(name)
+                    .map(|e| StringColumn::from_entries(e).map(FilterColumn::String))
+                    .transpose()?,
+                kosha_core::FilterColumnKind::Integer => store
+                    .integer_fields
+                    .get(name)
+                    .map(|e| FilterColumn::Integer(NumericColumn::from_entries(e))),
+                kosha_core::FilterColumnKind::Float => store
+                    .float_fields
+                    .get(name)
+                    .map(|e| FilterColumn::Float(NumericColumn::from_entries(e))),
+            };
+            match column {
+                Some(column) if state.legacy.is_some() => column,
+                _ => return Ok(None),
+            }
+        };
+        let column = Arc::new(column);
+        state.columns.insert(key, Arc::clone(&column));
+        Ok(Some(column))
     }
 }
 
@@ -3711,6 +4600,16 @@ struct LazyVectorIndex {
 /// [`SegmentReader::knn_search_within`]. `None` when the segment has no
 /// lazy v2 vector index.
 pub type BudgetedKnnResult = Option<Result<(Vec<(u32, f64)>, usize), KoshaError>>;
+
+/// One stored document plus its sidecar vectors, as yielded by
+/// [`SegmentReader::iter_doc_records_raw`]. `record`'s sidecar `Vector`
+/// fields keep their empty placeholder value; `vectors` holds each one's
+/// value as `(index into record.fields, vector)`.
+#[derive(Debug, Clone)]
+pub struct RawDocRecord {
+    pub record: DocRecord,
+    pub vectors: Vec<(usize, Vec<f32>)>,
+}
 
 pub struct SegmentReader {
     segment_dir: PathBuf,
@@ -3797,6 +4696,13 @@ impl SegmentReader {
             Some(footer) => footer,
             None => Self::read_footer(&segment_dir)?,
         };
+        let posting_spans = footer.posting_blobs_raw;
+        let filters = LazyFilters {
+            segment_dir: segment_dir.clone(),
+            doc_count: footer.doc_count,
+            columnar: footer.filter_columns.is_some(),
+            state: Mutex::new(FilterState::default()),
+        };
         let doc_store = match try_read_doc_index(&segment_dir, footer.doc_count) {
             Some(index) => DocStoreAccess::Lazy {
                 doc_store_path: segment_dir.join("doc_store.bin"),
@@ -3808,11 +4714,8 @@ impl SegmentReader {
             segment_dir: segment_dir.clone(),
             footer,
             doc_store,
-            inverted: Self::read_inverted(&segment_dir, postings_account)?,
-            filters: LazyFilters {
-                segment_dir: segment_dir.clone(),
-                state: Mutex::new(None),
-            },
+            inverted: Self::read_inverted(&segment_dir, postings_account, posting_spans)?,
+            filters,
             vector_store: vs,
             hnsw_map: hm,
             vector_index,
@@ -3828,45 +4731,69 @@ impl SegmentReader {
             return Ok(Arc::clone(dv));
         }
         let path = self.segment_dir.join(DOC_VECTORS_FILE);
-        let dv = Arc::new(DocVectors::open(path).map_err(|e| match e {
-            KoshaError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
-                KoshaError::NotFound(format!(
-                    "{DOC_VECTORS_FILE} missing from segment {:?}, whose footer says vectors \
-                     are stored there",
-                    self.segment_dir
-                ))
+        let missing = || {
+            KoshaError::NotFound(format!(
+                "{DOC_VECTORS_FILE} missing from segment {:?}, whose footer says vectors \
+                 are stored there",
+                self.segment_dir
+            ))
+        };
+        let dv = match DocVectors::open(path) {
+            Ok(dv) => dv,
+            // No whole file: the header may be in the sparse span cache
+            // (#245), fetched by a ranged read for page materialization.
+            Err(KoshaError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
+                let prefix = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE)
+                    .read_prefix()
+                    .ok_or_else(missing)?;
+                DocVectors::from_prefix(self.segment_dir.clone(), &prefix)?.ok_or_else(missing)?
             }
-            other => other,
-        })?);
+            Err(other) => return Err(other),
+        };
+        let dv = Arc::new(dv);
         *cached = Some(Arc::clone(&dv));
         Ok(dv)
     }
 
+    /// The sidecar header if it is available locally (whole file or cached
+    /// header span), without failing when it is not. `None` for segments
+    /// that store vectors inline.
+    fn local_doc_vectors(&self) -> Option<Arc<DocVectors>> {
+        if !self.footer.doc_vectors {
+            return None;
+        }
+        self.doc_vectors().ok()
+    }
+
     /// Put sidecar vectors back into the placeholder (empty-valued)
-    /// `Vector` fields of `record` (#243). No-op for segments that store
-    /// vectors inline. A placeholder with no matching sidecar entry is
-    /// corruption and fails loudly: returning the empty value would let a
-    /// compaction write the document out without its vector.
+    /// `Vector` fields of `record` (#243), as JSON. No-op for segments that
+    /// store vectors inline.
     fn fill_doc_vectors(&self, record: &mut DocRecord) -> Result<(), KoshaError> {
-        if !self.footer.doc_vectors
-            || !record
-                .fields
-                .iter()
-                .any(|f| f.field_type == FieldType::Vector && f.value.is_empty())
-        {
-            return Ok(());
+        for (index, vector) in self.sidecar_vectors(record)? {
+            record.fields[index].value = serde_json::to_string(&vector)?;
+        }
+        Ok(())
+    }
+
+    /// The sidecar vectors of `record`'s placeholder (empty-valued)
+    /// `Vector` fields, as `(field index, vector)`; empty for segments that
+    /// store vectors inline. A placeholder with no matching sidecar entry
+    /// is corruption and fails loudly: returning the empty value would let
+    /// a compaction write the document out without its vector.
+    fn sidecar_vectors(&self, record: &DocRecord) -> Result<Vec<(usize, Vec<f32>)>, KoshaError> {
+        let is_placeholder = |f: &Field| f.field_type == FieldType::Vector && f.value.is_empty();
+        if !self.footer.doc_vectors || !record.fields.iter().any(is_placeholder) {
+            return Ok(Vec::new());
         }
         let dv = self.doc_vectors()?;
         let mut stored = dv.vectors_for(record.doc_seq)?.into_iter();
-        for field in record
-            .fields
-            .iter_mut()
-            .filter(|f| f.field_type == FieldType::Vector && f.value.is_empty())
-        {
+        let mut out = Vec::new();
+        for (index, field) in record.fields.iter().enumerate() {
+            if !is_placeholder(field) {
+                continue;
+            }
             match stored.next() {
-                Some((name, vector)) if name == field.name => {
-                    field.value = serde_json::to_string(&vector)?;
-                }
+                Some((name, vector)) if name == field.name => out.push((index, vector)),
                 _ => {
                     return Err(KoshaError::CorruptSegment(format!(
                         "{DOC_VECTORS_FILE} in {:?} has no vector for doc_seq {} field '{}'",
@@ -3875,7 +4802,7 @@ impl SegmentReader {
                 }
             }
         }
-        Ok(())
+        Ok(out)
     }
 
     /// Loads this segment's vectors, dispatching on `vector.idx`'s format —
@@ -3900,7 +4827,16 @@ impl SegmentReader {
         // file. A missing file (open error) is not an error either — matches
         // `read_vectors`'s existing missing-file handling.
         let Some(header_buf) = read_vector_idx_header(&idx_path) else {
-            return Ok((VectorStore::default(), None, None, false));
+            // No local `vector.idx`. A query node reading postings by range
+            // (#245) only holds `vector.offsets`, whose header repeats the
+            // index's dim and version, plus whichever postings it fetched
+            // into the span cache.
+            return Ok(
+                Self::load_vector_index_from_offsets(segment_dir, postings_account)
+                    .map_or((VectorStore::default(), None, None, false), |vi| {
+                        (VectorStore::default(), None, Some(vi), false)
+                    }),
+            );
         };
 
         let Some((dim, _total_count, version)) = parse_vector_idx_header(&header_buf) else {
@@ -3995,6 +4931,40 @@ impl SegmentReader {
         }
     }
 
+    /// The lazy posting index from `vector.offsets` alone, for a segment
+    /// whose `vector.idx` is not local: postings are then read from the
+    /// sparse span cache (`vector.idx.spans/`) once fetched by range.
+    /// `None` without a valid sidecar.
+    fn load_vector_index_from_offsets(
+        segment_dir: &Path,
+        postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+    ) -> Option<LazyVectorIndex> {
+        let data = fs::read(segment_dir.join("vector.offsets")).ok()?;
+        if data.len() < VECTOR_OFFSETS_HEADER_LEN {
+            return None;
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().ok()?);
+        let dim = u32::from_le_bytes(data[8..12].try_into().ok()?);
+        let parsed = parse_vector_offsets(&data, dim, version)?;
+        let mut centroids = Vec::with_capacity(parsed.len());
+        let mut ranges = Vec::with_capacity(parsed.len());
+        let mut radii = Vec::with_capacity(parsed.len());
+        for p in parsed {
+            centroids.push(p.centroid);
+            ranges.push((p.offset, p.length));
+            radii.push(p.radius);
+        }
+        Some(LazyVectorIndex {
+            vector_idx_path: segment_dir.join("vector.idx"),
+            dim: dim as usize,
+            centroids,
+            ranges,
+            radii,
+            unit_norm: is_unit_norm_vector_index_version(version),
+            cache: PostingsCache::new(vector_postings_cache_max_bytes(), postings_account),
+        })
+    }
+
     /// `true` when this segment's vectors are served via the lazy v2
     /// posting index rather than the legacy `vector_store`/`hnsw_map`
     /// fields — callers branch on this to pick `knn_search` vs. the
@@ -4027,10 +4997,25 @@ impl SegmentReader {
             return Ok(hit);
         }
         let (offset, length) = vi.ranges[range_idx];
-        let mut file = fs::File::open(&vi.vector_idx_path)?;
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; length as usize];
-        file.read_exact(&mut buf)?;
+        // The whole local `vector.idx` when present, else the span cache a
+        // ranged cold query filled (#245). Neither: an IO error, which the
+        // query layer reports as a degraded segment, never as no matches.
+        let buf = span_cache::read_local_range(
+            &self.segment_dir,
+            VECTOR_IDX_FILE,
+            offset + length as u64,
+            offset,
+            length as u64,
+        )
+        .ok_or_else(|| {
+            KoshaError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "vector posting [{offset}, +{length}) of {} is not local",
+                    vi.vector_idx_path.display()
+                ),
+            ))
+        })?;
         let decoded = Arc::new(decode_posting_entries(&buf, vi.dim as u32));
         // Second-touch admission, same as text postings: one-shot probes
         // (a cold namespace scanned once) pass through without evicting a
@@ -4068,8 +5053,58 @@ impl SegmentReader {
         nprobe: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
+        self.knn_search_filtered_fetching(query, k, nprobe, accept, None)
+    }
+
+    /// [`Self::knn_search_filtered`] that first hands the postings it will
+    /// probe and does not hold locally to `fetch` (#245, ranged reads).
+    pub fn knn_search_filtered_fetching(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
         let vi = self.vector_index.as_ref()?;
-        Some(self.knn_search_lazy(vi, query, k, nprobe, accept))
+        Some(self.knn_search_lazy(vi, query, k, nprobe, accept, fetch))
+    }
+
+    /// Hand `fetch` the `vector.idx` ranges of the postings in `range_idxs`
+    /// that are neither decoded in memory nor readable locally, in one call.
+    fn prefetch_vector_postings(
+        &self,
+        vi: &LazyVectorIndex,
+        range_idxs: impl IntoIterator<Item = usize>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) {
+        let Some(fetch) = fetch else {
+            return;
+        };
+        let whole_len = fs::metadata(&vi.vector_idx_path)
+            .ok()
+            .filter(|m| m.is_file())
+            .map_or(0, |m| m.len());
+        let mut spans: Option<span_cache::SpanIndex> = None;
+        let mut missing = Vec::new();
+        for i in range_idxs {
+            let Some(&(offset, length)) = vi.ranges.get(i) else {
+                continue;
+            };
+            let end = offset + length as u64;
+            if length == 0 || whole_len >= end || vi.cache.get(i).is_some() {
+                continue;
+            }
+            let spans = spans.get_or_insert_with(|| {
+                span_cache::SpanIndex::load(&self.segment_dir, VECTOR_IDX_FILE)
+            });
+            if !spans.covers(offset, end) {
+                missing.push((offset, end));
+            }
+        }
+        if !missing.is_empty() {
+            fetch(&self.segment_dir, &missing);
+        }
     }
 
     /// Triangle-inequality lower bound on `query`'s distance to *any*
@@ -4164,10 +5199,28 @@ impl SegmentReader {
         max_probes: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
     ) -> BudgetedKnnResult {
-        let vi = self.vector_index.as_ref()?;
-        Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, accept))
+        self.knn_search_within_filtered_fetching(query, k, max_distance, max_probes, accept, None)
     }
 
+    /// [`Self::knn_search_within_filtered`] that first hands the postings
+    /// inside the budget it does not hold locally to `fetch`, in one call,
+    /// and fetches further postings in chunks of
+    /// [`VECTOR_PREFETCH_CHUNK`] if a restriction makes the probe run past
+    /// its budget (#245, ranged reads).
+    pub fn knn_search_within_filtered_fetching(
+        &self,
+        query: &[f32],
+        k: usize,
+        max_distance: f32,
+        max_probes: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> BudgetedKnnResult {
+        let vi = self.vector_index.as_ref()?;
+        Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn knn_search_within_lazy(
         &self,
         vi: &LazyVectorIndex,
@@ -4176,6 +5229,7 @@ impl SegmentReader {
         max_distance: f32,
         max_probes: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
         // Rank this segment's qualifying postings nearest-first (by lower
         // bound, not raw centroid distance — see `centroid_lower_bound`),
@@ -4199,6 +5253,7 @@ impl SegmentReader {
             .take_while(|(_, d)| *d <= max_distance)
             .count()
             .min(max_probes);
+        self.prefetch_vector_postings(vi, ranked[..budgeted].iter().map(|&(i, _)| i), fetch);
 
         let mut probes = 0usize;
         let mut scored: Vec<(u32, f64)> = Vec::new();
@@ -4209,6 +5264,11 @@ impl SegmentReader {
                 // still short (see the doc comment on the public wrapper).
                 if accept.is_none() || scored.len() >= k {
                     break;
+                }
+                if (position - budgeted) % VECTOR_PREFETCH_CHUNK == 0 {
+                    let chunk =
+                        &ranked[position..(position + VECTOR_PREFETCH_CHUNK).min(ranked.len())];
+                    self.prefetch_vector_postings(vi, chunk.iter().map(|&(i, _)| i), fetch);
                 }
             }
             probes += 1;
@@ -4241,6 +5301,7 @@ impl SegmentReader {
         k: usize,
         nprobe: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<Vec<(u32, f64)>, KoshaError> {
         // Unit-norm segments: normalize the query once, then every stored
         // comparison is a bare dot product — same cosine scores (clamped
@@ -4267,10 +5328,17 @@ impl SegmentReader {
         } else {
             kosha_vector_spfresh::nearest_centroids(&vi.centroids, query, rank)
         };
+        let budgeted = nprobe.min(candidates.len());
+        self.prefetch_vector_postings(vi, candidates[..budgeted].iter().copied(), fetch);
         let mut scored: Vec<(u32, f64)> = Vec::new();
-        for (position, range_idx) in candidates.into_iter().enumerate() {
+        for (position, &range_idx) in candidates.iter().enumerate() {
             if position >= nprobe && scored.len() >= k {
                 break;
+            }
+            if position >= budgeted && (position - budgeted) % VECTOR_PREFETCH_CHUNK == 0 {
+                let chunk =
+                    &candidates[position..(position + VECTOR_PREFETCH_CHUNK).min(candidates.len())];
+                self.prefetch_vector_postings(vi, chunk.iter().copied(), fetch);
             }
             for (id, v) in self.hydrate_posting(vi, range_idx)?.iter() {
                 if accept.is_some_and(|accept| !accept(*id)) {
@@ -4293,7 +5361,75 @@ impl SegmentReader {
     /// [`LazyFilters`]). Queries without filters/aggregations/field sorts
     /// never call this, and never pay the parse.
     pub fn filter_store(&self) -> Arc<FilterStore> {
-        self.filters.get()
+        self.try_filter_store().unwrap_or_else(|e| {
+            eprintln!(
+                "ERROR: filter columns of {} unreadable: {e}",
+                self.segment_dir.display()
+            );
+            Arc::new(FilterStore::default())
+        })
+    }
+
+    /// [`Self::filter_store`] that reports a damaged columnar filter file
+    /// (#244) as an error instead of an empty store. Callers that filter,
+    /// sort or aggregate use this so corruption fails the request closed.
+    pub fn try_filter_store(&self) -> Result<Arc<FilterStore>, KoshaError> {
+        self.filters.store_for(None)
+    }
+
+    /// The compatibility store with at least the columns named in
+    /// `fields` (#244) — see `SearchQuery::filter_column_fields`. On a
+    /// columnar segment this reads only those columns, which is all a
+    /// query node hydrated for the query; a legacy segment returns all of
+    /// `filters.bin`. Columns loaded by earlier calls stay in the store.
+    pub fn filter_store_for(
+        &self,
+        fields: &std::collections::BTreeSet<String>,
+    ) -> Result<Arc<FilterStore>, KoshaError> {
+        self.filters.store_for(Some(fields))
+    }
+
+    /// One filter column, decoded on first use and cached (#244). Works on
+    /// both formats: a legacy segment builds it from `filters.bin`.
+    /// `Ok(None)` when the segment has no such column or its file is not
+    /// local yet (a missing file is never cached, so a later call sees it
+    /// once hydrated). `Err` when the file is present but damaged.
+    pub fn filter_column(
+        &self,
+        field: &str,
+        kind: kosha_core::FilterColumnKind,
+    ) -> Result<Option<Arc<filter_columns::FilterColumn>>, KoshaError> {
+        self.filters.column(field, kind)
+    }
+
+    /// The documents of this segment that pass `clause` (#244).
+    ///
+    /// The one entry point for search and delete-by-query. A columnar
+    /// segment answers from its columns — dictionary lookups and term
+    /// bitmaps, zone-map-pruned numeric scans, presence bitmaps (see
+    /// [`filter_eval`]) — reading only the columns the clause names. A
+    /// legacy `filters.bin` segment keeps the row scan of
+    /// [`kosha_core::evaluate_filter`]. Both return the same set; a damaged
+    /// column fails the call instead of matching nothing.
+    pub fn evaluate_filter(&self, clause: &FilterClause) -> Result<DocSet, KoshaError> {
+        if self.has_filter_columns() {
+            return filter_eval::evaluate_filter_columns(clause, self, self.doc_count());
+        }
+        let mut fields = std::collections::BTreeSet::new();
+        clause.for_each_field(&mut |f| {
+            fields.insert(f.to_string());
+            fields.insert(kosha_core::base_field_name(f).to_string());
+        });
+        Ok(kosha_core::evaluate_filter(
+            clause,
+            &*self.filter_store_for(&fields)?,
+            self.doc_count(),
+        ))
+    }
+
+    /// Whether this segment stores filter values in the columnar format.
+    pub fn has_filter_columns(&self) -> bool {
+        self.footer.filter_columns.is_some()
     }
 
     pub fn footer(&self) -> &Footer {
@@ -4452,6 +5588,19 @@ impl SegmentReader {
                 let Some(entry) = index.entries.get(doc_seq as usize) else {
                     return Ok(None);
                 };
+                // The whole file when it is complete, else the sparse span
+                // cache (#245). Neither → the plain read below, which fails
+                // with the same IO error as before spans existed.
+                if let Some(buf) = span_cache::read_local_range(
+                    &self.segment_dir,
+                    DOC_STORE_FILE,
+                    index.complete_len(),
+                    entry.offset,
+                    entry.length as u64,
+                ) {
+                    let mut cursor = &buf[..];
+                    return Ok(Some(parse_one_doc_record(&mut cursor, doc_seq)));
+                }
                 let mut file = fs::File::open(doc_store_path)?;
                 file.seek(SeekFrom::Start(entry.offset))?;
                 let mut buf = vec![0u8; entry.length as usize];
@@ -4502,16 +5651,84 @@ impl SegmentReader {
                 // ("failed to fill whole buffer") forever. The offsets
                 // sidecar knows the exact expected file size — the last
                 // record's end — so validate against it.
-                let expected = index
-                    .entries
-                    .last()
-                    .map(|e| e.offset + e.length as u64)
-                    .unwrap_or(0);
+                let expected = index.complete_len();
                 std::fs::metadata(doc_store_path)
                     .map(|m| m.len() >= expected && m.len() > 0)
                     .unwrap_or(false)
             }
         }
+    }
+
+    /// Whether `doc_record_full(doc_seq)` can be served from local disk —
+    /// the whole doc store (see [`Self::has_local_doc_store`]), or this
+    /// document's spans in the sparse span cache (#245): its record bytes
+    /// and, for a sidecar segment, the vectors header plus its vector
+    /// bytes. Out-of-range `doc_seq`s are "local" (there is nothing to
+    /// fetch; `doc_record_full` returns `None`).
+    pub fn doc_is_local(&self, doc_seq: u32) -> bool {
+        if self.has_local_doc_store() {
+            return true;
+        }
+        let DocStoreAccess::Lazy { index, .. } = &self.doc_store else {
+            // Eager record, but a sidecar whose file is absent.
+            return false;
+        };
+        let Some(entry) = index.entries.get(doc_seq as usize) else {
+            return true;
+        };
+        let record_local =
+            file_is_complete(&self.segment_dir.join(DOC_STORE_FILE), index.complete_len())
+                || span_cache::SpanIndex::load(&self.segment_dir, DOC_STORE_FILE)
+                    .covers(entry.offset, entry.offset + entry.length as u64);
+        if !record_local {
+            return false;
+        }
+        if !self.footer.doc_vectors {
+            return true;
+        }
+        let Some(dv) = self.local_doc_vectors() else {
+            return false;
+        };
+        match dv.doc_span(doc_seq) {
+            None => true,
+            Some((start, end)) => {
+                file_is_complete(&self.segment_dir.join(DOC_VECTORS_FILE), dv.file_len())
+                    || span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE)
+                        .covers(start, end)
+            }
+        }
+    }
+
+    /// Length `doc_store.bin` has when complete, from the offsets sidecar;
+    /// `None` for `Eager` (legacy) segments.
+    pub fn doc_store_len(&self) -> Option<u64> {
+        match &self.doc_store {
+            DocStoreAccess::Eager(_) => None,
+            DocStoreAccess::Lazy { index, .. } => Some(index.complete_len()),
+        }
+    }
+
+    /// Whether this segment keeps vectors in `doc_vectors.bin` (#243).
+    pub fn uses_doc_vectors(&self) -> bool {
+        self.footer.doc_vectors
+    }
+
+    /// The sidecar vectors' `[start, end)` byte range for `doc_seq` in
+    /// `doc_vectors.bin`, read from a locally available header (whole file
+    /// or cached header span). `Ok(None)`: the document has no sidecar
+    /// vectors. `Err`: the header is not local (fetch
+    /// `[0, doc_vectors_header_len)` first) or is corrupt.
+    pub fn doc_vectors_span(&self, doc_seq: u32) -> Result<Option<(u64, u64)>, KoshaError> {
+        if !self.footer.doc_vectors {
+            return Ok(None);
+        }
+        Ok(self.doc_vectors()?.doc_span(doc_seq))
+    }
+
+    /// Whether the sidecar header is readable locally. Always `true` for
+    /// segments without a sidecar.
+    pub fn has_local_doc_vectors_header(&self) -> bool {
+        !self.footer.doc_vectors || self.local_doc_vectors().is_some()
     }
 
     /// Parse one document's full record from bytes fetched elsewhere — the
@@ -4578,6 +5795,29 @@ impl SegmentReader {
                 self.doc_count()
             ))),
             Err(e) => Err(e),
+        })
+    }
+
+    /// [`Self::iter_doc_records`] for merges: each record as stored, with
+    /// its sidecar vectors returned as f32 next to it instead of printed
+    /// into the placeholder fields as JSON (#242). Feed the result to
+    /// [`SegmentWriter::add_document_with_vectors`]. Inline-stored vectors
+    /// (`KOSHA_VECTOR_STORE=inline`, pre-#243 segments) stay in their
+    /// fields as JSON, as before. Same error contract as
+    /// `iter_doc_records`: callers must propagate every `Err`.
+    pub fn iter_doc_records_raw(
+        &self,
+    ) -> impl Iterator<Item = Result<RawDocRecord, KoshaError>> + '_ {
+        (0..self.doc_count()).map(move |seq| {
+            let record = self.doc_record_stored(seq)?.ok_or_else(|| {
+                KoshaError::NotFound(format!(
+                    "doc_seq {seq} missing from doc_store in segment {:?} (doc_count={})",
+                    self.segment_dir,
+                    self.doc_count()
+                ))
+            })?;
+            let vectors = self.sidecar_vectors(&record)?;
+            Ok(RawDocRecord { record, vectors })
         })
     }
 
@@ -4656,7 +5896,7 @@ impl SegmentReader {
     /// Used to unlock segment pruning on segments written before blooms existed.
     pub fn rewrite_filter_blooms(segment_dir: &Path) -> Result<Footer, KoshaError> {
         let mut footer = Self::read_footer(segment_dir)?;
-        let store = Self::read_filters(segment_dir)?;
+        let store = Self::read_filters_any(segment_dir, &footer)?;
         footer.filter_blooms = Some(build_filter_blooms(&store.string_fields));
         let json = serde_json::to_string_pretty(&footer)?;
         atomic_write(&segment_dir.join("footer.json"), json.as_bytes())?;
@@ -4669,7 +5909,7 @@ impl SegmentReader {
     /// blooms existed.
     pub fn rewrite_term_bloom(segment_dir: &Path) -> Result<Footer, KoshaError> {
         let mut footer = Self::read_footer(segment_dir)?;
-        let inverted = Self::read_inverted(segment_dir, None)?;
+        let inverted = Self::read_inverted(segment_dir, None, false)?;
         let combined: Vec<&str> = inverted
             .all_terms()
             .into_iter()
@@ -4755,17 +5995,22 @@ impl SegmentReader {
     /// table of contents) opens lazily with zero parsing; anything else is
     /// parsed eagerly via the legacy v1 stream layout — the exact cost every
     /// segment paid before v2 existed.
+    ///
+    /// `posting_spans` (the footer's `posting_blobs_raw`): a split index may
+    /// serve a term from the sparse span cache when its whole shard is not
+    /// local (#245). Off for segments whose shards may be compressed, where
+    /// a byte range of the stored file means nothing.
     fn read_inverted(
         segment_dir: &Path,
         account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+        posting_spans: bool,
     ) -> Result<InvertedAccess, KoshaError> {
         let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
         if SplitInvertedIndex::detect(&data) {
-            return Ok(InvertedAccess::Split(SplitInvertedIndex::from_bytes(
-                data,
-                segment_dir.to_path_buf(),
-                account,
-            )?));
+            let mut split =
+                SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), account)?;
+            split.posting_spans = posting_spans;
+            return Ok(InvertedAccess::Split(split));
         }
         if LazyInvertedIndex::detect(&data) {
             return Ok(InvertedAccess::Lazy(LazyInvertedIndex::from_bytes(
@@ -4845,10 +6090,28 @@ impl SegmentReader {
         fs::read(segment_dir.join("filters.bin")).unwrap_or_default()
     }
 
-    /// Eagerly read + parse `filters.bin` — the pre-lazy behavior, kept for
-    /// the bloom-rewrite admin path which always needs the parsed form.
-    fn read_filters(segment_dir: &Path) -> Result<FilterStore, KoshaError> {
-        Ok(Self::parse_filters(&Self::read_filters_raw(segment_dir)))
+    /// Eagerly read every filter column, in whichever format `footer`
+    /// says the segment uses — for the bloom-rewrite admin path, which
+    /// always needs the parsed form. A columnar segment must have its TOC
+    /// and every column local; a missing one is an error here (a rebuilt
+    /// bloom must not silently drop a field).
+    fn read_filters_any(segment_dir: &Path, footer: &Footer) -> Result<FilterStore, KoshaError> {
+        if footer.filter_columns.is_none() {
+            return Ok(Self::parse_filters(&Self::read_filters_raw(segment_dir)));
+        }
+        let filters = LazyFilters {
+            segment_dir: segment_dir.to_path_buf(),
+            doc_count: footer.doc_count,
+            columnar: true,
+            state: Mutex::new(FilterState::default()),
+        };
+        if !filter_columns::filter_files_present(segment_dir, footer) {
+            return Err(KoshaError::NotFound(format!(
+                "{}: columnar filter files not all local",
+                segment_dir.display()
+            )));
+        }
+        Ok((*filters.store_for(None)?).clone())
     }
 
     /// Parse filter columns from raw `filters.bin` bytes. Empty/short input
@@ -4896,6 +6159,16 @@ impl SegmentReader {
             }
         }
         store
+    }
+}
+
+impl filter_eval::ColumnSource for SegmentReader {
+    fn column(
+        &self,
+        name: &str,
+        kind: kosha_core::FilterColumnKind,
+    ) -> Result<Option<Arc<filter_columns::FilterColumn>>, KoshaError> {
+        self.filter_column(name, kind)
     }
 }
 
@@ -5907,7 +7180,10 @@ mod tests {
         // eager parse was ~529ms/segment on the worst staging namespace).
         let dir = std::env::temp_dir().join("kosha-test-lazy-filters");
         let _ = fs::remove_dir_all(&dir);
-        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        // The legacy `filters.bin` path; columnar segments have their own
+        // tests in `filter_column_format_tests`.
+        let mut w =
+            SegmentWriter::new(SegmentId("s1".into()), dir.clone()).with_filters_write_version(1);
         w.add_document(
             DocumentId("d1".into()),
             vec![
@@ -5919,13 +7195,13 @@ mod tests {
 
         let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
         assert!(
-            r.filters.state.lock().unwrap().is_none(),
+            r.filters.state.lock().unwrap().legacy.is_none(),
             "open must not have parsed filters.bin"
         );
         let store = r.filter_store();
         assert!(store.string_fields.contains_key("tag"));
         assert!(
-            r.filters.state.lock().unwrap().is_some(),
+            r.filters.state.lock().unwrap().legacy.is_some(),
             "first filter_store() call materializes the parse"
         );
 
@@ -5942,7 +7218,10 @@ mod tests {
         // nothing. The reader must read the file at first *use* instead.
         let dir = std::env::temp_dir().join("kosha-test-filters-hydrated-late");
         let _ = fs::remove_dir_all(&dir);
-        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        // The legacy `filters.bin` path; columnar segments have their own
+        // tests in `filter_column_format_tests`.
+        let mut w =
+            SegmentWriter::new(SegmentId("s1".into()), dir.clone()).with_filters_write_version(1);
         w.add_document(
             DocumentId("d1".into()),
             vec![
@@ -5956,7 +7235,7 @@ mod tests {
         let stash = dir.join("filters.bin.stash");
         fs::rename(dir.join("filters.bin"), &stash).unwrap();
         let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
-        assert!(r.filters.state.lock().unwrap().is_none());
+        assert!(r.filters.state.lock().unwrap().legacy.is_none());
 
         // "Hydrate" the file, then use the SAME (cached) reader.
         fs::rename(&stash, dir.join("filters.bin")).unwrap();
@@ -5985,7 +7264,10 @@ mod tests {
         // reader's query still returned zero hits.
         let dir = std::env::temp_dir().join("kosha-test-filters-first-use-races-hydration");
         let _ = fs::remove_dir_all(&dir);
-        let mut w = SegmentWriter::new(SegmentId("s1".into()), dir.clone());
+        // The legacy `filters.bin` path; columnar segments have their own
+        // tests in `filter_column_format_tests`.
+        let mut w =
+            SegmentWriter::new(SegmentId("s1".into()), dir.clone()).with_filters_write_version(1);
         w.add_document(
             DocumentId("d1".into()),
             vec![
@@ -6006,7 +7288,7 @@ mod tests {
             "first use before hydration sees an empty store, as expected"
         );
         assert!(
-            r.filters.state.lock().unwrap().is_none(),
+            r.filters.state.lock().unwrap().legacy.is_none(),
             "an empty read caused by a missing file must not be cached — \
              only a confirmed-present read commits to the cache"
         );
@@ -7509,6 +8791,106 @@ mod doc_vectors_tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// #245: with neither whole file local, a reader serves documents from
+    /// the sparse span cache — records from `doc_store.bin.spans`, vectors
+    /// via a header span plus the doc's vector span — and `doc_is_local`
+    /// reports exactly which documents are covered.
+    #[test]
+    fn documents_are_served_from_the_span_cache() {
+        let dir = scratch("spans");
+        write(
+            &dir,
+            VectorStoreMode::Sidecar,
+            (0..5)
+                .map(|i| {
+                    (
+                        ["d0", "d1", "d2", "d3", "d4"][i],
+                        vec![
+                            Field::text("t", format!("text {i}")),
+                            vector_field("emb", &[i as f32, 0.5]),
+                        ],
+                    )
+                })
+                .collect(),
+        );
+        let ds = fs::read(dir.join(DOC_STORE_FILE)).unwrap();
+        let dv = fs::read(dir.join(DOC_VECTORS_FILE)).unwrap();
+        fs::remove_file(dir.join(DOC_STORE_FILE)).unwrap();
+        fs::remove_file(dir.join(DOC_VECTORS_FILE)).unwrap();
+        let reader = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(!reader.has_local_doc_store());
+        assert!(!reader.doc_is_local(2));
+        assert!(!reader.has_local_doc_vectors_header());
+        assert!(reader.doc_vectors_span(2).is_err());
+        assert!(reader.doc_record_full(2).is_err());
+
+        let put = |file: &str, s: u64, e: u64, src: &[u8]| {
+            let d = span_cache::spans_dir(&dir, file);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                d.join(span_cache::span_file_name(s, e)),
+                &src[s as usize..e as usize],
+            )
+            .unwrap();
+        };
+        // The header length is discoverable from a short prefix.
+        let header_len = match doc_vectors_header_len(&dv[..10]).unwrap() {
+            Err(need) => {
+                assert!(need > 10);
+                doc_vectors_header_len(&dv).unwrap().unwrap()
+            }
+            Ok(len) => len,
+        };
+        assert_eq!(header_len, 8 + 4 + 3 + 4 + 5 * 12);
+        put(DOC_VECTORS_FILE, 0, header_len, &dv);
+        assert!(reader.has_local_doc_vectors_header());
+        let (vs, ve) = reader.doc_vectors_span(2).unwrap().unwrap();
+        assert_eq!(ve - vs, 8);
+        let (off, len) = reader.doc_span(2).unwrap();
+        put(DOC_STORE_FILE, off, off + len as u64, &ds);
+        assert!(!reader.doc_is_local(2), "vector span still missing");
+        put(DOC_VECTORS_FILE, vs, ve, &dv);
+        assert!(reader.doc_is_local(2));
+        assert!(!reader.doc_is_local(3));
+
+        let rec = reader.doc_record_full(2).unwrap().unwrap();
+        assert_eq!(rec.fields[0].value, "text 2");
+        let v: Vec<f32> = serde_json::from_str(&rec.fields[1].value).unwrap();
+        assert_eq!(v, vec![2.0, 0.5]);
+        assert!(reader.doc_record_full(3).is_err());
+
+        // Whole files win once they land, spans or not.
+        fs::write(dir.join(DOC_STORE_FILE), &ds).unwrap();
+        fs::write(dir.join(DOC_VECTORS_FILE), &dv).unwrap();
+        assert!(reader.doc_is_local(3));
+        let rec = reader.doc_record_full(3).unwrap().unwrap();
+        assert_eq!(rec.fields[0].value, "text 3");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_parse_from_prefix_matches_open() {
+        let dir = scratch("prefix");
+        write(
+            &dir,
+            VectorStoreMode::Sidecar,
+            vec![("d0", vec![vector_field("emb", &[1.0, 2.0, 3.0])])],
+        );
+        let bytes = fs::read(dir.join(DOC_VECTORS_FILE)).unwrap();
+        let whole = DocVectors::open(dir.join(DOC_VECTORS_FILE)).unwrap();
+        let from_prefix = DocVectors::from_prefix(dir.clone(), &bytes[..32])
+            .unwrap()
+            .unwrap();
+        assert_eq!(whole.doc_span(0), from_prefix.doc_span(0));
+        assert_eq!(whole.file_len(), bytes.len() as u64);
+        assert_eq!(from_prefix.file_len(), bytes.len() as u64);
+        assert!(DocVectors::from_prefix(dir.clone(), &bytes[..9])
+            .unwrap()
+            .is_none());
+        assert!(DocVectors::from_prefix(dir.clone(), b"XXXXXXXXXXXX").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn truncated_or_garbled_sidecar_is_rejected() {
         let dir = scratch("corrupt");
@@ -7617,15 +8999,18 @@ mod bounded_build_tests {
 
     /// A few thousand docs with a Zipf-ish vocabulary: shared stopwords
     /// (long posting lists across every run), mid-frequency words and
-    /// per-doc unique terms, plus filters and a vector.
+    /// per-doc unique terms, plus filters and a vector. `stop` is the
+    /// very-high-df term: in every doc, 1 to 9 times, so its encoded
+    /// postings are far bigger than a small build's per-term spill limit.
     fn corpus(n: usize) -> Vec<(DocumentId, Vec<Field>)> {
         (0..n)
             .map(|i| {
                 let text = format!(
                     "the quick brown fox number {i} jumps over the lazy dog topic{} \
-                     unique{i}term the end word{}",
+                     unique{i}term the end word{}{}",
                     i % 37,
-                    (i * 7919) % 1013
+                    (i * 7919) % 1013,
+                    " stop".repeat(1 + i % 9)
                 );
                 (
                     DocumentId(format!("doc-{i:05}")),
@@ -7658,8 +9043,18 @@ mod bounded_build_tests {
         budget: usize,
         docs: &[(DocumentId, Vec<Field>)],
     ) -> (Footer, usize, usize) {
+        build_version(dir, budget, docs, SKIP_SPLIT_INVERTED_VERSION)
+    }
+
+    fn build_version(
+        dir: &Path,
+        budget: usize,
+        docs: &[(DocumentId, Vec<Field>)],
+        version: u32,
+    ) -> (Footer, usize, usize) {
         let mut w = SegmentWriter::new(SegmentId("seg".into()), dir.to_path_buf())
-            .with_build_memory_bytes(budget);
+            .with_build_memory_bytes(budget)
+            .with_postings_write_version(version);
         for (id, fields) in docs {
             w.add_document(id.clone(), fields.clone());
         }
@@ -7683,8 +9078,9 @@ mod bounded_build_tests {
     }
 
     /// The spill path must be invisible in the output: a segment built with
-    /// a tiny budget (dozens of runs) is byte-for-byte the segment built
-    /// fully in memory, footer aside from its timestamp.
+    /// a tiny budget (dozens of runs, and a 4 KiB per-term encoder limit
+    /// that the very-high-df `stop` spills past) is byte-for-byte the
+    /// segment built fully in memory, footer aside from its timestamp.
     #[test]
     fn spilled_build_is_byte_identical_to_in_memory_build() {
         let docs = corpus(3_000);
@@ -7693,8 +9089,153 @@ mod bounded_build_tests {
         let (fb, runs_b, _) = build(&b_dir, 64 * 1024, &docs);
         assert_eq!(runs_a, 0);
         assert!(runs_b >= 10, "expected many runs, got {runs_b}");
+        assert_eq!(term_spill_limit(64 * 1024), 4 * 1024);
 
-        let (a, b) = (files(&a_dir), files(&b_dir));
+        assert_same_files(&a_dir, &b_dir, &fa, &fb);
+        assert!(!b_dir.join(BUILD_DIR).exists(), "scratch removed");
+
+        // And it reads back: postings, blooms and stored docs.
+        let r = SegmentReader::open(b_dir.clone()).unwrap();
+        assert_eq!(r.doc_count(), 3_000);
+        let the = r.postings("the").unwrap();
+        assert_eq!(the.len(), 3_000);
+        assert!(the.windows(2).all(|w| w[0].doc_id < w[1].doc_id));
+        assert_eq!(the[42].positions, vec![0, 8, 13]);
+        assert_eq!(r.postings("unique1234term").unwrap()[0].doc_id, 1234);
+        // The high-df term: every doc, right tf and positions, and its
+        // bytes are what the whole-list reference encoder produces.
+        let stop = r.postings("stop").unwrap().into_owned();
+        assert_eq!(stop.len(), 3_000);
+        for (i, p) in stop.iter().enumerate() {
+            assert_eq!(p.doc_id, i as u32);
+            assert_eq!(p.term_frequency as usize, 1 + i % 9);
+            assert_eq!(
+                p.positions,
+                (16..16 + (1 + i as u32 % 9)).collect::<Vec<_>>()
+            );
+        }
+        let field_lengths: Vec<u32> = r.iter_doc_meta().map(|m| m.field_length).collect();
+        let mut reference = Vec::new();
+        write_postings_skip_split(&mut reference, &stop, &field_lengths);
+        assert!(reference.len() > 3 * term_spill_limit(64 * 1024));
+        let blob = read_inverted_payload(
+            fs::read(b_dir.join(posting_blob_file_for_term("stop"))).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            blob.windows(reference.len()).any(|w| w == reference),
+            "streamed `stop` span equals the reference encoding"
+        );
+        assert!(fb
+            .term_bloom
+            .as_ref()
+            .unwrap()
+            .may_contain("unique2999term"));
+        let rec = r.doc_record_full(2_999).unwrap().unwrap();
+        assert_eq!(rec.doc_id.0, "doc-02999");
+        fs::remove_dir_all(a_dir).unwrap();
+        fs::remove_dir_all(b_dir).unwrap();
+    }
+
+    /// `KOSHA_POSTINGS_WRITE_VERSION=4` streams through the same encoder:
+    /// spilled and in-memory v4 builds are identical and read back.
+    #[test]
+    fn spilled_v4_build_is_byte_identical_to_in_memory_build() {
+        let docs = corpus(2_000);
+        let (a_dir, b_dir) = (scratch("mem4"), scratch("spill4"));
+        let (fa, _, _) = build_version(&a_dir, usize::MAX, &docs, SPLIT_INVERTED_VERSION);
+        let (fb, runs_b, _) = build_version(&b_dir, 64 * 1024, &docs, SPLIT_INVERTED_VERSION);
+        assert!(runs_b >= 5, "expected several runs, got {runs_b}");
+        assert_same_files(&a_dir, &b_dir, &fa, &fb);
+        let toc = read_inverted_payload(fs::read(b_dir.join("inverted.idx")).unwrap()).unwrap();
+        assert_eq!(toc[4..8], SPLIT_INVERTED_VERSION.to_le_bytes());
+        let r = SegmentReader::open(b_dir.clone()).unwrap();
+        let stop = r.postings("stop").unwrap().into_owned();
+        assert_eq!(stop.len(), 2_000);
+        let mut reference = Vec::new();
+        write_postings_varint_delta(&mut reference, &stop);
+        let blob = read_inverted_payload(
+            fs::read(b_dir.join(posting_blob_file_for_term("stop"))).unwrap(),
+        )
+        .unwrap();
+        assert!(blob.windows(reference.len()).any(|w| w == reference));
+        fs::remove_dir_all(a_dir).unwrap();
+        fs::remove_dir_all(b_dir).unwrap();
+    }
+
+    /// The streaming encoder emits exactly the whole-list encoders' bytes,
+    /// for both versions, across block boundaries, spills and reuse.
+    #[test]
+    fn term_encoder_matches_whole_list_encoders() {
+        let dir = scratch("encoder");
+        fs::create_dir_all(&dir).unwrap();
+        let field_lengths: Vec<u32> = (0..5_000u32).map(|i| 3 + (i * 31) % 200).collect();
+        let mut x = 7u64;
+        let mut rand = move |m: u32| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 33) as u32) % m
+        };
+        // Lengths around the block size, and one in every doc.
+        let mut terms: Vec<Vec<Posting>> = Vec::new();
+        for n in [1usize, 2, 127, 128, 129, 255, 256, 257, 1_000, 5_000] {
+            let mut doc = 0u32;
+            let postings = (0..n)
+                .map(|k| {
+                    doc = if n == 5_000 {
+                        k as u32
+                    } else {
+                        doc + 1 + rand(3)
+                    };
+                    let tf = 1 + rand(6);
+                    let mut pos = 0;
+                    let positions = (0..tf)
+                        .map(|_| {
+                            pos += rand(400);
+                            pos
+                        })
+                        .collect();
+                    Posting {
+                        doc_id: doc,
+                        term_frequency: tf,
+                        positions,
+                    }
+                })
+                .collect();
+            terms.push(postings);
+        }
+        for version in [SKIP_SPLIT_INVERTED_VERSION, SPLIT_INVERTED_VERSION] {
+            // A 64-byte limit spills nearly every posting.
+            let mut encoder = TermEncoder::new(version, &dir, 64);
+            for postings in &terms {
+                let mut expected = Vec::new();
+                if version == SPLIT_INVERTED_VERSION {
+                    write_postings_varint_delta(&mut expected, postings);
+                } else {
+                    write_postings_skip_split(&mut expected, postings, &field_lengths);
+                }
+                for p in postings {
+                    encoder
+                        .push(p.doc_id, p.term_frequency, &p.positions, &field_lengths)
+                        .unwrap();
+                }
+                let mut got = Vec::new();
+                let len = encoder.finish(&mut got).unwrap();
+                assert_eq!(len as usize, got.len());
+                assert!(
+                    got == expected,
+                    "v{version}, {} postings: streamed bytes differ",
+                    postings.len()
+                );
+            }
+            assert!(encoder.spilled_total() > 0, "the spill files were used");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn assert_same_files(a_dir: &Path, b_dir: &Path, fa: &Footer, fb: &Footer) {
+        let (a, b) = (files(a_dir), files(b_dir));
         let names: Vec<&str> = a.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, b.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>());
         assert!(names.iter().any(|n| n.starts_with("postings")), "{names:?}");
@@ -7707,30 +9248,169 @@ mod bounded_build_tests {
                 "{name} differs between in-memory and spilled builds"
             );
         }
-        let mut fa_json = serde_json::to_value(&fa).unwrap();
-        let mut fb_json = serde_json::to_value(&fb).unwrap();
+        let mut fa_json = serde_json::to_value(fa).unwrap();
+        let mut fb_json = serde_json::to_value(fb).unwrap();
         fa_json["created_at"] = serde_json::Value::Null;
         fb_json["created_at"] = serde_json::Value::Null;
         assert_eq!(fa_json, fb_json);
-        assert!(!b_dir.join(BUILD_DIR).exists(), "scratch removed");
+    }
 
-        // And it reads back: postings, blooms and stored docs.
-        let r = SegmentReader::open(b_dir.clone()).unwrap();
-        assert_eq!(r.doc_count(), 3_000);
-        let the = r.postings("the").unwrap();
-        assert_eq!(the.len(), 3_000);
-        assert!(the.windows(2).all(|w| w[0].doc_id < w[1].doc_id));
-        assert_eq!(the[42].positions, vec![0, 8, 13]);
-        assert_eq!(r.postings("unique1234term").unwrap()[0].doc_id, 1234);
-        assert!(fb
-            .term_bloom
-            .as_ref()
-            .unwrap()
-            .may_contain("unique2999term"));
-        let rec = r.doc_record_full(2_999).unwrap().unwrap();
-        assert_eq!(rec.doc_id.0, "doc-02999");
-        fs::remove_dir_all(a_dir).unwrap();
-        fs::remove_dir_all(b_dir).unwrap();
+    /// Tricky f32s: their JSON round trip is exact too, but the raw path
+    /// must not depend on that.
+    fn vector_docs(n: usize) -> Vec<(DocumentId, Vec<Field>)> {
+        (0..n)
+            .map(|i| {
+                let v = [
+                    1.0f32 / 3.0 + i as f32,
+                    -0.0,
+                    f32::MIN_POSITIVE / 7.0,
+                    f32::MAX,
+                    std::f32::consts::PI * i as f32,
+                ];
+                let mut fields = vec![
+                    Field::text("body", format!("doc {i} text")),
+                    Field::keyword("tag", format!("t{}", i % 3)),
+                    Field {
+                        name: "emb".into(),
+                        field_type: FieldType::Vector,
+                        value: serde_json::to_string(&v).unwrap(),
+                    },
+                ];
+                if i % 2 == 0 {
+                    fields.push(Field::text("notes", "after the vector"));
+                }
+                (DocumentId(format!("v{i}")), fields)
+            })
+            .collect()
+    }
+
+    fn write_segment(dir: &Path, mode: VectorStoreMode, docs: &[(DocumentId, Vec<Field>)]) {
+        let mut w = SegmentWriter::new(SegmentId("v".into()), dir.to_path_buf())
+            .with_vector_store_mode(mode);
+        for (id, fields) in docs {
+            w.add_document(id.clone(), fields.clone());
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+    }
+
+    /// Re-write `src` through the merge path (`iter_doc_records_raw` +
+    /// `add_document_with_vectors`).
+    fn remerge(src: &Path, dst: &Path, mode: VectorStoreMode) {
+        let r = SegmentReader::open(src.to_path_buf()).unwrap();
+        let mut w = SegmentWriter::new(SegmentId("v".into()), dst.to_path_buf())
+            .with_vector_store_mode(mode);
+        for raw in r.iter_doc_records_raw() {
+            let raw = raw.unwrap();
+            w.add_document_with_vectors(raw.record.doc_id, raw.record.fields, raw.vectors);
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+    }
+
+    fn vector_bits(dir: &Path) -> Vec<(String, String, Vec<u32>)> {
+        let r = SegmentReader::open(dir.to_path_buf()).unwrap();
+        let mut out = Vec::new();
+        for rec in r.iter_doc_records() {
+            let rec = rec.unwrap();
+            for f in rec
+                .fields
+                .iter()
+                .filter(|f| f.field_type == FieldType::Vector)
+            {
+                let v: Vec<f32> = serde_json::from_str(&f.value).unwrap();
+                out.push((
+                    rec.doc_id.0.clone(),
+                    f.name.clone(),
+                    v.iter().map(|x| x.to_bits()).collect(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// The merge path hands sidecar vectors over as f32: a sidecar →
+    /// sidecar re-merge reproduces every file, and sidecar ↔ inline
+    /// conversions keep the vectors bit-identical.
+    #[test]
+    fn raw_records_pass_vectors_through_bit_identically() {
+        let docs = vector_docs(300);
+        let sidecar = scratch("vec-sidecar");
+        let inline = scratch("vec-inline");
+        write_segment(&sidecar, VectorStoreMode::Sidecar, &docs);
+        write_segment(&inline, VectorStoreMode::Inline, &docs);
+        let expected = vector_bits(&sidecar);
+        assert_eq!(expected.len(), 300);
+        assert_eq!(vector_bits(&inline), expected);
+
+        let raw = SegmentReader::open(sidecar.clone()).unwrap();
+        let first = raw.iter_doc_records_raw().next().unwrap().unwrap();
+        assert!(first.record.fields[2].value.is_empty(), "placeholder kept");
+        assert_eq!(first.vectors.len(), 1);
+        assert_eq!(first.vectors[0].0, 2, "index into the record's fields");
+        let want: Vec<f32> = serde_json::from_str(&docs[0].1[2].value).unwrap();
+        assert_eq!(
+            first.vectors[0]
+                .1
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            want.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+
+        // sidecar → sidecar: same bytes, file for file.
+        let again = scratch("vec-sidecar2");
+        remerge(&sidecar, &again, VectorStoreMode::Sidecar);
+        let (fa, fb) = (
+            SegmentReader::read_footer(&sidecar).unwrap(),
+            SegmentReader::read_footer(&again).unwrap(),
+        );
+        assert_same_files(&sidecar, &again, &fa, &fb);
+
+        // sidecar → inline: the writer fills in the JSON, exactly as
+        // `doc_record_full` does, so the doc store matches an inline build.
+        let to_inline = scratch("vec-to-inline");
+        remerge(&sidecar, &to_inline, VectorStoreMode::Inline);
+        assert!(!SegmentReader::read_footer(&to_inline).unwrap().doc_vectors);
+        assert_eq!(
+            fs::read(to_inline.join("doc_store.bin")).unwrap(),
+            fs::read(inline.join("doc_store.bin")).unwrap()
+        );
+        assert_eq!(vector_bits(&to_inline), expected);
+
+        // inline → sidecar: nothing supplied, parsed from the JSON.
+        let to_sidecar = scratch("vec-to-sidecar");
+        remerge(&inline, &to_sidecar, VectorStoreMode::Sidecar);
+        assert_eq!(
+            fs::read(to_sidecar.join(DOC_VECTORS_FILE)).unwrap(),
+            fs::read(sidecar.join(DOC_VECTORS_FILE)).unwrap()
+        );
+        assert_eq!(vector_bits(&to_sidecar), expected);
+
+        for d in [sidecar, inline, again, to_inline, to_sidecar] {
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// A placeholder with no sidecar entry fails the raw read too.
+    #[test]
+    fn raw_records_reject_a_missing_sidecar_vector() {
+        let dir = scratch("vec-missing");
+        write_segment(&dir, VectorStoreMode::Sidecar, &vector_docs(3));
+        // Rewrite the sidecar with doc 1's entries dropped.
+        let mut w = SegmentWriter::new(SegmentId("x".into()), scratch("vec-missing-src"))
+            .with_vector_store_mode(VectorStoreMode::Sidecar);
+        let docs = vector_docs(3);
+        w.add_document(docs[0].0.clone(), docs[0].1.clone());
+        w.add_document(docs[2].0.clone(), docs[2].1.clone());
+        let other = w.output_dir.clone();
+        w.finalize(Bm25Params::default()).unwrap();
+        fs::copy(other.join(DOC_VECTORS_FILE), dir.join(DOC_VECTORS_FILE)).unwrap();
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let results: Vec<_> = r.iter_doc_records_raw().collect();
+        assert!(results
+            .iter()
+            .any(|r| matches!(r, Err(KoshaError::CorruptSegment(_)))));
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(other).unwrap();
     }
 
     /// The in-memory postings never exceed the budget by more than one
@@ -7790,5 +9470,633 @@ mod bounded_build_tests {
             parse_segment_build_memory_bytes(Some("lots")),
             DEFAULT_SEGMENT_BUILD_MEMORY_BYTES
         );
+    }
+}
+
+#[cfg(test)]
+mod posting_span_tests {
+    //! Raw posting shards and ranged term reads (#245, part 2).
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-postspan-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// 3,000 docs over a 400-word vocabulary: every shard a query term
+    /// lands in is well over the 4 KiB compression threshold.
+    fn build(dir: &Path, raw: bool) -> Footer {
+        let mut w = SegmentWriter::new(SegmentId("s".into()), dir.to_path_buf())
+            .with_raw_posting_blobs(raw);
+        for i in 0..3000u32 {
+            let words: Vec<String> = (0..12)
+                .map(|j| format!("w{}", (i * 7 + j * 13) % 400))
+                .collect();
+            let text = format!("alpha beta {} gamma", words.join(" "));
+            w.add_document(
+                kosha_core::DocumentId(format!("d{i}")),
+                vec![Field::text("t", text)],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap()
+    }
+
+    fn shard_files(dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("postings-")
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn is_wrapped(bytes: &[u8]) -> bool {
+        bytes.len() >= 4 && bytes[0..4] == COMPRESSED_INVERTED_MAGIC.to_le_bytes()
+    }
+
+    #[test]
+    fn raw_writer_leaves_shards_unwrapped_and_flags_the_footer() {
+        let raw_dir = scratch("raw");
+        let zst_dir = scratch("zst");
+        assert!(build(&raw_dir, true).posting_blobs_raw);
+        assert!(!build(&zst_dir, false).posting_blobs_raw);
+        assert!(shard_files(&raw_dir)
+            .iter()
+            .all(|p| !is_wrapped(&fs::read(p).unwrap())));
+        assert!(shard_files(&zst_dir)
+            .iter()
+            .any(|p| is_wrapped(&fs::read(p).unwrap())));
+        // The flag round-trips through footer.json, and a footer without it
+        // (every pre-#245 segment) reads as `false`.
+        let footer = SegmentReader::read_footer(&raw_dir).unwrap();
+        assert!(footer.posting_blobs_raw);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(zst_dir.join("footer.json")).unwrap()).unwrap();
+        assert!(
+            json.get("posting_blobs_raw").is_none(),
+            "omitted when false"
+        );
+        json.as_object_mut().unwrap().remove("posting_blobs_raw");
+        let old: Footer = serde_json::from_value(json).unwrap();
+        assert!(!old.posting_blobs_raw);
+
+        // Both read identically when whole (a raw shard is what any reader,
+        // old or new, already accepts: the wrapper was always optional).
+        let a = SegmentReader::open_with_options(raw_dir.clone(), false).unwrap();
+        let b = SegmentReader::open_with_options(zst_dir.clone(), false).unwrap();
+        for term in ["alpha", "w7", "w399", "gamma"] {
+            let pa: Vec<_> = a.postings(term).unwrap().to_vec();
+            let pb: Vec<_> = b.postings(term).unwrap().to_vec();
+            assert_eq!(pa, pb, "{term}");
+        }
+        let raw_size: u64 = shard_files(&raw_dir)
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().len())
+            .sum();
+        let zst_size: u64 = shard_files(&zst_dir)
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().len())
+            .sum();
+        println!("posting shards: raw {raw_size} bytes, zstd {zst_size} bytes");
+        let _ = fs::remove_dir_all(&raw_dir);
+        let _ = fs::remove_dir_all(&zst_dir);
+    }
+
+    /// Copy just `terms`' spans of every shard into the span cache and
+    /// remove the whole shards — the state a ranged cold query leaves.
+    fn keep_only_spans(dir: &Path, terms: &[String]) -> u64 {
+        let spans = posting_term_spans(dir, terms).unwrap();
+        let mut total = 0;
+        for s in &spans {
+            let shard = fs::read(dir.join(&s.file)).unwrap();
+            let d = span_cache::spans_dir(dir, &s.file);
+            fs::create_dir_all(&d).unwrap();
+            let (a, b) = (s.start as usize, (s.start + s.len) as usize);
+            fs::write(
+                d.join(span_cache::span_file_name(s.start, s.start + s.len)),
+                &shard[a..b],
+            )
+            .unwrap();
+            total += s.len;
+        }
+        for p in shard_files(dir) {
+            fs::remove_file(p).unwrap();
+        }
+        total
+    }
+
+    #[test]
+    fn term_spans_serve_postings_when_the_shard_is_absent() {
+        let dir = scratch("spans");
+        build(&dir, true);
+        let whole = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        let terms: Vec<String> = ["alpha", "w7", "gamma"].map(String::from).to_vec();
+        let expected: Vec<Vec<Posting>> = terms
+            .iter()
+            .map(|t| whole.postings(t).unwrap().to_vec())
+            .collect();
+        drop(whole);
+
+        let spans =
+            posting_term_spans(&dir, &[terms.clone(), vec!["absent".into()]].concat()).unwrap();
+        assert_eq!(spans.len(), 3, "terms the TOC lacks are left out");
+        let shard_bytes: u64 = shard_files(&dir)
+            .iter()
+            .map(|p| fs::metadata(p).unwrap().len())
+            .sum();
+        let span_bytes = keep_only_spans(&dir, &terms);
+        assert!(
+            span_bytes * 4 < shard_bytes,
+            "{span_bytes} of {shard_bytes}"
+        );
+
+        let reader = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        for (t, want) in terms.iter().zip(&expected) {
+            assert_eq!(&reader.postings(t).unwrap().to_vec(), want, "{t}");
+        }
+        let batch = reader.postings_for_terms(&terms);
+        assert_eq!(batch.len(), 3);
+        let scoring = reader.scoring_postings_for_terms(&terms);
+        assert_eq!(scoring.len(), 3);
+        assert!(!reader.take_blob_read_failure());
+
+        // A TOC-present term with neither shard nor span is an error, not a
+        // silent non-match (PR #83 class).
+        assert!(reader.postings("w8").is_none());
+        assert!(reader.take_blob_read_failure());
+        let more = vec!["w8".to_string()];
+        assert!(reader.scoring_postings_for_terms(&more).is_empty());
+        assert!(reader.take_blob_read_failure());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spans_are_ignored_for_segments_without_raw_shards() {
+        let dir = scratch("noraw");
+        build(&dir, true);
+        let terms = vec!["alpha".to_string()];
+        keep_only_spans(&dir, &terms);
+        // Same bytes, but the footer no longer vouches that shards are raw.
+        let mut footer = SegmentReader::read_footer(&dir).unwrap();
+        footer.posting_blobs_raw = false;
+        fs::write(
+            dir.join("footer.json"),
+            serde_json::to_vec(&footer).unwrap(),
+        )
+        .unwrap();
+        let reader = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert!(reader.postings("alpha").is_none());
+        assert!(reader.take_blob_read_failure());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn whole_shard_wins_over_spans() {
+        let dir = scratch("wins");
+        build(&dir, true);
+        let terms = vec!["alpha".to_string()];
+        let saved: Vec<(PathBuf, Vec<u8>)> = shard_files(&dir)
+            .into_iter()
+            .map(|p| {
+                let b = fs::read(&p).unwrap();
+                (p, b)
+            })
+            .collect();
+        keep_only_spans(&dir, &terms);
+        // Corrupt the span: if the reader used it, decoding would differ.
+        let span = posting_term_spans(&dir, &terms).unwrap().remove(0);
+        let d = span_cache::spans_dir(&dir, &span.file);
+        let name = span_cache::span_file_name(span.start, span.start + span.len);
+        fs::write(d.join(name), vec![0xffu8; span.len as usize]).unwrap();
+        for (p, b) in &saved {
+            fs::write(p, b).unwrap();
+        }
+        let reader = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        assert_eq!(reader.postings("alpha").unwrap().len(), 3000);
+        assert!(!reader.take_blob_read_failure());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// #244: the columnar filter format (`filters.toc` + `filters-NNN.col`).
+#[cfg(test)]
+mod filter_column_format_tests {
+    use super::*;
+    use kosha_core::{FilterColumnKind, FILTERS_TOC_FILE};
+    use std::collections::BTreeSet;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-fcol-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Documents covering every filterable field type, a field holding two
+    /// kinds, a multi-valued field, a field only some documents have, a
+    /// long Text value over the cap and a Vector (never a filter column).
+    fn docs() -> Vec<(DocumentId, Vec<Field>)> {
+        let long = "prose ".repeat(100);
+        let mut out = Vec::new();
+        for i in 0..20u32 {
+            let mut fields = vec![
+                Field::text("body", format!("hello world {i}")),
+                Field::text(
+                    "content",
+                    if i == 3 {
+                        long.clone()
+                    } else {
+                        format!("short {i}")
+                    },
+                ),
+                Field::keyword("matterId", format!("m{}", i % 3)),
+                Field::boolean("inScope", i % 2 == 0),
+                Field::date_val("createdAt", format!("2024-01-{:02}", i + 1)),
+                Field::integer("pages", i as i64 * 10 - 50),
+                Field::float_val("score", i as f64 / 4.0),
+                Field::vector("emb", vec![i as f32, 1.0]),
+            ];
+            if i % 5 == 0 {
+                fields.push(Field::keyword("sparse", "rare"));
+                fields.push(Field::keyword("matterId", "extra"));
+            }
+            if i == 7 {
+                fields.push(Field::integer("mixed", 7));
+            } else {
+                fields.push(Field::keyword("mixed", format!("k{i}")));
+            }
+            out.push((DocumentId(format!("d{i}")), fields));
+        }
+        out
+    }
+
+    fn write(dir: &Path, version: u32, docs: &[(DocumentId, Vec<Field>)]) -> Footer {
+        let mut w = SegmentWriter::new(SegmentId("s".into()), dir.to_path_buf())
+            .with_filters_write_version(version)
+            .with_text_filter_ignore_above(Some(256));
+        for (id, fields) in docs {
+            w.add_document(id.clone(), fields.clone());
+        }
+        w.finalize(Bm25Params::default()).unwrap()
+    }
+
+    fn sorted(store: &FilterStore) -> String {
+        let mut s: Vec<String> = store
+            .string_fields
+            .iter()
+            .map(|(k, v)| format!("s {k} {v:?}"))
+            .chain(
+                store
+                    .integer_fields
+                    .iter()
+                    .map(|(k, v)| format!("i {k} {v:?}")),
+            )
+            .chain(
+                store
+                    .float_fields
+                    .iter()
+                    .map(|(k, v)| format!("f {k} {v:?}")),
+            )
+            .collect();
+        s.sort();
+        s.join("\n")
+    }
+
+    fn blooms(footer: &Footer) -> String {
+        let sorted: std::collections::BTreeMap<_, _> =
+            footer.filter_blooms.as_ref().unwrap().iter().collect();
+        serde_json::to_string(&sorted).unwrap()
+    }
+
+    fn fields(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn columnar_round_trip_matches_filters_bin_for_every_field_type() {
+        let docs = docs();
+        let v1 = temp_dir("v1");
+        let v2 = temp_dir("v2");
+        let f1 = write(&v1, 1, &docs);
+        let f2 = write(&v2, 2, &docs);
+
+        assert!(f1.filter_columns.is_none());
+        assert!(v1.join("filters.bin").is_file());
+        assert!(!v1.join(FILTERS_TOC_FILE).exists());
+        let metas = f2.filter_columns.clone().expect("v2 footer lists columns");
+        assert!(!v2.join("filters.bin").exists(), "v2 writes no filters.bin");
+        assert!(v2.join(FILTERS_TOC_FILE).is_file());
+        for m in &metas {
+            assert_eq!(fs::metadata(v2.join(m.file_name())).unwrap().len(), m.bytes);
+        }
+        // Same blooms either way: pruning does not depend on the format.
+        assert_eq!(blooms(&f1), blooms(&f2));
+
+        let r1 = SegmentReader::open(v1.clone()).unwrap();
+        let r2 = SegmentReader::open(v2.clone()).unwrap();
+        assert!(r2.has_filter_columns() && !r1.has_filter_columns());
+        let s1 = r1.try_filter_store().unwrap();
+        let s2 = r2.try_filter_store().unwrap();
+        assert_eq!(
+            sorted(&s1),
+            sorted(&s2),
+            "adapter rebuilds filters.bin's store exactly"
+        );
+
+        // Every kind is present, the two-kind field is two columns, the
+        // long Text value is capped out (#243) and vectors never appear.
+        assert!(s2.string_fields.contains_key("inScope"));
+        assert!(s2.string_fields.contains_key("createdAt"));
+        assert_eq!(s2.integer_fields["pages"].len(), 20);
+        assert_eq!(s2.float_fields["score"].len(), 20);
+        assert_eq!(s2.integer_fields["mixed"], vec![(7, 7)]);
+        assert_eq!(s2.string_fields["mixed"].len(), 19);
+        assert_eq!(s2.string_fields["sparse"].len(), 4);
+        assert_eq!(s2.string_fields["content"].len(), 19);
+        assert!(!s2.string_fields["content"].iter().any(|(d, _)| *d == 3));
+        assert!(!s2.string_fields.contains_key("emb"));
+        assert_eq!(
+            metas.iter().filter(|m| m.name == "mixed").count(),
+            2,
+            "a field holding two kinds is two columns"
+        );
+
+        // Per-column API, both formats, same answer.
+        for r in [&r1, &r2] {
+            let col = r
+                .filter_column("matterId", FilterColumnKind::String)
+                .unwrap()
+                .unwrap();
+            let filter_columns::FilterColumn::String(s) = &*col else {
+                panic!()
+            };
+            assert_eq!(s.term_count(), 4);
+            assert_eq!(
+                s.term_bitmap("extra").unwrap().iter().collect::<Vec<_>>(),
+                vec![0, 5, 10, 15]
+            );
+            let col = r
+                .filter_column("pages", FilterColumnKind::Integer)
+                .unwrap()
+                .unwrap();
+            assert_eq!(col.len(), 20);
+            assert!(r
+                .filter_column("pages", FilterColumnKind::Float)
+                .unwrap()
+                .is_none());
+            assert!(r
+                .filter_column("nope", FilterColumnKind::String)
+                .unwrap()
+                .is_none());
+        }
+
+        // Stats in the footer and TOC.
+        let pages = metas.iter().find(|m| m.name == "pages").unwrap();
+        assert_eq!(
+            pages.stats.min,
+            Some(kosha_core::FilterStatValue::Integer(-50))
+        );
+        assert_eq!(
+            pages.stats.max,
+            Some(kosha_core::FilterStatValue::Integer(140))
+        );
+        assert_eq!(
+            (pages.stats.values, pages.stats.docs, pages.stats.distinct),
+            (20, 20, 20)
+        );
+        let matter = metas.iter().find(|m| m.name == "matterId").unwrap();
+        assert_eq!(
+            (
+                matter.stats.values,
+                matter.stats.docs,
+                matter.stats.distinct
+            ),
+            (24, 20, 4)
+        );
+        let toc = filter_columns::FiltersToc::decode(&fs::read(v2.join(FILTERS_TOC_FILE)).unwrap())
+            .unwrap();
+        assert_eq!(toc.columns, metas);
+
+        let _ = fs::remove_dir_all(&v1);
+        let _ = fs::remove_dir_all(&v2);
+    }
+
+    #[test]
+    fn segment_with_no_filter_fields_and_empty_segment() {
+        for (name, docs) in [
+            (
+                "nofields",
+                vec![(
+                    DocumentId("a".into()),
+                    vec![Field::text("body", "x ".repeat(300))],
+                )],
+            ),
+            ("nodocs", Vec::new()),
+        ] {
+            let dir = temp_dir(name);
+            let footer = write(&dir, 2, &docs);
+            assert_eq!(footer.filter_columns, Some(Vec::new()));
+            assert!(
+                dir.join(FILTERS_TOC_FILE).is_file(),
+                "the TOC is always written"
+            );
+            let r = SegmentReader::open(dir.clone()).unwrap();
+            let store = r.try_filter_store().unwrap();
+            assert!(store.string_fields.is_empty() && store.integer_fields.is_empty());
+            assert!(
+                r.filters.state.lock().unwrap().toc.is_some(),
+                "a present TOC is cached"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn filter_store_for_reads_only_the_named_columns() {
+        let dir = temp_dir("subset");
+        let footer = write(&dir, 2, &docs());
+        let metas = footer.filter_columns.unwrap();
+        let matter = metas.iter().find(|m| m.name == "matterId").unwrap();
+        // A query node hydrated only the TOC and the matterId column.
+        for m in &metas {
+            if m.id != matter.id {
+                fs::remove_file(dir.join(m.file_name())).unwrap();
+            }
+        }
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let store = r.filter_store_for(&fields(&["matterId"])).unwrap();
+        assert_eq!(store.string_fields["matterId"].len(), 24);
+        assert_eq!(store.string_fields.len(), 1);
+        assert!(store.integer_fields.is_empty());
+
+        // A later query touches `pages`, whose column lands afterwards: the
+        // missing read is not cached, and the store grows once it is local.
+        let missing = r.filter_store_for(&fields(&["matterId", "pages"])).unwrap();
+        assert!(!missing.integer_fields.contains_key("pages"));
+        assert!(r
+            .filter_column("pages", FilterColumnKind::Integer)
+            .unwrap()
+            .is_none());
+        let v2 = temp_dir("subset-src");
+        write(&v2, 2, &docs());
+        let pages = metas.iter().find(|m| m.name == "pages").unwrap();
+        fs::copy(v2.join(pages.file_name()), dir.join(pages.file_name())).unwrap();
+        let grown = r.filter_store_for(&fields(&["pages"])).unwrap();
+        assert_eq!(grown.integer_fields["pages"].len(), 20);
+        assert!(
+            grown.string_fields.contains_key("matterId"),
+            "earlier columns stay"
+        );
+        assert!(r
+            .filter_column("pages", FilterColumnKind::Integer)
+            .unwrap()
+            .is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&v2);
+    }
+
+    #[test]
+    fn missing_toc_is_retried_not_cached() {
+        let dir = temp_dir("late-toc");
+        write(&dir, 2, &docs());
+        let stash = dir.join("toc.stash");
+        fs::rename(dir.join(FILTERS_TOC_FILE), &stash).unwrap();
+        let r = SegmentReader::open_with_options(dir.clone(), false).unwrap();
+        let store = r.try_filter_store().unwrap();
+        assert!(store.string_fields.is_empty());
+        assert!(r.filters.state.lock().unwrap().toc.is_none());
+        fs::rename(&stash, dir.join(FILTERS_TOC_FILE)).unwrap();
+        let store = r.try_filter_store().unwrap();
+        assert!(store.string_fields.contains_key("matterId"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_or_truncated_column_fails_closed() {
+        let dir = temp_dir("corrupt");
+        let footer = write(&dir, 2, &docs());
+        let metas = footer.filter_columns.unwrap();
+        let matter = metas.iter().find(|m| m.name == "matterId").unwrap();
+        let path = dir.join(matter.file_name());
+        let good = fs::read(&path).unwrap();
+
+        // Truncated.
+        fs::write(&path, &good[..good.len() / 2]).unwrap();
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(matches!(
+            r.try_filter_store(),
+            Err(KoshaError::CorruptSegment(_))
+        ));
+        assert!(r.filter_store_for(&fields(&["matterId"])).is_err());
+        assert!(r
+            .filter_column("matterId", FilterColumnKind::String)
+            .is_err());
+        // Columns the query does not touch still load.
+        assert!(r.filter_store_for(&fields(&["pages"])).is_ok());
+
+        // A flipped byte in the body.
+        let mut bad = good.clone();
+        let mid = bad.len() - 3;
+        bad[mid] ^= 0xFF;
+        fs::write(&path, &bad).unwrap();
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(r.filter_store_for(&fields(&["matterId"])).is_err());
+
+        // Corrupt TOC.
+        fs::write(&path, &good).unwrap();
+        let toc_path = dir.join(FILTERS_TOC_FILE);
+        let mut toc = fs::read(&toc_path).unwrap();
+        toc.truncate(toc.len() - 1);
+        fs::write(&toc_path, &toc).unwrap();
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(r.try_filter_store().is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bloom_rewrite_reads_columnar_segments() {
+        let dir = temp_dir("bloom-rewrite");
+        let footer = write(&dir, 2, &docs());
+        let mut stripped = footer.clone();
+        stripped.filter_blooms = None;
+        fs::write(
+            dir.join("footer.json"),
+            serde_json::to_string(&stripped).unwrap(),
+        )
+        .unwrap();
+        let rebuilt = SegmentReader::rewrite_filter_blooms(&dir).unwrap();
+        assert_eq!(blooms(&rebuilt), blooms(&footer));
+        assert_eq!(rebuilt.filter_columns, footer.filter_columns);
+        // A column that is not local fails the rebuild instead of dropping
+        // that field's bloom.
+        let any = &footer.filter_columns.as_ref().unwrap()[0];
+        fs::remove_file(dir.join(any.file_name())).unwrap();
+        assert!(SegmentReader::rewrite_filter_blooms(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Compaction re-adds every stored document to a fresh writer, so
+    /// its output format is whatever the writer gate says, whatever the
+    /// inputs were: v1 inputs become columnar under `=2`, and columnar
+    /// inputs go back to `filters.bin` on a rollback to `=1`.
+    #[test]
+    fn rewriting_a_segment_follows_the_writer_gate_both_ways() {
+        let src_v1 = temp_dir("merge-src-v1");
+        let src_v2 = temp_dir("merge-src-v2");
+        write(&src_v1, 1, &docs());
+        write(&src_v2, 2, &docs());
+        let expected = sorted(
+            &SegmentReader::open(src_v1.clone())
+                .unwrap()
+                .try_filter_store()
+                .unwrap(),
+        );
+        for (src, target) in [(&src_v1, 2u32), (&src_v2, 1u32)] {
+            let out = temp_dir(&format!("merge-out-{target}"));
+            let reader = SegmentReader::open(src.clone()).unwrap();
+            let mut w = SegmentWriter::new(SegmentId("m".into()), out.clone())
+                .with_filters_write_version(target)
+                .with_text_filter_ignore_above(Some(256));
+            for raw in reader.iter_doc_records_raw() {
+                let raw = raw.unwrap();
+                w.add_document_with_vectors(raw.record.doc_id, raw.record.fields, raw.vectors);
+            }
+            let footer = w.finalize(Bm25Params::default()).unwrap();
+            assert_eq!(footer.filter_columns.is_some(), target == 2);
+            assert_eq!(out.join("filters.bin").exists(), target == 1);
+            let merged = SegmentReader::open(out.clone()).unwrap();
+            assert_eq!(sorted(&merged.try_filter_store().unwrap()), expected);
+            let _ = fs::remove_dir_all(&out);
+        }
+        let _ = fs::remove_dir_all(&src_v1);
+        let _ = fs::remove_dir_all(&src_v2);
+    }
+
+    #[test]
+    fn footer_without_filter_columns_parses_as_legacy() {
+        // A footer.json from before #244 has no `filter_columns` key.
+        let dir = temp_dir("legacy-footer");
+        let footer = write(&dir, 1, &docs());
+        let json = serde_json::to_string(&footer).unwrap();
+        assert!(!json.contains("filter_columns"));
+        let back: Footer = serde_json::from_str(&json).unwrap();
+        assert!(back.filter_columns.is_none());
+        assert_eq!(back.filter_files_for(None), vec!["filters.bin".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

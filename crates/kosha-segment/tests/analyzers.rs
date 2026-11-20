@@ -96,6 +96,11 @@ fn footer_without_timestamp(bytes: &[u8]) -> serde_json::Value {
     // with it treat its absence as "can't prune". Everything else must
     // match byte for byte.
     value.as_object_mut().unwrap().remove("fuzzy_bloom");
+    // Likewise `posting_blobs_raw` (#245): it records that no posting
+    // shard was zstd-wrapped, which readers before it never needed to know
+    // (the wrapper was always optional); the shards themselves must still
+    // match byte for byte below.
+    value.as_object_mut().unwrap().remove("posting_blobs_raw");
     value
 }
 

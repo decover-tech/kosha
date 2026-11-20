@@ -201,10 +201,63 @@ s3://kosha-{env}/{namespace_id}/segments/{segment_id}/
     doc_store.bin       # document payloads (content, metadata), compressed, block-addressed
     inverted.idx         # term → postings list (docId, freq, positions) for lexical search
     vector.idx           # ANN index (HNSW graph or IVF-PQ codebook + posting lists) — Phase 2, not written in Phase 1
-    filters.bin          # columnar filter fields (dates, ids, tags) for fast predicate eval
+    filters.bin          # filter fields (dates, ids, tags), row-oriented — or, with the columnar format:
+    filters.toc          #   column directory + per-column stats (#244)
+    filters-NNN.col      #   one file per (field, type) column, numbered by id
     footer.json          # offsets, counts, schema version, checksum (reserves a vector.idx slot even in Phase 1)
 ```
 
+**Filter index formats (#244).** A segment stores its filter values in one of two formats, and
+`footer.json` says which (`filter_columns` present = columnar); readers never infer it from the
+files that happen to be on local disk.
+
+- `filters.bin` (v1): every field's `(doc_seq, value)` pairs in one row-oriented blob. Any filter,
+  sort or aggregation on one field needs the whole file.
+- Columnar (v2): `filters.toc` plus one `filters-NNN.col` per `(field, type)` column. Files are
+  numbered, not named after fields, because field names are arbitrary strings. String columns
+  (keyword, bool, date, capped text) hold a sorted dictionary, a roaring bitmap of documents per
+  term, and a per-entry dictionary ordinal for sorts and aggregations. Integer and float columns
+  hold values in doc order with min/max zone maps per 4096 entries. Every column has a presence
+  bitmap and a CRC over its header and body; a damaged or truncated column fails the query
+  rather than matching nothing. The footer also carries the column directory and per-column
+  stats (value count, document count, distinct count, min, max), so a query node can plan
+  which columns to fetch without an extra round trip, and later work can skip segments by
+  range.
+
+A query node fetches only `filters.toc` and the columns the query names (filter, kNN filter,
+field sorts, collapse and aggregations; `x.keyword` also fetches `x`). On a columnar segment
+the query evaluates straight from the columns (`kosha_segment::filter_eval`, entry point
+`SegmentReader::evaluate_filter`):
+
+- `term`/`terms` on a string column: a dictionary binary search, then that term's bitmap. A
+  list value (JSON text such as `["a","b"]`) also matches per element through a per-column
+  element index built once from the dictionary.
+- `term`/`terms`/`range` on a numeric column: zone maps skip blocks that cannot match; integer
+  blocks entirely inside a range are taken without comparing values; only the remaining blocks
+  are scanned. Zone maps are verified against the values at decode.
+- `range` on a string column: the dictionary's ordinal range, then those terms' bitmaps (or
+  one pass over the ordinals when the range spans many terms).
+- `exists`: the presence bitmap, less documents whose only values are empty lists.
+- `bool`: set algebra; `must_not` subtracts from the all-documents set.
+
+The result is the segment's dense `DocSet`, cached per segment and clause as before. Each
+request removes its deleted documents from a copy, which gives the scoring loops a single
+pre-filter: one bit test per candidate, and when it is sparse (under 1 in 64 documents) the
+single-term WAND walk skips postings blocks whose doc range holds no passing document.
+`DocSet::to_bitmap` hands the same set to a later filtered vector probe (#252). Aggregations
+(`terms`, `cardinality`, `composite`) and field sorts/collapse read the ordinal and value
+arrays for the matching documents instead of building row maps. `filters.bin` segments keep
+the row-scan evaluator and the `FilterStore` paths. Both formats give identical results; a
+namespace may mix them. On a 1M-document segment, columnar `term`/`terms`/`range` evaluation
+is 40x to several thousand times faster than the row scan (`filter_eval_1m` bench).
+
+`KOSHA_FILTERS_WRITE_VERSION` picks the format writers (flush and compaction) emit: `1`
+(default) writes `filters.bin`, `2` writes columns. Every reader in this release reads both.
+Rollout: keep the gate at `1` until every query and write node runs a release that reads v2,
+then set it to `2`; compaction converts segments as it merges them. Rollback: set it back to `1`
+and compaction rewrites columnar segments as `filters.bin`, but a binary older than #244 cannot
+read columnar segments (their filters match nothing), so do not downgrade past this release
+while any remain.
 **Analysis is versioned per segment (#220, #221).** `inverted.idx` holds whatever terms the
 analyzer produced at write time, so a segment's `footer.json` records the exact analysis chains its
 `Text` fields went through (`analysis`: tokenizer + version + filters, with stopword lists copied
@@ -312,7 +365,7 @@ Indexer
 - Ingest / flush / exists / replace / delete take that namespace's `state` lock only.
 - Compaction takes `compact` for the whole operation (no concurrent compact on the same ns), but
   holds `state` only for (a) selecting merge inputs + cloning tombstones, and (b) CAS-publishing
-  the new manifest. Merge I/O (open + `iter_doc_records` + `SegmentWriter::finalize`) runs with
+  the new manifest. Merge I/O (open + `iter_doc_records_raw` + `SegmentWriter::finalize`) runs with
   `state` released so searches and writes against other work on that namespace can proceed against
   the pre-compact snapshot; concurrent mutations that remove a merge input cause publish to abort
   (or retry) rather than corrupt the manifest.
@@ -323,6 +376,27 @@ Indexer
   its inputs are still listed remotely with no new remote deletes. A remote compaction is accepted
   only if it removed no segment with unpublished local deletes. Otherwise the publish fails with
   409, and nothing is published that references a segment the remote manifest removed.
+
+**Merge memory (#242)**
+
+A merge feeds every live input document through one `SegmentWriter`, so its heap is the
+writer's heap:
+
+- Stored records stream to `.build/doc_store.bin`; sidecar vectors arrive as f32 from
+  `SegmentReader::iter_doc_records_raw` and go to `doc_vectors.bin` without a JSON round trip.
+- In-memory postings are capped by `KOSHA_SEGMENT_BUILD_MEMORY_BYTES`; past it they spill to
+  term-sorted runs.
+- `finalize` k-way merges the runs by term. Only each run's head term and posting count are
+  resident; a term's postings stream from the runs into a per-term encoder that writes the v5
+  skip-split (or v4) bytes incrementally and spills its sections to scratch files past
+  1/16 of the budget (4 KiB to 8 MiB). A term in every document costs no more memory than a rare
+  one. The output is byte-identical to the whole-list encoders.
+
+What remains O(input): the term table and string pool (O(vocabulary)), about 30 B per document
+for the doc-store offsets and 4 B for its field length, filter columns (short values only: `Text`
+is capped at 256 chars), and vectors plus k-means (#253). `crates/kosha-segment/tests/merge_memory.rs`
+asserts peak heap ≤ budget + 64 B/doc + 6 MiB for a merge where one term occurs 32 times in every
+document.
 
 **Merge selection (size-tiered lite)**
 
@@ -349,6 +423,15 @@ calls.
   when the node is under query load.
 - The `POST /v1/admin/compact-namespace` route remains the emergency lever; default body mode is
   `tiered`. Pass `"mode": "full"` only for deliberate one-shot remediation.
+- **Bounded local disk (#242).** A pass plans each merge group from object sizes in S3 (one
+  paginated ListObjectsV2 over the namespace prefix) before hydrating anything, hydrates only that
+  group's inputs (vectors included), merges and publishes it, then evicts the superseded inputs'
+  local directories (never one the manifest still references or with a file pinned by an in-flight
+  hydration or warmup; local-only mode never evicts, since there the directory is the only copy).
+  Peak local disk for a group is its inputs plus its output, about `2 x max_merged_segment_bytes`.
+  `full` loops capped groups inside one pass until none fits; a segment whose size S3 cannot report
+  never joins a capped group. `max_segment_bytes: 0` (uncapped, all-to-one) still hydrates
+  everything.
 
 **What this deliberately leaves to the compaction node role (§5)**
 
@@ -524,6 +607,45 @@ The SSD layer is a **read-through, write-behind cache**, never authoritative:
   hashing over namespace id) so repeated queries for the same namespace land on query nodes likely
   to already have it cached, without requiring hard node ownership — a node with a cold cache for
   a namespace simply falls back to S3 and warms up, no rebalancing operation required.
+- **Page documents by byte range** (#245): a query reads the scoring set (footers, TOC,
+  filters, `doc_store.offsets`) whole, but materializes its result page from ranged GETs of just
+  those documents' spans in `doc_store.bin` / `doc_vectors.bin`, coalescing spans closer than
+  64 KiB into one GET. Fetched spans persist in a sparse span cache,
+  `{segment}/{file}.spans/{start:016x}-{end:016x}`, one file per fetched range, counted and
+  LRU-evicted like any other cached file. A partial file is never written at the real file path,
+  because existence there means complete. A segment that keeps taking ranged reads is promoted:
+  its whole files are hydrated in the background and its spans dropped. A whole local file always
+  wins over spans. `KOSHA_DOC_STORE_READ_MODE=whole` reverts to whole-file page hydration.
+- **Postings by byte range** (#245): posting shards are written raw (no whole-file zstd wrapper),
+  flagged `posting_blobs_raw` in the footer, so the `(postings_off, postings_len)` the
+  `inverted.idx` TOC holds per term is a byte range of the stored shard. A cold query fetches its
+  terms' spans (coalesced per shard) into the same span cache, in one round trip after the
+  scaffolding round, and `SplitInvertedIndex` reads a term from the spans when the whole shard is
+  absent. A term whose span is missing still fails the query (never scores as absent). kNN
+  queries hold only `vector.offsets` locally and the reader asks the query node to fetch the
+  `vector.idx` ranges of the postings it is about to probe. A cold BM25 query is therefore
+  scaffolding, postings, page documents: 3 sequential round trips (4 when the footers must be
+  fetched first for pruning). No reader-format change: older binaries read raw shards, so a
+  rollback still reads new segments; segments without the flag keep whole-shard hydration.
+- **Usage-driven warming** (#213): every search records decayed read counts (hits, and bytes
+  fetched from S3) per namespace, per segment and per file class (scoring scaffolding, posting
+  shards, doc store, vector index), with a half-life of `KOSHA_ACCESS_HALF_LIFE_SECS` (default
+  600) and at most `KOSHA_ACCESS_MAX_SEGMENTS` segments tracked (default 50,000; the coldest tenth
+  is dropped past it). Every `KOSHA_WARMSET_PERSIST_SECS` (default 60) the pod writes its top
+  namespaces and segments to `_warmset/<KOSHA_ROLE>.json` under the S3 prefix (pods of one role
+  share it; the last writer wins). The readiness-gated boot pass warms `KOSHA_WARMUP_NAMESPACES`
+  (always included, first) plus the namespaces of that warm set, so a restarted pod warms what was
+  actually hot. A usage namespace gets the scoring scaffolding plus only the classes it was seen
+  reading. Items are warmed scaffolding first, then in descending read rate, and the pass stops at
+  `KOSHA_WARMUP_BUDGET_BYTES` (unset is unlimited): the first item that does not fit and
+  everything after it are skipped, and the log and `GET /v1/admin/warmup-status` list what was
+  warmed and what was skipped. On query pods a re-warm thread polls `manifest_version` for hot
+  namespaces every `KOSHA_REWARM_INTERVAL_MS` (default 5000) and, when a flush or compaction
+  publishes, installs the new manifest and fetches the added segments before a user query does,
+  within what is left of the budget (a compaction's removed inputs give their bytes back). It
+  batches like the boot pass (a hydration permit per 8 segments, 2 for doc stores and vector
+  indexes), never touches readiness, and fails open. Warming a segment whole also drops its
+  sparse spans, the same as a promotion. `KOSHA_WARMUP_USAGE=0` restores the static behavior.
 - **Failure mode**: losing a query node's local disk (or the whole node) loses nothing but cache
   warmth. Traffic reroutes (consistent hashing + health checks) and the replacement node rebuilds
   its cache from S3 traffic as queries land.

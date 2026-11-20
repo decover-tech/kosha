@@ -61,6 +61,10 @@ name = "knn_open_search"
 harness = false
 
 [[bench]]
+name = "filter_eval_1m"
+harness = false
+
+[[bench]]
 name = "field_bm25"
 harness = false
 

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -16,34 +16,47 @@ use kosha_core::{
     SortSpec, TermBloomMode, TotalHitsRelation,
 };
 use kosha_core::{AnalyzerSpec, FieldBoost, Footer, SegmentAnalysis};
+pub use kosha_segment::VectorSpanFetch;
 use kosha_segment::{
     tokenize, Analyzer, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
 };
 
-/// Optional callback the searcher invokes to ensure `doc_store.bin` is
-/// present locally for the segments holding the materialize page — the
-/// on-demand half of scoring-set-only hydration (Option A: fetch the whole
-/// `doc_store.bin` per page-segment on first miss, persist it via the disk
-/// cache, then serve page reads from local disk on every subsequent warm
-/// query). See [`Searcher::search_with_doc_store_hydrator`].
+/// One segment of a materialize page, as handed to a [`DocStoreHydrator`]:
+/// the documents of the page that live in this segment and are not yet
+/// readable from local disk ([`SegmentReader::doc_is_local`]).
+pub struct PageSegment<'a> {
+    /// `{data_dir}/{namespace}/{segment_id}`.
+    pub segment_dir: &'a Path,
+    /// The open segment, for byte spans: [`SegmentReader::doc_span`] for
+    /// `doc_store.bin`, [`SegmentReader::doc_vectors_span`] for
+    /// `doc_vectors.bin`.
+    pub reader: &'a SegmentReader,
+    /// The page's documents in this segment that still need bytes, in page
+    /// order, deduplicated.
+    pub doc_seqs: Vec<u32>,
+}
+
+/// Optional callback the searcher invokes, after ranking and before field
+/// materialization, so the page's documents become readable locally.
+/// See [`Searcher::search_with_doc_store_hydrator`].
 ///
-/// Each element of the input slice is a segment directory path
-/// (`{data_dir}/{namespace}/{segment_id}`) whose `doc_store.bin` is absent
-/// or partial on local disk; the implementor fetches and persists the whole
-/// file for each, idempotently (already-local segments are no-ops). Pass
-/// `None` to materialize straight from disk — the warm / local-dev path
-/// where `doc_store.bin` is already present.
+/// It receives one [`PageSegment`] per segment holding page hits that are
+/// not local yet. After it returns, each listed document should be readable
+/// by `doc_record_full`, from either source the reader understands:
+///   * the whole `doc_store.bin` (+ `doc_vectors.bin`) — the pre-#245
+///     "Option A" (`KOSHA_DOC_STORE_READ_MODE=whole`);
+///   * the sparse span cache ([`kosha_segment::span_cache`]) holding just
+///     the documents' byte ranges — "Option B" (#245, the default), fetched
+///     with ranged GETs.
 ///
-/// Why whole-file per-segment instead of per-doc ranged GETs: a ranged GET
-/// per page document means *every* warm query re-pays N S3 round-trips
-/// (~350 ms p50 at 8 QPS / topk=10 against 1M docs), because span bytes are
-/// never persisted (a partial `doc_store.bin` would mis-read as complete to
-/// the hydration existence check). Fetching the whole file once per
-/// page-segment turns that into one round-trip per segment on the *first*
-/// warm query, then zero round-trips thereafter — warm falls to the local
-/// seek cost (~ms). Per-doc span reads remain available as a future Option B
-/// refinement (a per-segment sparse span cache), but are not the warm path.
-pub type DocStoreHydrator<'a> = Option<&'a dyn Fn(&[PathBuf])>;
+/// Either way the bytes are persisted, which is what makes a warm repeat
+/// free: the searcher only calls the hydrator for documents that are not
+/// already local, so a second identical query never reaches it. (PR #84
+/// replaced an earlier ranged path that did *not* persist spans, so every
+/// warm query re-paid the S3 round trips.)
+///
+/// Pass `None` to materialize straight from disk — the local-dev path.
+pub type DocStoreHydrator<'a> = Option<&'a dyn Fn(&[PageSegment<'_>])>;
 
 /// Default number of parsed segments kept resident in memory (see
 /// [`SegmentCache`]). Segments are immutable once written (DESIGN.md §6.2),
@@ -267,6 +280,11 @@ pub struct TrackedSegment {
     filter_sets: Mutex<HashMap<String, Arc<DocSet>>>,
 }
 
+/// A pre-filter with fewer than one passing document per this many is
+/// "sparse": the single-term WAND walk then checks each postings block's
+/// doc range against it and skips blocks with no passing document.
+const SPARSE_FILTER_RATIO: usize = 64;
+
 /// Filter sets kept per segment before the cache is cleared and refilled.
 /// One set is `doc_count / 8` bytes (a few KB), so this bounds the cache at
 /// well under a megabyte per segment however many distinct filters arrive.
@@ -294,24 +312,27 @@ impl TrackedSegment {
     ///
     /// `key` is the clause's canonical JSON, computed once per request by
     /// the caller rather than once per segment here.
-    fn filter_set(&self, key: &str, clause: &FilterClause) -> Arc<DocSet> {
+    ///
+    /// Reads only the filter columns `clause` names (#244); a damaged
+    /// column fails the request instead of matching nothing. The set is
+    /// also the segment's pre-filter for a filtered vector probe (#252):
+    /// [`DocSet::to_bitmap`] gives it as a roaring bitmap.
+    fn filter_set(&self, key: &str, clause: &FilterClause) -> Result<Arc<DocSet>, KoshaError> {
         if let Some(set) = self.filter_sets.lock().unwrap().get(key) {
-            return Arc::clone(set);
+            return Ok(Arc::clone(set));
         }
         // Evaluated outside the lock: two requests racing on a new filter
         // both compute it, and one result is dropped. That is cheaper than
         // making every other request for this segment wait behind a scan.
-        let set = Arc::new(kosha_core::evaluate_filter(
-            clause,
-            &self.reader.filter_store(),
-            self.reader.doc_count(),
-        ));
+        // Columnar segments answer from term bitmaps and zone maps; legacy
+        // `filters.bin` segments scan rows (`SegmentReader::evaluate_filter`).
+        let set = Arc::new(self.reader.evaluate_filter(clause)?);
         let mut cache = self.filter_sets.lock().unwrap();
         if cache.len() >= MAX_FILTER_SETS_PER_SEGMENT {
             cache.clear();
         }
         cache.insert(key.to_string(), Arc::clone(&set));
-        set
+        Ok(set)
     }
 }
 
@@ -547,7 +568,7 @@ impl SegmentCache {
 ///
 /// Under-counting is the dangerous direction (this ledger exists because of
 /// a staging OOM), so anything that *can* become resident is still charged
-/// up front. That's why `filters.bin` is counted in full despite being
+/// up front. That's why `filters.bin` (or every local filter column) is counted in full despite being
 /// `LazyFilters`: it sits behind a `OnceLock` that the first filtered query
 /// populates and every later query keeps alive. Transient per-read buffers
 /// (lazy doc-store reads) hold nothing after the read, and decoded postings
@@ -577,6 +598,20 @@ pub fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u6
 
     // Becomes resident on the first filtered query and stays — see above.
     total = total.saturating_add(size("filters.bin"));
+    // Columnar segments (#244): the TOC plus whichever columns are local.
+    // A query node hydrates only the columns its queries touch, and only
+    // those can become resident.
+    if let Ok(entries) = std::fs::read_dir(seg_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(kosha_core::is_filter_column_file)
+            {
+                total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+            }
+        }
+    }
 
     if load_vectors {
         // Resident: centroids + ranges (v2 lazy) or the whole parsed
@@ -1938,7 +1973,7 @@ pub fn flat_knn(query_vector: &[f32], vectors: &[(u32, Vec<f32>)], k: usize) -> 
 /// across rayon workers, so it can legitimately exceed `score_wall_ms` under
 /// parallelism — read it together with `open_cold` as "average cold-open
 /// cost", not as a wall-clock share.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct SearchPhaseStats {
     /// Admission-gate wait (`MemoryLedger::admit`) plus the byte-estimate
     /// pass. Near-zero unless the pod is shedding load.
@@ -1961,6 +1996,12 @@ pub struct SearchPhaseStats {
     /// Under the global probe budget it should land near
     /// `num_candidates` for the whole query. Zero for non-kNN queries.
     pub knn_postings_probed: usize,
+    /// Segment directories holding at least one document of the returned
+    /// page, deduplicated, in page order: the segments whose doc store this
+    /// search read. The server's access tracker (#213) counts these as
+    /// doc-store reads per segment, so usage-driven warming knows which
+    /// segments' doc stores are actually hot.
+    pub page_segments: Vec<PathBuf>,
     /// Time spent resolving namespace-level BM25 statistics (issue #246):
     /// one cache lookup when warm, the per-segment `df` pass for terms not
     /// seen yet at this manifest version when cold.
@@ -2922,6 +2963,9 @@ impl Searcher {
         // Canonical JSON of `query.filter` and `query.knn.filter`, computed
         // once per request: the key into each segment's filter-set cache.
         filter_keys: &FilterKeys,
+        // Fetches the probed vector postings a segment does not hold
+        // locally (#245); see `Searcher::search_with_hydrators`.
+        vector_fetch: Option<VectorSpanFetch<'_>>,
         // Namespace-level BM25 statistics (issue #246); `None` scores this
         // segment with its own `N` / `df` / `avgdl`.
         corpus: Option<&Arc<CorpusStats>>,
@@ -2976,19 +3020,38 @@ impl Searcher {
         // query could not take the block-max WAND path and paid to score
         // every match in the segment first.
         let filter_set: Option<Arc<DocSet>> = match (&query.filter, &filter_keys.query) {
-            (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)),
+            (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)?),
             _ => None,
+        };
+        let segment_tombstones = tombstones
+            .and_then(|t| t.get(&entry.segment_id))
+            .filter(|seqs| !seqs.is_empty());
+        // The pre-filter: the filter's documents less this request's
+        // deleted ones, so a candidate costs one bit test either way. The
+        // cached set is shared, so the deletes go into a copy.
+        let filter_set = match (filter_set, segment_tombstones) {
+            (Some(set), Some(dead)) => {
+                let mut live = (*set).clone();
+                live.remove_all(dead);
+                Some(Arc::new(live))
+            }
+            (set, _) => set,
         };
         if filter_set.as_ref().is_some_and(|set| set.is_empty()) {
             // The bloom said "maybe"; the real answer is no document here.
             return Ok(None);
         }
-        let segment_tombstones = tombstones
-            .and_then(|t| t.get(&entry.segment_id))
-            .filter(|seqs| !seqs.is_empty());
+        // A sparse pre-filter also lets the single-term walk skip whole
+        // postings blocks whose doc range holds no passing document.
+        let sparse_filter: Option<&DocSet> = filter_set.as_deref().filter(|set| {
+            set.count().saturating_mul(SPARSE_FILTER_RATIO) < set.universe() as usize
+        });
         let accept = |doc_seq: u32| -> bool {
-            filter_set.as_ref().is_none_or(|set| set.contains(doc_seq))
-                && !segment_tombstones.is_some_and(|seqs| seqs.contains(&doc_seq))
+            match filter_set.as_ref() {
+                // Deleted documents are already out of the pre-filter.
+                Some(set) => set.contains(doc_seq),
+                None => !segment_tombstones.is_some_and(|seqs| seqs.contains(&doc_seq)),
+            }
         };
         // The filter or a tombstone rules the document out. The scoring
         // loops below were written against tombstones alone; a filter is
@@ -3000,9 +3063,15 @@ impl Searcher {
         let restricted = filter_set.is_some() || segment_tombstones.is_some();
         let rejected = |doc_seq: u32| -> bool { restricted && !accept(doc_seq) };
 
-        let needs_filter_store = !sort_value_fields.is_empty() || !query.aggs.is_empty();
+        // Columnar segments (#244) aggregate and sort straight from their
+        // columns; only `filters.bin` segments need the row-shaped store.
+        let columnar_filters = reader.has_filter_columns();
+        let needs_filter_store =
+            !columnar_filters && (!sort_value_fields.is_empty() || !query.aggs.is_empty());
         let filter_store = if needs_filter_store {
-            Some(reader.filter_store())
+            // Only the columns this query names (#244). A damaged column
+            // fails the request closed.
+            Some(reader.filter_store_for(&query.filter_column_fields())?)
         } else {
             None
         };
@@ -3317,10 +3386,24 @@ impl Searcher {
                     if let [source] = sources.as_slice() {
                         // ── Single present term: block-by-block walk ──
                         let df = score_dfs[0];
+                        // False when the sparse pre-filter has no document
+                        // in the block's doc range: nothing in it can pass.
+                        let block_may_pass = |block: usize| -> bool {
+                            sparse_filter.is_none_or(|set| {
+                                let first = match block {
+                                    0 => 0,
+                                    _ => source.last_doc(block - 1).saturating_add(1),
+                                };
+                                set.any_in_range(first, source.last_doc(block))
+                            })
+                        };
                         let total_hits = if segment_has_tombstones {
                             let mut count = 0;
                             let mut postings = Vec::new();
                             for block in 0..source.block_count() {
+                                if !block_may_pass(block) {
+                                    continue;
+                                }
                                 if !source.read_block(block, &mut postings) {
                                     return None;
                                 }
@@ -3363,6 +3446,9 @@ impl Searcher {
                         let mut topk = BoundedTopK::new(effective_k);
                         let mut buf: Vec<ScoringPosting> = Vec::with_capacity(SCORING_BLOCK_LEN);
                         for block in 0..source.block_count() {
+                            if !block_may_pass(block) {
+                                continue;
+                            }
                             // The block's per-doc score ceiling. v5 reads it
                             // straight from the skip entry — no posting decode,
                             // no doc_meta pass. Legacy formats recompute it by
@@ -4195,11 +4281,8 @@ impl Searcher {
             if count_only_filter {
                 // Nothing will be returned or ranked from this segment's
                 // hits, so only their number is needed.
-                filter_only_count = Some(if segment_tombstones.is_some() {
-                    set.iter().filter(|doc_seq| accept(*doc_seq)).count()
-                } else {
-                    set.count()
-                });
+                // Deleted documents are already out of the set.
+                filter_only_count = Some(set.count());
             } else {
                 for doc_seq in set.iter() {
                     if !accept(doc_seq) {
@@ -4237,7 +4320,7 @@ impl Searcher {
             // top `k` by closer vectors from other matters and then thrown
             // away by the filter.
             let knn_filter_set: Option<Arc<DocSet>> = match (&knn.filter, &filter_keys.knn) {
-                (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)),
+                (Some(clause), Some(key)) => Some(reader.filter_set(key, clause)?),
                 _ => None,
             };
             let knn_accept = |doc_seq: u32| -> bool {
@@ -4276,12 +4359,13 @@ impl Searcher {
             } else {
                 match knn_cutoff {
                     Some((cutoff, effective_budget)) => reader
-                        .knn_search_within_filtered(
+                        .knn_search_within_filtered_fetching(
                             &knn.vector,
                             fetch_k,
                             cutoff,
                             effective_budget,
                             knn_accept_dyn,
+                            vector_fetch,
                         )
                         .map(|r| {
                             r.map(|(results, probes)| {
@@ -4290,11 +4374,12 @@ impl Searcher {
                             })
                         }),
                     None => reader
-                        .knn_search_filtered(
+                        .knn_search_filtered_fetching(
                             &knn.vector,
                             fetch_k,
                             knn.num_candidates,
                             knn_accept_dyn,
+                            vector_fetch,
                         )
                         .map(|r| {
                             r.inspect(|_| {
@@ -4407,15 +4492,30 @@ impl Searcher {
         let aggs = if query.aggs.is_empty() {
             HashMap::new()
         } else {
-            let wanted: HashSet<u32> = seg_hits.keys().copied().collect();
-            let store = filter_store
-                .as_ref()
-                .expect("aggregations require filter store");
-            query
-                .aggs
-                .iter()
-                .map(|(name, agg)| (name.clone(), aggregate_matches(store, &wanted, agg)))
-                .collect()
+            if columnar_filters {
+                let mut wanted: Vec<u32> = seg_hits.keys().copied().collect();
+                wanted.sort_unstable();
+                query
+                    .aggs
+                    .iter()
+                    .map(|(name, agg)| {
+                        Ok((
+                            name.clone(),
+                            aggregate_matches_columnar(&reader, &wanted, agg)?,
+                        ))
+                    })
+                    .collect::<Result<_, KoshaError>>()?
+            } else {
+                let wanted: HashSet<u32> = seg_hits.keys().copied().collect();
+                let store = filter_store
+                    .as_ref()
+                    .expect("aggregations require filter store");
+                query
+                    .aggs
+                    .iter()
+                    .map(|(name, agg)| (name.clone(), aggregate_matches(store, &wanted, agg)))
+                    .collect()
+            }
         };
         let total_hits = filter_only_count.unwrap_or(seg_hits.len());
 
@@ -4486,13 +4586,17 @@ impl Searcher {
                 .map(|(_, doc_seq)| *doc_seq)
                 .chain(knn_hits.iter().map(|(doc_seq, _, _)| *doc_seq))
                 .collect();
-            build_sort_value_maps(
-                filter_store
-                    .as_ref()
-                    .expect("custom sort requires filter_store"),
-                sort_value_fields,
-                &wanted,
-            )
+            if columnar_filters {
+                build_sort_value_maps_columnar(&reader, sort_value_fields, &wanted)?
+            } else {
+                build_sort_value_maps(
+                    filter_store
+                        .as_ref()
+                        .expect("custom sort requires filter_store"),
+                    sort_value_fields,
+                    &wanted,
+                )
+            }
         };
         let mut candidates = Vec::with_capacity(ranked.len());
         for (score, doc_seq) in ranked {
@@ -4627,7 +4731,7 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
     ) -> Result<SearchResult, KoshaError> {
-        self.search_inner(namespace, manifest, query, tombstones, None)
+        self.search_inner(namespace, manifest, query, tombstones, None, None)
             .map(|(result, _stats)| result)
     }
 
@@ -4643,7 +4747,7 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
-        self.search_inner(namespace, manifest, query, tombstones, None)
+        self.search_inner(namespace, manifest, query, tombstones, None, None)
     }
 
     /// Like [`Searcher::search_with_stats`], but with an optional callback
@@ -4669,7 +4773,36 @@ impl Searcher {
         >,
         hydrator: DocStoreHydrator<'_>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
-        self.search_inner(namespace, manifest, query, tombstones, hydrator)
+        self.search_inner(namespace, manifest, query, tombstones, hydrator, None)
+    }
+
+    /// [`Searcher::search_with_doc_store_hydrator`] plus `vector_fetch`,
+    /// which each segment calls with the `vector.idx` ranges of the kNN
+    /// postings it is about to probe and does not hold locally (#245): a
+    /// query node then needs only `vector.offsets` up front and fetches the
+    /// probed postings by range instead of the whole `vector.idx`. Segments
+    /// probe in parallel, so their calls overlap (one round trip of wall
+    /// time); a restricted probe that runs past its budget calls again for
+    /// the next few postings.
+    pub fn search_with_hydrators(
+        &self,
+        namespace: &NamespaceId,
+        manifest: &Manifest,
+        query: &SearchQuery,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
+        hydrator: DocStoreHydrator<'_>,
+        vector_fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
+        self.search_inner(
+            namespace,
+            manifest,
+            query,
+            tombstones,
+            hydrator,
+            vector_fetch,
+        )
     }
 
     fn search_inner(
@@ -4681,6 +4814,7 @@ impl Searcher {
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
         doc_store_hydrator: DocStoreHydrator<'_>,
+        vector_fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(SearchResult, SearchPhaseStats), KoshaError> {
         // Out-of-range BM25 parameters are a client error, not something
         // to clamp: every entry point funnels through here.
@@ -4878,6 +5012,7 @@ impl Searcher {
                 &open_stats,
                 knn_cutoff,
                 &filter_keys,
+                vector_fetch,
                 corpus.as_ref(),
                 shared_wand,
             )
@@ -5136,39 +5271,54 @@ impl Searcher {
             }
         }
 
-        // On-demand `doc_store.bin` for the materialize page (Option A): a cold
-        // search hydrated just the offsets sidecar for Lazy segments, so
-        // `doc_store.bin` is absent until now. Collect the *distinct segment
-        // directories* among the page hits whose local `doc_store.bin` is
-        // missing, ask the hydrator to fetch & persist the whole file for
-        // each once, then materialize the page via the standard local
-        // seek+read path (`doc_record_full`). After this first warm query
-        // per page-segment, the file is on disk and `has_local_doc_store`
-        // short-circuits the callback on every subsequent warm query —
-        // warm page reads become sub-millisecond local seeks instead of
-        // N per-doc S3 ranged GETs every time.
+        // On-demand page bytes: a cold search hydrated just the offsets
+        // sidecar for Lazy segments, so the page's records are not local
+        // yet. Group the page's non-local documents by segment and ask the
+        // hydrator for them once (ranged spans or whole files — its call,
+        // see `DocStoreHydrator`). Whatever it fetched is persisted, so a
+        // warm repeat finds every document local and never gets here.
+        for cand in &candidates[from..to] {
+            let dir = cand.reader.segment_dir();
+            if !phase_stats.page_segments.iter().any(|d| d == dir) {
+                phase_stats.page_segments.push(dir.to_path_buf());
+            }
+        }
         if let Some(ensure_doc_store) = doc_store_hydrator {
-            let mut page_seg_paths: Vec<PathBuf> = Vec::new();
+            let mut page_segs: Vec<(&Arc<TrackedSegment>, Vec<u32>)> = Vec::new();
             for cand in &candidates[from..to] {
-                if cand.reader.has_local_doc_store() {
+                if cand.reader.doc_is_local(cand.doc_seq) {
                     continue;
                 }
-                let p = cand.reader.segment_dir().to_path_buf();
-                if !page_seg_paths.contains(&p) {
-                    page_seg_paths.push(p);
+                match page_segs
+                    .iter_mut()
+                    .find(|(reader, _)| Arc::ptr_eq(reader, &cand.reader))
+                {
+                    Some((_, seqs)) => {
+                        if !seqs.contains(&cand.doc_seq) {
+                            seqs.push(cand.doc_seq);
+                        }
+                    }
+                    None => page_segs.push((&cand.reader, vec![cand.doc_seq])),
                 }
             }
-            if !page_seg_paths.is_empty() {
-                ensure_doc_store(&page_seg_paths);
+            if !page_segs.is_empty() {
+                let request: Vec<PageSegment<'_>> = page_segs
+                    .into_iter()
+                    .map(|(reader, doc_seqs)| PageSegment {
+                        segment_dir: reader.segment_dir(),
+                        reader,
+                        doc_seqs,
+                    })
+                    .collect();
+                ensure_doc_store(&request);
             }
         }
 
         // Materialize fields / highlights only for the returned page — the
         // only place a `Lazy` segment's full field content is ever read
         // from disk (one seek+read per document, not the whole segment).
-        // `doc_store.bin` is now guaranteed local for every page-segment
-        // (either it pre-existed, or the hydrator just persisted it above),
-        // so `doc_record_full` succeeds without any further S3 round-trip.
+        // Every page document is now local — whole file or cached span —
+        // so `doc_record_full` needs no further S3 round trip.
         let mut page = Vec::with_capacity(to - from);
         for cand in &candidates[from..to] {
             let Some(doc_rec) = cand.reader.doc_record_full(cand.doc_seq)? else {
@@ -6493,6 +6643,262 @@ fn aggregate_matches(
     state
 }
 
+// ─── Columnar aggregations and sort values (#244) ──────────────────────────
+//
+// On a columnar segment, aggregations and field sorts read the filter
+// columns directly: the per-entry doc_seq array is walked against the
+// sorted candidate list (galloping, so a small candidate set touches few
+// entries), string values arrive as dictionary ordinals that are resolved
+// to text once per distinct ordinal, and numeric values come from the
+// value arrays. Nothing is copied into a row-shaped `FilterStore`.
+//
+// The results are the same as the `FilterStore` path's on a `filters.bin`
+// segment, rule for rule: field-name resolution (`x.keyword` -> `x`),
+// list values counted once per element, every column kind contributing to
+// an aggregation, and a sort reading the string column first, then the
+// integer column, then the float column.
+
+/// Call `f(wanted_index, entry_index)` for every entry of `docs` (a
+/// column's non-decreasing doc_seqs) whose doc_seq is in `wanted` (sorted,
+/// distinct). Gallops through `docs`, so the cost follows the candidate
+/// count, not the column length, when candidates are few.
+fn for_each_wanted_entry(docs: &[u32], wanted: &[u32], mut f: impl FnMut(usize, usize)) {
+    let mut p = 0usize;
+    for (wi, &doc) in wanted.iter().enumerate() {
+        if p >= docs.len() {
+            return;
+        }
+        if docs[p] < doc {
+            // Exponential probe, then binary search inside the bracket.
+            let mut step = 1usize;
+            let mut hi = p + 1;
+            while hi < docs.len() && docs[hi] < doc {
+                p = hi;
+                step *= 2;
+                hi = p + step;
+            }
+            let hi = hi.min(docs.len());
+            p += docs[p..hi].partition_point(|d| *d < doc);
+        }
+        while p < docs.len() && docs[p] == doc {
+            f(wi, p);
+            p += 1;
+        }
+    }
+}
+
+/// One aggregation source's values for each candidate, as interned key ids.
+struct ColumnarSourceValues {
+    /// Key id -> key text.
+    names: Vec<String>,
+    /// Parallel to the candidate list: sorted, distinct key ids.
+    per_doc: Vec<Vec<u32>>,
+}
+
+#[derive(Default)]
+struct KeyInterner {
+    names: Vec<String>,
+    ids: HashMap<String, u32>,
+}
+
+impl KeyInterner {
+    fn intern(&mut self, key: String) -> u32 {
+        if let Some(id) = self.ids.get(&key) {
+            return *id;
+        }
+        let id = self.names.len() as u32;
+        self.names.push(key.clone());
+        self.ids.insert(key, id);
+        id
+    }
+}
+
+fn columnar_source_values(
+    reader: &SegmentReader,
+    field: &str,
+    wanted: &[u32],
+) -> Result<ColumnarSourceValues, KoshaError> {
+    use kosha_core::FilterColumnKind;
+    use kosha_segment::filter_columns::FilterColumn;
+    use kosha_segment::filter_eval::resolve_column;
+    let mut keys = KeyInterner::default();
+    let mut per_doc: Vec<Vec<u32>> = vec![Vec::new(); wanted.len()];
+    for kind in [
+        FilterColumnKind::String,
+        FilterColumnKind::Integer,
+        FilterColumnKind::Float,
+    ] {
+        let Some(column) = resolve_column(reader, field, kind)? else {
+            continue;
+        };
+        match &*column {
+            FilterColumn::String(c) => {
+                // A list value counts once under each of its elements.
+                let mut ord_keys: HashMap<u32, Vec<u32>> = HashMap::new();
+                let ords = c.ords();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    let ord = ords[i];
+                    let ids = ord_keys.entry(ord).or_insert_with(|| {
+                        let term = c.term(ord);
+                        match term
+                            .starts_with('[')
+                            .then(|| kosha_core::list_elements(term))
+                            .flatten()
+                        {
+                            Some(elements) => {
+                                elements.into_iter().map(|e| keys.intern(e)).collect()
+                            }
+                            None => vec![keys.intern(term.to_string())],
+                        }
+                    });
+                    per_doc[wi].extend_from_slice(ids);
+                });
+            }
+            FilterColumn::Integer(c) => {
+                let mut cache: HashMap<i64, u32> = HashMap::new();
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    let v = values[i];
+                    let id = *cache.entry(v).or_insert_with(|| keys.intern(v.to_string()));
+                    per_doc[wi].push(id);
+                });
+            }
+            FilterColumn::Float(c) => {
+                let mut cache: HashMap<u64, u32> = HashMap::new();
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), wanted, |wi, i| {
+                    let v = values[i];
+                    let id = *cache
+                        .entry(v.to_bits())
+                        .or_insert_with(|| keys.intern(v.to_string()));
+                    per_doc[wi].push(id);
+                });
+            }
+        }
+    }
+    for ids in &mut per_doc {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    Ok(ColumnarSourceValues {
+        names: keys.names,
+        per_doc,
+    })
+}
+
+/// [`aggregate_matches`] over a columnar segment's filter columns.
+/// `wanted` is the segment's matching doc_seqs, sorted and distinct.
+fn aggregate_matches_columnar(
+    reader: &SegmentReader,
+    wanted: &[u32],
+    agg: &Aggregation,
+) -> Result<AggregationState, KoshaError> {
+    let sources = aggregation_sources(agg);
+    let mut state = AggregationState::default();
+    if sources.is_empty() {
+        return Ok(state);
+    }
+    let values: Vec<ColumnarSourceValues> = sources
+        .iter()
+        .map(|(_, field)| columnar_source_values(reader, field, wanted))
+        .collect::<Result<_, _>>()?;
+    if let [only] = values.as_slice() {
+        // One source (`terms`, `cardinality`, a one-source `composite`):
+        // count per key id, and make each key's text once.
+        let mut counts = vec![0usize; only.names.len()];
+        for ids in &only.per_doc {
+            for id in ids {
+                counts[*id as usize] += 1;
+            }
+        }
+        for (id, count) in counts.into_iter().enumerate() {
+            if count > 0 {
+                state.buckets.insert(vec![only.names[id].clone()], count);
+            }
+        }
+        return Ok(state);
+    }
+    for wi in 0..wanted.len() {
+        // Every combination of the document's values across the sources;
+        // a source with no value leaves the document out.
+        let mut keys: Vec<Vec<String>> = vec![Vec::new()];
+        for source in &values {
+            let ids = &source.per_doc[wi];
+            if ids.is_empty() {
+                keys.clear();
+                break;
+            }
+            keys = keys
+                .into_iter()
+                .flat_map(|prefix| {
+                    ids.iter().map(move |id| {
+                        let mut key = prefix.clone();
+                        key.push(source.names[*id as usize].clone());
+                        key
+                    })
+                })
+                .collect();
+        }
+        for key in keys {
+            *state.buckets.entry(key).or_default() += 1;
+        }
+    }
+    Ok(state)
+}
+
+/// [`build_sort_value_maps`] over a columnar segment's filter columns.
+fn build_sort_value_maps_columnar(
+    reader: &SegmentReader,
+    fields: &[String],
+    wanted: &HashSet<u32>,
+) -> Result<HashMap<String, HashMap<u32, SortValue>>, KoshaError> {
+    use kosha_core::FilterColumnKind;
+    use kosha_segment::filter_columns::FilterColumn;
+    use kosha_segment::filter_eval::resolve_column;
+    let mut sorted: Vec<u32> = wanted.iter().copied().collect();
+    sorted.sort_unstable();
+    let mut out = HashMap::with_capacity(fields.len());
+    for field in fields {
+        let mut map: HashMap<u32, SortValue> = HashMap::new();
+        // The first kind the field has a column of, as on `filters.bin`.
+        // A document with several values keeps its last, as there.
+        let mut column = None;
+        for kind in [
+            FilterColumnKind::String,
+            FilterColumnKind::Integer,
+            FilterColumnKind::Float,
+        ] {
+            column = resolve_column(reader, field, kind)?;
+            if column.is_some() {
+                break;
+            }
+        }
+        match column.as_deref() {
+            Some(FilterColumn::String(c)) => {
+                let ords = c.ords();
+                for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
+                    map.insert(sorted[wi], SortValue::Text(c.term(ords[i]).to_string()));
+                });
+            }
+            Some(FilterColumn::Integer(c)) => {
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
+                    map.insert(sorted[wi], SortValue::Number(values[i] as f64));
+                });
+            }
+            Some(FilterColumn::Float(c)) => {
+                let values = c.values();
+                for_each_wanted_entry(c.docs(), &sorted, |wi, i| {
+                    map.insert(sorted[wi], SortValue::Number(values[i]));
+                });
+            }
+            None => {}
+        }
+        out.insert(field.clone(), map);
+    }
+    Ok(out)
+}
+
 fn finish_aggregations(
     query: &SearchQuery,
     mut states: HashMap<String, AggregationState>,
@@ -7708,7 +8114,12 @@ mod tests {
             let mut t = on_disk(d, "footer.json")
                 + on_disk(d, "inverted.idx")
                 + on_disk(d, "doc_store.offsets")
-                + on_disk(d, "filters.bin");
+                + SegmentReader::read_footer(d)
+                    .unwrap()
+                    .filter_files_for(None)
+                    .iter()
+                    .map(|f| on_disk(d, f))
+                    .sum::<u64>();
             if load_vectors {
                 t += on_disk(d, "vector.offsets");
             }
@@ -8805,15 +9216,15 @@ mod tests {
         w2.finalize(Bm25Params::default()).unwrap();
 
         let seg_size = |dir: &std::path::Path| -> u64 {
-            [
-                "doc_store.bin",
-                "inverted.idx",
-                "filters.bin",
-                "footer.json",
-            ]
-            .iter()
-            .map(|f| std::fs::metadata(dir.join(f)).unwrap().len())
-            .sum()
+            let filters = SegmentReader::read_footer(dir)
+                .unwrap()
+                .filter_files_for(None);
+            ["doc_store.bin", "inverted.idx", "footer.json"]
+                .iter()
+                .map(|f| f.to_string())
+                .chain(filters)
+                .map(|f| std::fs::metadata(dir.join(f)).unwrap().len())
+                .sum()
         };
         let seg1_bytes = seg_size(&seg1_dir);
         let seg2_bytes = seg_size(&seg2_dir);
@@ -9806,9 +10217,10 @@ mod tests {
         // restore the backed-up file to its on-disk path so the segment's
         // local `doc_record_full` seek+read succeeds, exactly as it would
         // after the real hydrator's `ensure_files_local` lands the file.
-        let ensure_doc_store = move |segs: &[PathBuf]| {
+        let ensure_doc_store = move |segs: &[PageSegment<'_>]| {
             for seg in segs {
-                requested_clone.lock().unwrap().push(seg.clone());
+                let seg = seg.segment_dir;
+                requested_clone.lock().unwrap().push(seg.to_path_buf());
                 let _ = std::fs::copy(seg.join("doc_store.bin.bak"), seg.join("doc_store.bin"));
             }
         };
@@ -9875,6 +10287,94 @@ mod tests {
             "warm query must NOT re-invoke the hydrator — doc_store.bin is now local"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hydrator_gets_page_doc_spans_and_span_cache_serves_warm_repeat() {
+        // #245 Option B contract: the hydrator is told exactly which page
+        // documents are missing, per segment; it persists only their byte
+        // spans into the sparse span cache (never a partial file at the
+        // real `doc_store.bin` path), the searcher materializes from those
+        // spans, and a warm repeat finds every document local and never
+        // calls the hydrator again.
+        use kosha_segment::span_cache;
+        let dir = std::env::temp_dir().join("kosha-test-doc-store-spans");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        let seg_dir = dir.join(&ns.0).join("s1");
+        let mut w = SegmentWriter::new(SegmentId("s1".into()), seg_dir.clone());
+        for i in 0..200 {
+            let text = if i % 50 == 7 {
+                "needle hay"
+            } else {
+                "hay only"
+            };
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![Field::text("t", format!("{text} filler {i}"))],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let full = std::fs::read(seg_dir.join("doc_store.bin")).unwrap();
+        std::fs::remove_file(seg_dir.join("doc_store.bin")).unwrap();
+
+        let manifest = Manifest {
+            version: 1,
+            segments: vec![ManifestEntry {
+                segment_id: SegmentId("s1".into()),
+                doc_count: 200,
+            }],
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+        };
+        let searcher = Searcher::new(dir.clone());
+        let calls: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_in = Arc::clone(&calls);
+        let ensure = move |segs: &[PageSegment<'_>]| {
+            for seg in segs {
+                calls_in.lock().unwrap().push(seg.doc_seqs.clone());
+                for &seq in &seg.doc_seqs {
+                    let (off, len) = seg.reader.doc_span(seq).unwrap();
+                    let (s, e) = (off as usize, off as usize + len as usize);
+                    let spans = span_cache::spans_dir(seg.segment_dir, "doc_store.bin");
+                    std::fs::create_dir_all(&spans).unwrap();
+                    std::fs::write(
+                        spans.join(span_cache::span_file_name(s as u64, e as u64)),
+                        &full[s..e],
+                    )
+                    .unwrap();
+                }
+            }
+        };
+        let q = mk_query("needle", 10);
+        let (r, _) = searcher
+            .search_with_doc_store_hydrator(&ns, &manifest, &q, None, Some(&ensure))
+            .unwrap();
+        assert_eq!(r.results.len(), 4);
+        for doc in &r.results {
+            let i: usize = doc.doc_id.0[1..].parse().unwrap();
+            assert_eq!(doc.fields[0].value, format!("needle hay filler {i}"));
+        }
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "one hydrator call per query");
+            let mut seqs = calls[0].clone();
+            seqs.sort_unstable();
+            assert_eq!(seqs, vec![7, 57, 107, 157], "exactly the page's docs");
+        }
+        assert!(!seg_dir.join("doc_store.bin").exists());
+
+        let (r2, _) = searcher
+            .search_with_doc_store_hydrator(&ns, &manifest, &q, None, Some(&ensure))
+            .unwrap();
+        assert_eq!(r2.results.len(), 4);
+        assert_eq!(calls.lock().unwrap().len(), 1, "warm repeat must not fetch");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12291,6 +12791,503 @@ mod tests {
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// #244: queries over columnar filter segments answer exactly as over
+/// `filters.bin` ones — filters, sorts, collapse and aggregations all go
+/// through the compatibility `FilterStore` — and a damaged column fails
+/// the query instead of matching nothing.
+#[cfg(test)]
+mod columnar_filter_tests {
+    use super::*;
+    use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
+    use kosha_segment::SegmentWriter;
+
+    fn build(root: &std::path::Path, version: u32) -> Manifest {
+        let mut entries = Vec::new();
+        for s in 0..2u32 {
+            let id = SegmentId(format!("s{s}"));
+            let mut w = SegmentWriter::new(id.clone(), root.join("ns").join(&id.0))
+                .with_filters_write_version(version);
+            for d in 0..300u32 {
+                let mut fields = vec![
+                    Field::text("t", format!("clause number {d}")),
+                    Field::keyword("matterId", format!("m{}", d % 4)),
+                    Field::integer("page", ((d * 7 + s) % 50) as i64),
+                    Field::float_val("score", (d % 13) as f64 / 3.0),
+                    Field::boolean("inScope", d % 3 == 0),
+                ];
+                if d % 10 == 0 {
+                    fields.push(Field::keyword("tag", "rare"));
+                }
+                w.add_document(DocumentId(format!("s{s}-d{d}")), fields);
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: id,
+                doc_count: 300,
+            });
+        }
+        Manifest {
+            version: 1,
+            segments: entries,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+        }
+    }
+
+    fn queries() -> Vec<SearchQuery> {
+        [
+            serde_json::json!({"query_text": "clause", "max_results": 7,
+                "filter": {"bool": {"must": [{"term": {"matterId": "m1"}}],
+                                    "must_not": [{"term": {"inScope": "true"}}]}},
+                "sort": [{"page": {"order": "desc"}}, {"_id": {"order": "asc"}}],
+                "exact_total_hits": true}),
+            serde_json::json!({"query_text": "clause", "max_results": 5,
+                "filter": {"range": {"score": {"gte": "1.5", "lt": "3"}}},
+                "aggs": {"m": {"terms": {"field": "matterId"}},
+                         "c": {"cardinality": {"field": "page"}}},
+                "exact_total_hits": true}),
+            serde_json::json!({"query_text": "", "max_results": 10,
+                "filter": {"exists": {"field": "tag"}},
+                "collapse": {"field": "matterId"},
+                "exact_total_hits": true}),
+        ]
+        .into_iter()
+        .map(|q| serde_json::from_value(q).unwrap())
+        .collect()
+    }
+
+    fn summary(r: &SearchResult) -> String {
+        let ids: Vec<&str> = r.results.iter().map(|d| d.doc_id.0.as_str()).collect();
+        let aggs = r
+            .aggregations
+            .as_ref()
+            .map(|a| {
+                let v = serde_json::to_value(a).unwrap();
+                let sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                    serde_json::from_value(v).unwrap();
+                serde_json::to_string(&sorted).unwrap()
+            })
+            .unwrap_or_default();
+        format!("{} {ids:?} {aggs}", r.total_hits)
+    }
+
+    #[test]
+    fn columnar_segments_answer_like_filters_bin() {
+        let root = std::env::temp_dir().join(format!("kosha-q-244-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let m1 = build(&root.join("v1"), 1);
+        let m2 = build(&root.join("v2"), 2);
+        let s1 = Searcher::new(root.join("v1"));
+        let s2 = Searcher::new(root.join("v2"));
+        for q in queries() {
+            let a = s1.search(&ns, &m1, &q, None).unwrap();
+            let b = s2.search(&ns, &m2, &q, None).unwrap();
+            assert!(a.total_hits > 0);
+            assert_eq!(summary(&a), summary(&b), "query {q:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn damaged_column_fails_the_query_closed() {
+        let root = std::env::temp_dir().join(format!("kosha-q-244-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let m = build(&root, 2);
+        let seg = root.join("ns/s0");
+        let footer = SegmentReader::read_footer(&seg).unwrap();
+        let col = footer
+            .filter_columns
+            .unwrap()
+            .into_iter()
+            .find(|c| c.name == "matterId")
+            .unwrap();
+        let bytes = std::fs::read(seg.join(col.file_name())).unwrap();
+        std::fs::write(seg.join(col.file_name()), &bytes[..bytes.len() - 5]).unwrap();
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "clause", "filter": {"term": {"matterId": "m1"}}}))
+        .unwrap();
+        let err = Searcher::new(root.clone()).search(&ns, &m, &q, None);
+        assert!(
+            matches!(err, Err(KoshaError::CorruptSegment(_))),
+            "a truncated column must fail the query, got {:?}",
+            err.map(|r| r.total_hits)
+        );
+        // A query that never reads that column is unaffected.
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "clause", "filter": {"term": {"inScope": "true"}}}))
+        .unwrap();
+        assert!(
+            Searcher::new(root.clone())
+                .search(&ns, &m, &q, None)
+                .unwrap()
+                .total_hits
+                > 0
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// #244 part 2: the same corpus as `filters.bin` segments, as columnar
+/// segments, and as a namespace mixing both must answer every query
+/// identically — hits, order, totals and aggregation buckets — now that
+/// columnar segments filter from bitmaps and aggregate/sort from columns.
+#[cfg(test)]
+mod columnar_eval_differential_tests {
+    use super::*;
+    use kosha_core::{Bm25Params, DocumentId, Field, SegmentId};
+    use kosha_segment::SegmentWriter;
+
+    const DOCS: u32 = 1500;
+
+    fn doc(s: u32, d: u32) -> Vec<Field> {
+        let n = s * DOCS + d;
+        let tags = [
+            r#"["urgent","sealed"]"#,
+            r#"["draft"]"#,
+            "[]",
+            "urgent",
+            r#"["a","urgent"]"#,
+        ];
+        let mut fields = vec![
+            Field::text(
+                "t",
+                if n.is_multiple_of(9) {
+                    format!("privileged contract clause {n}")
+                } else {
+                    format!("contract clause {n}")
+                },
+            ),
+            Field::keyword("matterId", format!("m{}", n % 5)),
+            Field::integer("page", ((n * 37) % 211) as i64 - 20),
+            Field::float_val("score", (n % 17) as f64 / 4.0),
+            Field::boolean("inScope", !n.is_multiple_of(3)),
+            Field::date_val("createdAt", format!("2024-{:02}-01", n % 12 + 1)),
+        ];
+        if n % 6 != 5 {
+            fields.push(Field::keyword("tags", tags[(n % 5) as usize]));
+        }
+        if n.is_multiple_of(4) {
+            // Multi-valued.
+            fields.push(Field::keyword("matterId", "shared"));
+            fields.push(Field::integer("page", 1000 + (n % 3) as i64));
+        }
+        if n.is_multiple_of(50) {
+            fields.push(Field::keyword("rare", "yes"));
+        }
+        if n % 150 == 7 {
+            // Sparse enough (10 per segment) for the WAND walk to skip
+            // postings blocks on the pre-filter.
+            fields.push(Field::keyword("rarer", "yes"));
+        }
+        if n % 5 != 4 {
+            // GeoPoints (#212) live in the string column as "lat,lon".
+            let lat = (n % 40) as f64 * 0.05;
+            let lon = ((n * 7) % 40) as f64 * 0.05;
+            fields.push(Field::geo_point("loc", lat, lon));
+            if n.is_multiple_of(8) {
+                fields.push(Field::geo_point("loc", lon, lat));
+            }
+        }
+        fields
+    }
+
+    fn build(root: &std::path::Path, versions: &[u32]) -> Manifest {
+        let mut entries = Vec::new();
+        for (s, version) in versions.iter().enumerate() {
+            let s = s as u32;
+            let id = SegmentId(format!("s{s}"));
+            let mut w = SegmentWriter::new(id.clone(), root.join("ns").join(&id.0))
+                .with_filters_write_version(*version);
+            for d in 0..DOCS {
+                w.add_document(DocumentId(format!("s{s}-d{d:04}")), doc(s, d));
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: id,
+                doc_count: DOCS,
+            });
+        }
+        Manifest {
+            version: 1,
+            segments: entries,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+        }
+    }
+
+    fn queries() -> Vec<serde_json::Value> {
+        use serde_json::json;
+        let aggs = json!({
+            "by_matter": {"terms": {"field": "matterId.keyword", "size": 50}},
+            "by_tag": {"terms": {"field": "tags", "size": 50}},
+            "by_page": {"terms": {"field": "page", "size": 5}},
+            "by_score": {"terms": {"field": "score", "size": 50}},
+            "pages": {"cardinality": {"field": "page"}},
+            "tag_count": {"cardinality": {"field": "tags.keyword"}},
+            "combo": {"composite": {"size": 40, "sources": [
+                {"m": {"terms": {"field": "matterId"}}},
+                {"t": {"terms": {"field": "tags.keyword"}}}]}},
+            "combo_after": {"composite": {"size": 10,
+                "after": {"m": "m2", "t": "draft"},
+                "sources": [{"m": {"terms": {"field": "matterId"}}},
+                            {"t": {"terms": {"field": "tags"}}}]}},
+            "one": {"composite": {"size": 100, "sources": [
+                {"s": {"terms": {"field": "inScope"}}}]}}
+        });
+        vec![
+            // Filters: term, terms, range, bool, exists, lists, .keyword.
+            json!({"query_text": "contract", "max_results": 10,
+                   "filter": {"term": {"matterId.keyword": "m1"}}, "exact_total_hits": true}),
+            json!({"query_text": "privileged", "max_results": 10,
+                   "filter": {"term": {"rare": "yes"}}, "exact_total_hits": true}),
+            json!({"query_text": "contract", "max_results": 5,
+                   "filter": {"term": {"rarer": "yes"}}, "exact_total_hits": true}),
+            json!({"query_text": "contract", "max_results": 0,
+                   "filter": {"term": {"rarer": "yes"}}, "exact_total_hits": true}),
+            json!({"query_text": "contract clause", "max_results": 10,
+                   "filter": {"terms": {"tags": ["urgent", "draft"]}}, "exact_total_hits": true}),
+            json!({"query_text": "contract", "max_results": 10, "operator": "or",
+                   "filter": {"range": {"page": {"gte": "10", "lt": "60"}}},
+                   "exact_total_hits": true}),
+            json!({"query_text": "", "max_results": 10,
+                   "filter": {"range": {"score": {"gt": "1.5", "lte": "3"}}},
+                   "exact_total_hits": true}),
+            json!({"query_text": "", "max_results": 0,
+                   "filter": {"bool": {"must": [{"exists": {"field": "tags"}}],
+                                       "must_not": [{"term": {"inScope": "true"}}]}},
+                   "exact_total_hits": true}),
+            json!({"query_text": "clause", "max_results": 10,
+                   "filter": {"bool": {"should": [{"term": {"matterId": "shared"}},
+                                                  {"range": {"createdAt": {"gte": "2024-11-01"}}},
+                                                  {"term": {"tags": "sealed"}}],
+                                       "minimum_should_match": 2}},
+                   "exact_total_hits": true}),
+            // Aggregations over the query's matches.
+            json!({"query_text": "contract", "max_results": 3, "aggs": aggs,
+                   "exact_total_hits": true}),
+            json!({"query_text": "privileged", "max_results": 3, "aggs": aggs,
+                   "filter": {"terms": {"matterId": ["m2", "m3"]}},
+                   "exact_total_hits": true}),
+            json!({"query_text": "", "max_results": 0, "aggs": aggs,
+                   "filter": {"exists": {"field": "rare"}}, "exact_total_hits": true}),
+            // Field sorts: numeric (multi-valued, negative), text, date,
+            // missing values, a cursor and collapse.
+            json!({"query_text": "contract", "max_results": 15,
+                   "sort": [{"page": {"order": "asc"}}, {"_id": {"order": "asc"}}],
+                   "exact_total_hits": true}),
+            json!({"query_text": "contract", "max_results": 15,
+                   "sort": [{"score": {"order": "desc"}}, {"_id": {"order": "desc"}}],
+                   "filter": {"range": {"page": {"lt": "100"}}}, "exact_total_hits": true}),
+            json!({"query_text": "clause", "max_results": 12,
+                   "sort": [{"tags.keyword": {"order": "asc"}}, {"_id": {"order": "asc"}}],
+                   "exact_total_hits": true}),
+            json!({"query_text": "clause", "max_results": 12,
+                   "sort": [{"page": {"order": "desc"}}, {"_id": {"order": "asc"}}],
+                   "search_after": ["150", "s0-d0000"], "exact_total_hits": true}),
+            json!({"query_text": "contract", "max_results": 10,
+                   "sort": [{"createdAt": {"order": "desc"}}, {"_id": {"order": "asc"}}],
+                   "collapse": {"field": "matterId"}, "exact_total_hits": true}),
+            // Features that read the columns outside the filter: geo
+            // distance (#212), rank_by modifiers (#212), limit_per (#211).
+            json!({"query_text": "contract", "max_results": 10,
+                   "filter": {"geo_distance": {"distance": "60km", "loc": "0.5,0.5"}},
+                   "exact_total_hits": true}),
+            json!({"query_text": "", "max_results": 0,
+                   "filter": {"bool": {"must_not": [
+                       {"geo_distance": {"distance": "30km", "loc": {"lat": 1.0, "lon": 1.0}}}]}},
+                   "exact_total_hits": true}),
+            json!({"query_text": "contract clause", "max_results": 10,
+                   "rank_by": {"functions": [
+                       {"field_value": {"field": "score", "modifier": "log1p"}, "weight": 2},
+                       {"decay": {"field": "loc", "function": "gauss", "origin": {"lat": 0.2, "lon": 0.9},
+                                  "scale": "40km", "decay": 0.5}}],
+                     "boost_mode": "sum", "window_size": 200},
+                   "exact_total_hits": true}),
+            json!({"query_text": "contract", "max_results": 12,
+                   "limit_per": {"field": "matterId", "max": 2},
+                   "exact_total_hits": true}),
+        ]
+    }
+
+    fn summary(r: &SearchResult) -> String {
+        let hits: Vec<String> = r
+            .results
+            .iter()
+            .map(|d| format!("{}:{:.6}", d.doc_id.0, d.score))
+            .collect();
+        let aggs = r
+            .aggregations
+            .as_ref()
+            .map(|a| {
+                let v = serde_json::to_value(a).unwrap();
+                let sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                    serde_json::from_value(v).unwrap();
+                serde_json::to_string(&sorted).unwrap()
+            })
+            .unwrap_or_default();
+        format!("{} {hits:?} {aggs}", r.total_hits)
+    }
+
+    #[test]
+    fn legacy_columnar_and_mixed_namespaces_answer_identically() {
+        let root = std::env::temp_dir().join(format!("kosha-q-244-eval-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let layouts: [(&str, [u32; 3]); 3] =
+            [("v1", [1, 1, 1]), ("v2", [2, 2, 2]), ("mixed", [2, 1, 2])];
+        let built: Vec<(Manifest, Searcher)> = layouts
+            .iter()
+            .map(|(name, versions)| {
+                let dir = root.join(name);
+                (build(&dir, versions), Searcher::new(dir))
+            })
+            .collect();
+        // Deleted documents must stay out of hits, totals and buckets.
+        let tombstones = HashMap::from([
+            (
+                SegmentId("s0".into()),
+                HashSet::from([0u32, 5, 10, 50, 100]),
+            ),
+            (
+                SegmentId("s2".into()),
+                (0..DOCS).step_by(7).collect::<HashSet<u32>>(),
+            ),
+        ]);
+        for json in queries() {
+            let q: SearchQuery = serde_json::from_value(json.clone()).unwrap();
+            for deletes in [None, Some(&tombstones)] {
+                let answers: Vec<String> = built
+                    .iter()
+                    .map(|(m, s)| summary(&s.search(&ns, m, &q, deletes).unwrap()))
+                    .collect();
+                assert!(!answers[0].starts_with("0 "), "vacuous query {json}");
+                if json.get("aggs").is_some() {
+                    assert!(answers[0].contains(r#""key":"urgent""#), "{}", answers[0]);
+                }
+                assert_eq!(
+                    answers[0],
+                    answers[1],
+                    "v1 vs v2, deletes={}: {json}",
+                    deletes.is_some()
+                );
+                assert_eq!(
+                    answers[0],
+                    answers[2],
+                    "v1 vs mixed, deletes={}: {json}",
+                    deletes.is_some()
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A query node hydrates only the columns `filter_column_fields`
+    /// names (#244). Every query must answer the same from just those
+    /// columns as from `filters.bin`: a column it reads but does not name
+    /// (say `limit_per`'s or `rank_by`'s field) would read as absent.
+    #[test]
+    fn columnar_answers_from_only_the_named_columns() {
+        let root = std::env::temp_dir().join(format!("kosha-q-244-pruned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let legacy_dir = root.join("v1");
+        let legacy = build(&legacy_dir, &[1, 1, 1]);
+        let legacy_searcher = Searcher::new(legacy_dir);
+        for (i, json) in queries().into_iter().enumerate() {
+            let q: SearchQuery = serde_json::from_value(json.clone()).unwrap();
+            let dir = root.join(format!("v2-{i}"));
+            let m = build(&dir, &[2, 2, 2]);
+            let fields = q.filter_column_fields();
+            for entry in &m.segments {
+                let seg = dir.join("ns").join(&entry.segment_id.0);
+                let footer = SegmentReader::read_footer(&seg).unwrap();
+                let wanted = footer.filter_files_for(Some(&fields));
+                for file in footer.filter_files_for(None) {
+                    if !wanted.contains(&file) {
+                        std::fs::remove_file(seg.join(&file)).unwrap();
+                    }
+                }
+            }
+            let want = summary(&legacy_searcher.search(&ns, &legacy, &q, None).unwrap());
+            let got = summary(
+                &Searcher::new(dir.clone())
+                    .search(&ns, &m, &q, None)
+                    .unwrap(),
+            );
+            assert_eq!(want, got, "{json}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sparse_prefilter_block_skipping_keeps_exact_counts() {
+        // Independent of the differential above (both formats share the
+        // scoring loop): the WAND walk skips postings blocks on a sparse
+        // pre-filter, and must still count and return every passing doc.
+        let root = std::env::temp_dir().join(format!("kosha-q-244-sparse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ns = NamespaceId("ns".into());
+        let m = build(&root, &[2, 1, 2]);
+        let s = Searcher::new(root.clone());
+        let q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "contract", "max_results": 100,
+            "filter": {"term": {"rarer": "yes"}}, "exact_total_hits": true}))
+        .unwrap();
+        let r = s.search(&ns, &m, &q, None).unwrap();
+        assert_eq!(r.total_hits, 30);
+        assert_eq!(r.results.len(), 30);
+        // s2 loses d7 and d1057 (d % 150 == 7 and d % 7 == 0).
+        let tombstones = HashMap::from([(
+            SegmentId("s2".into()),
+            (0..DOCS).step_by(7).collect::<HashSet<u32>>(),
+        )]);
+        let r = s.search(&ns, &m, &q, Some(&tombstones)).unwrap();
+        assert_eq!(r.total_hits, 28);
+        assert!(r
+            .results
+            .iter()
+            .all(|d| d.doc_id.0 != "s2-d0007" && d.doc_id.0 != "s2-d1057"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn galloping_entry_walk_visits_exactly_the_wanted_entries() {
+        let docs: Vec<u32> = vec![0, 0, 1, 3, 3, 3, 4, 9, 10, 10, 200, 201, 5000];
+        for wanted in [
+            vec![],
+            vec![0],
+            vec![3, 10],
+            vec![2, 5, 6, 7, 8],
+            vec![0, 1, 3, 4, 9, 10, 200, 201, 5000],
+            vec![201, 4999, 5000, 6000],
+            (0..6000).collect::<Vec<u32>>(),
+        ] {
+            let mut got = Vec::new();
+            for_each_wanted_entry(&docs, &wanted, |wi, i| got.push((wanted[wi], i)));
+            let want: Vec<(u32, usize)> = docs
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| wanted.contains(d))
+                .map(|(i, d)| (*d, i))
+                .collect();
+            assert_eq!(got, want, "wanted {wanted:?}");
+        }
     }
 }
 
