@@ -271,11 +271,11 @@ fn encode_ivf(field: &FieldBags) -> Result<Vec<u8>, KoshaError> {
         .enumerate()
         .map(|(ordinal, t)| (ordinal as u32, t.to_vec()))
         .collect();
-    let index = kosha_vector_spfresh::ClusterIndex::build(
-        &points,
-        kosha_vector_spfresh::ClusterIndexConfig::new(dim),
-    )
-    .map_err(|e| {
+    // Late-interaction token clustering keeps the plain bisection build;
+    // the post-build refinement (#253) is tuned for the segment kNN index.
+    let mut config = kosha_vector_spfresh::ClusterIndexConfig::new(dim);
+    config.build_refine_rounds = 0;
+    let index = kosha_vector_spfresh::ClusterIndex::build(&points, config).map_err(|e| {
         KoshaError::CorruptSegment(format!(
             "failed to build the late-interaction index for field '{}': {e}",
             field.name
