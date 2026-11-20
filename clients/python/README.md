@@ -75,8 +75,9 @@ shape `{_index, _id, _version: 1, found, _source}`, and `_source` decodes exactl
   `found`.
 - `_source` (bool, name, comma list or list), `_source_includes` and `_source_excludes`
   filter fields as in `search`. `refresh=True` flushes the index first.
-- `get` sees what search sees. A document still in the server's write buffer (up to ~1 s,
-  `KOSHA_FLUSH_MAX_AGE_MS`) is not found yet; there is no realtime GET.
+- `get` sees what search sees. Under the server's default `strong` consistency (#255) that
+  includes documents still in its write buffer; under `eventual` a buffered document (up to
+  ~1 s, `KOSHA_FLUSH_MAX_AGE_MS`) is not found yet.
 
 `mget(body, index=None)` accepts `{"docs": [{"_index"?, "_id", "_source"?}]}` or
 `{"ids": [...]}` and returns `{"docs": [...]}` in request order, with `found: false` entries for
@@ -156,6 +157,15 @@ alongside. If the provider times out or fails, hits come back in search order an
 `resp["rerank"] == {"degraded": True, "reason": ...}`.
 
 ## Changelog
+
+### 0.2.16
+
+- Added the `consistency` option, `KoshaClient(..., consistency="strong" | "eventual")`
+  (issue #255). It is sent with every search (`search`, `count`, `get`, `mget`, `msearch`);
+  `None`, the default, leaves it to the server, which defaults to `strong`: writes are
+  searchable as soon as they return, without a flush. With `consistency="strong"`,
+  `refresh="wait_for"` no longer flushes (the write is already searchable); `refresh=True` and
+  `indices.refresh()` still flush.
 
 ### 0.2.15
 

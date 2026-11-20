@@ -233,6 +233,8 @@ pub fn build_search_query(
                 k,
                 num_candidates,
                 filter,
+                vectors: None,
+                scoring: None,
             })
         }
         // clap's `requires` makes these unreachable from the command line.
@@ -574,6 +576,9 @@ mod tests {
             knn_degraded_segments: None,
             rerank_degraded: Default::default(),
             rerank_degraded_reason: Default::default(),
+            knn_mode: None,
+            knn_filtered_candidates: None,
+            exhaustive_search_count: 0,
         }
     }
 

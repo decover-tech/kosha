@@ -42,7 +42,8 @@ pub enum FileClass {
     Postings,
     /// `doc_store.bin` (+ `doc_vectors.bin`): read for the returned page.
     DocStore,
-    /// `vector.offsets` + `vector.idx`: read by kNN probes.
+    /// `vector.offsets` + `vector.idx` (and `vector.<n>.*` for further
+    /// vector columns, #204): read by kNN probes.
     Vectors,
 }
 
@@ -74,7 +75,8 @@ impl FileClass {
             // Columnar filter index (#244): the TOC and its column files.
             n if kosha_core::is_filter_column_file(n) => Some(Self::Scoring),
             "doc_store.bin" | "doc_vectors.bin" => Some(Self::DocStore),
-            "vector.idx" | "vector.offsets" => Some(Self::Vectors),
+            // Every vector column's index and sidecar (#204).
+            n if kosha_core::is_vector_index_file(n) => Some(Self::Vectors),
             n if n.starts_with("postings-") && n.ends_with(".bin") => Some(Self::Postings),
             _ => None,
         }

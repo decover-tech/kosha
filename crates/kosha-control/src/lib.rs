@@ -170,6 +170,26 @@ impl Controller {
         Ok(())
     }
 
+    /// Remove a namespace and its manifest; `None` if it did not exist.
+    pub fn remove_namespace(&mut self, id: &NamespaceId) -> Option<Manifest> {
+        let at = self.namespaces.iter().position(|ns| ns == id)?;
+        self.namespaces.remove(at);
+        Some(self.manifests.remove(id).unwrap_or_else(|| Manifest {
+            version: 0,
+            segments: Vec::new(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            branch: None,
+            retired: Default::default(),
+            shards: Default::default(),
+        }))
+    }
+
     /// List all registered namespaces.
     pub fn list_namespaces(&self) -> &[NamespaceId] {
         &self.namespaces
@@ -237,6 +257,9 @@ impl ControlStore for Controller {
     ) -> Result<(Manifest, u64), KoshaError> {
         self.delete_namespace(id, retire_at_least)
     }
+    fn remove_namespace(&mut self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
+        Ok(self.remove_namespace(id))
+    }
 }
 
 #[cfg(test)]
@@ -257,8 +280,10 @@ mod tests {
             wal_origin: Some("writer-a".into()),
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         ctrl.compare_and_swap_manifest(&ns, 0, candidate.clone())
             .unwrap();
@@ -298,6 +323,26 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn remove_namespace_forgets_it_and_reports_what_it_held() {
+        let mut ctrl = Controller::new();
+        let ns = NamespaceId("t/branch".into());
+        assert!(ControlStore::remove_namespace(&mut ctrl, &ns)
+            .unwrap()
+            .is_none());
+        ctrl.ensure_namespace(ns.clone());
+        let mut manifest = ctrl.manifest(&ns).unwrap().clone();
+        manifest.version = 3;
+        ctrl.compare_and_swap_manifest(&ns, 0, manifest).unwrap();
+        let removed = ControlStore::remove_namespace(&mut ctrl, &ns)
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.version, 3);
+        assert!(!ctrl.has_namespace(&ns));
+        assert!(ctrl.manifest(&ns).is_none());
+        assert!(ControlStore::manifest_versions(&ctrl).unwrap().is_empty());
     }
 
     #[test]
@@ -405,8 +450,10 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
                 schema: None,
                 retired: Default::default(),
+                shards: None,
             },
         )
         .unwrap();
@@ -426,8 +473,10 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
                 schema: None,
                 retired: Default::default(),
+                shards: None,
             },
         )
         .unwrap();
@@ -456,8 +505,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
 
         // CAS with version 0 → should succeed (initial version is 0).
@@ -478,8 +529,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         assert!(ctrl.compare_and_swap_manifest(&ns, 0, manifest_v2).is_err());
     }

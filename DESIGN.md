@@ -208,11 +208,14 @@ a directory of objects in S3:
 s3://kosha-{env}/{namespace_id}/segments/{segment_id}/
     doc_store.bin       # document payloads (content, metadata), compressed, block-addressed
     inverted.idx         # term → postings list (docId, freq, positions) for lexical search
-    vector.idx           # ANN index: cluster postings (+ vector.offsets with centroids), written when the segment has vectors
+    vector.idx           # ANN index of the first vector column (cluster centroids + posting lists)
+    vector.offsets       # its centroids and posting byte ranges, read at open
+    vector.<n>.idx       # ANN index of vector column n (#204), and vector.<n>.offsets beside it
+    doc_vectors.bin      # stored vector values, binary f32 (#243); never quantized
     filters.bin          # filter fields (dates, ids, tags), row-oriented — or, with the columnar format:
     filters.toc          #   column directory + per-column stats (#244)
     filters-NNN.col      #   one file per (field, type) column, numbered by id
-    footer.json          # offsets, counts, schema version, checksum, analysis chains
+    footer.json          # counts, blooms, analysis chains, vector columns, format version
 ```
 
 **Filter index formats (#244).** A segment stores its filter values in one of two formats, and
@@ -266,6 +269,54 @@ then set it to `2`; compaction converts segments as it merges them. Rollback: se
 and compaction rewrites columnar segments as `filters.bin`, but a binary older than #244 cannot
 read columnar segments (their filters match nothing), so do not downgrade past this release
 while any remain.
+**Vector columns are per segment (#204).** Every `Vector` field gets its own ANN index, with its
+own dimension. The footer's `vector_fields` lists each column's name, dimension, vector count and
+file slot: slot 0 is `vector.idx` + `vector.offsets`, so a segment with one vector field is
+byte-identical to one written before columns existed, and slot `n` is `vector.<n>.idx` +
+`vector.<n>.offsets` (field names never appear in object keys). A kNN loads, hydrates and probes
+only the column `knn.field` names; its centroids alone take part in the global probe budget. A
+footer without `vector_fields` is a legacy segment: its single unnamed index answers a kNN on any
+field, unless its `doc_vectors.bin` names exactly one field, which then binds it. A `knn.field`
+that no segment indexes and no legacy segment could answer, or a query vector whose dimension
+differs from the field's, is a 400. The writer fixes each field's dimension per namespace at the
+first vector written to it (from segment footers and the write buffer) and rejects a document that
+disagrees with a 400; a segment writer that still meets one stores it without indexing it rather
+than failing the flush. There is no namespace schema for vector fields: everything above is read
+from segment footers.
+
+**i8 posting entries (#210).** A column's `vector.idx` entries are `[id][f32 x dim]` or, at
+on-disk version 4, `[id][scale: f32][i8 x dim]`: the unit-normalized vector scaled by
+`max|x_i| / 127` and rounded. Centroids and radii in `vector.offsets` stay f32 (radii are computed
+from the exact vectors, so the probe's lower bound still holds). The reader dispatches on the
+header version, so f32 and i8 segments coexist in a namespace and in one query; a version it does
+not know fails that column loudly (counted in `knn_degraded_segments`) rather than being misread
+as the legacy format. The footer's `vector_fields[].quantization` records the choice (omitted for
+f32). i8 entries score as `scale * Σ q_i·code_i` against the normalized query, without
+dequantizing, and the posting cache holds them as i8. Each segment then rescores its best
+`k * KOSHA_VECTOR_RESCORE_FACTOR` candidates with the f32 vectors in `doc_vectors.bin`, which is
+never quantized: it is the document's own value, and compaction re-encodes every index from it.
+Quantization is chosen at write time by `KOSHA_VECTOR_QUANTIZATION` /
+`KOSHA_VECTOR_QUANTIZATION_FIELDS`, not by the namespace schema.
+
+**Compaction merges postings instead of re-clustering (#253).** A flush clusters its vectors from
+scratch (`ClusterIndex::build`, recursive balanced 2-means). Compaction does not: for each vector
+column, the largest input whose column has at least `LIRE_ADOPT_MIN_VECTORS` (1,024) vectors and a
+clustered index has its postings adopted as they are — centroid and members, read from
+`vector.offsets` and the ids in `vector.idx`, with members remapped to merged doc_seqs and
+tombstoned or deleted ones dropped (a posting that lost members gets its centroid recomputed).
+Every other input's postings are then absorbed into those: each absorbed posting's centroid picks
+its 8 nearest adopted postings and each member moves into the nearest of them. Vectors of inputs
+too small to adopt are absorbed one by one into their nearest posting. Finally LIRE (SPFresh's
+split / merge / bounded reassign, `kosha-vector-spfresh`) splits every posting over 128 members,
+merges every one under 16 into its neighbour, and reassigns the vectors those events displace.
+Postings nothing touched keep their centroid and members, so the cost follows how much changed
+rather than the column's size. Entries are re-encoded from the exact f32 vectors, so an i8 column
+is requantized from `doc_vectors.bin` (or the doc store), never from its i8 copy, and radii are
+computed from exact vectors as on flush. The output is the same on-disk format; nothing about
+reading it changes. A column falls back to clustering from scratch when no input qualifies, when
+fewer than half its vectors come from adopted or absorbed postings, or on a dimension mismatch.
+`KOSHA_VECTOR_COMPACTION=rebuild` turns the whole mechanism off (default `lire`).
+
 **Analysis is versioned per segment (#220, #221).** `inverted.idx` holds whatever terms the
 analyzer produced at write time, so a segment's `footer.json` records the exact analysis chains its
 `Text` fields went through (`analysis`: tokenizer + version + filters, with stopword lists copied
@@ -334,7 +385,8 @@ Iceberg/Delta Lake use for tables, applied to a search index.
    first), the ingest node builds inverted + vector + filter indices for the buffered documents,
    writes a new segment to S3, and publishes an updated manifest that adds the new segment.
 4. **Compaction**: a background worker merges *small / recent* segments (and drops
-   tombstoned/deleted docs) into fewer, larger ones under a size-tiered policy (§7.1), publishing
+   tombstoned/deleted docs) into fewer, larger ones under a size-tiered policy (§7.1), merging the
+   inputs' vector postings rather than re-clustering them (#253, §6), publishing
    a new manifest and marking old segments for GC after a grace period (bounded by the longest
    manifest a query node might still be holding). Compaction never holds a process-wide lock
    across merge I/O, and never re-merges already-large segments on every pass.
@@ -461,11 +513,11 @@ calls.
 - Off-pod segment GC. Today GC runs on the write pod (`POST /v1/admin/gc`, §11).
 
 **Durability/visibility tradeoff**: a document is durable (survives any single node failure) as
-soon as its WAL append to S3 acknowledges. It becomes *queryable* once its segment is flushed and
-the manifest updated — bounded by the flush interval above. This is a deliberate, tunable relaxation
-versus ES's near-real-time (~1s) visibility; for Decover's ingestion pattern (batch document
-processing via Pandora, not live chat-style writes) this is an acceptable and, in fact, currently
-true in practice since ES refresh intervals are already tuned up for indexing throughput.
+soon as its WAL append to S3 acknowledges. It becomes *indexed* once its segment is flushed and
+the manifest updated — bounded by the flush interval above. It is *queryable* earlier: a search
+with `consistency: "strong"` (the default, #255) also scans the writer's unindexed tail
+exhaustively, so a write is searchable as soon as `/index` returns; `"eventual"` searches only
+indexed segments, with the flush-interval lag. See §11.
 
 ## 8. Read Path
 
@@ -554,11 +606,21 @@ true in practice since ES refresh intervals are already tuned up for indexing th
      is rescored with per-segment floors. Hybrid (RRF) requests are untouched: their lexical
      list is a rank window, scored by the general path. `SearchPhaseStats` reports
      `wand_docs_scored`, `wand_segments_skipped`, `wand_global_threshold` and `wand_bounds_ms`.
-   - Semantic: ANN search over `vector.idx` — probe the nearest cluster centroids (one probe
+   - Semantic: ANN search over the `knn.field` column's index (`vector.idx`, or
+     `vector.<n>.idx` for a second column, #204) — probe the nearest cluster centroids (one probe
      budget for the whole query, bounded with triangle-inequality radii) and score the
      postings' unit-norm vectors by dot product (cosine); older segments fall back to flat or
      HNSW search. This is the direct replacement for OpenSearch's `script_score` cosineSimilarity
-     query in `query_builder.py`.
+     query in `query_builder.py`. Filters (top-level, `knn.filter`) and tombstones are resolved
+     to a per-segment document set first and applied while postings are scored; a segment keeps
+     probing outward until `k` passing documents are found. Before any segment is scored, one
+     planning pass over the segments counts the passing documents (#252). At or below
+     `KOSHA_KNN_EXACT_THRESHOLD` (default 50,000) namespace-wide, every segment skips the probe
+     and scores each passing document's vector exactly, read from `doc_vectors.bin` (or from
+     every posting when the segment has no local sidecar); a segment where at most
+     `KOSHA_KNN_EXACT_FRACTION` (1%) of documents pass does too. The remaining segments share a
+     probe budget widened by `1 / selectivity` (capped at 8x). The response's `knn_mode` says
+     which happened: `ann`, `exact` or `mixed`.
 5. **Fusion**: candidate sets from lexical and semantic retrieval are merged via Reciprocal Rank
    Fusion, `score(d) = Σ_r 1/(rank_constant + rank_r(d))`, matching `ranking/rrf.py`'s existing
    behavior — ported in, not reinvented. Request shape is Elasticsearch's
@@ -729,9 +791,27 @@ existing org/user auth context Bach already establishes.
   disk until a flush publishes them. Segment + manifest writes are the durable "committed" state
   for query visibility; a flush publishes `wal_checkpoint` by CAS and only then reclaims the WAL
   records it covers.
-- **Read consistency**: each query snapshots one manifest version for its whole execution —
-  read-your-writes is bounded by the flush interval (§7), not immediate, which matches the
-  approach we already accept operationally with ES refresh tuning.
+- **Read consistency**: each query snapshots one manifest version for its whole execution.
+  Read-your-writes (#255) is a per-request option, `consistency`:
+  - `strong` (default; `KOSHA_DEFAULT_CONSISTENCY` changes it): the query also reads the
+    namespace's *unindexed tail* — the writer's buffered documents, a flush round in progress and
+    WAL-recovered deletes awaiting replay — relative to the same manifest version, from the
+    ingest pod's memory (`GET /internal/namespaces/{ns}/unindexed?manifest_version=V`,
+    internal credential) when it runs on a query pod. The tail is built into a transient local
+    segment with the normal segment writer and searched together with the
+    manifest's segments in one pass, so BM25 (with the tail folded into the namespace
+    statistics), kNN, filters, aggregations, `search_after` and capped `total_hits` behave
+    exactly as after a flush. Indexed copies the tail supersedes are masked like deletes, so the
+    newest version wins. A tail relative to another manifest version than the query's (a flush
+    published in between) is refused; the query pod refreshes its manifest and retries a few
+    times, then fails with 503 rather than miss or double-count documents. Responses report
+    `exhaustive_search_count`, the number of unindexed documents scanned.
+  - `eventual`: indexed segments only; visibility is bounded by the flush interval (§7).
+
+  The unindexed backlog per namespace is capped (`KOSHA_MAX_UNINDEXED_BYTES`, default 2 GiB;
+  `KOSHA_MAX_UNINDEXED_DOCS`, unset by default): past it `/index` and `/replace` return 429 with
+  `retry-after` until flushes catch up. The tail is served from the ingest pod's memory (its
+  write buffer and WAL-recovered records), never read back from the WAL, local or S3 (#236).
 - **Manifest updates**: conditional (compare-and-swap) writes prevent lost updates from concurrent
   flush/compaction; a losing writer retries against the new base.
 - **Garbage collection** (#239): superseded segments are deleted only after the max
@@ -919,7 +999,7 @@ one-time batch job reading from the existing Postgres/S3 document store and repl
 | Node loss | Shard relocation, potential temporary reduced replication | Cache rewarm only, no data risk |
 | Query surface | Full ES DSL (mostly unused by Sage) | Purpose-built hybrid retrieval + filters |
 | **Cost of data** | ~$0.16–0.24/GB-month (SSD-backed EBS volumes, 2–3× replication for HA), and sized for peak so effective utilization of provisioned storage is often only 30–50% | ~$0.023/GB-month (S3 Standard, single durable copy — no manual replication). SSD cache cost is decoupled from total corpus size: it scales with *active* data, not total stored data |
-| **Read / Write Latency** | Read: p50 ~50–100ms, p99 ~200–500ms (shard-size dependent). Write: near-real-time, ~1s refresh-to-visibility | Read: p50 ≤80ms / p99 ≤300ms warm-cache, p99 ≤1.5s cold-cache (§4). Write: WAL-ack durability <100ms, but visibility is bounded by the flush interval (default 60s, §7) — a deliberate regression on write-visibility latency, traded for storage/compute separation |
+| **Read / Write Latency** | Read: p50 ~50–100ms, p99 ~200–500ms (shard-size dependent). Write: near-real-time, ~1s refresh-to-visibility | Read: p50 ≤80ms / p99 ≤300ms warm-cache, p99 ≤1.5s cold-cache (§4). Write: WAL-ack durability <100ms, but indexing is bounded by the flush interval (§7); `strong` searches (the default) also scan unindexed writes, so visibility is immediate (#255) |
 | **Read / Write Throughput** | Bounded by shard count — max query/index parallelism is fixed at shard-creation time; adding capacity requires rebalancing | Read: scales ~linearly by adding stateless query nodes, no data movement required. Write: batched segment builds generally exceed ES's per-document bulk-index overhead, bounded mainly by S3 PUT throughput per ingest node |
 
 *Cost and throughput figures above are directional planning targets, not measured benchmarks — see §17 for the validation this design still needs before these numbers can be treated as commitments.*

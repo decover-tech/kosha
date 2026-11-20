@@ -793,6 +793,8 @@ mod tests {
                 deletion_vectors: Default::default(),
                 schema: None,
                 retired: Default::default(),
+                shards: None,
+                branch: None,
             },
         }
     }

@@ -20,7 +20,8 @@ use kosha_core::{
 use kosha_core::{AnalyzerSpec, FieldBoost, Footer, SegmentAnalysis};
 pub use kosha_segment::VectorSpanFetch;
 use kosha_segment::{
-    tokenize, Analyzer, PostingsMemoryAccount, ScoringPosting, SegmentReader, SCORING_BLOCK_LEN,
+    tokenize, Analyzer, PostingsMemoryAccount, ScoringPosting, SegmentReader, VectorFieldStatus,
+    SCORING_BLOCK_LEN,
 };
 
 /// One segment of a materialize page, as handed to a [`DocStoreHydrator`]:
@@ -634,16 +635,90 @@ pub fn approx_segment_bytes(seg_dir: &std::path::Path, load_vectors: bool) -> u6
     }
 
     if load_vectors {
-        // Resident: centroids + ranges (v2 lazy) or the whole parsed
-        // VectorStore (legacy / missing-sidecar fallback).
-        let vec_offsets = size("vector.offsets");
-        total = total.saturating_add(if vec_offsets > 0 {
-            vec_offsets
-        } else {
-            size("vector.idx")
-        });
+        // Resident, per vector column (#204): centroids + ranges (v2 lazy)
+        // or the whole parsed VectorStore (legacy / missing-sidecar
+        // fallback). Columns load on first use, so this charges every
+        // column present locally up front — the conservative direction.
+        for slot in vector_slots_on_disk(seg_dir) {
+            let vec_offsets = size(&kosha_core::vector_offsets_file(slot));
+            total = total.saturating_add(if vec_offsets > 0 {
+                vec_offsets
+            } else {
+                size(&kosha_core::vector_idx_file(slot))
+            });
+        }
     }
     total
+}
+
+/// Slots of the vector-index files present in `seg_dir` (#204): `0` for
+/// `vector.idx`, `n` for `vector.<n>.idx`. Sorted, deduplicated.
+fn vector_slots_on_disk(seg_dir: &std::path::Path) -> Vec<u32> {
+    let mut slots: Vec<u32> = std::fs::read_dir(seg_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            if !kosha_core::is_vector_index_file(&name) {
+                return None;
+            }
+            let rest = name.strip_prefix("vector.")?;
+            match rest.split_once('.') {
+                Some((slot, _)) => slot.parse().ok(),
+                None => Some(0),
+            }
+        })
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
+/// Reject a kNN that cannot be answered as asked (#204) — see
+/// [`Searcher::knn_plan`]. `statuses` holds one entry per
+/// segment present locally; with none there is nothing to judge by.
+fn check_knn_field<'a>(
+    namespace: &NamespaceId,
+    knn: &kosha_core::KnnQuery,
+    statuses: impl Iterator<Item = &'a VectorFieldStatus>,
+) -> Result<(), KoshaError> {
+    let dim = knn.vector.len();
+    let mut any = false;
+    let mut answerable = false;
+    let mut legacy_dims = std::collections::BTreeSet::new();
+    for status in statuses {
+        any = true;
+        match *status {
+            VectorFieldStatus::Indexed { dim: indexed } if indexed != dim => {
+                return Err(KoshaError::InvalidQuery(format!(
+                    "knn.vector has {dim} dimensions but vector field '{}' is indexed with {indexed}",
+                    knn.field
+                )));
+            }
+            VectorFieldStatus::Indexed { .. } => answerable = true,
+            // An unnamed legacy index of another dimension holds some
+            // other field's vectors: it cannot answer this query.
+            VectorFieldStatus::Legacy { dim: Some(legacy) } if legacy != dim => {
+                legacy_dims.insert(legacy);
+            }
+            VectorFieldStatus::Legacy { .. } => answerable = true,
+            VectorFieldStatus::Absent => {}
+        }
+    }
+    if answerable || !any {
+        return Ok(());
+    }
+    if let Some(legacy) = legacy_dims.first() {
+        return Err(KoshaError::InvalidQuery(format!(
+            "knn.vector has {dim} dimensions but the vector index that would answer \
+             knn.field '{}' has {legacy}",
+            knn.field
+        )));
+    }
+    Err(KoshaError::InvalidQuery(format!(
+        "knn.field '{}' has no vector index in namespace '{}'",
+        knn.field, namespace.0
+    )))
 }
 
 // ─── BM25 scorer ────────────────────────────────────────────────────────────
@@ -968,22 +1043,37 @@ pub struct QueryAnalysis {
     /// Fuzzy-bloom probes per token: the hashes of its deletion
     /// neighbourhood, computed once and shared by every segment.
     fuzzy_probes: Mutex<HashMap<String, Arc<BloomProbes>>>,
+    /// The legacy `standard@1` reading, analyzed up front: it is what every
+    /// segment without a footer `analysis` (nearly all of them) uses, so
+    /// those segments skip the per-chain map, its lock and its hashing on
+    /// the per-segment hot path.
+    legacy: Arc<AnalyzedQuery>,
     by_chain: Mutex<HashMap<AnalyzerSpec, Arc<AnalyzedQuery>>>,
 }
 
 impl QueryAnalysis {
     pub fn new(query: &SearchQuery) -> Self {
+        let text = query.query_text.clone();
+        let phrase = query.match_phrase.as_ref().map(|mp| mp.phrase.clone());
+        let fuzzy = query.fuzzy.clone();
+        let legacy = Arc::new(Self::analyze(
+            &Analyzer::new(&AnalyzerSpec::legacy()),
+            &text,
+            phrase.as_deref(),
+            fuzzy.as_ref().map(|fuzzy| fuzzy.value.as_str()),
+        ));
         Self {
-            has_text: !tokenize(&query.query_text).is_empty(),
-            text: query.query_text.clone(),
-            phrase: query.match_phrase.as_ref().map(|mp| mp.phrase.clone()),
+            has_text: !legacy.terms.is_empty(),
+            text,
+            phrase,
             fields: query.field_boosts(),
             phrase_fields: query
                 .match_phrase
                 .as_ref()
                 .and_then(|mp| mp.restricted_fields()),
-            fuzzy: query.fuzzy.clone(),
+            fuzzy,
             fuzzy_probes: Mutex::new(HashMap::new()),
+            legacy,
             by_chain: Mutex::new(HashMap::new()),
         }
     }
@@ -1131,24 +1221,35 @@ impl QueryAnalysis {
         keys
     }
 
+    fn analyze(
+        analyzer: &Analyzer,
+        text: &str,
+        phrase: Option<&str>,
+        fuzzy: Option<&str>,
+    ) -> AnalyzedQuery {
+        AnalyzedQuery {
+            terms: analyzer.analyze(text),
+            positioned: analyzer.analyze_with_positions(text),
+            phrase: phrase.map(|phrase| analyzer.analyze_with_positions(phrase)),
+            fuzzy: fuzzy
+                .map(|value| analyzer.analyze(value))
+                .unwrap_or_default(),
+        }
+    }
+
     pub fn for_chain(&self, spec: &AnalyzerSpec) -> Arc<AnalyzedQuery> {
+        if spec.is_legacy() {
+            return Arc::clone(&self.legacy);
+        }
         if let Some(found) = self.by_chain.lock().unwrap().get(spec) {
             return Arc::clone(found);
         }
-        let analyzer = Analyzer::new(spec);
-        let analyzed = Arc::new(AnalyzedQuery {
-            terms: analyzer.analyze(&self.text),
-            positioned: analyzer.analyze_with_positions(&self.text),
-            phrase: self
-                .phrase
-                .as_ref()
-                .map(|phrase| analyzer.analyze_with_positions(phrase)),
-            fuzzy: self
-                .fuzzy
-                .as_ref()
-                .map(|fuzzy| analyzer.analyze(&fuzzy.value))
-                .unwrap_or_default(),
-        });
+        let analyzed = Arc::new(Self::analyze(
+            &Analyzer::new(spec),
+            &self.text,
+            self.phrase.as_deref(),
+            self.fuzzy.as_ref().map(|fuzzy| fuzzy.value.as_str()),
+        ));
         Arc::clone(
             self.by_chain
                 .lock()
@@ -1162,6 +1263,10 @@ impl QueryAnalysis {
     /// holds `analysis`. Never empty. Readings with no terms are dropped
     /// unless every reading is empty.
     pub fn for_segment(&self, analysis: Option<&SegmentAnalysis>) -> Vec<Arc<AnalyzedQuery>> {
+        let Some(analysis) = analysis else {
+            return vec![Arc::clone(&self.legacy)];
+        };
+        let analysis = Some(analysis);
         let mut readings: Vec<Arc<AnalyzedQuery>> = Vec::new();
         for chain in kosha_core::analysis::segment_query_chains(analysis) {
             let reading = self.for_chain(&chain);
@@ -1257,8 +1362,11 @@ impl CorpusStatsCache {
     fn insert(&self, key: CorpusKey, entry: Arc<CorpusEntry>) -> Arc<CorpusEntry> {
         let mut entries = self.entries.lock().unwrap();
         // Older versions of the same namespace are dead once a newer one is
-        // being queried.
-        entries.retain(|k, _| k.0 != key.0 || k.1 > key.1);
+        // being queried. Other segment sets at the same version are not: a
+        // strong-consistency search (#255) adds the unindexed tail's
+        // transient segment to the manifest it searches, and must not evict
+        // the plain version's entry (nor the other way around).
+        entries.retain(|k, _| k.0 != key.0 || k.1 >= key.1);
         if entries.len() >= CORPUS_STATS_MAX_ENTRIES {
             entries.clear();
         }
@@ -1368,7 +1476,7 @@ impl CeilingCache {
 
     fn insert(&self, key: CorpusKey, entry: Arc<CeilingEntry>) -> Arc<CeilingEntry> {
         let mut entries = self.entries.lock().unwrap();
-        entries.retain(|k, _| k.0 != key.0 || k.1 > key.1);
+        entries.retain(|k, _| k.0 != key.0 || k.1 >= key.1);
         if entries.len() >= CEILING_CACHE_MAX_ENTRIES {
             entries.clear();
         }
@@ -1902,26 +2010,6 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     (dot / (norm_a * norm_b)) as f64
 }
 
-/// Over-fetch multiplier for per-segment kNN whenever candidates can be
-/// rejected *after* the top-`k` cut (tombstones, `knn.filter`, or a
-/// top-level `query.filter`): the segment fetches `k × factor` candidates
-/// and truncates back to `k` survivors post-rejection. Without it, a
-/// selective filter or a batch of deletes landing near the query silently
-/// voids most (or all) of the page. Nearly free on the lazy v2 path, which
-/// scores every hydrated candidate regardless and uses `k` only to
-/// truncate. `KOSHA_KNN_OVERFETCH_FACTOR`, default 10, min 1 (disables
-/// over-fetching). Read once.
-fn knn_overfetch_factor() -> usize {
-    static FACTOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *FACTOR.get_or_init(|| {
-        std::env::var("KOSHA_KNN_OVERFETCH_FACTOR")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10)
-            .max(1)
-    })
-}
-
 /// Whether `knn.num_candidates` is treated as a whole-query probe budget
 /// (default) rather than a per-segment one.
 ///
@@ -1943,6 +2031,28 @@ fn knn_global_budget_enabled() -> bool {
             Some("0") | Some("false") | Some("off")
         )
     })
+}
+
+/// Centroids probed per query token by late-interaction search (#205)
+/// before candidates are re-scored exactly. `KOSHA_LATE_INTERACTION_NPROBE`,
+/// default 16. Widened automatically in a segment where it turns up fewer
+/// than `k` acceptable documents.
+fn late_interaction_nprobe() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("KOSHA_LATE_INTERACTION_NPROBE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(16)
+    })
+}
+
+fn late_interaction_params(knn: &kosha_core::KnnQuery) -> kosha_segment::LateInteractionParams {
+    kosha_segment::LateInteractionParams {
+        nprobe: late_interaction_nprobe(),
+        num_candidates: knn.num_candidates.max(knn.k),
+    }
 }
 
 /// Fraction of a namespace's total centroid count that [`effective_knn_budget`]
@@ -2004,6 +2114,132 @@ fn effective_knn_budget(requested: usize, total_centroids: usize) -> usize {
     requested.max(floor)
 }
 
+/// Namespace-wide number of filter-passing documents at or below which a
+/// filtered kNN query skips the centroid probe and scores every passing
+/// document's vector exactly (#252). `KOSHA_KNN_EXACT_THRESHOLD`, default
+/// 50,000; `0` turns exact filtered kNN off. Scoring 50k vectors of 1024
+/// dims is ~200 MB of multiply-adds — a few milliseconds per core — and
+/// reads only the passing documents' vectors, while a probe for the same
+/// selective filter hydrates whole postings of documents it then rejects.
+pub const DEFAULT_KNN_EXACT_THRESHOLD: usize = 50_000;
+
+fn knn_exact_threshold_from_env() -> usize {
+    std::env::var("KOSHA_KNN_EXACT_THRESHOLD")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_KNN_EXACT_THRESHOLD)
+}
+
+/// A segment whose filter passes at most this fraction of its documents is
+/// searched exactly even when the namespace as a whole is above
+/// [`DEFAULT_KNN_EXACT_THRESHOLD`] (#252): a probe there would mostly
+/// hydrate rejected vectors, and keep probing outward to find `k` that
+/// pass. `KOSHA_KNN_EXACT_FRACTION`, default 1%. Still bounded by the
+/// threshold in absolute documents per segment.
+pub const DEFAULT_KNN_EXACT_FRACTION: f64 = 0.01;
+
+fn knn_exact_fraction_from_env() -> f64 {
+    std::env::var("KOSHA_KNN_EXACT_FRACTION")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .unwrap_or(DEFAULT_KNN_EXACT_FRACTION)
+}
+
+/// Most a filter's selectivity may widen the global probe budget (#252).
+/// A filter passing a fraction `s` of the probed segments' documents
+/// leaves about `s` of each probed posting usable, so the budget is
+/// scaled by `1 / s` — up to this factor, beyond which the per-segment
+/// outward probe (or the exact path) takes over.
+/// `KOSHA_KNN_FILTER_BUDGET_MAX_SCALE`, default 8.
+fn knn_filter_budget_max_scale() -> f64 {
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("KOSHA_KNN_FILTER_BUDGET_MAX_SCALE")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|f| *f >= 1.0 && f.is_finite())
+            .unwrap_or(8.0)
+    })
+}
+
+/// [`effective_knn_budget`] widened for a filter that passes `selectivity`
+/// of the documents in the segments that will be probed (#252). `None`
+/// (no filter) or a selectivity of 1 leaves the budget as it is.
+fn filtered_knn_budget(budget: usize, selectivity: Option<f64>) -> usize {
+    match selectivity {
+        Some(s) if s > 0.0 && s < 1.0 => {
+            let scale = (1.0 / s).min(knn_filter_budget_max_scale());
+            ((budget as f64) * scale).ceil() as usize
+        }
+        _ => budget,
+    }
+}
+
+/// How many documents of one segment a filtered kNN may return: those
+/// passing both the query filter and `knn.filter`, less deleted ones.
+///
+/// Kept behind this one function so columnar filter bitmaps (#244) can
+/// replace the counting without touching the planner.
+fn knn_passing_count(
+    filter: Option<&DocSet>,
+    knn_filter: Option<&DocSet>,
+    tombstones: Option<&HashSet<u32>>,
+    doc_count: u32,
+) -> usize {
+    let passes = |doc_seq: u32| {
+        filter.is_none_or(|set| set.contains(doc_seq))
+            && knn_filter.is_none_or(|set| set.contains(doc_seq))
+    };
+    let passing = match (filter, knn_filter) {
+        (Some(a), Some(b)) => a.intersection_count(b),
+        (Some(set), None) | (None, Some(set)) => set.count(),
+        (None, None) => doc_count as usize,
+    };
+    let deleted = tombstones.map_or(0, |seqs| {
+        seqs.iter()
+            .filter(|&&doc_seq| doc_seq < doc_count && passes(doc_seq))
+            .count()
+    });
+    passing.saturating_sub(deleted)
+}
+
+/// How a kNN query searched (#252); see `SearchResult::knn_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnnMode {
+    /// Centroid-probed postings in every segment.
+    Ann,
+    /// Every filter-passing vector scored, in every segment.
+    Exact,
+    /// Some segments each way.
+    Mixed,
+}
+
+impl KnnMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ann => "ann",
+            Self::Exact => "exact",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+/// Everything decided about a kNN query before any segment is scored (see
+/// [`Searcher::knn_plan`]), so every segment searches the way the plan
+/// says rather than deciding alone.
+#[derive(Debug, Default)]
+struct KnnPlan {
+    /// The global probe budget: see [`Searcher::knn_plan`].
+    cutoff: Option<(f32, usize)>,
+    /// Segments searched exactly over their filter-passing documents.
+    exact_segments: HashSet<kosha_core::SegmentId>,
+    mode: Option<KnnMode>,
+    /// Filter-passing, undeleted documents across the segments searched;
+    /// `None` without a filter.
+    filtered_candidates: Option<u64>,
+}
+
 /// Flat kNN search: compute cosine similarity against all stored vectors,
 /// return top-K (doc_seq, score) pairs.
 pub fn flat_knn(query_vector: &[f32], vectors: &[(u32, Vec<f32>)], k: usize) -> Vec<(u32, f64)> {
@@ -2051,6 +2287,12 @@ pub struct SearchPhaseStats {
     /// doc-store reads per segment, so usage-driven warming knows which
     /// segments' doc stores are actually hot.
     pub page_segments: Vec<PathBuf>,
+    /// Vectors scored by exact filtered kNN (#252), summed over segments.
+    pub knn_exact_vectors: usize,
+    /// See `SearchResult::knn_mode`; `None` for a non-kNN query.
+    pub knn_mode: Option<KnnMode>,
+    /// See `SearchResult::knn_filtered_candidates`.
+    pub knn_filtered_candidates: Option<u64>,
     /// Time spent resolving namespace-level BM25 statistics (issue #246):
     /// one cache lookup when warm, the per-segment `df` pass for terms not
     /// seen yet at this manifest version when cold.
@@ -2117,6 +2359,9 @@ struct OpenStatsCollector {
     wand_docs_scored: AtomicUsize,
     /// See [`SearchPhaseStats::wand_segments_skipped`].
     wand_segments_skipped: AtomicUsize,
+    /// Vectors scored by exact filtered kNN — see
+    /// [`SearchPhaseStats::knn_exact_vectors`].
+    knn_exact_vectors: AtomicUsize,
 }
 
 pub struct Searcher {
@@ -2135,6 +2380,10 @@ pub struct Searcher {
     /// [`Searcher::release_segment`] while an in-flight search still held
     /// them. Keyed by `(namespace, segment_id)`.
     draining: Mutex<HashMap<(String, String), DrainingReaders>>,
+    /// See [`DEFAULT_KNN_EXACT_THRESHOLD`]; `0` disables exact filtered kNN.
+    knn_exact_threshold: usize,
+    /// See [`DEFAULT_KNN_EXACT_FRACTION`].
+    knn_exact_fraction: f64,
 }
 
 /// Weak handles to the readers of one released segment.
@@ -2199,6 +2448,8 @@ impl Searcher {
             global_wand: std::sync::atomic::AtomicBool::new(true),
             ceilings: CeilingCache::default(),
             draining: Mutex::new(HashMap::new()),
+            knn_exact_threshold: knn_exact_threshold_from_env(),
+            knn_exact_fraction: knn_exact_fraction_from_env(),
         }
     }
 
@@ -2207,6 +2458,16 @@ impl Searcher {
     /// much gets scored differs — so this is a test/bench hook for
     /// measuring that, not a production knob.
     #[doc(hidden)]
+    /// Forget a segment that will never be searched again: the transient
+    /// segment a strong-consistency search built from a namespace's
+    /// unindexed tail (#255), once that tail has changed. Its directory may
+    /// be removed afterwards; searches already holding it finish on their
+    /// copy.
+    pub fn forget_segment(&self, namespace: &NamespaceId, segment_id: &kosha_core::SegmentId) {
+        self.segment_cache
+            .remove_segment(&namespace.0, &segment_id.0);
+    }
+
     pub fn set_global_wand_threshold(&self, enabled: bool) {
         self.global_wand.store(enabled, Ordering::Relaxed);
     }
@@ -2238,6 +2499,18 @@ impl Searcher {
             draining.remove(&key);
         }
         busy
+    }
+
+    /// Overrides when a filtered kNN query is answered exactly rather than
+    /// by probing (#252): at or below `threshold` filter-passing documents
+    /// namespace-wide, or in a segment where at most `fraction` of the
+    /// documents pass. `threshold == 0` turns the exact path off. The
+    /// defaults come from `KOSHA_KNN_EXACT_THRESHOLD` and
+    /// `KOSHA_KNN_EXACT_FRACTION`.
+    pub fn with_knn_exact_policy(mut self, threshold: usize, fraction: f64) -> Self {
+        self.knn_exact_threshold = threshold;
+        self.knn_exact_fraction = fraction.max(0.0);
+        self
     }
 
     /// Return the cached parsed segment for `(namespace, segment_id,
@@ -2307,7 +2580,7 @@ impl Searcher {
     /// still empty when `/readyz` flips true and the first wave of real
     /// query traffic pays for every [`Searcher::open_segment`] itself —
     /// which, at corpus scale, is exactly what
-    /// [`Searcher::global_probe_cutoff`] does on every kNN query (it opens
+    /// [`Searcher::knn_plan`] does on every kNN query (it opens
     /// every segment to read centroids), turning first-touch cost into a
     /// whole-namespace cold-start convoy.
     ///
@@ -2326,7 +2599,7 @@ impl Searcher {
     /// apply to the newly-warmed set, same as any other idle cache entry.
     /// Per-segment open failures are logged and skipped, not fatal — a
     /// missing/corrupt segment shouldn't block warming the rest, matching
-    /// how `global_probe_cutoff`'s `par_iter().filter_map(...)` already
+    /// how `knn_plan`'s `par_iter().filter_map(...)` already
     /// treats a failed open as "contributes nothing" rather than an error.
     pub fn warm_segments(
         &self,
@@ -2338,9 +2611,8 @@ impl Searcher {
             .segments
             .iter()
             .filter(|entry| {
-                self.data_dir
-                    .join(&namespace.0)
-                    .join(&entry.segment_id.0)
+                manifest
+                    .segment_dir(&self.data_dir, namespace, &entry.segment_id)
                     .exists()
             })
             .collect();
@@ -2358,7 +2630,8 @@ impl Searcher {
                     already_cached += 1;
                     0
                 } else {
-                    let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                    let seg_dir =
+                        manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
                     approx_segment_bytes(&seg_dir, load_vectors)
                 }
             })
@@ -2385,7 +2658,7 @@ impl Searcher {
             // for this call's duration too, protecting it from concurrent
             // eviction by whatever else this same pass opens.
             let was_cached = self.segment_cache.contains(&key);
-            let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+            let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
             match self.open_segment(
                 &namespace.0,
                 &entry.segment_id.0,
@@ -2427,50 +2700,102 @@ impl Searcher {
     /// caller reduces their outputs (candidates flattened, aggregations
     /// merged) — see [`Searcher::search`], which runs this via
     /// `par_iter().map(...)` across the manifest instead of one at a time.
-    /// The distance cutoff that admits about `num_candidates` posting
-    /// probes across the WHOLE query (or the corpus-scaled floor from
-    /// [`effective_knn_budget`], whichever is larger), paired with that
-    /// same effective budget so the caller can apply it as the per-segment
-    /// `max_probes` safety cap too — using the raw client `num_candidates`
-    /// there instead would silently re-shrink a floor-widened cutoff back
-    /// down in any segment where more than the client's own request
-    /// qualifies. `None` to fall back to per-segment `nprobe`.
+    /// Plans a kNN query before any segment is scored: the global probe
+    /// budget, and which segments skip the probe for an exact scan of
+    /// their filter-passing documents (#252).
+    ///
+    /// **Probe budget.** The distance cutoff that admits about
+    /// `num_candidates` posting probes across the WHOLE query (or the
+    /// corpus-scaled floor from [`effective_knn_budget`], whichever is
+    /// larger), paired with that same effective budget so the caller can
+    /// apply it as the per-segment `max_probes` safety cap too — using the
+    /// raw client `num_candidates` there instead would silently re-shrink a
+    /// floor-widened cutoff back down in any segment where more than the
+    /// client's own request qualifies. `None` to fall back to per-segment
+    /// `nprobe`. With a filter, the budget is widened by the inverse of its
+    /// selectivity over the segments that will be probed (see
+    /// [`filtered_knn_budget`]): a posting where one vector in twenty
+    /// passes yields a twentieth of the candidates an unfiltered one does.
     ///
     /// Cheap by construction: it only reads posting centroids, which are
     /// already resident in every open segment's `LazyVectorIndex` (loaded
     /// from the small `vector.offsets` sidecar), so this pass does no
     /// posting I/O at all — the expensive part of a kNN query is
     /// `hydrate_posting`, and that is precisely what the cutoff then
-    /// prevents.
+    /// prevents. The filter sets it counts are the ones scoring would
+    /// build anyway, and stay cached on the segment for it.
     ///
-    /// Returns `None` when no segment can report centroids (legacy flat
-    /// vector segments), so those namespaces keep their existing behavior
-    /// rather than silently searching nothing.
-    fn global_probe_cutoff(
+    /// The cutoff is `None` when no segment can report centroids (legacy
+    /// flat vector segments), so those namespaces keep their existing
+    /// behavior rather than silently searching nothing.
+    ///
+    /// **Exact segments.** Only for a query with a filter (top-level or
+    /// `knn.filter`): when at most `knn_exact_threshold` documents pass
+    /// across the namespace, every segment is searched exactly; otherwise a
+    /// segment where at most `knn_exact_fraction` of its documents pass
+    /// (and no more than the threshold) is. A segment where nothing passes
+    /// is planned exact too, which costs nothing, where a probe would walk
+    /// every posting looking for `k` that pass. Unfiltered kNN is never
+    /// planned exact, so its behavior and latency are unchanged.
+    ///
+    /// The same walk checks the query against `knn.field` (#204) and fails
+    /// with [`KoshaError::InvalidQuery`] — a client error, never an empty
+    /// or mixed page — when no segment indexes the field and no legacy
+    /// segment (written before vector columns, see
+    /// [`VectorFieldStatus::Legacy`]) could answer it either, or when
+    /// `knn.vector`'s dimension differs from the field's. Judged on the
+    /// segments present locally; with none present there is nothing to
+    /// judge by and the query proceeds.
+    #[allow(clippy::too_many_arguments)]
+    fn knn_plan(
         &self,
         namespace: &NamespaceId,
         manifest: &Manifest,
         query: &SearchQuery,
         knn: &kosha_core::KnnQuery,
+        filter_keys: &FilterKeys,
+        tombstones: Option<
+            &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
+        >,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
-    ) -> Option<(f32, usize)> {
+    ) -> Result<KnnPlan, KoshaError> {
+        let budgeted = knn_global_budget_enabled();
         let requested = knn.num_candidates.max(1);
         let prunable = query.has_prunable_filter();
-        // Distances from every segment's centroids, gathered in parallel —
-        // zero posting I/O, centroids are already resident from open. Kept
-        // untruncated per-segment (unlike the pre-corpus-scaling version):
-        // the effective budget below needs the corpus's real total
-        // centroid count, not just enough of it to satisfy the client's
-        // own request, and this pass was already O(that segment's centroid
-        // count) just to compute the distances in the first place — a
-        // segment that fails to open or has no lazy index contributes
-        // nothing, and simply takes the per-segment fallback path later.
-        let all: Vec<f32> = manifest
+        let filter_clauses = (
+            query.filter.as_ref().zip(filter_keys.query.as_deref()),
+            knn.filter.as_ref().zip(filter_keys.knn.as_deref()),
+        );
+        let restricted = filter_clauses.0.is_some() || filter_clauses.1.is_some();
+
+        struct SegmentInfo<'m> {
+            segment_id: &'m kosha_core::SegmentId,
+            status: VectorFieldStatus,
+            /// Lower-bound distances to `knn.field`'s centroids (global
+            /// budgeting only).
+            distances: Option<Vec<f32>>,
+            /// The column is a lazy posting index the query vector fits.
+            probeable: bool,
+            /// `(passing documents, doc_count)`, for a filtered query.
+            passing: Option<(usize, u32)>,
+        }
+
+        // Distances from every segment's centroids for `knn.field`,
+        // gathered in parallel — zero posting I/O, centroids are resident
+        // once the column is loaded. Kept untruncated per-segment (unlike
+        // the pre-corpus-scaling version): the effective budget below needs
+        // the corpus's real total centroid count, not just enough of it to
+        // satisfy the client's own request, and this pass was already
+        // O(that segment's centroid count) just to compute the distances in
+        // the first place — a segment that fails to open or has no lazy
+        // index contributes nothing, and simply takes the per-segment
+        // fallback path later.
+        let per_segment: Vec<SegmentInfo<'_>> = manifest
             .segments
             .par_iter()
             .filter_map(|entry| {
-                let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
                 if !seg_dir.exists() {
                     return None;
                 }
@@ -2479,13 +2804,25 @@ impl Searcher {
                 // a namespace shared by many matters they otherwise soaked
                 // up most of `num_candidates`, leaving the matter actually
                 // being searched with a fraction of the probes asked for.
+                // Its footer still says whether it indexes `knn.field`
+                // (a legacy footer cannot, so that segment is opened).
                 if prunable {
                     let footer = manifest.footer_or_read(&entry.segment_id, || {
                         SegmentReader::read_footer(&seg_dir).ok()
                     });
                     if let Some(footer) = footer.as_deref() {
                         if !query.segment_may_match_filters(footer.filter_blooms.as_ref()) {
-                            return None;
+                            if let Some(status) =
+                                kosha_segment::footer_vector_field_status(footer, &knn.field)
+                            {
+                                return Some(SegmentInfo {
+                                    segment_id: &entry.segment_id,
+                                    status,
+                                    distances: None,
+                                    probeable: false,
+                                    passing: Some((0, footer.doc_count)),
+                                });
+                            }
                         }
                     }
                 }
@@ -2500,27 +2837,166 @@ impl Searcher {
                         Some(open_stats),
                     )
                     .ok()?;
-                reader.knn_centroid_distances(&knn.vector)
+                let status = reader.vector_field_status(&knn.field);
+                // Only a column the query vector fits takes a share of the
+                // budget (a mismatch is rejected or skipped below).
+                let fits = match status {
+                    VectorFieldStatus::Indexed { dim } => dim == knn.vector.len(),
+                    VectorFieldStatus::Legacy { dim } => dim == Some(knn.vector.len()),
+                    VectorFieldStatus::Absent => false,
+                };
+                let probeable = fits
+                    && reader
+                        .vector_field(&knn.field)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|index| index.has_lazy_index());
+                let distances = if budgeted && probeable {
+                    reader.knn_centroid_distances(&knn.field, &knn.vector)
+                } else {
+                    None
+                };
+                let passing = if restricted {
+                    let doc_count = reader.doc_count();
+                    let filter = filter_clauses
+                        .0
+                        .map(|(clause, key)| reader.filter_set(key, clause))
+                        .transpose();
+                    let knn_filter = filter_clauses
+                        .1
+                        .map(|(clause, key)| reader.filter_set(key, clause))
+                        .transpose();
+                    match (filter, knn_filter) {
+                        (Ok(filter), Ok(knn_filter)) => {
+                            let deleted = tombstones
+                                .and_then(|t| t.get(&entry.segment_id))
+                                .filter(|seqs| !seqs.is_empty());
+                            let passing = knn_passing_count(
+                                filter.as_deref(),
+                                knn_filter.as_deref(),
+                                deleted,
+                                doc_count,
+                            );
+                            Some((passing, doc_count))
+                        }
+                        // An unreadable filter fails this segment's scoring
+                        // pass with the same error; plan it as probed.
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                Some(SegmentInfo {
+                    segment_id: &entry.segment_id,
+                    status,
+                    distances,
+                    probeable,
+                    passing,
+                })
             })
+            .collect();
+
+        check_knn_field(namespace, knn, per_segment.iter().map(|info| &info.status))?;
+
+        // ── exact or probed, per segment ──
+        let threshold = self.knn_exact_threshold;
+        let exact_enabled = restricted && threshold > 0;
+        let filtered_candidates: Option<u64> = restricted.then(|| {
+            per_segment
+                .iter()
+                .filter_map(|info| info.passing)
+                .map(|(passing, _)| passing as u64)
+                .sum()
+        });
+        let namespace_exact = exact_enabled && filtered_candidates.unwrap_or(0) <= threshold as u64;
+        let mut exact_segments = HashSet::new();
+        let (mut exact_count, mut ann_count) = (0usize, 0usize);
+        for info in per_segment.iter().filter(|info| info.probeable) {
+            let Some((passing, doc_count)) = info.passing else {
+                ann_count += 1;
+                continue;
+            };
+            let exact = exact_enabled
+                && (passing == 0
+                    || namespace_exact
+                    || (passing <= threshold
+                        && passing as f64 <= self.knn_exact_fraction * doc_count as f64));
+            if exact {
+                exact_segments.insert(info.segment_id.clone());
+            }
+            // A segment nothing passes in returns nothing either way.
+            if passing > 0 {
+                if exact {
+                    exact_count += 1;
+                } else {
+                    ann_count += 1;
+                }
+            }
+        }
+        let mode = match (exact_count, ann_count) {
+            (0, 0) if namespace_exact => KnnMode::Exact,
+            (0, _) => KnnMode::Ann,
+            (_, 0) => KnnMode::Exact,
+            _ => KnnMode::Mixed,
+        };
+        let mut plan = KnnPlan {
+            cutoff: None,
+            exact_segments,
+            mode: Some(mode),
+            filtered_candidates,
+        };
+
+        if !budgeted {
+            return Ok(plan);
+        }
+        // Only the segments that will be probed share the budget: an exact
+        // segment never reads a posting, and one where nothing passes is
+        // planned exact.
+        let probed: Vec<&SegmentInfo<'_>> = per_segment
+            .iter()
+            .filter(|info| info.distances.is_some())
+            .filter(|info| !plan.exact_segments.contains(info.segment_id))
+            .collect();
+        let selectivity = restricted.then(|| {
+            let (passing, docs) = probed
+                .iter()
+                .filter_map(|info| info.passing)
+                .fold((0u64, 0u64), |(p, d), (passing, docs)| {
+                    (p + passing as u64, d + docs as u64)
+                });
+            if docs == 0 {
+                1.0
+            } else {
+                passing as f64 / docs as f64
+            }
+        });
+        let mut all: Vec<f32> = probed
+            .iter()
+            .filter_map(|info| info.distances.as_deref())
             .flatten()
+            .copied()
             .collect();
 
         if all.is_empty() {
-            return None; // no v2 vector segments — keep legacy behavior
+            return Ok(plan); // no v2 vector segments to probe — keep legacy behavior
         }
         let total_centroids = all.len();
-        let budget = effective_knn_budget(requested, total_centroids);
-        let mut all = all;
+        let budget = filtered_knn_budget(
+            effective_knn_budget(requested, total_centroids),
+            selectivity,
+        );
         if all.len() <= budget {
             // The whole namespace has fewer centroids than the budget:
             // nothing to prune, admit everything.
-            return Some((f32::INFINITY, budget));
+            plan.cutoff = Some((f32::INFINITY, budget));
+            return Ok(plan);
         }
         let idx = budget - 1;
         all.select_nth_unstable_by(idx, |a, b| {
             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
         });
-        Some((all[idx], budget))
+        plan.cutoff = Some((all[idx], budget));
+        Ok(plan)
     }
 
     /// Namespace-level BM25 statistics for `terms` at this manifest (issue
@@ -2551,8 +3027,9 @@ impl Searcher {
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
     ) -> Option<Arc<CorpusStats>> {
-        let seg_dir =
-            |entry: &ManifestEntry| self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+        let seg_dir = |entry: &ManifestEntry| {
+            manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id)
+        };
         let key = (
             namespace.0.clone(),
             manifest.version,
@@ -2817,8 +3294,9 @@ impl Searcher {
         open_stats: &OpenStatsCollector,
         corpus: Option<&Arc<CorpusStats>>,
     ) -> Vec<f64> {
-        let seg_dir =
-            |entry: &ManifestEntry| self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+        let seg_dir = |entry: &ManifestEntry| {
+            manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id)
+        };
         let key = (
             namespace.0.clone(),
             manifest.version,
@@ -3034,11 +3512,14 @@ impl Searcher {
         tombstones: Option<
             &std::collections::HashMap<kosha_core::SegmentId, std::collections::HashSet<u32>>,
         >,
-        manifest_footer: Option<&kosha_core::Footer>,
+        // The manifest listing the segment: where its files live (a
+        // branch's inherited segment is in its parent's prefix, #208) and
+        // its cached footer.
+        manifest: &Manifest,
         permit: &AdmissionPermit,
         open_stats: &OpenStatsCollector,
         // `Some((cutoff, effective_budget))` = a global probe budget was
-        // computed for this kNN query (see `global_probe_cutoff`): probe
+        // computed for this kNN query (see `knn_plan`): probe
         // only centroids within `cutoff`, capped at `effective_budget` per
         // segment — NOT this segment's raw `knn.num_candidates`, which
         // `effective_budget` may already have widened past (see
@@ -3046,6 +3527,9 @@ impl Searcher {
         // flat segments, or budgeting disabled) — fall back to per-segment
         // `nprobe`.
         knn_cutoff: Option<(f32, usize)>,
+        // The plan put this segment on the exact path (#252): score every
+        // filter-passing document's vector instead of probing.
+        knn_exact: bool,
         // Canonical JSON of `query.filter` and `query.knn.filter`, computed
         // once per request: the key into each segment's filter-set cache.
         filter_keys: &FilterKeys,
@@ -3059,7 +3543,8 @@ impl Searcher {
         // ceiling (issue #248); `None` prunes against the local floor only.
         shared_wand: Option<SharedWand<'_>>,
     ) -> Result<Option<SegmentOutput>, KoshaError> {
-        let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+        let manifest_footer = manifest.segment_footer(&entry.segment_id);
+        let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
         if !seg_dir.exists() {
             return Ok(None);
         }
@@ -4440,102 +4925,184 @@ impl Searcher {
             // query. Falling back to per-segment `nprobe` (no cutoff) is
             // correct but pays `num_candidates` in EVERY segment, so total
             // probe depth scales with segment count.
-            let probe = if nothing_passes {
-                Some(Ok(Vec::new()))
-            } else {
-                match knn_cutoff {
-                    Some((cutoff, effective_budget)) => reader
-                        .knn_search_within_filtered_fetching(
-                            &knn.vector,
-                            fetch_k,
-                            cutoff,
-                            effective_budget,
-                            knn_accept_dyn,
-                            vector_fetch,
-                        )
-                        .map(|r| {
-                            r.map(|(results, probes)| {
-                                open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
-                                results
-                            })
-                        }),
-                    None => reader
-                        .knn_search_filtered_fetching(
-                            &knn.vector,
-                            fetch_k,
-                            knn.num_candidates,
-                            knn_accept_dyn,
-                            vector_fetch,
-                        )
-                        .map(|r| {
-                            r.inspect(|_| {
-                                // Per-segment fallback probes up to
-                                // `num_candidates` in THIS segment; record the
-                                // ceiling so the metric still reflects the
-                                // fan-out being paid.
-                                open_stats
-                                    .knn_postings
-                                    .fetch_add(knn.num_candidates, Ordering::Relaxed);
-                            })
-                        }),
+            //
+            // Only `knn.field`'s own index is searched (#204): another
+            // vector column of the same documents is never a candidate.
+            //
+            // Late interaction (#205) is ColBERT-style MaxSim over the
+            // field's token bags. A segment without bags for the field has
+            // no hits (never the single-vector paths below); a query of the
+            // wrong dimension is the client's error, not a degraded segment.
+            let late_interaction = knn.is_late_interaction();
+            let mut late_results: Option<Vec<(u32, f64)>> = None;
+            if late_interaction && !nothing_passes {
+                match reader.late_interaction_search(
+                    &knn.field,
+                    &knn.query_tokens(),
+                    fetch_k,
+                    late_interaction_params(knn),
+                    knn_accept_dyn,
+                ) {
+                    Ok(found) => {
+                        open_stats
+                            .knn_postings
+                            .fetch_add(found.postings_probed, Ordering::Relaxed);
+                        late_results = Some(found.hits);
+                    }
+                    Err(e @ KoshaError::InvalidQuery(_)) => return Err(e),
+                    Err(e) => {
+                        eprintln!(
+                            "WARN: late-interaction search failed in {}: {e} — treating as no vector hits for this segment",
+                            reader.segment_dir().display()
+                        );
+                        knn_segment_degraded = true;
+                        late_results = Some(Vec::new());
+                    }
                 }
+            }
+            let field_index = if nothing_passes || late_interaction {
+                Ok(None)
+            } else {
+                reader.vector_field(&knn.field)
             };
-            let knn_results: Vec<(u32, f64)> = match probe {
-                Some(Ok(results)) => results,
-                Some(Err(e)) => {
+            let knn_results: Vec<(u32, f64)> = match field_index {
+                Err(e) => {
                     eprintln!(
-                        "WARN: knn_search failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
+                        "WARN: vector field '{}' of {} could not be loaded: {e} — treating as no vector hits for this segment",
+                        knn.field,
                         reader.segment_dir().display()
                     );
-                    // Client-visible counterpart to the log line above — see
-                    // `SearchResult::knn_degraded_segments`. This segment's
-                    // true nearest neighbors are silently missing from the
-                    // page below; a caller checking only HTTP status has no
-                    // other way to know.
                     knn_segment_degraded = true;
                     Vec::new()
                 }
-                None if !reader.vector_store.vectors.is_empty() => {
-                    // Legacy segments (pre-v2 vector index). The HNSW walk
-                    // cannot be filtered from inside, so it over-fetches and
-                    // filters afterwards; the flat scan sees every vector
-                    // and filters exactly.
-                    if let Some(ref hnsw) = reader.hnsw_map {
-                        let take = if knn_restricted {
-                            fetch_k.saturating_mul(knn_overfetch_factor())
-                        } else {
-                            fetch_k
-                        };
-                        let query_point = kosha_segment::CosinePoint(knn.vector.clone());
-                        let mut search = instant_distance::Search::default();
-                        hnsw.search(&query_point, &mut search)
-                            .take(take)
-                            .map(|item| (*item.value, (1.0 - item.distance as f64).max(0.0)))
-                            .filter(|(doc_seq, _)| knn_accept(*doc_seq))
-                            .take(fetch_k)
-                            .collect()
-                    } else if knn_restricted {
-                        let allowed: Vec<(u32, Vec<f32>)> = reader
-                            .vector_store
-                            .vectors
+                // No vectors for this field in this segment.
+                Ok(None) => Vec::new(),
+                // A legacy segment's unnamed index holding another field's
+                // vectors (the namespace-wide check in `search_inner`
+                // already rejected a mismatch on an indexed column).
+                Ok(Some(index)) if index.dim().is_some_and(|dim| dim != knn.vector.len()) => {
+                    Vec::new()
+                }
+                Ok(Some(index)) if index.has_lazy_index() && knn_exact => {
+                    // Every document the filters and tombstones let
+                    // through, scored exactly (#252). Planned only for a
+                    // filtered query, so one of the sets exists.
+                    let base = knn_filter_set.as_deref().or(filter_set.as_deref());
+                    let candidates: Vec<u32> = match base {
+                        Some(set) => set.iter().filter(|&doc_seq| knn_accept(doc_seq)).collect(),
+                        None => (0..reader.doc_count())
+                            .filter(|&doc_seq| knn_accept(doc_seq))
+                            .collect(),
+                    };
+                    match reader.knn_exact_filtered_fetching(
+                        &knn.field,
+                        &knn.vector,
+                        fetch_k,
+                        &candidates,
+                        vector_fetch,
+                    ) {
+                        Some(Ok(exact)) => {
+                            open_stats
+                                .knn_postings
+                                .fetch_add(exact.postings_hydrated, Ordering::Relaxed);
+                            open_stats
+                                .knn_exact_vectors
+                                .fetch_add(exact.vectors_scored, Ordering::Relaxed);
+                            exact.hits
+                        }
+                        Some(Err(e)) => {
+                            eprintln!(
+                                "WARN: exact knn failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
+                                reader.segment_dir().display()
+                            );
+                            knn_segment_degraded = true;
+                            Vec::new()
+                        }
+                        None => Vec::new(),
+                    }
+                }
+                Ok(Some(index)) if index.has_lazy_index() => {
+                    let probe = match knn_cutoff {
+                        Some((cutoff, effective_budget)) => reader
+                            .knn_search_within_filtered_fetching(
+                                &knn.field,
+                                &knn.vector,
+                                fetch_k,
+                                cutoff,
+                                effective_budget,
+                                knn_accept_dyn,
+                                vector_fetch,
+                            )
+                            .map(|r| {
+                                r.map(|(results, probes)| {
+                                    open_stats.knn_postings.fetch_add(probes, Ordering::Relaxed);
+                                    results
+                                })
+                            }),
+                        None => reader
+                            .knn_search_filtered_fetching(
+                                &knn.field,
+                                &knn.vector,
+                                fetch_k,
+                                knn.num_candidates,
+                                knn_accept_dyn,
+                                vector_fetch,
+                            )
+                            .map(|r| {
+                                r.inspect(|_| {
+                                    // Per-segment fallback probes up to
+                                    // `num_candidates` in THIS segment;
+                                    // record the ceiling so the metric still
+                                    // reflects the fan-out being paid.
+                                    open_stats
+                                        .knn_postings
+                                        .fetch_add(knn.num_candidates, Ordering::Relaxed);
+                                })
+                            }),
+                    };
+                    match probe {
+                        Some(Ok(results)) => results,
+                        Some(Err(e)) => {
+                            eprintln!(
+                                "WARN: knn_search failed for a v2 vector index in {}: {e} — treating as no vector hits for this segment",
+                                reader.segment_dir().display()
+                            );
+                            // Client-visible counterpart to the log line
+                            // above — see
+                            // `SearchResult::knn_degraded_segments`. This
+                            // segment's true nearest neighbors are silently
+                            // missing from the page below; a caller checking
+                            // only HTTP status has no other way to know.
+                            knn_segment_degraded = true;
+                            Vec::new()
+                        }
+                        None => Vec::new(),
+                    }
+                }
+                Ok(Some(index)) if !index.flat().vectors.is_empty() => {
+                    // Legacy flat segments (pre-v2 vector index) or a
+                    // missing sidecar: the flat scan sees every vector and
+                    // filters exactly.
+                    let vectors = &index.flat().vectors;
+                    if knn_restricted {
+                        let allowed: Vec<(u32, Vec<f32>)> = vectors
                             .iter()
                             .filter(|(doc_seq, _)| knn_accept(*doc_seq))
                             .cloned()
                             .collect();
                         flat_knn(&knn.vector, &allowed, fetch_k)
                     } else {
-                        flat_knn(&knn.vector, &reader.vector_store.vectors, fetch_k)
+                        flat_knn(&knn.vector, vectors, fetch_k)
                     }
                 }
-                None => {
-                    // `vector_index` and `vector_store` are both empty
-                    // here (that's why we're in this arm at all), but that
-                    // shape is shared by two different segment states: a
-                    // segment with no vector field at all (legitimate, no
-                    // flag), and one whose vector.idx has a valid header
-                    // but a corrupt/truncated body (its true neighbors are
-                    // silently missing — must be counted).
-                    if reader.vector_index_degraded() {
+                Ok(Some(index)) => {
+                    // No lazy index and no flat vectors. That shape is
+                    // shared by two different states: a column with no
+                    // vectors (legitimate, no flag), and one whose
+                    // vector.idx has a valid header but a corrupt/truncated
+                    // body (its true neighbors are silently missing — must
+                    // be counted).
+                    if index.degraded() {
                         eprintln!(
                             "WARN: segment {} has a corrupt vector.idx body — treating as no vector hits for this segment",
                             reader.segment_dir().display()
@@ -4545,7 +5112,8 @@ impl Searcher {
                     Vec::new()
                 }
             };
-            let knn_results = knn_results
+            let knn_results = late_results
+                .unwrap_or(knn_results)
                 .into_iter()
                 // Filters and tombstones were applied inside the probe.
                 .filter(|(doc_seq, _)| reader.doc_meta(*doc_seq).is_some())
@@ -4967,6 +5535,9 @@ impl Searcher {
                     knn_degraded_segments: None,
                     rerank_degraded: None,
                     rerank_degraded_reason: None,
+                    knn_mode: None,
+                    knn_filtered_candidates: None,
+                    exhaustive_search_count: 0,
                 },
                 phase_stats,
             ));
@@ -4993,7 +5564,7 @@ impl Searcher {
             .segments
             .iter()
             .map(|entry| {
-                let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                let seg_dir = manifest.segment_dir(&self.data_dir, namespace, &entry.segment_id);
                 let key = (
                     namespace.0.clone(),
                     entry.segment_id.0.clone(),
@@ -5076,12 +5647,30 @@ impl Searcher {
         // pass over already-resident centroids to find the distance cutoff
         // that admits ~`num_candidates` postings ACROSS the whole query,
         // then let each segment probe only inside it.
-        let knn_cutoff = match query.knn {
-            Some(ref knn) if knn_global_budget_enabled() => {
-                self.global_probe_cutoff(namespace, manifest, query, knn, &permit, &open_stats)
-            }
-            _ => None,
+        //
+        // The same pass rejects a `knn.field` nothing can answer, or a
+        // vector of the wrong dimension for it (#204).
+        //
+        // The same pass decides, once for the whole query, which segments
+        // answer a filtered kNN exactly instead (#252).
+        //
+        // Late interaction (#205) probes its own per-field token index;
+        // none of this applies to it.
+        let knn_plan = match query.knn {
+            Some(ref knn) if !knn.is_late_interaction() => self.knn_plan(
+                namespace,
+                manifest,
+                query,
+                knn,
+                &filter_keys,
+                tombstones,
+                &permit,
+                &open_stats,
+            )?,
+            _ => KnnPlan::default(),
         };
+        phase_stats.knn_mode = knn_plan.mode;
+        phase_stats.knn_filtered_candidates = knn_plan.filtered_candidates;
 
         // ── BM25 collection statistics (issue #246) ────────────────────
         // Namespace-level by default, so every segment scores with the same
@@ -5127,10 +5716,11 @@ impl Searcher {
                 term_prune,
                 &sort_value_fields,
                 tombstones,
-                manifest.segment_footer(&entry.segment_id),
+                manifest,
                 &permit,
                 &open_stats,
-                knn_cutoff,
+                knn_plan.cutoff,
+                knn_plan.exact_segments.contains(&entry.segment_id),
                 &filter_keys,
                 vector_fetch,
                 corpus.as_ref(),
@@ -5216,6 +5806,7 @@ impl Searcher {
             as f64
             / 1e6;
         phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
+        phase_stats.knn_exact_vectors = open_stats.knn_exact_vectors.load(Ordering::Relaxed);
         let t_materialize = Instant::now();
 
         let mut candidates: Vec<HitCandidate> = Vec::new();
@@ -5480,6 +6071,9 @@ impl Searcher {
                 knn_degraded_segments: query.knn.as_ref().map(|_| knn_degraded_segments),
                 rerank_degraded: None,
                 rerank_degraded_reason: None,
+                knn_mode: phase_stats.knn_mode.map(|mode| mode.as_str().to_string()),
+                knn_filtered_candidates: phase_stats.knn_filtered_candidates,
+                exhaustive_search_count: 0,
             },
             phase_stats,
         ))
@@ -8333,8 +8927,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         for (segment, docs) in [
             (
@@ -8541,8 +9137,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8677,8 +9275,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8770,8 +9370,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -8980,8 +9582,10 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
                 schema: None,
                 retired: Default::default(),
+                shards: None,
             },
             all,
         )
@@ -9013,6 +9617,8 @@ mod tests {
             k: 10,
             num_candidates: 8,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
 
         let (r, stats) = searcher
@@ -9057,6 +9663,8 @@ mod tests {
             k: 5,
             num_candidates: 32,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.results.len(), 5);
@@ -9248,8 +9856,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
 
         // Reproduce the production regime exactly, independent of how this
@@ -9324,6 +9934,8 @@ mod tests {
             k: 10,
             num_candidates: 40,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
 
         // A kNN query now walks the segments TWICE: once in the zero-I/O
@@ -9416,8 +10028,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let result = searcher.search(
             &NamespaceId("test".into()),
@@ -9473,8 +10087,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -9547,8 +10163,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -9559,6 +10177,8 @@ mod tests {
             k: 10,
             num_candidates: N,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let bm25_q = mk_query("alpha", 10);
 
@@ -9636,8 +10256,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let result = searcher
             .search(
@@ -9722,8 +10344,10 @@ mod tests {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
                 schema: None,
                 retired: Default::default(),
+                shards: None,
             },
         )
     }
@@ -9866,6 +10490,8 @@ mod tests {
             k: 3,
             num_candidates: 100,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &query, None).unwrap();
         assert_eq!(r.results.len(), 3);
@@ -10120,8 +10746,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut query = mk_query("", 10);
@@ -10202,8 +10830,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -10292,8 +10922,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
 
         // Generous entry-count cap (10) but a byte budget that fits s1 alone,
@@ -10356,6 +10988,8 @@ mod tests {
             k: 1,
             num_candidates: 10,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let (result, stats) = searcher
             .search_with_stats(&ns, &manifest, &q, None)
@@ -10369,7 +11003,7 @@ mod tests {
         assert_eq!(
             stats.open_cached, 2,
             "a kNN query opens each segment twice — once in \
-             global_probe_cutoff for centroid distances, once in the actual \
+             knn_plan for centroid distances, once in the actual \
              per-segment scoring pass — and both must be served from the \
              cache warm_segments filled, not a fresh open"
         );
@@ -10413,8 +11047,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -10486,8 +11122,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 10);
@@ -10497,6 +11135,8 @@ mod tests {
             k: 1,
             num_candidates: 10,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.total_hits, 1);
@@ -10542,8 +11182,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -10555,6 +11197,8 @@ mod tests {
             k: 5,
             num_candidates: 40, // probe ~everything, this test is about recall not nprobe tuning
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(r.results.len(), 5);
@@ -10598,7 +11242,7 @@ mod tests {
         // "tpuf-comparable" default every existing recall test runs well
         // above (knn_global_budget_preserves_top_hit_against_brute_force
         // uses 8 segments at num_candidates=32, a 4x-over-segment-count
-        // ratio; the real run's ratio was ~0.5x). `global_probe_cutoff`
+        // ratio; the real run's ratio was ~0.5x). `knn_plan`
         // provably preserves the true global top-`num_candidates`
         // *centroids* (per-segment truncation can't drop a true top-K
         // member — proved by construction, not just tested here) — so the
@@ -10715,8 +11359,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mk_knn_q = |num_candidates: usize| {
@@ -10727,6 +11373,8 @@ mod tests {
                 k: 1,
                 num_candidates,
                 filter: None,
+                vectors: None,
+                scoring: None,
             });
             q
         };
@@ -10754,7 +11402,7 @@ mod tests {
             thin.results
         );
 
-        // Generous budget (>= total segment count): global_probe_cutoff's
+        // Generous budget (>= total segment count): knn_plan's
         // own short-circuit admits every segment, the target's centroid
         // now qualifies, and the buried true neighbour — by far the
         // single closest individual document in the corpus — is found.
@@ -10769,6 +11417,121 @@ mod tests {
             generous.results
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn namespace_mixing_f32_and_i8_segments_ranks_like_f32_brute_force() {
+        // #210: an i8-quantized segment written next to f32 segments (a
+        // namespace mid-migration) must rank as if every vector were f32:
+        // the i8 segment rescores its shortlist from `doc_vectors.bin`, so
+        // scores from both formats are the same exact cosine and merge
+        // into one correct order.
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-knn-mixed-quantization-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("test".into());
+        const DIM: usize = 32;
+        let vector = |seed: u64| -> Vec<f32> {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            (0..DIM)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+                })
+                .collect()
+        };
+        let cosine = |a: &[f32], b: &[f32]| -> f64 {
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            dot / (na * nb)
+        };
+
+        let mut entries = Vec::new();
+        let mut corpus: Vec<(String, Vec<f32>)> = Vec::new();
+        for (seg_idx, quantization) in [
+            kosha_core::VectorQuantization::F32,
+            kosha_core::VectorQuantization::I8,
+            kosha_core::VectorQuantization::F32,
+            kosha_core::VectorQuantization::I8,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seg = format!("seg{seg_idx}-{}", quantization.as_str());
+            let mut w = SegmentWriter::new(SegmentId(seg.clone()), dir.join(&ns.0).join(&seg))
+                .with_vector_quantization(kosha_segment::VectorQuantizationConfig::all(
+                    quantization,
+                ));
+            for i in 0..300u64 {
+                let id = format!("{seg}-{i}");
+                let v = vector(seg_idx as u64 * 1000 + i);
+                corpus.push((id.clone(), v.clone()));
+                w.add_document(DocumentId(id), vec![Field::vector("emb", v)]);
+            }
+            let footer = w.finalize(Bm25Params::default()).unwrap();
+            assert_eq!(
+                footer.vector_fields.as_ref().unwrap()[0].quantization,
+                quantization
+            );
+            entries.push(ManifestEntry {
+                segment_id: SegmentId(seg),
+                doc_count: 300,
+            });
+        }
+        let manifest = Manifest {
+            version: 1,
+            segments: entries,
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+            branch: None,
+        };
+        let searcher = Searcher::new(dir.clone());
+        let (mut hits_from_i8, mut total_recall) = (0usize, 0.0f64);
+        let queries = 10u64;
+        for q_seed in 0..queries {
+            let query = vector(900_000 + q_seed);
+            let mut q = mk_query("", 10);
+            q.knn = Some(kosha_core::KnnQuery {
+                field: "emb".into(),
+                vector: query.clone(),
+                k: 10,
+                // Every posting of every segment: only quantization, not
+                // the probe budget, could cost recall here.
+                num_candidates: 10_000,
+                filter: None,
+                scoring: None,
+                vectors: None,
+            });
+            let r = searcher.search(&ns, &manifest, &q, None).unwrap();
+            let got: Vec<String> = r.results.iter().map(|h| h.doc_id.0.clone()).collect();
+            let mut exact: Vec<(String, f64)> = corpus
+                .iter()
+                .map(|(id, v)| (id.clone(), cosine(&query, v)))
+                .collect();
+            exact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let want: Vec<String> = exact.into_iter().take(10).map(|(id, _)| id).collect();
+            assert_eq!(got.len(), 10);
+            hits_from_i8 += got.iter().filter(|id| id.contains("-i8-")).count();
+            total_recall += got.iter().filter(|id| want.contains(id)).count() as f64 / 10.0;
+            // Scores are ordered and both formats speak the same units.
+            assert!(r.results.windows(2).all(|w| w[0].score >= w[1].score));
+        }
+        assert!(hits_from_i8 > 0, "i8 segments contribute hits");
+        let recall = total_recall / queries as f64;
+        assert!(recall >= 0.99, "mixed-format recall@10 {recall}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10844,8 +11607,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 1);
@@ -10855,6 +11620,8 @@ mod tests {
             k: 1,
             num_candidates: 15, // thin: well under the 51-segment corpus
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -10917,8 +11684,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -10928,6 +11697,8 @@ mod tests {
             k: 5,
             num_candidates: 10,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         let r = searcher.search(&ns, &manifest, &q, None).unwrap();
         assert_eq!(
@@ -10985,8 +11756,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut q = mk_query("", 5);
@@ -10996,6 +11769,8 @@ mod tests {
             k: 5,
             num_candidates: 10,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
 
         // First call: vector.idx is present, opens and hydrates normally,
@@ -11058,8 +11833,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         (dir, manifest)
     }
@@ -11072,6 +11849,8 @@ mod tests {
             k,
             num_candidates: 40,
             filter,
+            vectors: None,
+            scoring: None,
         });
         q
     }
@@ -11179,8 +11958,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         // Fresh searcher (no warm in-memory segment cache) so opening the
         // segment for these searches goes through the real `try_read_doc_index`
@@ -11261,8 +12042,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         // Fresh searcher so each segment is actually opened (Lazy), not
         // served from a warm cache populated by an earlier call here.
@@ -11390,6 +12173,8 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
+            branch: None,
         };
         let searcher = Searcher::new(dir.clone());
         let calls: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -11473,8 +12258,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -11526,8 +12313,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = mk_query("hello", 10);
@@ -11587,8 +12376,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -11687,8 +12478,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -11734,8 +12527,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -11796,8 +12591,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -11851,8 +12648,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -12042,8 +12841,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -12176,8 +12977,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let run = |b: f64| {
@@ -12349,8 +13152,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let scores = |q: SearchQuery| -> Vec<(String, f64)> {
@@ -12511,8 +13316,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
 
         // Baseline (uncorrupted): "alpha beta" intersects, "beta" matches.
@@ -12608,8 +13415,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         // Open + warm the segment so the reader is cached, THEN evict
@@ -12664,8 +13473,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -12806,8 +13617,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -12872,8 +13685,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -13057,8 +13872,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let r = searcher
@@ -13109,8 +13926,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -13223,8 +14042,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut custodian_sort = HashMap::new();
@@ -13311,8 +14132,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let mut id_sort = std::collections::HashMap::new();
@@ -13449,8 +14272,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -13522,8 +14347,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let filter = Some(kosha_core::FilterClause::Term {
@@ -13578,8 +14405,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
 
@@ -13657,8 +14486,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -13757,8 +14588,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -13844,8 +14677,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let searcher = Searcher::new(dir.clone());
         let q = SearchQuery {
@@ -13930,6 +14765,8 @@ mod columnar_filter_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
+            branch: None,
         }
     }
 
@@ -14119,6 +14956,8 @@ mod columnar_eval_differential_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
+            branch: None,
         }
     }
 
@@ -14454,8 +15293,10 @@ mod corpus_stats_tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -15561,8 +16402,10 @@ mod rrf_tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let mut locations = HashMap::new();
         for (g, docs) in groups.iter().enumerate() {
@@ -15605,6 +16448,8 @@ mod rrf_tests {
             // compare fusion, not ANN recall.
             num_candidates: 100_000,
             filter: None,
+            vectors: None,
+            scoring: None,
         });
         q.rank = rank.map(|rrf| RankSpec { rrf: Some(rrf) });
         q
@@ -16161,8 +17006,10 @@ mod rrf_tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         for (g, docs) in groups.iter().enumerate() {
             let id = SegmentId(format!("seg-{g:03}"));
@@ -16229,6 +17076,8 @@ mod rrf_tests {
             k,
             num_candidates: 100,
             filter: None,
+            vectors: None,
+            scoring: None,
         };
         println!(
             "{} docs in {SEGMENTS} segments, {QUERIES} queries, 10 relevant each",
@@ -16412,8 +17261,10 @@ mod analyzer_tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 
@@ -16847,6 +17698,8 @@ mod field_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
+            branch: None,
         }
     }
 
@@ -17409,6 +18262,8 @@ mod field_tests {
             k: 1,
             num_candidates: 100,
             filter: None,
+            scoring: None,
+            vectors: None,
         });
         let result = run(&root, &manifest, &q);
         let lexical: Vec<&str> = result
@@ -17560,6 +18415,8 @@ mod limit_per_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
+            branch: None,
         };
         let mut locations = HashMap::new();
         for s in 0..segments {
@@ -17610,6 +18467,8 @@ mod limit_per_tests {
             // ANN recall.
             num_candidates: 100_000,
             filter: None,
+            scoring: None,
+            vectors: None,
         })
     }
 
@@ -18049,6 +18908,8 @@ mod rank_by_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
+            branch: None,
         };
         let mut locations = HashMap::new();
         for s in 0..segments {
@@ -18482,6 +19343,8 @@ mod rank_by_tests {
             k: 15,
             num_candidates: 100_000,
             filter: None,
+            scoring: None,
+            vectors: None,
         };
         let functions = json!([
             {"field_value": {"field": "votes", "modifier": "log1p"}, "weight": 2},
@@ -18740,6 +19603,8 @@ mod fuzzy_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
+            branch: None,
         }
     }
 
@@ -19327,6 +20192,8 @@ mod nested_attribute_tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
+            branch: None,
         };
         for (i, docs) in segments.iter().enumerate() {
             let id = SegmentId(format!("seg{i}"));
@@ -19656,6 +20523,8 @@ mod prefix_filter_tests {
             deletion_vectors: Default::default(),
             retired: Default::default(),
             schema: Default::default(),
+            shards: None,
+            branch: None,
         };
         (dir, ns, manifest)
     }
@@ -19778,6 +20647,8 @@ mod prefix_filter_tests {
             k: 8,
             num_candidates: 8,
             filter: Some(serde_json::from_str(IN_2026).unwrap()),
+            scoring: None,
+            vectors: None,
         });
         assert_eq!(
             ids(&searcher, &ns, &manifest, &q),
@@ -19853,6 +20724,8 @@ mod metric_aggregation_tests {
             deletion_vectors: Default::default(),
             retired: Default::default(),
             schema: Default::default(),
+            shards: None,
+            branch: None,
         }
     }
 
@@ -20833,5 +21706,777 @@ mod tracked_segment_filter_tests {
             Err(KoshaError::InvalidQuery(msg)) if msg.contains("numeric field")
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Multiple vector columns per namespace (#204): `knn.field` picks the
+/// column searched, a field nothing indexes is a client error, and
+/// segments written before columns existed keep serving.
+#[cfg(test)]
+mod vector_column_tests {
+    use super::*;
+    use kosha_core::{DocumentId, Field, FieldType, KnnQuery, ManifestEntry, SegmentId};
+    use kosha_segment::SegmentWriter;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-query-vector-columns-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn manifest(segments: &[(&str, u32)]) -> Manifest {
+        Manifest {
+            version: 1,
+            segments: segments
+                .iter()
+                .map(|(id, docs)| ManifestEntry {
+                    segment_id: SegmentId((*id).into()),
+                    doc_count: *docs,
+                })
+                .collect(),
+            segment_footers: Default::default(),
+            footer_crc32: Default::default(),
+            wal_checkpoint: 0,
+            wal_origin: None,
+            tombstones: Default::default(),
+            deletion_vectors: Default::default(),
+            schema: None,
+            retired: Default::default(),
+            shards: None,
+            branch: None,
+        }
+    }
+
+    fn knn_query(field: &str, vector: Vec<f32>, k: usize) -> SearchQuery {
+        let mut q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "",
+            "max_results": k,
+        }))
+        .unwrap();
+        q.knn = Some(KnnQuery {
+            field: field.into(),
+            vector,
+            k,
+            // Probe everything: these tests are about which column is
+            // searched, not recall tuning.
+            num_candidates: 10_000,
+            filter: None,
+            scoring: None,
+            vectors: None,
+        });
+        q
+    }
+
+    fn write_segment(ns_dir: &Path, id: &str, docs: &[(String, Vec<Field>)]) {
+        let mut w = SegmentWriter::new(SegmentId(id.into()), ns_dir.join(id));
+        for (doc_id, fields) in docs {
+            w.add_document(DocumentId(doc_id.clone()), fields.clone());
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(&path, to.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+
+    fn legacy_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kosha-segment/tests/fixtures")
+            .join(name)
+    }
+
+    /// The fixture generator's `emb` vectors (see kosha-segment's
+    /// `tests/vector_columns.rs`): doc `legacy-{i:02}`.
+    fn legacy_vectors() -> Vec<(String, Vec<f32>)> {
+        (0..24)
+            .map(|i| {
+                let a = i as f32 * 0.7;
+                (
+                    format!("legacy-{i:02}"),
+                    vec![
+                        a.sin(),
+                        a.cos(),
+                        (a * 1.3).sin(),
+                        ((i % 5) as f32) / 5.0 - 0.4,
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    fn brute_force(vectors: &[(String, Vec<f32>)], query: &[f32], k: usize) -> BTreeSet<String> {
+        let mut scored: Vec<(String, f64)> = vectors
+            .iter()
+            .map(|(id, v)| (id.clone(), cosine_similarity(query, v)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored.into_iter().take(k).map(|(id, _)| id).collect()
+    }
+
+    fn hit_ids(result: &SearchResult) -> BTreeSet<String> {
+        result.results.iter().map(|h| h.doc_id.0.clone()).collect()
+    }
+
+    /// Documents with a 4-dim `title_emb` (not every third), an 8-dim
+    /// `body_emb` (not every fifth), or both.
+    fn two_column_docs(prefix: &str, n: usize) -> Vec<(String, Vec<Field>)> {
+        (0..n)
+            .map(|i| {
+                let a = (i as f32 + prefix.len() as f32 * 3.1) * 0.37;
+                let mut fields = vec![Field::text("body", format!("doc {i}"))];
+                if i % 3 != 0 {
+                    fields.push(Field::vector(
+                        "title_emb",
+                        vec![a.sin(), a.cos(), (2.0 * a).sin(), 0.5],
+                    ));
+                }
+                if i % 5 != 0 {
+                    fields.push(Field::vector(
+                        "body_emb",
+                        (0..8).map(|d| ((d as f32 + 1.0) * a).cos()).collect(),
+                    ));
+                }
+                (format!("{prefix}{i:02}"), fields)
+            })
+            .collect()
+    }
+
+    fn column(docs: &[(String, Vec<Field>)], field: &str) -> Vec<(String, Vec<f32>)> {
+        docs.iter()
+            .filter_map(|(id, fields)| {
+                let f = fields
+                    .iter()
+                    .find(|f| f.name == field && f.field_type == FieldType::Vector)?;
+                Some((id.clone(), serde_json::from_str(&f.value).unwrap()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn knn_field_searches_only_its_own_column() {
+        let dir = temp_dir("two-columns");
+        let ns = NamespaceId("ns".into());
+        let a = two_column_docs("a", 40);
+        let b = two_column_docs("b", 30);
+        write_segment(&dir.join("ns"), "s1", &a);
+        write_segment(&dir.join("ns"), "s2", &b);
+        let manifest = manifest(&[("s1", 40), ("s2", 30)]);
+        let searcher = Searcher::new(dir.clone());
+        let all: Vec<_> = a.iter().chain(&b).cloned().collect();
+
+        for (field, query) in [
+            ("title_emb", vec![0.2, 0.9, 0.1, 0.5]),
+            ("body_emb", (0..8).map(|d| (d as f32 * 0.4).sin()).collect()),
+        ] {
+            let truth = column(&all, field);
+            for k in [1, 5, 12] {
+                let r = searcher
+                    .search(&ns, &manifest, &knn_query(field, query.clone(), k), None)
+                    .unwrap();
+                assert_eq!(hit_ids(&r), brute_force(&truth, &query, k), "{field} k={k}");
+                assert_eq!(r.knn_degraded_segments, Some(0));
+            }
+            // The whole column, and nothing but: documents without this
+            // field are never its neighbours.
+            let r = searcher
+                .search(
+                    &ns,
+                    &manifest,
+                    &knn_query(field, query.clone(), 1_000),
+                    None,
+                )
+                .unwrap();
+            let ids: BTreeSet<String> = truth.iter().map(|(id, _)| id.clone()).collect();
+            assert_eq!(hit_ids(&r), ids, "{field}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn knn_on_an_unindexed_field_or_with_the_wrong_dimension_is_a_client_error() {
+        let dir = temp_dir("invalid");
+        let ns = NamespaceId("ns".into());
+        write_segment(&dir.join("ns"), "s1", &two_column_docs("a", 20));
+        let manifest = manifest(&[("s1", 20)]);
+        let searcher = Searcher::new(dir.clone());
+
+        let err = searcher
+            .search(&ns, &manifest, &knn_query("nope", vec![1.0; 4], 3), None)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KoshaError::InvalidQuery(m) if m.contains("'nope'")),
+            "{err}"
+        );
+        let err = searcher
+            .search(
+                &ns,
+                &manifest,
+                &knn_query("body_emb", vec![1.0; 4], 3),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, KoshaError::InvalidQuery(m) if m.contains("8")),
+            "{err}"
+        );
+        // Also with the global probe budget's filter pruning in play.
+        let mut filtered = knn_query("nope", vec![1.0; 4], 3);
+        filtered.filter =
+            Some(serde_json::from_value(serde_json::json!({"term": {"body": "missing"}})).unwrap());
+        assert!(matches!(
+            searcher.search(&ns, &manifest, &filtered, None),
+            Err(KoshaError::InvalidQuery(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_segment_written_before_vector_columns_still_serves_knn() {
+        let dir = temp_dir("legacy");
+        let ns = NamespaceId("ns".into());
+        copy_dir(
+            &legacy_fixture("legacy-vector-seg"),
+            &dir.join("ns/legacy-vec"),
+        );
+        let manifest = manifest(&[("legacy-vec", 24)]);
+        let searcher = Searcher::new(dir.clone());
+        let query = vec![0.3, 0.9, -0.2, 0.1];
+        let r = searcher
+            .search(&ns, &manifest, &knn_query("emb", query.clone(), 5), None)
+            .unwrap();
+        assert_eq!(hit_ids(&r), brute_force(&legacy_vectors(), &query, 5));
+        assert_eq!(r.knn_degraded_segments, Some(0));
+
+        // `doc_vectors.bin` binds the unnamed index to `emb`, so no other
+        // field name can be answered here.
+        assert!(matches!(
+            searcher.search(
+                &ns,
+                &manifest,
+                &knn_query("title_emb", query.clone(), 5),
+                None
+            ),
+            Err(KoshaError::InvalidQuery(_))
+        ));
+
+        // Inline vectors leave the field unknown: the old index answers
+        // whatever `knn.field` a pre-#204 client sent.
+        let inline_dir = temp_dir("legacy-inline");
+        copy_dir(
+            &legacy_fixture("legacy-vector-seg-inline"),
+            &inline_dir.join("ns/legacy-vec"),
+        );
+        let searcher = Searcher::new(inline_dir.clone());
+        for field in ["emb", "contentEmbedding"] {
+            let r = searcher
+                .search(&ns, &manifest, &knn_query(field, query.clone(), 5), None)
+                .unwrap();
+            assert_eq!(
+                hit_ids(&r),
+                brute_force(&legacy_vectors(), &query, 5),
+                "{field}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&inline_dir).ok();
+    }
+
+    #[test]
+    fn a_namespace_mixing_old_and_new_segments_queries_correctly() {
+        let dir = temp_dir("mixed");
+        let ns = NamespaceId("ns".into());
+        copy_dir(
+            &legacy_fixture("legacy-vector-seg"),
+            &dir.join("ns/legacy-vec"),
+        );
+        // A new segment with the same 4-dim `emb` column plus an 8-dim
+        // `body_emb` one.
+        let new_docs: Vec<(String, Vec<Field>)> = (0..30)
+            .map(|i| {
+                let a = i as f32 * 0.53 + 0.1;
+                (
+                    format!("new-{i:02}"),
+                    vec![
+                        Field::vector("emb", vec![a.cos(), a.sin(), 0.2, (3.0 * a).sin()]),
+                        Field::vector(
+                            "body_emb",
+                            (0..8).map(|d| ((d as f32 + 0.5) * a).sin()).collect(),
+                        ),
+                    ],
+                )
+            })
+            .collect();
+        write_segment(&dir.join("ns"), "s2", &new_docs);
+        let manifest = manifest(&[("legacy-vec", 24), ("s2", 30)]);
+        let searcher = Searcher::new(dir.clone());
+
+        // `emb` spans both segments: the legacy index answers it.
+        let mut emb = legacy_vectors();
+        emb.extend(column(&new_docs, "emb"));
+        let query = vec![0.3, 0.9, -0.2, 0.1];
+        for k in [3, 10, 40] {
+            let r = searcher
+                .search(&ns, &manifest, &knn_query("emb", query.clone(), k), None)
+                .unwrap();
+            assert_eq!(hit_ids(&r), brute_force(&emb, &query, k), "emb k={k}");
+        }
+        let r = searcher
+            .search(&ns, &manifest, &knn_query("emb", query.clone(), 100), None)
+            .unwrap();
+        assert!(hit_ids(&r).iter().any(|id| id.starts_with("legacy-")));
+        assert!(hit_ids(&r).iter().any(|id| id.starts_with("new-")));
+
+        // `body_emb` exists only in the new segment; the legacy index (of
+        // `emb`) never contributes to it.
+        let body = column(&new_docs, "body_emb");
+        let query8: Vec<f32> = (0..8).map(|d| (d as f32 * 0.3).cos()).collect();
+        let r = searcher
+            .search(
+                &ns,
+                &manifest,
+                &knn_query("body_emb", query8.clone(), 100),
+                None,
+            )
+            .unwrap();
+        assert_eq!(hit_ids(&r), brute_force(&body, &query8, 100));
+        assert!(hit_ids(&r).iter().all(|id| id.starts_with("new-")));
+
+        // Neither segment indexes `title_emb`.
+        assert!(matches!(
+            searcher.search(&ns, &manifest, &knn_query("title_emb", query, 5), None),
+            Err(KoshaError::InvalidQuery(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Filtered kNN (#252): exact search for selective filters, a probe budget
+/// widened by selectivity, and `knn_mode` reporting.
+#[cfg(test)]
+mod filtered_knn_tests {
+    use super::*;
+    use kosha_core::{DocumentId, Field, KnnQuery, ManifestEntry, SegmentId};
+    use kosha_segment::{SegmentWriter, VectorStoreMode};
+    use std::path::{Path, PathBuf};
+
+    const DIM: usize = 32;
+
+    /// `(field, documents passing)` of the synthetic corpus: every
+    /// `period`-th document has `field = "y"`.
+    const SELECTIVITIES: [(&str, usize); 5] = [
+        ("s50", 2),      // 50%
+        ("s5", 20),      // 5%
+        ("s05", 200),    // 0.5%
+        ("s005", 2000),  // 0.05%
+        ("s0025", 4000), // 0.025%: fewer passing documents than k
+    ];
+
+    fn temp_dir(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-query-filtered-knn-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn coord(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1u64 << 23) as f32 * 2.0 - 1.0
+        }
+        fn vector(&mut self) -> Vec<f32> {
+            (0..DIM).map(|_| self.coord()).collect()
+        }
+    }
+
+    struct Corpus {
+        ns: NamespaceId,
+        manifest: Manifest,
+        /// `(doc id, global index, vector)`, in write order.
+        docs: Vec<(String, usize, Vec<f32>)>,
+    }
+
+    /// `segments` x `per_segment` random `DIM`-dim vectors. Document `i`
+    /// (global) has `s* = "y"` per [`SELECTIVITIES`], and `skew = "y"` for
+    /// every document of segment 0 plus the first 10 of segment 1.
+    fn corpus(dir: &Path, segments: usize, per_segment: usize, mode: VectorStoreMode) -> Corpus {
+        let ns = NamespaceId("ns".into());
+        let mut rng = Lcg(0x05ee_d252);
+        let mut docs = Vec::new();
+        let mut entries = Vec::new();
+        for seg in 0..segments {
+            let id = format!("seg{seg}");
+            let mut w = SegmentWriter::new(SegmentId(id.clone()), dir.join(&ns.0).join(&id))
+                .with_vector_store_mode(mode);
+            for local in 0..per_segment {
+                let i = seg * per_segment + local;
+                let vector = rng.vector();
+                let doc_id = format!("d{i}");
+                let mut fields = vec![Field::vector("emb", vector.clone())];
+                for (name, period) in SELECTIVITIES {
+                    let value = if i.is_multiple_of(period) { "y" } else { "n" };
+                    fields.push(Field::keyword(name, value));
+                }
+                let skew = seg == 0 || (seg == 1 && local < 10);
+                fields.push(Field::keyword("skew", if skew { "y" } else { "n" }));
+                w.add_document(DocumentId(doc_id.clone()), fields);
+                docs.push((doc_id, i, vector));
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            entries.push(ManifestEntry {
+                segment_id: SegmentId(id),
+                doc_count: per_segment as u32,
+            });
+        }
+        Corpus {
+            ns,
+            manifest: Manifest {
+                version: 1,
+                segments: entries,
+                segment_footers: Default::default(),
+                footer_crc32: Default::default(),
+                wal_checkpoint: 0,
+                wal_origin: None,
+                tombstones: Default::default(),
+                deletion_vectors: Default::default(),
+                schema: None,
+                retired: Default::default(),
+                shards: None,
+                branch: None,
+            },
+            docs,
+        }
+    }
+
+    fn term(field: &str) -> FilterClause {
+        FilterClause::Term {
+            term: HashMap::from([(field.to_string(), "y".to_string())]),
+        }
+    }
+
+    fn knn_query(vector: Vec<f32>, k: usize, filter: Option<FilterClause>) -> SearchQuery {
+        let mut q: SearchQuery = serde_json::from_value(serde_json::json!({
+            "query_text": "",
+            "max_results": k,
+        }))
+        .unwrap();
+        q.knn = Some(KnnQuery {
+            field: "emb".into(),
+            vector,
+            k,
+            num_candidates: 100,
+            filter,
+            scoring: None,
+            vectors: None,
+        });
+        q
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        cosine_similarity(a, b)
+    }
+
+    /// Brute-force top `k` ids of the documents `passes` keeps.
+    fn brute_force(
+        corpus: &Corpus,
+        query: &[f32],
+        k: usize,
+        passes: impl Fn(usize) -> bool,
+    ) -> Vec<String> {
+        let mut scored: Vec<(&str, f64)> = corpus
+            .docs
+            .iter()
+            .filter(|(_, i, _)| passes(*i))
+            .map(|(id, _, v)| (id.as_str(), cosine(query, v)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored
+            .into_iter()
+            .take(k)
+            .map(|(id, _)| id.to_string())
+            .collect()
+    }
+
+    fn ids(r: &SearchResult) -> Vec<String> {
+        r.results.iter().map(|d| d.doc_id.0.clone()).collect()
+    }
+
+    fn recall(got: &[String], truth: &[String]) -> f64 {
+        if truth.is_empty() {
+            return 1.0;
+        }
+        let hit = got.iter().filter(|id| truth.contains(id)).count();
+        hit as f64 / truth.len() as f64
+    }
+
+    /// The acceptance test of #252: recall@10 >= 0.95 against brute force
+    /// at 50%, 5%, 0.5% and 0.05% selectivity, and always
+    /// `min(k, |filtered|)` results — under the default policy (exact
+    /// everywhere for a 20k corpus), a low threshold (probe the broad
+    /// filters, exact for the selective ones), and with the exact path
+    /// off (the widened probe alone).
+    #[test]
+    fn filtered_knn_recall_at_every_selectivity() {
+        let dir = temp_dir("recall");
+        let corpus = corpus(&dir, 4, 5_000, VectorStoreMode::Sidecar);
+        let mut rng = Lcg(0xfeed);
+        let queries: Vec<Vec<f32>> = (0..10).map(|_| rng.vector()).collect();
+        let k = 10;
+        // (label, threshold, expected mode per selectivity)
+        let policies: [(&str, usize, [&str; 5]); 3] = [
+            ("default", DEFAULT_KNN_EXACT_THRESHOLD, ["exact"; 5]),
+            (
+                "threshold-500",
+                500,
+                ["ann", "ann", "exact", "exact", "exact"],
+            ),
+            ("exact-off", 0, ["ann"; 5]),
+        ];
+        for (label, threshold, modes) in policies {
+            let searcher = Searcher::new(dir.clone())
+                .with_knn_exact_policy(threshold, DEFAULT_KNN_EXACT_FRACTION);
+            for ((field, period), mode) in SELECTIVITIES.into_iter().zip(modes) {
+                let passing = corpus.docs.len().div_ceil(period);
+                let mut total_recall = 0.0;
+                for query in &queries {
+                    let q = knn_query(query.clone(), k, Some(term(field)));
+                    let r = searcher
+                        .search(&corpus.ns, &corpus.manifest, &q, None)
+                        .unwrap();
+                    let truth = brute_force(&corpus, query, k, |i| i.is_multiple_of(period));
+                    assert_eq!(
+                        r.results.len(),
+                        k.min(passing),
+                        "{label} {field}: min(k, |filtered|) results"
+                    );
+                    assert_eq!(r.knn_mode.as_deref(), Some(mode), "{label} {field}");
+                    assert_eq!(r.knn_filtered_candidates, Some(passing as u64));
+                    assert_eq!(r.knn_degraded_segments, Some(0));
+                    if mode == "exact" {
+                        assert_eq!(ids(&r), truth, "{label} {field}: exact is exact");
+                    }
+                    total_recall += recall(&ids(&r), &truth);
+                }
+                let mean = total_recall / queries.len() as f64;
+                eprintln!("filtered kNN {label} {field}: mode {mode} recall@10 {mean:.3}");
+                assert!(
+                    mean >= 0.95,
+                    "{label} {field}: recall@10 {mean:.3} below 0.95"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unfiltered_knn_is_never_exact() {
+        let dir = temp_dir("unfiltered");
+        let corpus = corpus(&dir, 2, 500, VectorStoreMode::Sidecar);
+        let searcher = Searcher::new(dir.clone());
+        let q = knn_query(corpus.docs[0].2.clone(), 5, None);
+        let (r, stats) = searcher
+            .search_with_stats(&corpus.ns, &corpus.manifest, &q, None)
+            .unwrap();
+        assert_eq!(r.knn_mode.as_deref(), Some("ann"));
+        assert_eq!(r.knn_filtered_candidates, None);
+        assert_eq!(stats.knn_exact_vectors, 0);
+        assert_eq!(r.results[0].doc_id.0, "d0");
+        // Not a kNN query: no mode at all, and nothing serialized.
+        let mut lexical = knn_query(vec![0.0; DIM], 5, None);
+        lexical.knn = None;
+        lexical.filter = Some(term("s50"));
+        let r = searcher
+            .search(&corpus.ns, &corpus.manifest, &lexical, None)
+            .unwrap();
+        assert_eq!(r.knn_mode, None);
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("knn_mode").is_none());
+        assert!(json.get("knn_filtered_candidates").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One segment where the filter passes everything is probed; one where
+    /// it passes 10 of 2,000 (0.5%) is scanned exactly: `mixed`.
+    #[test]
+    fn per_segment_fraction_gives_mixed_mode() {
+        let dir = temp_dir("mixed");
+        let corpus = corpus(&dir, 3, 2_000, VectorStoreMode::Sidecar);
+        let searcher = Searcher::new(dir.clone()).with_knn_exact_policy(1_000, 0.01);
+        let query = corpus.docs[2_003].2.clone(); // seg1, local 3: passes
+        let q = knn_query(query.clone(), 10, Some(term("skew")));
+        let (r, stats) = searcher
+            .search_with_stats(&corpus.ns, &corpus.manifest, &q, None)
+            .unwrap();
+        assert_eq!(r.knn_mode.as_deref(), Some("mixed"));
+        assert_eq!(r.knn_filtered_candidates, Some(2_010));
+        assert_eq!(stats.knn_exact_vectors, 10, "only seg1's 10 are scanned");
+        assert_eq!(r.results.len(), 10);
+        assert_eq!(r.results[0].doc_id.0, "d2003");
+        let truth = brute_force(&corpus, &query, 10, |i| {
+            i < 2_000 || (2_000..2_010).contains(&i)
+        });
+        assert!(
+            recall(&ids(&r), &truth) >= 0.9,
+            "{:?} vs {truth:?}",
+            ids(&r)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Segments that store vectors inline have no sidecar: the exact path
+    /// scores every posting instead, with the same answer and scores.
+    #[test]
+    fn exact_path_without_a_sidecar_scores_postings() {
+        let sidecar_dir = temp_dir("sidecar");
+        let inline_dir = temp_dir("inline");
+        let sidecar = corpus(&sidecar_dir, 2, 1_000, VectorStoreMode::Sidecar);
+        let inline = corpus(&inline_dir, 2, 1_000, VectorStoreMode::Inline);
+        let query = Lcg(7).vector();
+        let q = knn_query(query.clone(), 10, Some(term("s5")));
+        let (a, a_stats) = Searcher::new(sidecar_dir.clone())
+            .search_with_stats(&sidecar.ns, &sidecar.manifest, &q, None)
+            .unwrap();
+        let (b, b_stats) = Searcher::new(inline_dir.clone())
+            .search_with_stats(&inline.ns, &inline.manifest, &q, None)
+            .unwrap();
+        assert_eq!(a.knn_mode.as_deref(), Some("exact"));
+        assert_eq!(b.knn_mode.as_deref(), Some("exact"));
+        assert_eq!(ids(&a), ids(&b));
+        assert_eq!(
+            ids(&a),
+            brute_force(&sidecar, &query, 10, |i| i.is_multiple_of(20))
+        );
+        for (x, y) in a.results.iter().zip(&b.results) {
+            assert!(
+                (x.score - y.score).abs() < 1e-4,
+                "{} vs {}",
+                x.score,
+                y.score
+            );
+        }
+        assert_eq!(a_stats.knn_exact_vectors, 100);
+        assert_eq!(b_stats.knn_exact_vectors, 100);
+        assert_eq!(
+            a_stats.knn_postings_probed, 0,
+            "the sidecar needs no posting"
+        );
+        assert!(
+            b_stats.knn_postings_probed > 0,
+            "inline segments hydrate postings"
+        );
+        std::fs::remove_dir_all(&sidecar_dir).ok();
+        std::fs::remove_dir_all(&inline_dir).ok();
+    }
+
+    /// Exact search scores what the probe scores: with the exact path off,
+    /// a probe over everything returns the same hits and scores.
+    #[test]
+    fn exact_and_probed_scores_agree() {
+        let dir = temp_dir("agree");
+        let corpus = corpus(&dir, 2, 1_000, VectorStoreMode::Sidecar);
+        let query = Lcg(11).vector();
+        let mut q = knn_query(query, 10, Some(term("s5")));
+        q.knn.as_mut().unwrap().num_candidates = 100_000;
+        let exact = Searcher::new(dir.clone())
+            .search(&corpus.ns, &corpus.manifest, &q, None)
+            .unwrap();
+        let probed = Searcher::new(dir.clone())
+            .with_knn_exact_policy(0, 0.0)
+            .search(&corpus.ns, &corpus.manifest, &q, None)
+            .unwrap();
+        assert_eq!(exact.knn_mode.as_deref(), Some("exact"));
+        assert_eq!(probed.knn_mode.as_deref(), Some("ann"));
+        assert_eq!(ids(&exact), ids(&probed));
+        for (x, y) in exact.results.iter().zip(&probed.results) {
+            assert!(
+                (x.score - y.score).abs() < 1e-4,
+                "{} vs {}",
+                x.score,
+                y.score
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Deleted documents are not candidates, and do not count as passing.
+    #[test]
+    fn exact_path_skips_tombstoned_documents() {
+        let dir = temp_dir("tombstones");
+        let corpus = corpus(&dir, 2, 1_000, VectorStoreMode::Sidecar);
+        let query = corpus.docs[40].2.clone(); // d40 passes s5
+        let q = knn_query(query.clone(), 5, Some(term("s5")));
+        let searcher = Searcher::new(dir.clone());
+        let r = searcher
+            .search(&corpus.ns, &corpus.manifest, &q, None)
+            .unwrap();
+        assert_eq!(r.results[0].doc_id.0, "d40");
+        let tombstones = HashMap::from([(SegmentId("seg0".into()), HashSet::from([40u32]))]);
+        let r = searcher
+            .search(&corpus.ns, &corpus.manifest, &q, Some(&tombstones))
+            .unwrap();
+        assert_eq!(r.knn_mode.as_deref(), Some("exact"));
+        assert_eq!(r.knn_filtered_candidates, Some(99));
+        assert!(!ids(&r).contains(&"d40".to_string()));
+        assert_eq!(
+            ids(&r),
+            brute_force(&corpus, &query, 5, |i| i.is_multiple_of(20) && i != 40)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn passing_count_combines_filters_and_tombstones() {
+        let mut a = DocSet::empty(100);
+        let mut b = DocSet::empty(100);
+        for i in 0..50 {
+            a.insert(i);
+        }
+        for i in 25..100 {
+            b.insert(i);
+        }
+        let deleted = HashSet::from([0u32, 30, 99, 500]);
+        assert_eq!(knn_passing_count(None, None, None, 100), 100);
+        assert_eq!(knn_passing_count(Some(&a), None, None, 100), 50);
+        assert_eq!(knn_passing_count(None, Some(&b), None, 100), 75);
+        assert_eq!(knn_passing_count(Some(&a), Some(&b), None, 100), 25);
+        // 30 is in both; 0 only in `a`; 99 only in `b`; 500 is no document.
+        assert_eq!(
+            knn_passing_count(Some(&a), Some(&b), Some(&deleted), 100),
+            24
+        );
+        assert_eq!(knn_passing_count(None, None, Some(&deleted), 100), 97);
+    }
+
+    #[test]
+    fn filter_widens_the_probe_budget_up_to_the_cap() {
+        assert_eq!(filtered_knn_budget(100, None), 100);
+        assert_eq!(filtered_knn_budget(100, Some(1.0)), 100);
+        assert_eq!(filtered_knn_budget(100, Some(0.5)), 200);
+        assert_eq!(filtered_knn_budget(100, Some(0.25)), 400);
+        assert_eq!(filtered_knn_budget(100, Some(0.001)), 800, "capped at 8x");
+        assert_eq!(filtered_knn_budget(100, Some(0.0)), 100);
     }
 }

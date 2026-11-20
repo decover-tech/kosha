@@ -110,7 +110,14 @@ Read once in `crates/kosha-query/src/lib.rs`.
 | `KOSHA_KNN_GLOBAL_BUDGET` | Treat `knn.num_candidates` as one probe budget for the whole query. `0`, `false` or `off` gives each segment its own budget (old behavior) | on | flag |
 | `KOSHA_KNN_BUDGET_FRACTION` | Lower bound on the probe budget, as a fraction of the namespace's centroids. Must be > 0 | `0.05` | fraction |
 | `KOSHA_KNN_BUDGET_MAX_CAP` | Ceiling on that lower bound. A larger explicit `num_candidates` is still honored | `20000` | centroids |
-| `KOSHA_KNN_OVERFETCH_FACTOR` | Per-segment over-fetch when candidates can be rejected after the top-k cut (deletes, filters). Values below 1 become 1, which turns over-fetch off | `10` | multiplier |
+| `KOSHA_KNN_EXACT_THRESHOLD` | A filtered kNN with at most this many filter-passing documents namespace-wide scores every passing document's vector exactly instead of probing (#252). `0` disables exact filtered kNN | `50000` | documents |
+| `KOSHA_KNN_EXACT_FRACTION` | A segment where at most this fraction of documents pass the filter is searched exactly too (#252) | `0.01` | fraction |
+| `KOSHA_KNN_FILTER_BUDGET_MAX_SCALE` | Most a filtered kNN widens the global probe budget by (`1 / selectivity`, #252) | `8` | multiplier |
+| `KOSHA_LATE_INTERACTION_NPROBE` | Token-index postings probed per query token by a late-interaction (`knn.vectors`) search, before candidates are re-scored exactly (#205) | `16` | postings |
+| `KOSHA_DEFAULT_CONSISTENCY` | Consistency of a search that does not ask for one: `strong` (also search acknowledged but unindexed writes) or `eventual` (indexed segments only), #255. Unset: `strong`, except on a query pod without `KOSHA_INTERNAL_API_KEY`, which defaults to `eventual` | unset | enum |
+| `KOSHA_TAIL_FETCH_TIMEOUT_MS` | Query pods: timeout of the fetch of the ingest pod's unindexed tail for a strong search (#255) | `10000` | ms |
+| `KOSHA_MAX_UNINDEXED_BYTES` | Per-namespace cap on acknowledged but unindexed writes; past it `/index` and `/replace` return 429 with `retry-after` (#255). `0` disables | `2147483648` (2 GiB) | bytes |
+| `KOSHA_MAX_UNINDEXED_DOCS` | Per-namespace cap on unindexed documents, as above (#255) | unset | documents |
 
 ## Warmup
 
@@ -222,6 +229,10 @@ before rolling back, until every reader understands the newer one. Read once in
 | `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written: `4` or `5` | `5` | version |
 | `KOSHA_VECTOR_WRITE_VERSION` | Vector-index version written: `1` (flat), `2`, `3` or `4` (posting-based) | `4` | version |
 | `KOSHA_VECTOR_STORE` | Where vector field values are stored: `sidecar` (`doc_vectors.bin`) or `inline` (in `doc_store.bin`). Set `inline` before rolling back past #243 | `sidecar` | enum |
+| `KOSHA_VECTOR_QUANTIZATION` | How new segments store vector posting entries: `f32` or `i8` (scalar-quantized, vector index version 4, #210). Turn `i8` on only once every query pod reads version 4; turn it off and compact before rolling back past it | `f32` | enum |
+| `KOSHA_VECTOR_QUANTIZATION_FIELDS` | Per-field overrides of `KOSHA_VECTOR_QUANTIZATION`, e.g. `body_emb:i8,title_emb:f32` | empty | list |
+| `KOSHA_VECTOR_RESCORE_FACTOR` | An i8 column rescores its best `k * factor` probe candidates with the f32 vectors in `doc_vectors.bin` (#210); `0` disables | `4` | multiplier |
+| `KOSHA_VECTOR_COMPACTION` | How compaction builds merged vector indexes: `lire` seeds each column from its largest input's postings and repairs them with SPFresh's LIRE split / merge / reassign; `rebuild` re-clusters every vector (#253) | `lire` | enum |
 | `KOSHA_TEXT_FILTER_IGNORE_ABOVE` | Longest `Text` value copied into filter columns, like Elasticsearch's `ignore_above`; `off` copies every value | `256` | characters |
 | `KOSHA_FIELD_INDEX` | Per-field inverted indexes (#249); `off` writes segments exactly as before. Set it and compact before rolling back past #249 | on | flag (default on) |
 | `KOSHA_FILTERS_WRITE_VERSION` | Filter index written: `1` (`filters.bin`) or `2` (columnar `filters.toc` + `filters-NNN.col`, #244) (`filter_columns.rs`) | `1` | version |

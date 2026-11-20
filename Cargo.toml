@@ -19,3 +19,9 @@ all = { level = "warn", priority = -1 }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 rayon = "1"
+
+# The vector index's k-means / LIRE inner loops are ~50x slower unoptimized,
+# which made its recall tests (and every kosha-segment test that builds an
+# index) dominate `cargo test` time. Debug assertions stay on.
+[profile.dev.package.kosha-vector-spfresh]
+opt-level = 3

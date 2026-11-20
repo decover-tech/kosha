@@ -96,6 +96,17 @@ impl DocSet {
         self.count() == self.len as usize
     }
 
+    /// How many documents are in both sets, without building the
+    /// intersection.
+    pub fn intersection_count(&self, other: &DocSet) -> usize {
+        debug_assert_eq!(self.len, other.len);
+        self.words
+            .iter()
+            .zip(&other.words)
+            .map(|(a, b)| (a & b).count_ones() as usize)
+            .sum()
+    }
+
     pub fn intersect_with(&mut self, other: &DocSet) {
         debug_assert_eq!(self.len, other.len);
         for (a, b) in self.words.iter_mut().zip(&other.words) {

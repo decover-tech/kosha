@@ -605,6 +605,8 @@ mod tests {
                 deletion_vectors: Default::default(),
                 schema: None,
                 retired: Default::default(),
+                shards: None,
+                branch: None,
             },
             segs: seg_dirs,
         }
@@ -694,16 +696,8 @@ mod tests {
         let ensure = |pages: &[PageSegment<'_>]| {
             docs.hydrate(pages, store, cache);
         };
-        let fetch_vectors = |seg: &Path, ranges: &[(u64, u64)]| {
-            fetch_file_spans(
-                &f.rel(seg),
-                seg,
-                kosha_segment::VECTOR_IDX_FILE,
-                ranges,
-                64 * 1024,
-                store,
-                cache,
-            );
+        let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
+            fetch_file_spans(&f.rel(seg), seg, file, ranges, 64 * 1024, store, cache);
         };
         let (result, _) = searcher.search_with_hydrators(
             &f.ns,

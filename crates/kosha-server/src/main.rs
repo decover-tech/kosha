@@ -23,6 +23,7 @@ fn tenant_namespace(tenant: &str, namespace: &str) -> String {
 }
 
 mod auth;
+mod branching;
 mod compaction_sched;
 mod doc_spans;
 #[cfg(all(test, feature = "s3"))]
@@ -41,6 +42,7 @@ mod s3_wal;
 #[cfg(feature = "s3")]
 mod segment_commit;
 mod segment_gc;
+mod unindexed;
 mod warm;
 mod warm_run;
 
@@ -65,6 +67,10 @@ struct AppState {
     admin_auth_key: Option<String>,
     internal_service_key: Option<String>,
     publication_locks: Mutex<HashMap<NamespaceId, Arc<Mutex<()>>>>,
+    /// Serializes namespace branch creation and deletion (#208), so a
+    /// deletion's reference set cannot miss a branch being created from
+    /// the namespace it deletes.
+    branch_lock: Mutex<()>,
     /// Hydrated segment files that failed their `_COMMIT` size/CRC check
     /// (#231), counting refetch failures again. Reported in `/stats`.
     #[cfg(feature = "s3")]
@@ -367,7 +373,7 @@ struct AppState {
     /// bytes are fast to open but nothing has opened them yet — the first
     /// wave of real kNN queries still pays for every first-touch
     /// `open_segment` itself, which at corpus scale (every segment, on
-    /// every query — see `global_probe_cutoff`) reproduces the same
+    /// every query — see `knn_plan`) reproduces the same
     /// cold-start convoy this field's sibling exists to prevent. Its own
     /// flag rather than folding into `warmup_posting_blobs`: this phase
     /// mutates the *live* `segment_cache`/`MemoryLedger` that concurrent
@@ -393,6 +399,41 @@ struct AppState {
     /// last-confirmed-current times (lag) and control-plane error counters.
     /// Unused on the ingest pod, whose manifests are authoritative.
     manifest_follow: manifest_follow::ManifestFollow,
+    /// Merged read views of sharded namespaces (#207), keyed by root: the
+    /// root and shard manifests a view was built from, and the view. Reused
+    /// while every one of those is still the indexer's current shared
+    /// manifest — see [`AppState::sharded_view`].
+    shard_views: Mutex<HashMap<NamespaceId, ShardView>>,
+    /// `KOSHA_DEFAULT_CONSISTENCY` (#255); `None` = the built-in default,
+    /// see `AppState::default_consistency`.
+    default_consistency: Option<unindexed::Consistency>,
+    /// `KOSHA_MAX_UNINDEXED_BYTES` / `KOSHA_MAX_UNINDEXED_DOCS` (#255).
+    unindexed_cap: unindexed::UnindexedCap,
+    /// Strong-consistency search state: built tails, the tail HTTP client.
+    unindexed: unindexed::UnindexedState,
+}
+
+/// One cached merged manifest over a sharded namespace (#207).
+struct ShardView {
+    root: Arc<kosha_core::Manifest>,
+    shards: Vec<Option<Arc<kosha_core::Manifest>>>,
+    merged: Arc<kosha_core::Manifest>,
+}
+
+impl ShardView {
+    fn is_current(
+        &self,
+        root: &Arc<kosha_core::Manifest>,
+        shards: &[Option<Arc<kosha_core::Manifest>>],
+    ) -> bool {
+        Arc::ptr_eq(&self.root, root)
+            && self.shards.len() == shards.len()
+            && self.shards.iter().zip(shards).all(|pair| match pair {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            })
+    }
 }
 
 /// Per-segment single-flight completion signal used by
@@ -632,6 +673,10 @@ struct HydrationOutcome {
 /// the verdict records which column names were verified. A later query is
 /// covered only if every column it names was (`filters.bin` segments are
 /// verified whole by any filter pass, so the field set is what decides).
+///
+/// Vectors are verified per `knn.field` (#204): a kNN hydrates only the
+/// files of the vector column it searches, so a pass for one column says
+/// nothing about another's.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 struct HydrationVerdict {
     /// A filter-needing pass verified every segment's `filters.bin` or
@@ -639,31 +684,89 @@ struct HydrationVerdict {
     filters_verified: bool,
     /// Filter column names verified local in every columnar segment.
     filter_fields_verified: std::collections::BTreeSet<String>,
-    vectors_verified: bool,
+    /// Vector columns (`knn.field`s) verified local in every segment.
+    vector_fields_verified: std::collections::BTreeSet<String>,
 }
 
 impl HydrationVerdict {
     /// Whether this verdict can be trusted to skip a full
     /// `hydrate_segments_for_search` pass for a query with these needs.
     /// `needs_filters` is the query's filter column names, `None` when it
-    /// needs no filter files at all.
-    fn covers(&self, needs_filters: Option<&FilterFields>, needs_vectors: bool) -> bool {
+    /// needs no filter files at all. `knn_field` is the query's
+    /// `knn.field`, `None` for a non-kNN query.
+    fn covers(&self, needs_filters: Option<&FilterFields>, knn_field: Option<&str>) -> bool {
         let filters_ok = needs_filters.is_none_or(|fields| {
             self.filters_verified && fields.is_subset(&self.filter_fields_verified)
         });
-        filters_ok && (!needs_vectors || self.vectors_verified)
+        filters_ok && knn_field.is_none_or(|field| self.vector_fields_verified.contains(field))
     }
 
     /// Record what a successful, non-bloom-pruned pass for a query with
     /// these needs actually verified, merging with (not replacing) whatever
     /// was already known for this manifest version.
-    fn merge(&mut self, needs_filters: Option<&FilterFields>, needs_vectors: bool) {
+    fn merge(&mut self, needs_filters: Option<&FilterFields>, knn_field: Option<&str>) {
         if let Some(fields) = needs_filters {
             self.filters_verified = true;
             self.filter_fields_verified.extend(fields.iter().cloned());
         }
-        self.vectors_verified |= needs_vectors;
+        if let Some(field) = knn_field {
+            self.vector_fields_verified.insert(field.to_string());
+        }
     }
+}
+
+/// Whether the files a kNN on `field` reads from `seg_path` are local
+/// (#204): `field`'s column only, as `footer` lists it (see
+/// [`kosha_segment::knn_vector_columns`]). In ranged mode (#245) a column
+/// whose offsets sidecar is local is complete: its probed postings are read
+/// by range during the search. Otherwise the idx file is needed, plus the
+/// sidecar where one exists — a legacy segment's only for the clustered
+/// format: a clustered column without it is served by exact scan of every
+/// vector (seconds on a large segment). A legacy segment that stores its
+/// vectors in `doc_vectors.bin` also needs that file, whose field table
+/// binds its unnamed index.
+#[cfg(feature = "s3")]
+fn knn_files_complete(
+    seg_path: &Path,
+    footer: Option<&kosha_core::Footer>,
+    field: &str,
+    vectors_ranged: bool,
+) -> bool {
+    for column in kosha_segment::knn_vector_columns(footer, field) {
+        let offsets_local = column
+            .offsets_file
+            .as_ref()
+            .is_some_and(|f| file_present_nonempty(&seg_path.join(f)));
+        if vectors_ranged && offsets_local {
+            continue;
+        }
+        if !file_present_nonempty(&seg_path.join(&column.idx_file)) {
+            return false;
+        }
+        if column.offsets_file.is_some()
+            && !offsets_local
+            && (!column.legacy
+                || kosha_segment::vector_file_needs_offsets(seg_path, &column.idx_file))
+        {
+            return false;
+        }
+    }
+    !kosha_segment::knn_needs_doc_vectors(footer)
+        || file_present_nonempty(&seg_path.join(kosha_segment::DOC_VECTORS_FILE))
+}
+
+/// The vector key a query's [`HydrationVerdict`] records and checks: its
+/// `knn.field` for a single-vector kNN (#204), and a key of its own for a
+/// late-interaction kNN (#205), whose pass hydrates the field's multivec
+/// files rather than its single-vector column. `None` without kNN.
+fn knn_verdict_key(query: &SearchQuery) -> Option<String> {
+    query.knn.as_ref().map(|knn| {
+        if knn.is_late_interaction() {
+            format!("late_interaction:{}", knn.field)
+        } else {
+            knn.field.clone()
+        }
+    })
 }
 
 /// Filter column names a query reads (`SearchQuery::filter_column_fields`).
@@ -778,8 +881,9 @@ fn hydration_wants_file(name: &str, needs_vectors: bool) -> bool {
     // "vector.offsets"` too would have flipped this to `needs_vectors ||
     // true` for the sidecar (always fetch it, regardless of
     // `needs_vectors`) — the opposite bug from the one this function
-    // exists to prevent.
-    if name == "vector.idx" || name == "vector.offsets" {
+    // exists to prevent. Every vector column's files (#204:
+    // `vector.<n>.idx` / `vector.<n>.offsets`) are gated the same way.
+    if kosha_core::is_vector_index_file(name) {
         needs_vectors
     } else {
         true
@@ -805,8 +909,22 @@ fn segments_needing_sync<'a>(
     manifest
         .segments
         .iter()
-        .filter(|e| !synced.contains(&(ns.clone(), e.segment_id.clone())))
+        // A branch's inherited segment is durable by construction: it was
+        // listed by a published parent manifest (#208).
+        .filter(|e| !manifest.is_inherited_segment(ns, &e.segment_id))
+        .filter(|e| !synced.contains(&synced_key(manifest, ns, &e.segment_id)))
         .collect()
+}
+
+/// `synced_segments` key: the segment's *home* namespace and id, so a
+/// branch and its parent share one durability record per object (#208).
+#[cfg(feature = "s3")]
+fn synced_key(
+    manifest: &kosha_core::Manifest,
+    ns: &NamespaceId,
+    segment: &kosha_core::SegmentId,
+) -> (NamespaceId, kosha_core::SegmentId) {
+    (manifest.segment_home(ns, segment).clone(), segment.clone())
 }
 
 /// How many times one publish rebases onto a newer remote manifest before
@@ -983,6 +1101,9 @@ impl AppState {
 
     fn with_options(data_dir: PathBuf, options: StateOptions) -> Self {
         std::fs::create_dir_all(&data_dir).ok();
+        // Before the disk cache scans `data_dir`: transient tail segments of
+        // an earlier process are never reused (#255).
+        unindexed::remove_stale_tail_segments(&data_dir);
         // Segment files must live under data_dir (indexer/searcher paths).
         // KOSHA_CACHE_DIR is accepted for deploy overlays but Phase 1 always
         // materializes segments in KOSHA_DATA_DIR so paths stay consistent.
@@ -1255,17 +1376,20 @@ impl AppState {
                     if is_ingest_role {
                         if let Some(ref s3) = s3_storage {
                             for entry in &manifest.segments {
-                                let rel = format!("{}/{}", ns.0, entry.segment_id.0);
+                                // A branch's inherited segment is checked
+                                // (and keyed) where it lives (#208).
+                                let rel = manifest.segment_rel_dir(&ns, &entry.segment_id);
+                                let key = synced_key(&manifest, &ns, &entry.segment_id);
                                 let durability = s3.segment_durability(&rel);
                                 if durability.is_durable() {
-                                    synced_segments.insert((ns.clone(), entry.segment_id.clone()));
+                                    synced_segments.insert(key);
                                     continue;
                                 }
-                                let seg_path = data_dir.join(&ns.0).join(&entry.segment_id.0);
+                                let seg_path =
+                                    manifest.segment_dir(&data_dir, &ns, &entry.segment_id);
                                 match sync_segment_dir_to_s3(s3, &data_dir, &seg_path) {
                                     Ok(()) => {
-                                        synced_segments
-                                            .insert((ns.clone(), entry.segment_id.clone()));
+                                        synced_segments.insert(key);
                                         reconciled_missing += 1;
                                         println!(
                                             "reconciliation: re-uploaded segment not durable in \
@@ -1313,6 +1437,7 @@ impl AppState {
         let ingest_host = std::env::var("KOSHA_INGEST_HOST")
             .ok()
             .filter(|h| !h.is_empty());
+        let query_role = ingest_host.is_some();
         let write_http_client = ingest_host.as_ref().map(|h| {
             println!("write-path requests will be forwarded to ingest at {h}");
             reqwest::blocking::Client::builder()
@@ -1457,6 +1582,7 @@ impl AppState {
                 .ok()
                 .filter(|k| !k.is_empty()),
             publication_locks: Mutex::new(HashMap::new()),
+            branch_lock: Mutex::new(()),
             #[cfg(feature = "s3")]
             segment_checksum_failures: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "s3")]
@@ -1585,6 +1711,10 @@ impl AppState {
             manifest_follow: manifest_follow::ManifestFollow::new(
                 manifest_follow::refresh_interval_from_env(),
             ),
+            shard_views: Mutex::new(HashMap::new()),
+            default_consistency: unindexed::Consistency::from_env(),
+            unindexed_cap: unindexed::UnindexedCap::from_env(),
+            unindexed: unindexed::UnindexedState::new(query_role),
         }
     }
 
@@ -1785,10 +1915,62 @@ impl AppState {
         config: &kosha_core::gc::GcConfig,
     ) -> Vec<kosha_core::gc::NamespaceGcReport> {
         let _serial = self.gc_lock.lock().unwrap();
+        // No branch is created or deleted while GC decides what is still
+        // referenced (#208).
+        let _lineage = self.branch_lock.lock().unwrap();
         let all = self.controller.lock().unwrap().list_namespaces();
         let mut reports = Vec::new();
+        // Every manifest, read up front: a branch lists segments (and
+        // deletion bitmaps) under its parent's prefix, which the parent's
+        // GC must keep however long ago the parent itself dropped them.
+        // Fallible on purpose: a reference set that silently missed a
+        // manifest would reclaim live objects.
+        let mut manifests: Vec<(NamespaceId, kosha_core::Manifest)> = Vec::new();
+        for ns in &all {
+            match self.controller.lock().unwrap().try_manifest_cloned(ns) {
+                Ok(Some(manifest)) => manifests.push((ns.clone(), manifest)),
+                Ok(None) => {}
+                Err(e) => {
+                    return namespaces
+                        .iter()
+                        .map(|ns| kosha_core::gc::NamespaceGcReport {
+                            namespace: ns.0.clone(),
+                            dry_run: config.dry_run,
+                            aborted: Some(format!(
+                                "GC skipped: cannot read every manifest to find shared \
+                                 segments ({}: {e})",
+                                ns.0
+                            )),
+                            ..Default::default()
+                        })
+                        .collect();
+                }
+            }
+        }
         for ns in namespaces {
             let others: Vec<NamespaceId> = all.iter().filter(|n| *n != ns).cloned().collect();
+            let referenced = kosha_core::branch::References::collect(
+                manifests
+                    .iter()
+                    .filter(|(other, manifest)| other != ns && manifest.branch.is_some())
+                    .map(|(other, manifest)| (other, manifest)),
+            );
+            let config = match referenced {
+                Ok(refs) => kosha_core::gc::GcConfig {
+                    referenced_elsewhere: Some(Arc::new(refs)),
+                    ..config.clone()
+                },
+                Err(e) => {
+                    reports.push(kosha_core::gc::NamespaceGcReport {
+                        namespace: ns.0.clone(),
+                        dry_run: config.dry_run,
+                        aborted: Some(format!("GC skipped: cannot resolve branch references: {e}")),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            };
+            let config = &config;
             let mut load = || Ok(self.controller.lock().unwrap().manifest_cloned(ns));
             let mut commit = |expected: u64, manifest: kosha_core::Manifest| {
                 // Same lock as a local publish, so this node's writer sees
@@ -2004,7 +2186,13 @@ impl AppState {
     fn prewarm_followed_manifest(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) {
         #[cfg(feature = "s3")]
         {
-            if self.s3_storage.is_none() || !self.warmup_namespaces.contains(&ns.0) {
+            // A shard (#207) is warmed when its sharded root is listed.
+            let listed = self.warmup_namespaces.contains(&ns.0)
+                || kosha_core::sharding::shard_index_of(ns).is_some_and(|_| {
+                    ns.0.rsplit_once('/')
+                        .is_some_and(|(root, _)| self.warmup_namespaces.iter().any(|w| w == root))
+                });
+            if self.s3_storage.is_none() || !listed {
                 return;
             }
             let query = warmup_probe_query();
@@ -2020,7 +2208,7 @@ impl AppState {
                     .unwrap()
                     .entry((ns.0.clone(), manifest.version))
                     .or_default()
-                    .merge(None, false);
+                    .merge(None, None);
             } else {
                 eprintln!(
                     "warn: manifest refresh: prewarm of '{}' v{} left {} segment(s) cold",
@@ -2139,14 +2327,7 @@ impl AppState {
         let Some(mut manifest) = self.controller.lock().unwrap().manifest_cloned(ns) else {
             return Ok(None);
         };
-        kosha_core::deletes::hydrate(&mut manifest, |segment, vector| {
-            let path = vector.path(ns, segment)?;
-            #[cfg(feature = "s3")]
-            if let Some(ref s3) = self.s3_storage {
-                return s3.read(&path);
-            }
-            Ok(std::fs::read(self.data_dir.join(path))?)
-        })?;
+        self.hydrate_deletes(ns, &mut manifest)?;
         Ok(Some(manifest))
     }
 
@@ -2189,7 +2370,7 @@ impl AppState {
             // upload for them.
             let mut synced = self.synced_segments.lock().unwrap();
             for entry in &manifest.segments {
-                synced.insert((ns.clone(), entry.segment_id.clone()));
+                synced.insert(synced_key(&manifest, ns, &entry.segment_id));
             }
         }
         self.indexer.restore_manifest(ns.clone(), manifest);
@@ -2216,6 +2397,10 @@ impl AppState {
             .retain(|(cached, _), _| cached != &ns.0);
         self.result_cache.lock().unwrap().forget_namespace(&ns.0);
         self.posting_blob_presence.lock().unwrap().remove(&ns.0);
+        self.shard_views.lock().unwrap().remove(ns);
+        // A deleted namespace's built unindexed tail (#255) and its
+        // transient segment go too.
+        self.drop_cached_tail(ns);
         #[cfg(feature = "s3")]
         self.synced_segments
             .lock()
@@ -2232,6 +2417,58 @@ impl AppState {
             let _ = manifest;
             Ok(())
         })
+    }
+
+    /// Merged manifest over the shards of sharded root `ns` (#207), whose
+    /// current shared manifest is `root`. Shards never written are absent
+    /// (empty). Rebuilt only when the root or a shard's manifest changed.
+    fn sharded_view(
+        &self,
+        ns: &NamespaceId,
+        root: Arc<kosha_core::Manifest>,
+    ) -> Arc<kosha_core::Manifest> {
+        let count = root.shards.unwrap_or(1);
+        let shards: Vec<Option<Arc<kosha_core::Manifest>>> =
+            kosha_core::sharding::shard_namespaces(ns, count)
+                .iter()
+                .map(|shard| self.indexer.manifest_shared(shard))
+                .collect();
+        let mut views = self.shard_views.lock().unwrap();
+        if let Some(view) = views.get(ns).filter(|v| v.is_current(&root, &shards)) {
+            return Arc::clone(&view.merged);
+        }
+        let merged = Arc::new(kosha_core::sharding::merge_shard_manifests(&root, &shards));
+        views.insert(
+            ns.clone(),
+            ShardView {
+                root,
+                shards,
+                merged: Arc::clone(&merged),
+            },
+        );
+        merged
+    }
+
+    /// Cache footers parsed during a search's hydration on the manifest(s)
+    /// that list their segments. A merged sharded view's segment ids are
+    /// `_shard-XXXX/{id}`: those footers belong to the shard namespace.
+    fn remember_search_footers(
+        &self,
+        ns: &NamespaceId,
+        footers: &HashMap<kosha_core::SegmentId, Arc<kosha_core::Footer>>,
+    ) {
+        let sharded = self.indexer.shard_count(ns).is_some();
+        let mut by_shard: HashMap<NamespaceId, Vec<Arc<kosha_core::Footer>>> = HashMap::new();
+        for (segment, footer) in footers {
+            let target = match kosha_core::sharding::split_merged_segment_id(segment) {
+                Some((index, _)) if sharded => kosha_core::sharding::shard_namespace(ns, index),
+                _ => ns.clone(),
+            };
+            by_shard.entry(target).or_default().push(Arc::clone(footer));
+        }
+        for (target, footers) in by_shard {
+            self.indexer.remember_segment_footers(&target, footers);
+        }
     }
 
     /// Serialize publications per namespace and use the same immutable
@@ -2295,7 +2532,7 @@ impl AppState {
                         // them and this node has nothing local to send.
                         let mut synced = self.synced_segments.lock().unwrap();
                         for entry in &remote.segments {
-                            synced.insert((ns.clone(), entry.segment_id.clone()));
+                            synced.insert(synced_key(&remote, ns, &entry.segment_id));
                         }
                     }
                     if self.indexer.rebase_onto(ns, remote)? == kosha_write::RebaseOutcome::Adopted
@@ -2348,7 +2585,7 @@ impl AppState {
             return Ok(());
         };
         for segment_id in pending {
-            let seg_path = self.data_dir.join(&ns.0).join(&segment_id.0);
+            let seg_path = manifest.segment_dir(&self.data_dir, ns, &segment_id);
             // Only mark synced once the segment is committed (`_COMMIT`
             // written last, #231). A partial upload must be retried by a
             // future publish call, never treated as durable.
@@ -2356,10 +2593,15 @@ impl AppState {
             self.synced_segments
                 .lock()
                 .unwrap()
-                .insert((ns.clone(), segment_id));
+                .insert(synced_key(manifest, ns, &segment_id));
         }
         if let Some(ref s3) = self.s3_storage {
             for (segment, vector) in &manifest.deletion_vectors {
+                // Inherited from a branch parent (#208): already durable in
+                // the parent's prefix, and not this namespace's to write.
+                if vector.is_inherited(ns) {
+                    continue;
+                }
                 let path = vector.path(ns, segment)?;
                 let bytes = std::fs::read(self.data_dir.join(&path))?;
                 s3.write(&path, &bytes)?;
@@ -3067,19 +3309,25 @@ impl AppState {
         // segment needs depends on its footer.
         let query_analysis = kosha_query::QueryAnalysis::new(query);
         let needs_bloom_check = query.has_prunable_filter() || term_prune.is_some();
-        let needs_vectors = query.knn.is_some();
+        // Single-vector kNN reads its column's index; late interaction
+        // (#205) reads the field's multivec files instead (below).
+        let knn_field = query
+            .knn
+            .as_ref()
+            .filter(|knn| !knn.is_late_interaction())
+            .map(|knn| knn.field.as_str());
         let filter_fields = query_filter_fields(query);
         let all_seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
 
         let missing_manifest_footer_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
             .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
 
         // A footer rewritten after commit (bloom rebuild) is recorded by CRC
@@ -3092,10 +3340,8 @@ impl AppState {
             if manifest.segment_footer(&entry.segment_id).is_some() {
                 continue;
             }
-            let path = self
-                .data_dir
-                .join(&ns.0)
-                .join(&entry.segment_id.0)
+            let path = manifest
+                .segment_dir(&self.data_dir, ns, &entry.segment_id)
                 .join("footer.json");
             if let Ok(bytes) = std::fs::read(&path) {
                 if crc32fast::hash(&bytes) != expected {
@@ -3122,7 +3368,7 @@ impl AppState {
             .iter()
             .filter(|entry| manifest.segment_footer(&entry.segment_id).is_none())
             .filter_map(|entry| {
-                let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
                 let bytes = std::fs::read(seg_path.join("footer.json")).ok()?;
                 // Still not the recorded rewrite (e.g. S3 fetch failed and
                 // left nothing usable): don't cache or prune with it.
@@ -3135,14 +3381,18 @@ impl AppState {
                 }
                 let footer: kosha_core::Footer = serde_json::from_slice(&bytes).ok()?;
                 // A footer.json from a different segment id (a corrupt or
-                // misplaced file) must not be cached under this id.
-                (footer.segment_id == entry.segment_id)
+                // misplaced file) must not be cached under this id. In a
+                // merged sharded view (#207) the entry id carries the
+                // shard's path component; the footer keeps the shard-local
+                // id it was written with.
+                let own_id = kosha_core::sharding::split_merged_segment_id(&entry.segment_id)
+                    .map_or_else(|| entry.segment_id.clone(), |(_, local)| local);
+                (footer.segment_id == entry.segment_id || footer.segment_id == own_id)
                     .then(|| (entry.segment_id.clone(), Arc::new(footer)))
             })
             .collect();
         if !fetched_footers.is_empty() {
-            self.indexer
-                .remember_segment_footers(ns, fetched_footers.values().cloned());
+            self.remember_search_footers(ns, &fetched_footers);
         }
 
         let segment_footer = |entry: &kosha_core::ManifestEntry| {
@@ -3159,8 +3409,12 @@ impl AppState {
             .segments
             .iter()
             .filter_map(|entry| {
-                segment_footer(entry)
-                    .map(|footer| (self.data_dir.join(&ns.0).join(&entry.segment_id.0), footer))
+                segment_footer(entry).map(|footer| {
+                    (
+                        manifest.segment_dir(&self.data_dir, ns, &entry.segment_id),
+                        footer,
+                    )
+                })
             })
             .collect();
         let analyses: Vec<Option<&kosha_core::SegmentAnalysis>> = manifest
@@ -3176,7 +3430,7 @@ impl AppState {
             .filter(|t| !t.is_empty());
         let mut to_hydrate: Vec<PathBuf> = Vec::new();
         let mut stats_only: Vec<PathBuf> = Vec::new();
-        for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths) {
+        for (entry, seg_path) in manifest.segments.iter().zip(all_seg_paths.iter().cloned()) {
             // Borrowed, never cloned: footers hold every bloom. A segment
             // with no cached footer was already read (once) into
             // `fetched_footers` above.
@@ -3200,7 +3454,7 @@ impl AppState {
         let mut filter_files: HashMap<PathBuf, Vec<String>> = HashMap::new();
         if let Some(fields) = &filter_fields {
             for entry in &manifest.segments {
-                let seg_path = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                let seg_path = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
                 let footer = manifest
                     .segment_footer(&entry.segment_id)
                     .or_else(|| fetched_footers.get(&entry.segment_id).map(Arc::as_ref));
@@ -3210,7 +3464,7 @@ impl AppState {
         }
         let mut outcome = self.ensure_scoring_files_local(
             &to_hydrate,
-            needs_vectors,
+            knn_field,
             &filter_files,
             &manifest_footers,
             request,
@@ -3228,6 +3482,43 @@ impl AppState {
         outcome.missing.extend(postings_outcome.missing);
         outcome.rounds += postings_outcome.rounds;
         outcome.postings = postings_outcome.postings;
+        // Late interaction (#205) reads the queried field's bag store and
+        // token index, which only some segments have (their footers say
+        // which); single-vector kNN never fetches them.
+        if let Some(knn) = query.knn.as_ref().filter(|k| k.is_late_interaction()) {
+            let scoring: std::collections::HashSet<&PathBuf> = to_hydrate.iter().collect();
+            let mut by_file: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
+            for (entry, seg_path) in manifest.segments.iter().zip(&all_seg_paths) {
+                if !scoring.contains(seg_path) {
+                    continue;
+                }
+                let Some(i) = segment_footer(entry)
+                    .and_then(|f| f.multi_vectors.iter().position(|m| m.name == knn.field))
+                else {
+                    continue;
+                };
+                for file in [
+                    kosha_segment::multivec::bags_file(i),
+                    kosha_segment::multivec::ivf_file(i),
+                ] {
+                    by_file.entry(file).or_default().push(seg_path.clone());
+                }
+            }
+            for (file, paths) in by_file {
+                let (files, bytes) = self.ensure_files_local(&paths, &file, request);
+                outcome.files_fetched += files;
+                outcome.bytes_fetched += bytes;
+                // Still missing: the search must not run (and the verdict
+                // must not be cached) without them.
+                outcome.missing.extend(
+                    paths
+                        .iter()
+                        .filter(|p| !file_present_nonempty(&p.join(&file)))
+                        .filter_map(|p| p.strip_prefix(&self.data_dir).ok())
+                        .map(|p| p.to_string_lossy().into_owned()),
+                );
+            }
+        }
         if !stats_only.is_empty() {
             // Best effort: whatever is still missing afterwards doesn't fail
             // the search. The searcher then can't read that segment's `df`
@@ -3238,7 +3529,7 @@ impl AppState {
             // ranged spans where the segment allows (#245).
             let stats_files = self.ensure_scoring_files_local(
                 &stats_only,
-                false,
+                None,
                 &HashMap::new(),
                 &manifest_footers,
                 request,
@@ -3279,7 +3570,9 @@ impl AppState {
     /// `doc_store.offsets` sidecar is present (Lazy open: scoring reads only
     /// the small offsets sidecar, never the bulk doc store). Legacy segments
     /// without offsets fall back to eager open, which does need
-    /// `doc_store.bin`. `vector.idx` is required only for kNN queries.
+    /// `doc_store.bin`. Vector files are required only for kNN queries, and
+    /// then only those of the column `knn_field` names (#204, see
+    /// [`kosha_segment::knn_vector_files`]).
     ///
     /// Contrast [`AppState::REQUIRED_SEGMENT_FILES`] / `segment_is_complete`,
     /// which is the *full* set used by the compaction/merge path (those read
@@ -3298,7 +3591,7 @@ impl AppState {
     #[cfg(all(test, feature = "s3"))]
     fn segment_is_scoring_complete(
         seg_path: &Path,
-        needs_vectors: bool,
+        knn_field: Option<&str>,
         needs_filters: bool,
         manifest_footer: Option<&kosha_core::Footer>,
     ) -> bool {
@@ -3307,13 +3600,7 @@ impl AppState {
         } else {
             Vec::new()
         };
-        Self::scoring_complete(
-            seg_path,
-            needs_vectors,
-            false,
-            &filter_files,
-            manifest_footer,
-        )
+        Self::scoring_complete(seg_path, knn_field, false, &filter_files, manifest_footer)
     }
 
     /// [`Self::segment_is_scoring_complete`] with `vectors_ranged`: kNN
@@ -3327,7 +3614,7 @@ impl AppState {
     /// columns for a columnar one.
     fn scoring_complete(
         seg_path: &Path,
-        needs_vectors: bool,
+        knn_field: Option<&str>,
         vectors_ranged: bool,
         filter_files: &[String],
         manifest_footer: Option<&kosha_core::Footer>,
@@ -3354,18 +3641,16 @@ impl AppState {
         // segments never have one. A clustered segment without it is served
         // by exact scan of every vector (seconds on a large segment), so it
         // is not complete until the sidecar has been fetched.
-        if needs_vectors {
-            // `vector.offsets` exists only for the clustered format, whose
-            // postings the reader fetches by range.
-            if vectors_ranged && file_present_nonempty(&seg_path.join("vector.offsets")) {
-                return true;
-            }
-            if !file_present_nonempty(&seg_path.join("vector.idx")) {
-                return false;
-            }
-            if !file_present_nonempty(&seg_path.join("vector.offsets"))
-                && kosha_segment::vector_index_needs_offsets(seg_path)
-            {
+        if let Some(field) = knn_field {
+            let local_footer;
+            let footer = match manifest_footer {
+                Some(footer) => Some(footer),
+                None => {
+                    local_footer = SegmentReader::read_footer(seg_path).ok();
+                    local_footer.as_ref()
+                }
+            };
+            if !knn_files_complete(seg_path, footer, field, vectors_ranged) {
                 return false;
             }
         }
@@ -3390,7 +3675,7 @@ impl AppState {
     fn ensure_scoring_files_local(
         &self,
         seg_paths: &[PathBuf],
-        needs_vectors: bool,
+        knn_field: Option<&str>,
         filter_files: &HashMap<PathBuf, Vec<String>>,
         manifest_footers: &HashMap<PathBuf, &kosha_core::Footer>,
         request: &Arc<RequestHydration>,
@@ -3405,7 +3690,7 @@ impl AppState {
         let (owned, waiting) = partition_for_hydration(&self.in_flight_segments, seg_paths, |p| {
             Self::scoring_complete(
                 p,
-                needs_vectors,
+                knn_field,
                 vectors_ranged,
                 filters_of(p),
                 manifest_footers.get(p).copied(),
@@ -3414,6 +3699,26 @@ impl AppState {
 
         if !owned.is_empty() {
             let _permit = self.hydration_semaphore.acquire();
+
+            // Which vector files a kNN needs is read from each segment's
+            // footer (#204), so a footer known neither from the manifest nor
+            // locally must be fetched before the list below is built.
+            if knn_field.is_some() {
+                let without_footer: Vec<PathBuf> = owned
+                    .iter()
+                    .map(|(p, _)| p.clone())
+                    .filter(|p| {
+                        !manifest_footers.contains_key(p)
+                            && !file_present_nonempty(&p.join("footer.json"))
+                    })
+                    .collect();
+                if !without_footer.is_empty() {
+                    let (files, bytes) =
+                        self.ensure_files_local(&without_footer, "footer.json", request);
+                    outcome.files_fetched += files;
+                    outcome.bytes_fetched += bytes;
+                }
+            }
 
             // Sizes are unknown without a per-segment LIST round trip —
             // avoiding that round trip is half the point of this path (file
@@ -3486,39 +3791,52 @@ impl AppState {
                     logical_paths.push((format!("{s3_prefix}/doc_store.bin"), 0));
                 }
 
-                // Ranged mode (#245) fetches `vector.idx` whole only for
-                // segments that turn out to have no `vector.offsets`
-                // (below); clustered segments read their probed postings by
-                // range during the search.
-                if needs_vectors && !vectors_ranged {
-                    if !file_present_nonempty(&seg_path.join("vector.idx")) {
-                        logical_paths.push((format!("{s3_prefix}/vector.idx"), 0));
+                // Only the queried column's files (#204), as the segment's
+                // footer lists them. Ranged mode (#245) fetches a clustered
+                // column's offsets sidecar only: its probed postings are
+                // read by range during the search, and the idx file is
+                // fetched whole only for a column that turns out to have no
+                // sidecar (below). A legacy segment's `vector.offsets`
+                // exists only for the clustered format, and there is no
+                // footer signal to predict that (vector.idx is
+                // deliberately self-describing), so it is always attempted:
+                // a segment that doesn't have one just shows up as a
+                // per-file miss in `s3.read_many`'s accounting, not a
+                // hydration failure. Without the sidecar the lazy path
+                // never activates for S3-backed segments, and every kNN
+                // query silently takes the (still correct, just slower)
+                // eager fallback.
+                if let Some(field) = knn_field {
+                    let local_footer;
+                    let footer = match manifest_footers.get(seg_path) {
+                        Some(footer) => Some(*footer),
+                        None => {
+                            local_footer = SegmentReader::read_footer(seg_path).ok();
+                            local_footer.as_ref()
+                        }
+                    };
+                    for column in kosha_segment::knn_vector_columns(footer, field) {
+                        let mut files: Vec<&str> = Vec::new();
+                        if let Some(offsets) = &column.offsets_file {
+                            files.push(offsets);
+                        }
+                        if !vectors_ranged || column.offsets_file.is_none() {
+                            files.push(&column.idx_file);
+                        }
+                        for file in files {
+                            if !file_present_nonempty(&seg_path.join(file)) {
+                                logical_paths.push((format!("{s3_prefix}/{file}"), 0));
+                            }
+                        }
                     }
-                    // vector.offsets is the v2 posting-index sidecar — like
-                    // doc_store.offsets, only some segments have one
-                    // (legacy v1 segments never do; the reader falls back
-                    // to an eager parse of vector.idx alone when it's
-                    // absent). Unlike doc_store's sidecar, there's no
-                    // Footer.format_version signal to predict its existence
-                    // (vector.idx is deliberately self-describing,
-                    // independent of Footer — same as inverted.idx), so
-                    // this always attempts the fetch when vectors are
-                    // needed; a segment that doesn't have one just shows up
-                    // as a per-file miss in `s3.read_many`'s accounting,
-                    // not a hydration failure. Without this, the lazy path
-                    // never activates for S3-backed segments — the sidecar
-                    // never lands locally before `SegmentReader::open`, so
-                    // every S3-backed KNN query silently takes the (still
-                    // correct, just slower) eager fallback.
-                    if !file_present_nonempty(&seg_path.join("vector.offsets")) {
-                        logical_paths.push((format!("{s3_prefix}/vector.offsets"), 0));
+                    if kosha_segment::knn_needs_doc_vectors(footer)
+                        && !file_present_nonempty(&seg_path.join(kosha_segment::DOC_VECTORS_FILE))
+                    {
+                        logical_paths.push((
+                            format!("{s3_prefix}/{}", kosha_segment::DOC_VECTORS_FILE),
+                            0,
+                        ));
                     }
-                }
-                if needs_vectors
-                    && vectors_ranged
-                    && !file_present_nonempty(&seg_path.join("vector.offsets"))
-                {
-                    logical_paths.push((format!("{s3_prefix}/vector.offsets"), 0));
                 }
             }
 
@@ -3551,16 +3869,34 @@ impl AppState {
             // Ranged mode: a segment with no `vector.offsets` is a legacy
             // flat (or unclustered) one, searched by exact scan of the whole
             // `vector.idx`. One more round, for those segments only.
-            if needs_vectors && vectors_ranged {
-                let legacy: Vec<(String, u64)> = owned
-                    .iter()
-                    .filter(|(p, _)| {
-                        !file_present_nonempty(&p.join("vector.offsets"))
-                            && !file_present_nonempty(&p.join("vector.idx"))
-                    })
-                    .filter_map(|(p, _)| p.strip_prefix(&self.data_dir).ok())
-                    .map(|rel| (format!("{}/vector.idx", rel.to_string_lossy()), 0))
-                    .collect();
+            if let (Some(field), true) = (knn_field, vectors_ranged) {
+                let mut legacy: Vec<(String, u64)> = Vec::new();
+                for (p, _) in &owned {
+                    let Ok(rel) = p.strip_prefix(&self.data_dir) else {
+                        continue;
+                    };
+                    let local_footer;
+                    let footer = match manifest_footers.get(p) {
+                        Some(footer) => Some(*footer),
+                        None => {
+                            local_footer = SegmentReader::read_footer(p).ok();
+                            local_footer.as_ref()
+                        }
+                    };
+                    for column in kosha_segment::knn_vector_columns(footer, field) {
+                        let Some(offsets) = &column.offsets_file else {
+                            continue;
+                        };
+                        if !file_present_nonempty(&p.join(offsets))
+                            && !file_present_nonempty(&p.join(&column.idx_file))
+                        {
+                            legacy.push((
+                                format!("{}/{}", rel.to_string_lossy(), column.idx_file),
+                                0,
+                            ));
+                        }
+                    }
+                }
                 if !legacy.is_empty() {
                     self.hydrate_files(s3, &legacy, self.scoring_hydrate_concurrency, request);
                     outcome.rounds += 1;
@@ -3654,7 +3990,7 @@ impl AppState {
             .filter(|p| {
                 !Self::scoring_complete(
                     p,
-                    needs_vectors,
+                    knn_field,
                     vectors_ranged,
                     filters_of(p),
                     manifest_footers.get(*p).copied(),
@@ -3686,7 +4022,7 @@ impl AppState {
             .segments
             .iter()
             .map(|entry| {
-                let dir = self.data_dir.join(&ns.0).join(&entry.segment_id.0);
+                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
                 manifest
                     .footer_or_read(&entry.segment_id, || {
                         kosha_segment::SegmentReader::read_footer(&dir).ok()
@@ -3708,7 +4044,7 @@ impl AppState {
         let seg_paths: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .map(|entry| self.data_dir.join(&ns.0).join(&entry.segment_id.0))
+            .map(|entry| manifest.segment_dir(&self.data_dir, ns, &entry.segment_id))
             .collect();
         self.ensure_query_postings(
             ns,
@@ -3905,6 +4241,7 @@ impl AppState {
     fn hydrate_vector_postings(
         &self,
         seg: &Path,
+        file: &str,
         ranges: &[(u64, u64)],
         request: &Arc<RequestHydration>,
     ) -> posting_spans::PostingFetchStats {
@@ -3928,7 +4265,7 @@ impl AppState {
         let o = posting_spans::fetch_file_spans(
             &rel,
             seg,
-            kosha_segment::VECTOR_IDX_FILE,
+            file,
             ranges,
             self.posting_span_hydrator.coalesce_gap(),
             &fetcher,
@@ -3938,11 +4275,7 @@ impl AppState {
         stats.ranged_gets = o.gets;
         stats.ranged_bytes = o.bytes;
         if o.failed {
-            let (files, bytes) = self.ensure_files_local(
-                &[seg.to_path_buf()],
-                kosha_segment::VECTOR_IDX_FILE,
-                request,
-            );
+            let (files, bytes) = self.ensure_files_local(&[seg.to_path_buf()], file, request);
             stats.rounds += 1;
             stats.whole_files = files as u64;
             stats.whole_bytes = bytes;
@@ -4895,6 +5228,15 @@ fn is_write_path(request_line: &str) -> bool {
     if extract_namespace(request_line, "POST /v1/namespaces/", "/schema").is_some() {
         return true;
     }
+    if extract_namespace(request_line, "POST /v1/namespaces/", "/shards").is_some() {
+        return true;
+    }
+    // Branch create/delete (#208) write manifests and reclaim objects.
+    if extract_namespace(request_line, "POST /v1/namespaces/", "/branch").is_some()
+        || extract_namespace(request_line, "DELETE /v1/namespaces/", "/branch").is_some()
+    {
+        return true;
+    }
     // v1 admin routes — all mutate segment/manifest state.
     if request_line.starts_with("POST /v1/admin/") {
         return true;
@@ -5170,6 +5512,23 @@ fn route_inner(
         return handle_get_schema_with_ns(&ns, tenant, state);
     }
 
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/shards") {
+        return handle_put_shards_with_ns(&ns, tenant, body, state);
+    }
+
+    // ── Namespace branching (#208) ─────────────────────────────────────────
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/branch") {
+        return branching::handle_branch_create(&ns, tenant, body, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/branches") {
+        return branching::handle_branch_list(&ns, tenant, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "DELETE /v1/namespaces/", "/branch") {
+        return branching::handle_branch_delete(&ns, tenant, state);
+    }
+
     if request_line.starts_with("GET /v1/stats") {
         return handle_stats(state);
     }
@@ -5236,6 +5595,19 @@ fn route_inner(
         {
             return json_error(404, "not found");
         }
+    }
+
+    // A query pod's strong-consistency search reads the ingest pod's
+    // unindexed tail (#255). Authorized like the segment route above.
+    if let Some(rest) = request_line.strip_prefix("GET /internal/namespaces/") {
+        let target = rest.split(' ').next().unwrap_or("");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        return match path.strip_suffix("/unindexed") {
+            Some(ns) if !ns.is_empty() => {
+                unindexed::handle_internal_unindexed(&url_decode(ns), query, state)
+            }
+            _ => json_error(404, "not found"),
+        };
     }
 
     // ── Legacy Phase 1 routes (backward compat) ────────────────────────────
@@ -5544,6 +5916,45 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
     }))
 }
 
+/// Every other namespace whose manifest lists a segment or deletion
+/// bitmap stored under `id`'s prefix (a branch of it, or of one of its
+/// branches, #208).
+fn branches_referencing(
+    state: &AppState,
+    id: &NamespaceId,
+) -> Result<Vec<NamespaceId>, KoshaError> {
+    let below = format!("{}/", id.0);
+    let homed_here = |home: &NamespaceId| home == id || home.0.starts_with(&below);
+    let mut out = Vec::new();
+    let others = state.controller.lock().unwrap().list_namespaces();
+    for other in others {
+        if other == *id || other.0.starts_with(&below) {
+            continue;
+        }
+        let manifest = state
+            .controller
+            .lock()
+            .unwrap()
+            .try_manifest_cloned(&other)?;
+        let Some(manifest) = manifest else {
+            continue;
+        };
+        let refers = manifest
+            .branch
+            .as_ref()
+            .is_some_and(|branch| branch.segment_homes.values().any(homed_here))
+            || manifest
+                .deletion_vectors
+                .values()
+                .filter_map(|vector| vector.namespace.as_ref())
+                .any(homed_here);
+        if refers {
+            out.push(other);
+        }
+    }
+    Ok(out)
+}
+
 /// `DELETE /v1/namespaces/{ns}` — `DeleteNamespaceResponse`. 404 if the
 /// caller's tenant has no such namespace.
 ///
@@ -5568,6 +5979,30 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
 /// `run_manifest_refresh_tick`, or a search with `max_staleness_seconds: 0`).
 fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String {
     let id = NamespaceId(tenant_namespace(tenant, name));
+    // No branch is created from (or deleted under) this namespace while it
+    // goes (#208).
+    let _lineage = state.branch_lock.lock().unwrap();
+    // Deleting a namespace deletes everything under its prefix. A branch
+    // still listing segments or deletion bitmaps that live there would be
+    // left pointing at nothing, so the branches go first.
+    match branches_referencing(state, &id) {
+        Ok(branches) if branches.is_empty() => {}
+        Ok(branches) => {
+            return json_error(
+                409,
+                &format!(
+                    "namespace '{name}' has branches that share its segments ({}); delete \
+                     them first (DELETE /v1/namespaces/{{branch}}/branch)",
+                    branches
+                        .iter()
+                        .map(|b| b.0.split_once('/').map_or(b.0.as_str(), |(_, n)| n))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        }
+        Err(e) => return json_error(503, &format!("control store: {e}")),
+    }
     let lock = state.publication_lock(&id);
     let _guard = lock.lock().unwrap();
     let local_version = state.indexer.manifest_version(&id);
@@ -5592,6 +6027,45 @@ fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String
         }
         Err(e) => return json_error(500, &format!("delete namespace failed: {e}")),
     };
+    // A sharded namespace (#207): its shards are namespaces of their own,
+    // nested under its prefix (so the local and S3 cleanup below covers
+    // their files). Drop them from the control store and the writer too,
+    // or their manifests, buffers and WAL records would outlive the root.
+    let shard_ids = manifest
+        .shards
+        .filter(|&n| n > 1)
+        .map(|n| kosha_core::sharding::shard_namespaces(&id, n))
+        .unwrap_or_default();
+    for shard in &shard_ids {
+        let shard_local = state.indexer.manifest_version(shard);
+        let shard_deleted = state
+            .controller
+            .lock()
+            .unwrap()
+            .delete_namespace(shard, shard_local.unwrap_or(0));
+        let shard_retired = match shard_deleted {
+            Ok((_, retired)) => retired,
+            Err(KoshaError::NamespaceNotFound(_)) => shard_local.unwrap_or(0),
+            Err(e) => {
+                return json_error(
+                    500,
+                    &format!("delete namespace failed: shard {}: {e}", shard.0),
+                )
+            }
+        };
+        let shard_next =
+            kosha_core::initial_manifest_version(Some(shard_retired.max(shard_local.unwrap_or(0))));
+        if let Err(e) = state.indexer.drop_namespace(shard, shard_next, || {}) {
+            return json_error(
+                500,
+                &format!(
+                    "namespace '{name}': discarding the write-ahead log of shard {} failed: {e}",
+                    shard.0
+                ),
+            );
+        }
+        state.forget_namespace_caches(shard);
+    }
     let next_version =
         kosha_core::initial_manifest_version(Some(retired.max(local_version.unwrap_or(0))));
     // Local segment files go while the writer still holds the namespace's
@@ -5682,6 +6156,68 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     }
 
     let ns = request.namespace;
+    match write_routed(state, &ns, request.documents, index_into) {
+        Ok(count) => json_ok(&IndexResponse {
+            indexed_count: count,
+            namespace: ns,
+        }),
+        Err(response) => response,
+    }
+}
+
+/// Group documents by the shard their id routes to (#207), keeping each
+/// shard's documents in request order.
+fn route_to_shards(
+    ns: &NamespaceId,
+    shards: u32,
+    documents: Vec<kosha_core::Document>,
+) -> Vec<(NamespaceId, Vec<kosha_core::Document>)> {
+    let mut grouped: std::collections::BTreeMap<u32, Vec<kosha_core::Document>> =
+        Default::default();
+    for doc in documents {
+        let shard = kosha_core::sharding::shard_for_document(&doc.id.0, shards);
+        grouped.entry(shard).or_default().push(doc);
+    }
+    grouped
+        .into_iter()
+        .map(|(shard, docs)| (kosha_core::sharding::shard_namespace(ns, shard), docs))
+        .collect()
+}
+
+/// Apply a document write to `ns`, or — for a sharded namespace (#207) — to
+/// each shard its documents route to, publishing each shard. Shards are
+/// written one after another: a failure part-way leaves earlier shards
+/// written, which a client retry of the whole (idempotent, id-keyed) batch
+/// repairs. Returns how many documents were written.
+fn write_routed(
+    state: &AppState,
+    ns: &NamespaceId,
+    documents: Vec<kosha_core::Document>,
+    write: fn(&AppState, &NamespaceId, Vec<kosha_core::Document>) -> Result<usize, String>,
+) -> Result<usize, String> {
+    let Some(shards) = state.indexer.shard_count(ns) else {
+        return write(state, ns, documents);
+    };
+    let mut total = 0;
+    for (shard, docs) in route_to_shards(ns, shards, documents) {
+        total += write(state, &shard, docs)?;
+    }
+    Ok(total)
+}
+
+/// `POST /index` for one (unsharded or shard) namespace. `Err` carries a
+/// ready-to-send error response.
+fn index_into(
+    state: &AppState,
+    ns: &NamespaceId,
+    documents: Vec<kosha_core::Document>,
+) -> Result<usize, String> {
+    let ns = ns.clone();
+    // Unindexed backlog at its cap (#255): refuse before buffering more.
+    // Per written namespace, so a sharded namespace caps each shard.
+    if let Some(response) = state.unindexed_backpressure(&ns) {
+        return Err(response);
+    }
 
     // Upsert may rewrite immutable segments that hold prior versions of the
     // same ids, so materialize any S3-backed segment directories first.
@@ -5699,7 +6235,7 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
             let paths: Vec<PathBuf> = manifest
                 .segments
                 .iter()
-                .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
+                .map(|entry| manifest.segment_dir(&state.data_dir, &ns, &entry.segment_id))
                 .collect();
             // Rewrite/lookup paths must see a segment's full fidelity,
             // including vectors — unlike the search path, there's no
@@ -5707,7 +6243,7 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
             // fetch them.
             let outcome = state.ensure_segments_local(&paths, true);
             if let Some(error) = hydration_error_response(&outcome) {
-                return error;
+                return Err(error);
             }
         }
     }
@@ -5715,9 +6251,12 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     let (count, manifest_changed) = {
         let indexer = &state.indexer;
         let version_before = indexer.manifest(&ns).map(|m| m.version);
-        let count = match indexer.index_documents(ns.clone(), request.documents) {
+        let count = match indexer.index_documents(ns.clone(), documents) {
             Ok(c) => c,
-            Err(e) => return json_error(500, &format!("indexing error: {e}")),
+            // A rejected document (e.g. a vector of the wrong dimension
+            // for its field, #204) is the client's error.
+            Err(KoshaError::InvalidQuery(message)) => return Err(json_error(400, &message)),
+            Err(e) => return Err(json_error(500, &format!("indexing error: {e}"))),
         };
         // index_documents auto-flushes when the buffer hits the threshold
         // (or rewrites on id collision), which mutates the manifest —
@@ -5736,14 +6275,11 @@ fn handle_index(body: &[u8], state: &AppState) -> String {
     // write survives restarts (explicit flushes go through publish_namespace too).
     if manifest_changed || state.indexer.manifest_cloned(&ns).is_some() {
         if let Err(e) = state.publish_namespace(&ns) {
-            return publication_error("publication failed", &e);
+            return Err(publication_error("publication failed", &e));
         }
     }
 
-    json_ok(&IndexResponse {
-        indexed_count: count,
-        namespace: ns,
-    })
+    Ok(count)
 }
 
 // ─── POST /exists ───────────────────────────────────────────────────────────
@@ -5760,49 +6296,38 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
         Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
     };
 
-    // Existence scans immutable segments, so materialize any S3-backed
-    // segment directories before entering the indexer lock. Batched across
-    // the whole manifest — see handle_index for why this isn't a per-segment
-    // loop.
-    #[cfg(feature = "s3")]
-    {
-        let manifest = {
-            let indexer = &state.indexer;
-            indexer.manifest_cloned(&request.namespace)
-        };
-        if let Some(manifest) = manifest {
-            let paths: Vec<PathBuf> = manifest
-                .segments
-                .iter()
-                .map(|entry| {
-                    state
-                        .data_dir
-                        .join(&request.namespace.0)
-                        .join(&entry.segment_id.0)
-                })
-                .collect();
-            // Rewrite/lookup paths must see a segment's full fidelity,
-            // including vectors — unlike the search path, there's no
-            // per-call signal here for whether vectors matter, so always
-            // fetch them.
-            let outcome = state.ensure_segments_local(&paths, true);
-            if let Some(error) = hydration_error_response(&outcome) {
-                return error;
-            }
-        }
-    }
-
     let ids: Vec<kosha_core::DocumentId> = request
         .ids
         .iter()
         .cloned()
         .map(kosha_core::DocumentId)
         .collect();
-    let existing = {
-        let indexer = &state.indexer;
-        match indexer.existing_ids(&request.namespace, &ids) {
+    // A sharded namespace (#207): each id can only live in the shard it
+    // routes to, so ask each shard about its own ids.
+    let existing = match state.indexer.shard_count(&request.namespace) {
+        None => match existing_ids_in(state, &request.namespace, &ids) {
             Ok(set) => set,
-            Err(e) => return json_error(500, &format!("exists error: {e}")),
+            Err(response) => return response,
+        },
+        Some(shards) => {
+            let mut grouped: std::collections::BTreeMap<u32, Vec<kosha_core::DocumentId>> =
+                Default::default();
+            for id in ids {
+                let shard = kosha_core::sharding::shard_for_document(&id.0, shards);
+                grouped.entry(shard).or_default().push(id);
+            }
+            let mut existing = std::collections::HashSet::new();
+            for (shard, ids) in grouped {
+                let shard = kosha_core::sharding::shard_namespace(&request.namespace, shard);
+                if state.indexer.manifest_version(&shard).is_none() {
+                    continue;
+                }
+                match existing_ids_in(state, &shard, &ids) {
+                    Ok(set) => existing.extend(set),
+                    Err(response) => return response,
+                }
+            }
+            existing
         }
     };
     let mut present = Vec::new();
@@ -5821,6 +6346,41 @@ fn handle_exists(body: &[u8], state: &AppState) -> String {
     }))
 }
 
+/// The subset of `ids` live in one (unsharded or shard) namespace. `Err`
+/// carries a ready-to-send error response.
+fn existing_ids_in(
+    state: &AppState,
+    namespace: &NamespaceId,
+    ids: &[kosha_core::DocumentId],
+) -> Result<std::collections::HashSet<kosha_core::DocumentId>, String> {
+    // Existence scans immutable segments, so materialize any S3-backed
+    // segment directories before entering the indexer lock. Batched across
+    // the whole manifest — see handle_index for why this isn't a per-segment
+    // loop.
+    #[cfg(feature = "s3")]
+    {
+        if let Some(manifest) = state.indexer.manifest_cloned(namespace) {
+            let paths: Vec<PathBuf> = manifest
+                .segments
+                .iter()
+                .map(|entry| manifest.segment_dir(&state.data_dir, namespace, &entry.segment_id))
+                .collect();
+            // Rewrite/lookup paths must see a segment's full fidelity,
+            // including vectors — unlike the search path, there's no
+            // per-call signal here for whether vectors matter, so always
+            // fetch them.
+            let outcome = state.ensure_segments_local(&paths, true);
+            if let Some(error) = hydration_error_response(&outcome) {
+                return Err(error);
+            }
+        }
+    }
+    state
+        .indexer
+        .existing_ids(namespace, ids)
+        .map_err(|e| json_error(500, &format!("exists error: {e}")))
+}
+
 // ─── POST /replace ──────────────────────────────────────────────────────────
 
 fn handle_replace(body: &[u8], state: &AppState) -> String {
@@ -5829,6 +6389,26 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
         Err(error) => return json_error(400, &format!("invalid JSON: {error}")),
     };
     let namespace = request.namespace;
+    match write_routed(state, &namespace, request.documents, replace_into) {
+        Ok(count) => json_ok(&IndexResponse {
+            indexed_count: count,
+            namespace,
+        }),
+        Err(response) => response,
+    }
+}
+
+/// `POST /replace` for one (unsharded or shard) namespace. `Err` carries a
+/// ready-to-send error response.
+fn replace_into(
+    state: &AppState,
+    namespace: &NamespaceId,
+    documents: Vec<kosha_core::Document>,
+) -> Result<usize, String> {
+    let namespace = namespace.clone();
+    if let Some(response) = state.unindexed_backpressure(&namespace) {
+        return Err(response);
+    }
 
     // Replacement scans immutable segments, so materialize any S3-backed
     // segment directories before entering the indexer lock. Batched across
@@ -5844,7 +6424,7 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
             let paths: Vec<PathBuf> = manifest
                 .segments
                 .iter()
-                .map(|entry| state.data_dir.join(&namespace.0).join(&entry.segment_id.0))
+                .map(|entry| manifest.segment_dir(&state.data_dir, &namespace, &entry.segment_id))
                 .collect();
             // Rewrite/lookup paths must see a segment's full fidelity,
             // including vectors — unlike the search path, there's no
@@ -5852,16 +6432,17 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
             // fetch them.
             let outcome = state.ensure_segments_local(&paths, true);
             if let Some(error) = hydration_error_response(&outcome) {
-                return error;
+                return Err(error);
             }
         }
     }
 
     let count = {
         let indexer = &state.indexer;
-        match indexer.replace_documents(namespace.clone(), request.documents) {
+        match indexer.replace_documents(namespace.clone(), documents) {
             Ok(count) => count,
-            Err(error) => return json_error(500, &format!("replacement error: {error}")),
+            Err(KoshaError::InvalidQuery(message)) => return Err(json_error(400, &message)),
+            Err(error) => return Err(json_error(500, &format!("replacement error: {error}"))),
         }
     };
     {
@@ -5869,13 +6450,10 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
         controller.ensure_namespace(namespace.clone());
     }
     if let Err(e) = state.publish_namespace(&namespace) {
-        return publication_error("publication failed", &e);
+        return Err(publication_error("publication failed", &e));
     }
 
-    json_ok(&IndexResponse {
-        indexed_count: count,
-        namespace,
-    })
+    Ok(count)
 }
 
 // ─── POST /flush ────────────────────────────────────────────────────────────
@@ -5887,13 +6465,25 @@ fn handle_replace(body: &[u8], state: &AppState) -> String {
 /// (`spawn_idle_flush_timer`) so both take exactly the same path. `Err`
 /// carries a ready-to-send JSON error response.
 fn flush_and_publish_namespace(state: &AppState, namespace: &NamespaceId) -> Result<(), String> {
+    // A sharded namespace (#207) flushes and publishes each shard; the
+    // root itself never buffers documents.
+    if let Some(shards) = state.indexer.shard_count(namespace) {
+        for shard in kosha_core::sharding::shard_namespaces(namespace, shards) {
+            if state.indexer.manifest_version(&shard).is_some()
+                || state.indexer.pending_doc_count(&shard) > 0
+            {
+                flush_and_publish_namespace(state, &shard)?;
+            }
+        }
+        return Ok(());
+    }
     #[cfg(feature = "s3")]
     if state.indexer.needs_recovery_hydration(namespace) {
         if let Some(manifest) = state.indexer.manifest_cloned(namespace) {
             let paths: Vec<_> = manifest
                 .segments
                 .iter()
-                .map(|e| state.data_dir.join(&namespace.0).join(&e.segment_id.0))
+                .map(|e| manifest.segment_dir(&state.data_dir, namespace, &e.segment_id))
                 .collect();
             let outcome = state.ensure_segments_local(&paths, true);
             if let Some(error) = hydration_error_response(&outcome) {
@@ -5929,7 +6519,7 @@ fn handle_flush(body: &[u8], state: &AppState) -> String {
                 let paths: Vec<_> = manifest
                     .segments
                     .iter()
-                    .map(|e| state.data_dir.join(&namespace.0).join(&e.segment_id.0))
+                    .map(|e| manifest.segment_dir(&state.data_dir, &namespace, &e.segment_id))
                     .collect();
                 let outcome = state.ensure_segments_local(&paths, true);
                 if let Some(error) = hydration_error_response(&outcome) {
@@ -6045,43 +6635,63 @@ fn handle_delete(body: &[u8], state: &AppState) -> String {
         None => return json_error(400, "missing 'filter' or 'query'"),
     };
 
+    let deleted = match state.indexer.shard_count(&ns) {
+        None => delete_in(state, &ns, &filter),
+        // A sharded namespace (#207): delete in every shard that exists.
+        Some(shards) => kosha_core::sharding::shard_namespaces(&ns, shards)
+            .into_iter()
+            .filter(|shard| state.indexer.manifest_version(shard).is_some())
+            .try_fold(0, |total, shard| {
+                delete_in(state, &shard, &filter).map(|count| total + count)
+            }),
+    };
+    match deleted {
+        Ok(count) => json_ok(&serde_json::json!({
+            "deleted": count,
+            "namespace": ns.0,
+        })),
+        Err(response) => response,
+    }
+}
+
+/// Delete by query in one (unsharded or shard) namespace and publish.
+/// `Err` carries a ready-to-send error response.
+fn delete_in(
+    state: &AppState,
+    ns: &NamespaceId,
+    filter: &kosha_core::FilterClause,
+) -> Result<usize, String> {
     #[cfg(feature = "s3")]
-    if let Some(manifest) = state.indexer.manifest_cloned(&ns) {
+    if let Some(manifest) = state.indexer.manifest_cloned(ns) {
         let paths: Vec<PathBuf> = manifest
             .segments
             .iter()
-            .map(|e| state.data_dir.join(&ns.0).join(&e.segment_id.0))
+            .map(|e| manifest.segment_dir(&state.data_dir, ns, &e.segment_id))
             .collect();
         let outcome = state.ensure_segments_local(&paths, false);
         if let Some(error) = hydration_error_response(&outcome) {
-            return error;
+            return Err(error);
         }
     }
 
-    let (_manifest, count) = {
-        let indexer = &state.indexer;
-        let manifest = match indexer.manifest_cloned(&ns) {
-            Some(m) => m,
-            None => return json_error(404, &format!("namespace '{}' not found", ns.0)),
-        };
-        let old_manifest = manifest.clone();
-        match indexer.delete_by_query(&ns, &old_manifest, &filter) {
-            Ok(c) => (old_manifest, c),
+    let manifest = match state.indexer.manifest_cloned(ns) {
+        Some(m) => m,
+        None => return Err(json_error(404, &format!("namespace '{}' not found", ns.0))),
+    };
+    let count = state
+        .indexer
+        .delete_by_query(ns, &manifest, filter)
+        .map_err(|e| match e {
             // A filter the data cannot answer (e.g. `prefix` on a numeric
             // field) is the client's mistake, not a server fault.
-            Err(e @ KoshaError::InvalidQuery(_)) => return json_error(400, &e.to_string()),
-            Err(e) => return json_error(500, &format!("delete error: {e}")),
-        }
-    };
+            KoshaError::InvalidQuery(_) => json_error(400, &e.to_string()),
+            e => json_error(500, &format!("delete error: {e}")),
+        })?;
 
-    if let Err(e) = state.publish_namespace(&ns) {
-        return publication_error("deletion publication failed", &e);
+    if let Err(e) = state.publish_namespace(ns) {
+        return Err(publication_error("deletion publication failed", &e));
     }
-
-    json_ok(&serde_json::json!({
-        "deleted": count,
-        "namespace": ns.0,
-    }))
+    Ok(count)
 }
 
 // ─── GET /stats ──────────────────────────────────────────────────────────────
@@ -6112,8 +6722,15 @@ fn handle_stats(state: &AppState) -> String {
                 "version": manifest.version,
                 "manifest_version": manifest.version,
             });
+            // A sharded root (#207) lists no segments itself; its shards
+            // appear as their own `{root}/_shard-XXXX` entries.
+            if let Some(shards) = manifest.shards {
+                entry["shards"] = serde_json::json!(shards);
+            }
             if state.ingest_host.is_some() {
                 add_manifest_follow_stats(state, &ns, &mut entry);
+            } else {
+                add_unindexed_stats(state, &ns, &mut entry);
             }
             namespaces.push(entry);
         }
@@ -6171,6 +6788,14 @@ fn handle_stats(state: &AppState) -> String {
     }))
 }
 
+/// The writer's unindexed backlog of a namespace (#255): what strong
+/// searches scan exhaustively and what `KOSHA_MAX_UNINDEXED_*` caps.
+fn add_unindexed_stats(state: &AppState, ns: &NamespaceId, entry: &mut serde_json::Value) {
+    let (docs, bytes) = state.indexer.unindexed_usage(ns);
+    entry["unindexed_documents"] = serde_json::json!(docs);
+    entry["unindexed_bytes"] = serde_json::json!(bytes);
+}
+
 /// Per-namespace manifest-following fields for a query replica's stats
 /// (#232): the stored version last seen, when the local manifest was last
 /// confirmed current, and how long ago that was (`manifest_lag_seconds`,
@@ -6206,6 +6831,12 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             Err(e) => return json_error(400, &e),
         };
 
+    // Read-your-writes (#255): whether to also search unindexed writes.
+    let consistency = match unindexed::Consistency::from_json(body_val.get("consistency")) {
+        Ok(c) => c.unwrap_or_else(|| state.default_consistency()),
+        Err(e) => return json_error(400, &e),
+    };
+
     let query: kosha_core::SearchQuery = match serde_json::from_value(body_val) {
         Ok(q) => q,
         Err(e) => return json_error(400, &format!("invalid search query: {e}")),
@@ -6239,16 +6870,20 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     // full request, so rerank parameters are part of it.
     let search_query = first_stage.as_ref().unwrap_or(&query);
 
-    if let Err(e) = state.ensure_query_manifest_fresh(&ns, max_staleness) {
-        return search_error_response(&e);
-    }
-
-    // Shared, not copied: see `Indexer::manifest_shared`.
-    let Some(snapshot) = state.indexer.manifest_shared(&ns) else {
-        return json_error(404, &format!("namespace '{}' not found", ns.0));
+    // Shared, not copied: see `Indexer::manifest_shared`. A sharded
+    // namespace (#207) is searched through one merged view of its shards.
+    // Under strong consistency `view.search` is the manifest plus the
+    // namespace's (or each shard's) unindexed tail (#255); hydration and
+    // every manifest-version keyed cache use the plain snapshot,
+    // `view.base`.
+    let view = match state.search_view(&ns, consistency, max_staleness) {
+        Ok(Some(view)) => view,
+        Ok(None) => return json_error(404, &format!("namespace '{}' not found", ns.0)),
+        Err(response) => return response,
     };
-    let manifest: &kosha_core::Manifest = &snapshot;
-    let tombstones = Some(&manifest.tombstones);
+    let manifest: &kosha_core::Manifest = &view.base;
+    let searched: &kosha_core::Manifest = &view.search;
+    let tombstones = Some(&searched.tombstones);
 
     // ── Whole-response result cache ─────────────────────────────────────
     // Real query traffic is Zipfian in queries too; identical requests
@@ -6267,21 +6902,26 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         .rank_by
         .as_ref()
         .is_some_and(|rank_by| rank_by.is_time_dependent());
-    let cache_key =
-        if result_cache_budget() > 0 && !query.no_cache.unwrap_or(false) && !time_dependent {
-            canonical_query_for_cache(&query).map(|mut canonical| {
-                let mut generations: Vec<_> = manifest
-                    .deletion_vectors
-                    .iter()
-                    .map(|(segment, vector)| (&segment.0, &vector.generation))
-                    .collect();
-                generations.sort_unstable();
-                canonical.push_str(&serde_json::to_string(&generations).unwrap());
-                (ns.0.clone(), manifest.version, canonical)
-            })
-        } else {
-            None
-        };
+    // A search that included unindexed writes (#255) answers for more than
+    // `manifest.version`, so it neither reads nor fills the cache.
+    let cache_key = if result_cache_budget() > 0
+        && !query.no_cache.unwrap_or(false)
+        && !time_dependent
+        && view.is_plain()
+    {
+        canonical_query_for_cache(&query).map(|mut canonical| {
+            let mut generations: Vec<_> = manifest
+                .deletion_vectors
+                .iter()
+                .map(|(segment, vector)| (&segment.0, &vector.generation))
+                .collect();
+            generations.sort_unstable();
+            canonical.push_str(&serde_json::to_string(&generations).unwrap());
+            (ns.0.clone(), manifest.version, canonical)
+        })
+    } else {
+        None
+    };
     if let Some(ref key) = cache_key {
         if let Some(resp) = state.result_cache.lock().unwrap().lookup(key) {
             // Still demand for this namespace (#213): a cached response is
@@ -6325,7 +6965,8 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
         // need one of them; `covers` enforces that per-file-class check
         // instead of trusting a flat "namespace hydrated" bool.
         let needs_filters = query_filter_fields(search_query);
-        let needs_vectors = search_query.knn.is_some();
+        let needs_vectors_key = knn_verdict_key(search_query);
+        let needs_vectors = needs_vectors_key.as_deref();
         let cached_covers = state
             .completed_hydrations
             .lock()
@@ -6425,8 +7066,8 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
     #[cfg(feature = "s3")]
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
-    let fetch_vectors = |seg: &Path, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, ranges, &hydration_request);
+    let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
+        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request);
         vector_fetch_stats.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -6436,7 +7077,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
 
     match state.searcher.search_with_hydrators(
         &ns,
-        manifest,
+        searched,
         search_query,
         tombstones,
         doc_store_hydrator,
@@ -6446,6 +7087,7 @@ fn handle_search_post(body: &[u8], state: &AppState) -> String {
             // Scoring is done; a reranker round trip must not hold a
             // scoring slot.
             drop(slot);
+            result.exhaustive_search_count = view.exhaustive_search_count();
             #[cfg(feature = "s3")]
             let hydration = HydrationOutcome {
                 page: *page_fetch.lock().unwrap(),
@@ -6548,15 +7190,28 @@ fn canonical_query_for_cache(query: &SearchQuery) -> Option<String> {
     for &v in &knn.vector {
         v.to_bits().hash(&mut h2);
     }
+    // Late interaction (#205): every token vector, with its boundaries, so
+    // two bags with the same flattened floats never share a key.
+    let bag = knn.vectors.as_deref().unwrap_or_default();
+    for token in bag {
+        (0x5a5a_a5a5_u64, token.len() as u64).hash(&mut h1);
+        (0x5a5a_a5a5_u64, token.len() as u64).hash(&mut h2);
+        for &v in token {
+            v.to_bits().hash(&mut h1);
+            v.to_bits().hash(&mut h2);
+        }
+    }
     let digest = format!(
-        "dim{}:{:016x}{:016x}",
+        "dim{}:bag{}:{:016x}{:016x}",
         knn.vector.len(),
+        bag.len(),
         h1.finish(),
         h2.finish()
     );
     let mut stripped = query.clone();
     if let Some(ref mut k) = stripped.knn {
         k.vector = Vec::new();
+        k.vectors = k.vectors.as_ref().map(|_| Vec::new());
     }
     serde_json::to_string(&stripped)
         .ok()
@@ -6775,6 +7430,18 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     if let Err(e) = query.validate() {
         return search_error_response(&e);
     }
+    let consistency = match params.get("consistency") {
+        None => state.default_consistency(),
+        Some(raw) => match unindexed::Consistency::parse(raw) {
+            Some(c) => c,
+            None => {
+                return json_error(
+                    400,
+                    &format!("'consistency' must be 'strong' or 'eventual', got '{raw}'"),
+                )
+            }
+        },
+    };
 
     let max_staleness = match manifest_follow::parse_max_staleness(
         params
@@ -6785,16 +7452,20 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         Ok(v) => v,
         Err(e) => return json_error(400, &e),
     };
-    if let Err(e) = state.ensure_query_manifest_fresh(&ns, max_staleness) {
-        return search_error_response(&e);
-    }
-
-    // Shared, not copied: see `Indexer::manifest_shared`.
-    let Some(snapshot) = state.indexer.manifest_shared(&ns) else {
-        return json_error(404, &format!("namespace '{}' not found", ns.0));
+    // Shared, not copied: see `Indexer::manifest_shared`. A sharded
+    // namespace (#207) is searched through one merged view of its shards.
+    // Under strong consistency `view.search` is the manifest plus the
+    // namespace's (or each shard's) unindexed tail (#255); hydration and
+    // every manifest-version keyed cache use the plain snapshot,
+    // `view.base`.
+    let view = match state.search_view(&ns, consistency, max_staleness) {
+        Ok(Some(view)) => view,
+        Ok(None) => return json_error(404, &format!("namespace '{}' not found", ns.0)),
+        Err(response) => return response,
     };
-    let manifest: &kosha_core::Manifest = &snapshot;
-    let tombstones = Some(&manifest.tombstones);
+    let manifest: &kosha_core::Manifest = &view.base;
+    let searched: &kosha_core::Manifest = &view.search;
+    let tombstones = Some(&searched.tombstones);
 
     // One accountant for everything this request hydrates — footer prefetch,
     // scoring set, posting blobs, and the page's doc stores all share it, so
@@ -6812,7 +7483,8 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
         // bool.
         let verdict_key = (ns.0.clone(), manifest.version);
         let needs_filters = query_filter_fields(&query);
-        let needs_vectors = query.knn.is_some();
+        let needs_vectors_key = knn_verdict_key(&query);
+        let needs_vectors = needs_vectors_key.as_deref();
         let cached_covers = state
             .completed_hydrations
             .lock()
@@ -6881,8 +7553,8 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
     #[cfg(feature = "s3")]
     let vector_fetch_stats = Mutex::new(posting_spans::PostingFetchStats::default());
     #[cfg(feature = "s3")]
-    let fetch_vectors = |seg: &Path, ranges: &[(u64, u64)]| {
-        let stats = state.hydrate_vector_postings(seg, ranges, &hydration_request);
+    let fetch_vectors = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
+        let stats = state.hydrate_vector_postings(seg, file, ranges, &hydration_request);
         vector_fetch_stats.lock().unwrap().add(&stats);
     };
     #[cfg(feature = "s3")]
@@ -6892,13 +7564,14 @@ fn handle_search_get(request_line: &str, state: &AppState) -> String {
 
     match state.searcher.search_with_hydrators(
         &ns,
-        manifest,
+        searched,
         &query,
         tombstones,
         doc_store_hydrator,
         vector_fetch,
     ) {
-        Ok((result, phases)) => {
+        Ok((mut result, phases)) => {
+            result.exhaustive_search_count = view.exhaustive_search_count();
             #[cfg(feature = "s3")]
             let hydration = HydrationOutcome {
                 page: *page_fetch.lock().unwrap(),
@@ -6991,9 +7664,124 @@ fn handle_put_schema_with_ns(
             return json_error(500, &format!("publication failed: {e}"));
         }
     }
+    // A sharded namespace (#207): every shard writes segments, so every
+    // shard's manifest carries the schema too. The root's copy is the one
+    // `GET .../schema` reports.
+    if let Some(shards) = state.indexer.shard_count(&ns) {
+        if let Err(response) = propagate_schema_to_shards(state, &ns, shards, &schema) {
+            return response;
+        }
+    }
     json_ok(&serde_json::json!({
         "namespace": namespace,
         "schema": schema,
+        "changed": changed,
+    }))
+}
+
+/// Set `schema` on every shard of sharded root `ns` and publish the shards
+/// it changed. `Err` carries a ready-to-send error response.
+fn propagate_schema_to_shards(
+    state: &AppState,
+    ns: &NamespaceId,
+    shards: u32,
+    schema: &kosha_core::NamespaceSchema,
+) -> Result<(), String> {
+    for shard in kosha_core::sharding::shard_namespaces(ns, shards) {
+        let changed = state
+            .indexer
+            .set_schema(&shard, schema.clone())
+            .map_err(|e| json_error(500, &format!("schema update failed: {e}")))?;
+        if changed {
+            state
+                .publish_namespace(&shard)
+                .map_err(|e| json_error(500, &format!("publication failed: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// `POST /v1/namespaces/{ns}/shards` — create `{ns}` as a sharded namespace
+/// with a fixed shard count (#207): `{"shards": N}`, `2 <= N <= 256`.
+///
+/// Only a namespace holding no documents yet can be sharded (it is the
+/// creation-time setting; resharding is not supported). Repeating the call
+/// with the same count is a no-op; a different count is a 400. `1` asks
+/// for an ordinary namespace and changes nothing.
+///
+/// Every shard namespace is registered in the control store up front, so
+/// query replicas follow all of them from the first search, and inherits
+/// the root's schema if one was set first.
+fn handle_put_shards_with_ns(
+    namespace: &str,
+    tenant: &str,
+    body: &[u8],
+    state: &AppState,
+) -> String {
+    let ns = NamespaceId(tenant_namespace(tenant, namespace));
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return json_error(400, "invalid JSON"),
+    };
+    let Some(shards) = value.get("shards").and_then(|v| v.as_u64()) else {
+        return json_error(400, "missing integer 'shards'");
+    };
+    if shards == 1 {
+        return match state.indexer.shard_count(&ns) {
+            Some(existing) => json_error(
+                400,
+                &format!("namespace already has {existing} shards; resharding is not supported"),
+            ),
+            None => json_ok(&serde_json::json!({
+                "namespace": namespace,
+                "shards": 1,
+                "changed": false,
+            })),
+        };
+    }
+    let shards = match u32::try_from(shards) {
+        Ok(n) => n,
+        Err(_) => return json_error(400, "shards out of range"),
+    };
+    let changed = match state.indexer.set_shard_count(&ns, shards) {
+        Ok(changed) => changed,
+        Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
+        Err(e) => return json_error(500, &format!("sharding failed: {e}")),
+    };
+    let shard_ids = kosha_core::sharding::shard_namespaces(&ns, shards);
+    {
+        let mut controller = state.controller.lock().unwrap();
+        for shard in &shard_ids {
+            controller.ensure_namespace(shard.clone());
+        }
+        controller.ensure_namespace(ns.clone());
+    }
+    for shard in &shard_ids {
+        if state.indexer.manifest_version(shard).is_none() {
+            let stored = state.controller.lock().unwrap().try_manifest_cloned(shard);
+            if let Ok(Some(stored)) = stored {
+                state.indexer.restore_manifest(shard.clone(), stored);
+            }
+        }
+    }
+    // Unconditionally: a retry after a failed publish (`changed` is then
+    // false) must still commit the shard count. Publishing an already
+    // committed manifest is a no-op.
+    if let Err(e) = state.publish_namespace(&ns) {
+        return publication_error("publication failed", &e);
+    }
+    if let Some(schema) = state
+        .indexer
+        .manifest_shared(&ns)
+        .and_then(|m| m.schema.clone())
+    {
+        if let Err(response) = propagate_schema_to_shards(state, &ns, shards, &schema) {
+            return response;
+        }
+    }
+    json_ok(&serde_json::json!({
+        "namespace": namespace,
+        "shards": shards,
         "changed": changed,
     }))
 }
@@ -7087,9 +7875,17 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
         };
     }
     let indexer = &state.indexer;
-    let manifest = match indexer.manifest(&NamespaceId(scoped_ns.clone())) {
+    let root_id = NamespaceId(scoped_ns.clone());
+    let manifest = match indexer.manifest_shared(&root_id) {
         Some(m) => m,
         None => return json_error(404, &format!("namespace '{namespace}' not found")),
+    };
+    // A sharded namespace (#207) reports totals over its merged view, plus
+    // a per-shard breakdown.
+    let shards = indexer.shard_count(&root_id);
+    let manifest = match shards {
+        Some(_) => state.sharded_view(&root_id, manifest),
+        None => manifest,
     };
     let ns_docs: u64 = manifest.segments.iter().map(|s| s.doc_count as u64).sum();
     let mut body = serde_json::json!({
@@ -7099,8 +7895,45 @@ fn handle_namespace_stats(namespace: &str, tenant: &str, state: &AppState) -> St
         "version": manifest.version,
         "manifest_version": manifest.version,
     });
+    if let Some(shards) = shards {
+        body["shards"] = serde_json::json!(shards);
+        body["shard_stats"] =
+            serde_json::json!(kosha_core::sharding::shard_namespaces(&root_id, shards)
+                .iter()
+                .enumerate()
+                .map(|(index, shard)| {
+                    let m = indexer.manifest_shared(shard);
+                    serde_json::json!({
+                        "shard": index,
+                        "documents": m.as_ref().map_or(0, |m| m
+                            .segments
+                            .iter()
+                            .map(|s| s.doc_count as u64)
+                            .sum::<u64>()),
+                        "segments": m.as_ref().map_or(0, |m| m.segments.len()),
+                        "manifest_version": m.as_ref().map_or(0, |m| m.version),
+                    })
+                })
+                .collect::<Vec<_>>());
+    }
+    // A branch (#208) reports its lineage and how much it still shares.
+    if let Some(branch) = &manifest.branch {
+        let ns = NamespaceId(scoped_ns.clone());
+        let shared = manifest
+            .segments
+            .iter()
+            .filter(|entry| manifest.is_inherited_segment(&ns, &entry.segment_id))
+            .count();
+        body["branch"] = serde_json::json!({
+            "parent": branch.parent.0.split_once('/').map_or(branch.parent.0.as_str(), |(_, n)| n),
+            "parent_version": branch.parent_version,
+            "shared_segments": shared,
+        });
+    }
     if state.ingest_host.is_some() {
         add_manifest_follow_stats(state, &NamespaceId(scoped_ns), &mut body);
+    } else {
+        add_unindexed_stats(state, &NamespaceId(scoped_ns), &mut body);
     }
     json_ok(&body)
 }
@@ -7158,7 +7991,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
     let seg_paths: Vec<PathBuf> = manifest
         .segments
         .iter()
-        .map(|entry| state.data_dir.join(&ns.0).join(&entry.segment_id.0))
+        .map(|entry| manifest.segment_dir(&state.data_dir, &ns, &entry.segment_id))
         .collect();
     #[cfg(feature = "s3")]
     // Admin routes rewrite or merge segments — must preserve vectors.
@@ -7166,8 +7999,15 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
 
     let mut new_footers = Vec::new();
     let mut rebuilt = 0usize;
+    let mut inherited = 0usize;
     let mut errors = Vec::new();
     for (entry, seg_path) in manifest.segments.iter().zip(seg_paths.iter()) {
+        // A branch never rewrites a file in its parent's prefix (#208):
+        // run the rebuild on the namespace that owns the segment.
+        if manifest.is_inherited_segment(&ns, &entry.segment_id) {
+            inherited += 1;
+            continue;
+        }
         if !seg_path.exists() {
             errors.push(format!("{}: segment not local", entry.segment_id.0));
             continue;
@@ -7212,6 +8052,7 @@ fn handle_rebuild_filter_blooms(body: &[u8], tenant: &str, state: &AppState) -> 
         "namespace": ns.0,
         "segments": manifest.segments.len(),
         "rebuilt": rebuilt,
+        "skipped_inherited": inherited,
         "errors": errors,
     }))
 }
@@ -7286,7 +8127,12 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
         let mut skipped = 0usize;
         let mut failed = 0usize;
         for (i, entry) in manifest.segments.iter().enumerate() {
-            let seg_path = state.data_dir.join(&ns.0).join(&entry.segment_id.0);
+            let seg_path = manifest.segment_dir(&state.data_dir, &ns, &entry.segment_id);
+            // A branch never writes into its parent's prefix (#208).
+            if manifest.is_inherited_segment(&ns, &entry.segment_id) {
+                skipped += 1;
+                continue;
+            }
 
             // Resumable: a segment whose sidecar already reached S3 is done —
             // re-running after a crash/restart only pays for the remainder.
@@ -7295,7 +8141,7 @@ fn handle_backfill_offset_tables(body: &[u8], tenant: &str, state: &AppState) ->
                 .s3_storage
                 .as_ref()
                 .map(|s3| {
-                    let rel = format!("{}/{}", ns.0, entry.segment_id.0);
+                    let rel = manifest.segment_rel_dir(&ns, &entry.segment_id);
                     s3.list_with_sizes(&rel)
                         .map(|files| files.iter().any(|(n, _)| n == "doc_store.offsets"))
                         .unwrap_or(false)
@@ -7425,6 +8271,7 @@ fn handle_segment_gc(body: &[u8], state: &AppState) -> String {
         grace_ms: grace.as_millis() as u64,
         orphan_grace_ms: orphan_grace.as_millis() as u64,
         now_ms: unix_millis(),
+        referenced_elsewhere: None,
     };
     let reports = state.run_segment_gc(&namespaces, &config);
     let sum = |f: fn(&kosha_core::gc::NamespaceGcReport) -> u64| reports.iter().map(f).sum::<u64>();
@@ -7526,32 +8373,75 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
         req.get("max_segment_bytes").and_then(|v| v.as_u64()),
     );
 
+    // A sharded namespace (#207) holds its segments in its shards: run one
+    // pass per shard and report each.
+    if let Some(shards) = state.indexer.shard_count(&ns) {
+        let mut passes = Vec::new();
+        for shard in kosha_core::sharding::shard_namespaces(&ns, shards) {
+            if state.indexer.manifest_version(&shard).is_none() {
+                continue;
+            }
+            match compact_one(state, &shard, mode, opts.clone(), run_async) {
+                Ok(pass) => passes.push(pass),
+                Err((status, message)) => return json_error(status, &message),
+            }
+        }
+        let body = serde_json::json!({
+            "namespace": ns.0,
+            "mode": compact_mode_name(mode),
+            "shards": passes,
+        });
+        return if run_async {
+            json_accepted(&body)
+        } else {
+            json_ok(&body)
+        };
+    }
+
+    match compact_one(state, &ns, mode, opts, run_async) {
+        Ok(body) if run_async => json_accepted(&body),
+        Ok(body) => json_ok(&body),
+        Err((status, message)) => json_error(status, &message),
+    }
+}
+
+/// Register and run (or, `run_async`, start) one compaction pass on `ns`.
+/// The JSON body on success; `(status, message)` on refusal or failure.
+fn compact_one(
+    state: &AppState,
+    ns: &NamespaceId,
+    mode: kosha_write::CompactMode,
+    opts: kosha_write::CompactOptions,
+    run_async: bool,
+) -> Result<serde_json::Value, (u16, String)> {
     // Resolve the background handle before registering, so a refusal can't
     // leave a job stuck in `running`.
     let job_state = if run_async {
         match state.self_ref.upgrade() {
             Some(s) => Some(s),
-            None => return json_error(500, "server not initialized for background jobs"),
+            None => {
+                return Err((500, "server not initialized for background jobs".into()));
+            }
         }
     } else {
         None
     };
     let job_id = match state.compaction.try_start(
-        &ns,
+        ns,
         compact_mode_name(mode),
         compaction_sched::Trigger::Api,
         Instant::now(),
     ) {
         Ok(id) => id,
         Err(running) => {
-            return json_error(
+            return Err((
                 409,
-                &format!(
+                format!(
                     "a compaction pass is already running on namespace '{}' (job {running}); \
                      poll GET /v1/admin/compaction-jobs/{running}",
                     ns.0
                 ),
-            );
+            ));
         }
     };
 
@@ -7563,15 +8453,16 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
             "state": "running",
             "status_url": format!("/v1/admin/compaction-jobs/{job_id}"),
         });
+        let ns = ns.clone();
         std::thread::Builder::new()
             .name("kosha-compaction-job".into())
             .spawn(move || run_compaction_job(&job_state, &ns, opts, &job_id))
             .expect("failed to spawn compaction job thread");
-        return json_accepted(&response);
+        return Ok(response);
     }
 
-    match run_compaction_job(state, &ns, opts, &job_id) {
-        Ok(outcome) => json_ok(&serde_json::json!({
+    match run_compaction_job(state, ns, opts, &job_id) {
+        Ok(outcome) => Ok(serde_json::json!({
             "job_id": job_id,
             "namespace": ns.0,
             "mode": compact_mode_name(mode),
@@ -7587,7 +8478,7 @@ fn handle_compact_namespace(body: &[u8], tenant: &str, state: &AppState) -> Stri
             "peak_local_bytes": outcome.peak_local_bytes,
             "not_evicted": outcome.not_evicted,
         })),
-        Err(error) => json_error(500, &error),
+        Err(error) => Err((500, error)),
     }
 }
 
@@ -7653,7 +8544,11 @@ fn compact_options(
     if let Some(n) = request_max_segment_bytes {
         policy.max_merged_segment_bytes = n;
     }
-    kosha_write::CompactOptions { mode, policy }
+    kosha_write::CompactOptions {
+        mode,
+        policy,
+        vector_index: None,
+    }
 }
 
 /// Run one registered compaction pass and record its outcome. The caller
@@ -7740,7 +8635,6 @@ impl CompactionStorage for AppState {
                 ),
             }
         }
-        let ns_dir = self.data_dir.join(&ns.0);
         manifest
             .segments
             .iter()
@@ -7750,11 +8644,10 @@ impl CompactionStorage for AppState {
                 // lexical search hydrates without vector.idx). Local size
                 // only for segments S3 doesn't list, i.e. local-only mode
                 // or a flush not yet published.
-                let bytes = remote
-                    .get(&id.0)
-                    .copied()
-                    .filter(|b| *b > 0)
-                    .or_else(|| local_dir_bytes(&ns_dir.join(&id.0)))?;
+                let bytes =
+                    remote.get(&id.0).copied().filter(|b| *b > 0).or_else(|| {
+                        local_dir_bytes(&manifest.segment_dir(&self.data_dir, ns, id))
+                    })?;
                 Some((id.clone(), bytes))
             })
             .collect()
@@ -7858,11 +8751,8 @@ fn compaction_pass_with(
         peak_local_bytes: 0,
         not_evicted: Vec::new(),
     };
-    let group_bytes = |ids: &[kosha_core::SegmentId]| -> u64 {
-        ids.iter()
-            .filter_map(|id| local_dir_bytes(&ns_dir.join(&id.0)))
-            .sum()
-    };
+    let group_bytes =
+        |paths: &[PathBuf]| -> u64 { paths.iter().filter_map(|path| local_dir_bytes(path)).sum() };
 
     loop {
         let Some(manifest) = state.indexer.manifest_cloned(ns) else {
@@ -7874,16 +8764,21 @@ fn compaction_pass_with(
         else {
             break;
         };
-        drop(manifest);
         let ids = plan.input_ids();
+        // A branch's inherited inputs live under their home namespace's
+        // prefix (#208).
+        let paths: Vec<PathBuf> = ids
+            .iter()
+            .map(|id| manifest.segment_dir(&state.data_dir, ns, id))
+            .collect();
+        drop(manifest);
 
         // Hydrate only this group, in one fanned-out batch (see
         // `ensure_segments_local`). Compaction rewrites segments, so it
         // must preserve vectors.
-        let local_before = group_bytes(&ids);
-        let paths: Vec<PathBuf> = ids.iter().map(|id| ns_dir.join(&id.0)).collect();
+        let local_before = group_bytes(&paths);
         storage.hydrate(&paths);
-        let local_inputs = group_bytes(&ids);
+        let local_inputs = group_bytes(&paths);
         outcome.bytes_hydrated += local_inputs.saturating_sub(local_before);
         for path in &paths {
             if !path.exists() {
@@ -8069,8 +8964,10 @@ fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manife
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        branch: None,
         schema: None,
         retired: Default::default(),
+        shards: None,
     }
 }
 
@@ -8544,7 +9441,8 @@ fn log_search_timing(
         "search timing: ns={} total_ms={:.1} hydrate_ms={:.1} hydrate_files={} \
          hydrate_mb={:.1} queue_ms={:.1} admit_ms={:.1} bm25_stats={} bm25_stats_ms={:.2} \
          score_ms={:.1} materialize_ms={:.1} opens_cold={} opens_cached={} \
-         open_total_ms={:.1} knn_postings={} knn_degraded={} hits={} page_gets={} \
+         open_total_ms={:.1} knn_postings={} knn_mode={} knn_exact_vectors={} \
+         knn_filtered={} knn_degraded={} hits={} page_gets={} \
          page_ranged_kb={:.1} page_whole_files={} page_whole_mb={:.1} s3_rounds={} \
          s3_bytes={} postings_gets={} postings_ranged_kb={:.1} postings_whole_files={} \
          postings_whole_mb={:.1} vector_gets={} vector_ranged_kb={:.1} \
@@ -8564,6 +9462,11 @@ fn log_search_timing(
         phases.open_cached,
         phases.open_total_ms,
         phases.knn_postings_probed,
+        phases.knn_mode.map_or("-", |mode| mode.as_str()),
+        phases.knn_exact_vectors,
+        phases
+            .knn_filtered_candidates
+            .map_or_else(|| "-".to_string(), |n| n.to_string()),
         knn_degraded_segments.unwrap_or(0),
         total_hits,
         hydration.page.ranged_gets,
@@ -8808,6 +9711,12 @@ mod tests {
                 .unwrap()
                 .delete_namespace(id, retire_at_least)
         }
+        fn remove_namespace(
+            &mut self,
+            id: &NamespaceId,
+        ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
+            Ok(self.inner.lock().unwrap().remove_namespace(id))
+        }
     }
 
     impl SharedManifestStore {
@@ -9010,7 +9919,9 @@ mod tests {
                 serde_json::json!({"query_text": "quick"}),
             )
         };
-        assert_eq!(ok(search())["total_hits"], 1);
+        // Strong consistency (#255, the default) sees the buffered write
+        // too.
+        assert_eq!(ok(search())["total_hits"], 2);
         let old_version = state
             .controller
             .lock()
@@ -9036,7 +9947,7 @@ mod tests {
             serde_json::json!({"query_text": "quick"}),
         );
         assert_eq!(status_of(&foreign_search), 404, "{foreign_search}");
-        assert_eq!(ok(search())["total_hits"], 1);
+        assert_eq!(ok(search())["total_hits"], 2);
 
         let deleted = ok(v1(
             &state,
@@ -9682,6 +10593,13 @@ mod tests {
         ) -> Result<(kosha_core::Manifest, u64), KoshaError> {
             self.inner.delete_namespace(id, retire_at_least)
         }
+        fn remove_namespace(
+            &mut self,
+            id: &NamespaceId,
+        ) -> Result<Option<kosha_core::Manifest>, KoshaError> {
+            self.check()?;
+            self.inner.remove_namespace(id)
+        }
     }
 
     fn outage_store() -> OutageStore {
@@ -9786,6 +10704,42 @@ mod tests {
         assert_eq!(stats["manifest_refresh"]["interval_ms"], 20);
         // The ingest pod's stats carry no follower block.
         assert!(stats_json(&ingest)["manifest_refresh"].is_null());
+    }
+
+    /// #208: a query replica follows a branch like any namespace, and drops
+    /// it once the ingest pod deletes it, instead of serving a manifest
+    /// whose own objects were just reclaimed. The parent is unaffected.
+    #[test]
+    fn query_replica_follows_branches_and_forgets_deleted_ones() {
+        let store = outage_store();
+        let parent = NamespaceId("tenant/prod".into());
+        let child = NamespaceId("tenant/exp".into());
+        let (ingest, query) = ingest_and_query(&store, Some(Duration::from_secs(3600)));
+        index_text_and_publish(&ingest, &parent, &["a", "b"]);
+        ingest.branch_namespace(&parent, &child).unwrap();
+        index_text_and_publish(&ingest, &child, &["c"]);
+        let search = |ns: &str| {
+            let body = format!(r#"{{"namespace":"{ns}","query_text":"hello"}}"#);
+            total_hits(&handle_search_post(body.as_bytes(), &query))
+        };
+        assert_eq!(search("tenant/exp"), 3);
+        assert_eq!(search("tenant/prod"), 2);
+        assert!(query
+            .indexer
+            .manifest_shared(&child)
+            .unwrap()
+            .branch
+            .is_some());
+
+        ingest.delete_branch(&child).unwrap();
+        query.run_manifest_refresh_tick();
+        assert!(query.indexer.manifest_version(&child).is_none());
+        assert_eq!(search("tenant/prod"), 2);
+        assert!(handle_search_post(
+            br#"{"namespace":"tenant/exp","query_text":"hello"}"#,
+            &query
+        )
+        .starts_with("HTTP/1.1 404"));
     }
 
     /// #232: `max_staleness_seconds` forces a synchronous refresh when the
@@ -10145,8 +11099,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         state.import_manifest(&ns, manifest(1, "seed")).unwrap();
         assert_eq!(shared.manifest_cloned(&ns).unwrap().version, 1);
@@ -10540,6 +11496,87 @@ mod tests {
             let resp = get(bad);
             assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
         }
+    }
+
+    /// #204 over HTTP: two vector columns of different dimensions in one
+    /// namespace; `knn.field` picks the column, an unindexed field or a
+    /// wrong-dimension vector is a 400, and so is indexing a vector whose
+    /// dimension disagrees with its field's.
+    #[test]
+    fn knn_field_selects_the_vector_column_over_http() {
+        let state = test_state();
+        let ns = NamespaceId("columnsns".into());
+        let doc = |id: &str, title: Option<[f32; 2]>, body: Option<[f32; 3]>| {
+            let mut fields = vec![Field::text("text", "x")];
+            if let Some(v) = title {
+                fields.push(Field::vector("title_emb", v.to_vec()));
+            }
+            if let Some(v) = body {
+                fields.push(Field::vector("body_emb", v.to_vec()));
+            }
+            Document {
+                id: DocumentId(id.into()),
+                fields,
+            }
+        };
+        let index = |docs: Vec<Document>| {
+            let body = serde_json::to_vec(&kosha_core::IndexRequest {
+                namespace: ns.clone(),
+                documents: docs,
+            })
+            .unwrap();
+            handle_index(&body, &state)
+        };
+        let resp = index(vec![
+            doc("t1", Some([1.0, 0.0]), None),
+            doc("t2", Some([0.0, 1.0]), Some([0.0, 0.0, 1.0])),
+            doc("b1", None, Some([1.0, 0.0, 0.0])),
+            doc("b2", None, Some([0.0, 1.0, 0.0])),
+        ]);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        // 2 dims where `body_emb` has 3.
+        let bad = Document {
+            id: DocumentId("bad2".into()),
+            fields: vec![Field::vector("body_emb", vec![1.0, 0.0])],
+        };
+        let resp = index(vec![bad]);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("body_emb"), "{resp}");
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+
+        let post = |knn: &str| {
+            let body = format!(r#"{{"namespace":"columnsns","query_text":"","knn":{knn}}}"#);
+            handle_search_post(body.as_bytes(), &state)
+        };
+        let ids = |resp: &str| -> Vec<String> {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let body = &resp[resp.find("\r\n\r\n").unwrap() + 4..];
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            v["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let title = ids(&post(
+            r#"{"field":"title_emb","vector":[1.0,0.0],"k":10,"num_candidates":100}"#,
+        ));
+        assert_eq!(title, vec!["t1", "t2"], "only title_emb documents");
+        let body = ids(&post(
+            r#"{"field":"body_emb","vector":[1.0,0.0,0.0],"k":10,"num_candidates":100}"#,
+        ));
+        let mut sorted = body.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["b1", "b2", "t2"], "only body_emb documents");
+        assert_eq!(body[0], "b1", "{body:?}");
+
+        let resp = post(r#"{"field":"nope","vector":[1.0,0.0],"k":3}"#);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("nope"), "{resp}");
+        let resp = post(r#"{"field":"body_emb","vector":[1.0,0.0],"k":3}"#);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
     }
 
     #[test]
@@ -11258,6 +12295,8 @@ mod tests {
             analysis: None,
             field_index: None,
             fuzzy_bloom: kosha_core::fuzzy::build_fuzzy_bloom(terms.iter().copied()),
+            vector_fields: None,
+            multi_vectors: Vec::new(),
         };
         let mut query: SearchQuery = serde_json::from_str(
             r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
@@ -11918,8 +12957,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         // Simulate: an earlier publish call already confirmed seg-2
         // synced (e.g. it was "last" at the time it ran), but seg-1 and
@@ -11971,6 +13012,11 @@ mod tests {
             hydration_wants_file("vector.offsets", true),
             "a knn query must still fetch vector.offsets"
         );
+        // Further vector columns (#204) are gated the same way.
+        for f in ["vector.1.idx", "vector.1.offsets", "vector.12.idx"] {
+            assert!(!hydration_wants_file(f, false), "{f}");
+            assert!(hydration_wants_file(f, true), "{f}");
+        }
         for f in [
             "footer.json",
             "doc_store.bin",
@@ -12296,6 +13342,8 @@ mod tests {
             filter_columns: Default::default(),
             fuzzy_bloom: Default::default(),
             posting_blobs_raw: Default::default(),
+            vector_fields: Default::default(),
+            multi_vectors: Default::default(),
         }
     }
 
@@ -12434,6 +13482,58 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #204: a kNN's scoring set holds only the queried column's files, as
+    /// the segment's footer lists them.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn scoring_complete_needs_only_the_queried_vector_column() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-scoring-columns-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut w =
+            kosha_segment::SegmentWriter::new(kosha_core::SegmentId("s".into()), dir.clone());
+        w.add_document(
+            DocumentId("d".into()),
+            vec![
+                Field::text("text", "x"),
+                Field::vector("title_emb", vec![1.0, 0.0]),
+                Field::vector("body_emb", vec![1.0, 0.0, 0.0]),
+            ],
+        );
+        w.finalize(Default::default()).unwrap();
+        assert_eq!(
+            kosha_segment::knn_vector_files(&dir, "body_emb"),
+            vec![
+                ("vector.1.idx".to_string(), true),
+                ("vector.1.offsets".to_string(), true)
+            ]
+        );
+        assert!(kosha_segment::knn_vector_files(&dir, "nope").is_empty());
+        let complete =
+            |field| AppState::segment_is_scoring_complete(&dir, Some(field), false, None);
+        assert!(complete("title_emb") && complete("body_emb") && complete("nope"));
+        fs::remove_file(dir.join("vector.1.idx")).unwrap();
+        assert!(
+            complete("title_emb"),
+            "body_emb's files are not title_emb's"
+        );
+        assert!(!complete("body_emb"));
+        assert!(
+            complete("nope"),
+            "a column the segment does not have needs no files"
+        );
+        assert_eq!(
+            kosha_segment::vector_index_files(&dir),
+            vec![
+                "vector.idx",
+                "vector.offsets",
+                "vector.1.idx",
+                "vector.1.offsets"
+            ]
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn segment_is_scoring_complete_offsets_sidecar_replaces_doc_store_bin() {
@@ -12448,7 +13548,7 @@ mod tests {
         let footer = test_footer("kosha-test-scoring-complete", 1, 2);
 
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false, false, None),
+            !AppState::segment_is_scoring_complete(&dir, None, false, None),
             "empty dir must not be scoring-complete"
         );
 
@@ -12457,11 +13557,11 @@ mod tests {
         // the footer.
         fs::write(dir.join("doc_store.offsets"), 1u32.to_le_bytes()).unwrap();
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false, false, None),
+            !AppState::segment_is_scoring_complete(&dir, None, false, None),
             "without a manifest footer, footer.json on disk is still required"
         );
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false, false, Some(&footer)),
+            AppState::segment_is_scoring_complete(&dir, None, false, Some(&footer)),
             "a manifest footer snapshot must stand in for a missing footer.json"
         );
         fs::write(
@@ -12470,26 +13570,26 @@ mod tests {
         )
         .unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false, false, None),
+            AppState::segment_is_scoring_complete(&dir, None, false, None),
             "offsets sidecar (no doc_store.bin, no filters.bin) must be broad lexical scoring-complete"
         );
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, false, true, None),
+            !AppState::segment_is_scoring_complete(&dir, None, true, None),
             "queries using filters/sorts/aggs must still require filters.bin"
         );
         fs::write(dir.join("filters.bin"), b"x").unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, false, true, None),
+            AppState::segment_is_scoring_complete(&dir, None, true, None),
             "filters.bin present must make filter/sort/agg queries scoring-complete"
         );
         assert!(
-            !AppState::segment_is_scoring_complete(&dir, true, true, None),
+            !AppState::segment_is_scoring_complete(&dir, Some("emb"), true, None),
             "kNN scoring-complete must require vector.idx (still missing)"
         );
 
         fs::write(dir.join("vector.idx"), b"x").unwrap();
         assert!(
-            AppState::segment_is_scoring_complete(&dir, true, true, None),
+            AppState::segment_is_scoring_complete(&dir, Some("emb"), true, None),
             "vector.idx present must make it kNN scoring-complete"
         );
         assert!(
@@ -12497,7 +13597,7 @@ mod tests {
             "sanity: this assertion must be exercising the no-sidecar case"
         );
         assert!(
-            AppState::segment_is_scoring_complete(&dir, true, true, None),
+            AppState::segment_is_scoring_complete(&dir, Some("emb"), true, None),
             "vector.offsets (the v2 posting-index sidecar) must be optional for scoring \
              completeness — legacy v1 segments never have one, and the reader falls back to \
              an eager parse of vector.idx alone when it's absent, same as doc_store's own \
@@ -12519,12 +13619,12 @@ mod tests {
             fs::write(legacy.join(f), b"x").unwrap();
         }
         assert!(
-            AppState::segment_is_scoring_complete(&legacy, false, true, None),
+            AppState::segment_is_scoring_complete(&legacy, None, true, None),
             "legacy segment with doc_store.bin (no offsets) must be scoring-complete"
         );
         fs::remove_file(legacy.join("doc_store.bin")).unwrap();
         assert!(
-            !AppState::segment_is_scoring_complete(&legacy, false, true, None),
+            !AppState::segment_is_scoring_complete(&legacy, None, true, None),
             "legacy segment without offsets and without doc_store.bin is not scorable"
         );
         let _ = fs::remove_dir_all(&legacy);
@@ -12586,6 +13686,9 @@ mod tests {
             "POST /v1/namespaces/foo/flush HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/delete HTTP/1.1\r\n",
             "POST /v1/namespaces/foo/schema HTTP/1.1\r\n",
+            "POST /v1/namespaces/foo/shards HTTP/1.1\r\n",
+            "POST /v1/namespaces/foo/branch HTTP/1.1\r\n",
+            "DELETE /v1/namespaces/foo/branch HTTP/1.1\r\n",
             "POST /v1/admin/api-keys HTTP/1.1\r\n",
             "POST /v1/admin/rebuild-filter-blooms HTTP/1.1\r\n",
             "POST /v1/admin/backfill-offset-tables HTTP/1.1\r\n",
@@ -12613,6 +13716,7 @@ mod tests {
             "GET /v1/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/stats HTTP/1.1\r\n",
             "GET /v1/namespaces/foo/schema HTTP/1.1\r\n",
+            "GET /v1/namespaces/foo/branches HTTP/1.1\r\n",
             "GET /search?ns=foo&q=bar HTTP/1.1\r\n",
             "POST /search HTTP/1.1\r\n",
             "POST /exists HTTP/1.1\r\n",
@@ -12820,8 +13924,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
@@ -12921,34 +14027,38 @@ mod tests {
         let none = fields(&[]);
         let mut v = HydrationVerdict::default();
         assert!(
-            v.covers(None, false),
+            v.covers(None, None),
             "a query needing neither file class is trivially covered by any verdict"
         );
         assert!(
-            !v.covers(Some(&none), false),
+            !v.covers(Some(&none), None),
             "an unverified verdict must not cover a query that needs filters.bin"
         );
         assert!(
-            !v.covers(None, true),
+            !v.covers(None, Some("emb")),
             "an unverified verdict must not cover a query that needs vector.idx"
         );
 
         // A pass that itself needed only filters verifies only that.
-        v.merge(Some(&none), false);
-        assert!(v.covers(None, false));
-        assert!(v.covers(Some(&none), false));
+        v.merge(Some(&none), None);
+        assert!(v.covers(None, None));
+        assert!(v.covers(Some(&none), None));
         assert!(
-            !v.covers(None, true),
+            !v.covers(None, Some("emb")),
             "verifying filters.bin must not also mark vector.idx as verified"
         );
-        assert!(!v.covers(Some(&none), true));
+        assert!(!v.covers(Some(&none), Some("emb")));
 
         // A later pass needing vector.idx merges in, not overwrites.
-        v.merge(None, true);
+        v.merge(None, Some("emb"));
         assert!(
-            v.covers(Some(&none), true),
+            v.covers(Some(&none), Some("emb")),
             "flags accumulate across passes — filters_verified from an earlier pass must \
              survive a later pass that only verified vectors"
+        );
+        assert!(
+            !v.covers(None, Some("other_emb")),
+            "verifying one vector column's files must not cover a kNN on another (#204)"
         );
     }
 
@@ -12960,20 +14070,20 @@ mod tests {
         let fields =
             |names: &[&str]| -> FilterFields { names.iter().map(|s| s.to_string()).collect() };
         let mut v = HydrationVerdict::default();
-        v.merge(Some(&fields(&["matterId"])), false);
-        assert!(v.covers(Some(&fields(&["matterId"])), false));
+        v.merge(Some(&fields(&["matterId"])), None);
+        assert!(v.covers(Some(&fields(&["matterId"])), None));
         assert!(
-            v.covers(Some(&fields(&[])), false),
+            v.covers(Some(&fields(&[])), None),
             "TOC-only needs are covered"
         );
         assert!(
-            !v.covers(Some(&fields(&["documentId"])), false),
+            !v.covers(Some(&fields(&["documentId"])), None),
             "a column no pass fetched must not be assumed local"
         );
-        assert!(!v.covers(Some(&fields(&["matterId", "documentId"])), false));
-        v.merge(Some(&fields(&["documentId"])), false);
+        assert!(!v.covers(Some(&fields(&["matterId", "documentId"])), None));
+        v.merge(Some(&fields(&["documentId"])), None);
         assert!(
-            v.covers(Some(&fields(&["matterId", "documentId"])), false),
+            v.covers(Some(&fields(&["matterId", "documentId"])), None),
             "verified columns accumulate across passes"
         );
     }
@@ -13049,7 +14159,7 @@ mod tests {
             }
         }
         assert!(
-            !AppState::scoring_complete(&local, false, false, &wanted, Some(&footer)),
+            !AppState::scoring_complete(&local, None, false, &wanted, Some(&footer)),
             "not scorable before its filter files land"
         );
         let mut hydrated = 0u64;
@@ -13058,7 +14168,7 @@ mod tests {
         }
         assert!(AppState::scoring_complete(
             &local,
-            false,
+            None,
             false,
             &wanted,
             Some(&footer)
@@ -13096,6 +14206,8 @@ mod tests {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
+            branch: None,
         };
         let ns = NamespaceId("ns".into());
         let partial = kosha_query::Searcher::new(local_root.clone())
@@ -13123,7 +14235,7 @@ mod tests {
             segment_filter_files(Some(&footer), &local, &query_filter_fields(&other).unwrap());
         assert!(!AppState::scoring_complete(
             &local,
-            false,
+            None,
             false,
             &other_files,
             Some(&footer)
@@ -13149,8 +14261,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         let base_query = kosha_core::SearchQuery {
             query_text: String::new(),
@@ -13187,9 +14301,9 @@ mod tests {
         // `!bloom_pruned` gate) is eligible to merge into the cache.
         let warmup_like = base_query.clone();
         let needs_filters_1 = query_filter_fields(&warmup_like);
-        let needs_vectors_1 = warmup_like.knn.is_some();
+        let needs_vectors_1 = warmup_like.knn.as_ref().map(|knn| knn.field.as_str());
         assert!(
-            needs_filters_1.is_none() && !needs_vectors_1,
+            needs_filters_1.is_none() && needs_vectors_1.is_none(),
             "warmup's probe query must not need filters.bin/vector.idx — this is exactly \
              what makes its success unable to prove either file is local"
         );
@@ -13225,7 +14339,7 @@ mod tests {
         }];
         chunk_lookup.search_after = Some(vec!["0".to_string()]);
         let needs_filters_2 = query_filter_fields(&chunk_lookup);
-        let needs_vectors_2 = chunk_lookup.knn.is_some();
+        let needs_vectors_2 = chunk_lookup.knn.as_ref().map(|knn| knn.field.as_str());
         assert!(
             needs_filters_2.is_some(),
             "a documentId term filter needs filters.bin"
@@ -13261,7 +14375,7 @@ mod tests {
             )]),
         }];
         let needs_filters_3 = query_filter_fields(&sorted_unfiltered);
-        let needs_vectors_3 = sorted_unfiltered.knn.is_some();
+        let needs_vectors_3 = sorted_unfiltered.knn.as_ref().map(|knn| knn.field.as_str());
         assert!(
             needs_filters_3.is_some(),
             "sorting by a real field needs filters.bin"
@@ -13292,7 +14406,7 @@ mod tests {
             .get(&verdict_key)
             .cloned();
         assert!(
-            cached_after.is_some_and(|v| v.covers(needs_filters_3.as_ref(), false)),
+            cached_after.is_some_and(|v| v.covers(needs_filters_3.as_ref(), None)),
             "a pass that itself verified filters.bin must let a later query needing only \
              filters.bin take the fast path"
         );
@@ -15083,7 +16197,9 @@ mod tests {
         assert!(hit.get("highlight").is_none(), "{hit}");
     }
 
-    const LEGACY_HIGHLIGHT_SNAPSHOT: &str = r#"{"results":[{"doc_id":"d1","score":0.39556284962119864,"fields":[{"name":"title","field_type":"Text","value":"Contract law basics"},{"name":"body","field_type":"Text","value":"A contract needs an offer"},{"name":"tag","field_type":"Keyword","value":"contract"}],"highlights":["A <em>contract</em> needs an offer"]}],"total_hits":1,"total_hits_relation":"eq"}"#;
+    // Only change since capture: the additive top-level
+    // `exhaustive_search_count` (#255), present on every search response.
+    const LEGACY_HIGHLIGHT_SNAPSHOT: &str = r#"{"results":[{"doc_id":"d1","score":0.39556284962119864,"fields":[{"name":"title","field_type":"Text","value":"Contract law basics"},{"name":"body","field_type":"Text","value":"A contract needs an offer"},{"name":"tag","field_type":"Keyword","value":"contract"}],"highlights":["A <em>contract</em> needs an offer"]}],"total_hits":1,"total_hits_relation":"eq","exhaustive_search_count":0}"#;
 
     /// #195: two fields in one request, each with its own tags (falling
     /// back to the top-level tags, then the defaults); a requested field the
@@ -15200,6 +16316,8 @@ mod tests {
                 k,
                 num_candidates: 100,
                 filter: None,
+                vectors: None,
+                scoring: None,
             });
             q
         };
@@ -15219,6 +16337,27 @@ mod tests {
         v[517] = f32::from_bits(v[517].to_bits() ^ 1);
         let b = canonical_query_for_cache(&with_vec(v, 10)).unwrap();
         assert_ne!(a, b, "different vectors must produce different keys");
+
+        // Late interaction (#205): the bag is digested with its token
+        // boundaries, never inlined, and a single `vector` with the same
+        // floats is a different query.
+        let with_bag = |bag: Vec<Vec<f32>>| {
+            let mut q = with_vec(Vec::new(), 10);
+            q.knn.as_mut().unwrap().vectors = Some(bag);
+            canonical_query_for_cache(&q).unwrap()
+        };
+        let bag = with_bag(vec![vec![0.25, 0.5], vec![0.75, 1.0]]);
+        assert_eq!(bag, with_bag(vec![vec![0.25, 0.5], vec![0.75, 1.0]]));
+        assert_ne!(bag, with_bag(vec![vec![0.25], vec![0.5, 0.75, 1.0]]));
+        assert_ne!(bag, with_bag(vec![vec![0.25, 0.5], vec![0.75, 0.5]]));
+        assert_ne!(
+            bag,
+            canonical_query_for_cache(&with_vec(vec![0.25, 0.5, 0.75, 1.0], 10)).unwrap()
+        );
+        assert!(
+            !bag.contains("0.75"),
+            "no raw token vector in the key: {bag}"
+        );
 
         // Non-vector knn params still flow through the canonical JSON.
         let c = canonical_query_for_cache(&with_vec(vec![0.1_f32; 1024], 20)).unwrap();
@@ -15290,6 +16429,8 @@ mod tests {
             analysis: None,
             field_index: None,
             fuzzy_bloom: None,
+            vector_fields: None,
+            multi_vectors: Vec::new(),
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.
@@ -15353,6 +16494,467 @@ mod tests {
         let mut c = ResultCache::new(0);
         c.insert(rc_key("ns", 1, "q"), "resp");
         assert!(c.lookup(&rc_key("ns", 1, "q")).is_none(), "0 disables");
+    }
+
+    // ─── Read-your-writes (#255) ─────────────────────────────────────────
+
+    /// An ingest pod and a query pod over one control store and data
+    /// directory. The query pod reads the ingest pod's unindexed tail through
+    /// the real internal route (`route`, internal credential included); only
+    /// the HTTP hop is replaced. `before_fetch` runs on every fetch, before
+    /// the route is called (to inject a race).
+    fn read_your_writes_pods(
+        store: &OutageStore,
+        before_fetch: impl Fn(&AppState, &NamespaceId) + Send + Sync + 'static,
+    ) -> (Arc<AppState>, AppState) {
+        let (mut ingest, mut query) = ingest_and_query(store, Some(Duration::from_secs(3600)));
+        ingest.internal_service_key = Some("tail-key".into());
+        let ingest = Arc::new(ingest);
+        let writer = Arc::clone(&ingest);
+        query.unindexed.fetcher = Some(Box::new(move |ns, version, known| {
+            before_fetch(&writer, ns);
+            let mut line = format!(
+                "GET /internal/namespaces/{}/unindexed?manifest_version={version}",
+                unindexed::encode_path_segment(&ns.0)
+            );
+            if let Some(known) = known {
+                line.push_str("&if_none_match=");
+                line.push_str(&unindexed::encode_path_segment(known));
+            }
+            line.push_str(" HTTP/1.1");
+            let headers =
+                HashMap::from([("authorization".to_string(), "Bearer tail-key".to_string())]);
+            let response = route(&line, &headers, b"", "service", &writer);
+            if !response.starts_with("HTTP/1.1 200") {
+                return Err(KoshaError::Io(std::io::Error::other(response)));
+            }
+            let body = &response[response.find("\r\n\r\n").unwrap() + 4..];
+            Ok(serde_json::from_str(body).unwrap())
+        }));
+        (ingest, query)
+    }
+
+    fn ryw_doc(id: &str, text: &str, status: &str) -> Document {
+        Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text), Field::keyword("status", status)],
+        }
+    }
+
+    fn ryw_index(state: &AppState, ns: &str, docs: Vec<Document>) -> String {
+        let body = serde_json::to_vec(&IndexRequest {
+            namespace: NamespaceId(ns.into()),
+            documents: docs,
+        })
+        .unwrap();
+        handle_index(&body, state)
+    }
+
+    fn ryw_search(state: &AppState, body: serde_json::Value) -> serde_json::Value {
+        let response = handle_search_post(body.to_string().as_bytes(), state);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        serde_json::from_str(&response[response.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+    }
+
+    fn hit_ids(result: &serde_json::Value) -> Vec<String> {
+        result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["doc_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// #255 acceptance: `/index` then an immediate strong search on a query
+    /// pod returns the document, with no flush; eventual does not.
+    #[test]
+    fn strong_search_on_query_pod_sees_unflushed_write() {
+        let store = outage_store();
+        let (ingest, query) = read_your_writes_pods(&store, |_, _| {});
+        let ns = "tenant/ryw-index";
+        let response = ryw_index(&ingest, ns, vec![ryw_doc("a", "hello world", "x")]);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let ns_id = NamespaceId(ns.into());
+        assert_eq!(ingest.indexer.pending_doc_count(&ns_id), 1, "not flushed");
+
+        let strong = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "hello", "consistency": "strong"}),
+        );
+        assert_eq!(hit_ids(&strong), ["a"]);
+        assert_eq!(strong["total_hits"], 1);
+        assert_eq!(strong["exhaustive_search_count"], 1);
+        // Fields come back from the transient segment like any hit.
+        assert_eq!(strong["results"][0]["fields"][0]["value"], "hello world");
+
+        // The default is strong (the pod can read the tail).
+        let default = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "hello"}),
+        );
+        assert_eq!(hit_ids(&default), ["a"]);
+
+        let eventual = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "hello", "consistency": "eventual"}),
+        );
+        assert_eq!(eventual["total_hits"], 0);
+        assert_eq!(eventual["exhaustive_search_count"], 0);
+
+        // The ingest pod reads its own tail.
+        let local = ryw_search(
+            &ingest,
+            serde_json::json!({"namespace": ns, "query_text": "hello"}),
+        );
+        assert_eq!(hit_ids(&local), ["a"]);
+        assert_eq!(local["exhaustive_search_count"], 1);
+
+        // The GET route takes it as a query parameter.
+        let get = handle_search_get(
+            "GET /search?ns=tenant/ryw-index&q=hello&consistency=strong HTTP/1.1",
+            &query,
+        );
+        assert_eq!(total_hits(&get), 1);
+        let get = handle_search_get(
+            "GET /search?ns=tenant/ryw-index&q=hello&consistency=eventual HTTP/1.1",
+            &query,
+        );
+        assert_eq!(total_hits(&get), 0);
+        let bad = handle_search_get(
+            "GET /search?ns=tenant/ryw-index&q=hello&consistency=sometimes HTTP/1.1",
+            &query,
+        );
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        let bad = handle_search_post(
+            br#"{"namespace":"tenant/ryw-index","query_text":"hello","consistency":"weak"}"#,
+            &query,
+        );
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+
+        // A second write changes the tail; the next search sees both, and
+        // after a flush the documents come from the segment instead.
+        ryw_index(&ingest, ns, vec![ryw_doc("b", "hello again", "x")]);
+        let both = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "hello"}),
+        );
+        assert_eq!(both["total_hits"], 2);
+        assert_eq!(both["exhaustive_search_count"], 2);
+        flush_and_publish_namespace(&ingest, &ns_id).unwrap();
+        let flushed = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "hello"}),
+        );
+        assert_eq!(flushed["total_hits"], 2, "no double count after the flush");
+        assert_eq!(flushed["exhaustive_search_count"], 0);
+    }
+
+    /// #255 acceptance: an upsert shows only the newest version, whether
+    /// the old one is unindexed or indexed.
+    #[test]
+    fn strong_search_returns_only_the_newest_version() {
+        let store = outage_store();
+        let (ingest, query) = read_your_writes_pods(&store, |_, _| {});
+        let ns = "tenant/ryw-upsert";
+        // Both versions unindexed.
+        ryw_index(&ingest, ns, vec![ryw_doc("a", "alpha original", "x")]);
+        ryw_index(&ingest, ns, vec![ryw_doc("a", "beta rewritten", "x")]);
+        for state in [&*ingest, &query] {
+            let all = ryw_search(
+                state,
+                serde_json::json!({"namespace": ns, "query_text": "", "filter": {"match_all": {}}}),
+            );
+            assert_eq!(hit_ids(&all), ["a"]);
+            assert_eq!(all["results"][0]["fields"][0]["value"], "beta rewritten");
+            let old = ryw_search(
+                state,
+                serde_json::json!({"namespace": ns, "query_text": "original"}),
+            );
+            assert_eq!(old["total_hits"], 0);
+        }
+        // Indexed old version, then an upsert.
+        flush_and_publish_namespace(&ingest, &NamespaceId(ns.into())).unwrap();
+        ryw_index(&ingest, ns, vec![ryw_doc("a", "gamma third", "x")]);
+        let all = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "", "filter": {"match_all": {}}}),
+        );
+        assert_eq!(hit_ids(&all), ["a"]);
+        assert_eq!(all["total_hits"], 1);
+        assert_eq!(all["results"][0]["fields"][0]["value"], "gamma third");
+    }
+
+    /// #255: the tail's masks hide the indexed copies it supersedes (the
+    /// WAL-replay case, where an unindexed write replaces or deletes a
+    /// document that is still live in a segment).
+    #[test]
+    fn tail_masks_hide_superseded_indexed_copies() {
+        let store = outage_store();
+        let (ingest, mut query) = ingest_and_query(&store, Some(Duration::from_secs(3600)));
+        let ns = NamespaceId("tenant/ryw-mask".into());
+        ingest
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![
+                    ryw_doc("a", "old words", "x"),
+                    ryw_doc("b", "other words", "x"),
+                ],
+            )
+            .unwrap();
+        ingest.indexer.flush_namespace(&ns).unwrap();
+        ingest.publish_namespace(&ns).unwrap();
+        let manifest = ingest.indexer.manifest(&ns).unwrap();
+        let segment = manifest.segments[0].segment_id.clone();
+        let version = manifest.version;
+        query.unindexed.fetcher = Some(Box::new(move |_, asked, known| {
+            let mut tail = kosha_write::UnindexedTail {
+                manifest_version: version,
+                fingerprint: "crafted".into(),
+                ..Default::default()
+            };
+            assert_eq!(asked, version);
+            if known == Some("crafted") {
+                tail.not_modified = true;
+                return Ok(tail);
+            }
+            tail.documents = vec![ryw_doc("a", "new words", "x")];
+            tail.deleted_ids = vec![DocumentId("b".into())];
+            tail.masked = HashMap::from([(segment.clone(), vec![0, 1])]);
+            Ok(tail)
+        }));
+        let body = serde_json::json!({"namespace": "tenant/ryw-mask", "query_text": "words"});
+        for _ in 0..2 {
+            // The second search reuses the built tail (`not_modified`).
+            let strong = ryw_search(&query, body.clone());
+            assert_eq!(hit_ids(&strong), ["a"]);
+            assert_eq!(strong["total_hits"], 1);
+            assert_eq!(strong["results"][0]["fields"][0]["value"], "new words");
+        }
+        let mut eventual = body.clone();
+        eventual["consistency"] = "eventual".into();
+        let eventual = ryw_search(&query, eventual);
+        assert_eq!(eventual["total_hits"], 2);
+        assert!(eventual["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["fields"][0]["value"] == "old words"));
+    }
+
+    /// #255 acceptance: deletes (by query, of unindexed and indexed
+    /// documents) take effect for strong searches immediately.
+    #[test]
+    fn strong_search_hides_deleted_documents() {
+        let store = outage_store();
+        let (ingest, query) = read_your_writes_pods(&store, |_, _| {});
+        let ns = "tenant/ryw-delete";
+        ryw_index(&ingest, ns, vec![ryw_doc("old", "kept words", "drop")]);
+        flush_and_publish_namespace(&ingest, &NamespaceId(ns.into())).unwrap();
+        ryw_index(
+            &ingest,
+            ns,
+            vec![
+                ryw_doc("a", "kept words", "drop"),
+                ryw_doc("b", "kept words", "keep"),
+            ],
+        );
+        let before = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "kept"}),
+        );
+        assert_eq!(before["total_hits"], 3);
+        let delete = handle_delete(
+            br#"{"namespace":"tenant/ryw-delete","filter":{"term":{"status":"drop"}}}"#,
+            &ingest,
+        );
+        assert!(delete.starts_with("HTTP/1.1 200"), "{delete}");
+        for state in [&*ingest, &query] {
+            let after = ryw_search(
+                state,
+                serde_json::json!({"namespace": ns, "query_text": "kept"}),
+            );
+            assert_eq!(hit_ids(&after), ["b"]);
+            assert_eq!(after["total_hits"], 1);
+        }
+    }
+
+    /// #255: a flush that publishes between the query pod's manifest
+    /// snapshot and its tail fetch is neither missed nor double-counted:
+    /// the stale tail is refused, the manifest refreshed and the tail
+    /// fetched again.
+    #[test]
+    fn strong_search_survives_a_flush_racing_the_tail_fetch() {
+        let store = outage_store();
+        let race = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let armed = Arc::clone(&race);
+        let (ingest, query) = read_your_writes_pods(&store, move |writer, ns| {
+            if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                flush_and_publish_namespace(writer, ns).unwrap();
+            }
+        });
+        let ns = "tenant/ryw-race";
+        ryw_index(&ingest, ns, vec![ryw_doc("a", "racing words", "x")]);
+        // Load the namespace on the query pod at the pre-flush version.
+        let first = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "racing"}),
+        );
+        assert_eq!(first["total_hits"], 1);
+        ryw_index(&ingest, ns, vec![ryw_doc("b", "racing words", "x")]);
+        race.store(true, std::sync::atomic::Ordering::SeqCst);
+        let raced = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "racing"}),
+        );
+        assert!(
+            !race.load(std::sync::atomic::Ordering::SeqCst),
+            "the race ran"
+        );
+        assert_eq!(raced["total_hits"], 2);
+        assert_eq!(hit_ids(&raced).len(), 2);
+        assert_eq!(raced["exhaustive_search_count"], 0, "both now indexed");
+    }
+
+    /// #255: under strong consistency a tail that cannot be read fails the
+    /// search; it never silently degrades to eventual.
+    #[test]
+    fn strong_search_fails_when_the_tail_is_unreadable() {
+        let store = outage_store();
+        let (ingest, mut query) = ingest_and_query(&store, Some(Duration::from_secs(3600)));
+        index_text_and_publish(&ingest, &NamespaceId("tenant/ryw-down".into()), &["a"]);
+        // No internal credential and no fetcher: the default is eventual,
+        // an explicit strong request is refused with the reason.
+        let plain = br#"{"namespace":"tenant/ryw-down","query_text":"hello"}"#;
+        assert_eq!(total_hits(&handle_search_post(plain, &query)), 1);
+        let strong =
+            br#"{"namespace":"tenant/ryw-down","query_text":"hello","consistency":"strong"}"#;
+        let refused = handle_search_post(strong, &query);
+        assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+        assert!(refused.contains("KOSHA_INTERNAL_API_KEY"), "{refused}");
+        // A failing fetch is a 503 too.
+        query.unindexed.fetcher = Some(Box::new(|_, _, _| {
+            Err(KoshaError::Io(std::io::Error::other("ingest down")))
+        }));
+        let failed = handle_search_post(strong, &query);
+        assert!(failed.starts_with("HTTP/1.1 503"), "{failed}");
+        assert!(failed.contains("ingest down"), "{failed}");
+        let eventual =
+            br#"{"namespace":"tenant/ryw-down","query_text":"hello","consistency":"eventual"}"#;
+        assert_eq!(total_hits(&handle_search_post(eventual, &query)), 1);
+        // The internal route needs the internal credential.
+        let denied = route(
+            "GET /internal/namespaces/tenant%2Fryw-down/unindexed HTTP/1.1",
+            &HashMap::new(),
+            b"",
+            "tenant",
+            &ingest,
+        );
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+    }
+
+    /// #255 acceptance: past the unindexed cap `/index` and `/replace`
+    /// answer 429 with a retry hint until a flush drains the backlog.
+    #[test]
+    fn unindexed_backlog_cap_backpressures_writes() {
+        let mut state = test_state();
+        state.unindexed_cap = unindexed::UnindexedCap {
+            max_bytes: 0,
+            max_docs: Some(2),
+        };
+        let ns = "tenant/ryw-cap";
+        let ok = ryw_index(
+            &state,
+            ns,
+            vec![ryw_doc("a", "one", "x"), ryw_doc("b", "two", "x")],
+        );
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        let refused = ryw_index(&state, ns, vec![ryw_doc("c", "three", "x")]);
+        assert!(refused.starts_with("HTTP/1.1 429"), "{refused}");
+        assert!(refused.contains("\r\nretry-after: 1\r\n"), "{refused}");
+        assert!(refused.contains("KOSHA_MAX_UNINDEXED_DOCS"), "{refused}");
+        let replace = serde_json::to_vec(&IndexRequest {
+            namespace: NamespaceId(ns.into()),
+            documents: vec![ryw_doc("a", "patched", "x")],
+        })
+        .unwrap();
+        assert!(handle_replace(&replace, &state).starts_with("HTTP/1.1 429"));
+        let stats = stats_json(&state);
+        let entry = stats["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["namespace"] == ns)
+            .unwrap()
+            .clone();
+        assert_eq!(entry["unindexed_documents"], 2);
+        assert!(entry["unindexed_bytes"].as_u64().unwrap() > 0);
+
+        flush_and_publish_namespace(&state, &NamespaceId(ns.into())).unwrap();
+        let accepted = ryw_index(&state, ns, vec![ryw_doc("c", "three", "x")]);
+        assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
+
+        // The byte cap works the same way.
+        state.unindexed_cap = unindexed::UnindexedCap {
+            max_bytes: 1,
+            max_docs: None,
+        };
+        assert!(ryw_index(&state, ns, vec![ryw_doc("d", "four", "x")]).starts_with("HTTP/1.1 429"));
+    }
+
+    /// #255 acceptance: `search_after` pages and capped `total_hits` stay
+    /// coherent when unindexed hits are merged with indexed ones.
+    #[test]
+    fn strong_search_paginates_across_indexed_and_unindexed_hits() {
+        let store = outage_store();
+        let (ingest, query) = read_your_writes_pods(&store, |_, _| {});
+        let ns = "tenant/ryw-page";
+        let docs = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| ryw_doc(id, "page words", "x"))
+                .collect()
+        };
+        ryw_index(&ingest, ns, docs(&["d01", "d03", "d05", "d07", "d09"]));
+        flush_and_publish_namespace(&ingest, &NamespaceId(ns.into())).unwrap();
+        ryw_index(&ingest, ns, docs(&["d02", "d04", "d06", "d08", "d10"]));
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut body = serde_json::json!({
+                "namespace": ns,
+                "query_text": "page",
+                "max_results": 3,
+                "sort": [{"_id": {"order": "asc"}}],
+            });
+            if let Some(ref after) = cursor {
+                body["search_after"] = serde_json::json!([after]);
+            }
+            let page = ryw_search(&query, body);
+            assert_eq!(page["total_hits"], 10);
+            assert_eq!(page["exhaustive_search_count"], 5);
+            let ids = hit_ids(&page);
+            if ids.is_empty() {
+                break;
+            }
+            cursor = ids.last().cloned();
+            seen.extend(ids);
+        }
+        let expected: Vec<String> = (1..=10).map(|i| format!("d{i:02}")).collect();
+        assert_eq!(seen, expected, "every document once, in order");
+
+        let capped = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "page", "total_hits_cap": 7}),
+        );
+        assert_eq!(capped["total_hits"], 7);
+        assert_eq!(capped["total_hits_relation"], "gte");
+        let exact = ryw_search(
+            &query,
+            serde_json::json!({"namespace": ns, "query_text": "page", "exact_total_hits": true}),
+        );
+        assert_eq!(exact["total_hits"], 10);
+        assert_eq!(exact["total_hits_relation"], "eq");
     }
 
     #[test]
@@ -15787,5 +17389,572 @@ mod tests {
         for (_, v) in &rates.segments {
             assert!((v[warm::FileClass::DocStore.index()] - 1.0).abs() < 1e-3);
         }
+    }
+
+    // ─── Namespace sharding (#207) ──────────────────────────────────────
+
+    fn shard_v1(state: &AppState, line: &str, body: serde_json::Value) -> serde_json::Value {
+        let response = route(
+            &format!("{line} HTTP/1.1\r\n"),
+            &HashMap::new(),
+            &serde_json::to_vec(&body).unwrap(),
+            "acme",
+            state,
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{line}: {response}");
+        json_body(&response)
+    }
+
+    /// A small corpus with skewed term frequencies, a keyword, a number and
+    /// a few duplicate-scoring documents, so ranking, ties and filters all
+    /// get exercised.
+    fn sharding_corpus(range: std::ops::Range<usize>) -> serde_json::Value {
+        const WORDS: [&str; 8] = [
+            "contract", "breach", "court", "damages", "appeal", "motion", "witness", "evidence",
+        ];
+        let docs: Vec<serde_json::Value> = range
+            .map(|i| {
+                let mut seed = (i as u64).wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                let mut text: Vec<&str> = (0..(i % 7 + 2))
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                        WORDS[(seed >> 33) as usize % 8]
+                    })
+                    .collect();
+                if i % 5 == 0 {
+                    text.push("contract");
+                }
+                let kind = ["memo", "brief", "order"][i % 3];
+                serde_json::json!({
+                    "id": format!("doc-{i:04}"),
+                    "fields": [
+                        {"name": "body", "field_type": "Text", "value": text.join(" ")},
+                        {"name": "kind", "field_type": "Keyword", "value": kind},
+                        {"name": "rank", "field_type": "Integer", "value": format!("{}", (i * 37) % 101)},
+                    ]
+                })
+            })
+            .collect();
+        serde_json::json!({ "documents": docs })
+    }
+
+    fn hits(result: &serde_json::Value) -> Vec<(String, f64)> {
+        result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                (
+                    d["doc_id"].as_str().unwrap().to_string(),
+                    d["score"].as_f64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// Index, update, delete, flush and compact the same writes into an
+    /// unsharded and a 4-shard namespace.
+    fn load_plain_and_sharded(state: &AppState) {
+        let created = shard_v1(
+            state,
+            "POST /v1/namespaces/sharded/shards",
+            serde_json::json!({"shards": 4}),
+        );
+        assert_eq!(created["changed"], true);
+        for ns in ["plain", "sharded"] {
+            for batch in [0..120, 120..250, 250..300] {
+                shard_v1(
+                    state,
+                    &format!("POST /v1/namespaces/{ns}/documents"),
+                    sharding_corpus(batch),
+                );
+                shard_v1(
+                    state,
+                    &format!("POST /v1/namespaces/{ns}/flush"),
+                    serde_json::json!({}),
+                );
+            }
+            // Upserts of existing ids (they must replace, not duplicate).
+            let mut update = sharding_corpus(0..40);
+            for doc in update["documents"].as_array_mut().unwrap() {
+                doc["fields"][0]["value"] = serde_json::json!("appeal appeal granted");
+            }
+            shard_v1(
+                state,
+                &format!("POST /v1/namespaces/{ns}/documents"),
+                update,
+            );
+            shard_v1(
+                state,
+                &format!("POST /v1/namespaces/{ns}/flush"),
+                serde_json::json!({}),
+            );
+            let deleted = shard_v1(
+                state,
+                &format!("POST /v1/namespaces/{ns}/delete"),
+                serde_json::json!({"filter": {"term": {"kind": "order"}}}),
+            );
+            assert_eq!(deleted["deleted"], 100, "{ns}: {deleted}");
+        }
+    }
+
+    #[test]
+    fn sharded_namespace_matches_unsharded_results() {
+        let state = test_state();
+        load_plain_and_sharded(&state);
+
+        // Writes really were spread over the shards, each with its own
+        // manifest and segments.
+        let stats = json_body(&handle_namespace_stats("sharded", "acme", &state));
+        assert_eq!(stats["shards"], 4);
+        let per_shard = stats["shard_stats"].as_array().unwrap();
+        assert_eq!(per_shard.len(), 4);
+        for shard in per_shard {
+            assert!(shard["segments"].as_u64().unwrap() >= 2, "{stats}");
+        }
+        let plain_stats = json_body(&handle_namespace_stats("plain", "acme", &state));
+        assert_eq!(stats["documents"], plain_stats["documents"]);
+        let root = state
+            .indexer
+            .manifest_shared(&NamespaceId("acme/sharded".into()))
+            .unwrap();
+        assert!(root.segments.is_empty(), "the root holds no segments");
+
+        let queries = [
+            serde_json::json!({"query_text": "contract", "max_results": 400}),
+            serde_json::json!({"query_text": "appeal witness", "max_results": 25}),
+            serde_json::json!({"query_text": "court damages evidence", "max_results": 10, "from": 5}),
+            serde_json::json!({"query_text": "motion", "max_results": 400,
+                "filter": {"term": {"kind": "memo"}}}),
+            serde_json::json!({"query_text": "", "max_results": 50, "filter": {"match_all": {}},
+                "sort": [{"rank": {"order": "desc"}}, {"_id": {"order": "asc"}}]}),
+            serde_json::json!({"query_text": "breach", "max_results": 5, "exact_total_hits": false,
+                "aggs": {"kinds": {"terms": {"field": "kind"}}}}),
+        ];
+        let check = |phase: &str| {
+            for query in &queries {
+                let plain = shard_v1(&state, "POST /v1/namespaces/plain/search", query.clone());
+                let sharded = shard_v1(&state, "POST /v1/namespaces/sharded/search", query.clone());
+                assert_eq!(hits(&plain), hits(&sharded), "{phase}: {query}");
+                assert_eq!(
+                    plain["total_hits"], sharded["total_hits"],
+                    "{phase}: {query}"
+                );
+                assert_eq!(
+                    plain["total_hits_relation"], sharded["total_hits_relation"],
+                    "{phase}: {query}"
+                );
+                assert_eq!(
+                    plain["aggregations"], sharded["aggregations"],
+                    "{phase}: {query}"
+                );
+                assert!(
+                    !hits(&plain).is_empty() || query["query_text"] == "",
+                    "{query}"
+                );
+            }
+        };
+        check("after flush");
+
+        // Compact both (the sharded root compacts every shard) and compare
+        // again.
+        for ns in ["acme/plain", "acme/sharded"] {
+            let response = handle_compact_namespace(
+                &serde_json::to_vec(&serde_json::json!({"namespace": ns, "mode": "full"})).unwrap(),
+                "acme",
+                &state,
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+        let stats = json_body(&handle_namespace_stats("sharded", "acme", &state));
+        for shard in stats["shard_stats"].as_array().unwrap() {
+            assert_eq!(shard["segments"], 1, "{stats}");
+        }
+        check("after compaction");
+
+        // Exists is answered by the shard each id routes to.
+        let exists = shard_v1(
+            &state,
+            "POST /v1/namespaces/sharded/exists",
+            serde_json::json!({"ids": ["doc-0000", "doc-0002", "doc-0298", "nope"]}),
+        );
+        // doc-0002 was a deleted `order`.
+        assert_eq!(
+            exists["existing"],
+            serde_json::json!(["doc-0000", "doc-0298"])
+        );
+        assert_eq!(exists["missing"], serde_json::json!(["doc-0002", "nope"]));
+    }
+
+    #[test]
+    fn sharded_pagination_returns_each_document_once() {
+        let state = test_state();
+        load_plain_and_sharded(&state);
+        for sort in [
+            serde_json::json!([{"rank": {"order": "desc"}}, {"_id": {"order": "asc"}}]),
+            serde_json::json!([{"_id": {"order": "asc"}}]),
+        ] {
+            let mut seen = Vec::new();
+            let mut plain_seen = Vec::new();
+            let mut after: Option<serde_json::Value> = None;
+            loop {
+                let mut query = serde_json::json!({"query_text": "", "max_results": 7,
+                    "filter": {"match_all": {}}, "sort": sort});
+                if let Some(ref after) = after {
+                    query["search_after"] = after.clone();
+                }
+                let page = shard_v1(&state, "POST /v1/namespaces/sharded/search", query.clone());
+                let plain = shard_v1(&state, "POST /v1/namespaces/plain/search", query);
+                let results = page["results"].as_array().unwrap().clone();
+                assert_eq!(hits(&page), hits(&plain));
+                if results.is_empty() {
+                    break;
+                }
+                let last = results.last().unwrap();
+                let id = last["doc_id"].as_str().unwrap().to_string();
+                after = Some(if sort.as_array().unwrap().len() == 2 {
+                    let rank = last["fields"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|f| f["name"] == "rank")
+                        .unwrap()["value"]
+                        .clone();
+                    serde_json::json!([rank, id])
+                } else {
+                    serde_json::json!([id])
+                });
+                seen.extend(hits(&page).into_iter().map(|(id, _)| id));
+                plain_seen.extend(hits(&plain).into_iter().map(|(id, _)| id));
+            }
+            let unique: std::collections::HashSet<&String> = seen.iter().collect();
+            assert_eq!(
+                unique.len(),
+                seen.len(),
+                "a document was returned twice: {sort}"
+            );
+            assert_eq!(seen.len(), 200, "every live document exactly once: {sort}");
+            assert_eq!(seen, plain_seen);
+        }
+    }
+
+    /// Read-your-writes (#255) over a sharded namespace (#207): every
+    /// shard's unindexed tail is searched, relative to its own manifest.
+    #[test]
+    fn strong_search_sees_unflushed_writes_in_every_shard() {
+        let state = test_state();
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/live/shards",
+            serde_json::json!({"shards": 4}),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/live/documents",
+            sharding_corpus(0..20),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/live/flush",
+            serde_json::json!({}),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/live/documents",
+            sharding_corpus(20..40),
+        );
+        let count = |consistency: &str| {
+            shard_v1(
+                &state,
+                "POST /v1/namespaces/live/search",
+                serde_json::json!({"query_text": "", "max_results": 100,
+                                   "filter": {"terms": {"kind": ["memo", "brief", "order"]}},
+                                   "consistency": consistency}),
+            )["total_hits"]
+                .as_u64()
+                .unwrap()
+        };
+        let strong = shard_v1(
+            &state,
+            "POST /v1/namespaces/live/search",
+            serde_json::json!({"query_text": "", "max_results": 100,
+                               "filter": {"terms": {"kind": ["memo", "brief", "order"]}}}),
+        );
+        assert_eq!(strong["total_hits"], 40, "{strong}");
+        assert_eq!(strong["exhaustive_search_count"], 20, "{strong}");
+        assert_eq!(count("eventual"), 20);
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/live/flush",
+            serde_json::json!({}),
+        );
+        assert_eq!(count("strong"), 40);
+        assert_eq!(count("eventual"), 40);
+    }
+
+    #[test]
+    fn deleting_a_sharded_namespace_deletes_its_shards() {
+        let state = test_state();
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/gone/shards",
+            serde_json::json!({"shards": 3}),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/gone/documents",
+            sharding_corpus(0..30),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/gone/flush",
+            serde_json::json!({}),
+        );
+        let root = NamespaceId("acme/gone".into());
+        let shards = kosha_core::sharding::shard_namespaces(&root, 3);
+        assert!(shards
+            .iter()
+            .any(|shard| state.indexer.manifest_version(shard).is_some()));
+        let response = route(
+            "DELETE /v1/namespaces/gone HTTP/1.1\r\n",
+            &HashMap::new(),
+            b"",
+            "acme",
+            &state,
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        for shard in &shards {
+            assert!(
+                state.indexer.manifest(shard).is_none(),
+                "{} outlived its root",
+                shard.0
+            );
+            assert!(
+                state
+                    .controller
+                    .lock()
+                    .unwrap()
+                    .manifest_cloned(shard)
+                    .is_none(),
+                "{} still in the control store",
+                shard.0
+            );
+        }
+    }
+
+    #[test]
+    fn shard_count_is_fixed_at_creation() {
+        let state = test_state();
+        // A namespace that already has documents cannot be sharded.
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/full/documents",
+            sharding_corpus(0..3),
+        );
+        let refused = route(
+            "POST /v1/namespaces/full/shards HTTP/1.1\r\n",
+            &HashMap::new(),
+            br#"{"shards": 4}"#,
+            "acme",
+            &state,
+        );
+        assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+        // Asking for one shard is an ordinary namespace: nothing changes.
+        assert_eq!(
+            shard_v1(
+                &state,
+                "POST /v1/namespaces/full/shards",
+                serde_json::json!({"shards": 1})
+            )["changed"],
+            false
+        );
+
+        assert_eq!(
+            shard_v1(
+                &state,
+                "POST /v1/namespaces/fresh/shards",
+                serde_json::json!({"shards": 3})
+            )["changed"],
+            true
+        );
+        assert_eq!(
+            shard_v1(
+                &state,
+                "POST /v1/namespaces/fresh/shards",
+                serde_json::json!({"shards": 3})
+            )["changed"],
+            false
+        );
+        for bad in [
+            r#"{"shards": 5}"#,
+            r#"{"shards": 1}"#,
+            r#"{"shards": 0}"#,
+            r#"{"shards": 9999}"#,
+            r#"{}"#,
+        ] {
+            let response = route(
+                "POST /v1/namespaces/fresh/shards HTTP/1.1\r\n",
+                &HashMap::new(),
+                bad.as_bytes(),
+                "acme",
+                &state,
+            );
+            assert!(response.starts_with("HTTP/1.1 400"), "{bad}: {response}");
+        }
+        // The root refuses direct writes; every shard is registered in the
+        // control store and the root manifest records the count.
+        let root = NamespaceId("acme/fresh".into());
+        assert!(state
+            .indexer
+            .index_documents(
+                root.clone(),
+                vec![Document {
+                    id: DocumentId("x".into()),
+                    fields: vec![Field::text("body", "x")],
+                }]
+            )
+            .is_err());
+        let controller = state.controller.lock().unwrap();
+        assert_eq!(controller.manifest_cloned(&root).unwrap().shards, Some(3));
+        for shard in kosha_core::sharding::shard_namespaces(&root, 3) {
+            assert!(controller.has_namespace(&shard), "{}", shard.0);
+        }
+    }
+
+    #[test]
+    fn sharded_namespace_inherits_and_propagates_schema() {
+        let state = test_state();
+        let schema = serde_json::json!({"fields": {"name": {"analyzer": ["standard", "stem"]}}});
+        shard_v1(&state, "POST /v1/namespaces/s/schema", schema.clone());
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/s/shards",
+            serde_json::json!({"shards": 2}),
+        );
+        shard_v1(&state, "POST /v1/namespaces/p/schema", schema);
+        let root = NamespaceId("acme/s".into());
+        for shard in kosha_core::sharding::shard_namespaces(&root, 2) {
+            assert!(state
+                .indexer
+                .manifest_shared(&shard)
+                .unwrap()
+                .schema
+                .is_some());
+        }
+        // The analyzer reaches every shard's segments.
+        let docs = serde_json::json!({"documents": (0..20).map(|i| serde_json::json!({
+            "id": format!("n{i}"),
+            "fields": [{"name": "name", "field_type": "Text",
+                "value": if i % 4 == 0 { "running late" } else { "walked home" }}],
+        })).collect::<Vec<_>>()});
+        for ns in ["s", "p"] {
+            shard_v1(
+                &state,
+                &format!("POST /v1/namespaces/{ns}/documents"),
+                docs.clone(),
+            );
+            shard_v1(
+                &state,
+                &format!("POST /v1/namespaces/{ns}/flush"),
+                serde_json::json!({}),
+            );
+        }
+        let query = serde_json::json!({"query_text": "runs", "max_results": 50});
+        let sharded = shard_v1(&state, "POST /v1/namespaces/s/search", query.clone());
+        let plain = shard_v1(&state, "POST /v1/namespaces/p/search", query);
+        assert_eq!(sharded["total_hits"], 5, "{sharded}");
+        assert_eq!(hits(&sharded), hits(&plain));
+
+        // A later schema change reaches every shard too.
+        let other = serde_json::json!({"fields": {"name": {"analyzer": ["standard"]}}});
+        shard_v1(&state, "POST /v1/namespaces/s/schema", other);
+        let root_schema = state.indexer.manifest_shared(&root).unwrap().schema.clone();
+        assert!(root_schema.is_some());
+        for shard in kosha_core::sharding::shard_namespaces(&root, 2) {
+            assert_eq!(
+                state.indexer.manifest_shared(&shard).unwrap().schema,
+                root_schema
+            );
+        }
+    }
+
+    /// A query replica follows the root and every shard manifest from the
+    /// control store and searches the merged view.
+    #[test]
+    fn query_replica_searches_sharded_namespace() {
+        let store = outage_store();
+        let (ingest, query) = ingest_and_query(&store, None);
+        shard_v1(
+            &ingest,
+            "POST /v1/namespaces/docs/shards",
+            serde_json::json!({"shards": 4}),
+        );
+        shard_v1(
+            &ingest,
+            "POST /v1/namespaces/docs/documents",
+            sharding_corpus(0..60),
+        );
+        shard_v1(
+            &ingest,
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        );
+        let body = serde_json::json!({"query_text": "contract", "max_results": 100});
+        let on_ingest = shard_v1(&ingest, "POST /v1/namespaces/docs/search", body.clone());
+        let on_query = shard_v1(&query, "POST /v1/namespaces/docs/search", body.clone());
+        assert!(!hits(&on_ingest).is_empty());
+        assert_eq!(hits(&on_ingest), hits(&on_query));
+
+        // A later publish to one shard is picked up too.
+        shard_v1(
+            &ingest,
+            "POST /v1/namespaces/docs/documents",
+            sharding_corpus(60..90),
+        );
+        shard_v1(
+            &ingest,
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        );
+        let on_ingest = shard_v1(&ingest, "POST /v1/namespaces/docs/search", body.clone());
+        let on_query = shard_v1(&query, "POST /v1/namespaces/docs/search", body);
+        assert_eq!(hits(&on_ingest), hits(&on_query));
+        assert_eq!(on_ingest["total_hits"], on_query["total_hits"]);
+    }
+
+    /// Manifests written before sharding existed carry no `shards` field and
+    /// keep behaving as ordinary namespaces.
+    #[test]
+    fn manifests_without_a_shard_count_stay_unsharded() {
+        let legacy: kosha_core::Manifest =
+            serde_json::from_str(r#"{"version": 3, "segments": []}"#).unwrap();
+        assert_eq!(legacy.shards, None);
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("shards"));
+        let state = test_state();
+        let ns = NamespaceId("acme/legacy".into());
+        state
+            .controller
+            .lock()
+            .unwrap()
+            .save_manifest(&ns, &legacy)
+            .unwrap();
+        state.indexer.restore_manifest(ns.clone(), legacy);
+        assert_eq!(state.indexer.shard_count(&ns), None);
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/legacy/documents",
+            sharding_corpus(0..5),
+        );
+        shard_v1(
+            &state,
+            "POST /v1/namespaces/legacy/flush",
+            serde_json::json!({}),
+        );
+        let result = shard_v1(
+            &state,
+            "POST /v1/namespaces/legacy/search",
+            serde_json::json!({"query_text": "contract"}),
+        );
+        assert!(result["total_hits"].as_u64().unwrap() > 0);
     }
 }

@@ -161,12 +161,15 @@ fn fixture(name: &str) -> Fixture {
             },
         ],
         schema: Default::default(),
+        shards: None,
+        branch: None,
     };
     manifest.deletion_vectors.insert(
         SegmentId(LIVE.into()),
         DeletionVector {
             generation: current,
             count: 1,
+            namespace: Default::default(),
         },
     );
     let mut controller = Controller::new();
@@ -189,6 +192,7 @@ fn config(dry_run: bool) -> GcConfig {
         grace_ms: HOUR_MS,
         orphan_grace_ms: 24 * HOUR_MS,
         now_ms: now_ms(),
+        referenced_elsewhere: None,
     }
 }
 

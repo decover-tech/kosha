@@ -123,8 +123,10 @@ fn build_corpus(
         wal_origin: None,
         tombstones: Default::default(),
         deletion_vectors: Default::default(),
+        branch: None,
         schema: None,
         retired: Default::default(),
+        shards: None,
     }
 }
 

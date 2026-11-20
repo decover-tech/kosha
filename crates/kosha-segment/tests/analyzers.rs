@@ -101,6 +101,11 @@ fn footer_without_timestamp(bytes: &[u8]) -> serde_json::Value {
     // (the wrapper was always optional); the shards themselves must still
     // match byte for byte below.
     value.as_object_mut().unwrap().remove("posting_blobs_raw");
+    // Additive since #204: a segment without vectors says so explicitly
+    // (`[]`), which no reader before #204 looks at.
+    if value.get("vector_fields") == Some(&serde_json::json!([])) {
+        value.as_object_mut().unwrap().remove("vector_fields");
+    }
     value
 }
 

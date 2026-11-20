@@ -37,11 +37,15 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 | Configurable analyzers | Per-field `analyzer` in the namespace schema: `standard`, `standard@2` (Unicode), `keyword`, `lowercase`, `whitespace`, plus `lowercase` / `stop` / `stem` filters. See [Analyzers](#analyzers) |
 | `wildcard` | Per-field pattern match, case-insensitive by default |
 | `fuzzy` | Typo-tolerant term matching: `"fuzzy": {"field": "content", "value": "recieve", "fuzziness": 1}` finds `receive`. `fuzziness` is `0`, `1`, `2` or `"auto"` (default; Elasticsearch `AUTO:3,6`: exact below 3 characters, one edit up to 5, two from 6; `"auto:low,high"` moves the thresholds). An edit is an insertion, deletion, substitution or — with `transpositions` (default `true`) — a swap of adjacent characters. `prefix_length` (default 0) leading characters must match exactly and make expansion cheaper; `max_expansions` (default 50, at most 1024) caps the terms each token expands to per segment, nearest first, the exact term always kept. A non-exact match must leave a character of the shorter string untouched (`ox` never matches `o`). The value is analyzed with each segment's own analyzer and every token is expanded against that segment's sorted term dictionary (a Levenshtein-automaton walk that skips whole prefix ranges); several tokens combine with `operator` (AND by default). Scoring is tiered so **an exact match always outranks a one-edit match, which always outranks a two-edit one**: per token, `score = (2 − edits) + tf_norm` with `tf_norm ∈ (0, 1]` BM25's length-normalized tf saturation (namespace `avgdl`); no IDF, since expansions differ per segment. `field` (`""` / `_all` / `*` = every `Text` field) restricts it to one field's postings; segments written before per-field indexes answer from their combined index. Its own lexical query: not combinable with `query_text` / `fields` / `wildcard` / `match_phrase`, but can be the lexical leg of a hybrid request and takes `rank_by`. Segments are bloom-pruned for 0- and 1-edit tokens (see [Fuzzy bloom](#fuzzy-bloom)). Runs on an exhaustive path (no block-max WAND). On 1M docs x 30 words in 8 segments (1.08M distinct terms), warm: ~0.5–1 ms at 1 edit and ~3.5–4.5 ms at 2 edits for mid-frequency and rare words, ~10–14 ms when an expansion is a very frequent word (every posting is scored; the exact `query_text` WAND query takes 0.5 ms). The dictionary walk itself is ~0.2 ms per segment at 1 edit and ~2 ms at 2 edits (~0.3 ms with `prefix_length: 2`). Non-fuzzy queries are unchanged (`cargo bench -p kosha-query --bench fuzzy_expansion`) |
-| kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments |
+| kNN / ANN vector search | Cluster-and-posting on-disk vector index with centroid probing and triangle-inequality lower bounds; global probe budget; flat/HNSW fallback for older segments. Compaction merges the inputs' postings and repairs them with SPFresh's LIRE split / merge / reassign instead of re-clustering every vector (`KOSHA_VECTOR_COMPACTION=lire`, the default; `rebuild` re-clusters as before). Same on-disk format either way (#253) |
 | Hybrid retrieval (RRF) | A lexical query (`query_text` / `wildcard` / `match_phrase` / `fuzzy`) plus a `knn` clause is fused with Reciprocal Rank Fusion, `score = Σ 1/(rank_constant + rank)`. Tune with `"rank": {"rrf": {"rank_window_size": 100, "rank_constant": 60}}` (Elasticsearch names and defaults: window = `max_results`, constant = 60; window must be ≥ `max_results`). Each retriever is ranked across the whole namespace before fusing: the lexical list is the best `rank_window_size` BM25 hits, the vector list the nearest `min(knn.k, rank_window_size)`. Vector-only hits are kept. Each hit returns the fused `score` plus `rank_details` (`lexical_rank` / `lexical_score` / `knn_rank` / `knn_score`). The fused list is at most `rank_window_size` long; `from` / `max_results`, `sort`, `collapse` and `search_after` (e.g. on `[_score desc, _id asc]`) apply within it. `total_hits` and aggregations count the lexical matches plus the vector window. Optional `"mode": "lexical" \| "semantic" \| "hybrid"` is checked against the clauses present |
 | Filters | `term`, `terms`, `range` (`gte`/`gt`/`lte`/`lt`), `exists`, `prefix`, `bool` (`must` / `must_not` / `should` / `minimum_should_match`; OpenSearch's `filter` is accepted as `must`), `match_all`. Every clause composes inside `bool` and works in `filter`, `knn.filter` and `/delete`. An unknown or malformed clause is a 400, never a match-all. On a multi-valued field (a list, or a [nested path](#nested-attributes) with several values) a clause matches if ANY value does |
 | `prefix` filter | `{"prefix": {"path": "/matters/2026/"}}`, or the long form `{"prefix": {"path": {"value": "/matters/2026/", "case_insensitive": true}}}`. Case-sensitive by default, like `term` (and unlike the `wildcard` query): `"ab"` matches `abc` and `ab`, not `a`, `xab` or `ABC`. A list value matches when any element does. The empty prefix matches exactly the documents `exists` matches. String fields only: a `prefix` on an `Integer`/`Float` field is a 400. Only `value` and `case_insensitive` are accepted in the long form. Evaluated by a scan of the segment's filter column (each distinct value once on a columnar segment), cached per segment; bloom filters cannot skip segments for it |
+| Multiple vector columns | A namespace can hold several `Vector` fields (e.g. a 384-dim `title_emb` and a 1536-dim `body_emb`); each segment builds one index per field and `knn.field` picks the one searched. Each field has one dimension per namespace, fixed by the first vector written to it: a document whose vector disagrees is rejected with a 400, and so is a `knn` naming a field no segment indexes or a query vector of the wrong dimension. Segments written before this change keep serving any `knn.field` from their single index, unless their `doc_vectors.bin` names exactly one field (#204) |
+| i8 vector quantization | `KOSHA_VECTOR_QUANTIZATION=i8` (or per field, `KOSHA_VECTOR_QUANTIZATION_FIELDS=body_emb:i8,title_emb:f32`) stores each segment's ANN posting entries as one f32 scale plus `dim` signed bytes instead of `dim` f32s: `vector.idx`, the bytes a cold kNN hydrates and the warm posting cache all shrink ~4x (measured 3.96x at 768 dims). The probe scores with an i8 dot product, then rescores its best `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates (default 4, `0` disables) with the full-precision vectors in `doc_vectors.bin`, so final scores are exact cosine. f32 and i8 segments mix freely in a namespace. Default `f32`; see the rollout note below (#210) |
+| Late-interaction (ColBERT-style) vectors | A `Vector` field whose value is a bag of token vectors (`[[f32; dim]; n]`) is indexed for MaxSim: `"knn": {"field": "tokens", "vectors": [[...], [...]], "k": 10}` scores `Σ over query tokens of max cosine over the document's tokens`. See [Late interaction](#late-interaction) |
 | kNN-scoped filters | `knn.filter` restricts only the vector list; the top-level `filter` restricts both the lexical and the vector list |
+| Filtered kNN | Filters are applied inside the probe, and a filtered kNN always returns `min(k, documents passing)` hits. When at most 50,000 documents pass namespace-wide (`KOSHA_KNN_EXACT_THRESHOLD`; `0` disables), every passing document's vector is scored exactly instead of probing centroids, so recall is 1.0. A segment where at most 1% of documents pass (`KOSHA_KNN_EXACT_FRACTION`) is searched exactly too. Otherwise the global probe budget is widened by the inverse of the filter's selectivity (at most 8x, `KOSHA_KNN_FILTER_BUDGET_MAX_SCALE`). The response reports `knn_mode` (`ann` / `exact` / `mixed`) and `knn_filtered_candidates` (documents passing the filter). Unfiltered kNN is unchanged and reports `ann` |
 | Sorting | Multi-field `sort` over stored fields and [nested dotted paths](#nested-attributes), plus `_id`. A multi-valued field sorts by its smallest value for `asc` and its largest for `desc` (Elasticsearch's default `mode`) |
 | Pagination | `from` / `max_results`, and an OpenSearch-style `search_after` cursor |
 | Result diversification | `"limit_per": {"field": "author", "max": 2}` returns at most `max` hits per distinct value of a keyword field. The cap is applied while the result list is collected, so a page is filled from the next-best groups instead of coming back short; documents without the field are not capped. `collapse: {"field": ...}` is the one-per-group case (and groups missing values together); the two cannot be combined. `search_after` and `from` resume the same capped list, so no document repeats and a group spent on an earlier page is never refilled. `total_hits` and aggregations count matching documents before the cap (a pure kNN request reports its neighbour set, which is the diversified one). Works for BM25, kNN (diversity is found within the probed `num_candidates`) and hybrid, where each retriever's list is diversified before fusion and `rank_details` ranks are positions in those lists |
@@ -227,10 +231,13 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - Bulk document indexing, with field types `Text`, `Keyword`, `Integer`, `Float`, `Date`, `Boolean`, `Vector`, `GeoPoint`.
 - `Text` values longer than 256 chars (`KOSHA_TEXT_FILTER_IGNORE_ABOVE`; `off` disables the cap) are full-text searchable and returned in hits, but are not copied into the filter columns, so `term`/`terms`/`range` filters, `sort`, and aggregations do not see them. This matches Elasticsearch's dynamic-mapping `keyword` `ignore_above: 256`. Use `Keyword` for a long value that must be exact-matched.
 - Vector field values are stored once, as binary f32, in each segment's `doc_vectors.bin` instead of as JSON text in `doc_store.bin` (`KOSHA_VECTOR_STORE=sidecar`, the default). Hits and compaction still see the full vector, which comes back as the f32 values that were indexed, re-serialized as JSON. Its text can differ from what was sent: digits beyond f32 precision are lost, and so is number formatting. Set `KOSHA_VECTOR_STORE=inline` to keep the old layout. **Before rolling back to a release older than this change, set `inline` and compact:** older binaries can't read the sidecar, and an older binary compacting a sidecar segment drops its vectors.
+- Each `Vector` field gets its own ANN index per segment (#204). A segment with one vector field is byte-identical to before. **A release older than this change reads only a segment's first vector column, for any `knn.field`, and fails to compact a segment whose columns differ in dimension:** don't roll back past it once documents with several vector fields have been flushed.
+- i8 vector quantization (#210) is a writer setting: flushes and compactions written while it is on produce i8 indexes, and existing segments keep theirs until compaction rewrites them (from the f32 vectors in `doc_vectors.bin` or the doc store, never from the i8 copy). **Turn it on only after every query pod runs a release that reads i8 indexes**, since an older reader cannot read them and fails the kNN, and **turn it off and compact before rolling back** past that release. With it off, segments are byte-identical to before. Rescoring reads `doc_vectors.bin` where it is local; a segment stored with `KOSHA_VECTOR_STORE=inline`, or whose sidecar is not yet hydrated from S3, returns the i8 estimates (within ~0.01 of the exact cosine).
 - Upsert by document id — segments holding a prior version of an id are rewritten.
 - Delete by query (tombstone-based) and a document `exists` check.
 - Write-ahead log for buffered documents, replayed on restart.
-- Auto-flush at a configurable document threshold (`KOSHA_FLUSH_THRESHOLD`), plus an explicit `flush` that makes writes visible immediately. A buffer that stays below the threshold is flushed and published once it has been pending for `KOSHA_FLUSH_MAX_AGE_MS` (default 1000; `0` disables), similar to Elasticsearch's `refresh_interval`. The Python client flushes only on `refresh=True` / `"wait_for"` or `indices.refresh()`, not after every bulk batch.
+- Auto-flush at a configurable document threshold (`KOSHA_FLUSH_THRESHOLD`), plus an explicit `flush` that indexes writes immediately. A buffer that stays below the threshold is flushed and published once it has been pending for `KOSHA_FLUSH_MAX_AGE_MS` (default 1000; `0` disables), similar to Elasticsearch's `refresh_interval`. The Python client flushes only on `refresh=True` / `"wait_for"` or `indices.refresh()`, not after every bulk batch.
+- Read-your-writes without a flush (#255): searches default to `"consistency": "strong"` (body field, or `consistency=` on `GET /search`), which also scans the namespace's acknowledged-but-unindexed writes exhaustively — on a query pod by reading them from the ingest pod over `GET /internal/namespaces/{ns}/unindexed` (needs `KOSHA_INTERNAL_API_KEY` on both; without it a query pod defaults to `eventual` and refuses an explicit `strong` with 503). Upserts show only the newest version and deletes apply immediately; `exhaustive_search_count` in the response is how many unindexed documents were scanned. `"eventual"` searches indexed segments only. `KOSHA_DEFAULT_CONSISTENCY` sets the default. The unindexed backlog per namespace is capped by `KOSHA_MAX_UNINDEXED_BYTES` (default 2 GiB, `0` disables) and `KOSHA_MAX_UNINDEXED_DOCS` (unset by default): past either, `/index` and `/replace` return 429 with `retry-after: 1`. The ingest pod's `GET /v1/stats` reports `unindexed_documents` / `unindexed_bytes` per namespace.
 - Size-tiered compaction with a cap on merged-segment size (5 GiB default). A background scheduler on the write pod runs a tiered pass on any namespace past the segment trigger every `KOSHA_COMPACTION_INTERVAL_MS` (default 30000; `0` disables), at most `KOSHA_COMPACTION_MAX_CONCURRENT` passes at a time (default 1). Every pass plans its merge group from S3 object sizes before downloading anything, hydrates only that group, and evicts the superseded inputs from local disk once the merge is published, so a pass needs about 2 x the cap of local disk rather than the whole namespace. A `full` pass loops capped groups inside one job until none fits; job results report `groups`, `bytes_hydrated`, `bytes_evicted` and `peak_local_bytes`. `POST /v1/admin/compact-namespace` also accepts `"async": true` and returns `202` with a job id; poll `GET /v1/admin/compaction-jobs/{id}`, or see scheduler state in `GET /v1/admin/compaction-status`. Building a segment (flush or merge) keeps at most `KOSHA_SEGMENT_BUILD_MEMORY_BYTES` (default 256 MiB) of postings in memory: stored documents stream to disk as they're added, and postings over the budget spill to sorted runs that are merged on disk when the segment is finished. That final merge streams each term's postings through the encoder, so a term that appears in every document doesn't need its posting list in memory, and compaction passes vectors through as f32. A merge's peak heap is about the budget plus ~35 B per merged document (doc-store offsets and field lengths) plus the vocabulary, not counting short filter values and vectors (#253).
 - Segment garbage collection. Every publish records the segments and deletion generations it stops referencing in the manifest (`retired`). Each pod removes its local copies once `KOSHA_LOCAL_GC_GRACE` (default 5m) has passed and no in-flight search can still read them, checked every `KOSHA_LOCAL_GC_INTERVAL_MS` (default 60000; `0` disables). `POST /v1/admin/gc` `{"namespace"?, "dry_run": true}` lists (dry run, the default) or deletes the S3 objects no current manifest references: retired ones after `KOSHA_GC_GRACE` (default 1h), never-recorded orphans after `KOSHA_GC_ORPHAN_GRACE` (default 24h). A segment's `_COMMIT` is deleted before its data. Counters (`kosha_gc_bytes_reclaimed_total`, `kosha_gc_segments_deleted_total`, `kosha_retired_segments`, local equivalents) are under `gc` in `GET /v1/stats`. `k8s/base/cronjob-segment-gc.yaml` runs it daily, shipped suspended and in dry-run mode.
 
@@ -253,10 +260,12 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - Namespace registry and manifest store, in-memory by default or Postgres-backed (`postgres` feature + `DATABASE_URL`), with compare-and-swap manifest publishes.
 - Multi-tenancy: every API key maps to a tenant prefix that scopes all namespace access.
 - Read/write split: query pods forward every mutating route to `KOSHA_INGEST_HOST` and serve reads locally. A background refresher on each query pod polls every namespace's manifest version in one control-store query every `KOSHA_MANIFEST_REFRESH_MS` (default 500; `0` disables it and the pod checks before every search instead) and swaps in manifests that advanced; searches already running finish on the snapshot they started with, and namespaces in `KOSHA_WARMUP_NAMESPACES` have the new version's scoring set fetched before the swap. Searches don't touch the control store unless they pass `max_staleness_seconds` (body field or query parameter) and the namespace was last confirmed current longer ago than that. If the control store is unreachable, query pods keep serving their last-known-good manifests and only a namespace the pod never loaded fails (503). `GET /v1/stats` on a query pod reports per-namespace `manifest_version`, `stored_manifest_version`, `last_refresh_at` (Unix seconds) and `manifest_lag_seconds`, plus a `manifest_refresh` block with error counters and the maximum lag.
+- Namespace sharding with a fixed shard count set at creation (`POST /v1/namespaces/{ns}/shards`): documents route by id to N shard namespaces, each with its own manifest, segments, flushes and compaction; searches read all shards as one namespace. See [Namespace sharding](#namespace-sharding).
 - Backpressure controls: max concurrent searches, search queue depth and timeout, hydration concurrency, admission timeout.
 - `GET /healthz` (liveness), `GET /readyz` (readiness), `GET /v1/stats` and per-namespace stats.
 - Admin endpoints: create API key, rebuild filter blooms, backfill offset tables, compact a namespace (sync or async), compaction job and scheduler status, warmup status, import a namespace.
 - Schema migrations via `kosha-server migrate`.
+- Namespace branching (copy-on-write). `POST /v1/namespaces/{ns}/branch` with `{"name": "<branch>"}` creates a new namespace whose manifest lists the parent's segments and deletion bitmaps where they already are, so it takes the same time for 1M documents as for 10 and copies nothing. Writes, deletes, upserts and compactions on the branch go to the branch's own prefix; the parent's files and query results do not change. `GET /v1/namespaces/{ns}/branches` lists a namespace's branches (`GET .../stats` on a branch shows its parent and how many segments it still shares). `DELETE /v1/namespaces/{ns}/branch` deletes a branch and removes only the objects in its own prefix that no remaining manifest lists: segments a branch of the branch still uses are kept. Only branches can be deleted this way. Admin rewrites (`rebuild-filter-blooms`, `backfill-offset-tables`) on a branch skip the segments it shares with its parent. Segment GC never deletes an object a branch still lists, and `DELETE /v1/namespaces/{ns}` refuses (409) a namespace whose segments a branch still shares: delete the branches first. A sharded namespace cannot be branched yet.
 
 ### API and clients
 
@@ -272,7 +281,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - Analyzer features beyond the list in [Analyzers](#analyzers): per-language stemmers other than English, synonyms, n-grams, CJK dictionary segmentation (`standard@2` splits Han ideographs one per token), full Unicode case folding (`ß` and `SS` stay distinct). Other `FieldSchema` members (`type`, `indexed`, `stored`) are stored but not enforced — field types still come with each document.
 - Fuzzy: block-max WAND over expansions (fuzzy queries score every posting of every expansion), highlighting of fuzzy matches, fuzzy inside `fields` / `match_phrase`, bloom pruning for two-edit tokens.
 - gRPC — the service is defined in the proto, but HTTP/JSON is the only implemented transport.
-- Incremental vector-index updates. Each segment's posting-based `vector.idx` is built once, with `kosha-vector-spfresh`'s clustering, when the segment is written; the crate's incremental SPFresh/LIRE rebalancing (split / merge / reassign) is a benchmarked prototype the server does not use.
+- A namespace-level centroid index shared across segments and updated from the WAL (#253 step 2): each segment still carries its own postings, and a kNN probes every segment's centroids under the global budget.
 
 ## Per-field indexes
 
@@ -388,10 +397,12 @@ the routes marked *write* to the ingest pod.
 | Method and path | Body → response | Notes |
 |---|---|---|
 | `POST /v1/namespaces` | `CreateNamespaceRequest` → `CreateNamespaceResponse` | *write*. 409 if it exists, 400 for an invalid name or schema. Optional: namespaces still auto-create on first write. A `schema` is validated, echoed back and stored as the namespace schema, as `POST /v1/namespaces/{ns}/schema` would (see [Analyzers](#analyzers)). |
-| `DELETE /v1/namespaces/{ns}` | → `DeleteNamespaceResponse` | *write*. 404 if it does not exist. Permanent; see below. |
+| `DELETE /v1/namespaces/{ns}` | → `DeleteNamespaceResponse` | *write*. 404 if it does not exist, 409 while a branch still shares its segments. Permanent; see below. |
 | `POST /v1/namespaces/{ns}/documents` | `IndexDocumentsRequest` → `IndexDocumentsResponse` | *write*. Upsert by id. |
 | `POST /v1/namespaces/{ns}/flush` | → `FlushResponse` | *write*. Make buffered writes searchable. |
 | `POST /v1/namespaces/{ns}/delete` | `DeleteByQueryRequest` → `DeleteByQueryResponse` | *write*. Delete by query. |
+| `POST /v1/namespaces/{ns}/branch`, `GET /v1/namespaces/{ns}/branches`, `DELETE /v1/namespaces/{ns}/branch` | `{"name": "<branch>"}` → the branch; → its branches; → what was reclaimed | Create (*write*), list and delete (*write*) copy-on-write branches (#208). 409 if the name is taken, or for deleting a namespace that is not a branch. |
+| `POST /v1/namespaces/{ns}/shards` | `{"shards": N}` → `{"namespace", "shards", "changed"}` | *write*. Create the namespace sharded (#207); see [Namespace sharding](#namespace-sharding). |
 | `POST /v1/namespaces/{ns}/schema`, `GET /v1/namespaces/{ns}/schema` | `NamespaceSchema` | Set (*write*) or read the namespace schema; see [Analyzers](#analyzers). |
 | `POST /v1/namespaces/{ns}/search` | `SearchRequest` → `SearchResponse` | 404 for a missing namespace. |
 | `POST /v1/namespaces/{ns}/exists` | ids → per-id existence | |
@@ -426,6 +437,87 @@ manifest for it: within one manifest refresh (`KOSHA_MANIFEST_REFRESH_MS`,
 default 500 ms), or at once for a search with `max_staleness_seconds: 0`. Their local disk copies of its segments are not removed
 eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them. Re-creating the
 namespace, explicitly or by writing to it, starts it empty.
+
+## Late interaction
+
+ColBERT-style multi-vector retrieval (issue #205). Send a document's token embeddings as a
+`Vector` field whose value is a JSON array of equal-length arrays, and query them with a bag of
+query token embeddings:
+
+```json
+{"id": "p1", "fields": [{"name": "tokens", "field_type": "Vector",
+                         "value": "[[0.12, -0.03, ...], [0.08, 0.41, ...], ...]"}]}
+
+{"query_text": "", "max_results": 10,
+ "knn": {"field": "tokens", "vectors": [[0.2, ...], [0.1, ...]], "k": 10, "num_candidates": 100}}
+```
+
+The score is `MaxSim(Q, D) = Σ_q max_d cosine(q, d)` (so it ranges up to the number of query
+tokens). `vectors` implies `"scoring": "late_interaction"`; setting that with a single `vector`
+searches with a one-token bag. `knn.filter`, the top-level `filter`, deletes and hybrid RRF work
+as for single-vector kNN. A query whose tokens differ in dimension from the field's is a 400.
+
+**How it runs.** Each segment keeps, per late-interaction field, `multivec.{i}.bags` (every
+token, unit-normalized f32, with a per-document offsets table so one bag is one ranged read) and
+`multivec.{i}.ivf` (the tokens clustered with the same balanced k-means as the single-vector
+index; each posting holds its tokens' doc ids and int8 codes). For every query token the
+`KOSHA_LATE_INTERACTION_NPROBE` (default 16) nearest postings are scored from the int8 codes,
+the best `num_candidates` documents by that approximate MaxSim are re-scored exactly from their
+bags, and the top `k` are kept. With enough probes and candidates the result is exact MaxSim
+(tested against a brute-force reference). The source JSON stays in the doc store, so documents
+read back as sent and compaction rebuilds the files from it; a binary older than this change
+reads these segments normally, just without late-interaction hits, and its compactions drop the
+`multivec` files until a newer binary compacts again.
+
+**Cost** (`cargo bench -p kosha-query --bench late_interaction`, synthetic clustered corpus,
+Apple M5). Per document, relative to its raw f32 tokens: `.bags` 1.00x, `.ivf` 0.28x, and the
+source JSON in the doc store 2.55x, so about 4.8x the raw token bytes in all. With 128-dim
+tokens, 64 per document, that is 32 KB raw, ~124 KB stored, against ~0.5 KB for one 128-dim
+vector; the index build is k-means over every token (7.6 s for 8,000 such documents, 512k
+tokens). Queries: 8,000 documents x 64 tokens, 32 query tokens: warm p50 15.3 ms, recall@10
+against brute-force MaxSim 1.000 (single-vector kNN over mean-pooled tokens: 1.1 ms, but only
+0.40 of the MaxSim top 10). 4,000 x 32 tokens at 64 dim, 16 query tokens: 1.9 ms. Single-vector
+kNN is unchanged when the feature is unused (`knn_open_search` p50s identical to main).
+
+## Namespace sharding
+
+A namespace can be split into a fixed number of shards when it is created (issue #207). Before
+writing any document, set the count:
+
+```sh
+curl -X POST "$KOSHA/v1/namespaces/contracts/shards" -H "x-api-key: $KEY" -d '{"shards": 8}'
+# {"namespace":"contracts","shards":8,"changed":true}
+```
+
+- `2 <= shards <= 256`. `1` means an ordinary namespace and changes nothing. Repeating the call
+  with the same count is a no-op; any other count, or any count on a namespace that already holds
+  documents, is a 400 — resharding is not supported yet.
+- Every write route (`documents`, `flush`, `delete`, `exists`, the legacy `/index`, `/replace`)
+  keeps its shape. Each document goes to shard `jump_hash(fnv1a64(id), N)`, a function of the id
+  bytes and N only, so an upsert or `replace` always finds the previous version in the same shard.
+  A batch spanning shards is applied one shard after another; if one fails, retry the batch (writes
+  are keyed by id, so the retry is idempotent).
+- Each shard is a namespace of its own, `{tenant}/{ns}/_shard-0000` … `_shard-{N-1}`, with its own
+  manifest row, segments in S3 under that prefix, WAL checkpoint, flushes and compaction. The root
+  `{tenant}/{ns}` manifest records `"shards": N` and lists no segments. Shard namespaces are created
+  in the control store when the count is set, inherit the namespace schema, and follow later
+  `schema` changes.
+- Searches read the shards as one namespace: one merged manifest over every shard's segments,
+  scored with namespace-wide BM25 statistics, one top-K, one `search_after` order and one capped
+  total-hit count, so results — scores, order, totals, aggregations, pagination — equal the same
+  corpus in one unsharded namespace. Query pods follow every shard's manifest like any other.
+- `GET /v1/namespaces/{ns}/stats` reports totals plus `shards` and per-shard `shard_stats`.
+  `POST /v1/admin/compact-namespace` on the root runs one pass per shard; the other admin routes
+  take a shard by its full name (`{tenant}/{ns}/_shard-0003`).
+- `DELETE /v1/namespaces/{ns}` on the root deletes every shard with it (control store rows,
+  write buffers, WAL records and files).
+
+**Today's limits.** Scatter-gather runs inside one pod: every query pod still serves all shards of
+a namespace, so sharding bounds per-manifest size, publish contention, flush and compaction units,
+but not one pod's working set. Fanning shards out across pods, manual resharding and automatic
+resharding are follow-ups. Namespaces created before this change carry no shard count and are
+unchanged. A binary older than this change ignores the count: it sees the root as an empty
+namespace, so don't roll back past it while sharded namespaces are in use.
 
 ## Authorization and durability
 

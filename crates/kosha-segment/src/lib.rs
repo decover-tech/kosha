@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod filter_columns;
 pub mod filter_eval;
+pub mod multivec;
 pub mod span_cache;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -13,11 +14,13 @@ use instant_distance::{Builder, HnswMap, Point, Search};
 use kosha_core::{
     build_filter_blooms, build_term_bloom, AggBucket, AggBucketResult, AggMetricResult,
     AggregationResults, Bm25Params, DocRecord, DocSet, DocumentId, Field, FieldType, FilterClause,
-    FilterStore, Footer, KoshaError, LocalStorage, Posting, SegmentId, StorageBackend, VectorStore,
+    FilterStore, Footer, KoshaError, LocalStorage, Posting, SegmentId, StorageBackend,
+    VectorFieldMeta, VectorQuantization, VectorStore,
 };
 use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 
 pub use analysis::Analyzer;
+pub use multivec::{LateInteractionHits, LateInteractionParams};
 
 /// A point in HNSW space using cosine distance.
 #[derive(Clone)]
@@ -103,7 +106,16 @@ pub struct SegmentWriter {
     /// The column directory `write_filters` produced in columnar mode,
     /// recorded as `Footer::filter_columns`.
     filter_columns_meta: Option<Vec<kosha_core::FilterColumnMeta>>,
-    vectors: Vec<(u32, Vec<f32>)>,
+    /// Parsed `Vector` field values, one column per field name in
+    /// first-seen order (#204). Column `i` is written to file slot `i` (see
+    /// [`kosha_core::VectorFieldMeta::slot`]), so a single-column segment
+    /// keeps the `vector.idx` + `vector.offsets` layout it always had.
+    vector_columns: Vec<VectorColumn>,
+    /// Vectors kept for `doc_vectors.bin` but not indexed: their dimension
+    /// disagreed with the first vector seen for the same field in this
+    /// segment. The write API rejects such documents up front; this only
+    /// keeps a stray one from failing the whole flush.
+    unindexed_vectors: Vec<Vec<f32>>,
     /// See [`text_filter_ignore_above`]. Captured per writer so tests can
     /// override it without touching the process-wide env.
     text_filter_ignore_above: Option<u32>,
@@ -112,9 +124,19 @@ pub struct SegmentWriter {
     vector_store_mode: VectorStoreMode,
     /// `doc_vectors.bin` field-name table (sidecar mode only).
     doc_vector_fields: Vec<String>,
-    /// `(doc_seq, field_idx, index into self.vectors)` for each vector moved
-    /// to the sidecar, in doc_seq then field order.
-    doc_vector_entries: Vec<(u32, u32, u32)>,
+    /// How each vector column's posting entries are stored (#210). See
+    /// [`VectorQuantizationConfig`].
+    vector_quantization: VectorQuantizationConfig,
+    /// `(doc_seq, field_idx, where the vector is buffered)` for each vector
+    /// moved to the sidecar, in doc_seq then field order.
+    doc_vector_entries: Vec<(u32, u32, VectorRef)>,
+    /// Postings of compaction inputs to seed each vector column's index
+    /// from, by field name, one group per input (#253). See
+    /// [`Self::seed_vector_postings`].
+    vector_seeds: HashMap<String, Vec<Vec<VectorSeedPosting>>>,
+    /// How each column's index was built by `finalize`, for tests and
+    /// diagnostics. See [`VectorIndexBuild`].
+    vector_index_builds: Arc<Mutex<Vec<VectorIndexBuild>>>,
     /// Chain for `Text` fields without their own (#220).
     default_analyzer: Analyzer,
     /// Per-field chains that differ from `default_analyzer`.
@@ -129,6 +151,8 @@ pub struct SegmentWriter {
     field_index: bool,
     /// Per-field statistics for the footer's `field_index`.
     field_stats: BTreeMap<String, kosha_core::FieldStats>,
+    /// Late-interaction bags (#205), written to `multivec.*` at finalize.
+    multi_vectors: multivec::MultiVectorBuilder,
 }
 
 /// Whether new segments get per-field indexes (#249):
@@ -216,17 +240,22 @@ impl SegmentWriter {
             filter_float: HashMap::new(),
             filters_write_version: filter_columns::filters_write_version(),
             filter_columns_meta: None,
-            vectors: Vec::new(),
+            vector_columns: Vec::new(),
+            unindexed_vectors: Vec::new(),
             text_filter_ignore_above: text_filter_ignore_above(),
             vector_store_mode: VectorStoreMode::from_env(),
             doc_vector_fields: Vec::new(),
+            vector_quantization: VectorQuantizationConfig::from_env().clone(),
             doc_vector_entries: Vec::new(),
+            vector_seeds: HashMap::new(),
+            vector_index_builds: Arc::new(Mutex::new(Vec::new())),
             default_analyzer: Analyzer::new(&AnalyzerSpec::legacy()),
             field_analyzers: HashMap::new(),
             analyzed_fields: BTreeMap::new(),
             default_analyzer_used: false,
             field_index: field_index_enabled(),
             field_stats: BTreeMap::new(),
+            multi_vectors: multivec::MultiVectorBuilder::default(),
         }
     }
 
@@ -306,6 +335,51 @@ impl SegmentWriter {
         self
     }
 
+    /// Override how this writer stores vector posting entries (#210).
+    /// Production writers use `KOSHA_VECTOR_QUANTIZATION` and
+    /// `KOSHA_VECTOR_QUANTIZATION_FIELDS`; see [`VectorQuantizationConfig`].
+    pub fn with_vector_quantization(mut self, config: VectorQuantizationConfig) -> Self {
+        self.vector_quantization = config;
+        self
+    }
+
+    /// Seed `field`'s vector index with existing postings instead of
+    /// clustering its vectors from scratch (#253). Compaction calls this
+    /// once per input segment with that input's postings, `doc_seqs`
+    /// already remapped to this writer's doc_seqs (see
+    /// [`SegmentReader::vector_posting_layout`]).
+    ///
+    /// The vectors themselves still come from [`Self::add_document`]:
+    /// `doc_vectors.bin` needs them anyway, and the exact values are what
+    /// an i8 column requantizes from and what radii are computed from. A
+    /// seed only says which documents share a posting and where its
+    /// centroid is. At `finalize` the largest input's postings seed the
+    /// column's index
+    /// ([`kosha_vector_spfresh::ClusterIndex::from_postings`]), every other
+    /// input's postings — and vectors no seed covers — are absorbed into
+    /// them ([`kosha_vector_spfresh::ClusterIndex::absorb_postings`]), and
+    /// LIRE's split / merge / reassign repairs the postings that changed.
+    /// If most of a column's vectors are not covered, or a seed's
+    /// dimension disagrees with the column, the column is clustered from
+    /// scratch as usual. Seeds are ignored when
+    /// `KOSHA_VECTOR_WRITE_VERSION=1` (flat, unclustered).
+    pub fn seed_vector_postings(
+        &mut self,
+        field: &str,
+        postings: impl IntoIterator<Item = VectorSeedPosting>,
+    ) {
+        self.vector_seeds
+            .entry(field.to_string())
+            .or_default()
+            .push(postings.into_iter().collect());
+    }
+
+    /// A handle to how `finalize` built each vector column's index — read
+    /// it after `finalize` (which consumes the writer).
+    pub fn vector_index_builds(&self) -> Arc<Mutex<Vec<VectorIndexBuild>>> {
+        Arc::clone(&self.vector_index_builds)
+    }
+
     /// Override the `Text` → filter-column cap for this writer (`None`
     /// disables it). Production writers use the
     /// `KOSHA_TEXT_FILTER_IGNORE_ABOVE` default; see
@@ -341,8 +415,9 @@ impl SegmentWriter {
         // doc-store value is blanked after the loop below.
         let mut moved_to_sidecar: Vec<usize> = Vec::new();
         // Supplied vectors stored inline in place of an empty value:
-        // `(field index, index into self.vectors)`.
-        let mut needs_json: Vec<(usize, usize)> = Vec::new();
+        // `(field index, where it was buffered)`; `None` for an empty
+        // vector, which is never buffered.
+        let mut needs_json: Vec<(usize, Option<VectorRef>)> = Vec::new();
         // Position of the next `Text` value's first token (#249): each
         // value starts `position_gap` past the previous one's last token,
         // so no phrase spans two values. Always 0 without a field index.
@@ -481,10 +556,19 @@ impl SegmentWriter {
                         None => serde_json::from_str::<Vec<f32>>(&field.value).ok(),
                     };
                     if let Some(vec) = parsed {
+                        // An empty vector has nothing to index (and no
+                        // dimension to agree with); it stays inline.
+                        if vec.is_empty() {
+                            if was_supplied && field.value.is_empty() {
+                                needs_json.push((index, None));
+                            }
+                            continue;
+                        }
+                        let location = self.buffer_vector(&field.name, doc_seq, vec);
                         // An empty value is the sidecar placeholder; a
                         // literal `[]` would be indistinguishable from it
-                        // once blanked, so it stays inline.
-                        if self.vector_store_mode == VectorStoreMode::Sidecar && !vec.is_empty() {
+                        // once blanked, so it stays inline (above).
+                        if self.vector_store_mode == VectorStoreMode::Sidecar {
                             let field_idx = match self
                                 .doc_vector_fields
                                 .iter()
@@ -496,16 +580,25 @@ impl SegmentWriter {
                                     self.doc_vector_fields.len() - 1
                                 }
                             };
-                            self.doc_vector_entries.push((
-                                doc_seq,
-                                field_idx as u32,
-                                self.vectors.len() as u32,
-                            ));
+                            self.doc_vector_entries
+                                .push((doc_seq, field_idx as u32, location));
                             moved_to_sidecar.push(index);
                         } else if was_supplied && field.value.is_empty() {
-                            needs_json.push((index, self.vectors.len()));
+                            needs_json.push((index, Some(location)));
                         }
-                        self.vectors.push((doc_seq, vec));
+                    } else if let Some(bag) = multivec::parse_bag(&field.value) {
+                        // A bag of token vectors (#205): indexed for late
+                        // interaction, and kept inline in the doc store.
+                        if !self.multi_vectors.add(doc_seq, &field.name, &bag) {
+                            eprintln!(
+                                "WARN: late-interaction field '{}' of {:?}: token dimension {} \
+                                 differs from earlier documents in this segment — stored, \
+                                 not indexed",
+                                field.name,
+                                doc_id.0,
+                                bag[0].len()
+                            );
+                        }
                     }
                     // Unparseable values stay inline as given: nothing
                     // indexes them, but the stored document is lossless.
@@ -537,8 +630,9 @@ impl SegmentWriter {
         for index in moved_to_sidecar {
             fields[index].value.clear();
         }
-        for (index, v) in needs_json {
-            match serde_json::to_string(&self.vectors[v].1) {
+        for (index, location) in needs_json {
+            let vector = location.map_or(&[][..], |location| self.buffered_vector(location));
+            match serde_json::to_string(vector) {
                 Ok(json) => fields[index].value = json,
                 Err(e) => {
                     self.io_error.get_or_insert(e.into());
@@ -591,6 +685,53 @@ impl SegmentWriter {
                 }
             }
         }
+    }
+
+    /// Buffer one parsed vector under its field's column (#204), creating
+    /// the column on first sight. A vector whose dimension differs from the
+    /// column's is kept for the doc store but not indexed — one bad
+    /// document must not fail the whole flush (the write API rejects it
+    /// before it gets here; see `kosha_write`).
+    fn buffer_vector(&mut self, field: &str, doc_seq: u32, vec: Vec<f32>) -> VectorRef {
+        let column = match self.vector_columns.iter().position(|c| c.name == field) {
+            Some(i) => i,
+            None => {
+                self.vector_columns.push(VectorColumn {
+                    name: field.to_string(),
+                    dim: vec.len(),
+                    vectors: Vec::new(),
+                });
+                self.vector_columns.len() - 1
+            }
+        };
+        let col = &mut self.vector_columns[column];
+        if col.dim != vec.len() {
+            eprintln!(
+                "WARN: segment {}: vector field '{field}' of doc_seq {doc_seq} has {} dims, \
+                 the field's index has {} — stored but not indexed",
+                self.segment_id.0,
+                vec.len(),
+                col.dim
+            );
+            self.unindexed_vectors.push(vec);
+            return VectorRef::Unindexed(self.unindexed_vectors.len() as u32 - 1);
+        }
+        col.vectors.push((doc_seq, vec));
+        VectorRef::Column(column as u32, col.vectors.len() as u32 - 1)
+    }
+
+    /// The buffered vector `location` points at.
+    fn buffered_vector(&self, location: VectorRef) -> &[f32] {
+        match location {
+            VectorRef::Column(c, i) => &self.vector_columns[c as usize].vectors[i as usize].1,
+            VectorRef::Unindexed(i) => &self.unindexed_vectors[i as usize],
+        }
+    }
+
+    /// Vectors buffered so far that were not indexed because of a
+    /// dimension mismatch within their field.
+    pub fn unindexed_vector_count(&self) -> usize {
+        self.unindexed_vectors.len()
     }
 
     /// Number of sorted posting runs spilled so far.
@@ -651,11 +792,12 @@ impl SegmentWriter {
         self.write_doc_vectors()?;
         self.write_inverted_index()?;
         self.write_filters()?;
-        match vector_write_version() {
+        let vector_fields = match vector_write_version() {
             1 => self.write_vectors()?,
             _ => self.write_vectors_v2()?,
-        }
-        let footer = self.write_footer(bm25_params)?;
+        };
+        let multi_vectors = self.multi_vectors.write(&*self.backend)?;
+        let footer = self.write_footer(bm25_params, vector_fields, multi_vectors)?;
         let _ = fs::remove_dir_all(self.build_dir());
         self.finalized = true;
         Ok(footer)
@@ -695,7 +837,7 @@ impl SegmentWriter {
         let data_len: usize = self
             .doc_vector_entries
             .iter()
-            .map(|&(_, _, v)| self.vectors[v as usize].1.len() * 4)
+            .map(|&(_, _, v)| self.buffered_vector(v).len() * 4)
             .sum();
         let mut buf = Vec::with_capacity(16 + self.doc_vector_entries.len() * 12 + data_len);
         buf.extend_from_slice(&DOC_VECTORS_MAGIC.to_le_bytes());
@@ -708,10 +850,10 @@ impl SegmentWriter {
         for &(doc_seq, field_idx, v) in &self.doc_vector_entries {
             buf.extend_from_slice(&doc_seq.to_le_bytes());
             buf.extend_from_slice(&field_idx.to_le_bytes());
-            buf.extend_from_slice(&(self.vectors[v as usize].1.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(self.buffered_vector(v).len() as u32).to_le_bytes());
         }
         for &(_, _, v) in &self.doc_vector_entries {
-            for x in &self.vectors[v as usize].1 {
+            for x in self.buffered_vector(v) {
                 buf.extend_from_slice(&x.to_le_bytes());
             }
         }
@@ -942,23 +1084,39 @@ impl SegmentWriter {
     /// `finalize` only calls this when `KOSHA_VECTOR_WRITE_VERSION=1` is
     /// set (mixed-fleet rollback gate, see `vector_write_version`) —
     /// `write_vectors_v2` is the default.
-    fn write_vectors(&self) -> Result<(), KoshaError> {
-        if self.vectors.is_empty() {
-            return Ok(());
-        }
-        let mut buf = Vec::new();
-        let dim = self.vectors[0].1.len() as u32;
-        buf.extend_from_slice(&dim.to_le_bytes());
-        buf.extend_from_slice(&(self.vectors.len() as u32).to_le_bytes());
-        for &(doc_seq, ref v) in &self.vectors {
-            buf.extend_from_slice(&doc_seq.to_le_bytes());
-            for &val in v {
-                buf.extend_from_slice(&val.to_le_bytes());
+    ///
+    /// One file per vector column (#204), at the column's slot — see
+    /// [`kosha_core::VectorFieldMeta::slot`].
+    fn write_vectors(&self) -> Result<Vec<VectorFieldMeta>, KoshaError> {
+        let mut metas = Vec::with_capacity(self.vector_columns.len());
+        for (slot, column) in self.vector_columns.iter().enumerate() {
+            if column.vectors.is_empty() {
+                continue;
             }
+            let mut buf = Vec::new();
+            let dim = column.dim as u32;
+            buf.extend_from_slice(&dim.to_le_bytes());
+            buf.extend_from_slice(&(column.vectors.len() as u32).to_le_bytes());
+            for &(doc_seq, ref v) in &column.vectors {
+                buf.extend_from_slice(&doc_seq.to_le_bytes());
+                for &val in v {
+                    buf.extend_from_slice(&val.to_le_bytes());
+                }
+            }
+            // The flat format has no version field to tag quantization
+            // with: it is always f32 (see `write_vectors_v2`).
+            let meta = VectorFieldMeta {
+                name: column.name.clone(),
+                dim,
+                count: column.vectors.len() as u32,
+                slot: slot as u32,
+                offsets: false,
+                quantization: VectorQuantization::F32,
+            };
+            self.backend.write(&meta.idx_file(), &buf)?;
+            metas.push(meta);
         }
-        self.backend.write("vector.idx", &buf)?;
-
-        Ok(())
+        Ok(metas)
     }
 
     /// v2 format (default, see `vector_write_version`): `vector.idx`
@@ -967,11 +1125,66 @@ impl SegmentWriter {
     /// `kosha_vector_spfresh::ClusterIndex` from this segment's buffered
     /// vectors and serializes its postings — see the "Vector index format"
     /// section below for the byte layout.
-    fn write_vectors_v2(&self) -> Result<(), KoshaError> {
-        if self.vectors.is_empty() {
-            return Ok(());
+    ///
+    /// One index per vector column (#204), each at its column's slot: a
+    /// single-column segment gets exactly the `vector.idx` +
+    /// `vector.offsets` it always did, and further columns get
+    /// `vector.<slot>.idx` + `vector.<slot>.offsets`.
+    fn write_vectors_v2(&self) -> Result<Vec<VectorFieldMeta>, KoshaError> {
+        let mut metas = Vec::with_capacity(self.vector_columns.len());
+        for (slot, column) in self.vector_columns.iter().enumerate() {
+            if column.vectors.is_empty() {
+                continue;
+            }
+            // i8 entries need the newest header version: a writer pinned
+            // to an older `KOSHA_VECTOR_WRITE_VERSION` for a rolling deploy
+            // keeps writing f32, which every reader of that version reads.
+            let requested = self.vector_quantization.for_field(&column.name);
+            let quantization = if vector_write_version() >= 4 {
+                requested
+            } else {
+                if !requested.is_f32() {
+                    warn_quantization_needs_v4();
+                }
+                VectorQuantization::F32
+            };
+            let meta = VectorFieldMeta {
+                name: column.name.clone(),
+                dim: column.dim as u32,
+                count: column.vectors.len() as u32,
+                slot: slot as u32,
+                offsets: true,
+                quantization,
+            };
+            let seeds = self.vector_seeds.get(&column.name);
+            let (idx_bytes, offsets_bytes, build) =
+                Self::encode_vector_column(&column.vectors, seeds, quantization)?;
+            self.vector_index_builds
+                .lock()
+                .unwrap()
+                .push(VectorIndexBuild {
+                    field: column.name.clone(),
+                    ..build
+                });
+            self.backend.write(&meta.idx_file(), &idx_bytes)?;
+            self.backend.write(&meta.offsets_file(), &offsets_bytes)?;
+            metas.push(meta);
         }
-        let dim = self.vectors[0].1.len();
+        Ok(metas)
+    }
+
+    /// Cluster one column's vectors and encode `(vector.idx bytes,
+    /// vector.offsets bytes)` for it. Every vector must share one
+    /// dimension (`buffer_vector` guarantees it). With `seeds`, the index
+    /// is seeded from them and repaired by LIRE when they cover enough of
+    /// the column (see [`Self::seed_vector_postings`]); otherwise it is
+    /// clustered from scratch.
+    fn encode_vector_column(
+        column: &[(u32, Vec<f32>)],
+        seeds: Option<&Vec<Vec<VectorSeedPosting>>>,
+        quantization: VectorQuantization,
+    ) -> Result<(Vec<u8>, Vec<u8>, VectorIndexBuild), KoshaError> {
+        let dim = column[0].1.len();
         // Unit-norm (write version 3, on-disk header version 2): normalize
         // once here so the read path can score with a bare dot product.
         // Clustering runs on the normalized copies too (spherical k-means —
@@ -982,8 +1195,7 @@ impl SegmentWriter {
         let radius_aware = vector_write_version() >= 4;
         let normalized: Vec<(u32, Vec<f32>)>;
         let vectors: &[(u32, Vec<f32>)] = if unit_norm {
-            normalized = self
-                .vectors
+            normalized = column
                 .iter()
                 .map(|(id, v)| {
                     let mut v = v.clone();
@@ -993,18 +1205,31 @@ impl SegmentWriter {
                 .collect();
             &normalized
         } else {
-            &self.vectors
+            column
         };
         let config = kosha_vector_spfresh::ClusterIndexConfig::new(dim);
-        let index = kosha_vector_spfresh::ClusterIndex::build(vectors, config).map_err(|e| {
-            // A real ClusterIndex::build failure here (practically always
-            // DimensionMismatch — inconsistent vector dimensionality across
-            // documents in the same segment) means the legacy writer above
-            // would have silently written ragged, unparseable bytes instead.
-            // Fail loud rather than emit a corrupt vector.idx.
-            KoshaError::CorruptSegment(format!("failed to build vector index: {e}"))
-        })?;
+        let seeded = match seeds {
+            Some(seeds) if !seeds.is_empty() => seed_cluster_index(vectors, seeds, config.clone()),
+            _ => None,
+        };
+        let (index, mut build) = match seeded {
+            Some(seeded) => seeded,
+            None => {
+                let index =
+                    kosha_vector_spfresh::ClusterIndex::build(vectors, config).map_err(|e| {
+                        // A real ClusterIndex::build failure here (practically
+                        // always DimensionMismatch — inconsistent vector
+                        // dimensionality across documents in the same
+                        // segment) means the legacy writer above would have
+                        // silently written ragged, unparseable bytes instead.
+                        // Fail loud rather than emit a corrupt vector.idx.
+                        KoshaError::CorruptSegment(format!("failed to build vector index: {e}"))
+                    })?;
+                (index, VectorIndexBuild::default())
+            }
+        };
         let mut postings = index.snapshot();
+        build.postings = postings.len();
         let format_version = if unit_norm {
             for p in &mut postings {
                 kosha_vector_spfresh::normalize_in_place(&mut p.centroid);
@@ -1024,7 +1249,11 @@ impl SegmentWriter {
                         .fold(0.0f32, f32::max);
                 }
             }
-            if radius_aware {
+            if radius_aware && quantization == VectorQuantization::I8 {
+                // Radii were computed above from the exact vectors, so the
+                // probe's lower bound stays a bound on the true distance.
+                I8_VECTOR_INDEX_VERSION
+            } else if radius_aware {
                 RADIUS_AWARE_VECTOR_INDEX_VERSION
             } else {
                 UNIT_NORM_VECTOR_INDEX_VERSION
@@ -1032,14 +1261,16 @@ impl SegmentWriter {
         } else {
             VECTOR_INDEX_VERSION
         };
-        let (idx_bytes, offsets_bytes) =
-            encode_vector_index_v2(dim as u32, &postings, format_version);
-        self.backend.write("vector.idx", &idx_bytes)?;
-        self.backend.write("vector.offsets", &offsets_bytes)?;
-        Ok(())
+        let (idx, offsets) = encode_vector_index_v2(dim as u32, &postings, format_version);
+        Ok((idx, offsets, build))
     }
 
-    fn write_footer(&self, bm25_params: Bm25Params) -> Result<Footer, KoshaError> {
+    fn write_footer(
+        &self,
+        bm25_params: Bm25Params,
+        vector_fields: Vec<VectorFieldMeta>,
+        multi_vectors: Vec<kosha_core::MultiVectorField>,
+    ) -> Result<Footer, KoshaError> {
         let doc_count = self.field_lengths.len() as u32;
         let avg = if doc_count > 0 {
             self.total_field_length as f64 / doc_count as f64
@@ -1071,11 +1302,223 @@ impl SegmentWriter {
             }),
             // Built with the term bloom; without one, nothing to prune on.
             fuzzy_bloom: self.fuzzy_bloom.clone(),
+            vector_fields: Some(vector_fields),
+            multi_vectors,
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
         Ok(footer)
     }
+}
+
+/// One vector field's buffered values in a [`SegmentWriter`] (#204).
+struct VectorColumn {
+    name: String,
+    dim: usize,
+    vectors: Vec<(u32, Vec<f32>)>,
+}
+
+/// Where a [`SegmentWriter`] buffered one parsed vector.
+#[derive(Clone, Copy)]
+enum VectorRef {
+    /// `(column, index)` into `vector_columns`.
+    Column(u32, u32),
+    /// Index into `unindexed_vectors`.
+    Unindexed(u32),
+}
+
+/// One posting of a compaction input, handed to
+/// [`SegmentWriter::seed_vector_postings`] (#253).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorSeedPosting {
+    /// The input posting's stored centroid.
+    pub centroid: Vec<f32>,
+    /// Its members that survive into the output, as output doc_seqs.
+    pub doc_seqs: Vec<u32>,
+    /// Whether any member was dropped (deleted or tombstoned) on the way:
+    /// the centroid is then recomputed from the survivors.
+    pub dropped: bool,
+}
+
+/// How [`SegmentWriter::finalize`] built one vector column's index.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorIndexBuild {
+    pub field: String,
+    /// Seeded from compaction inputs' postings and repaired by LIRE
+    /// (`false`: clustered from scratch).
+    pub lire: bool,
+    /// Postings adopted as-is from the largest input (non-empty ones).
+    pub seeded_postings: usize,
+    /// Adopted postings whose centroid was recomputed (members dropped).
+    pub recentred_postings: usize,
+    /// Postings of the other inputs folded into the adopted ones.
+    pub absorbed_postings: usize,
+    /// Vectors no seed covered, absorbed one by one.
+    pub inserted_vectors: usize,
+    /// LIRE work done by the final rebalance.
+    pub postings_split: usize,
+    pub postings_merged: usize,
+    /// Postings written.
+    pub postings: usize,
+}
+
+/// Compaction inputs with fewer indexed vectors in a column than this
+/// contribute no postings: their vectors are absorbed into the merged
+/// index one by one (#253). A small segment's postings are clustered over
+/// too few points to be useful — a 50-vector segment is one posting whose
+/// centroid is the mean of everything — and its few vectors are cheap to
+/// place individually. Eight postings' worth at the default
+/// `max_posting_size` (128).
+pub const LIRE_ADOPT_MIN_VECTORS: usize = 1024;
+
+/// How compaction builds a merged segment's vector indexes (#253):
+/// `KOSHA_VECTOR_COMPACTION=lire` (the default) seeds each column from its
+/// inputs' postings and repairs them with LIRE; `rebuild` clusters every
+/// vector from scratch, as before. Either way the output is the same
+/// on-disk format every reader already reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorCompactionMode {
+    #[default]
+    Lire,
+    Rebuild,
+}
+
+impl VectorCompactionMode {
+    /// `KOSHA_VECTOR_COMPACTION`, read once.
+    pub fn from_env() -> Self {
+        static MODE: OnceLock<VectorCompactionMode> = OnceLock::new();
+        *MODE.get_or_init(|| Self::parse(std::env::var("KOSHA_VECTOR_COMPACTION").ok().as_deref()))
+    }
+
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("lire") => Self::Lire,
+            Some("rebuild") => Self::Rebuild,
+            Some(other) => {
+                eprintln!("WARN: KOSHA_VECTOR_COMPACTION={other} not lire|rebuild — using lire");
+                Self::Lire
+            }
+        }
+    }
+}
+
+/// How many of the largest input's postings each absorbed posting is
+/// matched against (by centroid) before its members pick the nearest. The
+/// default `reassign_radius`: the neighbourhood LIRE already treats as
+/// "nearby".
+const LIRE_ABSORB_CANDIDATES: usize = 8;
+
+/// Seeds a column's [`kosha_vector_spfresh::ClusterIndex`] from compaction
+/// inputs' postings (see [`SegmentWriter::seed_vector_postings`]):
+/// `vectors` is the column (doc_seq ascending, already normalized when the
+/// index is unit-norm), `groups` one list of seeds per input. `None` when
+/// the seeds cannot be used — a dimension mismatch, or fewer than half of
+/// the column's vectors covered (absorbing the rest one by one would then
+/// cost about as much as clustering, for worse postings) — and the caller
+/// clusters from scratch.
+fn seed_cluster_index(
+    vectors: &[(u32, Vec<f32>)],
+    groups: &[Vec<VectorSeedPosting>],
+    config: kosha_vector_spfresh::ClusterIndexConfig,
+) -> Option<(kosha_vector_spfresh::ClusterIndex, VectorIndexBuild)> {
+    use kosha_vector_spfresh::PostingSnapshot;
+    let dim = config.dim;
+    if groups.iter().flatten().any(|s| s.centroid.len() != dim) {
+        return None;
+    }
+    let position = |doc_seq: u32| vectors.binary_search_by_key(&doc_seq, |(id, _)| *id).ok();
+    let mut covered = vec![false; vectors.len()];
+    let mut recentred = vec![0usize; groups.len()];
+    // Per input: its non-empty postings, members resolved to vectors.
+    let mut snapshots: Vec<Vec<PostingSnapshot>> = Vec::with_capacity(groups.len());
+    for (g, seeds) in groups.iter().enumerate() {
+        let mut group = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let mut entries = Vec::with_capacity(seed.doc_seqs.len());
+            for &doc_seq in &seed.doc_seqs {
+                // A doc_seq the column does not hold (its vector was not
+                // indexed) or one an earlier seed already claimed is
+                // dropped.
+                if let Some(i) = position(doc_seq) {
+                    if !std::mem::replace(&mut covered[i], true) {
+                        entries.push((doc_seq, vectors[i].1.clone()));
+                    }
+                }
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            let centroid = if seed.dropped || entries.len() != seed.doc_seqs.len() {
+                recentred[g] += 1;
+                kosha_vector_spfresh::mean_vector(entries.iter().map(|(_, v)| v.as_slice()), dim)
+            } else {
+                seed.centroid.clone()
+            };
+            group.push(PostingSnapshot {
+                centroid,
+                entries,
+                radius: 0.0,
+            });
+        }
+        snapshots.push(group);
+    }
+    let uncovered: Vec<usize> = (0..vectors.len()).filter(|&i| !covered[i]).collect();
+    if uncovered.len() * 2 > vectors.len() {
+        return None;
+    }
+    // The largest input's postings are adopted as they are; the others'
+    // overlap them (each input partitioned the same space on its own), so
+    // they are absorbed rather than kept side by side.
+    let members = |g: &Vec<PostingSnapshot>| g.iter().map(|p| p.entries.len()).sum::<usize>();
+    let base = (0..snapshots.len()).max_by_key(|&g| members(&snapshots[g]))?;
+    let mut build = VectorIndexBuild {
+        lire: true,
+        seeded_postings: snapshots[base].len(),
+        recentred_postings: recentred[base],
+        inserted_vectors: uncovered.len(),
+        ..VectorIndexBuild::default()
+    };
+    let adopted = snapshots.swap_remove(base);
+    let mut index = kosha_vector_spfresh::ClusterIndex::from_postings(adopted, config).ok()?;
+    for group in snapshots {
+        build.absorbed_postings += group.len();
+        index.absorb_postings(group, LIRE_ABSORB_CANDIDATES).ok()?;
+    }
+    // A loose vector is a one-posting partition centred on itself: it goes
+    // to its exact nearest posting.
+    let loose = uncovered
+        .into_iter()
+        .map(|i| {
+            let (doc_seq, v) = &vectors[i];
+            PostingSnapshot {
+                centroid: v.clone(),
+                entries: vec![(*doc_seq, v.clone())],
+                radius: 0.0,
+            }
+        })
+        .collect();
+    index.absorb_postings(loose, LIRE_ABSORB_CANDIDATES).ok()?;
+    let stats = index.rebalance();
+    build.postings_split = stats.postings_split;
+    build.postings_merged = stats.postings_merged;
+    Some((index, build))
+}
+
+/// One vector column's posting structure as stored: each posting's
+/// centroid and member doc_seqs, in `vector.offsets` order. See
+/// [`SegmentReader::vector_posting_layout`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorPostingLayout {
+    pub dim: usize,
+    /// The index's header version (see [`is_known_vector_index_version`]).
+    pub version: u32,
+    pub postings: Vec<VectorPostingMembers>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorPostingMembers {
+    pub centroid: Vec<f32>,
+    pub doc_seqs: Vec<u32>,
 }
 
 // ─── Vector index format (v2: posting-based, LIRE) ──────────────────────────
@@ -1116,11 +1559,13 @@ pub const VECTOR_MAGIC: u32 = u32::from_le_bytes(*b"KVE2");
 /// File name of the clustered vector index.
 pub const VECTOR_IDX_FILE: &str = "vector.idx";
 
-/// Callback a reader calls with byte ranges of `{segment_dir}/vector.idx`
-/// it is about to read but does not hold locally (#245). After it returns,
+/// Callback a reader calls with byte ranges of one vector column's idx file
+/// (`{segment_dir}/{file}`: `vector.idx`, or `vector.<n>.idx` for column
+/// slot `n`, #204) it is about to read but does not hold locally (#245).
+/// After it returns,
 /// those ranges should be readable from the whole file or the span cache
 /// (`span_cache`); any still missing fail the search as an IO error.
-pub type VectorSpanFetch<'a> = &'a (dyn Fn(&Path, &[(u64, u64)]) + Sync);
+pub type VectorSpanFetch<'a> = &'a (dyn Fn(&Path, &str, &[(u64, u64)]) + Sync);
 
 /// Postings fetched per call when a restricted kNN probe runs past its
 /// budget (see `knn_search_within_filtered`).
@@ -1152,11 +1597,43 @@ pub const UNIT_NORM_VECTOR_INDEX_VERSION: u32 = 2;
 /// which degrades exactly to today's raw-centroid-distance ranking — no
 /// regression, just no improvement, until a segment is rewritten.
 pub const RADIUS_AWARE_VECTOR_INDEX_VERSION: u32 = 3;
+/// Version 4 (#210): everything version 3 is (unit-norm vectors and
+/// centroids, per-posting radius in `vector.offsets`), but each
+/// `vector.idx` entry is scalar-quantized to i8: `[id:u32][scale:f32]
+/// [i8×dim]` instead of `[id:u32][f32×dim]` — ~4x smaller at embedding
+/// dimensions. `scale` is `max|x_i| / 127` of the unit vector, so `x_i ≈
+/// scale * code_i` and a query scores with `scale * Σ q_i·code_i` (see
+/// `kosha_vector_spfresh::dot_i8`). Centroids and radii stay f32 (they are
+/// small and resident) and radii are computed from the exact vectors.
+///
+/// Written only when `KOSHA_VECTOR_QUANTIZATION` (or its per-field
+/// override) asks for `i8`: a reader that predates this version cannot
+/// read it, so the flag must stay off until every query pod runs a build
+/// that knows it. The footer's `VectorFieldMeta::quantization` records the
+/// choice per column; the header version alone decides how entries parse.
+pub const I8_VECTOR_INDEX_VERSION: u32 = 4;
 
 pub fn is_known_vector_index_version(version: u32) -> bool {
     version == VECTOR_INDEX_VERSION
         || version == UNIT_NORM_VECTOR_INDEX_VERSION
         || version == RADIUS_AWARE_VECTOR_INDEX_VERSION
+        || version == I8_VECTOR_INDEX_VERSION
+}
+
+/// Whether `version`'s `vector.idx` entries are i8-quantized (see
+/// [`I8_VECTOR_INDEX_VERSION`]). `==`, not `>=`: a later version is free to
+/// choose another entry encoding, and must say so here.
+pub fn is_i8_vector_index_version(version: u32) -> bool {
+    version == I8_VECTOR_INDEX_VERSION
+}
+
+/// Bytes of one `vector.idx` entry (id included) for `version`.
+fn vector_entry_size(dim: u32, version: u32) -> usize {
+    if is_i8_vector_index_version(version) {
+        4 + 4 + dim as usize
+    } else {
+        4 + 4 * dim as usize
+    }
 }
 
 /// `>=` rather than `==`: every version from [`UNIT_NORM_VECTOR_INDEX_VERSION`]
@@ -1209,12 +1686,20 @@ fn encode_vector_index_v2(
     offsets_buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
 
     let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
+    let quantized = is_i8_vector_index_version(version);
+    let mut codes: Vec<i8> = Vec::with_capacity(dim as usize);
     for p in postings {
         let offset = idx_buf.len() as u64;
         for (id, v) in &p.entries {
             idx_buf.extend_from_slice(&id.to_le_bytes());
-            for &x in v {
-                idx_buf.extend_from_slice(&x.to_le_bytes());
+            if quantized {
+                let scale = kosha_vector_spfresh::quantize_i8(v, &mut codes);
+                idx_buf.extend_from_slice(&scale.to_le_bytes());
+                idx_buf.extend(codes.iter().map(|&c| c as u8));
+            } else {
+                for &x in v {
+                    idx_buf.extend_from_slice(&x.to_le_bytes());
+                }
             }
         }
         let length = (idx_buf.len() as u64 - offset) as u32;
@@ -1248,8 +1733,117 @@ fn read_vector_idx_header(idx_path: &Path) -> Option<Vec<u8>> {
 /// always written together with a `vector.offsets` sidecar. Without the
 /// sidecar such a segment is still searchable, but only by exact scan.
 pub fn vector_index_needs_offsets(segment_dir: &Path) -> bool {
-    read_vector_idx_header(&segment_dir.join("vector.idx"))
+    vector_file_needs_offsets(segment_dir, VECTOR_IDX_FILE)
+}
+
+/// [`vector_index_needs_offsets`] for any vector column's idx file
+/// (`vector.idx` or `vector.<n>.idx`, #204). `false` when the file is not
+/// local.
+pub fn vector_file_needs_offsets(segment_dir: &Path, idx_file: &str) -> bool {
+    read_vector_idx_header(&segment_dir.join(idx_file))
         .is_some_and(|header| parse_vector_idx_header(&header).is_some())
+}
+
+/// One vector column a kNN on some field reads from a segment (#204) — see
+/// [`knn_vector_columns`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnnVectorColumn {
+    /// `vector.idx` or `vector.<n>.idx`.
+    pub idx_file: String,
+    /// Its offsets sidecar, when the column has one — or, for a legacy
+    /// segment, may have one (only the idx header tells, see
+    /// [`vector_file_needs_offsets`]).
+    pub offsets_file: Option<String>,
+    /// The single unnamed index of a segment written before vector
+    /// columns existed.
+    pub legacy: bool,
+}
+
+/// The vector columns a kNN on `field` reads, decided from the segment's
+/// footer (#204): `field`'s own column when the footer lists columns
+/// (nothing when it has none — another column's files are never fetched
+/// for this query), else the one unnamed legacy index. `None` (no footer
+/// known) is treated as legacy.
+pub fn knn_vector_columns(footer: Option<&Footer>, field: &str) -> Vec<KnnVectorColumn> {
+    match footer.and_then(|f| f.vector_fields.as_ref()) {
+        Some(fields) => fields
+            .iter()
+            .filter(|meta| meta.name == field)
+            .map(|meta| KnnVectorColumn {
+                idx_file: meta.idx_file(),
+                offsets_file: meta.offsets.then(|| meta.offsets_file()),
+                legacy: false,
+            })
+            .collect(),
+        None => vec![KnnVectorColumn {
+            idx_file: VECTOR_IDX_FILE.to_string(),
+            offsets_file: Some("vector.offsets".to_string()),
+            legacy: true,
+        }],
+    }
+}
+
+/// Whether a kNN on a segment with this footer needs `doc_vectors.bin`
+/// local: a legacy segment (no `vector_fields`) that stores its vectors
+/// there, since the sidecar's field table is what binds its unnamed index
+/// to a field name (#204, see [`SegmentReader::vector_field_status`]).
+pub fn knn_needs_doc_vectors(footer: Option<&Footer>) -> bool {
+    footer.is_some_and(|f| f.vector_fields.is_none() && f.doc_vectors)
+}
+
+/// The files a kNN on `field` needs from `segment_dir` (#204), each paired
+/// with whether the segment cannot be searched without it. Decided from
+/// the local `footer.json`:
+///
+/// * a footer listing vector columns needs just `field`'s column (nothing
+///   when it has none) — another column's files are never fetched for
+///   this query;
+/// * a legacy footer (or none readable) needs the one unnamed index —
+///   `vector.offsets` only when `vector.idx` is in the clustered format,
+///   see [`vector_index_needs_offsets`] — plus `doc_vectors.bin` when the
+///   footer says vectors live there, since its field table is what binds
+///   the unnamed index to a field name
+///   (see [`SegmentReader::vector_field_status`]).
+pub fn knn_vector_files(segment_dir: &Path, field: &str) -> Vec<(String, bool)> {
+    let footer = SegmentReader::read_footer(segment_dir).ok();
+    let mut files = Vec::new();
+    for column in knn_vector_columns(footer.as_ref(), field) {
+        if let Some(offsets) = column.offsets_file {
+            let required =
+                !column.legacy || vector_file_needs_offsets(segment_dir, &column.idx_file);
+            files.push((column.idx_file, true));
+            files.push((offsets, required));
+        } else {
+            files.push((column.idx_file, true));
+        }
+    }
+    if knn_needs_doc_vectors(footer.as_ref()) {
+        files.push((DOC_VECTORS_FILE.to_string(), true));
+    }
+    files
+}
+
+/// Every vector-index file `segment_dir`'s local footer lists (#204): each
+/// column's idx file plus its offsets sidecar. A legacy footer (or none
+/// readable) lists `vector.idx` and `vector.offsets`, whether or not the
+/// segment has them.
+pub fn vector_index_files(segment_dir: &Path) -> Vec<String> {
+    match SegmentReader::read_footer(segment_dir)
+        .ok()
+        .and_then(|f| f.vector_fields)
+    {
+        Some(fields) => fields
+            .iter()
+            .flat_map(|meta| {
+                let mut files = vec![meta.idx_file()];
+                if meta.offsets {
+                    files.push(meta.offsets_file());
+                }
+                files
+            })
+            .collect(),
+        None => vec!["vector.idx".to_string(), "vector.offsets".to_string()],
+    }
 }
 
 /// Parses a v2 `vector.idx`'s header only — `(dim, total_count, version)`.
@@ -1280,22 +1874,18 @@ fn parse_vector_idx_header(data: &[u8]) -> Option<(u32, u32, u32)> {
 /// returns `None`, same "never trust blindly" discipline as
 /// `try_read_doc_index`'s doc-count cross-check.
 fn parse_vector_idx_eager(data: &[u8]) -> Option<VectorStore> {
-    let (dim, total_count, _version) = parse_vector_idx_header(data)?;
-    let record_size = 4 + 4 * dim as usize;
+    let (dim, total_count, version) = parse_vector_idx_header(data)?;
+    let record_size = vector_entry_size(dim, version);
     let expected_len = VECTOR_IDX_HEADER_LEN + total_count as usize * record_size;
     if data.len() != expected_len {
         return None;
     }
-    let mut cursor = &data[VECTOR_IDX_HEADER_LEN..];
-    let mut vectors = Vec::with_capacity(total_count as usize);
-    for _ in 0..total_count {
-        let id = read_u32_le(&mut cursor);
-        let mut v = Vec::with_capacity(dim as usize);
-        for _ in 0..dim {
-            v.push(read_f32_le(&mut cursor));
-        }
-        vectors.push((id, v));
-    }
+    // An i8 column served without its sidecar is dequantized: the flat
+    // scan only knows f32 vectors, and this path is a fallback anyway.
+    let vectors = match decode_posting_entries(&data[VECTOR_IDX_HEADER_LEN..], dim, version) {
+        VectorPosting::F32(vectors) => vectors,
+        quantized @ VectorPosting::I8 { .. } => quantized.dequantized(),
+    };
     Some(VectorStore {
         vectors,
         dimensions: dim as usize,
@@ -1359,11 +1949,29 @@ fn parse_vector_offsets(
 }
 
 /// Decodes one posting's raw entry bytes (sliced from `vector.idx` via a
-/// `VectorPostingIndex`'s `offset`/`length`) into `(id, vector)` pairs.
-fn decode_posting_entries(mut cursor: &[u8], dim: u32) -> Vec<(u32, Vec<f32>)> {
+/// `VectorPostingIndex`'s `offset`/`length`) for an index of `version`.
+fn decode_posting_entries(mut cursor: &[u8], dim: u32, version: u32) -> VectorPosting {
     // record_size is always >= 4 (id alone, even at dim=0), so this never divides by zero.
-    let record_size = 4 + 4 * dim as usize;
+    let record_size = vector_entry_size(dim, version);
     let count = cursor.len() / record_size;
+    if is_i8_vector_index_version(version) {
+        let dim = dim as usize;
+        let mut ids = Vec::with_capacity(count);
+        let mut scales = Vec::with_capacity(count);
+        let mut codes = Vec::with_capacity(count * dim);
+        for _ in 0..count {
+            ids.push(read_u32_le(&mut cursor));
+            scales.push(read_f32_le(&mut cursor));
+            codes.extend(cursor[..dim].iter().map(|&b| b as i8));
+            cursor = &cursor[dim..];
+        }
+        return VectorPosting::I8 {
+            dim,
+            ids,
+            scales,
+            codes,
+        };
+    }
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let id = read_u32_le(&mut cursor);
@@ -1373,7 +1981,102 @@ fn decode_posting_entries(mut cursor: &[u8], dim: u32) -> Vec<(u32, Vec<f32>)> {
         }
         out.push((id, v));
     }
-    out
+    VectorPosting::F32(out)
+}
+
+/// One vector posting's decoded live entries, in the encoding its
+/// `vector.idx` stores (#210). Cached as-is, so an i8 column's posting
+/// cache holds ~4x more postings in the same bytes.
+#[derive(Debug, Clone, PartialEq)]
+enum VectorPosting {
+    F32(Vec<(u32, Vec<f32>)>),
+    /// Entry `i` is `ids[i]`, scale `scales[i]`, codes
+    /// `codes[i * dim..(i + 1) * dim]`.
+    I8 {
+        dim: usize,
+        ids: Vec<u32>,
+        scales: Vec<f32>,
+        codes: Vec<i8>,
+    },
+}
+
+impl VectorPosting {
+    /// Approximate heap + inline bytes, for the posting cache's budget.
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                VectorPosting::F32(entries) => {
+                    entries.len()
+                        * (std::mem::size_of::<(u32, Vec<f32>)>()
+                            + entries.first().map_or(0, |(_, v)| v.len())
+                                * std::mem::size_of::<f32>())
+                }
+                VectorPosting::I8 {
+                    ids, scales, codes, ..
+                } => ids.len() * 4 + scales.len() * 4 + codes.len(),
+            }
+    }
+
+    /// Calls `emit(id, similarity)` for every entry `accept` lets through
+    /// (all of them when `None`). `f32_similarity` scores an f32 entry —
+    /// each caller keeps the formula it has always used. An i8 entry is
+    /// scored against `unit_query` (the query, unit-normalized; only read
+    /// for i8) as `scale * Σ q_i·code_i`, clamped like the f32 dot path:
+    /// the stored vector is unit-norm, so that is its cosine.
+    fn for_each_similarity(
+        &self,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        f32_similarity: impl Fn(&[f32]) -> f32,
+        unit_query: &[f32],
+        mut emit: impl FnMut(u32, f32),
+    ) {
+        match self {
+            VectorPosting::F32(entries) => {
+                for (id, v) in entries {
+                    if accept.is_some_and(|accept| !accept(*id)) {
+                        continue;
+                    }
+                    emit(*id, f32_similarity(v));
+                }
+            }
+            VectorPosting::I8 {
+                dim,
+                ids,
+                scales,
+                codes,
+            } => {
+                for (i, (&id, &scale)) in ids.iter().zip(scales).enumerate() {
+                    if accept.is_some_and(|accept| !accept(id)) {
+                        continue;
+                    }
+                    let entry = &codes[i * dim..(i + 1) * dim];
+                    let sim = kosha_vector_spfresh::dot_i8(unit_query, entry, scale);
+                    emit(id, sim.clamp(-1.0, 1.0));
+                }
+            }
+        }
+    }
+
+    /// The entries as f32 vectors (an i8 posting dequantized).
+    fn dequantized(self) -> Vec<(u32, Vec<f32>)> {
+        match self {
+            VectorPosting::F32(entries) => entries,
+            VectorPosting::I8 {
+                dim,
+                ids,
+                scales,
+                codes,
+            } => ids
+                .into_iter()
+                .zip(scales)
+                .enumerate()
+                .map(|(i, (id, scale))| {
+                    let entry = &codes[i * dim..(i + 1) * dim];
+                    (id, kosha_vector_spfresh::dequantize_i8(entry, scale))
+                })
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1433,8 +2136,8 @@ mod vector_index_v2_tests {
         for (i, entry) in parsed_offsets.iter().enumerate() {
             let slice =
                 &idx_bytes[entry.offset as usize..(entry.offset as usize + entry.length as usize)];
-            let decoded = decode_posting_entries(slice, dim);
-            assert_eq!(decoded, postings[i].entries);
+            let decoded = decode_posting_entries(slice, dim, VECTOR_INDEX_VERSION);
+            assert_eq!(decoded, VectorPosting::F32(postings[i].entries.clone()));
         }
     }
 
@@ -1576,7 +2279,9 @@ mod vector_index_v2_tests {
                 decode_posting_entries(
                     &data[p.offset as usize..(p.offset + p.length as u64) as usize],
                     dim,
+                    version,
                 )
+                .dequantized()
             })
             .map(|(id, _)| id)
             .collect();
@@ -1610,8 +2315,10 @@ mod vector_index_v2_tests {
         writer.write_doc_store().unwrap();
         writer.write_inverted_index().unwrap();
         writer.write_filters().unwrap();
-        writer.write_vectors_v2().unwrap();
-        writer.write_footer(Bm25Params::default()).unwrap();
+        let vector_fields = writer.write_vectors_v2().unwrap();
+        writer
+            .write_footer(Bm25Params::default(), vector_fields, Vec::new())
+            .unwrap();
 
         // On disk: header says unit-norm, and every stored vector and
         // centroid actually is unit-L2.
@@ -2596,6 +3303,106 @@ pub fn doc_vectors_header_len(prefix: &[u8]) -> Result<Result<u64, u64>, KoshaEr
     }
 }
 
+/// How a [`SegmentWriter`] stores each vector column's ANN posting entries
+/// (#210): a default for every field plus per-field overrides.
+///
+/// Production writers read it once from the environment:
+/// `KOSHA_VECTOR_QUANTIZATION=f32|i8` (default `f32`) sets the default and
+/// `KOSHA_VECTOR_QUANTIZATION_FIELDS=body_emb:i8,title_emb:f32` overrides
+/// it per field. The namespace schema (#220) carries only analyzers so
+/// far; declaring quantization per field there is follow-up work.
+///
+/// `i8` writes vector index version [`I8_VECTOR_INDEX_VERSION`], which a
+/// reader built before it cannot read (it fails the kNN on that column).
+/// Turn it on only once every query pod runs a build that reads it, and
+/// turn it off and compact before rolling back past one. With it off (the default) segments are byte-identical to those
+/// written before #210. `doc_vectors.bin` keeps full-precision vectors
+/// either way: it is the document's own value, rescoring reads it, and
+/// compaction re-encodes every index from it (#253).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorQuantizationConfig {
+    pub default: VectorQuantization,
+    pub fields: HashMap<String, VectorQuantization>,
+}
+
+impl VectorQuantizationConfig {
+    /// Every field stored as `quantization`.
+    pub fn all(quantization: VectorQuantization) -> Self {
+        Self {
+            default: quantization,
+            fields: HashMap::new(),
+        }
+    }
+
+    /// `self` with `field` stored as `quantization`.
+    pub fn with_field(
+        mut self,
+        field: impl Into<String>,
+        quantization: VectorQuantization,
+    ) -> Self {
+        self.fields.insert(field.into(), quantization);
+        self
+    }
+
+    /// How `field`'s postings are stored.
+    pub fn for_field(&self, field: &str) -> VectorQuantization {
+        self.fields.get(field).copied().unwrap_or(self.default)
+    }
+
+    fn from_env() -> &'static Self {
+        static CONFIG: OnceLock<VectorQuantizationConfig> = OnceLock::new();
+        CONFIG.get_or_init(|| {
+            Self::parse(
+                std::env::var("KOSHA_VECTOR_QUANTIZATION").ok().as_deref(),
+                std::env::var("KOSHA_VECTOR_QUANTIZATION_FIELDS")
+                    .ok()
+                    .as_deref(),
+            )
+        })
+    }
+
+    /// Parses the two env values. Anything unrecognised is warned about
+    /// and ignored — falling back to `f32`, which every reader reads.
+    pub fn parse(default: Option<&str>, fields: Option<&str>) -> Self {
+        let default = match default.map(str::trim) {
+            None | Some("") => VectorQuantization::F32,
+            Some(raw) => VectorQuantization::parse(raw).unwrap_or_else(|| {
+                eprintln!("WARN: KOSHA_VECTOR_QUANTIZATION={raw} not f32|i8 — using f32");
+                VectorQuantization::F32
+            }),
+        };
+        let mut config = Self::all(default);
+        for entry in fields.unwrap_or("").split(',').map(str::trim) {
+            if entry.is_empty() {
+                continue;
+            }
+            match entry
+                .rsplit_once(':')
+                .and_then(|(name, q)| Some((name.trim(), VectorQuantization::parse(q)?)))
+            {
+                Some((name, q)) if !name.is_empty() => {
+                    config.fields.insert(name.to_string(), q);
+                }
+                _ => eprintln!(
+                    "WARN: KOSHA_VECTOR_QUANTIZATION_FIELDS entry {entry:?} not <field>:f32|i8 — ignored"
+                ),
+            }
+        }
+        config
+    }
+}
+
+/// Logged once: i8 was asked for but `KOSHA_VECTOR_WRITE_VERSION` pins an
+/// older index version, so the writer keeps writing f32.
+fn warn_quantization_needs_v4() {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        eprintln!(
+            "WARN: i8 vector quantization needs KOSHA_VECTOR_WRITE_VERSION=4 (the default) — writing f32 vectors"
+        );
+    });
+}
+
 /// Parsed `doc_vectors.bin` header: field names, entries and where each
 /// entry's vector starts in the file. Vectors themselves are read on
 /// demand, from the local file when it is whole, otherwise from the sparse
@@ -2690,6 +3497,11 @@ impl DocVectors {
         })
     }
 
+    /// The sidecar's field-name table, in first-seen order.
+    pub fn field_names(&self) -> &[String] {
+        &self.fields
+    }
+
     /// `(field name, vector)` for every vector stored for `doc_seq`, in the
     /// document's field order. One local read.
     pub fn vectors_for(&self, doc_seq: u32) -> Result<Vec<(&str, Vec<f32>)>, KoshaError> {
@@ -2725,6 +3537,88 @@ impl DocVectors {
         }
         Ok(out)
     }
+
+    /// Whether the sidecar holds any vector of `field`.
+    pub fn has_field(&self, field: &str) -> bool {
+        self.fields.iter().any(|name| name == field)
+    }
+
+    /// Calls `visit(doc_seq, vector)` for `field`'s vector of every
+    /// document in `doc_seqs` (ascending) that has one, in `doc_seq` order,
+    /// and returns how many were visited.
+    ///
+    /// Built for exact kNN over a filtered set (#252): vectors that sit
+    /// close together in the file (gaps up to [`Self::COALESCE_GAP`]) are
+    /// read with one read, so a dense set costs a few large sequential
+    /// reads and a sparse one a seek per document, never a file open per
+    /// document as [`Self::vectors_for`] does.
+    pub fn visit_field_vectors(
+        &self,
+        field: &str,
+        doc_seqs: &[u32],
+        mut visit: impl FnMut(u32, &[f32]),
+    ) -> Result<usize, KoshaError> {
+        let Some(field_idx) = self.fields.iter().position(|name| name == field) else {
+            return Ok(0);
+        };
+        let field_idx = field_idx as u32;
+        // Entry indices of the wanted vectors, ascending (entries are
+        // sorted by doc_seq, and so is `doc_seqs`).
+        let mut wanted: Vec<usize> = Vec::with_capacity(doc_seqs.len());
+        let mut from = 0usize;
+        for &doc_seq in doc_seqs {
+            let start = from + self.entries[from..].partition_point(|e| e.0 < doc_seq);
+            let mut i = start;
+            while i < self.entries.len() && self.entries[i].0 == doc_seq {
+                if self.entries[i].1 == field_idx {
+                    wanted.push(i);
+                }
+                i += 1;
+            }
+            from = i;
+        }
+        if wanted.is_empty() {
+            return Ok(0);
+        }
+        let end_of = |i: usize| self.offsets[i] + self.entries[i].2 as u64 * 4;
+        let mut file = fs::File::open(self.segment_dir.join(DOC_VECTORS_FILE))?;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut vector: Vec<f32> = Vec::new();
+        let mut run_start = 0usize;
+        while run_start < wanted.len() {
+            let mut run_end = run_start + 1;
+            while run_end < wanted.len()
+                && self.offsets[wanted[run_end]] <= end_of(wanted[run_end - 1]) + Self::COALESCE_GAP
+            {
+                run_end += 1;
+            }
+            let span_start = self.offsets[wanted[run_start]];
+            let span_end = end_of(wanted[run_end - 1]);
+            buf.resize((span_end - span_start) as usize, 0);
+            file.seek(SeekFrom::Start(span_start))?;
+            file.read_exact(&mut buf)?;
+            for &i in &wanted[run_start..run_end] {
+                let at = (self.offsets[i] - span_start) as usize;
+                let dim = self.entries[i].2 as usize;
+                vector.clear();
+                vector.extend(
+                    buf[at..at + dim * 4]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f32::from_le_bytes(*b)),
+                );
+                visit(self.entries[i].0, &vector);
+            }
+            run_start = run_end;
+        }
+        Ok(wanted.len())
+    }
+
+    /// Largest gap between two wanted vectors that
+    /// [`Self::visit_field_vectors`] reads through rather than seeking
+    /// over: reading 64 KiB costs about what one more seek does.
+    pub const COALESCE_GAP: u64 = 64 * 1024;
 
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -4569,31 +5463,24 @@ impl LazyFilters {
     }
 }
 
-/// Return type of `load_vector_index`: `(vector_store, hnsw_map,
-/// vector_index, degraded)`, exactly one of `vector_index` or
-/// `(vector_store, hnsw_map)` populated. `degraded` is `true` only for the
-/// one case where a segment's vectors are unreadable rather than genuinely
-/// absent (a valid v2 header with a corrupt/truncated body) — everything
-/// else, including "no vector.idx file at all", leaves it `false`.
-type LoadedVectorState = (
-    VectorStore,
-    Option<HnswMap<CosinePoint, u32>>,
-    Option<LazyVectorIndex>,
-    bool,
-);
-
-/// Resident state for a v2 (posting-based) segment's vectors: centroids are
-/// always in memory (small — a segment's posting count tops out in the
-/// hundreds), posting entries are loaded on demand from `vector.idx` by
-/// `SegmentReader::hydrate_posting`. Mutually exclusive with
-/// `vector_store`/`hnsw_map` being populated — see `load_vector_index`'s
-/// doc comment for the four-way dispatch.
 /// A vector posting's decoded live entries, shared between the per-segment
 /// cache and in-flight queries (a cache hit is a pointer clone).
-type SharedVectorPosting = Arc<Vec<(u32, Vec<f32>)>>;
+type SharedVectorPosting = Arc<VectorPosting>;
 
+/// Resident state for a v2 (posting-based) vector column: centroids are
+/// always in memory (small — a segment's posting count tops out in the
+/// hundreds), posting entries are loaded on demand from the column's
+/// `vector[.<slot>].idx` by `SegmentReader::hydrate_posting`. Mutually
+/// exclusive with [`VectorFieldIndex::flat`] being populated — see
+/// `load_vector_index`'s doc comment for the four-way dispatch.
 struct LazyVectorIndex {
     vector_idx_path: PathBuf,
+    /// Basename of `vector_idx_path` (`vector.idx` or `vector.<n>.idx`):
+    /// the file the span cache and [`VectorSpanFetch`] name (#245).
+    idx_file: String,
+    /// The column's file slot — part of every posting-cache key, so two
+    /// columns' postings never alias in the segment's shared cache.
+    slot: u32,
     dim: usize,
     /// Parallel to `ranges` — kept as a separate `Vec<Vec<f32>>` (not a
     /// `Vec<VectorPostingIndex>`) so `knn_search` can pass it straight to
@@ -4612,14 +5499,135 @@ struct LazyVectorIndex {
     /// [`UNIT_NORM_VECTOR_INDEX_VERSION`]) — scoring uses the dot-only fast
     /// path: normalize the query once, then `1 - dot` *is* cosine distance.
     unit_norm: bool,
-    /// Decoded postings LRU keyed by range index — the vector twin of the
-    /// text path's per-segment [`PostingsCache`]. Without it every kNN
-    /// query re-reads and re-decodes its `nprobe` candidate postings from
-    /// `vector.idx`, even when the segment itself is warm in the
-    /// `SegmentCache` — hydration I/O + decode was the dominant warm-path
-    /// cost. Entries are `Arc`s (hit = pointer clone) and resident bytes
-    /// report to the same live-bytes account as text postings.
-    cache: PostingsCache<SharedVectorPosting>,
+    /// The idx header's version — decides how posting entries decode.
+    version: u32,
+    /// Entries are i8-quantized ([`I8_VECTOR_INDEX_VERSION`]): scores are
+    /// approximate, and the probe rescores its best candidates from
+    /// `doc_vectors.bin` (see [`SegmentReader::with_vector_rescore_factor`]).
+    quantized: bool,
+    /// The column's field name, from the footer (`None` for a legacy
+    /// segment's unnamed index) — what `doc_vectors.bin` is keyed by.
+    field: Option<String>,
+}
+
+impl LazyVectorIndex {
+    fn from_parsed(
+        idx_path: &Path,
+        slot: u32,
+        dim: u32,
+        version: u32,
+        parsed: Vec<VectorPostingIndex>,
+        field: Option<String>,
+    ) -> Self {
+        let mut centroids = Vec::with_capacity(parsed.len());
+        let mut ranges = Vec::with_capacity(parsed.len());
+        let mut radii = Vec::with_capacity(parsed.len());
+        for p in parsed {
+            centroids.push(p.centroid);
+            ranges.push((p.offset, p.length));
+            radii.push(p.radius);
+        }
+        LazyVectorIndex {
+            vector_idx_path: idx_path.to_path_buf(),
+            idx_file: idx_path.file_name().map_or_else(
+                || VECTOR_IDX_FILE.to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
+            slot,
+            dim: dim as usize,
+            centroids,
+            ranges,
+            radii,
+            unit_norm: is_unit_norm_vector_index_version(version),
+            version,
+            quantized: is_i8_vector_index_version(version),
+            field,
+        }
+    }
+}
+
+/// One vector column of a segment, loaded (#204). Exactly one of `lazy` or
+/// `flat` is populated, or neither when the column's vectors are absent or
+/// unreadable (`degraded` tells those two apart).
+pub struct VectorFieldIndex {
+    lazy: Option<LazyVectorIndex>,
+    flat: VectorStore,
+    /// `true` when the column has a valid v2 `vector.idx` header but a
+    /// corrupt/truncated body. `lazy` is then `None` and `flat` empty —
+    /// identical, at the type level, to a column with no vectors at all.
+    /// The query layer (`kosha-query`) checks this flag to tell the two
+    /// apart: a genuinely vector-less segment contributes zero kNN hits
+    /// legitimately, while a degraded one is silently missing real results
+    /// and must be counted in `SearchResult::knn_degraded_segments`.
+    degraded: bool,
+}
+
+impl VectorFieldIndex {
+    /// Served by the lazy v2 posting index (rather than [`Self::flat`]).
+    pub fn has_lazy_index(&self) -> bool {
+        self.lazy.is_some()
+    }
+    /// Legacy / missing-sidecar vectors, served by exact flat scan. Empty
+    /// when [`Self::has_lazy_index`].
+    pub fn flat(&self) -> &VectorStore {
+        &self.flat
+    }
+    /// See the field's doc comment.
+    pub fn degraded(&self) -> bool {
+        self.degraded
+    }
+    /// The column's dimension, when known from the index itself.
+    pub fn dim(&self) -> Option<usize> {
+        match &self.lazy {
+            Some(vi) => Some(vi.dim),
+            None if !self.flat.vectors.is_empty() => Some(self.flat.dimensions),
+            None => None,
+        }
+    }
+}
+
+/// One vector column as a reader knows it before loading it (#204).
+struct VectorFieldSlot {
+    /// From the footer's `vector_fields`; `None` for the one unnamed index
+    /// of a legacy segment.
+    meta: Option<VectorFieldMeta>,
+    idx_path: PathBuf,
+    offsets_path: PathBuf,
+    /// Loaded on the first kNN that targets this column, so a query on one
+    /// column never reads (or needs hydrated) another column's files.
+    loaded: Mutex<Option<Arc<VectorFieldIndex>>>,
+}
+
+/// How a segment relates to a `knn.field` (#204) — see
+/// [`SegmentReader::vector_field_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VectorFieldStatus {
+    /// The footer lists the field: its own index, of this dimension.
+    Indexed { dim: usize },
+    /// A segment written before vector columns existed, whose single
+    /// unnamed index answers a kNN on any field name it is not known to
+    /// be bound away from (migration rule). `dim` is `None` when the index
+    /// could not be read.
+    Legacy { dim: Option<usize> },
+    /// The segment has no vectors for the field.
+    Absent,
+}
+
+/// [`VectorFieldStatus`] of `field` from `footer` alone, when the footer
+/// lists its vector columns; `None` for a legacy footer, whose segment must
+/// be opened to tell (see [`SegmentReader::vector_field_status`]).
+pub fn footer_vector_field_status(footer: &Footer, field: &str) -> Option<VectorFieldStatus> {
+    let fields = footer.vector_fields.as_ref()?;
+    Some(
+        fields
+            .iter()
+            .find(|meta| meta.name == field)
+            .map_or(VectorFieldStatus::Absent, |meta| {
+                VectorFieldStatus::Indexed {
+                    dim: meta.dim as usize,
+                }
+            }),
+    )
 }
 
 /// `(top-k hits, postings hydrated)` for a budgeted kNN probe — see
@@ -4637,36 +5645,68 @@ pub struct RawDocRecord {
     pub vectors: Vec<(usize, Vec<f32>)>,
 }
 
+/// The `k` highest-scoring of `scored`, best first (ties keep no
+/// particular order, as on the probe path).
+fn top_k_by_score(mut scored: Vec<(u32, f64)>, k: usize) -> Vec<(u32, f64)> {
+    let by_score_desc =
+        |a: &(u32, f64), b: &(u32, f64)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+    if k == 0 {
+        return Vec::new();
+    }
+    if scored.len() > k {
+        scored.select_nth_unstable_by(k - 1, by_score_desc);
+        scored.truncate(k);
+    }
+    scored.sort_by(by_score_desc);
+    scored
+}
+
+/// Where [`SegmentReader::knn_exact_filtered`] read the candidates'
+/// vectors from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactKnnSource {
+    /// `doc_vectors.bin` (#243): one read per run of nearby candidates.
+    Sidecar,
+    /// Every posting of the column's `vector.idx`, because the segment has
+    /// no local sidecar holding the field (inline-vector segments, a
+    /// legacy index the sidecar does not bind, or a sidecar not hydrated
+    /// locally).
+    Postings,
+}
+
+/// Outcome of an exact, filtered kNN over one segment (#252).
+#[derive(Debug, Clone)]
+pub struct ExactKnnResult {
+    /// The `k` nearest candidates, nearest first, scored by cosine
+    /// similarity exactly as the posting probe scores them.
+    pub hits: Vec<(u32, f64)>,
+    /// Candidate vectors scored.
+    pub vectors_scored: usize,
+    /// Postings hydrated (zero when served from the sidecar).
+    pub postings_hydrated: usize,
+    pub source: ExactKnnSource,
+}
+
 pub struct SegmentReader {
     segment_dir: PathBuf,
     footer: Footer,
     doc_store: DocStoreAccess,
     inverted: InvertedAccess,
     filters: LazyFilters,
-    pub vector_store: VectorStore,
-    /// Always `None` since issue #126: ANN structures are built at write
-    /// time only, and open never constructs HNSW (a rayon all-core,
-    /// minutes-at-scale build) — flat/legacy segments are served by exact
-    /// `flat_knn` over `vector_store` instead. The field survives so a
-    /// pre-built graph could be *loaded* here if a future format persists
-    /// one; nothing populates it today.
-    pub hnsw_map: Option<HnswMap<CosinePoint, u32>>,
-    /// `Some` only for a v2 segment whose `vector.offsets` sidecar parsed
-    /// cleanly. When set, `vector_store`/`hnsw_map` above are left at their
-    /// defaults (empty/`None`) — callers check this first (`knn_search`)
-    /// and fall back to `hnsw_map`/`vector_store` otherwise, exactly as
-    /// before this field existed.
-    vector_index: Option<LazyVectorIndex>,
-    /// `true` when this segment has a valid v2 `vector.idx` header but a
-    /// corrupt/truncated body. In this state `vector_index` is `None` and
-    /// `vector_store` is empty — identical, at the type level, to a segment
-    /// with no vector field at all. The query layer (`kosha-query`) checks
-    /// this flag to tell the two apart: a genuinely vector-less segment
-    /// contributes zero kNN hits legitimately, while a degraded one is
-    /// silently missing real results and must be counted in
-    /// `SearchResult::knn_degraded_segments` instead. See
-    /// `load_vector_index`'s corrupt-body branch.
-    vector_index_degraded: bool,
+    /// The segment's vector columns (#204), empty unless opened with
+    /// `load_vectors`. Each is loaded on first use.
+    vector_slots: Vec<VectorFieldSlot>,
+    /// Decoded vector postings LRU shared by every column, keyed by
+    /// `(slot, range index)` — the vector twin of the text path's
+    /// per-segment [`PostingsCache`]. Without it every kNN query re-reads
+    /// and re-decodes its `nprobe` candidate postings from `vector.idx`,
+    /// even when the segment itself is warm in the `SegmentCache` —
+    /// hydration I/O + decode was the dominant warm-path cost. Entries are
+    /// `Arc`s (hit = pointer clone) and resident bytes report to the same
+    /// live-bytes account as text postings. One cache per segment keeps
+    /// `KOSHA_VECTOR_POSTINGS_CACHE_MAX_BYTES` a per-segment budget however
+    /// many columns there are.
+    vector_cache: PostingsCache<SharedVectorPosting>,
     /// Parsed `doc_vectors.bin` header, loaded on first doc-record read of a
     /// segment whose footer sets `doc_vectors` (#243). Only success is
     /// cached: the file may be hydrated after the segment was opened.
@@ -4674,25 +5714,57 @@ pub struct SegmentReader {
     /// Per-field document lengths decoded from the norms lists (#249),
     /// dense by doc_seq, for the fields queries have asked about.
     field_lengths: Mutex<HashMap<String, Arc<Vec<u32>>>>,
+    /// i8 columns rescore their best `k * vector_rescore_factor` probe
+    /// candidates at full precision (#210); `0` disables. See
+    /// [`vector_rescore_factor`].
+    vector_rescore_factor: usize,
+    /// Late-interaction fields (#205) opened so far, by footer index. Only
+    /// success is cached, as for `doc_vectors`.
+    multi_vectors: Mutex<HashMap<usize, Arc<multivec::MultiVectorIndex>>>,
+}
+
+/// Default of [`SegmentReader::with_vector_rescore_factor`]:
+/// `KOSHA_VECTOR_RESCORE_FACTOR`, default `4`, `0` disables rescoring.
+/// Only i8-quantized vector columns (#210) are rescored — an f32 column's
+/// probe scores are already exact.
+pub fn vector_rescore_factor() -> usize {
+    static FACTOR: OnceLock<usize> = OnceLock::new();
+    *FACTOR.get_or_init(|| {
+        match std::env::var("KOSHA_VECTOR_RESCORE_FACTOR").ok().as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_VECTOR_RESCORE_FACTOR,
+            Some(raw) => raw.parse().unwrap_or_else(|_| {
+                eprintln!(
+                    "WARN: KOSHA_VECTOR_RESCORE_FACTOR={raw} not a non-negative integer — using {DEFAULT_VECTOR_RESCORE_FACTOR}"
+                );
+                DEFAULT_VECTOR_RESCORE_FACTOR
+            }),
+        }
+    })
+}
+
+const DEFAULT_VECTOR_RESCORE_FACTOR: usize = 4;
+
+/// Posting-cache key for `range_idx` of the column at `slot`.
+fn vector_cache_key(slot: u32, range_idx: usize) -> usize {
+    ((slot as u64) << 32 | range_idx as u64) as usize
 }
 
 impl SegmentReader {
-    /// Opens a segment, always loading vectors and building the HNSW graph.
-    /// Kept for callers that genuinely need the vector store regardless of
-    /// query shape (merge/compaction, tests). Query-time lexical search
-    /// should use `open_with_options` instead — see its doc comment.
+    /// Opens a segment with vector search enabled. Kept for callers that
+    /// genuinely need the vectors regardless of query shape
+    /// (merge/compaction, tests). Query-time lexical search should use
+    /// `open_with_options` instead — see its doc comment.
     pub fn open(segment_dir: PathBuf) -> Result<Self, KoshaError> {
         Self::open_with_options(segment_dir, true)
     }
 
-    /// Opens a segment, loading the vector store and building its HNSW graph
-    /// only when `load_vectors` is true.
+    /// Opens a segment, enabling vector search only when `load_vectors` is
+    /// true.
     ///
-    /// `vector.idx` reads and `build_hnsw` are the dominant cost of opening a
-    /// segment (especially under emulation, e.g. amd64-under-Rosetta), yet a
-    /// pure lexical/BM25 query (no `query.knn`) never touches either. Skipping
-    /// both for that case is what keeps keyword search latency independent of
-    /// embedding volume.
+    /// Vector files are the dominant cost of opening a segment, yet a pure
+    /// lexical/BM25 query (no `query.knn`) never touches them. A segment
+    /// opened without `load_vectors` reports no vector columns at all; one
+    /// opened with it loads each column on the first kNN that targets it.
     pub fn open_with_options(segment_dir: PathBuf, load_vectors: bool) -> Result<Self, KoshaError> {
         Self::open_with_footer_options(segment_dir, load_vectors, None, None)
     }
@@ -4713,11 +5785,6 @@ impl SegmentReader {
         footer: Option<Footer>,
         postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
     ) -> Result<Self, KoshaError> {
-        let (vs, hm, vector_index, vector_index_degraded) = if load_vectors {
-            Self::load_vector_index(&segment_dir, postings_account.clone())?
-        } else {
-            (VectorStore::default(), None, None, false)
-        };
         let footer = resolve_open_footer(&segment_dir, footer)?;
         let posting_spans = footer.posting_blobs_raw;
         let filters = LazyFilters {
@@ -4725,6 +5792,11 @@ impl SegmentReader {
             doc_count: footer.doc_count,
             columnar: footer.filter_columns.is_some(),
             state: Mutex::new(FilterState::default()),
+        };
+        let vector_slots = if load_vectors {
+            Self::vector_slots(&segment_dir, &footer)
+        } else {
+            Vec::new()
         };
         let doc_store = match try_read_doc_index(&segment_dir, footer.doc_count) {
             Some(index) => DocStoreAccess::Lazy {
@@ -4737,15 +5809,106 @@ impl SegmentReader {
             segment_dir: segment_dir.clone(),
             footer,
             doc_store,
-            inverted: Self::read_inverted(&segment_dir, postings_account, posting_spans)?,
+            inverted: Self::read_inverted(&segment_dir, postings_account.clone(), posting_spans)?,
             filters,
-            vector_store: vs,
-            hnsw_map: hm,
-            vector_index,
-            vector_index_degraded,
+            vector_slots,
+            vector_cache: PostingsCache::new(vector_postings_cache_max_bytes(), postings_account),
             doc_vectors: Mutex::new(None),
             field_lengths: Mutex::new(HashMap::new()),
+            vector_rescore_factor: vector_rescore_factor(),
+            multi_vectors: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Override how many probe candidates per wanted hit an i8 vector
+    /// column rescores at full precision (#210); `0` disables rescoring.
+    /// Readers default to `KOSHA_VECTOR_RESCORE_FACTOR` (see
+    /// [`vector_rescore_factor`]).
+    pub fn with_vector_rescore_factor(mut self, factor: usize) -> Self {
+        self.vector_rescore_factor = factor;
+        self
+    }
+
+    /// Bytes the decoded vector-posting cache holds right now (#210
+    /// measurement; also what it reports to the live-bytes account).
+    pub fn vector_cache_resident_bytes(&self) -> usize {
+        self.vector_cache.state.lock().unwrap().total_bytes
+    }
+
+    /// The vector columns `footer` declares, or the single unnamed legacy
+    /// index of a segment written before columns existed. No I/O.
+    fn vector_slots(segment_dir: &Path, footer: &Footer) -> Vec<VectorFieldSlot> {
+        let slot = |meta: Option<VectorFieldMeta>, slot: u32| VectorFieldSlot {
+            idx_path: segment_dir.join(kosha_core::vector_idx_file(slot)),
+            offsets_path: segment_dir.join(kosha_core::vector_offsets_file(slot)),
+            meta,
+            loaded: Mutex::new(None),
+        };
+        match &footer.vector_fields {
+            Some(fields) => fields
+                .iter()
+                .map(|meta| slot(Some(meta.clone()), meta.slot))
+                .collect(),
+            None => vec![slot(None, 0)],
+        }
+    }
+
+    /// Whether this segment has late-interaction data for `field` (#205).
+    pub fn has_multi_vector_field(&self, field: &str) -> bool {
+        self.footer.multi_vectors.iter().any(|f| f.name == field)
+    }
+
+    /// Late-interaction (MaxSim) top `k` over `field` (#205). See
+    /// [`multivec`] for the files and the algorithm. A segment without
+    /// late-interaction data for `field` returns no hits; query tokens of a
+    /// different dimension than the field's are an `InvalidQuery`.
+    pub fn late_interaction_search(
+        &self,
+        field: &str,
+        query: &[&[f32]],
+        k: usize,
+        params: LateInteractionParams,
+        accept: Option<&dyn Fn(u32) -> bool>,
+    ) -> Result<LateInteractionHits, KoshaError> {
+        let Some(i) = self
+            .footer
+            .multi_vectors
+            .iter()
+            .position(|f| f.name == field)
+        else {
+            return Ok(LateInteractionHits::default());
+        };
+        let index = {
+            let mut cached = self.multi_vectors.lock().unwrap();
+            match cached.get(&i) {
+                Some(index) => Arc::clone(index),
+                None => {
+                    let index = Arc::new(multivec::MultiVectorIndex::open(
+                        &self.segment_dir,
+                        i,
+                        &self.footer.multi_vectors[i],
+                    )?);
+                    cached.insert(i, Arc::clone(&index));
+                    index
+                }
+            }
+        };
+        if let Some(bad) = query.iter().find(|q| q.len() != index.dim()) {
+            return Err(KoshaError::InvalidQuery(format!(
+                "knn field '{field}' holds {}-dimensional token vectors; a query vector has {}",
+                index.dim(),
+                bad.len()
+            )));
+        }
+        let normalized: Vec<Vec<f32>> = query
+            .iter()
+            .map(|q| {
+                let mut q = q.to_vec();
+                kosha_vector_spfresh::normalize_in_place(&mut q);
+                q
+            })
+            .collect();
+        index.search(&normalized, k, params, accept)
     }
 
     fn doc_vectors(&self) -> Result<Arc<DocVectors>, KoshaError> {
@@ -4828,17 +5991,147 @@ impl SegmentReader {
         Ok(out)
     }
 
-    /// Loads this segment's vectors, dispatching on `vector.idx`'s format —
-    /// see the "Vector index format" section's four-way breakdown above
-    /// `VECTOR_MAGIC`. Returns `(vector_store, hnsw_map, vector_index)`
-    /// where exactly one of `vector_index` or `(vector_store, hnsw_map)` is
-    /// populated (the latter possibly both empty/`None`, for "no vectors").
-    fn load_vector_index(
-        segment_dir: &Path,
-        postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
-    ) -> Result<LoadedVectorState, KoshaError> {
-        let idx_path = segment_dir.join("vector.idx");
+    /// The field a legacy segment's unnamed index belongs to, when that is
+    /// knowable: its `doc_vectors.bin` (#243) names exactly one vector
+    /// field. `None` — unbound — when the segment stores vectors inline,
+    /// names several fields (their vectors share the one index), or the
+    /// sidecar is not local.
+    fn legacy_bound_field(&self) -> Option<String> {
+        if !self.footer.doc_vectors {
+            return None;
+        }
+        let dv = self.doc_vectors().ok()?;
+        match dv.field_names() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
+    }
 
+    /// The slot that serves a kNN on `field`, if any (#204): the footer's
+    /// column of that name, or — migration rule — a legacy segment's
+    /// unnamed index, unless its `doc_vectors.bin` binds it to a different
+    /// field.
+    fn vector_slot(&self, field: &str) -> Option<&VectorFieldSlot> {
+        let slot = self.vector_slots.iter().find(|s| match &s.meta {
+            Some(meta) => meta.name == field,
+            None => true,
+        })?;
+        if slot.meta.is_none() {
+            if let Some(bound) = self.legacy_bound_field() {
+                if bound != field {
+                    return None;
+                }
+            }
+        }
+        Some(slot)
+    }
+
+    /// How this segment relates to a kNN on `field` — see
+    /// [`VectorFieldStatus`]. No I/O for a segment whose footer lists its
+    /// vector columns; a legacy segment's unnamed index is loaded (once).
+    /// A segment opened without `load_vectors` reports
+    /// [`VectorFieldStatus::Absent`] for everything.
+    pub fn vector_field_status(&self, field: &str) -> VectorFieldStatus {
+        let Some(slot) = self.vector_slot(field) else {
+            return VectorFieldStatus::Absent;
+        };
+        if let Some(meta) = &slot.meta {
+            return VectorFieldStatus::Indexed {
+                dim: meta.dim as usize,
+            };
+        }
+        // Legacy: load the unnamed index (what the kNN itself will use
+        // next, so this costs nothing extra) to learn whether it holds any
+        // vectors and of what dimension. A segment that never had a vector
+        // field has no `vector.idx` and loads empty.
+        match self.load_slot(slot) {
+            Ok(index) => match index.dim() {
+                Some(dim) => VectorFieldStatus::Legacy { dim: Some(dim) },
+                None if index.degraded() => VectorFieldStatus::Legacy { dim: None },
+                None => VectorFieldStatus::Absent,
+            },
+            Err(_) => VectorFieldStatus::Legacy { dim: None },
+        }
+    }
+
+    /// Names of the vector columns this segment's footer declares (empty
+    /// for a legacy segment, or one opened without `load_vectors`).
+    pub fn vector_field_names(&self) -> Vec<&str> {
+        self.vector_slots
+            .iter()
+            .filter_map(|s| s.meta.as_ref().map(|m| m.name.as_str()))
+            .collect()
+    }
+
+    /// The loaded index for `field` (#204), loading it on first use.
+    /// `Ok(None)` when this segment has no vectors for `field` (see
+    /// [`Self::vector_field_status`]).
+    pub fn vector_field(&self, field: &str) -> Result<Option<Arc<VectorFieldIndex>>, KoshaError> {
+        match self.vector_slot(field) {
+            Some(slot) => self.load_slot(slot).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The segment's first vector column — what the field-less kNN methods
+    /// below search. Single-column segments (and every legacy segment)
+    /// have only that one.
+    fn default_vector_field(&self) -> Option<Arc<VectorFieldIndex>> {
+        let slot = self.vector_slots.first()?;
+        match self.load_slot(slot) {
+            Ok(loaded) => Some(loaded),
+            Err(e) => {
+                eprintln!(
+                    "WARN: failed to load the vector index of {}: {e}",
+                    self.segment_dir.display()
+                );
+                None
+            }
+        }
+    }
+
+    fn load_slot(&self, slot: &VectorFieldSlot) -> Result<Arc<VectorFieldIndex>, KoshaError> {
+        let mut loaded = slot.loaded.lock().unwrap();
+        if let Some(loaded) = loaded.as_ref() {
+            return Ok(Arc::clone(loaded));
+        }
+        let index = Arc::new(Self::load_vector_index(
+            &slot.idx_path,
+            &slot.offsets_path,
+            slot.meta.as_ref().map_or(0, |m| m.slot),
+            slot.meta.as_ref().map(|m| m.name.clone()),
+        )?);
+        // A declared column that is neither local nor servable from its
+        // offsets sidecar alone (S3 hydration fetches only the queried
+        // column, and a ranged query node only its `vector[.<n>].offsets`)
+        // is not cached as empty: it may be hydrated after this segment was
+        // opened.
+        if slot.meta.is_some() && !index.has_lazy_index() && !slot.idx_path.exists() {
+            return Err(KoshaError::NotFound(format!(
+                "{} missing from segment {:?}, whose footer lists it",
+                slot.idx_path.display(),
+                self.segment_dir
+            )));
+        }
+        *loaded = Some(Arc::clone(&index));
+        Ok(index)
+    }
+
+    /// Loads one vector column, dispatching on its idx file's format — see
+    /// the "Vector index format" section's four-way breakdown above
+    /// `VECTOR_MAGIC`. At most one of `lazy` or `flat` is populated (both
+    /// empty for "no vectors").
+    fn load_vector_index(
+        idx_path: &Path,
+        offsets_path: &Path,
+        slot: u32,
+        field: Option<String>,
+    ) -> Result<VectorFieldIndex, KoshaError> {
+        let empty = |degraded| VectorFieldIndex {
+            lazy: None,
+            flat: VectorStore::default(),
+            degraded,
+        };
         // Read only the header first — `vector.idx` is hundreds of MB to
         // GBs per segment at embedding scale, and the common case below
         // (valid v2 header + a good `vector.offsets` sidecar) never needs a
@@ -4849,183 +6142,222 @@ impl SegmentReader {
         // the legacy fallback exactly as it did when this read the whole
         // file. A missing file (open error) is not an error either — matches
         // `read_vectors`'s existing missing-file handling.
-        let Some(header_buf) = read_vector_idx_header(&idx_path) else {
-            // No local `vector.idx`. A query node reading postings by range
-            // (#245) only holds `vector.offsets`, whose header repeats the
-            // index's dim and version, plus whichever postings it fetched
-            // into the span cache.
+        let Some(header_buf) = read_vector_idx_header(idx_path) else {
+            // No local idx file. A query node reading postings by range
+            // (#245) only holds the column's offsets sidecar, whose header
+            // repeats the index's dim and version, plus whichever postings
+            // it fetched into the span cache.
             return Ok(
-                Self::load_vector_index_from_offsets(segment_dir, postings_account)
-                    .map_or((VectorStore::default(), None, None, false), |vi| {
-                        (VectorStore::default(), None, Some(vi), false)
-                    }),
+                match Self::load_vector_index_from_offsets(idx_path, offsets_path, slot, field) {
+                    Some(vi) => VectorFieldIndex {
+                        lazy: Some(vi),
+                        flat: VectorStore::default(),
+                        degraded: false,
+                    },
+                    None => empty(false),
+                },
             );
         };
 
+        // A v2 magic with a version this build does not know (written by a
+        // newer build) must not be parsed as the magic-less legacy format,
+        // which would read the magic as a dimension. Fail the column
+        // loudly instead; the query layer counts it as degraded.
+        if header_buf.len() >= 8 && header_buf[0..4] == VECTOR_MAGIC.to_le_bytes() {
+            let version = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+            if !is_known_vector_index_version(version) {
+                return Err(KoshaError::CorruptSegment(format!(
+                    "{} has vector index version {version}, which this build cannot read",
+                    idx_path.display()
+                )));
+            }
+        }
         let Some((dim, _total_count, version)) = parse_vector_idx_header(&header_buf) else {
             // Short (<HEADER_LEN) file, or no magic/an unrecognized version
-            // — legacy v1 flat format. Serve it with exact flat_knn (no
-            // hnsw_map): ANN structures are built at WRITE time only.
-            // Constructing HNSW here put a rayon all-core, minutes-long
-            // build on the open path (issue #126: >10min for one query at
-            // 1M docs, and admission control turned the stall into 100%
-            // 429s), while exact scan of a flush-sized segment is
-            // milliseconds — and strictly better recall. `read_vectors`
-            // re-reads the file itself; it never consumed the header-only
-            // buffer above.
-            let vs = Self::read_vectors(segment_dir)?;
-            return Ok((vs, None, None, false));
+            // — legacy v1 flat format. Serve it with exact flat_knn: ANN
+            // structures are built at WRITE time only. Constructing HNSW
+            // here put a rayon all-core, minutes-long build on the open
+            // path (issue #126: >10min for one query at 1M docs, and
+            // admission control turned the stall into 100% 429s), while
+            // exact scan of a flush-sized segment is milliseconds — and
+            // strictly better recall.
+            return Ok(VectorFieldIndex {
+                lazy: None,
+                flat: Self::read_vectors(idx_path)?,
+                degraded: false,
+            });
         };
 
         // Valid v2 header. Prefer the lazy path — built entirely from the
         // small `vector.offsets` sidecar, `vector.idx`'s body is never read
-        // on this branch, which is the fix: the old code read the whole
-        // file up front even though this, the common case, never uses it.
-        // Fall back to a full eager parse of the (already self-describing)
-        // blob if the sidecar is missing or fails its own sanity checks —
-        // search still works, just without the lazy-hydration benefit,
-        // rather than losing vector search for the segment entirely.
-        if let Ok(offsets_data) = fs::read(segment_dir.join("vector.offsets")) {
+        // on this branch. Fall back to a full eager parse of the (already
+        // self-describing) blob if the sidecar is missing or fails its own
+        // sanity checks — search still works, just without the
+        // lazy-hydration benefit, rather than losing vector search for the
+        // column entirely.
+        if let Ok(offsets_data) = fs::read(offsets_path) {
             if let Some(parsed) = parse_vector_offsets(&offsets_data, dim, version) {
-                let mut centroids = Vec::with_capacity(parsed.len());
-                let mut ranges = Vec::with_capacity(parsed.len());
-                let mut radii = Vec::with_capacity(parsed.len());
-                for p in parsed {
-                    centroids.push(p.centroid);
-                    ranges.push((p.offset, p.length));
-                    radii.push(p.radius);
-                }
-                return Ok((
-                    VectorStore::default(),
-                    None,
-                    Some(LazyVectorIndex {
-                        vector_idx_path: idx_path,
-                        dim: dim as usize,
-                        centroids,
-                        ranges,
-                        radii,
-                        unit_norm: is_unit_norm_vector_index_version(version),
-                        cache: PostingsCache::new(
-                            vector_postings_cache_max_bytes(),
-                            postings_account,
-                        ),
-                    }),
-                    false,
-                ));
+                return Ok(VectorFieldIndex {
+                    lazy: Some(LazyVectorIndex::from_parsed(
+                        idx_path, slot, dim, version, parsed, field,
+                    )),
+                    flat: VectorStore::default(),
+                    degraded: false,
+                });
             }
             eprintln!(
-                "WARN: vector.offsets present but failed validation for {} \
-                 — falling back to eager vector.idx parse (no lazy hydration for this segment)",
-                segment_dir.display()
+                "WARN: {} present but failed validation — falling back to eager {} parse \
+                 (no lazy hydration for this column)",
+                offsets_path.display(),
+                idx_path.display()
             );
         }
 
         eprintln!(
-            "WARN: no usable vector.offsets for {} — exact scan of the whole vector.idx",
-            segment_dir.display()
+            "WARN: no usable {} — exact scan of the whole {}",
+            offsets_path.display(),
+            idx_path.display()
         );
         // Sidecar missing or invalid — this is the one path that genuinely
-        // needs the whole body, so read it now (not upfront, unlike the old
-        // code). A read error here (e.g. a TOCTOU race — the file vanished
-        // between the header read above and now) degrades the same way a
-        // missing file always has, rather than becoming a hard error.
-        let Ok(data) = fs::read(&idx_path) else {
-            return Ok((VectorStore::default(), None, None, false));
+        // needs the whole body, so read it now. A read error here (e.g. a
+        // TOCTOU race — the file vanished between the header read above and
+        // now) degrades the same way a missing file always has, rather than
+        // becoming a hard error.
+        let Ok(data) = fs::read(idx_path) else {
+            return Ok(empty(false));
         };
         match parse_vector_idx_eager(&data) {
-            Some(vs) => {
-                // Same rule as the legacy branch above: no query/open-path
-                // ANN builds — exact flat_knn serves this segment.
-                Ok((vs, None, None, false))
-            }
+            // Same rule as the legacy branch above: no query/open-path ANN
+            // builds — exact flat_knn serves this column.
+            Some(vs) => Ok(VectorFieldIndex {
+                lazy: None,
+                flat: vs,
+                degraded: false,
+            }),
             None => {
                 // Valid header but the body itself is truncated/corrupt —
-                // genuinely unrecoverable for this segment's vectors. Marked
+                // genuinely unrecoverable for this column's vectors. Marked
                 // `degraded` (not just empty) so the query layer counts this
                 // segment in `SearchResult::knn_degraded_segments` rather
                 // than treating it as a legitimate vector-less segment.
                 eprintln!(
-                    "WARN: vector.idx has a valid v2 header but corrupt body for {} \
-                     — this segment will return no vector search results until rewritten",
-                    segment_dir.display()
+                    "WARN: {} has a valid v2 header but corrupt body \
+                     — this column will return no vector search results until rewritten",
+                    idx_path.display()
                 );
-                Ok((VectorStore::default(), None, None, true))
+                Ok(empty(true))
             }
         }
     }
 
-    /// The lazy posting index from `vector.offsets` alone, for a segment
-    /// whose `vector.idx` is not local: postings are then read from the
-    /// sparse span cache (`vector.idx.spans/`) once fetched by range.
-    /// `None` without a valid sidecar.
+    /// The lazy posting index from a column's offsets sidecar alone, for a
+    /// segment whose idx file is not local: postings are then read from
+    /// the sparse span cache (`vector[.<n>].idx.spans/`) once fetched by
+    /// range (#245). `None` without a valid sidecar.
     fn load_vector_index_from_offsets(
-        segment_dir: &Path,
-        postings_account: Option<Arc<dyn PostingsMemoryAccount + Send + Sync>>,
+        idx_path: &Path,
+        offsets_path: &Path,
+        slot: u32,
+        field: Option<String>,
     ) -> Option<LazyVectorIndex> {
-        let data = fs::read(segment_dir.join("vector.offsets")).ok()?;
+        let data = fs::read(offsets_path).ok()?;
         if data.len() < VECTOR_OFFSETS_HEADER_LEN {
             return None;
         }
         let version = u32::from_le_bytes(data[4..8].try_into().ok()?);
         let dim = u32::from_le_bytes(data[8..12].try_into().ok()?);
         let parsed = parse_vector_offsets(&data, dim, version)?;
-        let mut centroids = Vec::with_capacity(parsed.len());
-        let mut ranges = Vec::with_capacity(parsed.len());
-        let mut radii = Vec::with_capacity(parsed.len());
-        for p in parsed {
-            centroids.push(p.centroid);
-            ranges.push((p.offset, p.length));
-            radii.push(p.radius);
-        }
-        Some(LazyVectorIndex {
-            vector_idx_path: segment_dir.join("vector.idx"),
-            dim: dim as usize,
-            centroids,
-            ranges,
-            radii,
-            unit_norm: is_unit_norm_vector_index_version(version),
-            cache: PostingsCache::new(vector_postings_cache_max_bytes(), postings_account),
-        })
+        Some(LazyVectorIndex::from_parsed(
+            idx_path, slot, dim, version, parsed, field,
+        ))
     }
 
-    /// `true` when this segment's vectors are served via the lazy v2
-    /// posting index rather than the legacy `vector_store`/`hnsw_map`
-    /// fields — callers branch on this to pick `knn_search` vs. the
-    /// existing `hnsw_map`/`flat_knn` path.
+    /// `true` when this segment's (first) vector column is served via the
+    /// lazy v2 posting index rather than an exact flat scan.
     pub fn has_lazy_vector_index(&self) -> bool {
-        self.vector_index.is_some()
+        self.default_vector_field()
+            .is_some_and(|f| f.has_lazy_index())
     }
 
-    /// `true` when this segment's vectors exist but are currently
-    /// unreadable (corrupt/truncated `vector.idx` body behind a valid v2
-    /// header) — as opposed to the segment genuinely having no vector
-    /// field, which also reports empty `vector_index`/`vector_store` but
-    /// leaves this `false`. See the field's doc comment for why callers
-    /// must check this before treating an empty kNN result as legitimate.
+    /// `true` when this segment's (first) vector column exists but is
+    /// currently unreadable (corrupt/truncated `vector.idx` body behind a
+    /// valid v2 header) — see [`VectorFieldIndex::degraded`].
     pub fn vector_index_degraded(&self) -> bool {
-        self.vector_index_degraded
+        self.default_vector_field().is_some_and(|f| f.degraded())
     }
 
-    /// Reads and decodes one posting's live entries from `vector.idx` —
-    /// seek + read_exact, same established pattern `doc_record_full` uses
-    /// for `doc_store.bin`'s lazy path (bypassing `StorageBackend`, which
-    /// only supports whole-file read/write; every current `SegmentReader`
-    /// read path already does this for the same reason).
+    /// `field`'s posting structure — each posting's centroid and member
+    /// doc_seqs — for compaction to seed its output's index from (#253).
+    /// Reads `vector.idx` once, sequentially, keeping only ids (not
+    /// vectors). `Ok(None)` when the column is not served by a clustered
+    /// index: absent, the legacy flat format, a missing or invalid
+    /// `vector.offsets`, or a degraded body.
+    pub fn vector_posting_layout(
+        &self,
+        field: &str,
+    ) -> Result<Option<VectorPostingLayout>, KoshaError> {
+        let Some(index) = self.vector_field(field)? else {
+            return Ok(None);
+        };
+        let Some(vi) = index.lazy.as_ref() else {
+            return Ok(None);
+        };
+        let entry_size = vector_entry_size(vi.dim as u32, vi.version);
+        let mut file = std::io::BufReader::new(fs::File::open(&vi.vector_idx_path)?);
+        let mut buf = Vec::new();
+        let mut postings = Vec::with_capacity(vi.ranges.len());
+        for (centroid, &(offset, length)) in vi.centroids.iter().zip(&vi.ranges) {
+            if !(length as usize).is_multiple_of(entry_size) {
+                return Err(KoshaError::CorruptSegment(format!(
+                    "{}: posting at {offset} is {length} bytes, not a multiple of {entry_size}",
+                    vi.vector_idx_path.display()
+                )));
+            }
+            file.seek(SeekFrom::Start(offset))?;
+            buf.resize(length as usize, 0);
+            file.read_exact(&mut buf)?;
+            let doc_seqs = buf
+                .chunks_exact(entry_size)
+                .map(|entry| u32::from_le_bytes(entry[..4].try_into().unwrap()))
+                .collect();
+            postings.push(VectorPostingMembers {
+                centroid: centroid.clone(),
+                doc_seqs,
+            });
+        }
+        Ok(Some(VectorPostingLayout {
+            dim: vi.dim,
+            version: vi.version,
+            postings,
+        }))
+    }
+
+    /// The flat (legacy / missing-sidecar) vectors of this segment's first
+    /// vector column — empty when it is served lazily or has none.
+    pub fn vector_store(&self) -> VectorStore {
+        self.default_vector_field()
+            .map(|f| f.flat.clone())
+            .unwrap_or_default()
+    }
+
+    /// Reads and decodes one posting's live entries from the column's idx
+    /// file — the whole local file when present, else the span cache a
+    /// ranged cold query filled (#245).
     fn hydrate_posting(
         &self,
         vi: &LazyVectorIndex,
         range_idx: usize,
     ) -> Result<SharedVectorPosting, KoshaError> {
-        if let Some(hit) = vi.cache.get(range_idx) {
+        let key = vector_cache_key(vi.slot, range_idx);
+        if let Some(hit) = self.vector_cache.get(key) {
             return Ok(hit);
         }
         let (offset, length) = vi.ranges[range_idx];
-        // The whole local `vector.idx` when present, else the span cache a
-        // ranged cold query filled (#245). Neither: an IO error, which the
-        // query layer reports as a degraded segment, never as no matches.
+        // Neither local file nor span: an IO error, which the query layer
+        // reports as a degraded segment, never as no matches.
         let buf = span_cache::read_local_range(
             &self.segment_dir,
-            VECTOR_IDX_FILE,
+            &vi.idx_file,
             offset + length as u64,
             offset,
             length as u64,
@@ -5039,62 +6371,75 @@ impl SegmentReader {
                 ),
             ))
         })?;
-        let decoded = Arc::new(decode_posting_entries(&buf, vi.dim as u32));
+        let decoded = Arc::new(decode_posting_entries(&buf, vi.dim as u32, vi.version));
         // Second-touch admission, same as text postings: one-shot probes
         // (a cold namespace scanned once) pass through without evicting a
         // hot working set; recurring probes get cached on their second
         // hydration.
-        if vi.cache.admit_on_miss(range_idx) {
-            let bytes = decoded.len()
-                * (std::mem::size_of::<(u32, Vec<f32>)>() + vi.dim * std::mem::size_of::<f32>());
-            vi.cache.insert(range_idx, Arc::clone(&decoded), bytes);
+        if self.vector_cache.admit_on_miss(key) {
+            let bytes = decoded.resident_bytes();
+            self.vector_cache.insert(key, Arc::clone(&decoded), bytes);
         }
         Ok(decoded)
     }
 
-    /// kNN search over the lazy v2 posting index: probe `nprobe` nearest
-    /// centroids (all resident, no I/O), hydrate just those candidate
-    /// postings from disk, score by cosine similarity, return the top `k`.
-    /// `None` if this segment has no lazy vector index — the caller (see
-    /// `kosha-query`'s KNN block) falls back to `hnsw_map`/`flat_knn`.
+    /// kNN search over the lazy v2 posting index of the segment's first
+    /// vector column: probe `nprobe` nearest centroids (all resident, no
+    /// I/O), hydrate just those candidate postings from disk, score by
+    /// cosine similarity, return the top `k`. `None` if that column has no
+    /// lazy vector index — the caller (see `kosha-query`'s KNN block) falls
+    /// back to an exact flat scan.
     pub fn knn_search(
         &self,
         query: &[f32],
         k: usize,
         nprobe: usize,
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
-        self.knn_search_filtered(query, k, nprobe, None)
+        let field = self.default_vector_field()?;
+        let vi = field.lazy.as_ref()?;
+        Some(self.knn_search_lazy(vi, query, k, nprobe, None, None))
     }
 
-    /// [`Self::knn_search`] restricted to the documents `accept` lets
-    /// through. See [`Self::knn_search_within_filtered`] for how the
-    /// restriction is applied.
+    /// [`Self::knn_search`] over `field`'s column (#204), restricted to the
+    /// documents `accept` lets through. See
+    /// [`Self::knn_search_within_filtered`] for how the restriction is
+    /// applied. `None` when the column has no lazy index here.
     pub fn knn_search_filtered(
         &self,
+        field: &str,
         query: &[f32],
         k: usize,
         nprobe: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
-        self.knn_search_filtered_fetching(query, k, nprobe, accept, None)
+        self.knn_search_filtered_fetching(field, query, k, nprobe, accept, None)
     }
 
     /// [`Self::knn_search_filtered`] that first hands the postings it will
     /// probe and does not hold locally to `fetch` (#245, ranged reads).
     pub fn knn_search_filtered_fetching(
         &self,
+        field: &str,
         query: &[f32],
         k: usize,
         nprobe: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Option<Result<Vec<(u32, f64)>, KoshaError>> {
-        let vi = self.vector_index.as_ref()?;
+        let index = match self.vector_field(field) {
+            Ok(index) => index?,
+            Err(e) => return Some(Err(e)),
+        };
+        let vi = index.lazy.as_ref()?;
+        if let Err(e) = Self::check_query_dim(vi, field, query) {
+            return Some(Err(e));
+        }
         Some(self.knn_search_lazy(vi, query, k, nprobe, accept, fetch))
     }
 
-    /// Hand `fetch` the `vector.idx` ranges of the postings in `range_idxs`
-    /// that are neither decoded in memory nor readable locally, in one call.
+    /// Hand `fetch` the ranges of the column's idx file for the postings in
+    /// `range_idxs` that are neither decoded in memory nor readable
+    /// locally, in one call.
     fn prefetch_vector_postings(
         &self,
         vi: &LazyVectorIndex,
@@ -5115,19 +6460,39 @@ impl SegmentReader {
                 continue;
             };
             let end = offset + length as u64;
-            if length == 0 || whole_len >= end || vi.cache.get(i).is_some() {
+            if length == 0
+                || whole_len >= end
+                || self
+                    .vector_cache
+                    .get(vector_cache_key(vi.slot, i))
+                    .is_some()
+            {
                 continue;
             }
             let spans = spans.get_or_insert_with(|| {
-                span_cache::SpanIndex::load(&self.segment_dir, VECTOR_IDX_FILE)
+                span_cache::SpanIndex::load(&self.segment_dir, &vi.idx_file)
             });
             if !spans.covers(offset, end) {
                 missing.push((offset, end));
             }
         }
         if !missing.is_empty() {
-            fetch(&self.segment_dir, &missing);
+            fetch(&self.segment_dir, &vi.idx_file, &missing);
         }
+    }
+
+    /// A query vector must have its column's dimension: scoring vectors of
+    /// different lengths is meaningless (and asserts in the distance
+    /// kernels).
+    fn check_query_dim(vi: &LazyVectorIndex, field: &str, query: &[f32]) -> Result<(), KoshaError> {
+        if vi.dim == query.len() {
+            return Ok(());
+        }
+        Err(KoshaError::InvalidQuery(format!(
+            "knn.vector has {} dimensions but vector field '{field}' is indexed with {}",
+            query.len(),
+            vi.dim
+        )))
     }
 
     /// Triangle-inequality lower bound on `query`'s distance to *any*
@@ -5145,11 +6510,10 @@ impl SegmentReader {
         (kosha_vector_spfresh::cosine_distance(query, centroid) - radius).max(0.0)
     }
 
-    /// Lower-bound distance from `query` to every one of this segment's
-    /// postings (see [`Self::centroid_lower_bound`]) — **pure CPU, zero
-    /// I/O**: centroids and radii are already resident in
-    /// [`LazyVectorIndex`], loaded from the `vector.offsets` sidecar at
-    /// open.
+    /// Lower-bound distance from `query` to every posting of `field`'s
+    /// column (#204; see [`Self::centroid_lower_bound`]) — **pure CPU,
+    /// zero posting I/O**: centroids and radii are resident in
+    /// [`LazyVectorIndex`], loaded from the column's offsets sidecar.
     ///
     /// This is the cheap half of a global probe budget. `num_candidates` is
     /// a *whole-query* budget, but a segment can only ever rank its own
@@ -5161,13 +6525,19 @@ impl SegmentReader {
     /// Ranking by the lower bound rather than raw centroid distance is what
     /// lets a "diffuse" posting (mediocre centroid pull, but a genuinely
     /// close member buried inside it) still qualify — see
-    /// `RADIUS_AWARE_VECTOR_INDEX_VERSION`.
+    /// `RADIUS_AWARE_VECTOR_INDEX_VERSION`. Only `field`'s centroids count:
+    /// another column's postings are never probed for this query, so they
+    /// must not take a share of its budget.
     ///
-    /// `None` when this segment has no lazy v2 vector index (legacy flat
-    /// segments), which the caller treats as "cannot participate in global
-    /// budgeting" and falls back to its own path.
-    pub fn knn_centroid_distances(&self, query: &[f32]) -> Option<Vec<f32>> {
-        let vi = self.vector_index.as_ref()?;
+    /// `None` when this segment has no lazy v2 index for `field` (no
+    /// vectors for it, or legacy flat vectors), which the caller treats as
+    /// "cannot participate in global budgeting".
+    pub fn knn_centroid_distances(&self, field: &str, query: &[f32]) -> Option<Vec<f32>> {
+        let index = self.vector_field(field).ok()??;
+        let vi = index.lazy.as_ref()?;
+        if vi.dim != query.len() {
+            return None;
+        }
         Some(
             vi.centroids
                 .iter()
@@ -5177,10 +6547,11 @@ impl SegmentReader {
         )
     }
 
-    /// Score only the postings whose centroid distance is `<= max_distance`,
-    /// capped at `max_probes` regardless (a tie at the cutoff, or a
-    /// degenerate all-zero-distance segment, must not reopen the fan-out
-    /// this exists to bound). Returns the segment's top `k`.
+    /// Score only the postings of the segment's first vector column whose
+    /// centroid distance is `<= max_distance`, capped at `max_probes`
+    /// regardless (a tie at the cutoff, or a degenerate all-zero-distance
+    /// segment, must not reopen the fan-out this exists to bound). Returns
+    /// the segment's top `k`.
     ///
     /// The companion to [`Self::knn_centroid_distances`]: the query layer
     /// derives `max_distance` from the global budget, so the union of work
@@ -5196,11 +6567,14 @@ impl SegmentReader {
         max_distance: f32,
         max_probes: usize,
     ) -> BudgetedKnnResult {
-        self.knn_search_within_filtered(query, k, max_distance, max_probes, None)
+        let field = self.default_vector_field()?;
+        let vi = field.lazy.as_ref()?;
+        Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, None, None))
     }
 
-    /// [`Self::knn_search_within`] restricted to the documents `accept`
-    /// lets through (a filter, deleted documents, or both).
+    /// [`Self::knn_search_within`] over `field`'s column (#204), restricted
+    /// to the documents `accept` lets through (a filter, deleted documents,
+    /// or both).
     ///
     /// The restriction is applied while postings are scored, not to the
     /// finished top `k`: a vector whose document is not accepted is never a
@@ -5216,13 +6590,22 @@ impl SegmentReader {
     /// alternative is an empty or short page for a filter that does match.
     pub fn knn_search_within_filtered(
         &self,
+        field: &str,
         query: &[f32],
         k: usize,
         max_distance: f32,
         max_probes: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
     ) -> BudgetedKnnResult {
-        self.knn_search_within_filtered_fetching(query, k, max_distance, max_probes, accept, None)
+        self.knn_search_within_filtered_fetching(
+            field,
+            query,
+            k,
+            max_distance,
+            max_probes,
+            accept,
+            None,
+        )
     }
 
     /// [`Self::knn_search_within_filtered`] that first hands the postings
@@ -5230,8 +6613,10 @@ impl SegmentReader {
     /// and fetches further postings in chunks of
     /// [`VECTOR_PREFETCH_CHUNK`] if a restriction makes the probe run past
     /// its budget (#245, ranged reads).
+    #[allow(clippy::too_many_arguments)]
     pub fn knn_search_within_filtered_fetching(
         &self,
+        field: &str,
         query: &[f32],
         k: usize,
         max_distance: f32,
@@ -5239,8 +6624,137 @@ impl SegmentReader {
         accept: Option<&dyn Fn(u32) -> bool>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> BudgetedKnnResult {
-        let vi = self.vector_index.as_ref()?;
+        let index = match self.vector_field(field) {
+            Ok(index) => index?,
+            Err(e) => return Some(Err(e)),
+        };
+        let vi = index.lazy.as_ref()?;
+        if let Err(e) = Self::check_query_dim(vi, field, query) {
+            return Some(Err(e));
+        }
         Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch))
+    }
+
+    /// Exact kNN over `field`'s column (#204), restricted to `candidates`:
+    /// the ascending `doc_seq`s a filter lets through, with deleted
+    /// documents already removed (#252).
+    ///
+    /// Every candidate's vector is scored, so the result is the true top
+    /// `k` of the filtered set — no centroid is consulted. Worth it when
+    /// the filter passes few documents: probing would otherwise hydrate
+    /// postings full of documents the filter throws away, and keep going
+    /// outward until it has found `k` that pass.
+    ///
+    /// Vectors are read from `doc_vectors.bin` (#243) when the segment has
+    /// it locally and it holds `field`; otherwise every posting of the
+    /// column is hydrated and filtered (the only way to see every vector
+    /// of a segment that stores them inline). Scores are the posting
+    /// probe's: cosine similarity, which on the sidecar's raw vectors is
+    /// the same number the index's unit-normalized copies give.
+    ///
+    /// `None` when the column has no lazy index here (a legacy flat index
+    /// is already scanned exactly by the caller).
+    pub fn knn_exact_filtered(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        candidates: &[u32],
+    ) -> Option<Result<ExactKnnResult, KoshaError>> {
+        self.knn_exact_filtered_fetching(field, query, k, candidates, None)
+    }
+
+    /// [`Self::knn_exact_filtered`] that, when it has to score from the
+    /// vector postings, first hands every posting it does not hold
+    /// locally to `fetch` in one call (#245, ranged reads).
+    pub fn knn_exact_filtered_fetching(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        candidates: &[u32],
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Option<Result<ExactKnnResult, KoshaError>> {
+        let index = match self.vector_field(field) {
+            Ok(index) => index?,
+            Err(e) => return Some(Err(e)),
+        };
+        let vi = index.lazy.as_ref()?;
+        if let Err(e) = Self::check_query_dim(vi, field, query) {
+            return Some(Err(e));
+        }
+        if candidates.is_empty() || k == 0 {
+            return Some(Ok(ExactKnnResult {
+                hits: Vec::new(),
+                vectors_scored: 0,
+                postings_hydrated: 0,
+                source: ExactKnnSource::Sidecar,
+            }));
+        }
+        if self.footer.doc_vectors && self.segment_dir.join(DOC_VECTORS_FILE).exists() {
+            match self.doc_vectors() {
+                Ok(dv) if dv.has_field(field) => {
+                    let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
+                    let visited = dv.visit_field_vectors(field, candidates, |doc_seq, v| {
+                        // A stray vector of another dimension was never
+                        // indexed (see `SegmentWriter::unindexed_vectors`),
+                        // so it is not a candidate on the probe path either.
+                        if v.len() == query.len() {
+                            scored.push((
+                                doc_seq,
+                                kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                            ));
+                        }
+                    });
+                    match visited {
+                        Ok(_) => {
+                            let vectors_scored = scored.len();
+                            return Some(Ok(ExactKnnResult {
+                                hits: top_k_by_score(scored, k),
+                                vectors_scored,
+                                postings_hydrated: 0,
+                                source: ExactKnnSource::Sidecar,
+                            }));
+                        }
+                        Err(e) => eprintln!(
+                            "WARN: exact kNN could not read {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
+                            self.segment_dir.display()
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "WARN: exact kNN could not open {DOC_VECTORS_FILE} of {}: {e} — scoring from vector postings instead",
+                    self.segment_dir.display()
+                ),
+            }
+        }
+        // No usable sidecar: every posting, filtered while it is scored.
+        self.prefetch_vector_postings(vi, 0..vi.ranges.len(), fetch);
+        // An i8 column scores approximately here (it has no exact vectors
+        // without the sidecar).
+        let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
+        let unit_query = Self::unit_query(vi, query);
+        let is_candidate = |id: u32| candidates.binary_search(&id).is_ok();
+        for range_idx in 0..vi.ranges.len() {
+            let posting = match self.hydrate_posting(vi, range_idx) {
+                Ok(posting) => posting,
+                Err(e) => return Some(Err(e)),
+            };
+            posting.for_each_similarity(
+                Some(&is_candidate),
+                |v| kosha_vector_spfresh::cosine_similarity(query, v),
+                &unit_query,
+                |id, sim| scored.push((id, sim as f64)),
+            );
+        }
+        let vectors_scored = scored.len();
+        Some(Ok(ExactKnnResult {
+            hits: top_k_by_score(scored, k),
+            vectors_scored,
+            postings_hydrated: vi.ranges.len(),
+            source: ExactKnnSource::Postings,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5259,7 +6773,7 @@ impl SegmentReader {
         // so the `max_probes` cap keeps the *best* candidates when it
         // bites. `max_distance` is itself a lower-bound cutoff (computed
         // from the same bound across all segments — see
-        // `Searcher::global_probe_cutoff`), so both sides of this
+        // `Searcher::knn_plan`), so both sides of this
         // comparison are in the same units.
         let mut ranked: Vec<(usize, f32)> = vi
             .centroids
@@ -5280,6 +6794,7 @@ impl SegmentReader {
 
         let mut probes = 0usize;
         let mut scored: Vec<(u32, f64)> = Vec::new();
+        let unit_query = Self::unit_query(vi, query);
         for (position, (range_idx, _)) in ranked.iter().enumerate() {
             if position >= budgeted {
                 // Past the budget. Without a restriction this is where the
@@ -5295,19 +6810,14 @@ impl SegmentReader {
                 }
             }
             probes += 1;
-            for (id, v) in self.hydrate_posting(vi, *range_idx)?.iter() {
-                if accept.is_some_and(|accept| !accept(*id)) {
-                    continue;
-                }
-                scored.push((
-                    *id,
-                    kosha_vector_spfresh::cosine_similarity(query, v) as f64,
-                ));
-            }
+            self.hydrate_posting(vi, *range_idx)?.for_each_similarity(
+                accept,
+                |v| kosha_vector_spfresh::cosine_similarity(query, v),
+                &unit_query,
+                |id, sim| scored.push((id, sim as f64)),
+            );
         }
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-        Ok((scored, probes))
+        Ok((self.finish_probe(vi, query, scored, k), probes))
     }
 
     // Deliberately NOT radius-aware: this is the per-segment `nprobe`
@@ -5363,21 +6873,120 @@ impl SegmentReader {
                     &candidates[position..(position + VECTOR_PREFETCH_CHUNK).min(candidates.len())];
                 self.prefetch_vector_postings(vi, chunk.iter().copied(), fetch);
             }
-            for (id, v) in self.hydrate_posting(vi, range_idx)?.iter() {
-                if accept.is_some_and(|accept| !accept(*id)) {
-                    continue;
-                }
-                let sim = if vi.unit_norm {
-                    kosha_vector_spfresh::dot(query, v).clamp(-1.0, 1.0)
-                } else {
-                    kosha_vector_spfresh::cosine_similarity(query, v)
-                };
-                scored.push((*id, sim as f64));
+            // `query` is already unit-normalized for every unit-norm
+            // column, which includes every i8 one.
+            self.hydrate_posting(vi, range_idx)?.for_each_similarity(
+                accept,
+                |v| {
+                    if vi.unit_norm {
+                        kosha_vector_spfresh::dot(query, v).clamp(-1.0, 1.0)
+                    } else {
+                        kosha_vector_spfresh::cosine_similarity(query, v)
+                    }
+                },
+                query,
+                |id, sim| scored.push((id, sim as f64)),
+            );
+        }
+        Ok(self.finish_probe(vi, query, scored, k))
+    }
+
+    /// `query` unit-normalized when `vi` is i8 (whose entries score
+    /// against a unit query); otherwise unused, so not computed.
+    fn unit_query<'q>(vi: &LazyVectorIndex, query: &'q [f32]) -> std::borrow::Cow<'q, [f32]> {
+        if vi.quantized {
+            let mut q = query.to_vec();
+            kosha_vector_spfresh::normalize_in_place(&mut q);
+            std::borrow::Cow::Owned(q)
+        } else {
+            std::borrow::Cow::Borrowed(query)
+        }
+    }
+
+    /// The probe's top `k` of `scored`, best first.
+    ///
+    /// An f32 column's scores are exact: sort and cut, as always. An i8
+    /// column's are approximate, so its best `k * rescore_factor` are
+    /// rescored with their full-precision vectors from `doc_vectors.bin`
+    /// (#210) before the cut — the quantization error then only decides
+    /// which candidates make that shortlist, not their final order.
+    /// Rescoring needs the sidecar locally and holding this field; without
+    /// it (inline-vector segments, a factor of `0`, a sidecar not yet
+    /// hydrated) the i8 scores stand.
+    fn finish_probe(
+        &self,
+        vi: &LazyVectorIndex,
+        query: &[f32],
+        mut scored: Vec<(u32, f64)>,
+        k: usize,
+    ) -> Vec<(u32, f64)> {
+        let by_score_desc = |a: &(u32, f64), b: &(u32, f64)| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        if !vi.quantized || self.vector_rescore_factor == 0 {
+            scored.sort_by(by_score_desc);
+            scored.truncate(k);
+            return scored;
+        }
+        let mut shortlist = top_k_by_score(scored, k.saturating_mul(self.vector_rescore_factor));
+        if let Some(field) = vi.field.as_deref() {
+            self.rescore_exact(field, query, &mut shortlist);
+        }
+        shortlist.sort_by(by_score_desc);
+        shortlist.truncate(k);
+        shortlist
+    }
+
+    /// Replaces each candidate's score with the cosine similarity of
+    /// `query` and its full-precision vector in `doc_vectors.bin`, where
+    /// the sidecar has one. Returns how many were rescored; `0` (scores
+    /// untouched) when the sidecar is absent, lacks `field`, or fails to
+    /// read.
+    fn rescore_exact(&self, field: &str, query: &[f32], candidates: &mut [(u32, f64)]) -> usize {
+        if candidates.is_empty()
+            || !self.footer.doc_vectors
+            || !self.segment_dir.join(DOC_VECTORS_FILE).exists()
+        {
+            return 0;
+        }
+        let dv = match self.doc_vectors() {
+            Ok(dv) if dv.has_field(field) => dv,
+            Ok(_) => return 0,
+            Err(e) => {
+                eprintln!(
+                    "WARN: cannot rescore i8 kNN candidates of {}: {e} — keeping quantized scores",
+                    self.segment_dir.display()
+                );
+                return 0;
+            }
+        };
+        let mut doc_seqs: Vec<u32> = candidates.iter().map(|(id, _)| *id).collect();
+        doc_seqs.sort_unstable();
+        doc_seqs.dedup();
+        let mut exact: HashMap<u32, f64> = HashMap::with_capacity(doc_seqs.len());
+        let visited = dv.visit_field_vectors(field, &doc_seqs, |doc_seq, v| {
+            if v.len() == query.len() {
+                exact.insert(
+                    doc_seq,
+                    kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                );
+            }
+        });
+        if let Err(e) = visited {
+            eprintln!(
+                "WARN: cannot rescore i8 kNN candidates of {}: {e} — keeping quantized scores",
+                self.segment_dir.display()
+            );
+            return 0;
+        }
+        let mut rescored = 0;
+        for (id, score) in candidates.iter_mut() {
+            if let Some(&s) = exact.get(id) {
+                *score = s;
+                rescored += 1;
             }
         }
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-        Ok(scored)
+        rescored
     }
 
     /// The segment's filter columns, parsed on first use (see
@@ -6113,12 +7722,11 @@ impl SegmentReader {
         index
     }
 
-    fn read_vectors(segment_dir: &Path) -> Result<VectorStore, KoshaError> {
-        let path = segment_dir.join("vector.idx");
+    fn read_vectors(path: &Path) -> Result<VectorStore, KoshaError> {
         if !path.exists() {
             return Ok(VectorStore::default());
         }
-        let data = fs::read(&path)?;
+        let data = fs::read(path)?;
         let mut cursor = &data[..];
         if cursor.len() < 8 {
             return Ok(VectorStore::default());
@@ -7702,8 +9310,7 @@ mod tests {
 
         // Lexical path: no vectors read, no lazy index built either.
         let lexical = SegmentReader::open_with_options(dir.clone(), false).unwrap();
-        assert!(lexical.vector_store.vectors.is_empty());
-        assert!(lexical.hnsw_map.is_none());
+        assert!(lexical.vector_store().vectors.is_empty());
         assert!(!lexical.has_lazy_vector_index());
         // Lexical data is unaffected — still fully readable.
         assert!(lexical.postings("quick").is_some());
@@ -7744,8 +9351,9 @@ mod tests {
         w.write_doc_store().unwrap();
         w.write_inverted_index().unwrap();
         w.write_filters().unwrap();
-        w.write_vectors_v2().unwrap();
-        w.write_footer(Bm25Params::default()).unwrap();
+        let vector_fields = w.write_vectors_v2().unwrap();
+        w.write_footer(Bm25Params::default(), vector_fields, Vec::new())
+            .unwrap();
         seg_id
     }
 
@@ -7803,10 +9411,9 @@ mod tests {
             "v2 segment should open on the lazy path"
         );
         assert!(
-            r.vector_store.vectors.is_empty(),
+            r.vector_store().vectors.is_empty(),
             "legacy fields stay empty on the lazy path"
         );
-        assert!(r.hnsw_map.is_none());
 
         let results = r
             .knn_search(&[1.0, 0.0, 0.0, 0.0], 2, 16)
@@ -7899,7 +9506,7 @@ mod tests {
             !r.has_lazy_vector_index(),
             "a file shorter than the header must never take the lazy path"
         );
-        assert!(r.vector_store.vectors.is_empty());
+        assert!(r.vector_store().vectors.is_empty());
         assert!(!r.vector_index_degraded());
 
         let _ = fs::remove_dir_all(&dir);
@@ -7933,11 +9540,11 @@ mod tests {
             "legacy v1 has no lazy index — served by exact flat_knn"
         );
         assert_eq!(
-            r.vector_store.vectors.len(),
+            r.vector_store().vectors.len(),
             1,
             "must recover the one legacy vector"
         );
-        assert_eq!(r.vector_store.dimensions, 2);
+        assert_eq!(r.vector_store().dimensions, 2);
         assert!(!r.vector_index_degraded());
         assert!(!vector_index_needs_offsets(&dir), "legacy flat format");
 
@@ -7962,7 +9569,7 @@ mod tests {
 
         let r = SegmentReader::open_with_options(dir.clone(), true).unwrap();
         assert!(!r.has_lazy_vector_index());
-        assert!(r.vector_store.vectors.is_empty());
+        assert!(r.vector_store().vectors.is_empty());
         assert!(
             r.vector_index_degraded(),
             "a valid header with an unparseable body must be marked degraded, \
@@ -7988,14 +9595,9 @@ mod tests {
             "missing sidecar must fall back to the eager path, not silently drop vectors"
         );
         assert_eq!(
-            r.vector_store.vectors.len(),
+            r.vector_store().vectors.len(),
             2,
             "eager fallback must recover every vector"
-        );
-        assert!(
-            r.hnsw_map.is_none(),
-            "no ANN structure is ever built outside the write path — the \
-             eager fallback is served by exact flat_knn (issue #126)"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -8018,8 +9620,7 @@ mod tests {
 
         let r = SegmentReader::open(dir.clone()).unwrap();
         assert!(!r.has_lazy_vector_index());
-        assert!(r.vector_store.vectors.is_empty());
-        assert!(r.hnsw_map.is_none());
+        assert!(r.vector_store().vectors.is_empty());
         assert!(
             r.knn_search(&[0.0], 5, 16).is_none(),
             "no lazy index means knn_search returns None, not an error"
@@ -8068,7 +9669,7 @@ mod tests {
         );
         assert!(!r.has_lazy_vector_index());
         assert!(
-            r.vector_store.vectors.is_empty(),
+            r.vector_store().vectors.is_empty(),
             "a corrupt body has no recoverable vectors — degraded, not \
              silently repopulated from somewhere else"
         );
@@ -9119,6 +10720,50 @@ mod doc_vectors_tests {
             .unwrap()
             .is_none());
         assert!(DocVectors::from_prefix(dir.clone(), b"XXXXXXXXXXXX").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The batch reader behind exact filtered kNN (#252): only the named
+    /// field, only the asked-for documents, in order — across both
+    /// coalesced runs and gaps wide enough to seek over.
+    #[test]
+    fn visit_field_vectors_reads_one_field_of_the_wanted_documents() {
+        let dir = scratch("visit");
+        // 3000 docs x 2 fields x 8 dims x 4 B = 192 KB: a gap of 100
+        // documents is 6.4 KB (read through), one of 2000 is 128 KB (seek).
+        let docs: Vec<(String, Vec<Field>)> = (0..3000)
+            .map(|i| {
+                let a: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32).collect();
+                let b: Vec<f32> = a.iter().map(|x| -x).collect();
+                (
+                    format!("d{i}"),
+                    vec![vector_field("a", &a), vector_field("b", &b)],
+                )
+            })
+            .collect();
+        write(
+            &dir,
+            VectorStoreMode::Sidecar,
+            docs.iter()
+                .map(|(id, f)| (id.as_str(), f.clone()))
+                .collect(),
+        );
+        let dv = DocVectors::open(dir.join(DOC_VECTORS_FILE)).unwrap();
+        assert!(dv.has_field("b"));
+        assert!(!dv.has_field("c"));
+        let wanted = [0u32, 1, 100, 200, 2200, 2999, 5000];
+        let mut seen = Vec::new();
+        let n = dv
+            .visit_field_vectors("b", &wanted, |doc_seq, v| seen.push((doc_seq, v.to_vec())))
+            .unwrap();
+        assert_eq!(n, 6, "doc_seq 5000 has no vector");
+        let expected: Vec<(u32, Vec<f32>)> = wanted[..6]
+            .iter()
+            .map(|&i| (i, (0..8).map(|d| -((i * 8 + d) as f32)).collect()))
+            .collect();
+        assert_eq!(seen, expected);
+        assert_eq!(dv.visit_field_vectors("c", &wanted, |_, _| {}).unwrap(), 0);
+        assert_eq!(dv.visit_field_vectors("a", &[], |_, _| {}).unwrap(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 

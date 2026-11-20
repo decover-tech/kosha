@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod branch;
 pub mod deletes;
 pub mod fields;
 pub mod fuzzy;
@@ -16,6 +17,7 @@ pub mod histogram;
 pub use histogram::{AggDateHistogram, AggHistogram, DurationValue};
 pub mod docset;
 pub mod nested;
+pub mod sharding;
 pub use analysis::{
     AnalysisConfig, AnalyzerSpec, FieldSchema, NamespaceSchema, SegmentAnalysis, TokenFilterSpec,
     TokenizerKind,
@@ -126,6 +128,21 @@ pub trait ControlStore: Send + Sync {
         let _ = retire_at_least;
         Err(KoshaError::NotFound(format!(
             "this control store cannot delete namespace {}",
+            id.0
+        )))
+    }
+
+    /// Remove a namespace and its manifest from the registry, returning the
+    /// manifest it held (`Ok(None)` if there was no such namespace). Used by
+    /// branch deletion (#208); the caller reclaims the namespace's own
+    /// objects afterwards, keeping every one another manifest references
+    /// (see [`branch::References`]).
+    ///
+    /// The default refuses, so a store that cannot delete never silently
+    /// keeps a namespace the caller then reclaims the objects of.
+    fn remove_namespace(&mut self, id: &NamespaceId) -> Result<Option<Manifest>, KoshaError> {
+        Err(KoshaError::ControlPlane(format!(
+            "this control store cannot remove namespace {}",
             id.0
         )))
     }
@@ -1927,6 +1944,25 @@ pub struct Footer {
     /// bloom — means fuzzy queries cannot prune the segment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuzzy_bloom: Option<BloomFilter>,
+    /// The vector columns this segment indexes, one ANN index each (#204).
+    ///
+    /// `None` — every segment written before vector columns existed — is a
+    /// *legacy* segment: its one `vector.idx` (if any) holds vectors of an
+    /// unknown field and answers a kNN on any field name (see
+    /// `kosha_segment::SegmentReader::vector_field`). `Some(list)` is
+    /// authoritative: a field not listed has no vectors in this segment,
+    /// and `Some([])` means the segment has no vector index at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_fields: Option<Vec<VectorFieldMeta>>,
+    /// Late-interaction (multi-vector) fields in this segment (#205): one
+    /// entry per `Vector` field whose values were bags of token vectors
+    /// (`[[f32; dim]; n]`). Entry `i`'s files are
+    /// `multivec.{i}.bags` and `multivec.{i}.ivf`. Empty — every segment
+    /// written before #205, and every segment without a bag — means no
+    /// late-interaction data; nothing is serialized then, so such footers
+    /// stay byte-identical to before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub multi_vectors: Vec<MultiVectorField>,
 }
 
 /// Value type of one filter column (#244). A field name can appear with
@@ -2051,6 +2087,128 @@ impl Footer {
             }
         }
     }
+}
+
+/// One vector column's ANN index inside a segment — an entry of
+/// [`Footer::vector_fields`] (#204).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorFieldMeta {
+    /// The document field name the vectors came from.
+    pub name: String,
+    /// Dimension of every vector indexed for this field in this segment.
+    pub dim: u32,
+    /// Number of vectors indexed.
+    pub count: u32,
+    /// Which pair of files holds the index: slot `0` is `vector.idx` +
+    /// `vector.offsets` (the single-column layout, byte-identical to what
+    /// segments have always had), slot `n` is `vector.<n>.idx` +
+    /// `vector.<n>.offsets`. Field names never appear in file names.
+    pub slot: u32,
+    /// Whether the writer emitted the `offsets` sidecar (false only for the
+    /// `KOSHA_VECTOR_WRITE_VERSION=1` flat format).
+    #[serde(default)]
+    pub offsets: bool,
+    /// How the column's posting entries are stored (#210). Omitted from
+    /// the JSON for `f32`, so a segment written without quantization has
+    /// exactly the footer it always had, and every footer written before
+    /// #210 reads as `f32`.
+    #[serde(default, skip_serializing_if = "VectorQuantization::is_f32")]
+    pub quantization: VectorQuantization,
+}
+
+/// Storage of a vector column's ANN posting entries (#210). Centroids and
+/// `doc_vectors.bin` stay `f32` either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorQuantization {
+    /// Full-precision `f32` entries.
+    #[default]
+    F32,
+    /// Scalar-quantized entries: one `f32` scale per vector and `dim`
+    /// signed bytes, ~4x smaller than `f32`.
+    I8,
+}
+
+impl VectorQuantization {
+    pub fn is_f32(&self) -> bool {
+        *self == VectorQuantization::F32
+    }
+
+    /// Parses `f32` / `i8` (case-insensitive); `None` for anything else.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "f32" => Some(Self::F32),
+            "i8" | "int8" => Some(Self::I8),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::I8 => "i8",
+        }
+    }
+}
+
+impl VectorFieldMeta {
+    /// File holding this field's vectors.
+    pub fn idx_file(&self) -> String {
+        vector_idx_file(self.slot)
+    }
+    /// File holding this field's posting centroids/ranges sidecar.
+    pub fn offsets_file(&self) -> String {
+        vector_offsets_file(self.slot)
+    }
+}
+
+/// `vector.idx` for slot 0, `vector.<slot>.idx` otherwise (#204).
+pub fn vector_idx_file(slot: u32) -> String {
+    if slot == 0 {
+        "vector.idx".to_string()
+    } else {
+        format!("vector.{slot}.idx")
+    }
+}
+
+/// `vector.offsets` for slot 0, `vector.<slot>.offsets` otherwise (#204).
+pub fn vector_offsets_file(slot: u32) -> String {
+    if slot == 0 {
+        "vector.offsets".to_string()
+    } else {
+        format!("vector.{slot}.offsets")
+    }
+}
+
+/// Whether `name` is one of a segment's vector-index files (any slot) —
+/// `vector.idx`, `vector.offsets`, `vector.<n>.idx` or `vector.<n>.offsets`.
+pub fn is_vector_index_file(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("vector.") else {
+        return false;
+    };
+    let tail = match rest.split_once('.') {
+        Some((slot, tail)) => {
+            if slot.is_empty() || !slot.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            tail
+        }
+        None => rest,
+    };
+    tail == "idx" || tail == "offsets"
+}
+
+/// One late-interaction field of a segment; see [`Footer::multi_vectors`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiVectorField {
+    /// The document field name the bags were read from.
+    pub name: String,
+    /// Dimensionality of every token vector in the field.
+    pub dim: u32,
+    /// Documents with a bag in this field.
+    pub docs: u32,
+    /// Token vectors across all of those bags.
+    pub tokens: u64,
 }
 
 /// Current segment format version written by `SegmentWriter`. See
@@ -2525,9 +2683,77 @@ pub struct Manifest {
     /// written before it existed still parse and older binaries ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired: Vec<gc::RetiredObject>,
+    /// Fixed shard count (#207), set once when the namespace is created
+    /// sharded. `Some(n)` with `n > 1` marks a *root* manifest: it lists no
+    /// segments itself; documents live in the shard namespaces
+    /// [`sharding::shard_namespace`] names. `None` (every manifest written
+    /// before sharding existed) is an ordinary, unsharded namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shards: Option<u32>,
+    /// Set on a namespace created by `POST /v1/namespaces/{ns}/branch`
+    /// (#208): where it was branched from, and which of its segments live
+    /// in another namespace's storage prefix. `None` for every other
+    /// namespace (and every manifest written before branching existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<branch::BranchInfo>,
 }
 
 impl Manifest {
+    /// Namespace whose storage prefix (`{home}/{segment}/` on local disk
+    /// and in S3) holds `segment`'s files. A branch lists its parent's
+    /// segments without copying them (#208); everything else, and every
+    /// segment a branch writes itself, lives under the listing namespace.
+    pub fn segment_home<'a>(&'a self, ns: &'a NamespaceId, segment: &SegmentId) -> &'a NamespaceId {
+        self.branch
+            .as_ref()
+            .and_then(|branch| branch.segment_homes.get(segment))
+            .unwrap_or(ns)
+    }
+
+    /// Logical (data-dir / S3-key relative) directory of `segment`, as
+    /// listed by the manifest of `ns`: `{home}/{segment}`.
+    pub fn segment_rel_dir(&self, ns: &NamespaceId, segment: &SegmentId) -> String {
+        format!("{}/{}", self.segment_home(ns, segment).0, segment.0)
+    }
+
+    /// Local directory of `segment` under `data_dir`, as listed by the
+    /// manifest of `ns`.
+    pub fn segment_dir(
+        &self,
+        data_dir: &std::path::Path,
+        ns: &NamespaceId,
+        segment: &SegmentId,
+    ) -> std::path::PathBuf {
+        data_dir
+            .join(&self.segment_home(ns, segment).0)
+            .join(&segment.0)
+    }
+
+    /// Whether `segment` lives in another namespace's prefix (inherited
+    /// from a branch parent). Such a segment is already durable: the
+    /// listing namespace never uploads, rewrites or deletes it.
+    pub fn is_inherited_segment(&self, ns: &NamespaceId, segment: &SegmentId) -> bool {
+        self.segment_home(ns, segment) != ns
+    }
+
+    /// Drop branch bookkeeping for segments the manifest no longer lists
+    /// (compacted away). Keeps the row from growing with history.
+    pub fn retain_listed_segment_homes(&mut self) {
+        if let Some(branch) = self.branch.as_mut() {
+            if branch.segment_homes.is_empty() {
+                return;
+            }
+            let listed: std::collections::HashSet<&SegmentId> = self
+                .segments
+                .iter()
+                .map(|entry| &entry.segment_id)
+                .collect();
+            branch
+                .segment_homes
+                .retain(|segment, _| listed.contains(segment));
+        }
+    }
+
     /// The analysis settings new segments of this namespace are written
     /// with. A schema this binary cannot resolve (one set by a newer
     /// version naming an analyzer this one lacks) falls back to the
@@ -2557,6 +2783,8 @@ impl Manifest {
             deletion_vectors: Default::default(),
             schema: None,
             retired: Default::default(),
+            shards: None,
+            branch: None,
         }
     }
 
@@ -2653,13 +2881,96 @@ impl Manifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnnQuery {
     pub field: String,
+    /// The query vector for single-vector kNN. Empty (and omitted) for a
+    /// late-interaction query that sends `vectors` instead.
+    #[serde(default)]
     pub vector: Vec<f32>,
     #[serde(default = "default_knn_k")]
     pub k: usize,
+    /// Single-vector kNN: the whole-query posting probe budget. Late
+    /// interaction: how many candidate documents per segment are re-scored
+    /// with exact MaxSim (at least `k`).
     #[serde(default = "default_knn_num_candidates")]
     pub num_candidates: usize,
     #[serde(default)]
     pub filter: Option<FilterClause>,
+    /// Late interaction (#205): the query's bag of token vectors. Setting
+    /// it selects [`KnnScoring::LateInteraction`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<Vec<Vec<f32>>>,
+    /// How documents are scored against the query. `None` is inferred:
+    /// late interaction when `vectors` is set, single-vector cosine
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring: Option<KnnScoring>,
+}
+
+/// `knn.scoring`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnnScoring {
+    /// One query vector against one document vector, cosine similarity.
+    Cosine,
+    /// ColBERT-style MaxSim (#205): the query and each document are bags
+    /// of token vectors, and the score is the sum over query tokens of the
+    /// best cosine similarity against any of the document's tokens.
+    LateInteraction,
+}
+
+impl KnnQuery {
+    /// Whether this query is scored with late interaction (MaxSim).
+    pub fn is_late_interaction(&self) -> bool {
+        match self.scoring {
+            Some(KnnScoring::LateInteraction) => true,
+            Some(KnnScoring::Cosine) => false,
+            None => self.vectors.is_some(),
+        }
+    }
+
+    /// The query's token vectors for late interaction: `vectors`, or the
+    /// single `vector` as a one-token bag.
+    pub fn query_tokens(&self) -> Vec<&[f32]> {
+        match self.vectors {
+            Some(ref bag) => bag.iter().map(Vec::as_slice).collect(),
+            None if !self.vector.is_empty() => vec![self.vector.as_slice()],
+            None => Vec::new(),
+        }
+    }
+
+    /// Shape checks that need no segment. An `Err` is a client error.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.vectors.is_some() && !self.vector.is_empty() {
+            return Err("knn takes either vector or vectors, not both".into());
+        }
+        if self.scoring == Some(KnnScoring::Cosine) && self.vectors.is_some() {
+            return Err(
+                "knn.vectors is a bag of token vectors and needs scoring \"late_interaction\""
+                    .into(),
+            );
+        }
+        if !self.is_late_interaction() {
+            // `vector` used to be a required field; it may be omitted now
+            // only because `vectors` can stand in for it.
+            if self.vector.is_empty() {
+                return Err("knn needs a vector (or vectors, for late interaction)".into());
+            }
+            return Ok(());
+        }
+        let tokens = self.query_tokens();
+        let Some(first) = tokens.first() else {
+            return Err("late-interaction knn needs at least one query vector".into());
+        };
+        if first.is_empty() {
+            return Err("knn.vectors entries must not be empty".into());
+        }
+        if tokens.iter().any(|t| t.len() != first.len()) {
+            return Err("every knn.vectors entry must have the same dimension".into());
+        }
+        if tokens.iter().any(|t| t.iter().any(|x| !x.is_finite())) {
+            return Err("knn.vectors must hold finite numbers".into());
+        }
+        Ok(())
+    }
 }
 fn default_knn_k() -> usize {
     10
@@ -3024,6 +3335,9 @@ impl SearchQuery {
         }
         for (name, agg) in &self.aggs {
             agg.validate(name).map_err(KoshaError::InvalidQuery)?;
+        }
+        if let Some(ref knn) = self.knn {
+            knn.validate().map_err(KoshaError::InvalidQuery)?;
         }
         let has_lexical = self.has_lexical_query();
         let has_knn = self.knn.is_some();
@@ -3515,6 +3829,24 @@ pub struct SearchResult {
     /// error). Never contains credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank_degraded_reason: Option<String>,
+    /// How a kNN query that carries a filter searched (#252): `"ann"` when
+    /// every segment probed its vector postings, `"exact"` when every
+    /// segment scored each filter-passing document's vector (recall 1.0
+    /// over the filtered set), `"mixed"` when some did each. `None` for a
+    /// query without kNN; `"ann"` for an unfiltered kNN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn_mode: Option<String>,
+    /// For a filtered kNN query, how many documents passed the filter (and
+    /// were not deleted) across the segments searched — the set kNN chose
+    /// from. `None` when the query has no kNN or no filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knn_filtered_candidates: Option<u64>,
+    /// Acknowledged-but-unindexed documents this search scored
+    /// exhaustively (#255): the namespace's unindexed tail under
+    /// `consistency: "strong"`, `0` under `"eventual"` or when everything
+    /// was already indexed.
+    #[serde(default)]
+    pub exhaustive_search_count: u64,
 }
 
 // ─── Indexing types ────────────────────────────────────────────────────────
@@ -4111,6 +4443,8 @@ mod tests {
             analysis: None,
             field_index: None,
             fuzzy_bloom: None,
+            vector_fields: None,
+            multi_vectors: Vec::new(),
         }
     }
 
@@ -4130,8 +4464,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         }
     }
 

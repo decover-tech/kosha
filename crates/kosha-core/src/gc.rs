@@ -195,6 +195,12 @@ pub struct GcConfig {
     pub orphan_grace_ms: u64,
     /// "Now", in Unix epoch milliseconds.
     pub now_ms: u64,
+    /// Objects some *other* namespace's manifest references (#208: a
+    /// branch lists segments, and deletion bitmaps, that live under its
+    /// parent's prefix). Never deleted, whatever this namespace's own
+    /// manifest says. `None` when nothing else can reference this
+    /// namespace's objects.
+    pub referenced_elsewhere: Option<std::sync::Arc<crate::branch::References>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -332,6 +338,19 @@ pub fn plan_namespace(
                 if Some(generation) == current {
                     continue;
                 }
+                if config
+                    .referenced_elsewhere
+                    .as_ref()
+                    .is_some_and(|refs| refs.holds_file(&meta.path))
+                {
+                    skipped.push(GcSkipped {
+                        path: meta.path.clone(),
+                        reason: "deletion generation another namespace's manifest references \
+                                 (a branch)"
+                            .into(),
+                    });
+                    continue;
+                }
                 let record = retired.get(&(segment.clone(), Some(generation.to_string())));
                 let eligible = match record {
                     Some(r) => age(r.retired_at_ms) >= config.grace_ms,
@@ -362,6 +381,16 @@ pub fn plan_namespace(
             continue;
         }
 
+        if config.referenced_elsewhere.as_ref().is_some_and(|refs| {
+            refs.holds_segment_dir(&child_path)
+                || files.iter().any(|(_, meta)| refs.holds_file(&meta.path))
+        }) {
+            skipped.push(GcSkipped {
+                path: child_path.clone(),
+                reason: "segment another namespace's manifest references (a branch)".into(),
+            });
+            continue;
+        }
         let newest = files
             .iter()
             .map(|(_, m)| m.last_modified_ms)
@@ -539,6 +568,8 @@ mod tests {
             deletion_vectors: Default::default(),
             retired: Default::default(),
             schema: Default::default(),
+            shards: None,
+            branch: None,
         }
     }
 
@@ -546,6 +577,7 @@ mod tests {
         DeletionVector {
             generation: generation_byte.to_string().repeat(64),
             count: 1,
+            namespace: Default::default(),
         }
     }
 

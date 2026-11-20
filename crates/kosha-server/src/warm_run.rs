@@ -242,9 +242,11 @@ impl AppState {
         class: FileClass,
         segments: &[String],
     ) -> BatchOutcome {
+        // A branch's inherited segments live under their home namespace's
+        // prefix (#208).
         let seg_paths: Vec<PathBuf> = segments
             .iter()
-            .map(|s| self.data_dir.join(&ns.0).join(s))
+            .map(|s| manifest.segment_dir(&self.data_dir, ns, &kosha_core::SegmentId(s.clone())))
             .collect();
         let request = RequestHydration::unlimited();
         match class {
@@ -281,6 +283,8 @@ impl AppState {
                     deletion_vectors: HashMap::new(),
                     schema: None,
                     retired: Default::default(),
+                    shards: None,
+                    branch: None,
                 };
                 let o =
                     self.hydrate_segments_for_search(ns, &subset, &warmup_probe_query(), &request);
@@ -348,22 +352,41 @@ impl AppState {
             }
             FileClass::Vectors => {
                 let (mut files, mut bytes) = (0usize, 0u64);
+                // Every vector column's files (#204): `vector.idx` +
+                // `vector.offsets`, then `vector.<n>.idx` + `vector.<n>.offsets`
+                // as each segment's (already warmed) footer lists them.
+                let mut by_file: std::collections::BTreeMap<String, Vec<PathBuf>> =
+                    std::collections::BTreeMap::new();
+                for seg in &seg_paths {
+                    for file in kosha_segment::vector_index_files(seg) {
+                        by_file.entry(file).or_default().push(seg.clone());
+                    }
+                }
                 {
                     let _permit = self.hydration_semaphore.acquire();
-                    for file in ["vector.offsets", kosha_segment::VECTOR_IDX_FILE] {
-                        let (f, b) = self.ensure_files_local(&seg_paths, file, &request);
+                    // Offsets sidecars first, as before: they are what an
+                    // open reads.
+                    let mut order: Vec<(&String, &Vec<PathBuf>)> = by_file.iter().collect();
+                    order.sort_by_key(|(file, _)| !file.ends_with(".offsets"));
+                    for (file, segs) in order {
+                        let (f, b) = self.ensure_files_local(segs, file, &request);
                         files += f;
                         bytes += b;
                     }
                 }
                 let mut missing = 0;
-                for seg in &seg_paths {
-                    let idx = seg.join(kosha_segment::VECTOR_IDX_FILE);
-                    if file_present_nonempty(&idx) {
-                        self.posting_span_hydrator
-                            .finish_promotion(&self.cache, &idx, true);
-                    } else {
-                        missing += 1;
+                for (file, segs) in &by_file {
+                    if !file.ends_with(".idx") {
+                        continue;
+                    }
+                    for seg in segs {
+                        let idx = seg.join(file);
+                        if file_present_nonempty(&idx) {
+                            self.posting_span_hydrator
+                                .finish_promotion(&self.cache, &idx, true);
+                        } else {
+                            missing += 1;
+                        }
                     }
                 }
                 BatchOutcome {
@@ -410,6 +433,11 @@ impl AppState {
         }
         for dir in &phases.page_segments {
             if let Some(seg) = dir.file_name().and_then(|n| n.to_str()) {
+                // A strong search's transient tail segment (#255) is local,
+                // never published and gone once the tail changes.
+                if seg.starts_with(crate::unindexed::TAIL_SEGMENT_PREFIX) {
+                    continue;
+                }
                 reads.push((seg, FileClass::DocStore));
             }
         }
@@ -490,6 +518,35 @@ impl AppState {
         // segment's scaffolding lands, the search path's hydration verdict
         // can be recorded, as the static warmup did.
         let mut whole: HashSet<String> = HashSet::new();
+        // A sharded namespace (#207) holds its segments in its shards,
+        // ordinary namespaces nested under its prefix: warm each of them.
+        let specs: Vec<WarmSpec> = specs
+            .into_iter()
+            .flat_map(|spec| match self.indexer.shard_count(&spec.ns) {
+                None => vec![spec],
+                Some(shards) => kosha_core::sharding::shard_namespaces(&spec.ns, shards)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, shard)| WarmSpec {
+                        ns: shard,
+                        source: spec.source,
+                        // Merged-view ids (`_shard-XXXX/{id}`) back to the
+                        // shard's own segment ids.
+                        only: spec.only.as_ref().map(|only| {
+                            only.iter()
+                                .filter_map(|id| {
+                                    kosha_core::sharding::split_merged_segment_id(
+                                        &kosha_core::SegmentId(id.clone()),
+                                    )
+                                    .filter(|(i, _)| *i as usize == index)
+                                    .map(|(_, local)| local.0)
+                                })
+                                .collect()
+                        }),
+                    })
+                    .collect(),
+            })
+            .collect();
         for spec in specs {
             let Some(manifest) = self.indexer.manifest_shared(&spec.ns) else {
                 report
@@ -583,7 +640,7 @@ impl AppState {
                     .unwrap()
                     .entry((ns_name.clone(), manifest.version))
                     .or_default()
-                    .merge(None, false);
+                    .merge(None, None);
             }
         }
 

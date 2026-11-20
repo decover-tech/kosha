@@ -9,6 +9,11 @@ license.workspace = true
 name = "kosha-build-segments"
 path = "src/main.rs"
 
+# Measures i8 vector quantization (#210) on segment sets built above.
+[[bin]]
+name = "kosha-vector-quant-eval"
+path = "src/bin/vector_quant_eval.rs"
+
 [lints]
 workspace = true
 

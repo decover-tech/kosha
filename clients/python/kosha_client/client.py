@@ -54,6 +54,7 @@ class KoshaClient:
         max_retries: int = 3,
         retry_on_timeout: bool = True,
         pool_maxsize: int = 20,
+        consistency: str | None = None,
         **kwargs: Any,
     ) -> None:
         # Normalise the Kosha base URL.  Resolution order:
@@ -99,6 +100,15 @@ class KoshaClient:
             retry_on_timeout=retry_on_timeout,
         )
 
+        # Read-your-writes (#255): ``"strong"`` searches also scan writes the
+        # server has acknowledged but not indexed yet, so a write is
+        # searchable as soon as it returns, with no ``/flush``. ``None``
+        # (the default) leaves the choice to the server
+        # (``KOSHA_DEFAULT_CONSISTENCY``, itself ``strong`` by default).
+        if consistency is not None and consistency not in ("strong", "eventual"):
+            raise ValueError("consistency must be 'strong', 'eventual' or None")
+        self._consistency = consistency
+
         self._kosha_url = kosha_url
         self._auth = http_auth
         self._timeout = timeout
@@ -142,8 +152,7 @@ class KoshaClient:
 
     # ── Search ─────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _wants_refresh(params: dict) -> bool:
+    def _wants_refresh(self, params: dict) -> bool:
         """Whether a write asked to be visible on return (ES ``refresh``).
 
         ``True``/``"true"``/``""`` (bare ``?refresh``) and ``"wait_for"`` all
@@ -151,11 +160,18 @@ class KoshaClient:
         refresh to wait on, so both are an explicit ``/flush``. Anything else
         (the default) leaves visibility to the server's idle-buffer flush
         (``KOSHA_FLUSH_MAX_AGE_MS``, ~1 s), like ES's ``refresh_interval``.
+        With ``consistency="strong"`` a write is searchable on return
+        without one (#255), so ``"wait_for"`` needs no flush.
         """
         refresh = params.get("refresh", False)
         if isinstance(refresh, bool):
             return refresh
-        return str(refresh).strip().lower() in ("", "true", "wait_for")
+        refresh = str(refresh).strip().lower()
+        if refresh == "wait_for" and self._consistency == "strong":
+            # ``wait_for`` only asks for the write to be searchable on
+            # return, which strong searches already guarantee (#255).
+            return False
+        return refresh in ("", "true", "wait_for")
 
     def _flush(self, namespace: str) -> None:
         self._request("POST", "flush", {"namespace": namespace})
@@ -192,6 +208,8 @@ class KoshaClient:
             body = {**body, "rerank": rerank}
         kosha_body, context = self._translate_search(body, params)
         kosha_body["namespace"] = ns
+        if self._consistency is not None:
+            kosha_body["consistency"] = self._consistency
 
         start = time.monotonic()
         try:
@@ -1427,6 +1445,8 @@ class KoshaClient:
         # empty query with no filter matches nothing on the server.
         kosha_body["filter"] = {"match_all": {}}
         kosha_body["namespace"] = ns
+        if self._consistency is not None:
+            kosha_body["consistency"] = self._consistency
         try:
             result = self._request("POST", "search", body=kosha_body)
         except KoshaRequestError as e:
@@ -1467,9 +1487,10 @@ class KoshaClient:
         ``search``. ``refresh=True`` flushes the index first.
 
         Kosha has no fetch-by-id endpoint: this is a one-hit search (see
-        ``_lookup_id``), so it sees what search sees. A document still in
-        the server's write buffer (~1 s, ``KOSHA_FLUSH_MAX_AGE_MS``) is not
-        found yet; there is no realtime GET.
+        ``_lookup_id``), so it sees what search sees: with the server's
+        default ``strong`` consistency (#255) that includes documents still
+        in its write buffer; under ``eventual`` they are not found until
+        flushed (~1 s, ``KOSHA_FLUSH_MAX_AGE_MS``).
         """
         if id is None or str(id) == "":
             raise KoshaRequestError(400, "get requires a document id")

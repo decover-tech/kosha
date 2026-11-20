@@ -539,9 +539,13 @@ impl Publisher {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
                 // The rebuilt segments were analyzed with this schema.
                 schema: existing.schema.clone(),
                 retired: Default::default(),
+                // A replace rebuilds the namespace unsharded: its segments
+                // are written to the root itself (#207).
+                shards: None,
             },
             PublishMode::Append => existing.clone(),
         };
@@ -685,8 +689,10 @@ pub fn run(argv: impl IntoIterator<Item = String>) -> Result<()> {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         });
         // Restore to advance segment IDs beyond an existing/partial run.
         // Replace mode: Publisher publishes only this run's segments.
@@ -836,8 +842,10 @@ mod tests {
             wal_origin: None,
             tombstones: Default::default(),
             deletion_vectors: Default::default(),
+            branch: None,
             schema: None,
             retired: Default::default(),
+            shards: None,
         };
         commit_manifest(&mut store, &ns, 0, &manifest(1, "run-1")).unwrap();
         // An ingest writer publishes on top while the run is uploading.

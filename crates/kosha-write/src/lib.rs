@@ -55,6 +55,16 @@ struct NamespaceState {
     known: bool,
     wal_sequence: u64,
     flushing_ids: HashSet<DocumentId>,
+    /// The documents of the flush round in progress (#255): taken out of
+    /// the buffer but not yet in a committed segment, so still part of the
+    /// namespace's unindexed tail. Shared with the writer threads, not
+    /// copied.
+    flushing_docs: Vec<Arc<Vec<Document>>>,
+    /// Bumped whenever the unindexed tail (buffer, flushing documents,
+    /// pending deletes) may have changed without a manifest version bump.
+    /// With the manifest version and [`Indexer::instance`] it names one
+    /// tail state — see [`UnindexedTail::fingerprint`].
+    tail_epoch: u64,
     recovered: Vec<(u64, kosha_core::WalRecord)>,
     recovered_deletes: HashSet<DocumentId>,
     replay_required: bool,
@@ -174,6 +184,76 @@ impl PublishedBase {
     }
 }
 
+/// The writes a namespace has acknowledged but not yet indexed into a
+/// segment of its manifest (#255): what a strong-consistency search scans
+/// exhaustively on top of the indexed segments.
+///
+/// It is relative to one local manifest version, `manifest_version`: the
+/// documents and deletes here are exactly what that version is missing.
+/// A reader whose own manifest has another version must not combine the
+/// two (it would double-count a flush that published in between, or miss
+/// one) — it refreshes its manifest and asks again.
+///
+/// Served by the ingest pod as `GET /internal/namespaces/{ns}/unindexed`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct UnindexedTail {
+    /// The local manifest version the tail applies on top of.
+    pub manifest_version: u64,
+    /// That manifest's `wal_checkpoint`: every WAL record after it is in
+    /// the tail (informational; the version is what readers compare).
+    #[serde(default)]
+    pub wal_checkpoint: u64,
+    /// Names this exact tail state (writer process, manifest version and a
+    /// tail change counter). Equal fingerprints mean equal tails, so a
+    /// reader can keep what it built from one and ask with
+    /// `if_none_match` next time.
+    #[serde(default)]
+    pub fingerprint: String,
+    /// The newest unindexed version of each upserted document, oldest
+    /// first. Each one supersedes any indexed copy of its id.
+    #[serde(default)]
+    pub documents: Vec<Document>,
+    /// Ids deleted since `manifest_version` whose deletes are not in the
+    /// manifest yet (WAL-recovered deletes awaiting replay).
+    #[serde(default)]
+    pub deleted_ids: Vec<DocumentId>,
+    /// The live indexed copies (segment, doc seq) that the documents and
+    /// deletes above supersede: treated as deleted by a search over
+    /// `manifest_version`, so the newest version wins and deletes apply.
+    #[serde(default)]
+    pub masked: HashMap<SegmentId, Vec<u32>>,
+    /// The reader already has this tail (`known_fingerprint` matched):
+    /// documents, deletes and masks are left out.
+    #[serde(default)]
+    pub not_modified: bool,
+    /// The reader asked for a tail relative to another manifest version
+    /// than the writer's current one: documents, deletes and masks are left
+    /// out, and the reader should refresh its manifest and ask again.
+    #[serde(default)]
+    pub stale: bool,
+}
+
+impl UnindexedTail {
+    /// Nothing to scan and nothing to hide.
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty()
+            && self.deleted_ids.is_empty()
+            && self.masked.values().all(Vec::is_empty)
+    }
+}
+
+/// Approximate in-memory size of a buffered document, the unit of
+/// `KOSHA_MAX_UNINDEXED_BYTES` (#255): its id and every field's name and
+/// value, plus a small per-field overhead.
+pub fn approx_document_bytes(doc: &Document) -> u64 {
+    let fields: usize = doc
+        .fields
+        .iter()
+        .map(|field| field.name.len() + field.value.len() + 8)
+        .sum();
+    (doc.id.0.len() + fields) as u64
+}
+
 /// What [`Indexer::rebase_onto`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebaseOutcome {
@@ -227,8 +307,10 @@ impl NamespaceState {
                 wal_origin: None,
                 tombstones: Default::default(),
                 deletion_vectors: Default::default(),
+                branch: None,
                 schema: None,
                 retired: Default::default(),
+                shards: None,
             },
             published_version: 0,
             published_base: PublishedBase::default(),
@@ -238,6 +320,8 @@ impl NamespaceState {
             known: false,
             wal_sequence: 0,
             flushing_ids: HashSet::new(),
+            flushing_docs: Vec::new(),
+            tail_epoch: 0,
             recovered: Vec::new(),
             recovered_deletes: HashSet::new(),
             replay_required: false,
@@ -323,6 +407,11 @@ struct NamespaceHandle {
     /// concurrent writer to drain it.
     flush_coord: Mutex<FlushCoord>,
     flush_done: Condvar,
+    /// Dimension of each vector field written to this namespace (#204),
+    /// learned lazily from segment footers and the write buffer on the
+    /// first write, then from every accepted batch. See
+    /// [`Indexer::check_vector_dims`].
+    vector_dims: Mutex<Option<HashMap<String, usize>>>,
 }
 
 /// Bounded counting semaphore backing `NamespaceHandle::writer_slots`. Not a
@@ -393,6 +482,10 @@ pub struct Indexer {
     /// Lock order: may be taken while a namespace `state` lock is held,
     /// never the other way round.
     local_retired: Mutex<Vec<LocalRetirement>>,
+    /// Random per-process id: part of every [`UnindexedTail::fingerprint`],
+    /// so a restarted writer never hands out a fingerprint an earlier
+    /// process used for a different tail.
+    instance: String,
 }
 
 impl Indexer {
@@ -442,6 +535,7 @@ impl Indexer {
             // segment; only a >= 2x backlog splits (#241).
             min_docs_per_flush_writer: 1000,
             local_retired: Mutex::new(Vec::new()),
+            instance: uuid::Uuid::new_v4().simple().to_string(),
         };
 
         // Recover un-flushed documents from WAL on startup.
@@ -459,6 +553,7 @@ impl Indexer {
 
     fn apply_recovered_record(&self, state: &mut NamespaceState, record: &kosha_core::WalRecord) {
         let deleted: HashSet<_> = record.deleted_ids.iter().cloned().collect();
+        state.tail_epoch += 1;
         state.recovered_deletes.extend(deleted.iter().cloned());
         for doc in &record.documents {
             state.recovered_deletes.remove(&doc.id);
@@ -488,6 +583,11 @@ impl Indexer {
     pub fn with_bm25_params(mut self, params: Bm25Params) -> Self {
         self.bm25_params = params;
         self
+    }
+
+    /// The BM25 parameters new segments are built with.
+    pub fn bm25_params(&self) -> &Bm25Params {
+        &self.bm25_params
     }
 
     pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
@@ -528,9 +628,33 @@ impl Indexer {
                         last_round_error: None,
                     }),
                     flush_done: Condvar::new(),
+                    vector_dims: Mutex::new(None),
                 })
             })
             .clone()
+    }
+
+    /// A sharded root (#207) holds no documents: writes go to its shards.
+    /// Reaching here with one is a routing bug, refused rather than written
+    /// where no search would look.
+    fn refuse_sharded_root(
+        handle: &NamespaceHandle,
+        namespace: &NamespaceId,
+    ) -> Result<(), KoshaError> {
+        if handle
+            .state
+            .lock()
+            .unwrap()
+            .manifest
+            .shards
+            .is_some_and(|n| n > 1)
+        {
+            return Err(KoshaError::InvalidQuery(format!(
+                "namespace '{}' is sharded; write to its shards",
+                namespace.0
+            )));
+        }
+        Ok(())
     }
 
     fn buffer_mut_in<'a>(
@@ -589,7 +713,9 @@ impl Indexer {
         let mut changes = Vec::new();
         let mut deleted_ids = HashSet::new();
         for entry in &state.manifest.segments {
-            let seg_dir = self.data_dir.join(&namespace.0).join(&entry.segment_id.0);
+            let seg_dir = state
+                .manifest
+                .segment_dir(&self.data_dir, namespace, &entry.segment_id);
             let reader = kosha_segment::SegmentReader::open(seg_dir)?;
             // The search path's evaluator (columnar or `filters.bin`), so a
             // delete matches exactly the documents a search would.
@@ -711,7 +837,9 @@ impl Indexer {
         let mut index: HashMap<DocumentId, Vec<(SegmentId, u32)>> = HashMap::new();
         if state.known {
             for entry in &state.manifest.segments {
-                let seg_dir = data_dir.join(&namespace.0).join(&entry.segment_id.0);
+                let seg_dir = state
+                    .manifest
+                    .segment_dir(data_dir, namespace, &entry.segment_id);
                 if !seg_dir.exists() {
                     return Err(KoshaError::SegmentNotFound(entry.segment_id.clone()));
                 }
@@ -762,6 +890,111 @@ impl Indexer {
         }
     }
 
+    /// Reject a batch whose vectors disagree in dimension with their
+    /// field's (#204): each vector column has one dimension per namespace,
+    /// fixed by the first vector written to it. Without this check a
+    /// mismatched document would land in the buffer and could only be
+    /// dropped from the index at flush time, silently.
+    ///
+    /// Called with the namespace's `writes` lock held, so accepted batches
+    /// update the map in order.
+    fn check_vector_dims(
+        &self,
+        namespace: &NamespaceId,
+        handle: &NamespaceHandle,
+        documents: &[Document],
+    ) -> Result<(), KoshaError> {
+        let vectors: Vec<(&DocumentId, &str, usize)> = documents
+            .iter()
+            .flat_map(|doc| {
+                doc.fields
+                    .iter()
+                    .filter(|f| f.field_type == kosha_core::FieldType::Vector)
+                    .filter_map(move |f| {
+                        let v = serde_json::from_str::<Vec<f32>>(&f.value).ok()?;
+                        (!v.is_empty()).then_some((&doc.id, f.name.as_str(), v.len()))
+                    })
+            })
+            .collect();
+        if vectors.is_empty() {
+            return Ok(());
+        }
+        let mut guard = handle.vector_dims.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(self.known_vector_dims(namespace, handle));
+        }
+        let known = guard.as_mut().unwrap();
+        let mut batch: HashMap<&str, usize> = HashMap::new();
+        for (id, field, dim) in &vectors {
+            let expected = known
+                .get(*field)
+                .copied()
+                .or_else(|| batch.get(field).copied());
+            match expected {
+                Some(expected) if expected != *dim => {
+                    return Err(KoshaError::InvalidQuery(format!(
+                        "document '{}': vector field '{field}' has {dim} dimensions, but \
+                         '{field}' vectors in namespace '{}' have {expected}",
+                        id.0, namespace.0
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    batch.insert(field, *dim);
+                }
+            }
+        }
+        for (field, dim) in batch {
+            known.insert(field.to_string(), dim);
+        }
+        Ok(())
+    }
+
+    /// Vector field dimensions already in the namespace: from the footers
+    /// of its segments (those written since #204 list their columns) and
+    /// from documents still in the write buffer.
+    fn known_vector_dims(
+        &self,
+        namespace: &NamespaceId,
+        handle: &NamespaceHandle,
+    ) -> HashMap<String, usize> {
+        let state = handle.state.lock().unwrap().clone();
+        let mut dims = HashMap::new();
+        for entry in &state.manifest.segments {
+            // The manifest's cached footer when it has one; else the local
+            // footer.json, wherever the segment lives (a branch's inherited
+            // segments sit under their home namespace, #208).
+            let footer = match state.manifest.segment_footer(&entry.segment_id) {
+                Some(footer) => footer.vector_fields.clone(),
+                None => {
+                    let seg_dir =
+                        state
+                            .manifest
+                            .segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                    match kosha_segment::SegmentReader::read_footer(&seg_dir) {
+                        Ok(footer) => footer.vector_fields,
+                        Err(_) => continue,
+                    }
+                }
+            };
+            for meta in footer.into_iter().flatten() {
+                dims.entry(meta.name).or_insert(meta.dim as usize);
+            }
+        }
+        let buffered = state.buffer.iter().flat_map(|buf| &buf.documents);
+        for field in buffered.flat_map(|doc| &doc.fields) {
+            if field.field_type != kosha_core::FieldType::Vector {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Vec<f32>>(&field.value) {
+                if !v.is_empty() {
+                    dims.entry(field.name.clone()).or_insert(v.len());
+                }
+            }
+        }
+        dims
+    }
+
     /// Index documents into a namespace (OpenSearch `index` semantics).
     ///
     /// Same `doc_id` overwrites any prior live copy: buffered versions are
@@ -784,9 +1017,11 @@ impl Indexer {
         let handle = self.ns_handle(&namespace);
 
         let writes = handle.writes.lock().unwrap();
+        Self::refuse_sharded_root(&handle, &namespace)?;
         if self.needs_recovery_hydration(&namespace) {
             self.flush_namespace(&namespace)?;
         }
+        self.check_vector_dims(&namespace, &handle, &documents)?;
         self.ensure_id_index(&namespace, &handle)?;
 
         // `needs_flush` is decided under `state` but acted on after it's
@@ -829,6 +1064,7 @@ impl Indexer {
                 buf.documents.retain(|doc| !id_set.contains(&doc.id));
             }
             state.known = true;
+            state.tail_epoch += 1;
             let flush_threshold = self.flush_threshold;
             let buf = Self::buffer_mut_in(
                 &mut state,
@@ -887,10 +1123,12 @@ impl Indexer {
         let count = documents.len();
         let handle = self.ns_handle(&namespace);
         let _writes = handle.writes.lock().unwrap();
+        Self::refuse_sharded_root(&handle, &namespace)?;
         // Recovery must be resolved before assigning a new operation order.
         if self.needs_recovery_hydration(&namespace) {
             self.flush_namespace(&namespace)?;
         }
+        self.check_vector_dims(&namespace, &handle, &documents)?;
         let _compact = handle.compact.lock().unwrap();
         let _mutation = handle.mutation.lock().unwrap();
         self.ensure_id_index(&namespace, &handle)?;
@@ -921,7 +1159,9 @@ impl Indexer {
                     Some(buffered.fields.clone())
                 } else if let Some((seg, seq)) = live.last() {
                     let reader = kosha_segment::SegmentReader::open_with_options(
-                        self.data_dir.join(&namespace.0).join(&seg.0),
+                        snapshot
+                            .manifest
+                            .segment_dir(&self.data_dir, &namespace, seg),
                         false,
                     )?;
                     Some(
@@ -974,6 +1214,7 @@ impl Indexer {
         if let Some(buffer) = state.buffer.as_mut() {
             buffer.documents.retain(|doc| !ids.contains(&doc.id));
         }
+        state.tail_epoch += 1;
         for (segment, seq) in locations {
             state.tombstones.entry(segment).or_default().insert(seq);
         }
@@ -1035,6 +1276,7 @@ impl Indexer {
             }
             state.manifest.tombstones = state.tombstones.clone();
             state.manifest.version += 1;
+            state.tail_epoch += 1;
             state.recovered_deletes.clear();
             state.replay_required = false;
         }
@@ -1188,11 +1430,17 @@ impl Indexer {
                 .as_ref()
                 .map(|b| b.documents.iter().map(|doc| doc.id.clone()).collect())
                 .unwrap_or_default();
-            let chunks = Self::take_flush_chunks_in(
+            let chunks: Vec<_> = Self::take_flush_chunks_in(
                 &mut state,
                 self.max_concurrent_flush_writers,
                 self.min_docs_per_flush_writer,
-            );
+            )
+            .into_iter()
+            .map(|(docs, seg_id, params)| (Arc::new(docs), seg_id, params))
+            .collect();
+            // Still unindexed until phase 3 commits them (#255).
+            state.flushing_docs = chunks.iter().map(|(docs, _, _)| Arc::clone(docs)).collect();
+            state.tail_epoch += 1;
             (chunks, checkpoint, analysis)
         };
         if chunks.is_empty() {
@@ -1217,11 +1465,7 @@ impl Indexer {
         // <= its capacity by construction, so this is the structural
         // backstop, not the primary bound.
         let ns_dir = self.data_dir.join(&namespace.0);
-        let results: Vec<(
-            SegmentId,
-            Vec<Document>,
-            Result<kosha_core::Footer, KoshaError>,
-        )> = if chunks.len() == 1 {
+        let results: Vec<FlushChunkOutcome> = if chunks.len() == 1 {
             let (docs, seg_id, bm25_params) = chunks.into_iter().next().unwrap();
             vec![Self::write_flush_chunk(
                 &ns_dir,
@@ -1262,9 +1506,9 @@ impl Indexer {
         // silently dropped -- so "every buffered document ends up in
         // exactly one segment" still holds on partial failure, same as it
         // held (trivially, with only one chunk) before this change.
-        let mut failed_docs: Vec<Document> = Vec::new();
+        let mut failed_docs: Vec<Arc<Vec<Document>>> = Vec::new();
         let mut first_err: Option<KoshaError> = None;
-        let mut succeeded: Vec<(SegmentId, Vec<Document>, kosha_core::Footer)> = Vec::new();
+        let mut succeeded: Vec<(SegmentId, Arc<Vec<Document>>, kosha_core::Footer)> = Vec::new();
         for (seg_id, docs, result) in results {
             match result {
                 Ok(footer) => succeeded.push((seg_id, docs, footer)),
@@ -1272,7 +1516,7 @@ impl Indexer {
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
-                    failed_docs.extend(docs);
+                    failed_docs.push(docs);
                 }
             }
         }
@@ -1281,9 +1525,14 @@ impl Indexer {
         // in the WAL and restore it ahead of newer buffered writes.
         if let Some(error) = first_err {
             for (_, docs, _) in succeeded {
-                failed_docs.extend(docs);
+                failed_docs.push(docs);
             }
             let mut state = handle.state.lock().unwrap();
+            // Released first so the chunks below unwrap without a copy.
+            state.flushing_docs.clear();
+            state.tail_epoch += 1;
+            let mut failed_docs: Vec<Document> =
+                failed_docs.into_iter().flat_map(unshare_docs).collect();
             let buf = Self::buffer_mut_in(
                 &mut state,
                 namespace.clone(),
@@ -1307,6 +1556,8 @@ impl Indexer {
             let mut state = handle.state.lock().unwrap();
             Self::commit_recovery(&mut state, recovery);
             state.flushing_ids.clear();
+            state.flushing_docs.clear();
+            state.tail_epoch += 1;
             state.manifest.wal_checkpoint = state.manifest.wal_checkpoint.max(checkpoint);
             state.manifest.wal_origin = Some(origin);
             for (seg_id, docs, footer) in succeeded {
@@ -1326,7 +1577,8 @@ impl Indexer {
                     &self.data_dir,
                     &self.bm25_params,
                 );
-                buf.documents.extend(failed_docs);
+                buf.documents
+                    .extend(failed_docs.into_iter().flat_map(unshare_docs));
             }
         }
 
@@ -1344,19 +1596,15 @@ impl Indexer {
     fn write_flush_chunk(
         ns_dir: &Path,
         handle: &NamespaceHandle,
-        docs: Vec<Document>,
+        docs: Arc<Vec<Document>>,
         seg_id: SegmentId,
         bm25_params: Bm25Params,
         analysis: &kosha_core::AnalysisConfig,
-    ) -> (
-        SegmentId,
-        Vec<Document>,
-        Result<kosha_core::Footer, KoshaError>,
-    ) {
+    ) -> FlushChunkOutcome {
         let _permit = handle.writer_slots.acquire();
         let seg_dir = ns_dir.join(seg_id.0.as_str());
         let mut writer = SegmentWriter::new(seg_id.clone(), seg_dir).with_analysis(analysis);
-        for doc in &docs {
+        for doc in docs.iter() {
             writer.add_document(doc.id.clone(), doc.fields.clone());
         }
         let result = writer.finalize(bm25_params);
@@ -1450,6 +1698,7 @@ impl Indexer {
 
         // WAL reclamation waits for durable manifest publication.
         let _ = (wal_enabled, wal);
+        state.tail_epoch += 1;
         state.manifest.wal_checkpoint = state.wal_sequence;
         state.manifest.wal_origin = Some(wal.origin().to_owned());
 
@@ -1500,16 +1749,18 @@ impl Indexer {
         opts: CompactOptions,
         after_plan: impl FnOnce(),
     ) -> Result<CompactResult, KoshaError> {
+        let vector_index = opts.vector_index;
         self.compact_with_selector(
             namespace,
-            |manifest, ns_dir| {
+            |manifest, seg_dir| {
                 select_merge_inputs(
                     manifest,
                     &opts,
-                    |seg_id| ns_dir.join(&seg_id.0).exists(),
-                    |seg_id| segment_dir_bytes(&ns_dir.join(&seg_id.0)),
+                    |seg_id| seg_dir(seg_id).exists(),
+                    |seg_id| segment_dir_bytes(&seg_dir(seg_id)),
                 )
             },
+            vector_index,
             after_plan,
         )
     }
@@ -1528,7 +1779,7 @@ impl Indexer {
     ) -> Result<CompactResult, KoshaError> {
         self.compact_with_selector(
             namespace,
-            |manifest, ns_dir| {
+            |manifest, seg_dir| {
                 let inputs: Vec<ManifestEntry> = plan
                     .inputs
                     .iter()
@@ -1538,11 +1789,12 @@ impl Indexer {
                             .iter()
                             .find(|e| e.segment_id == planned.segment_id)
                     })
-                    .filter(|e| ns_dir.join(&e.segment_id.0).exists())
+                    .filter(|e| seg_dir(&e.segment_id).exists())
                     .cloned()
                     .collect();
                 (inputs.len() >= 2).then_some(MergePlan { inputs })
             },
+            None,
             || {},
         )
     }
@@ -1550,20 +1802,27 @@ impl Indexer {
     fn compact_with_selector(
         &self,
         namespace: &NamespaceId,
-        select: impl FnOnce(&Manifest, &Path) -> Option<MergePlan>,
+        select: impl FnOnce(&Manifest, &dyn Fn(&SegmentId) -> PathBuf) -> Option<MergePlan>,
+        // How the merged vector indexes are built (#253); `None` reads
+        // `KOSHA_VECTOR_COMPACTION`.
+        vector_index: Option<kosha_segment::VectorCompactionMode>,
         after_plan: impl FnOnce(),
     ) -> Result<CompactResult, KoshaError> {
         let handle = self.ns_handle(namespace);
         let _compact_guard = handle.compact.lock().unwrap();
 
-        let (plan, tombstones, bm25_params, segments_before, analysis) = {
+        let (plan, tombstones, bm25_params, segments_before, analysis, input_dirs) = {
             let mut state = handle.state.lock().unwrap();
             if !state.known {
                 return Ok(CompactResult::unchanged(0));
             }
             let segments_before = state.manifest.segments.len();
-            let ns_dir = self.data_dir.join(&namespace.0);
-            let plan = match select(&state.manifest, &ns_dir) {
+            let manifest = &state.manifest;
+            // A branch's inherited segments live under their home
+            // namespace's prefix (#208).
+            let seg_dir =
+                |seg_id: &SegmentId| manifest.segment_dir(&self.data_dir, namespace, seg_id);
+            let plan = match select(manifest, &seg_dir) {
                 Some(p) => p,
                 None => return Ok(CompactResult::unchanged(segments_before)),
             };
@@ -1589,7 +1848,28 @@ impl Indexer {
             // *current* schema (#220): compaction is how segments written
             // with an older analyzer converge on the new one.
             let analysis = state.manifest.analysis_config();
-            (plan, tombstones, bm25_params, segments_before, analysis)
+            // Inputs are read where they live: a branch's inherited inputs
+            // stay in the parent's prefix (#208). The output always goes to
+            // this namespace's own prefix.
+            let input_dirs: HashMap<SegmentId, PathBuf> = plan
+                .inputs
+                .iter()
+                .map(|entry| {
+                    let dir =
+                        state
+                            .manifest
+                            .segment_dir(&self.data_dir, namespace, &entry.segment_id);
+                    (entry.segment_id.clone(), dir)
+                })
+                .collect();
+            (
+                plan,
+                tombstones,
+                bm25_params,
+                segments_before,
+                analysis,
+                input_dirs,
+            )
         };
 
         after_plan();
@@ -1606,6 +1886,9 @@ impl Indexer {
             kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir).with_analysis(&analysis);
         let mut any_docs = false;
         let old_segment_ids = plan.input_ids();
+        let seed_vectors = vector_index
+            .unwrap_or_else(kosha_segment::VectorCompactionMode::from_env)
+            == kosha_segment::VectorCompactionMode::Lire;
         // (old segment_id, old doc_seq) → the doc's doc_seq in the merged
         // output, for every doc actually copied. `SegmentWriter::add_document`
         // assigns doc_seq as `self.doc_records.len()` at call time (strictly
@@ -1616,8 +1899,11 @@ impl Indexer {
         let mut next_new_seq: u32 = 0;
 
         for entry in &plan.inputs {
-            let reader = kosha_segment::SegmentReader::open(ns_dir.join(&entry.segment_id.0))?;
+            let reader = kosha_segment::SegmentReader::open(input_dirs[&entry.segment_id].clone())?;
             let ts = tombstones.get(&entry.segment_id);
+            // This input's old doc_seq → merged doc_seq (`u32::MAX`: not
+            // copied), for seeding the merged vector index (#253).
+            let mut input_remap: Vec<u32> = Vec::new();
             // `?` here is deliberate: a doc that fails to read must abort
             // the whole compaction, not just be skipped from the merge
             // output — see `iter_doc_records`'s doc comment for the
@@ -1639,9 +1925,19 @@ impl Indexer {
                     continue;
                 }
                 seq_remap.insert((entry.segment_id.clone(), doc_rec.doc_seq), next_new_seq);
+                if seed_vectors {
+                    let old = doc_rec.doc_seq as usize;
+                    if input_remap.len() <= old {
+                        input_remap.resize(old + 1, u32::MAX);
+                    }
+                    input_remap[old] = next_new_seq;
+                }
                 next_new_seq += 1;
                 writer.add_document_with_vectors(doc_rec.doc_id, doc_rec.fields, vectors);
                 any_docs = true;
+            }
+            if seed_vectors {
+                seed_merged_vector_index(&reader, &input_remap, &mut writer);
             }
         }
 
@@ -1774,6 +2070,14 @@ impl Indexer {
     /// in durable storage (e.g. S3) but not on local disk.
     pub fn restore_manifest(&self, namespace: NamespaceId, mut manifest: Manifest) {
         let handle = self.ns_handle(&namespace);
+        let state = handle.state.lock().unwrap();
+        if state.known && state.manifest.version > manifest.version {
+            return;
+        }
+        // Relearn vector dimensions from the restored segments on the next
+        // write (#204); `vector_dims` is only ever locked before `state`.
+        drop(state);
+        handle.vector_dims.lock().unwrap().take();
         let mut state = handle.state.lock().unwrap();
         if state.known && state.manifest.version > manifest.version {
             return;
@@ -1831,6 +2135,7 @@ impl Indexer {
             state.replay_required = !buf.documents.is_empty() && !manifest.segments.is_empty();
         }
         state.tombstones = manifest.tombstones.clone();
+        state.tail_epoch += 1;
         state.published_version = manifest.version;
         state.published_base = PublishedBase::of(&manifest, &manifest.tombstones);
         state.pending_bases.clear();
@@ -1843,6 +2148,60 @@ impl Indexer {
         state.manifest = manifest;
         state.shared_manifest = None;
         state.known = true;
+    }
+
+    /// Forget a namespace that has been removed from the control store
+    /// (branch deletion, #208).
+    ///
+    /// Waits for in-flight writes, flushes, upserts and compactions, then
+    /// refuses with `InvalidQuery` if the namespace holds anything not yet
+    /// published (buffered or WAL-recovered documents, deletes, or a
+    /// manifest newer than the published one): the caller flushes and
+    /// publishes first, and a write that slipped in between must not be
+    /// silently dropped. Otherwise runs `while_locked` (the control-store
+    /// removal and object reclamation) with every namespace lock held, so
+    /// no write, flush or publish can interleave, and only on its success
+    /// resets the namespace to unknown. A write that arrives afterwards
+    /// starts a new, empty namespace of the same name.
+    pub fn drop_branch_namespace(
+        &self,
+        namespace: &NamespaceId,
+        while_locked: impl FnOnce() -> Result<(), KoshaError>,
+    ) -> Result<(), KoshaError> {
+        let handle = self.ns_handle(namespace);
+        // The order every writer takes them: writes -> compact -> mutation
+        // -> state.
+        let _writes = handle.writes.lock().unwrap();
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        let mut state = handle.state.lock().unwrap();
+        let buffered = state.buffer.as_ref().map_or(0, |b| b.documents.len());
+        let unpublished_deletes = state.known
+            && PublishedBase::of(&state.manifest, &state.tombstones).tombstones
+                != state.published_base.tombstones;
+        if buffered > 0
+            || !state.recovered.is_empty()
+            || !state.recovered_deletes.is_empty()
+            || (state.known && state.manifest.version != state.published_version)
+            || unpublished_deletes
+        {
+            return Err(KoshaError::InvalidQuery(format!(
+                "namespace {} has writes that are not published yet; flush it and retry",
+                namespace.0
+            )));
+        }
+        while_locked()?;
+        let wal_sequence = state.wal_sequence;
+        *state = NamespaceState::new();
+        // WAL sequences are process-wide; never hand one out twice.
+        state.wal_sequence = wal_sequence;
+        drop(state);
+        // Everything was published, but WAL files can outlive their
+        // checkpoint; with the manifest gone nothing would skip them on
+        // replay, so discard the namespace's records (as `drop_namespace`
+        // does for `DELETE /v1/namespaces/{ns}`).
+        self.wal.discard_namespace(namespace)?;
+        Ok(())
     }
 
     /// Set the namespace schema (#220), creating the namespace if needed.
@@ -1947,6 +2306,66 @@ impl Indexer {
         fresh.wal_sequence = state.wal_sequence;
         *state = fresh;
         true
+    }
+
+    /// Make `namespace` a sharded root with a fixed `shards` count (#207),
+    /// creating it if needed. Only a namespace that holds nothing yet — no
+    /// segments, no buffered or recovered writes — can be sharded:
+    /// documents already written live where unsharded routing put them,
+    /// and moving them is resharding, which this does not do. Asking again
+    /// for the count it already has is a no-op (`Ok(false)`); asking for a
+    /// different one is refused. The caller publishes the manifest.
+    pub fn set_shard_count(
+        &self,
+        namespace: &NamespaceId,
+        shards: u32,
+    ) -> Result<bool, KoshaError> {
+        if !(2..=kosha_core::sharding::MAX_SHARDS).contains(&shards) {
+            return Err(KoshaError::InvalidQuery(format!(
+                "shards must be between 2 and {}",
+                kosha_core::sharding::MAX_SHARDS
+            )));
+        }
+        let handle = self.ns_handle(namespace);
+        let _writes = handle.writes.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        let mut state = handle.state.lock().unwrap();
+        match state.manifest.shards {
+            Some(existing) if existing == shards => return Ok(false),
+            Some(existing) => {
+                return Err(KoshaError::InvalidQuery(format!(
+                    "namespace already has {existing} shards; resharding is not supported"
+                )))
+            }
+            None => {}
+        }
+        let pending = state.buffer.as_ref().map_or(0, |b| b.documents.len())
+            + state.recovered.len()
+            + state.recovered_deletes.len();
+        if !state.manifest.segments.is_empty() || pending > 0 {
+            return Err(KoshaError::InvalidQuery(
+                "namespace already holds documents; a shard count can only be set \
+                 on a new, empty namespace"
+                    .into(),
+            ));
+        }
+        state.manifest.shards = Some(shards);
+        state.manifest.version += 1;
+        state.shared_manifest = None;
+        state.known = true;
+        Ok(true)
+    }
+
+    /// The fixed shard count of a sharded root namespace (#207); `None` for
+    /// an ordinary namespace, a shard, or one this indexer does not know.
+    pub fn shard_count(&self, namespace: &NamespaceId) -> Option<u32> {
+        let map = self.namespaces.lock().unwrap();
+        let handle = map.get(namespace)?;
+        let state = handle.state.lock().unwrap();
+        if !state.known {
+            return None;
+        }
+        state.manifest.shards.filter(|&n| n > 1)
     }
 
     pub fn manifest(&self, namespace: &NamespaceId) -> Option<Manifest> {
@@ -2091,6 +2510,7 @@ impl Indexer {
         manifest
             .footer_crc32
             .retain(|segment, _| listed.contains(segment));
+        manifest.retain_listed_segment_homes();
         Some((state.published_version, manifest))
     }
 
@@ -2114,6 +2534,123 @@ impl Indexer {
             .map(|(_, record)| record.documents.len() + record.deleted_ids.len())
             .sum();
         buffered + recovered
+    }
+
+    /// Documents and approximate bytes ([`approx_document_bytes`]) written
+    /// to `namespace` but not yet in a committed segment: the write buffer
+    /// plus a flush round in progress. The backlog `KOSHA_MAX_UNINDEXED_*`
+    /// caps (#255). `(0, 0)` for an unknown namespace.
+    pub fn unindexed_usage(&self, namespace: &NamespaceId) -> (usize, u64) {
+        let map = self.namespaces.lock().unwrap();
+        let Some(handle) = map.get(namespace) else {
+            return (0, 0);
+        };
+        let state = handle.state.lock().unwrap();
+        let flushing = state.flushing_docs.iter().flat_map(|chunk| chunk.iter());
+        let buffered = state.buffer.iter().flat_map(|b| b.documents.iter());
+        flushing.chain(buffered).fold((0, 0), |(docs, bytes), doc| {
+            (docs + 1, bytes + approx_document_bytes(doc))
+        })
+    }
+
+    /// The namespace's unindexed tail (#255): every acknowledged write that
+    /// is not in a segment of the current local manifest, with the indexed
+    /// copies it supersedes. See [`UnindexedTail`].
+    ///
+    /// `expected_version`: the manifest version the caller searches. When
+    /// the local version differs, the result is only a `stale` marker
+    /// carrying the local version. `known_fingerprint`: the fingerprint of
+    /// a tail the caller already holds; when it is still current the result
+    /// is only a `not_modified` marker. Both skip copying the documents.
+    ///
+    /// `None` for a namespace this writer does not know. Computing the
+    /// masks needs the id index (built on the first write anyway); building
+    /// it reads every segment's doc metadata and fails if one is not local.
+    pub fn unindexed_tail(
+        &self,
+        namespace: &NamespaceId,
+        expected_version: Option<u64>,
+        known_fingerprint: Option<&str>,
+    ) -> Result<Option<UnindexedTail>, KoshaError> {
+        let Some(handle) = self.namespaces.lock().unwrap().get(namespace).cloned() else {
+            return Ok(None);
+        };
+        loop {
+            {
+                let state = handle.state.lock().unwrap();
+                if !state.known {
+                    return Ok(None);
+                }
+                let mut tail = UnindexedTail {
+                    manifest_version: state.manifest.version,
+                    wal_checkpoint: state.manifest.wal_checkpoint,
+                    fingerprint: format!(
+                        "{}-{}-{}",
+                        self.instance, state.manifest.version, state.tail_epoch
+                    ),
+                    ..UnindexedTail::default()
+                };
+                if expected_version.is_some_and(|v| v != tail.manifest_version) {
+                    tail.stale = true;
+                    return Ok(Some(tail));
+                }
+                if known_fingerprint == Some(tail.fingerprint.as_str()) {
+                    tail.not_modified = true;
+                    return Ok(Some(tail));
+                }
+                // Oldest first: a flush round in progress holds older
+                // writes than the buffer that kept filling behind it.
+                let documents: Vec<Document> = state
+                    .flushing_docs
+                    .iter()
+                    .flat_map(|chunk| chunk.iter())
+                    .chain(state.buffer.iter().flat_map(|b| b.documents.iter()))
+                    .cloned()
+                    .collect();
+                let documents = dedupe_documents_last_wins(documents);
+                let upserted: HashSet<&DocumentId> = documents.iter().map(|d| &d.id).collect();
+                let mut deleted_ids: Vec<DocumentId> = state
+                    .recovered_deletes
+                    .iter()
+                    .filter(|id| !upserted.contains(id))
+                    .cloned()
+                    .collect();
+                deleted_ids.sort_by(|a, b| a.0.cmp(&b.0));
+                if documents.is_empty() && deleted_ids.is_empty() {
+                    return Ok(Some(tail));
+                }
+                if let Some(index) = state.id_index.as_ref() {
+                    let listed: HashSet<&SegmentId> = state
+                        .manifest
+                        .segments
+                        .iter()
+                        .map(|entry| &entry.segment_id)
+                        .collect();
+                    let mut masked: HashMap<SegmentId, Vec<u32>> = HashMap::new();
+                    for id in upserted.iter().copied().chain(deleted_ids.iter()) {
+                        for (segment, seq) in index.get(id).into_iter().flatten() {
+                            let dead = state
+                                .tombstones
+                                .get(segment)
+                                .is_some_and(|set| set.contains(seq));
+                            if listed.contains(segment) && !dead {
+                                masked.entry(segment.clone()).or_default().push(*seq);
+                            }
+                        }
+                    }
+                    for seqs in masked.values_mut() {
+                        seqs.sort_unstable();
+                        seqs.dedup();
+                    }
+                    drop(upserted);
+                    tail.documents = documents;
+                    tail.deleted_ids = deleted_ids;
+                    tail.masked = masked;
+                    return Ok(Some(tail));
+                }
+            }
+            self.ensure_id_index(namespace, &handle)?;
+        }
     }
 
     /// Materialize immutable sidecars for precisely the snapshot being
@@ -2150,7 +2687,7 @@ impl Indexer {
                 .clone();
             return Ok(Some((expected, manifest)));
         }
-        manifest.deletion_vectors.clear();
+        let previous = std::mem::take(&mut manifest.deletion_vectors);
         for entry in &manifest.segments {
             if let Some(ids) = manifest
                 .tombstones
@@ -2158,6 +2695,20 @@ impl Indexer {
                 .filter(|ids| !ids.is_empty())
             {
                 let (vector, bytes) = kosha_core::deletes::DeletionVector::encode(ids)?;
+                // A bitmap a branch inherited unchanged stays where it is,
+                // in the parent's prefix (#208): never copied, never
+                // written to. Any change produces a new generation, which
+                // goes to this namespace's own prefix.
+                if let Some(inherited) = previous
+                    .get(&entry.segment_id)
+                    .filter(|old| old.is_inherited(namespace))
+                    .filter(|old| old.generation == vector.generation)
+                {
+                    manifest
+                        .deletion_vectors
+                        .insert(entry.segment_id.clone(), inherited.clone());
+                    continue;
+                }
                 let path = self
                     .data_dir
                     .join(vector.path(namespace, &entry.segment_id)?);
@@ -2435,6 +2986,10 @@ impl Indexer {
                 tombstones: tombstones.clone(),
                 // Rebuilt from `tombstones` by `prepare_publication`.
                 deletion_vectors: Default::default(),
+                // Lineage is fixed at branch time; segment homes are the
+                // union (a segment id has one home wherever it is listed),
+                // pruned to the merged segment list below.
+                branch: merge_branch_info(remote.branch.as_ref(), state.manifest.branch.as_ref()),
                 // A schema set on this writer since its last publication
                 // wins (it is the newer admin action); otherwise keep the
                 // remote's, which may carry another writer's change.
@@ -2444,7 +2999,11 @@ impl Indexer {
                     remote.schema.clone()
                 },
                 retired: Default::default(),
+                // Fixed once set (#207): whichever side set it.
+                shards: state.manifest.shards.or(remote.shards),
             };
+            let mut manifest = manifest;
+            manifest.retain_listed_segment_homes();
             (manifest, tombstones, RebaseOutcome::Rebased)
         } else {
             let mut manifest = remote.clone();
@@ -2716,6 +3275,19 @@ fn merge_fields(
     base
 }
 
+/// One flush chunk's segment id, documents and `finalize` outcome.
+type FlushChunkOutcome = (
+    SegmentId,
+    Arc<Vec<Document>>,
+    Result<kosha_core::Footer, KoshaError>,
+);
+
+/// A flush chunk's documents back as an owned list: moved out when this is
+/// the last reference (the usual case), copied otherwise.
+fn unshare_docs(docs: Arc<Vec<Document>>) -> Vec<Document> {
+    Arc::try_unwrap(docs).unwrap_or_else(|shared| (*shared).clone())
+}
+
 /// Last occurrence of each `doc_id` wins (OpenSearch bulk last-write-wins).
 fn dedupe_documents_last_wins(documents: Vec<Document>) -> Vec<Document> {
     let mut last_by_id: HashMap<String, Document> = HashMap::new();
@@ -2730,6 +3302,61 @@ fn dedupe_documents_last_wins(documents: Vec<Document>) -> Vec<Document> {
         .into_iter()
         .filter_map(|id| last_by_id.remove(&id))
         .collect()
+}
+
+/// Hands one compaction input's vector postings to the merged segment's
+/// writer (#253), so the merged index is seeded from them and repaired
+/// with LIRE instead of re-clustering every vector. `remap[old_doc_seq]`
+/// is the doc's merged doc_seq, `u32::MAX` (or out of range) when it was
+/// not copied (deleted or tombstoned) — those members are dropped here.
+///
+/// Columns too small to have useful postings (fewer than
+/// [`kosha_segment::LIRE_ADOPT_MIN_VECTORS`] vectors), without a clustered
+/// index (legacy flat format, missing sidecar) or that fail to read are
+/// skipped: the writer then absorbs their vectors one by one, or
+/// clusters the column from scratch when most of it is uncovered. A
+/// legacy footer, which does not name its vector column, is skipped too.
+fn seed_merged_vector_index(
+    reader: &kosha_segment::SegmentReader,
+    remap: &[u32],
+    writer: &mut kosha_segment::SegmentWriter,
+) {
+    let Some(fields) = reader.footer().vector_fields.clone() else {
+        return;
+    };
+    for meta in fields {
+        if !meta.offsets || (meta.count as usize) < kosha_segment::LIRE_ADOPT_MIN_VECTORS {
+            continue;
+        }
+        let layout = match reader.vector_posting_layout(&meta.name) {
+            Ok(Some(layout)) => layout,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!(
+                    "WARN: compaction: cannot read the vector postings of {} field '{}' ({e}) \
+                     — its vectors are re-clustered instead",
+                    reader.segment_dir().display(),
+                    meta.name
+                );
+                continue;
+            }
+        };
+        let seeds = layout.postings.into_iter().map(|p| {
+            let before = p.doc_seqs.len();
+            let doc_seqs: Vec<u32> = p
+                .doc_seqs
+                .into_iter()
+                .filter_map(|old| remap.get(old as usize).copied())
+                .filter(|&new| new != u32::MAX)
+                .collect();
+            kosha_segment::VectorSeedPosting {
+                centroid: p.centroid,
+                dropped: doc_seqs.len() != before,
+                doc_seqs,
+            }
+        });
+        writer.seed_vector_postings(&meta.name, seeds);
+    }
 }
 
 fn segment_flush_counter(segment_id: &SegmentId) -> Option<u64> {
@@ -2755,6 +3382,25 @@ fn segment_dir_bytes(dir: &std::path::Path) -> Option<u64> {
         }
     }
     Some(total)
+}
+
+/// The branch lineage of a rebased manifest: either side's lineage (they
+/// agree: it is fixed when the branch is created), with both sides' segment
+/// homes.
+fn merge_branch_info(
+    remote: Option<&kosha_core::branch::BranchInfo>,
+    local: Option<&kosha_core::branch::BranchInfo>,
+) -> Option<kosha_core::branch::BranchInfo> {
+    let mut merged = remote.or(local)?.clone();
+    if let (Some(_), Some(local)) = (remote, local) {
+        for (segment, home) in &local.segment_homes {
+            merged
+                .segment_homes
+                .entry(segment.clone())
+                .or_insert_with(|| home.clone());
+        }
+    }
+    Some(merged)
 }
 
 /// Standalone filter applier for delete operations (no Searcher dependency).
@@ -2792,7 +3438,7 @@ mod tests {
             .segments
             .iter()
             .flat_map(|entry| {
-                kosha_segment::SegmentReader::open(dir.join(&ns.0).join(&entry.segment_id.0))
+                kosha_segment::SegmentReader::open(manifest.segment_dir(dir, ns, &entry.segment_id))
                     .unwrap()
                     .iter_doc_records()
                     .map(|r| r.unwrap())
@@ -2805,6 +3451,190 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// Every file under `root`, with its bytes.
+    fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    fn publish(idx: &Indexer, ns: &NamespaceId) -> Manifest {
+        let (_, manifest) = idx.prepare_publication(ns).unwrap().unwrap();
+        idx.acknowledge_manifest(ns, &manifest).unwrap();
+        manifest
+    }
+
+    fn live_ids(dir: &Path, ns: &NamespaceId, manifest: &Manifest) -> Vec<(String, String)> {
+        let mut ids: Vec<_> = live_records(dir, ns, manifest)
+            .into_iter()
+            .map(|r| (r.doc_id.0, r.fields[0].value.clone()))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// #208: a branch references its parent's segments and bitmaps in
+    /// place; its writes, deletes, upserts and compactions go to its own
+    /// prefix and leave every parent byte and the parent manifest as they
+    /// were.
+    #[test]
+    fn a_branch_writes_deletes_and_compacts_without_touching_its_parent() {
+        let dir = std::env::temp_dir().join(format!("kosha-branch-{}", uuid::Uuid::new_v4()));
+        let parent = NamespaceId("t/prod".into());
+        let child = NamespaceId("t/test".into());
+        let idx = Indexer::new(dir.clone());
+        let doc = |id: &str, text: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text), Field::keyword("id", id)],
+        };
+        idx.index_documents(parent.clone(), vec![doc("d1", "one"), doc("d2", "two")])
+            .unwrap();
+        idx.flush_namespace(&parent).unwrap();
+        idx.index_documents(parent.clone(), vec![doc("d3", "three"), doc("d4", "four")])
+            .unwrap();
+        idx.flush_namespace(&parent).unwrap();
+        let filter: FilterClause = serde_json::from_str(r#"{"term": {"id": "d2"}}"#).unwrap();
+        let m = idx.manifest(&parent).unwrap();
+        assert_eq!(idx.delete_by_query(&parent, &m, &filter).unwrap(), 1);
+        let published = publish(&idx, &parent);
+        assert_eq!(published.deletion_vectors.len(), 1);
+        let parent_files = tree_bytes(&dir.join(&parent.0));
+        let parent_manifest = idx.manifest(&parent).unwrap();
+
+        // Branch: the stored manifest references the parent's objects.
+        let mut branch = published.branch_from(&parent, 1);
+        kosha_core::deletes::hydrate(&mut branch, |segment, vector| {
+            Ok(std::fs::read(dir.join(vector.path(&child, segment)?))?)
+        })
+        .unwrap();
+        idx.restore_manifest(child.clone(), branch);
+        assert!(
+            !dir.join(&child.0).exists(),
+            "branching must not write a byte"
+        );
+        let child_manifest = idx.manifest(&child).unwrap();
+        assert_eq!(
+            live_ids(&dir, &child, &child_manifest),
+            live_ids(&dir, &parent, &parent_manifest)
+        );
+        // Publishing the untouched branch keeps the inherited bitmap.
+        let republished = publish(&idx, &child);
+        let vector = republished.deletion_vectors.values().next().unwrap();
+        assert_eq!(vector.namespace.as_ref(), Some(&parent));
+        assert!(!dir.join(&child.0).exists());
+
+        // Write, delete from an inherited segment, upsert an inherited doc.
+        idx.index_documents(child.clone(), vec![doc("d5", "five")])
+            .unwrap();
+        idx.flush_namespace(&child).unwrap();
+        let filter: FilterClause = serde_json::from_str(r#"{"term": {"id": "d1"}}"#).unwrap();
+        let m = idx.manifest(&child).unwrap();
+        assert_eq!(idx.delete_by_query(&child, &m, &filter).unwrap(), 1);
+        idx.replace_documents(child.clone(), vec![doc("d3", "THREE")])
+            .unwrap();
+        idx.flush_namespace(&child).unwrap();
+        let published_child = publish(&idx, &child);
+        for (segment, vector) in &published_child.deletion_vectors {
+            if !vector.is_inherited(&child) {
+                let path = vector.path(&child, segment).unwrap();
+                assert!(path.starts_with("t/test/"), "{path}");
+            }
+        }
+        for entry in &published_child.segments {
+            let home = published_child.segment_home(&child, &entry.segment_id);
+            assert!(
+                home == &parent || entry.segment_id.0.starts_with("t_test-"),
+                "{entry:?} in {home:?}"
+            );
+        }
+
+        // Full compaction merges inherited and own segments into the
+        // branch's prefix.
+        let result = idx
+            .compact_namespace_with_options(&child, CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
+        let compacted = publish(&idx, &child);
+        assert_eq!(compacted.segments.len(), 1);
+        assert!(!compacted.is_inherited_segment(&child, &compacted.segments[0].segment_id));
+        assert!(
+            compacted.branch.as_ref().unwrap().segment_homes.is_empty(),
+            "homes of compacted-away segments are pruned"
+        );
+        let expected_child = vec![
+            ("d3".to_string(), "THREE".to_string()),
+            ("d4".to_string(), "four".to_string()),
+            ("d5".to_string(), "five".to_string()),
+        ];
+        assert_eq!(
+            live_ids(&dir, &child, &idx.manifest(&child).unwrap()),
+            expected_child
+        );
+
+        // The parent: same bytes, same manifest, same documents.
+        assert_eq!(tree_bytes(&dir.join(&parent.0)), parent_files);
+        assert!(idx
+            .manifest(&parent)
+            .unwrap()
+            .same_contents(&parent_manifest));
+        assert_eq!(
+            live_ids(&dir, &parent, &idx.manifest(&parent).unwrap()),
+            vec![
+                ("d1".to_string(), "one".to_string()),
+                ("d3".to_string(), "three".to_string()),
+                ("d4".to_string(), "four".to_string()),
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn drop_namespace_refuses_unpublished_writes_and_forgets_published_ones() {
+        let dir = std::env::temp_dir().join(format!("kosha-drop-{}", uuid::Uuid::new_v4()));
+        let ns = NamespaceId("t/branch".into());
+        let idx = Indexer::new(dir.clone());
+        let doc = Document {
+            id: DocumentId("a".into()),
+            fields: vec![Field::text("text", "hello")],
+        };
+        idx.index_documents(ns.clone(), vec![doc.clone()]).unwrap();
+        let mut ran = false;
+        let refused = idx.drop_branch_namespace(&ns, || {
+            ran = true;
+            Ok(())
+        });
+        assert!(matches!(refused, Err(KoshaError::InvalidQuery(_))));
+        assert!(!ran, "nothing is removed while writes are unpublished");
+        idx.flush_namespace(&ns).unwrap();
+        publish(&idx, &ns);
+        // A failing removal leaves the namespace as it was.
+        assert!(idx
+            .drop_branch_namespace(&ns, || Err(KoshaError::ControlPlane("down".into())))
+            .is_err());
+        assert!(idx.manifest(&ns).is_some());
+        idx.drop_branch_namespace(&ns, || Ok(())).unwrap();
+        assert!(idx.manifest(&ns).is_none());
+        assert!(!idx.namespaces().contains(&ns));
+        // A restart has nothing to replay: the WAL was cleared on publish.
+        drop(idx);
+        let restarted = Indexer::new(dir.clone());
+        assert_eq!(restarted.pending_doc_count(&ns), 0);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3063,6 +3893,93 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// #255: the unindexed tail is the buffer, relative to the local
+    /// manifest version, with a fingerprint that changes with it.
+    #[test]
+    fn unindexed_tail_follows_buffer_and_flushes() {
+        let dir = std::env::temp_dir().join(format!("kosha-tail-buffer-{}", uuid::Uuid::new_v4()));
+        let idx = Indexer::new(dir.clone()).with_flush_threshold(100);
+        let ns = NamespaceId("ns".into());
+        let doc = |id: &str, text: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", text)],
+        };
+        assert!(idx.unindexed_tail(&ns, None, None).unwrap().is_none());
+        idx.index_documents(ns.clone(), vec![doc("a", "one"), doc("b", "two")])
+            .unwrap();
+        idx.index_documents(ns.clone(), vec![doc("a", "three")])
+            .unwrap();
+        let tail = idx.unindexed_tail(&ns, None, None).unwrap().unwrap();
+        assert_eq!(tail.manifest_version, 0);
+        let ids: Vec<_> = tail.documents.iter().map(|d| d.id.0.as_str()).collect();
+        assert_eq!(ids, ["b", "a"], "newest version of each id, oldest first");
+        assert_eq!(tail.documents[1].fields[0].value, "three");
+        assert!(tail.masked.is_empty() && tail.deleted_ids.is_empty());
+        assert_eq!(idx.unindexed_usage(&ns).0, 2);
+        assert!(idx.unindexed_usage(&ns).1 > 0);
+
+        // Same state: the caller's copy is still current.
+        let same = idx
+            .unindexed_tail(&ns, Some(0), Some(&tail.fingerprint))
+            .unwrap()
+            .unwrap();
+        assert!(same.not_modified && same.documents.is_empty());
+        // Another manifest version: only a stale marker.
+        let stale = idx.unindexed_tail(&ns, Some(7), None).unwrap().unwrap();
+        assert!(stale.stale && stale.documents.is_empty());
+        assert_eq!(stale.manifest_version, 0);
+
+        idx.index_documents(ns.clone(), vec![doc("c", "four")])
+            .unwrap();
+        let grown = idx.unindexed_tail(&ns, None, None).unwrap().unwrap();
+        assert_ne!(grown.fingerprint, tail.fingerprint);
+        assert_eq!(grown.documents.len(), 3);
+
+        idx.flush_namespace(&ns).unwrap();
+        let flushed = idx.unindexed_tail(&ns, None, None).unwrap().unwrap();
+        assert!(flushed.is_empty());
+        assert_eq!(flushed.manifest_version, idx.manifest_version(&ns).unwrap());
+        assert_eq!(idx.unindexed_usage(&ns), (0, 0));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #255: WAL-recovered writes awaiting replay are in the tail, with
+    /// masks for the indexed copies they replace or delete.
+    #[test]
+    fn unindexed_tail_masks_replayed_upserts_and_deletes() {
+        let dir = std::env::temp_dir().join(format!("kosha-tail-replay-{}", uuid::Uuid::new_v4()));
+        let ns = NamespaceId("ns".into());
+        let doc = |id: &str, text: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![
+                Field::text("text", text),
+                Field::keyword("status", "remove"),
+            ],
+        };
+        let idx = Indexer::new(dir.clone());
+        idx.index_documents(ns.clone(), vec![doc("same", "old"), doc("gone", "x")])
+            .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let committed = idx.manifest(&ns).unwrap();
+        idx.acknowledge_manifest(&ns, &committed).unwrap();
+        // Crash after WAL appends that never reached a segment.
+        idx.wal.append(&ns, &[doc("same", "new")]).unwrap();
+        idx.wal
+            .append_delete(&ns, vec![DocumentId("gone".into())])
+            .unwrap();
+        drop(idx);
+        let restart = Indexer::new(dir.clone());
+        restart.restore_manifest(ns.clone(), committed.clone());
+        let tail = restart.unindexed_tail(&ns, None, None).unwrap().unwrap();
+        assert_eq!(tail.manifest_version, committed.version);
+        assert_eq!(tail.documents.len(), 1);
+        assert_eq!(tail.documents[0].fields[0].value, "new");
+        assert_eq!(tail.deleted_ids, vec![DocumentId("gone".into())]);
+        let segment = &committed.segments[0].segment_id;
+        assert_eq!(tail.masked.get(segment), Some(&vec![0, 1]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn regression_recovered_upsert_replaces_committed_version() {
         let dir = std::env::temp_dir().join("kosha-regression-replay-upsert");
@@ -3207,6 +4124,236 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #253: `lire` compaction seeds the merged vector index from the
+    /// inputs' postings (remapped to merged doc_seqs, tombstoned members
+    /// dropped); `rebuild` clusters from scratch. Both stay searchable by
+    /// the current reader and hold every live vector exactly once.
+    #[test]
+    fn lire_compaction_reuses_input_postings_and_remaps_doc_seqs() {
+        use kosha_segment::VectorCompactionMode;
+        fn vector(i: u64) -> Vec<f32> {
+            let mut s = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            };
+            let c = (i % 16) as f32;
+            (0..16)
+                .map(|d| if d as f32 == c { 3.0 } else { 0.0 } + next() * 0.5)
+                .collect()
+        }
+        fn layout(
+            dir: &std::path::Path,
+            ns: &NamespaceId,
+            seg: &SegmentId,
+        ) -> Vec<(Vec<f32>, Vec<u32>)> {
+            let reader = kosha_segment::SegmentReader::open(dir.join(&ns.0).join(&seg.0)).unwrap();
+            reader
+                .vector_posting_layout("emb")
+                .unwrap()
+                .unwrap()
+                .postings
+                .into_iter()
+                .map(|p| (p.centroid, p.doc_seqs))
+                .collect()
+        }
+        for mode in [VectorCompactionMode::Lire, VectorCompactionMode::Rebuild] {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-lire-compact-{mode:?}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            // One 2,000-doc input: big enough to have its postings adopted.
+            let idx = Indexer::new(dir.clone())
+                .with_flush_threshold(10_000)
+                .with_max_concurrent_flush_writers(1);
+            let ns = NamespaceId("lire".into());
+            let doc = |id: u64, v: Vec<f32>| Document {
+                id: DocumentId(format!("d{id}")),
+                fields: vec![
+                    Field::text("text", format!("doc {id}")),
+                    Field::vector("emb", v),
+                ],
+            };
+            idx.index_documents(ns.clone(), (0..2_000).map(|i| doc(i, vector(i))).collect())
+                .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+            let big = idx.manifest(&ns).unwrap().segments[0].segment_id.clone();
+            let input = layout(&dir, &ns, &big);
+            // Update 4 docs (tombstones in `big`) with new vectors: at most
+            // 8 of the input's postings change.
+            let updated: Vec<u64> = (0..4).map(|k| k * 397).collect();
+            idx.index_documents(
+                ns.clone(),
+                updated
+                    .iter()
+                    .map(|&i| doc(i, vector(10_000 + i)))
+                    .collect(),
+            )
+            .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+
+            let result = idx
+                .compact_namespace_with_options(&ns, CompactOptions::full().with_vector_index(mode))
+                .unwrap();
+            assert!(result.merged);
+            let manifest = idx.manifest(&ns).unwrap();
+            assert_eq!(manifest.segments.len(), 1);
+            let merged_id = manifest.segments[0].segment_id.clone();
+            let merged = layout(&dir, &ns, &merged_id);
+
+            let mut seqs: Vec<u32> = merged.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+            seqs.sort_unstable();
+            assert_eq!(seqs, (0..2_000).collect::<Vec<u32>>(), "{mode:?}");
+
+            // Re-normalizing a stored (unit) centroid may move its last bit.
+            let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+            let reused = input
+                .iter()
+                .filter(|(c, _)| merged.iter().any(|(m, _)| same(m, c)))
+                .count();
+            match mode {
+                VectorCompactionMode::Lire => assert!(
+                    reused * 2 >= input.len(),
+                    "lire reused only {reused} of {} input postings",
+                    input.len()
+                ),
+                VectorCompactionMode::Rebuild => assert_eq!(reused, 0),
+            }
+
+            // doc_seqs were remapped right: each doc's (current) vector
+            // finds that doc.
+            let reader =
+                kosha_segment::SegmentReader::open(dir.join(&ns.0).join(&merged_id.0)).unwrap();
+            for i in (0..2_000u64).step_by(41).chain(updated.iter().copied()) {
+                let v = if updated.contains(&i) {
+                    vector(10_000 + i)
+                } else {
+                    vector(i)
+                };
+                let hits = reader.knn_search(&v, 1, 1_000).unwrap().unwrap();
+                let rec = reader.doc_record_full(hits[0].0).unwrap().unwrap();
+                assert_eq!(rec.doc_id.0, format!("d{i}"), "{mode:?}");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// #204: each vector column keeps its own index across a compaction,
+    /// which re-adds every document through `SegmentWriter`.
+    #[test]
+    fn compaction_preserves_vector_columns() {
+        let dir =
+            std::env::temp_dir().join(format!("kosha-compact-columns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("cols".into());
+        let title = |i: usize| vec![i as f32 + 1.0, 0.5, -(i as f32), 0.25];
+        let body = |i: usize| -> Vec<f32> { (0..8).map(|d| (d * i) as f32 * 0.1 + 0.3).collect() };
+        for i in 0..4 {
+            let mut fields = vec![Field::text("text", format!("doc {i}"))];
+            if i != 1 {
+                fields.push(Field::vector("title_emb", title(i)));
+            }
+            if i != 2 {
+                fields.push(Field::vector("body_emb", body(i)));
+            }
+            idx.index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId(format!("d{i}")),
+                    fields,
+                }],
+            )
+            .unwrap();
+            idx.flush_namespace(&ns).unwrap();
+        }
+        let result = idx
+            .compact_namespace_with_options(&ns, CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
+        let after = idx.manifest(&ns).unwrap();
+        assert_eq!(after.segments.len(), 1);
+        let seg_dir = dir.join(&ns.0).join(&after.segments[0].segment_id.0);
+        let reader = kosha_segment::SegmentReader::open(seg_dir).unwrap();
+        let columns: Vec<(String, u32, u32)> = reader
+            .footer()
+            .vector_fields
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.name, m.dim, m.count))
+            .collect();
+        assert_eq!(
+            columns,
+            vec![("title_emb".into(), 4, 3), ("body_emb".into(), 8, 3)]
+        );
+        for (field, query, missing) in [("title_emb", title(3), "d1"), ("body_emb", body(3), "d2")]
+        {
+            let hits = reader
+                .knn_search_filtered(field, &query, 10, 100, None)
+                .unwrap()
+                .unwrap();
+            let ids: Vec<String> = hits
+                .iter()
+                .map(|(seq, _)| reader.doc_meta(*seq).unwrap().doc_id.to_owned())
+                .collect();
+            assert_eq!(ids.len(), 3, "{field}: {ids:?}");
+            assert_eq!(ids[0], "d3", "{field}: exact match first");
+            assert!(!ids.iter().any(|id| id == missing), "{field}: {ids:?}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #204: a vector whose dimension differs from its field's is rejected
+    /// at the write API, whether the field's dimension was fixed by a
+    /// flushed segment, by buffered documents, or earlier in the batch.
+    #[test]
+    fn vector_of_the_wrong_dimension_is_rejected_at_write() {
+        let dir = std::env::temp_dir().join(format!("kosha-vector-dims-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ns = NamespaceId("dims".into());
+        let doc = |id: &str, field: &str, dim: usize| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::vector(field, vec![0.5; dim])],
+        };
+        let rejected = |r: Result<usize, KoshaError>| matches!(r, Err(KoshaError::InvalidQuery(ref m)) if m.contains("dimensions"));
+
+        let idx = Indexer::new(dir.clone());
+        idx.index_documents(ns.clone(), vec![doc("a", "emb", 4)])
+            .unwrap();
+        // Fixed by the buffered document.
+        assert!(rejected(
+            idx.index_documents(ns.clone(), vec![doc("b", "emb", 3)])
+        ));
+        // Within one batch.
+        assert!(rejected(idx.index_documents(
+            ns.clone(),
+            vec![doc("c", "other", 2), doc("d", "other", 5)]
+        )));
+        // A different field has its own dimension.
+        idx.index_documents(ns.clone(), vec![doc("e", "other", 8)])
+            .unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        assert!(rejected(
+            idx.replace_documents(ns.clone(), vec![doc("a", "emb", 2)])
+        ));
+
+        // Fixed by a flushed segment's footer, for a fresh process.
+        let manifest = idx.manifest(&ns).unwrap();
+        let restarted = Indexer::new(dir.clone());
+        restarted.restore_manifest(ns.clone(), manifest);
+        assert!(rejected(
+            restarted.index_documents(ns.clone(), vec![doc("f", "other", 4)])
+        ));
+        restarted
+            .index_documents(ns.clone(), vec![doc("g", "other", 8), doc("h", "emb", 4)])
+            .unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
