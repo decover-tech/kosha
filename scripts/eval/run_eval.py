@@ -56,6 +56,10 @@ client = KoshaClient(hosts=[args.host], namespace=args.namespace, timeout=120)
 samples = gzip.open(os.path.join(args.out, "samples.jsonl.gz"), "wt")
 samples_lock = threading.Lock()
 random.seed(3)
+# Every request carries an id the server prints on its log lines, so a slow
+# or failed request here can be found in the pod that served it (bundle.py).
+RUN_ID = f"ev{int(time.time()) % 10**8}"
+request_numbers = iter(range(1, 10**9))
 
 
 def utc():
@@ -77,15 +81,17 @@ def send(case, phase, cached=False, body=None):
     body = dict(body or case["request"])
     if not cached:
         body["request_cache"] = False
+    with samples_lock:
+        rid = f"{RUN_ID}-{next(request_numbers)}"
     started = time.perf_counter()
     response = error = None
     try:
-        response = client.search(body=body)
+        response = client.search(body=body, headers={"X-Request-Id": rid})
     except Exception as e:  # recorded, never hidden
         error = f"{getattr(e, 'status_code', type(e).__name__)} {str(getattr(e, 'error', e))[:90]}"
     ms = (time.perf_counter() - started) * 1000
     with samples_lock:
-        samples.write(json.dumps({"t": round(time.time(), 3), "phase": phase, "case": case["id"],
+        samples.write(json.dumps({"t": round(time.time(), 3), "rid": rid, "phase": phase, "case": case["id"],
                                   "area": case["area"], "ms": round(ms, 2), "error": error}) + "\n")
     return response, ms, error
 
@@ -168,9 +174,9 @@ def recall(case, response):
     return min(len(as_close), k) / max(1, k), top_right
 
 
-def load(clients, seconds, phase):
+def load(clients, seconds, phase, semantic=True):
     """`clients` threads sending a random mix for `seconds`."""
-    pool = [c for c in cases if c["area"] in LOAD_AREAS]
+    pool = [c for c in cases if c["area"] in LOAD_AREAS and (semantic or c["area"] != "knn")]
     lat, errors, stop, lock = [], collections.Counter(), time.time() + seconds, threading.Lock()
 
     def worker(seed):
@@ -189,7 +195,7 @@ def load(clients, seconds, phase):
             **summary(lat), "errors": sum(errors.values()), "errors_by_reason": errors}
 
 
-report = {"matter": manifest["matter"], "evalset_version": manifest["version"], "mode": args.mode,
+report = {"matter": manifest["matter"], "evalset_version": manifest["version"], "mode": args.mode, "run_id": RUN_ID,
           "host": args.host, "namespace": args.namespace, "started": utc(), "cases": len(cases)}
 failures = open(os.path.join(args.out, "failures.jsonl"), "w")
 
@@ -247,6 +253,8 @@ print("latency done", flush=True)
 # ── 3. Adding clients, then a sustained run ────────────────────────────────
 levels, seconds = mode["ramp"]
 report["concurrency"] = [load(n, seconds, f"clients-{n}") for n in levels]
+# The same top level without semantic queries, to tell their cost apart.
+report["concurrency_no_semantic"] = [load(levels[-1], seconds, f"clients-{levels[-1]}-no-semantic", semantic=False)]
 if mode["sustained"]:
     minutes = [load(8, 60, f"sustained-{m:02d}") for m in range(mode["sustained"])]
     report["sustained"] = {"clients": 8, "minutes": len(minutes), "p95_first_5_min": pct([m["p95"] or 0 for m in minutes[:5]], 0.5),
@@ -284,6 +292,9 @@ for key, title in (("latency_first_ms", "first request"), ("latency_warm_ms", "w
 out += ["", "Adding clients (mixed requests)", "", "| Clients | Requests/s | p50 | p90 | p95 | Errors |", "|---|---|---|---|---|---|"]
 out += [f"| {r['clients']} | {r['requests_per_second']} | {r['p50']} | {r['p90']} | {r['p95']} | {r['errors']} {r['errors_by_reason'] or ''} |"
         for r in report["concurrency"]]
+r = report["concurrency_no_semantic"][0]
+out += ["", f"Without semantic queries at {r['clients']} clients: {r['requests_per_second']} requests/s, "
+        f"p50 {r['p50']}, p95 {r['p95']} ms, {r['errors']} error(s)."]
 if "sustained" in report:
     s = report["sustained"]
     out += ["", f"Sustained {s['minutes']} min at {s['clients']} clients: p95 {s['p95_first_5_min']} ms in the first 5 minutes, "
