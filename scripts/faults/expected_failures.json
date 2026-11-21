@@ -1,0 +1,9 @@
+{
+  "_comment": "Known engine bugs the fault suite trips, in the same format as scripts/integration/expected_failures.json. 'checks' maps fnmatch globs over check ids (<scenario>:<aspect>[@<pod>]) to a key in 'bugs'; each bug names its GitHub issue. Delete a bug and its globs when it is fixed. --strict also fails when a listed check passes.",
+  "bugs": {
+    "#330": "Concurrent first-boot migrations race: CREATE SCHEMA IF NOT EXISTS fails with a duplicate key on pg_namespace, so one of several pods booting against an unmigrated database exits"
+  },
+  "checks": {
+    "first-boot:*": "#330"
+  }
+}
