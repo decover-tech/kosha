@@ -524,7 +524,8 @@ fn compaction_scheduler_placement_follows_the_role() {
 /// admin API, over a real socket.
 #[test]
 fn indexer_serves_only_probes_and_compaction_admin() {
-    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpStream;
     let shared = Arc::new(Mutex::new(kosha_control::Controller::new()));
     let (indexer, _) = state(&shared, role::Role::Indexer, true);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -537,8 +538,7 @@ fn indexer_serves_only_probes_and_compaction_admin() {
                 .as_bytes(),
         )
         .unwrap();
-        let mut resp = String::new();
-        s.read_to_string(&mut resp).unwrap();
+        let resp = crate::http::read_response_string(&mut s).unwrap();
         status(&resp)
     };
     assert_eq!(get("GET", "/healthz"), 200);
