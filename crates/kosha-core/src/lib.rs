@@ -2201,6 +2201,11 @@ pub enum VectorQuantization {
     /// Scalar-quantized entries: one `f32` scale per vector and `dim`
     /// signed bytes, ~4x smaller than `f32`.
     I8,
+    /// RaBitQ 1-bit codes against the posting centroid: two `f32`s and one
+    /// bit per (power-of-two padded) dimension, ~30x smaller than `f32` at
+    /// embedding dimensions.
+    #[serde(rename = "rabitq")]
+    RaBitQ,
 }
 
 impl VectorQuantization {
@@ -2208,11 +2213,13 @@ impl VectorQuantization {
         *self == VectorQuantization::F32
     }
 
-    /// Parses `f32` / `i8` (case-insensitive); `None` for anything else.
+    /// Parses `f32` / `i8` / `rabitq` (case-insensitive); `None` for
+    /// anything else.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "f32" => Some(Self::F32),
             "i8" | "int8" => Some(Self::I8),
+            "rabitq" => Some(Self::RaBitQ),
             _ => None,
         }
     }
@@ -2221,6 +2228,7 @@ impl VectorQuantization {
         match self {
             Self::F32 => "f32",
             Self::I8 => "i8",
+            Self::RaBitQ => "rabitq",
         }
     }
 }
