@@ -91,3 +91,33 @@ python3 query_bench.py --host http://localhost:8080 \
   distribution (turbopuffer's is undocumented; this uses a Zipfian synthetic
   corpus), and whether tpuf-benchmark's "8 QPS" is per-namespace or
   aggregate across concurrent namespaces.
+
+## Logs and tail analysis
+
+Every CI benchmark run (`.github/workflows/benchmark.yml`) archives its
+server logs and per-request records to
+`s3://decoverai-bench-corpus-cache/runs/<run_id>/`, including failed runs:
+
+- `<suite>/<phase>.json`: summary percentiles (also in the job artifact)
+- `<suite>/<phase>.requests.jsonl.gz`: one record per request (query
+  index, term count, client send lag, latency, hits, and the server's own
+  phase timings, from `query_bench.py --raw-out --server-timings` with
+  `KOSHA_DASHBOARD=on`)
+- `<suite>/server/warmup.log.gz`, `<suite>/server/<phase>.log.gz`: the
+  server log for each stage, including the `search timing:` line per request
+- `server/full.log.gz`, `meta.json` (commit, inputs)
+
+A VM kept after a failed run has its container log rescued to
+`runs/rescued-<timestamp>/` before the next run recreates the container.
+
+To see where a phase's tail comes from:
+
+```bash
+aws s3 cp s3://decoverai-bench-corpus-cache/runs/<run_id>/bm25/warm_or_nocache.requests.jsonl.gz .
+python3 analyze_tail.py warm_or_nocache.requests.jsonl.gz --queries queries.txt
+```
+
+It splits client latency into server time vs time outside the engine,
+breaks the p99+ requests down by server phase, tells query-intrinsic cost
+(same queries slow every time) from contention (slow once, fast on
+repeats), and shows the tail by minute and by requests in flight.
