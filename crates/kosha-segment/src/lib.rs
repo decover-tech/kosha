@@ -1263,6 +1263,10 @@ impl SegmentWriter {
                 // Radii were computed above from the exact vectors, so the
                 // probe's lower bound stays a bound on the true distance.
                 I8_VECTOR_INDEX_VERSION
+            } else if radius_aware && quantization == VectorQuantization::RaBitQ {
+                // Same: radii from exact vectors; codes are relative to the
+                // final (renormalized, on-disk) centroids.
+                RABITQ_VECTOR_INDEX_VERSION
             } else if radius_aware {
                 RADIUS_AWARE_VECTOR_INDEX_VERSION
             } else {
@@ -1622,12 +1626,29 @@ pub const RADIUS_AWARE_VECTOR_INDEX_VERSION: u32 = 3;
 /// that knows it. The footer's `VectorFieldMeta::quantization` records the
 /// choice per column; the header version alone decides how entries parse.
 pub const I8_VECTOR_INDEX_VERSION: u32 = 4;
+/// Version 5: everything version 3 is, but each `vector.idx` entry is a
+/// RaBitQ 1-bit code of the entry's residual from its posting centroid
+/// (see `kosha_vector_spfresh::encode_rabitq`): `[id:u32]
+/// [residual_norm:f32][ip:f32][bits: rabitq_code_bytes(dim)]`. At
+/// `dim = 1024` that is 140 bytes instead of 4100 (f32) or 1032 (i8).
+/// The code needs its posting's centroid to decode, so a column without a
+/// valid `vector.offsets` cannot fall back to the eager flat scan; it is
+/// served as degraded instead.
+///
+/// Scores are estimates with a per-entry error bound; the probe rescores
+/// the candidates the bound cannot rule out (at least `k *
+/// vector_rescore_factor`) from `doc_vectors.bin`. Same rollout rule as
+/// version 4: written only when `KOSHA_VECTOR_QUANTIZATION` (or a per-field
+/// override) asks for `rabitq`, which must stay off until every query pod
+/// reads this version.
+pub const RABITQ_VECTOR_INDEX_VERSION: u32 = 5;
 
 pub fn is_known_vector_index_version(version: u32) -> bool {
     version == VECTOR_INDEX_VERSION
         || version == UNIT_NORM_VECTOR_INDEX_VERSION
         || version == RADIUS_AWARE_VECTOR_INDEX_VERSION
         || version == I8_VECTOR_INDEX_VERSION
+        || version == RABITQ_VECTOR_INDEX_VERSION
 }
 
 /// Whether `version`'s `vector.idx` entries are i8-quantized (see
@@ -1637,10 +1658,24 @@ pub fn is_i8_vector_index_version(version: u32) -> bool {
     version == I8_VECTOR_INDEX_VERSION
 }
 
+/// Whether `version`'s `vector.idx` entries are RaBitQ codes (see
+/// [`RABITQ_VECTOR_INDEX_VERSION`]). `==`, like the i8 check.
+pub fn is_rabitq_vector_index_version(version: u32) -> bool {
+    version == RABITQ_VECTOR_INDEX_VERSION
+}
+
+/// Whether `version`'s entries score approximately (i8 or RaBitQ), so the
+/// probe rescores its shortlist at full precision.
+fn is_quantized_vector_index_version(version: u32) -> bool {
+    is_i8_vector_index_version(version) || is_rabitq_vector_index_version(version)
+}
+
 /// Bytes of one `vector.idx` entry (id included) for `version`.
 fn vector_entry_size(dim: u32, version: u32) -> usize {
     if is_i8_vector_index_version(version) {
         4 + 4 + dim as usize
+    } else if is_rabitq_vector_index_version(version) {
+        4 + 4 + 4 + kosha_vector_spfresh::rabitq_code_bytes(dim as usize)
     } else {
         4 + 4 * dim as usize
     }
@@ -1697,12 +1732,20 @@ fn encode_vector_index_v2(
 
     let radius_aware = version >= RADIUS_AWARE_VECTOR_INDEX_VERSION;
     let quantized = is_i8_vector_index_version(version);
+    let rabitq = is_rabitq_vector_index_version(version)
+        .then(|| kosha_vector_spfresh::RaBitQRotation::new(dim as usize));
     let mut codes: Vec<i8> = Vec::with_capacity(dim as usize);
+    let mut bits: Vec<u8> = Vec::new();
     for p in postings {
         let offset = idx_buf.len() as u64;
         for (id, v) in &p.entries {
             idx_buf.extend_from_slice(&id.to_le_bytes());
-            if quantized {
+            if let Some(rotation) = &rabitq {
+                let code = kosha_vector_spfresh::encode_rabitq(rotation, v, &p.centroid, &mut bits);
+                idx_buf.extend_from_slice(&code.residual_norm.to_le_bytes());
+                idx_buf.extend_from_slice(&code.ip.to_le_bytes());
+                idx_buf.extend_from_slice(&bits);
+            } else if quantized {
                 let scale = kosha_vector_spfresh::quantize_i8(v, &mut codes);
                 idx_buf.extend_from_slice(&scale.to_le_bytes());
                 idx_buf.extend(codes.iter().map(|&c| c as u8));
@@ -1885,6 +1928,11 @@ fn parse_vector_idx_header(data: &[u8]) -> Option<(u32, u32, u32)> {
 /// `try_read_doc_index`'s doc-count cross-check.
 fn parse_vector_idx_eager(data: &[u8]) -> Option<VectorStore> {
     let (dim, total_count, version) = parse_vector_idx_header(data)?;
+    if is_rabitq_vector_index_version(version) {
+        // RaBitQ codes are residuals from posting centroids, which live in
+        // the sidecar this fallback is serving without.
+        return None;
+    }
     let record_size = vector_entry_size(dim, version);
     // Checked: a corrupt header's dim and count can overflow the product
     // (#257 fuzzing), which must read as corruption, not wrap or panic.
@@ -1899,6 +1947,7 @@ fn parse_vector_idx_eager(data: &[u8]) -> Option<VectorStore> {
     let vectors = match decode_posting_entries(&data[VECTOR_IDX_HEADER_LEN..], dim, version) {
         VectorPosting::F32(vectors) => vectors,
         quantized @ VectorPosting::I8 { .. } => quantized.dequantized(),
+        VectorPosting::RaBitQ { .. } => return None,
     };
     Some(VectorStore {
         vectors,
@@ -2015,6 +2064,26 @@ fn decode_posting_entries(mut cursor: &[u8], dim: u32, version: u32) -> VectorPo
             codes,
         };
     }
+    if is_rabitq_vector_index_version(version) {
+        let code_bytes = kosha_vector_spfresh::rabitq_code_bytes(dim as usize);
+        let mut ids = Vec::with_capacity(count);
+        let mut codes = Vec::with_capacity(count);
+        let mut bits = Vec::with_capacity(count * code_bytes);
+        for _ in 0..count {
+            ids.push(read_u32_le(&mut cursor));
+            let residual_norm = read_f32_le(&mut cursor);
+            let ip = read_f32_le(&mut cursor);
+            codes.push(kosha_vector_spfresh::RaBitQCode { residual_norm, ip });
+            bits.extend_from_slice(&cursor[..code_bytes]);
+            cursor = &cursor[code_bytes..];
+        }
+        return VectorPosting::RaBitQ {
+            code_bytes,
+            ids,
+            codes,
+            bits,
+        };
+    }
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let id = read_u32_le(&mut cursor);
@@ -2041,6 +2110,51 @@ enum VectorPosting {
         scales: Vec<f32>,
         codes: Vec<i8>,
     },
+    /// RaBitQ codes (version 5). Entry `i` is `ids[i]`, `codes[i]`, bits
+    /// `bits[i * code_bytes..(i + 1) * code_bytes]`. Only scorable with the
+    /// posting's centroid (see [`ProbeQuery`]).
+    RaBitQ {
+        code_bytes: usize,
+        ids: Vec<u32>,
+        codes: Vec<kosha_vector_spfresh::RaBitQCode>,
+        bits: Vec<u8>,
+    },
+}
+
+/// A kNN query prepared once per vector column, for scoring that column's
+/// postings with [`VectorPosting::for_each_similarity`].
+struct ProbeQuery<'q> {
+    /// The query unit-normalized for quantized columns (whose entries
+    /// score against a unit query); the raw query otherwise, unused there.
+    unit: std::borrow::Cow<'q, [f32]>,
+    /// The rotated query lookup table, for a RaBitQ column.
+    rabitq: Option<std::rc::Rc<kosha_vector_spfresh::RaBitQQuery>>,
+}
+
+/// The [`kosha_vector_spfresh::RaBitQQuery`] for `unit_query`. It depends
+/// only on the query and its dimension (every RaBitQ code is written with
+/// the same rotation), so each thread keeps the last one it built: a query
+/// probing many segments builds its lookup table once per scoring thread,
+/// not once per segment.
+fn rabitq_query_for(unit_query: &[f32]) -> std::rc::Rc<kosha_vector_spfresh::RaBitQQuery> {
+    type Last = Option<(Vec<f32>, std::rc::Rc<kosha_vector_spfresh::RaBitQQuery>)>;
+    thread_local! {
+        static LAST: std::cell::RefCell<Last> = const { std::cell::RefCell::new(None) };
+    }
+    LAST.with(|last| {
+        let mut last = last.borrow_mut();
+        if let Some((query, built)) = last.as_ref() {
+            if query.as_slice() == unit_query {
+                return std::rc::Rc::clone(built);
+            }
+        }
+        let rotation = kosha_vector_spfresh::RaBitQRotation::new(unit_query.len());
+        let built = std::rc::Rc::new(kosha_vector_spfresh::RaBitQQuery::new(
+            &rotation, unit_query,
+        ));
+        *last = Some((unit_query.to_vec(), std::rc::Rc::clone(&built)));
+        built
+    })
 }
 
 impl VectorPosting {
@@ -2057,21 +2171,32 @@ impl VectorPosting {
                 VectorPosting::I8 {
                     ids, scales, codes, ..
                 } => ids.len() * 4 + scales.len() * 4 + codes.len(),
+                VectorPosting::RaBitQ {
+                    ids, codes, bits, ..
+                } => {
+                    ids.len() * 4
+                        + codes.len() * std::mem::size_of::<kosha_vector_spfresh::RaBitQCode>()
+                        + bits.len()
+                }
             }
     }
 
-    /// Calls `emit(id, similarity)` for every entry `accept` lets through
-    /// (all of them when `None`). `f32_similarity` scores an f32 entry —
-    /// each caller keeps the formula it has always used. An i8 entry is
-    /// scored against `unit_query` (the query, unit-normalized; only read
-    /// for i8) as `scale * Σ q_i·code_i`, clamped like the f32 dot path:
-    /// the stored vector is unit-norm, so that is its cosine.
+    /// Calls `emit(id, similarity, error_bound)` for every entry `accept`
+    /// lets through (all of them when `None`). `f32_similarity` scores an
+    /// f32 entry — each caller keeps the formula it has always used. An i8
+    /// entry is scored against `probe.unit` (the query, unit-normalized) as
+    /// `scale * Σ q_i·code_i`, clamped like the f32 dot path: the stored
+    /// vector is unit-norm, so that is its cosine. A RaBitQ entry is
+    /// estimated from `probe.rabitq` and `centroid` (this posting's
+    /// centroid, unit-norm), with RaBitQ's error bound; f32 and i8 entries
+    /// report a bound of `0`.
     fn for_each_similarity(
         &self,
         accept: Option<&dyn Fn(u32) -> bool>,
         f32_similarity: impl Fn(&[f32]) -> f32,
-        unit_query: &[f32],
-        mut emit: impl FnMut(u32, f32),
+        probe: &ProbeQuery<'_>,
+        centroid: &[f32],
+        mut emit: impl FnMut(u32, f32, f32),
     ) {
         match self {
             VectorPosting::F32(entries) => {
@@ -2079,7 +2204,7 @@ impl VectorPosting {
                     if accept.is_some_and(|accept| !accept(*id)) {
                         continue;
                     }
-                    emit(*id, f32_similarity(v));
+                    emit(*id, f32_similarity(v), 0.0);
                 }
             }
             VectorPosting::I8 {
@@ -2093,16 +2218,40 @@ impl VectorPosting {
                         continue;
                     }
                     let entry = &codes[i * dim..(i + 1) * dim];
-                    let sim = kosha_vector_spfresh::dot_i8(unit_query, entry, scale);
-                    emit(id, sim.clamp(-1.0, 1.0));
+                    let sim = kosha_vector_spfresh::dot_i8(&probe.unit, entry, scale);
+                    emit(id, sim.clamp(-1.0, 1.0), 0.0);
+                }
+            }
+            VectorPosting::RaBitQ {
+                code_bytes,
+                ids,
+                codes,
+                bits,
+            } => {
+                let Some(query) = probe.rabitq.as_ref() else {
+                    return;
+                };
+                let centroid_dot = kosha_vector_spfresh::dot(&probe.unit, centroid);
+                for (i, (&id, code)) in ids.iter().zip(codes).enumerate() {
+                    if accept.is_some_and(|accept| !accept(id)) {
+                        continue;
+                    }
+                    let entry = &bits[i * code_bytes..(i + 1) * code_bytes];
+                    let (sim, err) = query.estimate(code, entry, centroid_dot);
+                    emit(id, sim.clamp(-1.0, 1.0), err);
                 }
             }
         }
     }
 
-    /// The entries as f32 vectors (an i8 posting dequantized).
+    /// The entries as f32 vectors (an i8 posting dequantized). RaBitQ
+    /// entries cannot be decoded without their centroid: ids only, with
+    /// empty vectors — callers that need vectors exclude version 5 first.
     fn dequantized(self) -> Vec<(u32, Vec<f32>)> {
         match self {
+            VectorPosting::RaBitQ { ids, .. } => {
+                ids.into_iter().map(|id| (id, Vec::new())).collect()
+            }
             VectorPosting::F32(entries) => entries,
             VectorPosting::I8 {
                 dim,
@@ -3350,13 +3499,14 @@ pub fn doc_vectors_header_len(prefix: &[u8]) -> Result<Result<u64, u64>, KoshaEr
 /// (#210): a default for every field plus per-field overrides.
 ///
 /// Production writers read it once from the environment:
-/// `KOSHA_VECTOR_QUANTIZATION=f32|i8` (default `f32`) sets the default and
+/// `KOSHA_VECTOR_QUANTIZATION=f32|i8|rabitq` (default `f32`) sets the default and
 /// `KOSHA_VECTOR_QUANTIZATION_FIELDS=body_emb:i8,title_emb:f32` overrides
 /// it per field. The namespace schema (#220) carries only analyzers so
 /// far; declaring quantization per field there is follow-up work.
 ///
-/// `i8` writes vector index version [`I8_VECTOR_INDEX_VERSION`], which a
-/// reader built before it cannot read (it fails the kNN on that column).
+/// `i8` writes vector index version [`I8_VECTOR_INDEX_VERSION`] and
+/// `rabitq` writes [`RABITQ_VECTOR_INDEX_VERSION`]; a reader built before
+/// either cannot read it (it fails the kNN on that column).
 /// Turn it on only once every query pod runs a build that reads it, and
 /// turn it off and compact before rolling back past one. With it off (the default) segments are byte-identical to those
 /// written before #210. `doc_vectors.bin` keeps full-precision vectors
@@ -3410,7 +3560,7 @@ impl VectorQuantizationConfig {
         let default = match default.map(str::trim) {
             None | Some("") => VectorQuantization::F32,
             Some(raw) => VectorQuantization::parse(raw).unwrap_or_else(|| {
-                eprintln!("WARN: KOSHA_VECTOR_QUANTIZATION={raw} not f32|i8 — using f32");
+                eprintln!("WARN: KOSHA_VECTOR_QUANTIZATION={raw} not f32|i8|rabitq — using f32");
                 VectorQuantization::F32
             }),
         };
@@ -3427,7 +3577,7 @@ impl VectorQuantizationConfig {
                     config.fields.insert(name.to_string(), q);
                 }
                 _ => eprintln!(
-                    "WARN: KOSHA_VECTOR_QUANTIZATION_FIELDS entry {entry:?} not <field>:f32|i8 — ignored"
+                    "WARN: KOSHA_VECTOR_QUANTIZATION_FIELDS entry {entry:?} not <field>:f32|i8|rabitq — ignored"
                 ),
             }
         }
@@ -3441,7 +3591,7 @@ fn warn_quantization_needs_v4() {
     static WARNED: OnceLock<()> = OnceLock::new();
     WARNED.get_or_init(|| {
         eprintln!(
-            "WARN: i8 vector quantization needs KOSHA_VECTOR_WRITE_VERSION=4 (the default) — writing f32 vectors"
+            "WARN: i8/rabitq vector quantization needs KOSHA_VECTOR_WRITE_VERSION=4 (the default) — writing f32 vectors"
         );
     });
 }
@@ -5567,10 +5717,13 @@ struct LazyVectorIndex {
     unit_norm: bool,
     /// The idx header's version — decides how posting entries decode.
     version: u32,
-    /// Entries are i8-quantized ([`I8_VECTOR_INDEX_VERSION`]): scores are
-    /// approximate, and the probe rescores its best candidates from
-    /// `doc_vectors.bin` (see [`SegmentReader::with_vector_rescore_factor`]).
+    /// Entries are quantized (i8, [`I8_VECTOR_INDEX_VERSION`], or RaBitQ,
+    /// [`RABITQ_VECTOR_INDEX_VERSION`]): scores are approximate, and the
+    /// probe rescores its best candidates from `doc_vectors.bin` (see
+    /// [`SegmentReader::with_vector_rescore_factor`]).
     quantized: bool,
+    /// Entries are RaBitQ codes ([`RABITQ_VECTOR_INDEX_VERSION`]).
+    rabitq: bool,
     /// The column's field name, from the footer (`None` for a legacy
     /// segment's unnamed index) — what `doc_vectors.bin` is keyed by.
     field: Option<String>,
@@ -5606,7 +5759,8 @@ impl LazyVectorIndex {
             radii,
             unit_norm: is_unit_norm_vector_index_version(version),
             version,
-            quantized: is_i8_vector_index_version(version),
+            quantized: is_quantized_vector_index_version(version),
+            rabitq: is_rabitq_vector_index_version(version),
             field,
         }
     }
@@ -5713,6 +5867,36 @@ pub struct RawDocRecord {
 
 /// The `k` highest-scoring of `scored`, best first (ties keep no
 /// particular order, as on the probe path).
+/// Cap on a RaBitQ probe's bound-driven rescoring shortlist, as a multiple
+/// of the `k * vector_rescore_factor` list every quantized column rescores.
+/// Bounds widen on a posting with loose residuals; this keeps one such
+/// segment from reading half its `doc_vectors.bin` for a single query.
+const RABITQ_SHORTLIST_CAP: usize = 8;
+
+/// How many of `scored` RaBitQ's error bounds cannot rule out of the top
+/// `k`: candidates whose upper bound (`score + error`) reaches the `k`-th
+/// largest lower bound (`score - error`). Everything when there are at
+/// most `k` candidates.
+fn rabitq_bound_shortlist_len(scored: &[(u32, f64)], errors: &[f32], k: usize) -> usize {
+    if k == 0 || scored.len() <= k {
+        return scored.len();
+    }
+    let mut lower: Vec<f64> = scored
+        .iter()
+        .zip(errors)
+        .map(|(&(_, s), &e)| s - e as f64)
+        .collect();
+    let (_, kth, _) = lower.select_nth_unstable_by(k - 1, |a, b| {
+        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let threshold = *kth;
+    scored
+        .iter()
+        .zip(errors)
+        .filter(|(&(_, s), &e)| s + e as f64 >= threshold)
+        .count()
+}
+
 fn top_k_by_score(mut scored: Vec<(u32, f64)>, k: usize) -> Vec<(u32, f64)> {
     let by_score_desc =
         |a: &(u32, f64), b: &(u32, f64)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
@@ -6804,10 +6988,10 @@ impl SegmentReader {
         }
         // No usable sidecar: every posting, filtered while it is scored.
         self.prefetch_vector_postings(vi, 0..vi.ranges.len(), fetch);
-        // An i8 column scores approximately here (it has no exact vectors
-        // without the sidecar).
+        // A quantized column scores approximately here (it has no exact
+        // vectors without the sidecar).
         let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
-        let unit_query = Self::unit_query(vi, query);
+        let probe = Self::probe_query(vi, query);
         let is_candidate = |id: u32| candidates.binary_search(&id).is_ok();
         for range_idx in 0..vi.ranges.len() {
             let posting = match self.hydrate_posting(vi, range_idx) {
@@ -6817,8 +7001,9 @@ impl SegmentReader {
             posting.for_each_similarity(
                 Some(&is_candidate),
                 |v| kosha_vector_spfresh::cosine_similarity(query, v),
-                &unit_query,
-                |id, sim| scored.push((id, sim as f64)),
+                &probe,
+                &vi.centroids[range_idx],
+                |id, sim, _| scored.push((id, sim as f64)),
             );
         }
         let vectors_scored = scored.len();
@@ -6867,7 +7052,8 @@ impl SegmentReader {
 
         let mut probes = 0usize;
         let mut scored: Vec<(u32, f64)> = Vec::new();
-        let unit_query = Self::unit_query(vi, query);
+        let mut errors: Vec<f32> = Vec::new();
+        let probe = Self::probe_query(vi, query);
         for (position, (range_idx, _)) in ranked.iter().enumerate() {
             if position >= budgeted {
                 // Past the budget. Without a restriction this is where the
@@ -6886,11 +7072,15 @@ impl SegmentReader {
             self.hydrate_posting(vi, *range_idx)?.for_each_similarity(
                 accept,
                 |v| kosha_vector_spfresh::cosine_similarity(query, v),
-                &unit_query,
-                |id, sim| scored.push((id, sim as f64)),
+                &probe,
+                &vi.centroids[*range_idx],
+                |id, sim, err| {
+                    scored.push((id, sim as f64));
+                    errors.push(err);
+                },
             );
         }
-        Ok((self.finish_probe(vi, query, scored, k), probes))
+        Ok((self.finish_probe(vi, query, scored, &errors, k), probes))
     }
 
     // Deliberately NOT radius-aware: this is the per-segment `nprobe`
@@ -6937,6 +7127,10 @@ impl SegmentReader {
         let budgeted = nprobe.min(candidates.len());
         self.prefetch_vector_postings(vi, candidates[..budgeted].iter().copied(), fetch);
         let mut scored: Vec<(u32, f64)> = Vec::new();
+        let mut errors: Vec<f32> = Vec::new();
+        // `query` is already unit-normalized for every unit-norm column,
+        // which includes every quantized one.
+        let probe = Self::probe_query(vi, query);
         for (position, &range_idx) in candidates.iter().enumerate() {
             if position >= nprobe && scored.len() >= k {
                 break;
@@ -6946,8 +7140,6 @@ impl SegmentReader {
                     &candidates[position..(position + VECTOR_PREFETCH_CHUNK).min(candidates.len())];
                 self.prefetch_vector_postings(vi, chunk.iter().copied(), fetch);
             }
-            // `query` is already unit-normalized for every unit-norm
-            // column, which includes every i8 one.
             self.hydrate_posting(vi, range_idx)?.for_each_similarity(
                 accept,
                 |v| {
@@ -6957,23 +7149,33 @@ impl SegmentReader {
                         kosha_vector_spfresh::cosine_similarity(query, v)
                     }
                 },
-                query,
-                |id, sim| scored.push((id, sim as f64)),
+                &probe,
+                &vi.centroids[range_idx],
+                |id, sim, err| {
+                    scored.push((id, sim as f64));
+                    errors.push(err);
+                },
             );
         }
-        Ok(self.finish_probe(vi, query, scored, k))
+        Ok(self.finish_probe(vi, query, scored, &errors, k))
     }
 
-    /// `query` unit-normalized when `vi` is i8 (whose entries score
-    /// against a unit query); otherwise unused, so not computed.
-    fn unit_query<'q>(vi: &LazyVectorIndex, query: &'q [f32]) -> std::borrow::Cow<'q, [f32]> {
-        if vi.quantized {
+    /// `query` prepared for scoring `vi`'s postings: unit-normalized when
+    /// `vi` is quantized (whose entries score against a unit query;
+    /// otherwise unused, so not computed), plus the rotated lookup table
+    /// for a RaBitQ column (see [`rabitq_query_for`]).
+    fn probe_query<'q>(vi: &LazyVectorIndex, query: &'q [f32]) -> ProbeQuery<'q> {
+        let unit = if vi.quantized {
             let mut q = query.to_vec();
             kosha_vector_spfresh::normalize_in_place(&mut q);
             std::borrow::Cow::Owned(q)
         } else {
             std::borrow::Cow::Borrowed(query)
-        }
+        };
+        // A query of another dimension scores nothing here, as the f32
+        // paths' dimension checks would have it.
+        let rabitq = (vi.rabitq && unit.len() == vi.dim).then(|| rabitq_query_for(&unit));
+        ProbeQuery { unit, rabitq }
     }
 
     /// The probe's top `k` of `scored`, best first.
@@ -6985,12 +7187,19 @@ impl SegmentReader {
     /// which candidates make that shortlist, not their final order.
     /// Rescoring needs the sidecar locally and holding this field; without
     /// it (inline-vector segments, a factor of `0`, a sidecar not yet
-    /// hydrated) the i8 scores stand.
+    /// hydrated) the quantized scores stand.
+    ///
+    /// A RaBitQ column's shortlist grows to as many candidates as its error
+    /// bounds (`errors[i]`, parallel to `scored`) cannot rule out of the
+    /// top `k` — upper bound at or above the `k`-th best lower bound —
+    /// taken best-estimate first and capped at [`RABITQ_SHORTLIST_CAP`]
+    /// times the factor-sized list.
     fn finish_probe(
         &self,
         vi: &LazyVectorIndex,
         query: &[f32],
         mut scored: Vec<(u32, f64)>,
+        errors: &[f32],
         k: usize,
     ) -> Vec<(u32, f64)> {
         let by_score_desc = |a: &(u32, f64), b: &(u32, f64)| {
@@ -7001,7 +7210,15 @@ impl SegmentReader {
             scored.truncate(k);
             return scored;
         }
-        let mut shortlist = top_k_by_score(scored, k.saturating_mul(self.vector_rescore_factor));
+        let factor_len = k.saturating_mul(self.vector_rescore_factor);
+        let shortlist_len = if vi.rabitq && errors.len() == scored.len() {
+            factor_len
+                .max(rabitq_bound_shortlist_len(&scored, errors, k))
+                .min(factor_len.saturating_mul(RABITQ_SHORTLIST_CAP))
+        } else {
+            factor_len
+        };
+        let mut shortlist = top_k_by_score(scored, shortlist_len);
         if let Some(field) = vi.field.as_deref() {
             self.rescore_exact(field, query, &mut shortlist);
         }
@@ -7027,7 +7244,7 @@ impl SegmentReader {
             Ok(_) => return 0,
             Err(e) => {
                 eprintln!(
-                    "WARN: cannot rescore i8 kNN candidates of {}: {e} — keeping quantized scores",
+                    "WARN: cannot rescore quantized kNN candidates of {}: {e} — keeping quantized scores",
                     self.segment_dir.display()
                 );
                 return 0;
@@ -7047,7 +7264,7 @@ impl SegmentReader {
         });
         if let Err(e) = visited {
             eprintln!(
-                "WARN: cannot rescore i8 kNN candidates of {}: {e} — keeping quantized scores",
+                "WARN: cannot rescore quantized kNN candidates of {}: {e} — keeping quantized scores",
                 self.segment_dir.display()
             );
             return 0;
