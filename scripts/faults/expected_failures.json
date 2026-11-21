@@ -1,11 +1,9 @@
 {
   "_comment": "Known engine bugs the fault suite trips, in the same format as scripts/integration/expected_failures.json. 'checks' maps fnmatch globs over check ids (<scenario>:<aspect>[@<pod>]) to a key in 'bugs'; each bug names its GitHub issue. Delete a bug and its globs when it is fixed. --strict also fails when a listed check passes.",
   "bugs": {
-    "#330": "Concurrent first-boot migrations race: CREATE SCHEMA IF NOT EXISTS fails with a duplicate key on pg_namespace, so one of several pods booting against an unmigrated database exits",
     "#368": "S3 WAL self-fences after a connection reset on a WAL PUT (the SDK's retry of the conditional PUT gets 412): the ingest pod answers 500 to every write until it is restarted, so it does not recover from the S3 toxics before the restart"
   },
   "checks": {
-    "first-boot:*": "#330",
     "s3-toxics:recovered": "#368",
     "s3-toxics:redrive": "#368",
     "s3-toxics:doc-count@*": "#368"

@@ -44,7 +44,7 @@ Scenarios (each check id starts with the scenario name):
   first-boot           a fresh database, three pods (ingest + 2 query)
                        started at the same moment: none may exit, all must be
                        ready, and a write through one is readable on the
-                       others (#330: listed in expected_failures.json)
+                       others (the #330 concurrent-migration race)
 
 Usage (from the repo root; what .github/workflows/faults.yml runs):
 
@@ -1010,7 +1010,7 @@ def self_test() -> int:
 
     known_failures = load_expected()
     res = conf.Results(known_failures["checks"], known_failures["bugs"])
-    res.record("first-boot:running@kosha-boot-2", False, "exited 1")
+    res.record("s3-toxics:recovered", False, "writes fenced")
     res.record("kill-mid-flush:acked-present", True)
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "r.json")
@@ -1020,7 +1020,7 @@ def self_test() -> int:
             rep = json.load(f)
         res.record("kill-mid-flush:doc-count@ingest", False, "lost")
         code2 = conf.report(res, None, False, False)
-    check("first-boot (#330) is an expected failure", code == 0 and rep["summary"]["xfail"] == 1, rep["summary"])
+    check("a listed failure (#368) is expected", code == 0 and rep["summary"]["xfail"] == 1, rep["summary"])
     check("report carries recovery + timings", rep["recovery"][0]["ready_s"] == 1.5 and rep["scenarios"][0]["scenario"] == "x" and rep["config"]["run_id"] == "1")
     check("an unlisted failure fails the run", code2 == 1)
     print("self-test: %s" % ("FAILED: " + ", ".join(failures) if failures else "all ok"))
