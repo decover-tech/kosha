@@ -237,7 +237,8 @@ What a run does, in order:
    checkpoint. With `KOSHA_WAL_MODE=s3` it reads every stream under `_wal/`
    in the bucket. With a local WAL it reads `KOSHA_DATA_DIR/_wal`, which
    lives on the ingest pod's disk; when that is not mounted, let the
-   writer's idle flush run, stop the writer and pass `--skip-wal-check`.
+   writer's idle flush run, stop the writer and pass `--skip-wal-check`
+   (but see step 5: prefer mounting the WAL).
 3. Copies every object of the manifest's segments (data files, footers,
    deletion bitmaps, `_COMMIT` markers last) from `<bare>/` to
    `<tenant>/<name>/` with server-side `CopyObject`. Objects already copied at
@@ -246,20 +247,29 @@ What a run does, in order:
    bare namespace, its namespaces share the prefix.
 4. Checks that every copied object is at the destination with the same
    size, and that counts and bytes match.
-5. Re-keys the control plane in one Postgres transaction:
+5. Marks the bare id discarded in every WAL stream it checked, through its
+   highest LSN there (the `discarded` WAL meta entry a namespace DELETE
+   writes). Without the bare id's manifest, a writer's recovery would
+   otherwise replay its already-flushed records still sitting in group
+   files and republish a stale bare namespace. `--skip-wal-check` cannot
+   do this: a WAL group file still holding records of the bare id replays
+   them on the writer's next boot.
+6. Re-keys the control plane in one Postgres transaction:
    `kosha.namespaces`, `kosha.manifests`, `kosha.writer_leases` (the token
    is carried over; the old id's lease is bumped and expired) and
    `kosha.retired_namespaces` (the bare id is retired at its last version).
    It fails, and changes nothing, when `<tenant>/<name>` already exists or
    the manifest moved since step 2.
-6. Reopens the manifest under `<tenant>/<name>` and checks the segment list
+7. Reopens the manifest under `<tenant>/<name>` and checks the segment list
    and document count.
-7. Deletes the copied objects under `<bare>/` (not with `--keep-source`).
+8. Deletes the copied objects under `<bare>/` (not with `--keep-source`).
 
-A rerun is safe at any point. Before step 5 it starts over and skips what
-is already copied; after step 5 it finds the new id in the control plane
-and only finishes steps 6 and 7 (so `--keep-source` now, plain rerun
-later, deletes the source when you are ready).
+A rerun is safe at any point. Before step 6 it starts over and skips what
+is already copied; after step 6 it finds the new id in the control plane
+and only deletes source objects (so `--keep-source` now, plain rerun
+later, deletes the source when you are ready). From then on the new id
+is authoritative, so a rerun never copies: it deletes each source object
+whose destination object exists, and leaves the others alone.
 
 It refuses a sharded namespace and a namespace whose segments a branch of
 another namespace reads (#208); move or delete those by hand.

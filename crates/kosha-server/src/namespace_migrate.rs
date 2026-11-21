@@ -15,16 +15,25 @@
 //!    `{to}/...` (server-side `CopyObject` on S3; each segment's `_COMMIT`
 //!    marker last), skipping objects already copied at the same size;
 //! 4. verify the destination holds every object at its size;
-//! 5. re-key the control plane in one transaction
+//! 5. mark the bare id discarded in every checked WAL stream through its
+//!    highest LSN (the `discarded` meta entry a namespace DELETE writes),
+//!    so a writer's recovery never replays its already-flushed records and
+//!    republishes a stale bare namespace once its manifest is gone
+//!    (`--skip-wal-check` cannot do this: that WAL is not reachable);
+//! 6. re-key the control plane in one transaction
 //!    ([`kosha_control::NamespaceRename`]), which fails when `to` exists or
 //!    the manifest moved since step 2;
-//! 6. reopen the manifest under `to` and check its segments and document
+//! 7. reopen the manifest under `to` and check its segments and document
 //!    count match;
-//! 7. delete the copied source objects (skipped with `--keep-source`).
+//! 8. delete the copied source objects (skipped with `--keep-source`).
 //!
-//! Every step is safe to rerun: a run that died before step 5 starts over
+//! Every step is safe to rerun: a run that died before step 6 starts over
 //! and skips what is already copied; a run that died after it finds `to`
-//! in the control plane and `from` gone, and finishes steps 6 and 7.
+//! in the control plane and `from` gone, and only deletes source objects.
+//! After the rename `to` is authoritative (a writer may already have
+//! rewritten objects in place, such as a segment's `footer.json`), so a
+//! resumed run never copies: it deletes the source objects that exist at
+//! the destination and leaves any other in place.
 //!
 //! Only objects under the bare prefix that belong to segments the manifest
 //! references are copied and deleted. The prefix `{from}/` can also hold
@@ -65,7 +74,11 @@ pub(crate) struct Args {
     pub list_unreachable: bool,
     /// Skip the WAL-tail check. Only for a writer that was flushed and
     /// stopped when its WAL is not reachable from here (a local WAL on the
-    /// ingest pod's disk).
+    /// ingest pod's disk). The run then cannot mark the bare id discarded
+    /// in that WAL either: any group file still holding a record of the
+    /// bare id replays it on the writer's next boot (republishing a stale
+    /// bare namespace), so that WAL must hold no such file by then. Prefer
+    /// mounting the WAL and running without this flag.
     pub skip_wal_check: bool,
 }
 
@@ -476,16 +489,41 @@ mod s3_objects {
 
 // ─── WAL tail ────────────────────────────────────────────────────────────────
 
-/// Records for `ns` in `store` that its manifest does not cover, counted
-/// the way recovery replays them (`Indexer::restore_manifest`): when the
-/// manifest's `wal_origin` names this stream (or no stream), records past
+/// The WAL meta entry recovery reads to skip a deleted namespace's records
+/// (`DISCARDED_META` in `kosha_write::wal`): `{"namespace": through_lsn}`.
+const DISCARDED_META: &str = "discarded";
+
+fn invalid_data(message: String) -> KoshaError {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message).into()
+}
+
+fn read_discarded(store: &dyn WalStore) -> Result<BTreeMap<String, u64>, KoshaError> {
+    match store.read_meta(DISCARDED_META)? {
+        None => Ok(BTreeMap::new()),
+        Some(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|_| invalid_data("invalid WAL discard list".into())),
+    }
+}
+
+/// What one WAL stream holds for a namespace.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalScan {
+    /// Records the manifest does not cover (see [`wal_scan`]).
+    pub tail: usize,
+    /// Highest LSN of any of the namespace's records, 0 when it has none.
+    pub high: u64,
+}
+
+/// Scan `store` for `ns`'s records. The tail counts them the way recovery
+/// replays them (`Indexer::restore_manifest`): when the manifest's
+/// `wal_origin` names this stream (or no stream), records past
 /// `wal_checkpoint`; otherwise every record. Records a namespace deletion
 /// discarded are skipped, as recovery skips them.
-pub(crate) fn wal_tail_records(
+pub(crate) fn wal_scan(
     store: &dyn WalStore,
     ns: &NamespaceId,
     manifest: &Manifest,
-) -> Result<usize, KoshaError> {
+) -> Result<WalScan, KoshaError> {
     let origin = store
         .read_meta("origin")?
         .and_then(|bytes| String::from_utf8(bytes).ok());
@@ -493,25 +531,56 @@ pub(crate) fn wal_tail_records(
         .wal_origin
         .as_deref()
         .is_none_or(|o| origin.as_deref() == Some(o));
-    let discarded: BTreeMap<String, u64> = store
-        .read_meta("discarded")?
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    let discarded_through = discarded.get(&ns.0).copied().unwrap_or(0);
-    let mut tail = 0;
+    let discarded_through = read_discarded(store)?.get(&ns.0).copied().unwrap_or(0);
+    let mut scan = WalScan::default();
     for file in store.list()? {
         let bytes = store.read(file)?;
         let (records, _torn) = kosha_write::wal::decode_wal_file(&bytes, file)?;
-        tail += records
-            .iter()
-            .filter(|(lsn, record)| {
-                record.namespace == *ns
-                    && *lsn > discarded_through
-                    && (!checkpoint_applies || *lsn > manifest.wal_checkpoint)
-            })
-            .count();
+        for (lsn, record) in &records {
+            if record.namespace != *ns {
+                continue;
+            }
+            scan.high = scan.high.max(*lsn);
+            if *lsn > discarded_through && (!checkpoint_applies || *lsn > manifest.wal_checkpoint) {
+                scan.tail += 1;
+            }
+        }
     }
-    Ok(tail)
+    Ok(scan)
+}
+
+/// Records for `ns` in `store` that its manifest does not cover.
+#[cfg(test)]
+pub(crate) fn wal_tail_records(
+    store: &dyn WalStore,
+    ns: &NamespaceId,
+    manifest: &Manifest,
+) -> Result<usize, KoshaError> {
+    wal_scan(store, ns, manifest).map(|scan| scan.tail)
+}
+
+/// Durably mark `ns` discarded through `through` in `store`, as a
+/// namespace DELETE does (`WalWriter::discard_namespace`), so recovery
+/// skips its records at or below that LSN. Once the namespace's manifest
+/// is gone, nothing else stops recovery from replaying records that
+/// manifest had already checkpointed. Returns whether the entry changed.
+pub(crate) fn discard_wal_records(
+    store: &dyn WalStore,
+    ns: &NamespaceId,
+    through: u64,
+) -> Result<bool, KoshaError> {
+    if through == 0 {
+        return Ok(false);
+    }
+    let mut discarded = read_discarded(store)?;
+    let entry = discarded.entry(ns.0.clone()).or_insert(0);
+    if *entry >= through {
+        return Ok(false);
+    }
+    *entry = through;
+    let bytes = serde_json::to_vec(&discarded).map_err(|e| invalid_data(e.to_string()))?;
+    store.write_meta(DISCARDED_META, &bytes)?;
+    Ok(true)
 }
 
 // ─── The migration ───────────────────────────────────────────────────────────
@@ -790,7 +859,13 @@ where
 }
 
 /// The control plane already points at `to` (an earlier run died after
-/// the rename): copy anything still missing, verify, delete the source.
+/// the rename, or ran with `--keep-source`): delete the source objects.
+///
+/// The rename only ran after every object was verified at the destination,
+/// and since then `to` is the tenant's live namespace: a writer may have
+/// rewritten objects in place (a segment's `footer.json`) or collected
+/// them. So nothing is copied, whatever the sizes; only source objects
+/// whose destination exists are deleted, and any other is left in place.
 fn finish_after_rename(
     objects: &dyn SegmentObjects,
     from: &NamespaceId,
@@ -800,7 +875,16 @@ fn finish_after_rename(
     out: &mut dyn Write,
 ) -> Result<Report, String> {
     let owned = owned_segment_dirs(manifest, to);
-    let (planned, left_behind) = plan_objects(objects, from, to, &owned)?;
+    let (candidates, mut left_behind) = plan_objects(objects, from, to, &owned)?;
+    let target: BTreeSet<String> = objects
+        .list(&to.0)?
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .collect();
+    let (planned, missing): (Vec<Planned>, Vec<Planned>) = candidates
+        .into_iter()
+        .partition(|p| target.contains(&p.rel));
+    left_behind += missing.len();
     let mut report = Report {
         objects: planned.len(),
         bytes: planned.iter().map(|p| p.size).sum(),
@@ -812,20 +896,21 @@ fn finish_after_rename(
     let _ = writeln!(
         out,
         "control plane already re-keyed to {} (version {}, {} documents); \
-         {} source objects ({} bytes) left under {}/, {} still to copy",
-        to.0,
-        manifest.version,
-        report.documents,
-        report.objects,
-        report.bytes,
-        from.0,
-        planned.iter().filter(|p| !p.in_place).count()
+         {} source objects ({} bytes) under {}/ are also at the destination; nothing is \
+         copied, the destination is authoritative",
+        to.0, manifest.version, report.documents, report.objects, report.bytes, from.0
     );
+    if !missing.is_empty() {
+        let _ = writeln!(
+            out,
+            "{} source objects under {}/ have no destination object and are left alone",
+            missing.len(),
+            from.0
+        );
+    }
     if args.dry_run {
         return Ok(report);
     }
-    report.copied = copy_missing(objects, from, to, &planned, out, || Ok(()))?;
-    verify_copies(objects, to, &planned)?;
     report.deleted = delete_source(objects, from, &planned, args, out)?;
     Ok(report)
 }
@@ -944,12 +1029,17 @@ where
             from.0
         ));
     }
+    // Highest LSN of `from`'s records in each checked stream, marked
+    // discarded before the rename.
+    let mut wal_high: Vec<u64> = Vec::new();
     match wal {
         Some(streams) => {
             let mut tail = 0;
             for store in streams {
-                tail += wal_tail_records(store.as_ref(), from, &manifest)
+                let scan = wal_scan(store.as_ref(), from, &manifest)
                     .map_err(|e| format!("reading the WAL: {e}"))?;
+                tail += scan.tail;
+                wal_high.push(scan.high);
             }
             if tail > 0 {
                 return Err(format!(
@@ -968,7 +1058,10 @@ where
         None => {
             let _ = writeln!(
                 out,
-                "WAL: check skipped (--skip-wal-check); the writer must have been flushed and stopped"
+                "WAL: check skipped (--skip-wal-check); the writer must have been flushed and \
+                 stopped, and its WAL cannot be marked: a WAL file still holding records of {} \
+                 replays them as a stale bare namespace on the writer's next boot",
+                from.0
             );
         }
     }
@@ -1050,6 +1143,30 @@ where
         "copied {} objects; verified {} objects / {} bytes at {}/",
         report.copied, report.objects, report.bytes, to.0
     );
+
+    // Every record of `from` left in the checked streams is covered by its
+    // manifest (the tail is empty). Once the rename removes that manifest,
+    // recovery would replay them under the bare id and the idle flush would
+    // republish a stale bare namespace, so mark them discarded, as a DELETE
+    // does. This runs under the leases, just before the rename: should the
+    // rename fail, `from` keeps a manifest whose checkpoint already covers
+    // every record marked here, so nothing is lost; and a run that dies
+    // after the rename leaves no unmarked window behind.
+    if let Some(streams) = wal {
+        let mut marked = 0;
+        for (store, high) in streams.iter().zip(&wal_high) {
+            if discard_wal_records(store.as_ref(), from, *high)
+                .map_err(|e| format!("marking {}'s WAL records discarded: {e}", from.0))?
+            {
+                marked += 1;
+            }
+        }
+        let _ = writeln!(
+            out,
+            "WAL: marked {}'s records discarded in {marked} stream(s)",
+            from.0
+        );
+    }
 
     let outcome = ctrl
         .rename_namespace(from, to, manifest.version)
@@ -1656,5 +1773,154 @@ mod tests {
         fresh.save_manifest(&ns("corpus-branch"), &child).unwrap();
         let err = migrate(&mut fresh, &objects, None, &migrate_args, &mut Vec::new()).unwrap_err();
         assert!(err.contains("corpus-branch"), "{err}");
+    }
+
+    /// A checkpointed record of the bare id that still sits in a WAL group
+    /// file (shared with another namespace's unflushed record) passes the
+    /// tail check, but must not replay once the bare manifest is gone.
+    #[test]
+    fn checkpointed_wal_records_do_not_resurrect_the_bare_namespace() {
+        use crate::{AppState, StateOptions};
+
+        let dir = crate::tests::test_dir();
+        let wal_dir = dir.join("_wal");
+        let doc = |id: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", "x")],
+        };
+        let writer = kosha_write::wal::WalWriter::new(wal_dir.clone());
+        let lsns = writer
+            .append_records(&[
+                kosha_core::WalRecord::new(ns("corpus"), vec![doc("a")]),
+                kosha_core::WalRecord::new(ns("other"), vec![doc("b")]),
+            ])
+            .unwrap();
+        let mut manifest = manifest_with(2, &[]);
+        manifest.wal_origin = Some(writer.origin().to_owned());
+        manifest.wal_checkpoint = lsns[0];
+        drop(writer);
+        let store = kosha_write::wal::LocalWalStore::new(wal_dir.clone());
+        assert_eq!(
+            wal_tail_records(&store, &ns("corpus"), &manifest).unwrap(),
+            0
+        );
+        let mut control = Controller::new();
+        control.save_manifest(&ns("corpus"), &manifest).unwrap();
+
+        let wal: Vec<Arc<dyn WalStore>> = vec![Arc::new(store)];
+        let objects = LocalObjects::new(dir.clone());
+        let migrate_args = Args {
+            from: Some(ns("corpus")),
+            to: Some(ns("acme/corpus")),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        migrate(&mut control, &objects, Some(&wal), &migrate_args, &mut out).unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.contains("records discarded in 1 stream"),
+            "{printed}"
+        );
+
+        // Recovery skips the bare id's record and still replays the other.
+        let recovered = kosha_write::wal::WalWriter::recover(&wal_dir).unwrap();
+        assert!(
+            recovered.iter().all(|r| r.namespace != ns("corpus")),
+            "{recovered:?}"
+        );
+        assert!(recovered.iter().any(|r| r.namespace == ns("other")));
+
+        // A writer booting on that WAL does not bring `corpus` back.
+        let state = AppState::with_options(
+            dir.clone(),
+            StateOptions {
+                control_store: Some(Box::new(control)),
+                role: Some(crate::role::Role::Standalone),
+                writer_lease: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(state.indexer.pending_doc_count(&ns("other")) > 0);
+        assert_eq!(state.indexer.pending_doc_count(&ns("corpus")), 0);
+        assert!(!state.indexer.namespaces().contains(&ns("corpus")));
+        let controller = state.controller.lock().unwrap();
+        assert!(!controller.has_namespace(&ns("corpus")));
+        assert!(controller.has_namespace(&ns("acme/corpus")));
+    }
+
+    /// After the rename the destination is the tenant's live namespace: a
+    /// resumed run (`--keep-source`, then a plain rerun) never overwrites a
+    /// destination object rewritten in place, and deletes only source
+    /// objects whose destination exists.
+    #[test]
+    fn rerun_after_the_rename_never_overwrites_the_destination() {
+        let dir = crate::tests::test_dir();
+        let objects = LocalObjects::new(dir.clone());
+        for (path, bytes) in [
+            ("corpus/seg-000001/doc_store.bin", &b"bytes"[..]),
+            ("corpus/seg-000001/footer.json", b"{\"old\":1}"),
+            ("corpus/seg-000001/_COMMIT", b"commit"),
+        ] {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).unwrap();
+        }
+        let mut control = Controller::new();
+        control
+            .save_manifest(&ns("corpus"), &manifest_with(3, &[("seg-000001", 4)]))
+            .unwrap();
+        let migrate_args = Args {
+            from: Some(ns("corpus")),
+            to: Some(ns("acme/corpus")),
+            keep_source: true,
+            ..Default::default()
+        };
+        let first = migrate(&mut control, &objects, None, &migrate_args, &mut Vec::new()).unwrap();
+        assert_eq!((first.copied, first.deleted), (3, 0));
+
+        // The live namespace rewrites its footer in place (a different
+        // size) and drops another object.
+        let footer = dir.join("acme/corpus/seg-000001/footer.json");
+        std::fs::write(&footer, b"{\"rewritten\":true,\"crc\":42}").unwrap();
+        std::fs::remove_file(dir.join("acme/corpus/seg-000001/doc_store.bin")).unwrap();
+
+        let finish = Args {
+            keep_source: false,
+            ..migrate_args
+        };
+        let dry = migrate(
+            &mut control,
+            &objects,
+            None,
+            &Args {
+                dry_run: true,
+                ..finish.clone()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!((dry.objects, dry.copied, dry.deleted), (2, 0, 0));
+        let second = migrate(&mut control, &objects, None, &finish, &mut Vec::new()).unwrap();
+        assert!(second.resumed);
+        assert_eq!(
+            (
+                second.objects,
+                second.copied,
+                second.deleted,
+                second.left_behind
+            ),
+            (2, 0, 2, 1)
+        );
+        // The rewritten footer is untouched and nothing was copied back.
+        assert_eq!(
+            std::fs::read(&footer).unwrap(),
+            b"{\"rewritten\":true,\"crc\":42}"
+        );
+        assert!(!dir.join("acme/corpus/seg-000001/doc_store.bin").exists());
+        // Only the source object without a destination copy is left.
+        assert_eq!(
+            objects.list("corpus").unwrap(),
+            vec![("seg-000001/doc_store.bin".to_string(), 5)]
+        );
     }
 }
