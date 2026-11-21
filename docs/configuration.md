@@ -234,7 +234,13 @@ The control plane is in memory unless `DATABASE_URL` is set in a binary built wi
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_HTTP_PORT` | HTTP listen port (binds `0.0.0.0`) | `8080` | port |
-| `KOSHA_HTTP_IO_TIMEOUT_SECS` | Per-syscall socket read/write timeout. Bounds stalled clients, not how long a request may take | `300` | seconds |
+| `KOSHA_HTTP_IO_TIMEOUT_SECS` | How long a request body may take to arrive (HTTP 408 after), and how long one response write may stall on a client that stopped reading. Also caps the default `KOSHA_HTTP_IDLE_TIMEOUT_SECS`. Bounds stalled clients, not how long a request may take (`http.rs`) | `300` | seconds |
+| `KOSHA_HTTP_IDLE_TIMEOUT_SECS` | How long the server waits for a complete request head, counted from when it starts waiting: on a new connection that is the header-read timeout, and between requests on a kept-alive connection it is the idle timeout. The connection is closed after it | `30` (or `KOSHA_HTTP_IO_TIMEOUT_SECS` if lower) | seconds |
+| `KOSHA_HTTP_MAX_CONNECTIONS` | Open connections served at once. A connection over the cap gets HTTP 503 with `Retry-After: 1` and is closed | `1024` | connections |
+| `KOSHA_HTTP_MAX_INFLIGHT` | Requests running a handler at once (on a bounded blocking pool; the async side has at most 4 threads). A request over the cap gets HTTP 503 with `Retry-After: 1`. `GET /healthz` is answered without a slot | `256` | requests |
+| `KOSHA_HTTP_SHUTDOWN_GRACE_SECS` | On SIGTERM or SIGINT the listener closes, idle connections close, and in-flight requests get this long to finish. The pod then releases its writer leases and exits | `25` | seconds |
+| `KOSHA_TLS_CERT_PATH` | PEM certificate chain. With `KOSHA_TLS_KEY_PATH`, the listener serves HTTPS only. Setting just one of the two is a startup error | unset (HTTP) | path |
+| `KOSHA_TLS_KEY_PATH` | PEM private key (PKCS#8, PKCS#1 or SEC1) for `KOSHA_TLS_CERT_PATH` | unset | path |
 | `KOSHA_AUTH` | `disabled` (or `off`, `false`, `0`, `none`) turns authentication off; every request becomes tenant `dev`. Local development only | enabled | flag |
 | `KOSHA_API_KEY` | One tenant API key, mapped to tenant `default` | unset | string |
 | `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs | unset | list |
@@ -245,6 +251,17 @@ The control plane is in memory unless `DATABASE_URL` is set in a binary built wi
 
 The server refuses to start when no credential is configured (no env key, no admin or internal
 key, no Postgres keys) unless `KOSHA_AUTH=disabled`.
+
+The server speaks HTTP/1.1 with keep-alive (#259): responses carry a `content-length` and the
+connection stays open for the next request. TLS covers client-facing traffic only. The internal
+clients take no CA configuration yet: peer hydration always connects over `http://` (so pods
+that share segments through hydration leases should not turn TLS on), and query-to-ingest
+forwarding to an `https://` `KOSHA_INGEST_HOST` trusts only the platform's roots. TLS between
+pods is tracked in #343.
+
+`GET /internal/segment/...` streams the cached file as raw `application/octet-stream`. Peers on
+builds from before #259 send base64 with `x-kosha-encoding: base64`; the client still decodes
+that, so a rolling upgrade with mixed peers works.
 
 ## Metrics
 

@@ -10,7 +10,7 @@ workspace = true
 
 [features]
 default = []
-s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:tokio"]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
 postgres = ["kosha-control/postgres"]
 migrate = [
     "s3",
@@ -35,12 +35,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
-# `io-util` is what provides `AsyncWriteExt`, used to stream S3 response
-# bodies chunk-by-chunk into the local cache instead of buffering whole
-# objects (see s3_storage::stream_body_to_file). It resolves today via
-# feature unification with aws-sdk-s3's own tokio dependency; naming it
-# here keeps this crate compiling if that ever changes.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "time"], optional = true }
+# The HTTP server (http.rs) runs on its own tokio runtime, so tokio is not
+# optional. `io-util` also provides `AsyncWriteExt`, used to stream S3
+# response bodies chunk-by-chunk into the local cache instead of buffering
+# whole objects (see s3_storage::stream_body_to_file).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "time", "net", "signal", "sync"] }
+# HTTP/1.1 server (#259): keep-alive, bounded concurrency, header-read
+# timeouts and streamed response bodies. See http.rs.
+hyper = { version = "=1.10.1", features = ["server", "http1"] }
+hyper-util = { version = "=0.1.20", features = ["tokio"] }
+http-body-util = "=0.1.4"
+# Optional client-facing TLS (KOSHA_TLS_CERT_PATH / KOSHA_TLS_KEY_PATH).
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["tls12", "aws_lc_rs"] }
 # Not optional/migrate-gated: also used for query→ingest write forwarding
 # (see main.rs's is_write_path/forward_to_ingest), a core server feature
 # independent of the `migrate` CLI subcommand.
@@ -49,10 +55,9 @@ aws-sigv4 = { version = "1.5.1", optional = true }
 aws-credential-types = { version = "1.3.0", optional = true }
 aws-smithy-runtime-api = { version = "1.14.0", optional = true }
 http = { version = "1.5.0", optional = true }
-# Encodes/decodes segment bytes served over the internal peer-hydration
-# endpoint (see main.rs's `hydrate_files`/`GET /internal/segment`) — the
-# hand-rolled HTTP layer here works in `String` responses, so binary segment
-# payloads travel as base64 rather than requiring a raw-bytes response path.
+# `GET /internal/segment` now streams raw bytes (#259). A peer still running
+# an older build answers with `x-kosha-encoding: base64`; `fetch_from_peer`
+# decodes that so a rolling upgrade with mixed peers keeps working.
 base64 = "0.22"
 # Per-file checksums in the segment `_COMMIT` marker (segment_commit.rs).
 crc32fast = "1"
@@ -60,3 +65,7 @@ crc32fast = "1"
 # itself, like this workspace.
 prometheus-client = "0.26"
 fail = "0.5"
+
+[dev-dependencies]
+# Self-signed certificates for the TLS smoke test (http.rs).
+rcgen = "=0.14.5"

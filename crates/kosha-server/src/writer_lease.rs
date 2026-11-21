@@ -189,6 +189,35 @@ impl WriterLeases {
         self.held.lock().unwrap().contains_key(ns)
     }
 
+    /// Release every held lease, on graceful shutdown, so the next writer
+    /// takes them at once instead of waiting out the TTL. Returns how many
+    /// were released; a failed release only means that lease lapses on its
+    /// own.
+    pub(crate) fn release_all(&self, controller: &Controller) -> usize {
+        let held: Vec<(NamespaceId, Held)> = self.held.lock().unwrap().drain().collect();
+        let mut released = 0;
+        for (ns, held) in held {
+            let result = match &self.backend {
+                LeaseBackend::ControlStore => {
+                    controller
+                        .lock()
+                        .unwrap()
+                        .release_writer_lease(&ns, &self.holder, held.token)
+                }
+                #[cfg(feature = "postgres")]
+                LeaseBackend::Postgres(store) => store.release(&ns, &self.holder, held.token),
+            };
+            match result {
+                Ok(()) => released += 1,
+                Err(error) => eprintln!(
+                    "WARN: writer lease release for {} failed: {error}; it lapses on its own",
+                    ns.0
+                ),
+            }
+        }
+        released
+    }
+
     /// Renew every held lease once. Returns the namespaces whose lease was
     /// taken over (the caller fences them). A control-plane error leaves
     /// the lease alone; it lapses locally once `valid_until` passes, and
