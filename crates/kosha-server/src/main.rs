@@ -40,6 +40,8 @@ mod manifest_follow;
 mod metrics;
 #[cfg(feature = "migrate")]
 mod migrate;
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+mod namespace_migrate;
 mod posting_spans;
 mod rerank;
 mod role;
@@ -5439,6 +5441,9 @@ fn warmup_probe_query() -> kosha_core::SearchQuery {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("migrate-namespace") {
+        std::process::exit(namespace_migrate::main(std::env::args().skip(2)));
+    }
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         #[cfg(feature = "migrate")]
         {
@@ -5497,6 +5502,10 @@ fn main() {
     let addr = format!("0.0.0.0:{port}");
 
     let state = AppState::new_shared_as(PathBuf::from(data_dir.clone()), role);
+    // Pre-#262 bare namespaces no tenant can reach (#344).
+    namespace_migrate::warn_unreachable_bare_namespaces(
+        &state.controller.lock().unwrap().list_namespaces(),
+    );
     // Bind the listener first so a slow warmup doesn't delay the port;
     // `/readyz` keeps HPA/kube endpoints from sending traffic while it
     // runs (Tier 1 O2). Liveness (`/healthz`) is unaffected.

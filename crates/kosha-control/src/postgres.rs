@@ -690,6 +690,14 @@ impl ControlStore for PgStore {
     }
 }
 
+impl PgStore {
+    /// The pool and the runtime that owns it, for sibling modules that
+    /// run their own transactions (`namespace_rename`).
+    pub(crate) fn pool_and_runtime(&self) -> (&sqlx::PgPool, &tokio::runtime::Runtime) {
+        (&self.pool, &self.rt)
+    }
+}
+
 #[cfg(test)]
 mod retry_tests {
     use super::*;

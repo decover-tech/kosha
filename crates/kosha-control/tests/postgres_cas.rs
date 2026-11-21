@@ -258,6 +258,90 @@ fn postgres_fenced_cas_race_and_takeover() {
     leases.release(&ns, loser_holder, taken).unwrap();
 }
 
+/// #344: `migrate-namespace`'s control-plane step. The rename moves the
+/// namespace and manifest rows in one transaction, carries the lease token,
+/// fences the old id and retires it; a collision or a moved version
+/// changes nothing.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_rename_namespace_rekeys_rows_in_one_transaction() {
+    use kosha_control::NamespaceRename;
+    use std::time::Duration;
+
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let mut store = PgStore::new(&url).unwrap();
+    let observer = PgStore::new(&url).unwrap();
+    let id = uuid::Uuid::new_v4();
+    let from = NamespaceId(format!("bare-{id}"));
+    let to = NamespaceId(format!("tenant-{id}/corpus"));
+    let ttl = Duration::from_secs(60);
+
+    let mut manifest = candidate("bare-000001", 1);
+    manifest.tombstones.clear();
+    manifest.deletion_vectors.insert(
+        SegmentId("bare-000001".into()),
+        kosha_core::deletes::DeletionVector {
+            generation: "a".repeat(64),
+            count: 1,
+            namespace: Some(from.clone()),
+        },
+    );
+    store.compare_and_swap_manifest(&from, 0, manifest).unwrap();
+    let token = store
+        .acquire_writer_lease(&from, "migrator", ttl)
+        .unwrap()
+        .unwrap();
+
+    // A moved version is refused and changes nothing.
+    assert!(matches!(
+        store.rename_namespace(&from, &to, 7),
+        Err(KoshaError::ManifestConflict {
+            actual: Some(1),
+            ..
+        })
+    ));
+    assert!(observer.has_namespace(&from));
+    assert!(!observer.has_namespace(&to));
+
+    // A collision is refused and changes nothing.
+    let taken = NamespaceId(format!("tenant-{id}/taken"));
+    store.create_namespace(taken.clone()).unwrap();
+    assert!(matches!(
+        store.rename_namespace(&from, &taken, 1),
+        Err(KoshaError::NamespaceExists(ref existing)) if existing == &taken
+    ));
+    assert_eq!(observer.manifest_version(&from).unwrap(), Some(1));
+    assert_eq!(observer.manifest_version(&taken).unwrap(), Some(0));
+
+    let outcome = store.rename_namespace(&from, &to, 1).unwrap();
+    assert_eq!(outcome.lease_token, Some(token));
+    assert!(!observer.has_namespace(&from));
+    assert_eq!(observer.manifest_version(&from).unwrap(), None);
+    let moved = observer.try_manifest_cloned(&to).unwrap().unwrap();
+    assert_eq!(moved.version, 1);
+    assert_eq!(moved.segments[0].segment_id.0, "bare-000001");
+    assert_eq!(
+        moved.deletion_vectors[&SegmentId("bare-000001".into())].namespace,
+        Some(to.clone())
+    );
+    // The holder keeps `to` under the carried token; `from` is fenced.
+    assert!(store
+        .renew_writer_lease(&to, "migrator", token, ttl)
+        .unwrap());
+    assert!(!store
+        .renew_writer_lease(&from, "migrator", token, ttl)
+        .unwrap());
+    store.release_writer_lease(&to, "migrator", token).unwrap();
+    // Renaming again finds nothing to move.
+    assert!(matches!(
+        store.rename_namespace(&from, &to, 1),
+        Err(KoshaError::NamespaceNotFound(_))
+    ));
+    // The bare id was retired: re-creating it starts above version 1.
+    store.create_namespace(from.clone()).unwrap();
+    assert_eq!(observer.manifest_version(&from).unwrap(), Some(2));
+}
+
 /// `url` with its database name replaced by `db` (query string kept).
 fn with_database(url: &str, db: &str) -> String {
     let (base, query) = match url.split_once('?') {

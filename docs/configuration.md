@@ -229,6 +229,12 @@ The control plane is in memory unless `DATABASE_URL` is set in a binary built wi
 | `KOSHA_MANIFEST_REFRESH_MS` | How often query pods poll for new manifest versions; `0` disables the refresher and pods check before every search (`manifest_follow.rs`) | `500` | milliseconds |
 | `KOSHA_API_KEY_REFRESH_SECS` | How often API keys are reloaded from Postgres (`auth.rs`) | `30` | seconds |
 
+Namespaces written before tenant scoping (#262) have bare ids that no tenant can reach; the
+server lists them in a `WARN` at boot. `kosha-server migrate-namespace --from <bare> --to
+<tenant>/<name>` moves one. It reads `DATABASE_URL`, the S3 variables, `KOSHA_DATA_DIR` and
+`KOSHA_WAL_MODE` like the server does. See "Migrating pre-#262 namespaces" in
+`k8s/README.md` for what it does and the staging/prod procedure.
+
 ## HTTP server and auth
 
 | Variable | Purpose | Default | Units |
