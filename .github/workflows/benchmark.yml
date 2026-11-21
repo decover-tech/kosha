@@ -154,11 +154,15 @@ jobs:
               -e KOSHA_CACHE_DIR=/var/cache/kosha -e KOSHA_DATA_DIR=/var/cache/kosha/data \
               -e KOSHA_CACHE_MAX_BYTES=644245094400 -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \
               -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
-              -e KOSHA_WARMUP_NAMESPACES="msmarco-10m,msmarco-10m-vec" \
+              -e KOSHA_ADMIN_API_KEY=sk-bench-admin \
+              -e KOSHA_WARMUP_NAMESPACES="default/msmarco-10m,default/msmarco-10m-vec" \
               -v /data/kosha:/var/cache/kosha kosha-server:bench
             sudo docker start kosha
-            for i in $(seq 60); do curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null && break; sleep 3
-              [ "$i" -eq 60 ] && { echo "::error::kosha /stats never responded after 180s"; sudo docker logs kosha; exit 1; }; done
+            # /healthz: unauthenticated liveness. Global /stats is admin-only
+            # since #262 (tenant isolation), so it 403s for sk-bench. Warmup
+            # ids are tenant-scoped (sk-bench is tenant "default").
+            for i in $(seq 60); do curl -sf http://127.0.0.1:8080/healthz >/dev/null && break; sleep 3
+              [ "$i" -eq 60 ] && { echo "::error::kosha /healthz never responded after 180s"; sudo docker logs --tail 200 kosha; exit 1; }; done
             aws s3 cp --only-show-errors s3://decoverai-bench-corpus-cache/msmarco-10m/queries.txt /data/queries.txt
             aws s3 cp --only-show-errors s3://decoverai-bench-corpus-cache/msmarco-10m-emb/queries_emb.f32 /data/queries_emb.f32 || true'
 
