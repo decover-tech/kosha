@@ -120,7 +120,12 @@ jobs:
         run: |
           IP='${{ steps.tf.outputs.ip }}'
           SSH="ssh -i $RUNNER_TEMP/bench.pem -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 ec2-user@$IP"
-          for i in $(seq 60); do $SSH 'command -v docker >/dev/null && echo ready' && break || sleep 10; done
+          # Docker is installed by user-data on first boot: wait for cloud-init
+          # to finish and the daemon to answer, not just for the binary.
+          for i in $(seq 60); do
+            $SSH 'sudo cloud-init status --wait >/dev/null 2>&1; sudo docker info >/dev/null 2>&1 && echo ready' && break || sleep 10
+            [ "$i" -eq 60 ] && { echo "::error::bench VM never reached cloud-init done + docker running"; exit 1; }
+          done
           rsync -az -e "ssh -i $RUNNER_TEMP/bench.pem -o StrictHostKeyChecking=accept-new" \
             --exclude target --exclude .git ./ "ec2-user@$IP:kosha/"
           $SSH 'sudo dnf install -q -y python3.11 python3.11-pip >/dev/null 2>&1 || true
@@ -135,8 +140,11 @@ jobs:
           $SSH 'set -e
             cd ~/kosha && sudo docker build -q -t kosha-server:bench .
             sudo mkdir -p /data/kosha /data/pg && sudo chown ec2-user:ec2-user /data && sudo chown -R 10001:10001 /data/kosha
+            # NOTE: this block is one single-quoted remote script, so it must
+            # not contain an apostrophe. One in a comment here once ended the
+            # quote, and the rest of the step silently ran on the runner.
             # A reused VM (the previous run failed and kept the stack) still
-            # holds that run's kosha container. Its log is the only record of
+            # holds the kosha container of that run. Its log is the only record of
             # what went wrong server-side, so archive it before recreating.
             if sudo docker inspect kosha >/dev/null 2>&1; then
               TS=$(date -u +%Y%m%dT%H%M%SZ)
@@ -263,7 +271,7 @@ jobs:
             echo ""
             echo "| phase | p50 ms | p90 ms | p99 ms | requests | errors |"
             echo "|---|---|---|---|---|---|"
-            find results -name '*.json' ! -name 'recall.json' | sort | while read -r f; do
+            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' | sort | while read -r f; do
               python3 - "$f" << 'EOF'
           import json, sys
           d = json.load(open(sys.argv[1]))
