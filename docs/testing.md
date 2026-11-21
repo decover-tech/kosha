@@ -108,13 +108,13 @@ workload and records every acknowledged id. The scenarios are:
 - SIGKILL the ingest pod mid-flush, and again mid-compaction;
 - S3 latency, timeouts and connection resets during flushes;
 - a Postgres connection cut, then a Postgres restart;
-- three pods booting at once against a fresh database (#330; listed as an expected failure
-  until it is fixed).
+- three pods booting at once against a fresh database (the #330 migration race).
 
 After each fault, the suite checks zero acknowledged-write loss (exists API) and the exact doc
 count on both pods. It also checks that no row of `kosha.manifests` references a segment
 without its `_COMMIT` in MinIO, both sampled during the fault and after recovery. It measures
-recovery time and writes a JSON report. `.github/workflows/faults.yml` runs it nightly, on
+recovery time and writes a JSON report. Known engine bugs it trips, such as #368, are listed in
+`scripts/faults/expected_failures.json`. `.github/workflows/faults.yml` runs it nightly, on
 demand, and on PRs that touch `kosha-server`, `kosha-write`, `kosha-control` or the scripts.
 On failure the workflow uploads the report and server logs.
 

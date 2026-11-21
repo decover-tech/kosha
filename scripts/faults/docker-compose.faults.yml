@@ -15,7 +15,7 @@
 #
 # The `first-boot` profile adds three pods (one ingest, two query) that the
 # concurrent-first-boot scenario starts at the same moment against a freshly
-# created database, ${KOSHA_FIRSTBOOT_DB} (#330). Relative paths resolve
+# created database, ${KOSHA_FIRSTBOOT_DB} (the #330 migration race). Relative paths resolve
 # against the repo root (the directory of the first -f file).
 
 services:

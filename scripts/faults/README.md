@@ -59,7 +59,7 @@ or 5xx: it may or may not have landed).
 | `kill-mid-compaction` | Flush `--segments` (8) segments, start an async full compaction (`POST /v1/admin/compact-namespace`), SIGKILL the ingest pod while it runs (job state recorded), then start it. A synchronous compaction must then succeed, and the count must still be exact. |
 | `s3-toxics` | On the MinIO proxy, one at a time for `--toxic-seconds` each: 1 s latency (±250 ms), `timeout` (connections stall and close after 2 s), `reset_peer` on half the connections. A flush is attempted under each. After recovery, a SIGKILL restart; the acked writes and the count are checked again. |
 | `postgres-cut` | The Postgres proxy disabled for `--cut-seconds` (10) with a flush attempted, then re-enabled; then a real `docker compose restart postgres` (failover approximation). After recovery, a SIGKILL restart and the same re-checks. |
-| `first-boot` | `createdb` a fresh database, then start `kosha-boot-1..3` in one `compose up`. Every pod must stay running and become ready, and a write through the ingest pod must be readable on both query pods. Expected to fail until #330 (concurrent migrations race) is fixed. |
+| `first-boot` | `createdb` a fresh database, then start `kosha-boot-1..3` in one `compose up`. Every pod must stay running and become ready, and a write through the ingest pod must be readable on both query pods. Guards the concurrent-migration fix of #330 (advisory lock). |
 
 ## Checks
 
@@ -74,7 +74,7 @@ final contents are exactly every id ever sent), flushes, and checks:
 | `:doc-count@ingest`, `@query` | `match_all` total equals every id ever written, exactly (strong read on ingest; eventual read on the query pod after it catches up) |
 | `:manifest-committed` | Every segment of every row of `kosha.manifests` has its `_COMMIT` object in MinIO |
 | `:manifest-during-fault` | The same, sampled every `--watch-every` (2) seconds while the fault was on. Unreadable samples (Postgres away on purpose) are counted, not failed |
-| `:acked-present-after-restart`, `:doc-count-after-restart` | `s3-toxics` and `postgres-cut`: the same after a SIGKILL restart |
+| `:redrive-after-restart`, `:acked-present-after-restart`, `:doc-count-after-restart` | `s3-toxics` and `postgres-cut`: after a SIGKILL restart, batches still unacknowledged are re-sent, and the acked ids and exact count are checked again |
 
 ## Report
 
@@ -91,9 +91,11 @@ final contents are exactly every id ever sent), flushes, and checks:
 
 `expected_failures.json` uses the integration suite's format: fnmatch globs over check ids,
 each mapped to a bug with its issue. A listed check that fails is reported as `xfail` and does
-not fail the job. With `--strict`, a listed check that passes also fails the job. `first-boot:*`
-is listed for #330. The race does not always trigger, so the scenario may pass (`xpass`).
-Delete the entry when #330 is fixed.
+not fail the job. With `--strict`, a listed check that passes also fails the job. The `s3-toxics` recovery and pre-restart count checks are listed for #368, which this suite
+found. After a connection reset on a WAL PUT, the S3 WAL can fence itself, and the ingest pod
+then refuses every write until it restarts. The post-restart checks
+(`:redrive-after-restart`, `:acked-present-after-restart`, `:doc-count-after-restart`) are
+not listed, and still hold. Delete each entry when its bug is fixed.
 
 ## Not covered here
 

@@ -44,7 +44,7 @@ Scenarios (each check id starts with the scenario name):
   first-boot           a fresh database, three pods (ingest + 2 query)
                        started at the same moment: none may exit, all must be
                        ready, and a write through one is readable on the
-                       others (#330: listed in expected_failures.json)
+                       others (the #330 concurrent-migration race)
 
 Usage (from the repo root; what .github/workflows/faults.yml runs):
 
@@ -186,7 +186,7 @@ class S3:
         """HTTP status of HEAD <key> (200 present, 404 absent), None when S3
         could not be reached."""
         url = "%s/%s/%s" % (self.endpoint, self.bucket, urllib.parse.quote(key, safe="/-_.~"))
-        hdrs = sigv4_headers("HEAD", url, self.region, self.access_key, self.secret_key, datetime.datetime.utcnow())
+        hdrs = sigv4_headers("HEAD", url, self.region, self.access_key, self.secret_key, datetime.datetime.now(datetime.timezone.utc))
         req = urllib.request.Request(url, method="HEAD")
         for k, v in hdrs.items():
             req.add_header(k, v)
@@ -559,7 +559,9 @@ class Suite:
         self.record("%s:recovered" % name, ok, json.dumps({k: (round(v, 2) if isinstance(v, float) else v) for k, v in rec.items()}))
         w.stop()
         acked = set(w.acked)
-        sent, left = w.redrive(time.time() + a.max_recovery)
+        # A pod that never acked again is not going to start now: do not
+        # spend another --max-recovery on it.
+        sent, left = w.redrive(time.time() + (a.max_recovery if rec["first_ack_s"] is not None else 30))
         rec["unacked_batches"] = sent
         rec["write_failures"] = dict(w.failures)
         self.record("%s:redrive" % name, left == 0, "%d unacked batches re-sent, %d still unacknowledged" % (sent, left))
@@ -739,6 +741,11 @@ class Suite:
         self.recovery.append(rec)
 
     def after_restart(self, name: str, w: Workload) -> None:
+        # Writes still unacknowledged before the restart (a pod that stopped
+        # accepting them) get another chance on the fresh process.
+        _, left = w.redrive(time.time() + self.args.max_recovery)
+        status, _ = self.flush(w)
+        self.record("%s:redrive-after-restart" % name, left == 0 and status == 200, "%d batches still unacknowledged, flush HTTP %s" % (left, status))
         missing, errors = missing_ids(self.exists(w), w.acked)
         self.record("%s:acked-present-after-restart" % name, not missing and not errors, "%d missing %s" % (len(missing), missing[:10]))
         want = len(w.all_ids())
@@ -1003,7 +1010,7 @@ def self_test() -> int:
 
     known_failures = load_expected()
     res = conf.Results(known_failures["checks"], known_failures["bugs"])
-    res.record("first-boot:running@kosha-boot-2", False, "exited 1")
+    res.record("s3-toxics:recovered", False, "writes fenced")
     res.record("kill-mid-flush:acked-present", True)
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "r.json")
@@ -1011,9 +1018,9 @@ def self_test() -> int:
         extend_report(path, [{"scenario": "x", "seconds": 1.0, "error": None}], [{"scenario": "x", "ready_s": 1.5}], {"run_id": "1"})
         with open(path) as f:
             rep = json.load(f)
-        res.record("s3-toxics:doc-count@ingest", False, "lost")
+        res.record("kill-mid-flush:doc-count@ingest", False, "lost")
         code2 = conf.report(res, None, False, False)
-    check("first-boot (#330) is an expected failure", code == 0 and rep["summary"]["xfail"] == 1, rep["summary"])
+    check("a listed failure (#368) is expected", code == 0 and rep["summary"]["xfail"] == 1, rep["summary"])
     check("report carries recovery + timings", rep["recovery"][0]["ready_s"] == 1.5 and rep["scenarios"][0]["scenario"] == "x" and rep["config"]["run_id"] == "1")
     check("an unlisted failure fails the run", code2 == 1)
     print("self-test: %s" % ("FAILED: " + ", ".join(failures) if failures else "all ok"))
