@@ -142,7 +142,12 @@ jobs:
             # Keep the image id, not just the tag: on a fresh VM the tag was
             # once missing by `docker create` time (run 44877848769). Re-tag
             # from the id if needed; fail with diagnostics if the image is gone.
+            diag() { echo "--- DIAG $1: $(date -u +%T)"; sudo docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | head; }
+            echo "--- DIAG docker: $(sudo docker info --format "root={{.DockerRootDir}} driver={{.Driver}} server={{.ServerVersion}}" 2>&1)"
+            df -h / /data /var/lib/docker 2>/dev/null | sed "s/^/--- DIAG df: /"
+            diag before-build
             cd ~/kosha && IMG=$(sudo docker build -q -t kosha-server:bench .)
+            diag after-build
             if ! sudo docker image inspect kosha-server:bench >/dev/null 2>&1; then
               echo "::warning::kosha-server:bench tag missing after build; re-tagging $IMG"
               sudo docker tag "$IMG" kosha-server:bench || { echo "::error::built image $IMG not in the daemon"; sudo docker version; sudo docker images; exit 1; }
@@ -160,7 +165,9 @@ jobs:
             fi
             # Results/logs from a previous run on this VM must not leak into this one.
             sudo rm -rf /data/results-ci
+            diag before-rm
             sudo docker rm -f pg kosha 2>/dev/null || true
+            diag after-rm
             sudo docker run -d --name pg --network host -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=kosha \
               -v /data/pg:/var/lib/postgresql/data postgres:16
             # Bounded waits throughout: an unbounded `until` loop turns a
@@ -170,6 +177,13 @@ jobs:
             # "still working" from "never coming up" short of cancelling).
             for i in $(seq 60); do sudo docker exec pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 2
               [ "$i" -eq 60 ] && { echo "::error::postgres never became ready after 120s"; sudo docker logs pg; exit 1; }; done
+            diag before-create
+            if ! sudo docker image inspect kosha-server:bench >/dev/null 2>&1; then
+              echo "::error::kosha-server:bench vanished between build and create"
+              sudo journalctl -u docker --since "-15 min" --no-pager | tail -60
+              sudo docker info 2>&1 | head -40
+              exit 1
+            fi
             sudo docker create --name kosha --network host \
               -e DATABASE_URL=postgresql://postgres:bench@127.0.0.1:5432/kosha \
               -e KOSHA_API_KEY=sk-bench \
