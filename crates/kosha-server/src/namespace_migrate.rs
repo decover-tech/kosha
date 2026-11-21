@@ -305,7 +305,7 @@ fn part_ranges(size: u64, part: u64) -> Vec<(u64, u64)> {
 #[cfg(feature = "s3")]
 mod s3_objects {
     use super::*;
-    use crate::s3_storage::S3Storage;
+    use crate::s3_storage::{ApplySse, ObjectSse, S3Storage};
 
     /// `CopyObject` handles objects up to 5 GiB; larger ones are copied in
     /// parts with `UploadPartCopy`.
@@ -335,12 +335,15 @@ mod s3_objects {
             key: &str,
             source: &str,
             size: u64,
+            sse: Option<&ObjectSse>,
         ) -> Result<(), String> {
             use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+            // Parts copied with UploadPartCopy inherit the upload's SSE.
             let upload = client
                 .create_multipart_upload()
                 .bucket(bucket)
                 .key(key)
+                .apply_sse(sse)
                 .send()
                 .await
                 .map_err(|e| format!("create_multipart_upload {key}: {e}"))?;
@@ -429,15 +432,29 @@ mod s3_objects {
             let bucket = self.s3.bucket().to_owned();
             let source = copy_source(&bucket, &self.s3.s3_key(from));
             let key = self.s3.s3_key(to);
+            // A copy is a write (#343): without SSE headers CopyObject falls
+            // back to the bucket default rather than keeping the source's
+            // encryption. Resolve from the destination path, so a namespace
+            // moved into `<tenant>/...` lands under that tenant's KMS key.
+            let sse = self.s3.sse().for_path(to);
             self.rt.block_on(async move {
                 if size > SINGLE_COPY_MAX {
-                    return Self::multipart_copy(&client, &bucket, &key, &source, size).await;
+                    return Self::multipart_copy(
+                        &client,
+                        &bucket,
+                        &key,
+                        &source,
+                        size,
+                        sse.as_ref(),
+                    )
+                    .await;
                 }
                 client
                     .copy_object()
                     .bucket(&bucket)
                     .key(&key)
                     .copy_source(&source)
+                    .apply_sse(sse.as_ref())
                     .send()
                     .await
                     .map(|_| ())
