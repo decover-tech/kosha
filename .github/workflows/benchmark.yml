@@ -135,6 +135,18 @@ jobs:
           $SSH 'set -e
             cd ~/kosha && sudo docker build -q -t kosha-server:bench .
             sudo mkdir -p /data/kosha /data/pg && sudo chown ec2-user:ec2-user /data && sudo chown -R 10001:10001 /data/kosha
+            # A reused VM (the previous run failed and kept the stack) still
+            # holds that run's kosha container. Its log is the only record of
+            # what went wrong server-side, so archive it before recreating.
+            if sudo docker inspect kosha >/dev/null 2>&1; then
+              TS=$(date -u +%Y%m%dT%H%M%SZ)
+              sudo docker logs --timestamps kosha 2>&1 | gzip > /tmp/prev-kosha.log.gz || true
+              aws s3 cp --only-show-errors /tmp/prev-kosha.log.gz \
+                "s3://decoverai-bench-corpus-cache/runs/rescued-$TS/server/full.log.gz" || true
+              rm -f /tmp/prev-kosha.log.gz
+            fi
+            # Results/logs from a previous run on this VM must not leak into this one.
+            sudo rm -rf /data/results-ci
             sudo docker rm -f pg kosha 2>/dev/null || true
             sudo docker run -d --name pg --network host -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=kosha \
               -v /data/pg:/var/lib/postgresql/data postgres:16
@@ -155,6 +167,7 @@ jobs:
               -e KOSHA_CACHE_MAX_BYTES=644245094400 -e KOSHA_SEGMENT_CACHE_MAX_BYTES=51539607552 \
               -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
               -e KOSHA_ADMIN_API_KEY=sk-bench-admin \
+              -e KOSHA_DASHBOARD=on \
               -e KOSHA_WARMUP_NAMESPACES="default/msmarco-10m,default/msmarco-10m-vec" \
               -v /data/kosha:/var/cache/kosha kosha-server:bench
             sudo docker start kosha
@@ -215,6 +228,29 @@ jobs:
               --queries-file /data/queries.txt --queries-emb /data/queries_emb.f32 \
               --sample '${{ inputs.recall_sample }}' --k 10 --num-candidates '${{ inputs.recall_num_candidates }}' \
               --out /data/results-ci/vector/recall.json"
+
+      - name: Archive server logs + results to S3
+        # Runs on failure too: a failed run's logs are the useful ones. The
+        # bench segment bucket is destroyed with the stack, so this goes to
+        # the persistent corpus-cache bucket, keyed by run id:
+        #   s3://decoverai-bench-corpus-cache/runs/<run_id>/
+        #     meta.json, <suite>/<phase>.json, <phase>.requests.jsonl.gz,
+        #     <suite>/server/{warmup,<phase>}.log.gz, server/full.log.gz
+        if: always() && inputs.suite != 'none' && steps.tf.outputs.ip != ''
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          DEST="s3://decoverai-bench-corpus-cache/runs/${{ github.run_id }}"
+          $SSH "set -e
+            sudo mkdir -p /data/results-ci/server && sudo chown -R \$(id -u):\$(id -g) /data/results-ci
+            sudo docker logs --timestamps kosha 2>&1 | gzip > /data/results-ci/server/full.log.gz || true
+            cat > /data/results-ci/meta.json <<META
+          {\"run_id\": \"${{ github.run_id }}\", \"sha\": \"${{ github.sha }}\", \"ref\": \"${{ github.ref_name }}\",
+           \"suite\": \"${{ inputs.suite }}\", \"mode\": \"${{ inputs.mode }}\", \"qps\": \"${{ inputs.qps }}\",
+           \"duration\": \"${{ inputs.duration }}\", \"archived_at\": \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
+          META
+            aws s3 sync --only-show-errors /data/results-ci $DEST/"
+          echo "Server logs + results archived to $DEST/" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect results + summary
         if: always() && inputs.suite != 'none'

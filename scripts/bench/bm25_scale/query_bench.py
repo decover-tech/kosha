@@ -61,6 +61,7 @@ NO_CACHE = False
 KNN_VECS = None
 KNN_FIELD = "text_emb"
 KNN_NUM_CANDIDATES = 100
+SERVER_TIMINGS = False
 
 
 def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> dict:
@@ -82,14 +83,30 @@ def payload_for(namespace: str, query_text: str, topk: int, qidx: int = 0) -> di
             payload["operator"] = OPERATOR
     if NO_CACHE:
         payload["no_cache"] = True
+    if SERVER_TIMINGS:
+        # Server phase breakdown in the response (needs KOSHA_DASHBOARD on
+        # the server; silently absent otherwise).
+        payload["timings"] = True
     return payload
 
 
 def run_query(
     session, host, namespace, headers, query_text, topk, timeout,
     results, lock, errors, hit_counts, degraded_counts, qidx=0,
+    raw=None, seq=0, scheduled=0.0, start=0.0,
 ):
     t0 = time.time()
+    rec = None
+    if raw is not None:
+        rec = {
+            "seq": seq,
+            "qidx": qidx,
+            "terms": len(query_text.split()),
+            "t_send_s": round(t0 - start, 4),
+            # Client-side lateness: thread start vs the open-loop schedule.
+            # Large values mean the load generator, not the server, added delay.
+            "send_lag_ms": round((t0 - scheduled) * 1000, 2),
+        }
     try:
         resp = session.post(
             f"{host}/search",
@@ -114,9 +131,17 @@ def run_query(
             results.append(latency)
             hit_counts.append(hits)
             degraded_counts.append(degraded if degraded is not None else 0)
+            if rec is not None:
+                rec.update(latency_ms=round(latency * 1000, 3), hits=hits)
+                if "timings" in body:
+                    rec["server"] = body["timings"]
+                raw.append(rec)
     except Exception as e:  # noqa: BLE001 - benchmark tool, record and move on
         with lock:
             errors.append(str(e))
+            if rec is not None:
+                rec.update(latency_ms=round((time.time() - t0) * 1000, 3), error=str(e)[:200])
+                raw.append(rec)
 
 
 def main() -> None:
@@ -162,10 +187,24 @@ def main() -> None:
         help="ANN candidate pool per query (tpuf-comparable default)",
     )
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument(
+        "--raw-out",
+        type=Path,
+        default=None,
+        help="write one JSON line per request (qidx, terms, send lag, latency, "
+        "hits, server timings) for tail analysis; gzipped if the name ends .gz",
+    )
+    ap.add_argument(
+        "--server-timings",
+        action="store_true",
+        help="send timings=true so each response carries the server phase "
+        "breakdown (requires KOSHA_DASHBOARD on the server)",
+    )
     args = ap.parse_args()
-    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES
+    global OPERATOR, NO_CACHE, KNN_VECS, KNN_FIELD, KNN_NUM_CANDIDATES, SERVER_TIMINGS
     OPERATOR = args.operator
     NO_CACHE = args.no_cache
+    SERVER_TIMINGS = args.server_timings
 
     queries = [l.strip() for l in args.queries_file.read_text().splitlines() if l.strip()]
     if not queries:
@@ -199,6 +238,7 @@ def main() -> None:
     errors: list[str] = []
     hit_counts: list[int] = []
     degraded_counts: list[int] = []
+    raw: list[dict] | None = [] if args.raw_out else None
     lock = threading.Lock()
     threads: list[threading.Thread] = []
 
@@ -234,6 +274,10 @@ def main() -> None:
                 hit_counts,
                 degraded_counts,
                 qidx,
+                raw,
+                i - 1,
+                next_send,
+                start,
             ),
             daemon=True,
         )
@@ -307,6 +351,15 @@ def main() -> None:
     if args.out:
         args.out.write_text(json.dumps(summary, indent=2))
         print(f"\nwrote {args.out}")
+    if raw is not None:
+        import gzip
+
+        raw.sort(key=lambda r: r["seq"])
+        opener = gzip.open if str(args.raw_out).endswith(".gz") else open
+        with opener(args.raw_out, "wt") as f:
+            for r in raw:
+                f.write(json.dumps(r) + "\n")
+        print(f"wrote {len(raw)} request records to {args.raw_out}")
 
 
 if __name__ == "__main__":
