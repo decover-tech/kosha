@@ -36,33 +36,71 @@ API_KEY="${KOSHA_API_KEY:-sk-bench}"
 BENCH=~/kosha/scripts/bench/bm25_scale/query_bench.py
 PY=~/venv311/bin/python3
 
-$PY $BENCH --help | grep -q -- "--no-cache" || { echo FLAGS-MISSING; exit 1; }
+for f in --no-cache --raw-out --server-timings; do $PY $BENCH --help | grep -q -- "$f" || { echo "FLAGS-MISSING $f"; exit 1; }; done
 [ "$SUITE" = "vector" ] && { $PY $BENCH --help | grep -q -- "--knn-embeddings" || { echo FLAGS-MISSING; exit 1; }; }
-sudo mkdir -p "$OUT" && sudo chown -R "$(id -u):$(id -g)" "$OUT"
+sudo mkdir -p "$OUT/server" && sudo chown -R "$(id -u):$(id -g)" "$OUT"
+
+# Server logs per stage (warmup, each phase) land in $OUT/server/ so they
+# ship with the results artifact and get archived to S3 by the workflow.
+# `docker logs --since` takes an RFC 3339 timestamp; ISO_NOW marks a stage.
+iso_now() { date -u +%Y-%m-%dT%H:%M:%S.%NZ; }
+save_server_log() { # save_server_log <name> <since> [until]
+  sudo docker logs --timestamps --since "$2" ${3:+--until "$3"} kosha 2>&1 \
+    | gzip > "$OUT/server/$1.log.gz" || true
+}
 
 # ── cold reset, warmup-gated ─────────────────────────────────────────────
 sudo docker stop kosha >/dev/null
 sudo rm -rf /data/kosha/data/*
 T0=$(date +%s)
+WARMUP_SINCE=$(iso_now)
 sudo docker start kosha >/dev/null
+# The 10M vector working set (~257GB from S3) can outlast an hour of
+# warmup; WARMUP_TIMEOUT_S lets the caller budget for it. Progress every
+# 5 minutes (bytes on local disk) so a slow warmup is distinguishable
+# from a stuck one, and the server log on timeout.
+WARMUP_TIMEOUT_S="${WARMUP_TIMEOUT_S:-3600}"
+LAST_REPORT=$T0
 until curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1; do
   sleep 5
-  [ $(( $(date +%s) - T0 )) -gt 3600 ] && { echo "WARMUP-TIMEOUT"; exit 1; }
+  NOW=$(date +%s)
+  if [ $(( NOW - LAST_REPORT )) -ge 300 ]; then
+    echo "WARMUP-PROGRESS $(( NOW - T0 ))s local=$(sudo du -sb /data/kosha 2>/dev/null | cut -f1) bytes"
+    LAST_REPORT=$NOW
+  fi
+  if [ $(( NOW - T0 )) -gt "$WARMUP_TIMEOUT_S" ]; then
+    echo "WARMUP-TIMEOUT after ${WARMUP_TIMEOUT_S}s"
+    curl -s http://127.0.0.1:8080/readyz || true; echo
+    sudo docker logs --tail 200 kosha 2>&1 || true
+    save_server_log warmup "$WARMUP_SINCE"
+    exit 1
+  fi
 done
 echo "WARMUP-READY in $(( $(date +%s) - T0 ))s"
+save_server_log warmup "$WARMUP_SINCE"
 
+# Every phase also writes one record per request (--raw-out: query,
+# term count, client send lag, latency, hits, and the server's own phase
+# timings via --server-timings) and its server log, so a tail can be
+# decomposed after the fact: analyze_tail.py <label>.requests.jsonl.gz.
 phase() { # phase <label> <extra-args...>
   local label="$1"; shift
+  local since; since=$(iso_now)
   $PY $BENCH \
     --host http://127.0.0.1:8080 --namespace "$NS" \
     --queries-file /data/queries.txt --api-key "$API_KEY" \
     --qps "$QPS" --topk 10 --duration "$DURATION" --timeout 600 \
+    --server-timings --raw-out "$OUT/$label.requests.jsonl.gz" \
     "$@" --out "$OUT/$label.json"
+  save_server_log "$label" "$since"
   echo "PHASE-COMPLETE $label"
 }
 
 if [ "$SUITE" = "bm25" ]; then
   phase cold_or_nocache  --phase cold --operator or --no-cache
+  # Same process, caches now warm, result cache still bypassed: the
+  # engine's steady-state number, comparable to tpuf's published warm.
+  phase warm_or_nocache  --phase warm --operator or --no-cache
   phase warm_or_cache    --phase warm --operator or
 else
   phase knn_cold_nocache --phase cold --knn-embeddings /data/queries_emb.f32 --no-cache

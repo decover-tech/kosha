@@ -11,8 +11,7 @@
 //!   - `GET  /search             ` → BM25 search across a namespace
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 #[cfg(feature = "s3")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -34,6 +33,7 @@ mod doc_store_fallback_tests;
 mod embedding;
 #[cfg(test)]
 mod embedding_server_tests;
+mod http;
 #[cfg(feature = "s3")]
 mod hydration_budget;
 mod manifest_follow;
@@ -1015,13 +1015,10 @@ fn publication_error(context: &str, error: &KoshaError) -> String {
     json_error(status, &format!("{context}: {error}"))
 }
 
-/// Add a `Retry-After` header to a ready-made response.
+/// Add a `Retry-After` header to a ready-made response, right after its
+/// status line.
 fn retry_after(response: String, secs: u64) -> String {
-    response.replacen(
-        "\r\nconnection: close\r\n",
-        &format!("\r\nretry-after: {secs}\r\nconnection: close\r\n"),
-        1,
-    )
+    response.replacen("\r\n", &format!("\r\nretry-after: {secs}\r\n"), 1)
 }
 
 /// Upload a segment directory to S3 and commit it: every data file first,
@@ -1567,6 +1564,7 @@ impl AppState {
         let write_http_client = ingest_host.as_ref().map(|h| {
             println!("write-path requests will be forwarded to ingest at {h}");
             reqwest::blocking::Client::builder()
+                .pool_idle_timeout(http::INTERNAL_CLIENT_POOL_IDLE)
                 .timeout(Duration::from_secs(
                     // Matches the server's own request I/O timeout
                     // (`KOSHA_HTTP_IO_TIMEOUT_SECS`). The previous default of 30 s
@@ -1625,9 +1623,12 @@ impl AppState {
         #[cfg(all(feature = "s3", feature = "postgres"))]
         let peer_http_client = hydration_leases.as_ref().map(|_| {
             reqwest::blocking::Client::builder()
+                .pool_idle_timeout(http::INTERNAL_CLIENT_POOL_IDLE)
                 // Short: a peer that isn't answering quickly should be
                 // abandoned in favor of the S3 fallback, not held onto —
-                // see `fetch_from_peer`.
+                // see `fetch_from_peer`. The blocking client applies it to
+                // each read, not the whole transfer, so a large streamed
+                // file is not cut off.
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("failed to build peer-hydration HTTP client")
@@ -3593,6 +3594,7 @@ impl AppState {
                     fetch_from_s3.push((path.clone(), *size));
                 }
                 kosha_control::HydrationLease::OwnedBy(peer_addr) => {
+                    // Streams the file straight into the cache (#259).
                     match self.fetch_from_peer(&peer_addr, path) {
                         Ok(bytes) => {
                             self.metrics
@@ -3602,17 +3604,8 @@ impl AppState {
                             // Peer-fetched bytes are hydration too — charge
                             // them so a request can't route around its
                             // ceiling just because another replica happened
-                            // to own the lease. (`fetch_from_peer` buffers
-                            // the file whole; making *that* stream needs a
-                            // raw-bytes response path on
-                            // `GET /internal/segment`, tracked separately.)
-                            request.charge(bytes.len() as u64);
-                            if let Err(e) = self.cache.put_bytes(path, &bytes) {
-                                eprintln!(
-                                    "WARN: failed to persist peer-fetched {path} from \
-                                     {peer_addr}: {e}"
-                                );
-                            }
+                            // to own the lease.
+                            request.charge(bytes);
                         }
                         Err(e) => {
                             self.metrics.record_lease(metrics::LeaseOutcome::Timeout);
@@ -3642,6 +3635,9 @@ impl AppState {
     /// Fetch one already-hydrated segment file from a peer replica's
     /// `GET /internal/segment/<path>` instead of S3 — used when
     /// `hydration_lease` reports another replica already owns the fetch.
+    /// The body streams to a temp file that is renamed into the cache when
+    /// complete, so memory stays O(chunk) whatever the file size (#259).
+    /// Returns the bytes written.
     ///
     /// Polls with a short bounded backoff rather than a single shot: we
     /// lost the cross-replica race, so the owner may still be mid-download
@@ -3649,7 +3645,7 @@ impl AppState {
     /// request stuck — any error here is meant to be handled by falling
     /// back to fetching straight from S3, not by failing the request.
     #[cfg(all(feature = "s3", feature = "postgres"))]
-    fn fetch_from_peer(&self, peer_addr: &str, logical_path: &str) -> Result<Vec<u8>, KoshaError> {
+    fn fetch_from_peer(&self, peer_addr: &str, logical_path: &str) -> Result<u64, KoshaError> {
         let Some(ref client) = self.peer_http_client else {
             return Err(KoshaError::NotFound(
                 "no peer HTTP client configured".into(),
@@ -3666,15 +3662,9 @@ impl AppState {
             }
             match req.send() {
                 Ok(resp) if resp.status().as_u16() == 200 => {
-                    let encoded = resp.text().map_err(|e| {
-                        KoshaError::NotFound(format!("peer response read failed: {e}"))
-                    })?;
-                    use base64::Engine;
-                    return base64::engine::general_purpose::STANDARD
-                        .decode(encoded.trim())
-                        .map_err(|e| {
-                            KoshaError::NotFound(format!("peer response decode failed: {e}"))
-                        });
+                    return self.store_peer_response(resp, logical_path).map_err(|e| {
+                        KoshaError::NotFound(format!("peer {peer_addr} transfer failed: {e}"))
+                    });
                 }
                 Ok(resp) if resp.status().as_u16() == 404 => {
                     if std::time::Instant::now() >= deadline {
@@ -3696,6 +3686,81 @@ impl AppState {
                         "peer {peer_addr} unreachable: {e}"
                     )));
                 }
+            }
+        }
+    }
+
+    /// Write a peer's `200` segment response into the cache under
+    /// `logical_path`: to a temp file first, renamed into place only once
+    /// complete, so a reader never sees a partial file.
+    ///
+    /// Current peers send raw bytes. A peer on a build from before #259
+    /// sends the whole file base64-encoded with `x-kosha-encoding: base64`;
+    /// that is still decoded, so a rolling upgrade with mixed peers works.
+    #[cfg(all(feature = "s3", feature = "postgres"))]
+    fn store_peer_response(
+        &self,
+        mut resp: reqwest::blocking::Response,
+        logical_path: &str,
+    ) -> Result<u64, KoshaError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dest = self.cache.path_for(logical_path)?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = dest.with_file_name(format!(
+            ".{}.peer-{}-{}.tmp",
+            dest.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("segment"),
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let legacy_base64 = resp
+            .headers()
+            .get("x-kosha-encoding")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("base64"));
+        let declared = resp.content_length();
+
+        let written = (|| -> Result<u64, KoshaError> {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp)?;
+            let written = if legacy_base64 {
+                let encoded = resp
+                    .text()
+                    .map_err(|e| KoshaError::NotFound(format!("read: {e}")))?;
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded.trim())
+                    .map_err(|e| KoshaError::NotFound(format!("base64 decode: {e}")))?;
+                file.write_all(&bytes)?;
+                bytes.len() as u64
+            } else {
+                let mut out = std::io::BufWriter::with_capacity(256 * 1024, &mut file);
+                let n = std::io::copy(&mut resp, &mut out)?;
+                out.flush()?;
+                if let Some(expected) = declared.filter(|expected| *expected != n) {
+                    return Err(KoshaError::NotFound(format!(
+                        "short body: {n} of {expected} bytes"
+                    )));
+                }
+                n
+            };
+            Ok(written)
+        })();
+        match written {
+            Ok(n) => {
+                if let Err(e) = std::fs::rename(&tmp, &dest) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
+                self.cache.note_external_write(logical_path);
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
             }
         }
     }
@@ -5455,105 +5520,76 @@ fn main() {
     state.spawn_manifest_refresher();
     state.spawn_local_gc();
     let listener = TcpListener::bind(&addr).expect("failed to bind HTTP listener");
-    println!("kosha-server role={role} listening on {addr} data_dir={data_dir}");
+    let config =
+        http::Config::from_env(Duration::from_secs(io_timeout_secs), auth::max_body_bytes());
+    let scheme = if config.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    println!(
+        "kosha-server role={role} listening on {scheme}://{addr} data_dir={data_dir} \
+         max_connections={} max_inflight={}",
+        config.max_connections, config.max_inflight
+    );
 
-    serve(listener, state, Duration::from_secs(io_timeout_secs));
+    if let Err(error) = serve_until(
+        listener,
+        Arc::clone(&state),
+        config,
+        http::os_shutdown_signal(),
+    ) {
+        fatal(&format!("HTTP server failed: {error}"));
+    }
+    // SIGTERM/SIGINT: the listener is closed and in-flight requests are
+    // drained (or the grace period ran out). Hand writer leases back so the
+    // next writer pod can take them now instead of after
+    // KOSHA_WRITER_LEASE_TTL_MS. Unflushed writes stay in the WAL, which the
+    // next owner replays, exactly as after a crash.
+    let released = state.writer_leases.release_all(&state.controller);
+    println!("kosha-server stopped; released {released} writer lease(s)");
+    std::process::exit(0);
 }
 
-/// Accept loop: one thread per connection.
-///
-/// A single slow or stalled client must never block the server — including
-/// the /healthz probe, whose connection would otherwise sit in the accept
-/// queue behind whatever is stuck. Socket-level timeouts bound how long a
-/// stalled client can hold its handler thread.
+/// Serve HTTP on `listener` until `shutdown` resolves, then drain (see
+/// `http.rs`). Every request runs [`dispatch`] on the server's bounded
+/// blocking pool; the rayon scoring pool is untouched.
+fn serve_until(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    config: http::Config,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let handler: http::Handler = Arc::new(move |request| dispatch(&state, request));
+    http::run(listener, config, handler, shutdown)
+}
+
+/// Serve until the process exits, with the environment's HTTP settings.
+/// Tests only: `main` uses [`serve_until`] with the OS shutdown signal.
+#[cfg(test)]
 fn serve(listener: TcpListener, state: Arc<AppState>, io_timeout: Duration) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                stream.set_read_timeout(Some(io_timeout)).ok();
-                stream.set_write_timeout(Some(io_timeout)).ok();
-                let state = Arc::clone(&state);
-                std::thread::spawn(move || {
-                    if let Err(err) = handle(&state, stream) {
-                        eprintln!("request error: {err}");
-                    }
-                });
-            }
-            Err(err) => eprintln!("accept error: {err}"),
-        }
-    }
+    let config = http::Config::from_env(io_timeout, auth::max_body_bytes());
+    serve_until(listener, state, config, std::future::pending()).expect("HTTP server failed");
 }
 
 // ─── Request handling ───────────────────────────────────────────────────────
 
-fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
+/// Handle one parsed request: probes, the dashboard, authentication, role
+/// routing, then [`route`]. Synchronous; the HTTP server (`http.rs`) has
+/// already enforced the body-size cap and read the body.
+fn dispatch(state: &AppState, request: http::Request) -> http::Response {
     let started = Instant::now();
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|e| KoshaError::NotFound(format!("failed to clone stream: {e}")))?,
-    );
-
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line).ok();
-
-    let mut headers = HashMap::new();
-    let mut content_length: usize = 0;
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            // EOF, socket timeout, or any other read error ends the headers.
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                if line == "\r\n" {
-                    break;
-                }
-                let line = line.trim_end();
-                if let Some((key, value)) = line.split_once(':') {
-                    let k = key.trim().to_lowercase();
-                    let v = value.trim();
-                    headers.insert(k, v.to_string());
-                    if let Some(len) = headers.get("content-length") {
-                        content_length = len.parse().unwrap_or(0);
-                    }
-                }
-            }
-        }
-    }
+    let request_line = request.request_line();
+    let headers = request.headers;
+    let body = request.body;
 
     set_request_id(headers.get("x-request-id").map(String::as_str));
-
-    // Reject oversized bodies from the declared length, before reading (or
-    // allocating) any of it.
-    let max_body = auth::max_body_bytes();
-    if content_length > max_body {
-        let resp = json_error(
-            413,
-            &format!(
-                "request body of {content_length} bytes exceeds the {max_body}-byte limit \
-                 (KOSHA_MAX_BODY_BYTES)"
-            ),
-        );
-        stream.write_all(resp.as_bytes()).ok();
-        return Ok(());
-    }
-
-    let mut body = Vec::new();
-    if content_length > 0 {
-        reader
-            .take(content_length as u64)
-            .read_to_end(&mut body)
-            .ok();
-    }
 
     // Liveness/readiness probes hit this with no Authorization header (k8s
     // httpGet probes don't support that out of the box) — must stay
     // unauthenticated, per the doc comment at the top of this file.
     if request_line.starts_with("GET /healthz") || request_line.starts_with("GET /v1/healthz") {
-        stream
-            .write_all(json_ok(&serde_json::json!({"status": "ok"})).as_bytes())
-            .ok();
-        return Ok(());
+        return http::Response::from_raw(json_ok(&serde_json::json!({"status": "ok"})));
     }
 
     // `/readyz` (Tier 1 O2): distinct from `/healthz` (liveness — always
@@ -5563,24 +5599,15 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
     // unauthenticated, same as `/healthz`.
     if request_line.starts_with("GET /readyz") || request_line.starts_with("GET /v1/readyz") {
         if state.is_ready() {
-            stream
-                .write_all(json_ok(&serde_json::json!({"status": "ready"})).as_bytes())
-                .ok();
-        } else {
-            let body = serde_json::json!({
-                "status": "warming",
-                "warmup_namespaces": state.warmup_namespaces,
-                "boot_namespaces": *state.warming.boot_namespaces.lock().unwrap(),
-            })
-            .to_string();
-            let resp = format!(
-                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: {}\r\n\
-                 content-type: application/json\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(resp.as_bytes()).ok();
+            return http::Response::from_raw(json_ok(&serde_json::json!({"status": "ready"})));
         }
-        return Ok(());
+        let body = serde_json::json!({
+            "status": "warming",
+            "warmup_namespaces": state.warmup_namespaces,
+            "boot_namespaces": *state.warming.boot_namespaces.lock().unwrap(),
+        })
+        .to_string();
+        return http::Response::json(503, body);
     }
 
     // `/metrics` (#223): Prometheus scrapes, unauthenticated by default like
@@ -5588,17 +5615,14 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
     // `is_write_path`) and answered ahead of the indexer's route gate
     // (#254): each pod, whatever its role, reports its own process.
     if request_line.starts_with("GET /metrics ") || request_line.starts_with("GET /metrics?") {
-        let resp = handle_metrics(state, &headers);
-        stream.write_all(resp.as_bytes()).ok();
-        return Ok(());
+        return http::Response::from_raw(handle_metrics(state, &headers));
     }
 
     // Built-in dashboard (#214): its static assets hold no data and are
     // served without a key; every data call the page makes comes back
     // through the authenticated API below. 404 unless KOSHA_DASHBOARD is on.
     if let Some(resp) = dashboard::static_response(&request_line, state.dashboard.enabled()) {
-        stream.write_all(resp.as_bytes()).ok();
-        return Ok(());
+        return http::Response::from_raw(resp);
     }
 
     // ── API key authentication ──────────────────────────────────────────
@@ -5621,21 +5645,38 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         &state.ingest_host,
         &state.write_http_client,
     ) {
-        (Err(resp), _, _) => resp.clone(),
+        (Err(resp), _, _) => http::Response::from_raw(resp.clone()),
         // An indexer (#254) serves only the compaction admin API.
         (Ok(_), _, _)
             if state.role == role::Role::Indexer && !role::Role::indexer_serves(&request_line) =>
         {
-            json_error(
+            http::Response::from_raw(json_error(
                 404,
                 "not served by an indexer pod (KOSHA_ROLE=indexer): it serves only \
                  /v1/admin/compact* and /v1/admin/compaction-*",
-            )
+            ))
         }
         (Ok(_), Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
-            forward_to_ingest(client, ingest_host, &request_line, &headers, &body)
+            http::Response::from_raw(forward_to_ingest(
+                client,
+                ingest_host,
+                &request_line,
+                &headers,
+                &body,
+            ))
         }
-        (Ok(tenant), _, _) => route(&request_line, &headers, &body, tenant, state),
+        // Pod-to-pod segment transfer streams the file instead of building
+        // a `String` (#259). Any other credential falls through to `route`,
+        // which answers 403.
+        (Ok(_), _, _)
+            if request_line.starts_with("GET /internal/segment/")
+                && service_authorized(&headers, state.internal_service_key.as_deref()) =>
+        {
+            internal_segment_response(&request_line, state)
+        }
+        (Ok(tenant), _, _) => {
+            http::Response::from_raw(route(&request_line, &headers, &body, tenant, state))
+        }
     };
     log_request(
         &request_line,
@@ -5644,8 +5685,7 @@ fn handle(state: &AppState, mut stream: TcpStream) -> Result<(), KoshaError> {
         &response,
         started,
     );
-    stream.write_all(response.as_bytes()).ok();
-    Ok(())
+    response
 }
 
 thread_local! {
@@ -5703,8 +5743,7 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
         segment_checksum_failures,
     });
     format!(
-        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {}\r\n\
-         connection: close\r\n\r\n{body}",
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {}\r\n\r\n{body}",
         body.len(),
         metrics::CONTENT_TYPE,
     )
@@ -5762,20 +5801,20 @@ fn log_request(
     request_line: &str,
     tenant: &str,
     body_bytes: usize,
-    response: &str,
+    response: &http::Response,
     started: Instant,
 ) {
-    let status = response.get(9..12).unwrap_or("???");
+    let status = response.status();
     let mut parts = request_line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or("-"), parts.next().unwrap_or("-"));
     let path = target.split('?').next().unwrap_or(target);
-    if status == "200" && path.ends_with("/search") {
+    if status == 200 && path.ends_with("/search") {
         return;
     }
     println!(
         "request: {method} {path} status={status} tenant={tenant} ms={:.1} in_bytes={body_bytes} out_bytes={}{}",
         started.elapsed().as_secs_f64() * 1e3,
-        response.len(),
+        response.body_len(),
         request_id()
     );
 }
@@ -6201,25 +6240,10 @@ fn route_inner(
         return handle_segment_gc(body, state);
     }
 
-    // ── Internal, pod-to-pod only ────────────────────────────────────────
-    // Never called by clients — only by a peer replica that lost the
-    // `hydration_leases` claim race for this file (see `fetch_from_peer`).
-    // Authorized by the route wrapper using KOSHA_INTERNAL_API_KEY; ordinary
-    // tenant credentials cannot retrieve another tenant's cached files.
-    if request_line.starts_with("GET /internal/segment/") {
-        #[cfg(all(feature = "s3", feature = "postgres"))]
-        {
-            let path = request_line
-                .strip_prefix("GET /internal/segment/")
-                .and_then(|rest| rest.split(' ').next())
-                .unwrap_or("");
-            return handle_internal_segment(&url_decode(path), state);
-        }
-        #[cfg(not(all(feature = "s3", feature = "postgres")))]
-        {
-            return json_error(404, "not found");
-        }
-    }
+    // `GET /internal/segment/...` (pod-to-pod) never reaches here: it
+    // streams a file, so `dispatch` answers it (`internal_segment_response`)
+    // once the internal credential checks out. `route` still answers 403
+    // to any other credential.
 
     // A query pod's strong-consistency search reads the ingest pod's
     // unindexed tail (#255). Authorized like the segment route above.
@@ -10350,38 +10374,45 @@ fn hydration_failed_message(missing: &[String]) -> String {
 
 // ─── Internal (pod-to-pod) routes ───────────────────────────────────────────
 
-/// `GET /internal/segment/<relative-path>` — serve an already-cached
-/// segment file's bytes to a peer replica, for `fetch_from_peer`.
+/// `GET /internal/segment/<relative-path>` — stream an already-cached
+/// segment file's raw bytes to a peer replica, for `fetch_from_peer`, as
+/// `application/octet-stream` in O(chunk) memory (#259). Only called once
+/// the internal service credential checked out (see `dispatch`); ordinary
+/// tenant credentials cannot retrieve another tenant's cached files.
+///
 /// `relative_path` is validated the same way any other cache key is
 /// (`Cache::path_for` rejects `..`/absolute-path traversal). 404 (not an
 /// error — the caller retries against the lease owner) when the path isn't
 /// cached on this pod, whether because it's not the owner or hydration is
 /// still in flight.
-#[cfg(all(feature = "s3", feature = "postgres"))]
-fn handle_internal_segment(relative_path: &str, state: &AppState) -> String {
-    let local_path = match state.cache.path_for(relative_path) {
-        Ok(p) => p,
-        Err(_) => return json_error(400, "invalid path"),
-    };
-    match std::fs::read(&local_path) {
-        Ok(bytes) => segment_response(&bytes),
-        Err(_) => json_error(404, "not cached here"),
+fn internal_segment_response(request_line: &str, state: &AppState) -> http::Response {
+    #[cfg(all(feature = "s3", feature = "postgres"))]
+    {
+        let raw = request_line
+            .strip_prefix("GET /internal/segment/")
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or("");
+        let relative_path = url_decode(raw.split('?').next().unwrap_or(raw));
+        let local_path = match state.cache.path_for(&relative_path) {
+            Ok(p) => p,
+            Err(_) => return http::Response::from_raw(json_error(400, "invalid path")),
+        };
+        // Files land in the cache by rename, complete, so an open file is
+        // a whole one; its length is fixed from here on.
+        let opened = std::fs::File::open(&local_path)
+            .and_then(|file| file.metadata().map(|meta| (file, meta)));
+        match opened {
+            Ok((file, meta)) if meta.is_file() => {
+                http::Response::file(file, meta.len(), "application/octet-stream")
+            }
+            _ => http::Response::from_raw(json_error(404, "not cached here")),
+        }
     }
-}
-
-/// Base64-encoded body response for `handle_internal_segment` — this
-/// server's response plumbing works in `String`s throughout (see
-/// `json_ok`/`raw_response` below), so raw segment bytes travel as base64
-/// rather than needing a separate raw-bytes response path just for this one
-/// route. `fetch_from_peer` is the corresponding decoder.
-#[cfg(all(feature = "s3", feature = "postgres"))]
-fn segment_response(bytes: &[u8]) -> String {
-    use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    format!(
-        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/octet-stream\r\nx-kosha-encoding: base64\r\nconnection: close\r\n\r\n{encoded}",
-        encoded.len()
-    )
+    #[cfg(not(all(feature = "s3", feature = "postgres")))]
+    {
+        let _ = (request_line, state);
+        http::Response::from_raw(json_error(404, "not found"))
+    }
 }
 
 // ─── JSON response helpers ──────────────────────────────────────────────────
@@ -10389,7 +10420,7 @@ fn segment_response(bytes: &[u8]) -> String {
 fn json_ok<T: serde::Serialize>(value: &T) -> String {
     let body = serde_json::to_string(value).unwrap_or_else(|_| "{}".into());
     format!(
-        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
         body.len()
     )
 }
@@ -10511,7 +10542,7 @@ fn search_error_response(e: &KoshaError) -> String {
 fn json_accepted<T: serde::Serialize>(value: &T) -> String {
     let body = serde_json::to_string(value).unwrap_or_else(|_| "{}".into());
     format!(
-        "HTTP/1.1 202 Accepted\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 202 Accepted\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
         body.len()
     )
 }
@@ -10538,7 +10569,7 @@ fn json_error(status_code: u16, message: &str) -> String {
         _ => "500 Internal Server Error",
     };
     format!(
-        "HTTP/1.1 {status_line}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status_line}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
         body.len()
     )
 }
@@ -10556,7 +10587,7 @@ fn json_error_body(status_code: u16, message: &str) -> String {
         _ => "500 Internal Server Error",
     };
     format!(
-        "HTTP/1.1 {status_line}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status_line}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
         body.len()
     )
 }
@@ -10583,7 +10614,7 @@ fn raw_response(status_code: u16, body: &str) -> String {
         _ => "Response",
     };
     format!(
-        "HTTP/1.1 {status_code} {reason}\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status_code} {reason}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
         body.len()
     )
 }
@@ -10619,6 +10650,8 @@ mod tests {
     use super::*;
     use kosha_core::{Document, DocumentId, Field};
     use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
 
     #[derive(Clone)]
     pub(crate) struct SharedManifestStore {
@@ -11074,8 +11107,6 @@ mod tests {
     /// share: create → index → search → delete → 404 → re-create → empty.
     #[test]
     fn query_replica_forwards_namespace_create_and_delete() {
-        use std::io::Read;
-
         let shared = Arc::new(Mutex::new(kosha_control::Controller::new()));
         let ingest = test_state();
         *ingest.controller.lock().unwrap() = Box::new(SharedManifestStore::new(shared.clone()));
@@ -11115,8 +11146,7 @@ mod tests {
                     .as_bytes(),
                 )
                 .unwrap();
-                let mut resp = String::new();
-                s.read_to_string(&mut resp).unwrap();
+                let resp = http::read_response_string(&mut s).unwrap();
                 (status_of(&resp), body_of(&resp))
             };
         // `max_staleness_seconds: 0`: read the control store on every
@@ -14831,9 +14861,8 @@ mod tests {
         let mut s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         s.write_all(request.as_bytes()).unwrap();
-        let mut resp = String::new();
-        s.read_to_string(&mut resp).unwrap();
-        resp
+        // Framed by content-length: the server keeps the connection open.
+        http::read_response_string(&mut s).unwrap()
     }
 
     fn http_json(addr: std::net::SocketAddr, line: &str, body: &serde_json::Value) -> String {
@@ -15834,33 +15863,49 @@ mod tests {
 
     #[cfg(all(feature = "s3", feature = "postgres"))]
     #[test]
-    fn internal_segment_route_serves_cached_bytes_as_base64() {
+    fn internal_segment_route_serves_cached_bytes_raw() {
         let mut state = test_state();
         state.internal_service_key = Some("peer-test-secret".into());
         state
             .cache
-            .put_bytes("ns/seg/doc_store.bin", b"hello segment")
+            .put_bytes("ns/seg/doc_store.bin", b"hello segment\x00\xff")
             .unwrap();
 
-        let response = route(
-            "GET /internal/segment/ns/seg/doc_store.bin HTTP/1.1\r\n",
-            &HashMap::from([("authorization".into(), "Bearer peer-test-secret".into())]),
-            b"",
-            "test",
+        let mut response = dispatch(
             &state,
+            test_request(
+                "GET /internal/segment/ns/seg/doc_store.bin HTTP/1.1\r\n\
+                 authorization: Bearer peer-test-secret\r\n\r\n",
+            ),
         );
-        let (status, headers, body) = parse(&response);
-        assert!(status.starts_with("HTTP/1.1 200 OK"), "status: {status}");
-        assert!(
-            headers.to_lowercase().contains("x-kosha-encoding: base64"),
-            "headers: {headers}"
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/octet-stream")
         );
+        assert_eq!(response.header("x-kosha-encoding"), None);
+        assert_eq!(response.body_len(), 15);
+        assert_eq!(response.body_bytes(), b"hello segment\x00\xff");
+    }
 
-        use base64::Engine;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(body.trim())
-            .expect("body must be valid base64");
-        assert_eq!(decoded, b"hello segment");
+    #[cfg(all(feature = "s3", feature = "postgres"))]
+    #[test]
+    fn internal_segment_route_requires_the_internal_credential() {
+        let mut state = test_state();
+        state.internal_service_key = Some("peer-test-secret".into());
+        state.admin_auth_key = Some("admin-secret".into());
+        state
+            .cache
+            .put_bytes("ns/seg/doc_store.bin", b"hello segment")
+            .unwrap();
+        let response = dispatch(
+            &state,
+            test_request(
+                "GET /internal/segment/ns/seg/doc_store.bin HTTP/1.1\r\n\
+                 authorization: Bearer admin-secret\r\n\r\n",
+            ),
+        );
+        assert_eq!(response.status(), 403);
     }
 
     #[cfg(all(feature = "s3", feature = "postgres"))]
@@ -15868,14 +15913,14 @@ mod tests {
     fn internal_segment_route_404s_when_not_cached() {
         let mut state = test_state();
         state.internal_service_key = Some("peer-test-secret".into());
-        let response = route(
-            "GET /internal/segment/ns/seg/missing.bin HTTP/1.1\r\n",
-            &HashMap::from([("authorization".into(), "Bearer peer-test-secret".into())]),
-            b"",
-            "test",
+        let response = dispatch(
             &state,
+            test_request(
+                "GET /internal/segment/ns/seg/missing.bin HTTP/1.1\r\n\
+                 authorization: Bearer peer-test-secret\r\n\r\n",
+            ),
         );
-        assert!(response.starts_with("HTTP/1.1 404"), "response: {response}");
+        assert_eq!(response.status(), 404);
     }
 
     #[cfg(all(feature = "s3", feature = "postgres"))]
@@ -15883,22 +15928,44 @@ mod tests {
     fn internal_segment_route_rejects_path_traversal() {
         let mut state = test_state();
         state.internal_service_key = Some("peer-test-secret".into());
-        let response = route(
-            "GET /internal/segment/../../etc/passwd HTTP/1.1\r\n",
-            &HashMap::from([("authorization".into(), "Bearer peer-test-secret".into())]),
-            b"",
-            "test",
+        let response = dispatch(
             &state,
+            test_request(
+                "GET /internal/segment/../../etc/passwd HTTP/1.1\r\n\
+                 authorization: Bearer peer-test-secret\r\n\r\n",
+            ),
         );
-        assert!(response.starts_with("HTTP/1.1 400"), "response: {response}");
+        assert_eq!(response.status(), 400);
+    }
+
+    /// Parse a raw request (request line, headers, blank line, body) into
+    /// the [`http::Request`] the server hands to `dispatch`.
+    fn test_request(raw: &str) -> http::Request {
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw, ""));
+        let mut lines = head.split("\r\n");
+        let mut first = lines.next().unwrap_or("").split_whitespace();
+        let method = first.next().unwrap_or("GET").to_string();
+        let target = first.next().unwrap_or("/").to_string();
+        let headers = lines
+            .filter_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            })
+            .collect();
+        http::Request {
+            method,
+            target,
+            headers,
+            body: body.as_bytes().to_vec(),
+        }
     }
 
     /// End-to-end over a real socket, mirroring
     /// `forward_to_ingest_relays_method_path_and_response`: a real "peer"
     /// server (its own `AppState`/`serve()` loop) with a segment file
     /// already in its cache, and `fetch_from_peer` against it — exercises
-    /// the actual reqwest + base64 round trip, not just the pure route
-    /// handler above.
+    /// the actual reqwest round trip into the requester's cache, not just
+    /// the pure route handler above.
     #[cfg(all(feature = "s3", feature = "postgres"))]
     #[test]
     fn fetch_from_peer_round_trips_bytes_over_real_http() {
@@ -15925,10 +15992,152 @@ mod tests {
                 .unwrap(),
         );
 
-        let bytes = requester
+        let written = requester
             .fetch_from_peer(&addr.to_string(), "ns/seg/doc_store.bin")
             .expect("peer fetch should succeed");
-        assert_eq!(bytes, b"peer bytes");
+        assert_eq!(written, 10);
+        let local = requester.cache.path_for("ns/seg/doc_store.bin").unwrap();
+        assert_eq!(fs::read(local).unwrap(), b"peer bytes");
+    }
+
+    /// A requester with a peer HTTP client and the shared internal key.
+    #[cfg(all(feature = "s3", feature = "postgres"))]
+    fn peer_requester() -> AppState {
+        let mut requester = test_state();
+        requester.internal_auth_key = Some("peer-test-secret".into());
+        requester.peer_http_client = Some(
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        );
+        requester
+    }
+
+    /// #259 acceptance: a large segment file moves peer to peer as raw
+    /// bytes, streamed on both ends, and arrives intact.
+    #[cfg(all(feature = "s3", feature = "postgres"))]
+    #[test]
+    fn fetch_from_peer_streams_a_64_mib_file_intact() {
+        const SIZE: usize = 64 * 1024 * 1024;
+        let mut peer = test_state();
+        peer.internal_service_key = Some("peer-test-secret".into());
+        // Deterministic, incompressible-looking bytes (xorshift).
+        let mut data = vec![0u8; SIZE];
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for chunk in data.chunks_mut(8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
+        }
+        let expected_crc = crc32fast::hash(&data);
+        peer.cache.put_bytes("ns/big/doc_store.bin", &data).unwrap();
+        drop(data);
+        let addr = serve_state(peer);
+
+        let requester = peer_requester();
+        let written = requester
+            .fetch_from_peer(&addr.to_string(), "ns/big/doc_store.bin")
+            .expect("peer fetch should succeed");
+        assert_eq!(written, SIZE as u64);
+        let local = requester.cache.path_for("ns/big/doc_store.bin").unwrap();
+        let received = fs::read(&local).unwrap();
+        assert_eq!(received.len(), SIZE);
+        assert_eq!(crc32fast::hash(&received), expected_crc);
+        // Accounted in the cache like any other hydrated file, and no temp
+        // file left behind.
+        assert!(requester.cache.total_size() >= SIZE as u64);
+        let leftovers: Vec<_> = fs::read_dir(local.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Rolling upgrade: a peer still on a pre-#259 build answers with the
+    /// whole file base64-encoded and `x-kosha-encoding: base64`. The new
+    /// client must still decode it.
+    #[cfg(all(feature = "s3", feature = "postgres"))]
+    #[test]
+    fn fetch_from_peer_accepts_a_legacy_base64_peer() {
+        use base64::Engine;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
+        let seen_auth = Arc::new(Mutex::new(String::new()));
+        let seen = Arc::clone(&seen_auth);
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if line.to_ascii_lowercase().starts_with("authorization:") {
+                    *seen.lock().unwrap() = line.trim().to_string();
+                }
+            }
+            let mut stream = stream;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/octet-stream\r\n\
+                 x-kosha-encoding: base64\r\nconnection: close\r\n\r\n{encoded}",
+                encoded.len()
+            )
+            .unwrap();
+        });
+
+        let requester = peer_requester();
+        let written = requester
+            .fetch_from_peer(&addr.to_string(), "ns/old/postings.bin")
+            .expect("legacy peer fetch should succeed");
+        assert_eq!(written, payload.len() as u64);
+        let local = requester.cache.path_for("ns/old/postings.bin").unwrap();
+        assert_eq!(fs::read(local).unwrap(), payload);
+        assert_eq!(
+            seen_auth.lock().unwrap().as_str(),
+            "authorization: Bearer peer-test-secret"
+        );
+    }
+
+    /// A peer that hangs up mid-body must not leave a truncated file in the
+    /// cache: the caller falls back to S3 instead.
+    #[cfg(all(feature = "s3", feature = "postgres"))]
+    #[test]
+    fn fetch_from_peer_discards_a_truncated_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let mut stream = stream;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\nonly a few bytes")
+                .unwrap();
+        });
+        let requester = peer_requester();
+        assert!(requester
+            .fetch_from_peer(&addr.to_string(), "ns/cut/doc_store.bin")
+            .is_err());
+        let local = requester.cache.path_for("ns/cut/doc_store.bin").unwrap();
+        assert!(!local.exists());
+        let leftovers: Vec<_> = fs::read_dir(local.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[cfg(all(feature = "s3", feature = "postgres"))]
@@ -15986,7 +16195,9 @@ mod tests {
         assert!(status.starts_with("HTTP/1.1 "));
         assert!(headers.contains(&format!("content-length: {}", body.len())));
         assert!(headers.contains("content-type: application/json"));
-        assert!(headers.contains("connection: close"));
+        // Keep-alive (#259): the server frames responses by length and
+        // leaves the connection open.
+        assert!(!headers.contains("connection: close"));
     }
 
     #[test]
@@ -17380,8 +17591,6 @@ mod tests {
         // Regression: the accept loop used to handle one connection at a
         // time, so a single stalled client blocked every subsequent request
         // — including the /healthz probe.
-        use std::io::Read;
-
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let state = Arc::new(test_state());
@@ -17395,8 +17604,7 @@ mod tests {
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         s.write_all(b"GET /healthz HTTP/1.1\r\nhost: x\r\n\r\n")
             .unwrap();
-        let mut resp = String::new();
-        s.read_to_string(&mut resp).unwrap();
+        let resp = http::read_response_string(&mut s).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "response: {resp}");
     }
 
@@ -19352,23 +19560,10 @@ mod tests {
         state
     }
 
-    /// One request through `handle`, the socket entry point, with no
-    /// credentials at all.
+    /// One request through `dispatch`, the entry point every socket
+    /// request takes, with no credentials at all.
     fn raw_request(state: &AppState, request: &str) -> String {
-        use std::io::Read;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let request = request.to_string();
-        let client = std::thread::spawn(move || {
-            let mut stream = TcpStream::connect(addr).unwrap();
-            stream.write_all(request.as_bytes()).unwrap();
-            let mut out = String::new();
-            stream.read_to_string(&mut out).unwrap();
-            out
-        });
-        let (stream, _) = listener.accept().unwrap();
-        handle(state, stream).unwrap();
-        client.join().unwrap()
+        dispatch(state, test_request(request)).into_raw_string()
     }
 
     fn header_value<'a>(response: &'a str, name: &str) -> Option<&'a str> {

@@ -238,7 +238,7 @@ fn not_found() -> String {
 fn response(status: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\ncontent-length: {}\r\ncontent-type: {content_type}\r\n\
-         {SECURITY_HEADERS}connection: close\r\n\r\n{body}",
+         {SECURITY_HEADERS}\r\n{body}",
         body.len()
     )
 }

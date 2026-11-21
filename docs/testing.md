@@ -94,3 +94,39 @@ targets. The nightly workflow fuzzes each target for two minutes, keeps the corp
 Actions cache and uploads any crash as an artifact. Reproduce one with
 `cargo +nightly fuzz run <target> <artifact>`; a decoder panic is a bug: it must return
 `KoshaError::CorruptSegment` (or the WAL's `InvalidData`) instead, with a regression test.
+
+## Process-level faults and soak (#357)
+
+The sections above test one process from inside it. Two scripts test the deployed shape from
+outside, over HTTP.
+
+**Fault-injection suite** (`scripts/faults/`, see its README). It runs the ingest + query
+compose stack with [toxiproxy](https://github.com/Shopify/toxiproxy) between the pods and
+MinIO and between the pods and Postgres. Each scenario runs a continuous acknowledged-write
+workload and records every acknowledged id. The scenarios are:
+
+- SIGKILL the ingest pod mid-flush, and again mid-compaction;
+- S3 latency, timeouts and connection resets during flushes;
+- a Postgres connection cut, then a Postgres restart;
+- three pods booting at once against a fresh database (#330; listed as an expected failure
+  until it is fixed).
+
+After each fault, the suite checks zero acknowledged-write loss (exists API) and the exact doc
+count on both pods. It also checks that no row of `kosha.manifests` references a segment
+without its `_COMMIT` in MinIO, both sampled during the fault and after recovery. It measures
+recovery time and writes a JSON report. `.github/workflows/faults.yml` runs it nightly, on
+demand, and on PRs that touch `kosha-server`, `kosha-write`, `kosha-control` or the scripts.
+On failure the workflow uploads the report and server logs.
+
+    python3 scripts/faults/run_faults.py --self-test   # no Docker
+
+**Soak driver** (`scripts/soak/soak.py`, see its README). It loads one large namespace and N
+Zipf-sized namespaces across several tenants. It then runs continuous upserts and deletes at a
+target docs/s alongside BM25, kNN and filtered queries at a ramping QPS. It records p50/p99
+per query class, write-to-visible latency, the 5xx and connection-error rates, and segment
+counts over time (`/metrics`, namespace stats). At the end it checks every namespace's exact
+doc count. Pass/fail thresholds come from flags. `--smoke` is a 5-minute run, which
+`faults.yml` runs after the fault scenarios. The defaults are the 24-hour soak on the stage
+cluster with hourly query-pod replacement, an ops run documented in `scripts/soak/README.md`.
+
+    python3 scripts/soak/soak.py --self-test           # includes a short run against a fake server

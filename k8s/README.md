@@ -132,6 +132,75 @@ Consequences worth knowing:
   `base/`, so `k8s/prod` inherits them; without the label and taint on the
   prod cluster, the pod sits `Pending` forever.
 
+## Encryption at rest
+
+Both places tenant data rests must be encrypted. The full reference (env
+vars, which key an object uses, key rotation) is in
+`docs/configuration.md`, "Encryption at rest".
+
+**S3.** Set `KOSHA_S3_SSE=aws:kms` (and optionally
+`KOSHA_S3_SSE_KMS_KEY_ID`, `KOSHA_S3_SSE_BUCKET_KEY=true` and per-tenant
+`KOSHA_S3_TENANT_KMS_KEYS` / `KOSHA_S3_TENANT_KMS_KEYS_FILE`) in the
+ConfigMap; see the commented example in `base/configmap.yaml`. Every pod
+that reads or writes S3 (ingest, query, indexer, the GC CronJob and
+`migrate`) runs as the `kosha` service account, so its IRSA role needs KMS
+access to every key in use, the old key included until a rotation's hard
+cutover is done:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "KoshaSegmentKms",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+      "Resource": [
+        "arn:aws:kms:us-east-1:111122223333:key/DEFAULT-KEY-ID",
+        "arn:aws:kms:us-east-1:111122223333:key/TENANT-KEY-ID"
+      ],
+      "Condition": {
+        "StringEquals": { "kms:ViaService": "s3.us-east-1.amazonaws.com" }
+      }
+    }
+  ]
+}
+```
+
+Each key's policy must also allow that role (or delegate to IAM). With S3
+Bucket Keys on, KMS sees the bucket ARN rather than the object ARN in the
+encryption context, so a key policy that conditions on
+`kms:EncryptionContext:aws:s3:arn` must name the bucket. A misconfigured key
+shows up as `AccessDenied` on the first upload or hydration after the
+rollout, so roll out to stage first.
+
+**Local disk.** The ingest pod's NVMe instance store
+(`/var/lib/kosha-cache`) is encrypted by the hardware on Nitro instance
+types, with a per-instance key destroyed when the instance stops, so keep
+the `NodePool` to Nitro types. The query and indexer pods' `emptyDir`
+caches and every node's root volume are EBS: enable EBS encryption by
+default for the account, and set `encrypted: true` in the `EC2NodeClass`
+`blockDeviceMappings`. A PVC-backed cache needs an encrypted StorageClass:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: kosha-encrypted-gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+  # Optional: a customer-managed key instead of aws/ebs.
+  # kmsKeyId: arn:aws:kms:us-east-1:111122223333:key/EBS-KEY-ID
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+```
+
+Encryption in transit between pods (peer hydration, read-to-write
+forwarding) is not covered yet; it follows the HTTP server replacement
+(#259).
+
 ## Deploying
 
 `.github/workflows/release.yml` / `deploy.yml` call

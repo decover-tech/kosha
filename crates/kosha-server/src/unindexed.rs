@@ -277,6 +277,7 @@ impl UnindexedState {
             .as_nanos();
         let http = query_role.then(|| {
             reqwest::blocking::Client::builder()
+                .pool_idle_timeout(crate::http::INTERNAL_CLIENT_POOL_IDLE)
                 .timeout(Duration::from_millis(
                     std::env::var("KOSHA_TAIL_FETCH_TIMEOUT_MS")
                         .ok()

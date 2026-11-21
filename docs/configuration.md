@@ -47,6 +47,85 @@ it, segments stay on local disk under `KOSHA_DATA_DIR`. Read in `S3Config::from_
 The region comes from `AWS_DEFAULT_REGION`, then `AWS_REGION`, then `us-east-1` when a custom
 endpoint is set.
 
+### Encryption at rest (S3 server-side encryption)
+
+Kosha can request server-side encryption (SSE) on every object it writes to S3 (#343):
+segment files, `_COMMIT` markers, deletion vectors, `migrate` uploads and S3 WAL group
+commits, including the conditional `If-None-Match` puts. The settings are read in
+`SseConfig::from_lookup` (`crates/kosha-server/src/s3_storage.rs`) and validated at startup.
+The node **fails closed**: an unknown mode, a malformed tenant map, or a KMS-only setting
+without `KOSHA_S3_SSE=aws:kms` logs `FATAL: invalid S3 encryption config: ...` and exits,
+so a typo never falls back to weaker encryption. The startup log prints the mode, for example
+`S3 server-side encryption: mode=aws:kms default_key=configured bucket_key=on tenant_keys=2`.
+Key ids are never logged.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_S3_SSE` | `none` sends no SSE header, so the bucket's default encryption applies. `AES256` requests SSE-S3. `aws:kms` requests SSE-KMS. Case-insensitive | `none` | enum |
+| `KOSHA_S3_SSE_KMS_KEY_ID` | KMS key (key id, key ARN or `alias/...`) for objects with no per-tenant key. Requires `aws:kms`. Unset with `aws:kms` means the AWS-managed `aws/s3` key | unset | key id |
+| `KOSHA_S3_SSE_BUCKET_KEY` | `true` or `false`: S3 Bucket Keys, which cut KMS request cost. Requires `aws:kms`. Unset sends no header, so the bucket's setting applies | unset | flag |
+| `KOSHA_S3_TENANT_KMS_KEYS` | Per-tenant KMS keys (BYOK) as `tenant=key-id,tenant2=key-id2`. Requires `aws:kms`. A tenant not listed uses `KOSHA_S3_SSE_KMS_KEY_ID` | unset | map |
+| `KOSHA_S3_TENANT_KMS_KEYS_FILE` | The same map as a JSON file, `{"tenant": "key-id"}` (for example a mounted Secret). Set at most one of this and `KOSHA_S3_TENANT_KMS_KEYS` | unset | path |
+
+**Which key an object uses.** Every object under a namespace is
+`{namespace}/{segment}/{file}`, and a tenant-scoped namespace is `{tenant}/{name}` (branches
+and shards stay under the same tenant). The tenant is the namespace's first component, and its
+key comes from the tenant map, falling back to the default key. These objects have no tenant
+and always use the default key:
+
+- objects of a bare namespace, such as `migrate` without `--namespace`;
+- **WAL objects** (`{prefix}/_wal/{writer_id}/...`). A WAL stream belongs to one ingest writer,
+  and one group commit holds the records of every tenant that wrote in that window, so it cannot
+  carry a per-tenant key. A tenant that requires its own key for all of its data at rest should
+  keep this in mind when `KOSHA_WAL_MODE=s3`: WAL objects are short-lived (reclaimed once a
+  checkpoint covers them), but they are encrypted with the default key.
+
+**Reads need no change.** S3 decrypts SSE-S3 and SSE-KMS objects transparently on `GET`, but
+with SSE-KMS the pod's role needs `kms:Decrypt` (reads) and `kms:GenerateDataKey` (writes,
+including multipart uploads) on every key in use. See the IAM policy in `k8s/README.md`.
+
+**Turning SSE on** affects new objects only. Existing objects keep the encryption they were
+written with and stay readable (subject to the KMS permissions above).
+
+#### Key rotation
+
+- **KMS automatic rotation** (recommended): enable rotation on the key in KMS. KMS keeps the
+  old key material for decryption, so nothing is re-encrypted and no Kosha config changes.
+- **Switching to a different key** (a new `KOSHA_S3_SSE_KMS_KEY_ID` or a new tenant entry):
+  roll out the new value. New objects use the new key at once. Old objects keep the old key
+  and stay readable as long as the role can still `kms:Decrypt` with it, so keep the old key
+  enabled and in the IAM policy. Compaction rewrites segments into new objects, so the old
+  key's share of the data shrinks over time.
+- **Hard cutover** (the old key must stop being used): after the rollout, re-encrypt the
+  remaining objects in place, then disable the old key once nothing references it:
+
+  ```sh
+  aws s3 cp s3://$BUCKET/$PREFIX/acme/ s3://$BUCKET/$PREFIX/acme/ --recursive \
+    --sse aws:kms --sse-kms-key-id "$NEW_KEY_ARN"
+  ```
+
+  The copy rewrites each object with the same bytes, so `_COMMIT` checksums stay valid. Run it
+  per tenant prefix (or for the whole prefix with the default key), and check with
+  `aws s3api head-object` that `SSEKMSKeyId` is the new key before disabling the old one.
+
+#### Local cache volumes
+
+SSE covers S3 only. Each pod also keeps segments, the read-through cache and (with
+`KOSHA_WAL_MODE=local`) the WAL on local disk under `KOSHA_DATA_DIR`, so that disk must be
+encrypted too. This is a deployment requirement, not something Kosha enforces:
+
+- **EBS** (root volumes, `emptyDir` on the node's root disk, PVCs): turn on EBS encryption by
+  default for the account and region, or set `encrypted: "true"` (and optionally `kmsKeyId`)
+  on the StorageClass, and `blockDeviceMappings[].ebs.encrypted: true` in the Karpenter
+  `EC2NodeClass`.
+- **NVMe instance store** (the ingest pool): the data on NVMe instance-store volumes of current
+  (Nitro) instance types is encrypted by the hardware with a per-instance key that is
+  destroyed when the instance stops. Use only Nitro instance types in that `NodePool`.
+  Software encryption (for example LUKS in the node user-data) is an option where policy
+  requires a customer-managed key.
+
+See `k8s/README.md` ("Encryption at rest") for an IAM policy and a StorageClass example.
+
 ## Cache
 
 | Variable | Purpose | Default | Units |
@@ -161,7 +240,13 @@ server lists them in a `WARN` at boot. `kosha-server migrate-namespace --from <b
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
 | `KOSHA_HTTP_PORT` | HTTP listen port (binds `0.0.0.0`) | `8080` | port |
-| `KOSHA_HTTP_IO_TIMEOUT_SECS` | Per-syscall socket read/write timeout. Bounds stalled clients, not how long a request may take | `300` | seconds |
+| `KOSHA_HTTP_IO_TIMEOUT_SECS` | How long a request body may take to arrive (HTTP 408 after), and how long one response write may stall on a client that stopped reading. Also caps the default `KOSHA_HTTP_IDLE_TIMEOUT_SECS`. Bounds stalled clients, not how long a request may take (`http.rs`) | `300` | seconds |
+| `KOSHA_HTTP_IDLE_TIMEOUT_SECS` | How long the server waits for a complete request head, counted from when it starts waiting: on a new connection that is the header-read timeout, and between requests on a kept-alive connection it is the idle timeout. The connection is closed after it | `30` (or `KOSHA_HTTP_IO_TIMEOUT_SECS` if lower) | seconds |
+| `KOSHA_HTTP_MAX_CONNECTIONS` | Open connections served at once. A connection over the cap gets HTTP 503 with `Retry-After: 1` and is closed | `1024` | connections |
+| `KOSHA_HTTP_MAX_INFLIGHT` | Requests running a handler at once (on a bounded blocking pool; the async side has at most 4 threads). A request over the cap gets HTTP 503 with `Retry-After: 1`. `GET /healthz` is answered without a slot | `256` | requests |
+| `KOSHA_HTTP_SHUTDOWN_GRACE_SECS` | On SIGTERM or SIGINT the listener closes, idle connections close, and in-flight requests get this long to finish. The pod then releases its writer leases and exits | `25` | seconds |
+| `KOSHA_TLS_CERT_PATH` | PEM certificate chain. With `KOSHA_TLS_KEY_PATH`, the listener serves HTTPS only. Setting just one of the two is a startup error | unset (HTTP) | path |
+| `KOSHA_TLS_KEY_PATH` | PEM private key (PKCS#8, PKCS#1 or SEC1) for `KOSHA_TLS_CERT_PATH` | unset | path |
 | `KOSHA_AUTH` | `disabled` (or `off`, `false`, `0`, `none`) turns authentication off; every request becomes tenant `dev`. Local development only | enabled | flag |
 | `KOSHA_API_KEY` | One tenant API key, mapped to tenant `default` | unset | string |
 | `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs | unset | list |
@@ -172,6 +257,17 @@ server lists them in a `WARN` at boot. `kosha-server migrate-namespace --from <b
 
 The server refuses to start when no credential is configured (no env key, no admin or internal
 key, no Postgres keys) unless `KOSHA_AUTH=disabled`.
+
+The server speaks HTTP/1.1 with keep-alive (#259): responses carry a `content-length` and the
+connection stays open for the next request. TLS covers client-facing traffic only. The internal
+clients take no CA configuration yet: peer hydration always connects over `http://` (so pods
+that share segments through hydration leases should not turn TLS on), and query-to-ingest
+forwarding to an `https://` `KOSHA_INGEST_HOST` trusts only the platform's roots. TLS between
+pods is tracked in #343.
+
+`GET /internal/segment/...` streams the cached file as raw `application/octet-stream`. Peers on
+builds from before #259 send base64 with `x-kosha-encoding: base64`; the client still decodes
+that, so a rolling upgrade with mixed peers works.
 
 ## Metrics
 
