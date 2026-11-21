@@ -210,6 +210,107 @@ Notes:
   `make migration-job-manifest`. OpenSearch host/IAM for that Job are
   environment-specific — edit or regenerate before use.
 
+## Migrating pre-#262 namespaces
+
+Since #262 every client namespace resolves to `<tenant>/<name>`, and the
+segment prefix in S3 embeds that id. Namespaces written before #262 live
+under bare ids (`paragraph_index_hnsw`, the bench corpora) that no tenant
+can address. A server booting on such a control plane logs:
+
+    WARN: 2 namespace(s) predate tenant scoping (#262) and are unreachable through /v1/namespaces: ...
+
+`kosha-server migrate-namespace` (#344) moves one bare namespace to
+`<tenant>/<name>`. It is an offline command (a Job, or by hand), not an
+endpoint. It needs `DATABASE_URL` and the same S3 settings as the server
+(`KOSHA_S3_BUCKET`, `KOSHA_S3_PREFIX`, ...), so `kosha-config` and
+`kosha-secret` are all it needs. Without `KOSHA_S3_BUCKET` it moves
+segments inside `KOSHA_DATA_DIR`.
+
+    kosha-server migrate-namespace --list-unreachable
+    kosha-server migrate-namespace --from <bare> --to <tenant>/<name> [--dry-run] [--keep-source]
+
+What a run does, in order:
+
+1. Takes the writer lease (#254) on both ids. A live writer holding either
+   lease makes it refuse: stop the writer first.
+2. Refuses when the WAL holds records for the bare id past the manifest's
+   checkpoint. With `KOSHA_WAL_MODE=s3` it reads every stream under `_wal/`
+   in the bucket. With a local WAL it reads `KOSHA_DATA_DIR/_wal`, which
+   lives on the ingest pod's disk; when that is not mounted, let the
+   writer's idle flush run, stop the writer and pass `--skip-wal-check`.
+3. Copies every object of the manifest's segments (data files, footers,
+   deletion bitmaps, `_COMMIT` markers last) from `<bare>/` to
+   `<tenant>/<name>/` with server-side `CopyObject`. Objects already copied at
+   the same size are skipped. Objects under `<bare>/` that belong to no
+   segment of the manifest are left alone: if a tenant is named like the
+   bare namespace, its namespaces share the prefix.
+4. Checks that every copied object is at the destination with the same
+   size, and that counts and bytes match.
+5. Re-keys the control plane in one Postgres transaction:
+   `kosha.namespaces`, `kosha.manifests`, `kosha.writer_leases` (the token
+   is carried over; the old id's lease is bumped and expired) and
+   `kosha.retired_namespaces` (the bare id is retired at its last version).
+   It fails, and changes nothing, when `<tenant>/<name>` already exists or
+   the manifest moved since step 2.
+6. Reopens the manifest under `<tenant>/<name>` and checks the segment list
+   and document count.
+7. Deletes the copied objects under `<bare>/` (not with `--keep-source`).
+
+A rerun is safe at any point. Before step 5 it starts over and skips what
+is already copied; after step 5 it finds the new id in the control plane
+and only finishes steps 6 and 7 (so `--keep-source` now, plain rerun
+later, deletes the source when you are ready).
+
+It refuses a sharded namespace and a namespace whose segments a branch of
+another namespace reads (#208); move or delete those by hand.
+
+### Staging / prod procedure
+
+Do this for each environment before it takes a build past #262, or right
+after (the data is invisible, not lost, until it is moved).
+
+1. List what needs moving and pick the tenant for each namespace (the
+   tenant of the API key its clients use; `default` for `KOSHA_API_KEY`):
+
+       kubectl -n kosha exec deploy/kosha -- kosha-server migrate-namespace --list-unreachable
+
+2. Let the writer flush, then stop it, so nothing writes the bare id while
+   it moves. No client can write a bare id since #262, and the idle flush
+   (`KOSHA_FLUSH_MAX_AGE_MS`, default 1 s; check it is not `0`) publishes
+   whatever the writer still buffers or recovered from its WAL, bare
+   namespaces included. Give it a few seconds after boot, then:
+
+       kubectl -n kosha scale deploy/kosha --replicas=0
+
+   Query pods can keep serving other namespaces.
+
+3. Dry run, then the real run, from a one-off pod with the server's
+   configuration. With a local WAL, mount the ingest data dir or add
+   `--skip-wal-check` (only after step 2):
+
+       kubectl -n kosha run kosha-migrate-ns --rm -it --restart=Never \
+         --image=<registry>/decover/kosha:<tag> \
+         --overrides='{"spec":{"serviceAccountName":"kosha","containers":[{"name":"kosha-migrate-ns","image":"<registry>/decover/kosha:<tag>","args":["migrate-namespace","--from","<bare>","--to","<tenant>/<name>","--dry-run"],"envFrom":[{"configMapRef":{"name":"kosha-config"}},{"secretRef":{"name":"kosha-secret"}}]}]}}'
+
+   Check the plan (objects, bytes, documents), then run it again without
+   `--dry-run`. Use `--keep-source` for prod's first run if you want the
+   old objects kept until clients have checked the data.
+
+4. Start the writer and restart the query pods, so every pod drops its
+   view of the bare id:
+
+       kubectl -n kosha scale deploy/kosha --replicas=1
+       kubectl -n kosha rollout restart deploy/kosha-query
+
+5. Verify as the tenant. The document count must equal the one the run
+   printed:
+
+       curl -H "Authorization: Bearer <tenant key>" "$KOSHA/v1/namespaces/<name>/stats"
+
+   The boot warning no longer lists the namespace. Local disk caches still
+   hold the old copies under `<bare>/`; they are only a cache and can be
+   deleted.
+
 ## Local verification
 
     kustomize build k8s/stage
