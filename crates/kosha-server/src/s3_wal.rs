@@ -10,6 +10,11 @@
 //!
 //! Keys are `{KOSHA_S3_PREFIX}/{key}`, the same prefix as segments, e.g.
 //! `{prefix}/_wal/{writer_id}/{lsn:020}.bin`.
+//!
+//! Every put carries the segment store's SSE headers (#343). A WAL stream
+//! belongs to one ingest writer, not one tenant (a group commit holds
+//! records of every tenant that wrote in that window), so WAL objects use
+//! the default key, never a per-tenant one.
 use std::fmt;
 use std::future::Future;
 use std::time::Duration;
@@ -17,7 +22,7 @@ use std::time::Duration;
 use kosha_core::KoshaError;
 use kosha_write::object_wal::WalObjectBackend;
 
-use crate::s3_storage::{join_s3_key, S3Storage};
+use crate::s3_storage::{join_s3_key, ApplySse, ObjectSse, S3Storage};
 
 pub struct S3WalBackend {
     client: aws_sdk_s3::Client,
@@ -25,6 +30,8 @@ pub struct S3WalBackend {
     prefix: String,
     timeout: Duration,
     rt: tokio::runtime::Runtime,
+    /// SSE headers for every put: the default key, see the module docs.
+    sse: Option<ObjectSse>,
 }
 
 impl fmt::Debug for S3WalBackend {
@@ -33,6 +40,7 @@ impl fmt::Debug for S3WalBackend {
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
             .field("timeout", &self.timeout)
+            .field("sse", &self.sse.as_ref().map(|s| s.algorithm.as_str()))
             .finish()
     }
 }
@@ -61,6 +69,7 @@ impl S3WalBackend {
             prefix: s3.prefix().to_owned(),
             timeout,
             rt,
+            sse: s3.sse().for_tenant(None),
         })
     }
 
@@ -94,6 +103,7 @@ impl S3WalBackend {
             .put_object()
             .bucket(&self.bucket)
             .key(&full)
+            .apply_sse(self.sse.as_ref())
             .body(aws_sdk_s3::primitives::ByteStream::from(bytes.to_vec()));
         let request = if conditional {
             request.if_none_match("*")
@@ -233,5 +243,65 @@ impl WalObjectBackend for S3WalBackend {
             }
             first_error.map_or(Ok(()), Err)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::s3_storage::{capture, SseConfig};
+
+    const DEFAULT_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/default";
+
+    fn backend(sse: SseConfig, tag: &str) -> (S3WalBackend, capture::CaptureRequests) {
+        let root = std::env::temp_dir().join(format!("kosha-wal-sse-{tag}-{}", std::process::id()));
+        let (storage, capture) = capture::storage(root, "kosha", sse);
+        let backend = S3WalBackend::new(&storage, Duration::from_secs(10)).unwrap();
+        (backend, capture)
+    }
+
+    #[test]
+    fn wal_puts_use_the_default_key_never_a_tenant_key() {
+        let sse = SseConfig::from_lookup(|name| match name {
+            "KOSHA_S3_SSE" => Some("aws:kms".into()),
+            "KOSHA_S3_SSE_KMS_KEY_ID" => Some(DEFAULT_KEY.into()),
+            "KOSHA_S3_TENANT_KMS_KEYS" => Some("_wal=alias/wal,acme=alias/acme".into()),
+            _ => None,
+        })
+        .unwrap();
+        let (wal, capture) = backend(sse, "kms");
+        assert!(wal
+            .put_if_absent("_wal/ingest-0/00000000000000000001.bin", b"group")
+            .is_err());
+        assert!(wal.put("_wal/ingest-0/meta/sequence", b"1").is_err());
+        let requests = capture.take();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        // The conditional put keeps its precondition alongside SSE.
+        assert_eq!(requests[0].header("if-none-match"), Some("*"));
+        assert_eq!(requests[1].header("if-none-match"), None);
+        for request in &requests {
+            assert!(
+                request.uri.contains("/bucket/kosha/_wal/ingest-0/"),
+                "{}",
+                request.uri
+            );
+            assert_eq!(
+                request.header("x-amz-server-side-encryption"),
+                Some("aws:kms")
+            );
+            assert_eq!(
+                request.header("x-amz-server-side-encryption-aws-kms-key-id"),
+                Some(DEFAULT_KEY)
+            );
+        }
+    }
+
+    #[test]
+    fn wal_puts_without_sse_send_no_encryption_headers() {
+        let (wal, capture) = backend(SseConfig::default(), "none");
+        assert!(wal.put_if_absent("_wal/ingest-0/a.bin", b"group").is_err());
+        let requests = capture.take();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].sse_headers().is_empty(), "{:?}", requests[0]);
     }
 }

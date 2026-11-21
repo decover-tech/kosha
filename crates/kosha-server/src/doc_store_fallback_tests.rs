@@ -248,6 +248,7 @@ fn cold_query_node(s3: &FakeS3, manifest: kosha_core::Manifest) -> AppState {
         access_key: Some("test".into()),
         secret_key: Some("test".into()),
         region: Some("us-east-1".into()),
+        sse: Default::default(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
