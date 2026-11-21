@@ -45,9 +45,25 @@ sudo docker stop kosha >/dev/null
 sudo rm -rf /data/kosha/data/*
 T0=$(date +%s)
 sudo docker start kosha >/dev/null
+# The 10M vector working set (~257GB from S3) can outlast an hour of
+# warmup; WARMUP_TIMEOUT_S lets the caller budget for it. Progress every
+# 5 minutes (bytes on local disk) so a slow warmup is distinguishable
+# from a stuck one, and the server log on timeout.
+WARMUP_TIMEOUT_S="${WARMUP_TIMEOUT_S:-3600}"
+LAST_REPORT=$T0
 until curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1; do
   sleep 5
-  [ $(( $(date +%s) - T0 )) -gt 3600 ] && { echo "WARMUP-TIMEOUT"; exit 1; }
+  NOW=$(date +%s)
+  if [ $(( NOW - LAST_REPORT )) -ge 300 ]; then
+    echo "WARMUP-PROGRESS $(( NOW - T0 ))s local=$(sudo du -sb /data/kosha 2>/dev/null | cut -f1) bytes"
+    LAST_REPORT=$NOW
+  fi
+  if [ $(( NOW - T0 )) -gt "$WARMUP_TIMEOUT_S" ]; then
+    echo "WARMUP-TIMEOUT after ${WARMUP_TIMEOUT_S}s"
+    curl -s http://127.0.0.1:8080/readyz || true; echo
+    sudo docker logs --tail 200 kosha 2>&1 || true
+    exit 1
+  fi
 done
 echo "WARMUP-READY in $(( $(date +%s) - T0 ))s"
 
