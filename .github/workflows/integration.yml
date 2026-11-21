@@ -59,14 +59,12 @@ jobs:
         with:
           key: postgres-cas
 
-      # One test thread: concurrent first-time migrations of a fresh
-      # database race (#330). Drop --test-threads=1 once that is fixed.
       - name: Postgres CAS tests
         if: ${{ !cancelled() }}
         run: |
           $COMPOSE exec -T postgres createdb -U kosha kosha_cas_test
           KOSHA_TEST_DATABASE_URL=postgres://kosha:kosha-dev@localhost:5432/kosha_cas_test \
-            cargo test --locked -p kosha-control --features postgres --test postgres_cas -- --ignored --test-threads=1
+            cargo test --locked -p kosha-control --features postgres --test postgres_cas -- --ignored
 
       - name: Server logs
         if: failure()
