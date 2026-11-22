@@ -80,6 +80,9 @@ mod segment_gc;
 mod tenant_limits;
 mod unindexed;
 mod usage;
+mod usage_reconcile;
+#[cfg(test)]
+mod usage_reconcile_tests;
 #[cfg(test)]
 mod usage_tests;
 mod warm;
@@ -5643,6 +5646,9 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("migrate-namespace") {
         std::process::exit(namespace_migrate::main(std::env::args().skip(2)));
     }
+    if std::env::args().nth(1).as_deref() == Some("reconcile-usage") {
+        std::process::exit(usage_reconcile::main(std::env::args().skip(2)));
+    }
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         #[cfg(feature = "migrate")]
         {
@@ -6885,6 +6891,12 @@ fn route_inner(
         || request_line.starts_with("GET /v1/admin/usage?")
     {
         return usage::handle_admin_usage(request_line, state);
+    }
+
+    if request_line.starts_with("GET /v1/admin/usage/reconcile ")
+        || request_line.starts_with("GET /v1/admin/usage/reconcile?")
+    {
+        return usage_reconcile::handle_admin_reconcile(request_line, state);
     }
 
     // ── Billing (#349) ─────────────────────────────────────────────────────
