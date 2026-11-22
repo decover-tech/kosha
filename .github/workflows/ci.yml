@@ -91,6 +91,10 @@ jobs:
           python -m pip install -e . pytest pyyaml
       - name: Run unit tests
         run: python -m pytest tests/ -q
+      # The ES -> Kosha copy script against a stub Elasticsearch and a fake
+      # Kosha, including every command in docs/migration/from-elasticsearch.md.
+      - name: Copy script smoke test
+        run: python -m pytest ../../scripts/tests/ -q
 
   # Regression tests for the commit_bench_section.sh hook + amend driver
   # (scripts/test_commit_bench_section.sh). Uses a cargo shim so no real

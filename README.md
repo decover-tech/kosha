@@ -313,7 +313,7 @@ own document, or combine the two values into one leaf (`"name_org": "Ada|beta"`)
 - HTTP/JSON `/v1` API (see [HTTP routes](#http-routes)) — namespace create and delete, `documents`, `search`, `flush`, `delete`, `exists`, `stats` — with the Phase 1 unversioned routes still served for backward compatibility.
 - `proto/kosha/v1/kosha.proto` is the canonical API contract and the source for generated stubs and the OpenAPI spec.
 - `kosha` CLI (built from `crates/kosha-cli`, not yet on crates.io): health, index, search, flush, delete, stats, admin commands, named profiles, `--json` output, and a `kosha curl` escape hatch.
-- OpenSearch-compatible Python client, [`kosha-client` on PyPI](https://pypi.org/project/kosha-client/): `search`, `index`, `bulk`, `count`, `update`, `delete_by_query`, `update_by_query`, `scroll`, plus `indices` and `tasks` namespaces, translating the ES query DSL to Kosha's native shape.
+- OpenSearch-compatible Python client, [`kosha-client` on PyPI](https://pypi.org/project/kosha-client/): `search`, `index`, `bulk`, `count`, `update`, `delete_by_query`, `update_by_query`, `scroll`, plus `indices` and `tasks` namespaces, translating the ES query DSL to Kosha's native shape. What it supports, partially supports and rejects: [docs/compat/opensearch.md](docs/compat/opensearch.md). Moving an index over: [docs/migration/from-elasticsearch.md](docs/migration/from-elasticsearch.md).
 
 ### Not supported yet
 

@@ -44,7 +44,7 @@ jobs:
 
       - name: OpenSearch DSL compatibility matrix
         run: |
-          python -m pip install pyyaml
+          python -m pip install pyyaml pytest
           python scripts/conformance/dsl/run.py \
             --host http://localhost:8080 --api-key sk-kosha-dev \
             --admin-key sk-kosha-admin-dev \
@@ -58,6 +58,14 @@ jobs:
             echo "::error::docs/compat/ is stale. Run 'make compat-matrix' and commit the result."
             exit 1
           fi
+
+      # The ES -> Kosha copy script, from a stub Elasticsearch into this
+      # stack's server (and into a fake one, as in ci.yml).
+      - name: Copy script smoke test (live)
+        env:
+          KOSHA_TEST_HOST: http://localhost:8080
+          KOSHA_TEST_API_KEY: sk-kosha-dev
+        run: python -m pytest scripts/tests/ -q
 
       - name: Server logs
         if: failure()
