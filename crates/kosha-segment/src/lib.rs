@@ -2129,6 +2129,47 @@ struct ProbeQuery<'q> {
     unit: std::borrow::Cow<'q, [f32]>,
     /// The rotated query lookup table, for a RaBitQ column.
     rabitq: Option<std::rc::Rc<kosha_vector_spfresh::RaBitQQuery>>,
+    /// An i8 entry's error bound per unit of its `scale` (#381): the
+    /// estimate `scale * <q, code>` is off from the exact `<q, x>` by at
+    /// most `scale * i8_error_per_scale`. See [`i8_error_per_scale`].
+    /// `0.0` for every other column, and never read by the default
+    /// per-segment probe (which rescores a fixed `k * factor` of an i8
+    /// column regardless of bounds).
+    i8_error_per_scale: f32,
+}
+
+/// How an i8 entry's error bound is derived (#381, global rescoring only;
+/// `KOSHA_KNN_I8_BOUND`).
+///
+/// * `strict` (default): each coordinate was rounded to the nearest code,
+///   so `|x_i - scale * code_i| <= scale / 2` and the estimate is within
+///   `scale / 2 * ||q||_1` of the exact dot product. A guarantee, but a
+///   loose one at high dimension (`||q||_1` of a unit 1024-dim query is
+///   ~25).
+/// * `probabilistic`: treats the rounding errors as independent and
+///   uniform on `[-scale/2, scale/2]`, so the error has standard deviation
+///   `scale * ||q||_2 / sqrt(12)`; the bound is `RABITQ_EPSILON0` of those
+///   (the same confidence the RaBitQ bound uses). Not a guarantee.
+fn i8_error_per_scale(unit_query: &[f32]) -> f32 {
+    static PROBABILISTIC: OnceLock<bool> = OnceLock::new();
+    let probabilistic = *PROBABILISTIC.get_or_init(|| {
+        matches!(
+            std::env::var("KOSHA_KNN_I8_BOUND")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("probabilistic")
+        )
+    });
+    // Slack for f32 accumulation in `dot_i8` and in the exact cosine the
+    // bound is compared against.
+    const SLACK: f32 = 1e-4;
+    if probabilistic {
+        let l2 = unit_query.iter().map(|x| x * x).sum::<f32>().sqrt();
+        kosha_vector_spfresh::RABITQ_EPSILON0 * l2 / 12f32.sqrt() + SLACK
+    } else {
+        0.5 * unit_query.iter().map(|x| x.abs()).sum::<f32>() + SLACK
+    }
 }
 
 /// The [`kosha_vector_spfresh::RaBitQQuery`] for `unit_query`. It depends
@@ -2219,7 +2260,7 @@ impl VectorPosting {
                     }
                     let entry = &codes[i * dim..(i + 1) * dim];
                     let sim = kosha_vector_spfresh::dot_i8(&probe.unit, entry, scale);
-                    emit(id, sim.clamp(-1.0, 1.0), 0.0);
+                    emit(id, sim.clamp(-1.0, 1.0), scale * probe.i8_error_per_scale);
                 }
             }
             VectorPosting::RaBitQ {
@@ -3788,6 +3829,32 @@ impl DocVectors {
             out.push((self.fields[field_idx as usize].as_str(), vector));
         }
         Ok(out)
+    }
+
+    /// `field`'s vector of `doc_seq` out of `buf`, the bytes of the
+    /// document's whole [`Self::doc_span`] (#381). `None` when the document
+    /// has no `field` vector or `buf` is not that span's length.
+    fn field_vector_in_span(&self, doc_seq: u32, field: &str, buf: &[u8]) -> Option<Vec<f32>> {
+        let (start, end) = self.entry_range(doc_seq);
+        let (span_start, span_end) = self.doc_span(doc_seq)?;
+        if buf.len() as u64 != span_end - span_start {
+            return None;
+        }
+        (start..end).find_map(|i| {
+            let (_, field_idx, dim) = self.entries[i];
+            if self.fields[field_idx as usize] != field {
+                return None;
+            }
+            let at = (self.offsets[i] - span_start) as usize;
+            Some(
+                buf[at..at + dim as usize * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect(),
+            )
+        })
     }
 
     /// Whether the sidecar holds any vector of `field`.
@@ -5846,6 +5913,11 @@ impl VectorFieldIndex {
     pub fn has_lazy_index(&self) -> bool {
         self.lazy.is_some()
     }
+    /// The lazy index holds quantized codes (i8 or RaBitQ), whose probe
+    /// scores are estimates until rescored from `doc_vectors.bin`.
+    pub fn is_quantized(&self) -> bool {
+        self.lazy.as_ref().is_some_and(|vi| vi.quantized)
+    }
     /// Legacy / missing-sidecar vectors, served by exact flat scan. Empty
     /// when [`Self::has_lazy_index`].
     pub fn flat(&self) -> &VectorStore {
@@ -5913,6 +5985,92 @@ pub fn footer_vector_field_status(footer: &Footer, field: &str) -> Option<Vector
 /// [`SegmentReader::knn_search_within`]. `None` when the segment has no
 /// lazy v2 vector index.
 pub type BudgetedKnnResult = Option<Result<(Vec<(u32, f64)>, usize), KoshaError>>;
+
+/// How much of a column a kNN probe reads (#381, see
+/// [`SegmentReader::knn_candidates_fetching`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KnnProbeBudget {
+    /// The global budget: postings whose centroid lower bound is within
+    /// `max_distance`, at most `max_probes` of them (see
+    /// [`SegmentReader::knn_search_within`]).
+    Within {
+        max_distance: f32,
+        max_probes: usize,
+    },
+    /// The per-segment fallback: the `nprobe` nearest centroids.
+    Nprobe(usize),
+}
+
+/// One kNN candidate with its score estimate and error bound (#381): the
+/// exact cosine similarity is (with the bound's confidence) within
+/// `estimate +- error`. `error == 0` means the estimate is exact.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KnnCandidate {
+    pub doc_seq: u32,
+    pub estimate: f64,
+    pub error: f64,
+}
+
+impl KnnCandidate {
+    /// Lowest score the candidate can have.
+    pub fn lower(&self) -> f64 {
+        self.estimate - self.error
+    }
+
+    /// Highest score the candidate can have.
+    pub fn upper(&self) -> f64 {
+        self.estimate + self.error
+    }
+}
+
+/// The `k`-th largest lower bound of `candidates`; `None` when there are
+/// fewer than `k` (nothing can be ruled out) or `k == 0`.
+pub fn kth_lower_bound(candidates: &[KnnCandidate], k: usize) -> Option<f64> {
+    if k == 0 || candidates.len() < k {
+        return None;
+    }
+    let mut lower: Vec<f64> = candidates.iter().map(KnnCandidate::lower).collect();
+    let (_, kth, _) = lower.select_nth_unstable_by(k - 1, |a, b| {
+        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some(*kth)
+}
+
+/// [`SegmentReader::knn_candidates_fetching`]'s answer.
+#[derive(Debug, Clone, Default)]
+pub struct KnnCandidates {
+    /// Best estimate first.
+    pub candidates: Vec<KnnCandidate>,
+    /// Postings hydrated and scored.
+    pub postings: usize,
+    /// The column is f32: every estimate is exact and needs no rescoring.
+    pub exact: bool,
+}
+
+/// [`SegmentReader::knn_exact_scores_fetching`]'s answer.
+#[derive(Debug, Clone, Default)]
+pub struct ExactRescore {
+    /// `(doc_seq, exact cosine similarity)` for each vector read, in no
+    /// particular order.
+    pub scores: Vec<(u32, f64)>,
+    /// Requested documents whose exact vector could not be read.
+    pub unavailable: usize,
+    /// Why, when `unavailable > 0`.
+    pub reason: Option<String>,
+    /// The whole `doc_vectors.bin` was not local: vectors came from the
+    /// span cache, after ranged reads where needed.
+    pub ranged: bool,
+    /// Spans handed to `fetch` (not already in the span cache).
+    pub ranged_spans: usize,
+}
+
+/// Every candidate a probe scored, before any cut: `errors[i]` is the
+/// error bound of `scored[i]`'s score (`0.0` when exact).
+struct ProbedCandidates {
+    scored: Vec<(u32, f64)>,
+    errors: Vec<f32>,
+    postings: usize,
+}
 
 /// One stored document plus its sidecar vectors, as yielded by
 /// [`SegmentReader::iter_doc_records_raw`]. `record`'s sidecar `Vector`
@@ -6960,6 +7118,227 @@ impl SegmentReader {
         Some(self.knn_search_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch))
     }
 
+    /// The candidates half of a kNN probe over `field`'s column, for
+    /// global bound-driven rescoring (#381, `KOSHA_KNN_GLOBAL_RESCORE`).
+    ///
+    /// Probes exactly as [`Self::knn_search_within_filtered_fetching`]
+    /// (or [`Self::knn_search_filtered_fetching`] for
+    /// [`KnnProbeBudget::Nprobe`]) does, but neither cuts to a fixed
+    /// shortlist nor rescores. Instead:
+    ///
+    /// * an f32 column's scores are exact: its best `k`, each with error
+    ///   `0`, and [`KnnCandidates::exact`] set;
+    /// * a quantized column returns every candidate whose upper bound
+    ///   (`estimate + error`) reaches this segment's `k`-th largest lower
+    ///   bound (`estimate - error`). The query layer's global `k`-th lower
+    ///   bound is at least as high, so nothing dropped here could survive
+    ///   the global cut either.
+    ///
+    /// Candidates come back best estimate first. `None` when the column has
+    /// no lazy index here.
+    pub fn knn_candidates_fetching(
+        &self,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        budget: KnnProbeBudget,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Option<Result<KnnCandidates, KoshaError>> {
+        let index = match self.vector_field(field) {
+            Ok(index) => index?,
+            Err(e) => return Some(Err(e)),
+        };
+        let vi = index.lazy.as_ref()?;
+        if let Err(e) = Self::check_query_dim(vi, field, query) {
+            return Some(Err(e));
+        }
+        let probed = match budget {
+            KnnProbeBudget::Within {
+                max_distance,
+                max_probes,
+            } => self.probe_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch),
+            KnnProbeBudget::Nprobe(nprobe) => {
+                let mut unit = query.to_vec();
+                if vi.unit_norm {
+                    kosha_vector_spfresh::normalize_in_place(&mut unit);
+                }
+                self.probe_nprobe_lazy(vi, &unit, k, nprobe, accept, fetch)
+            }
+        };
+        let probed = match probed {
+            Ok(probed) => probed,
+            Err(e) => return Some(Err(e)),
+        };
+        let postings = probed.postings;
+        if !vi.quantized {
+            let candidates = top_k_by_score(probed.scored, k)
+                .into_iter()
+                .map(|(doc_seq, estimate)| KnnCandidate {
+                    doc_seq,
+                    estimate,
+                    error: 0.0,
+                })
+                .collect();
+            return Some(Ok(KnnCandidates {
+                candidates,
+                postings,
+                exact: true,
+            }));
+        }
+        let mut candidates: Vec<KnnCandidate> = probed
+            .scored
+            .iter()
+            .zip(probed.errors.iter().chain(std::iter::repeat(&0.0)))
+            .map(|(&(doc_seq, estimate), &error)| KnnCandidate {
+                doc_seq,
+                estimate,
+                error: error as f64,
+            })
+            .collect();
+        if let Some(threshold) = kth_lower_bound(&candidates, k) {
+            candidates.retain(|c| c.upper() >= threshold);
+        }
+        candidates.sort_by(|a, b| {
+            b.estimate
+                .partial_cmp(&a.estimate)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Some(Ok(KnnCandidates {
+            candidates,
+            postings,
+            exact: false,
+        }))
+    }
+
+    /// Exact cosine similarity of `query` with `field`'s full-precision
+    /// vector of each of `doc_seqs` (#381), read from `doc_vectors.bin`:
+    /// the local file when it is whole, otherwise by ranged reads through
+    /// `fetch` into the span cache (one call for every missing span). The
+    /// sidecar's header must be local for the ranged path (whole file or
+    /// cached header span); it is not fetched here.
+    ///
+    /// Never fails: a document whose vector cannot be read is counted in
+    /// [`ExactRescore::unavailable`] and left out of `scores`, so the caller
+    /// can surface that its estimate stands, instead of silently returning
+    /// it as final.
+    pub fn knn_exact_scores_fetching(
+        &self,
+        field: &str,
+        query: &[f32],
+        doc_seqs: &[u32],
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> ExactRescore {
+        let mut wanted: Vec<u32> = doc_seqs.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut out = ExactRescore::default();
+        if wanted.is_empty() {
+            return out;
+        }
+        let unavailable = |mut out: ExactRescore, why: String| {
+            out.unavailable = wanted.len();
+            out.reason = Some(why);
+            out
+        };
+        if !self.footer.doc_vectors {
+            return unavailable(
+                out,
+                format!("segment stores vectors inline, no {DOC_VECTORS_FILE}"),
+            );
+        }
+        let dv = match self.doc_vectors() {
+            Ok(dv) => dv,
+            Err(e) => return unavailable(out, format!("{DOC_VECTORS_FILE} header: {e}")),
+        };
+        if !dv.has_field(field) {
+            return unavailable(
+                out,
+                format!("{DOC_VECTORS_FILE} holds no '{field}' vectors"),
+            );
+        }
+        let whole = self.segment_dir.join(DOC_VECTORS_FILE);
+        let whole_local =
+            fs::metadata(&whole).is_ok_and(|m| m.is_file() && m.len() == dv.file_len());
+        let mut exact: HashMap<u32, f64> = HashMap::with_capacity(wanted.len());
+        if whole_local {
+            let visited = dv.visit_field_vectors(field, &wanted, |doc_seq, v| {
+                if v.len() == query.len() {
+                    exact.insert(
+                        doc_seq,
+                        kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                    );
+                }
+            });
+            if let Err(e) = visited {
+                return unavailable(out, format!("{DOC_VECTORS_FILE} read: {e}"));
+            }
+        } else {
+            out.ranged = true;
+            let spans: Vec<(u32, (u64, u64))> = wanted
+                .iter()
+                .filter_map(|&doc_seq| dv.doc_span(doc_seq).map(|span| (doc_seq, span)))
+                .collect();
+            // The span cache is listed once before the fetch and once after
+            // it, never per candidate: a listing is a `read_dir` plus a stat
+            // of every cached span, and the directory grows as rescoring
+            // caches spans.
+            let mut local = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+            if let Some(fetch) = fetch {
+                let missing: Vec<(u64, u64)> = spans
+                    .iter()
+                    .map(|&(_, span)| span)
+                    .filter(|&(start, end)| !local.covers(start, end))
+                    .collect();
+                if !missing.is_empty() {
+                    out.ranged_spans = missing.len();
+                    fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
+                    local = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
+                }
+            }
+            let ranges: Vec<(u64, u64)> = spans.iter().map(|&(_, span)| span).collect();
+            let bytes = local.read_many(&ranges);
+            for ((doc_seq, (start, end)), buf) in spans.into_iter().zip(bytes) {
+                // A span evicted between the listing and the read (its
+                // whole file may have been promoted meanwhile): the
+                // per-document read checks both. A span never cached is
+                // just unavailable, with no further listing.
+                let buf = buf.or_else(|| {
+                    if !local.covers(start, end) {
+                        return None;
+                    }
+                    span_cache::read_local_range(
+                        &self.segment_dir,
+                        DOC_VECTORS_FILE,
+                        dv.file_len(),
+                        start,
+                        end - start,
+                    )
+                });
+                let Some(v) = buf.and_then(|buf| dv.field_vector_in_span(doc_seq, field, &buf))
+                else {
+                    continue;
+                };
+                if v.len() == query.len() {
+                    exact.insert(
+                        doc_seq,
+                        kosha_vector_spfresh::cosine_similarity(query, &v) as f64,
+                    );
+                }
+            }
+        }
+        out.unavailable = wanted.len() - exact.len();
+        if out.unavailable > 0 {
+            out.reason = Some(format!(
+                "{} of {} vectors not readable from {DOC_VECTORS_FILE}",
+                out.unavailable,
+                wanted.len()
+            ));
+        }
+        out.scores = exact.into_iter().collect();
+        out
+    }
+
     /// Exact kNN over `field`'s column (#204), restricted to `candidates`:
     /// the ascending `doc_seq`s a filter lets through, with deleted
     /// documents already removed (#252).
@@ -7094,6 +7473,27 @@ impl SegmentReader {
         accept: Option<&dyn Fn(u32) -> bool>,
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<(Vec<(u32, f64)>, usize), KoshaError> {
+        let probed =
+            self.probe_within_lazy(vi, query, k, max_distance, max_probes, accept, fetch)?;
+        Ok((
+            self.finish_probe(vi, query, probed.scored, &probed.errors, k),
+            probed.postings,
+        ))
+    }
+
+    /// The probe half of [`Self::knn_search_within_lazy`]: every candidate
+    /// scored, with its error bound, before any cut or rescoring.
+    #[allow(clippy::too_many_arguments)]
+    fn probe_within_lazy(
+        &self,
+        vi: &LazyVectorIndex,
+        query: &[f32],
+        k: usize,
+        max_distance: f32,
+        max_probes: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Result<ProbedCandidates, KoshaError> {
         // Rank this segment's qualifying postings nearest-first (by lower
         // bound, not raw centroid distance — see `centroid_lower_bound`),
         // so the `max_probes` cap keeps the *best* candidates when it
@@ -7148,7 +7548,11 @@ impl SegmentReader {
                 },
             );
         }
-        Ok((self.finish_probe(vi, query, scored, &errors, k), probes))
+        Ok(ProbedCandidates {
+            scored,
+            errors,
+            postings: probes,
+        })
     }
 
     // Deliberately NOT radius-aware: this is the per-segment `nprobe`
@@ -7179,6 +7583,22 @@ impl SegmentReader {
         } else {
             query
         };
+        let probed = self.probe_nprobe_lazy(vi, query, k, nprobe, accept, fetch)?;
+        Ok(self.finish_probe(vi, query, probed.scored, &probed.errors, k))
+    }
+
+    /// The probe half of [`Self::knn_search_lazy`]. `postings` counts the
+    /// postings actually scored. A unit-norm column expects `query`
+    /// already unit-normalized (scores are bare dot products).
+    fn probe_nprobe_lazy(
+        &self,
+        vi: &LazyVectorIndex,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        accept: Option<&dyn Fn(u32) -> bool>,
+        fetch: Option<VectorSpanFetch<'_>>,
+    ) -> Result<ProbedCandidates, KoshaError> {
         // With a restriction, rank every posting so the probe can continue
         // past `nprobe` while the page is still short, as the budgeted
         // variant does.
@@ -7199,6 +7619,7 @@ impl SegmentReader {
         // `query` is already unit-normalized for every unit-norm column,
         // which includes every quantized one.
         let probe = Self::probe_query(vi, query);
+        let mut postings = 0usize;
         for (position, &range_idx) in candidates.iter().enumerate() {
             if position >= nprobe && scored.len() >= k {
                 break;
@@ -7208,6 +7629,7 @@ impl SegmentReader {
                     &candidates[position..(position + VECTOR_PREFETCH_CHUNK).min(candidates.len())];
                 self.prefetch_vector_postings(vi, chunk.iter().copied(), fetch);
             }
+            postings += 1;
             self.hydrate_posting(vi, range_idx)?.for_each_similarity(
                 accept,
                 |v| {
@@ -7225,7 +7647,11 @@ impl SegmentReader {
                 },
             );
         }
-        Ok(self.finish_probe(vi, query, scored, &errors, k))
+        Ok(ProbedCandidates {
+            scored,
+            errors,
+            postings,
+        })
     }
 
     /// `query` prepared for scoring `vi`'s postings: unit-normalized when
@@ -7243,7 +7669,16 @@ impl SegmentReader {
         // A query of another dimension scores nothing here, as the f32
         // paths' dimension checks would have it.
         let rabitq = (vi.rabitq && unit.len() == vi.dim).then(|| rabitq_query_for(&unit));
-        ProbeQuery { unit, rabitq }
+        let i8_error_per_scale = if vi.quantized && !vi.rabitq {
+            i8_error_per_scale(&unit)
+        } else {
+            0.0
+        };
+        ProbeQuery {
+            unit,
+            rabitq,
+            i8_error_per_scale,
+        }
     }
 
     /// The probe's top `k` of `scored`, best first.
@@ -7293,6 +7728,17 @@ impl SegmentReader {
         shortlist.sort_by(by_score_desc);
         shortlist.truncate(k);
         shortlist
+    }
+
+    /// Whether the default per-segment kNN path (`finish_probe`) would
+    /// rescore a quantized column's shortlist here (#381 observability):
+    /// the same gate as [`Self::rescore_exact`], i.e. rescoring is on and
+    /// the WHOLE `doc_vectors.bin` is local. When this is `false` the
+    /// per-segment path returns its quantized estimates as final scores.
+    pub fn rescores_quantized_locally(&self) -> bool {
+        self.vector_rescore_factor > 0
+            && self.footer.doc_vectors
+            && self.segment_dir.join(DOC_VECTORS_FILE).exists()
     }
 
     /// Replaces each candidate's score with the cosine similarity of
@@ -12451,6 +12897,357 @@ mod filter_column_format_tests {
         let back: Footer = serde_json::from_str(&json).unwrap();
         assert!(back.filter_columns.is_none());
         assert_eq!(back.filter_files_for(None), vec!["filters.bin".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Global bound-driven rescoring (#381): the segment half — candidates
+/// with error bounds, and exact scores from `doc_vectors.bin` (local or
+/// ranged) with unavailability reported rather than hidden.
+#[cfg(test)]
+mod global_rescore_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const DIM: usize = 32;
+    const DOCS: u64 = 600;
+
+    fn scratch(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-global-rescore-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn vector(seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..DIM)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+        let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        dot / (na * nb)
+    }
+
+    /// A segment of `DOCS` vectors in `quantization`, plus the vectors by
+    /// doc_seq (documents are added in doc_seq order).
+    fn segment(name: &str, quantization: VectorQuantization) -> (PathBuf, Vec<Vec<f32>>) {
+        let dir = scratch(name);
+        let mut w = SegmentWriter::new(SegmentId("s".into()), dir.clone())
+            .with_vector_store_mode(VectorStoreMode::Sidecar)
+            .with_vector_quantization(VectorQuantizationConfig::all(quantization));
+        let mut vectors = Vec::new();
+        for i in 0..DOCS {
+            let v = vector(i + 1);
+            vectors.push(v.clone());
+            w.add_document(DocumentId(format!("d{i}")), vec![Field::vector("emb", v)]);
+        }
+        let footer = w.finalize(Bm25Params::default()).unwrap();
+        assert!(footer.doc_vectors);
+        (dir, vectors)
+    }
+
+    fn brute_force(vectors: &[Vec<f32>], query: &[f32], k: usize) -> Vec<(u32, f64)> {
+        let scored: Vec<(u32, f64)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u32, cosine(query, v)))
+            .collect();
+        top_k_by_score(scored, k)
+    }
+
+    /// Every posting: only the quantization, never the probe budget, can
+    /// cost a neighbour here.
+    const ALL: KnnProbeBudget = KnnProbeBudget::Nprobe(1_000_000);
+
+    #[test]
+    fn i8_bounds_hold_and_bound_driven_rescoring_is_exact() {
+        let (dir, vectors) = segment("i8", VectorQuantization::I8);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let k = 10;
+        for q in 0..20u64 {
+            let query = vector(900_000 + q);
+            let found = reader
+                .knn_candidates_fetching("emb", &query, k, ALL, None, None)
+                .unwrap()
+                .unwrap();
+            assert!(!found.exact);
+            assert!(found.postings > 0);
+            // The strict i8 bound is a guarantee, not a confidence.
+            for c in &found.candidates {
+                let exact = cosine(&query, &vectors[c.doc_seq as usize]);
+                assert!(
+                    (c.estimate - exact).abs() <= c.error,
+                    "doc {} estimate {} exact {exact} error {}",
+                    c.doc_seq,
+                    c.estimate,
+                    c.error
+                );
+            }
+            // So the true top k always survives the segment's prune.
+            let want = brute_force(&vectors, &query, k);
+            let ids: HashSet<u32> = found.candidates.iter().map(|c| c.doc_seq).collect();
+            for (doc_seq, _) in &want {
+                assert!(ids.contains(doc_seq), "true neighbour {doc_seq} pruned");
+            }
+            // The prune keeps strictly fewer than every vector.
+            assert!(found.candidates.len() < DOCS as usize);
+            // Rescored exactly, the shortlist's top k is the brute force's.
+            let seqs: Vec<u32> = found.candidates.iter().map(|c| c.doc_seq).collect();
+            let rescored = reader.knn_exact_scores_fetching("emb", &query, &seqs, None);
+            assert_eq!(rescored.unavailable, 0, "{:?}", rescored.reason);
+            assert!(!rescored.ranged);
+            let got = top_k_by_score(rescored.scores, k);
+            let got_ids: Vec<u32> = got.iter().map(|h| h.0).collect();
+            let want_ids: Vec<u32> = want.iter().map(|h| h.0).collect();
+            assert_eq!(got_ids, want_ids);
+            for ((_, g), (_, w)) in got.iter().zip(&want) {
+                assert!((g - w).abs() < 1e-5);
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f32_candidates_are_the_exact_top_k() {
+        let (dir, vectors) = segment("f32", VectorQuantization::F32);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let query = vector(4242);
+        let found = reader
+            .knn_candidates_fetching("emb", &query, 10, ALL, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(found.exact);
+        assert_eq!(found.candidates.len(), 10);
+        assert!(found.candidates.iter().all(|c| c.error == 0.0));
+        let want: Vec<u32> = brute_force(&vectors, &query, 10)
+            .into_iter()
+            .map(|h| h.0)
+            .collect();
+        let got: Vec<u32> = found.candidates.iter().map(|c| c.doc_seq).collect();
+        assert_eq!(got, want);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rabitq_bound_driven_rescoring_recalls_the_brute_force_top_k() {
+        // RaBitQ's bound holds with a confidence (epsilon0 = 1.9 standard
+        // deviations), not always: recall is high, not guaranteed.
+        let (dir, vectors) = segment("rabitq", VectorQuantization::RaBitQ);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let k = 10;
+        let (mut recall, mut held, mut total) = (0.0f64, 0usize, 0usize);
+        let queries = 20u64;
+        for q in 0..queries {
+            let query = vector(700_000 + q);
+            let found = reader
+                .knn_candidates_fetching("emb", &query, k, ALL, None, None)
+                .unwrap()
+                .unwrap();
+            assert!(!found.exact);
+            for c in &found.candidates {
+                total += 1;
+                let exact = cosine(&query, &vectors[c.doc_seq as usize]);
+                held += usize::from((c.estimate - exact).abs() <= c.error);
+            }
+            let seqs: Vec<u32> = found.candidates.iter().map(|c| c.doc_seq).collect();
+            let rescored = reader.knn_exact_scores_fetching("emb", &query, &seqs, None);
+            assert_eq!(rescored.unavailable, 0);
+            let got: HashSet<u32> = top_k_by_score(rescored.scores, k)
+                .into_iter()
+                .map(|h| h.0)
+                .collect();
+            let want = brute_force(&vectors, &query, k);
+            recall += want.iter().filter(|h| got.contains(&h.0)).count() as f64 / k as f64;
+        }
+        let recall = recall / queries as f64;
+        assert!(recall >= 0.95, "recall@10 {recall}");
+        assert!(
+            held as f64 >= 0.9 * total as f64,
+            "bounds held {held}/{total}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_scores_report_a_missing_sidecar_and_read_ranged_spans() {
+        let (dir, vectors) = segment("ranged", VectorQuantization::I8);
+        let query = vector(31337);
+        let seqs: Vec<u32> = vec![3, 17, 250, 599];
+        let dv = fs::read(dir.join(DOC_VECTORS_FILE)).unwrap();
+        fs::remove_file(dir.join(DOC_VECTORS_FILE)).unwrap();
+
+        // No sidecar at all (not even its header): every candidate is
+        // reported unavailable, with a reason — never silently final.
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let missing = reader.knn_exact_scores_fetching("emb", &query, &seqs, None);
+        assert_eq!(missing.unavailable, seqs.len());
+        assert!(missing.scores.is_empty());
+        assert!(missing
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains(DOC_VECTORS_FILE));
+
+        // Header cached, vectors not: ranged reads through `fetch`.
+        let put = |s: u64, e: u64| {
+            let d = span_cache::spans_dir(&dir, DOC_VECTORS_FILE);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                d.join(span_cache::span_file_name(s, e)),
+                &dv[s as usize..e as usize],
+            )
+            .unwrap();
+        };
+        let header_len = doc_vectors_header_len(&dv).unwrap().unwrap();
+        put(0, header_len);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+
+        // Without a fetcher the vectors are not local: unavailable.
+        let no_fetch = reader.knn_exact_scores_fetching("emb", &query, &seqs, None);
+        assert!(no_fetch.ranged);
+        assert_eq!(no_fetch.unavailable, seqs.len());
+
+        let calls = Mutex::new(Vec::<(String, usize)>::new());
+        let fetch = |seg: &Path, file: &str, ranges: &[(u64, u64)]| {
+            assert_eq!(seg, dir.as_path());
+            calls.lock().unwrap().push((file.to_string(), ranges.len()));
+            for &(s, e) in ranges {
+                put(s, e);
+            }
+        };
+        let fetched = reader.knn_exact_scores_fetching("emb", &query, &seqs, Some(&fetch));
+        assert!(fetched.ranged);
+        assert_eq!(fetched.unavailable, 0, "{:?}", fetched.reason);
+        assert_eq!(fetched.ranged_spans, seqs.len());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(DOC_VECTORS_FILE.to_string(), seqs.len())],
+            "one fetch call for every missing span"
+        );
+        for (doc_seq, score) in &fetched.scores {
+            let want = cosine(&query, &vectors[*doc_seq as usize]);
+            assert!((score - want).abs() < 1e-5);
+        }
+        // Spans now cached: no second fetch.
+        let again = reader.knn_exact_scores_fetching("emb", &query, &seqs, Some(&fetch));
+        assert_eq!(again.unavailable, 0);
+        assert_eq!(again.ranged_spans, 0);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kth_lower_bound_needs_k_candidates() {
+        let c = |doc_seq, estimate, error| KnnCandidate {
+            doc_seq,
+            estimate,
+            error,
+        };
+        let cands = [c(0, 0.9, 0.1), c(1, 0.8, 0.0), c(2, 0.5, 0.2)];
+        assert_eq!(kth_lower_bound(&cands, 0), None);
+        assert_eq!(kth_lower_bound(&cands, 4), None);
+        assert!((kth_lower_bound(&cands, 1).unwrap() - 0.8).abs() < 1e-12);
+        let second = kth_lower_bound(&cands, 2).unwrap();
+        assert!((second - 0.8).abs() < 1e-12);
+        assert!((kth_lower_bound(&cands, 3).unwrap() - 0.3).abs() < 1e-12);
+    }
+
+    /// Microbenchmark for the ranged rescore read (#381): a segment whose
+    /// `doc_vectors.bin` is not local and whose span cache holds one span
+    /// per document (`docs` spans), read for `selected` candidates. Compares
+    /// the per-candidate `vectors_for` loop (one span-directory listing per
+    /// candidate, the PR's first version) with `knn_exact_scores_fetching`
+    /// (one listing per call). Timing only, so ignored by default:
+    /// `cargo test -p kosha-segment --release -- --ignored --nocapture
+    /// ranged_rescore_read_microbench`.
+    #[test]
+    #[ignore]
+    fn ranged_rescore_read_microbench() {
+        const BENCH_DIM: usize = 1024;
+        let docs: u64 = std::env::var("MICROBENCH_DOCS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4000);
+        let selected: usize = 400;
+        let dir = scratch("microbench");
+        let mut w = SegmentWriter::new(SegmentId("s".into()), dir.clone())
+            .with_vector_store_mode(VectorStoreMode::Sidecar)
+            .with_vector_quantization(VectorQuantizationConfig::all(VectorQuantization::I8));
+        let gen = |seed: u64| -> Vec<f32> {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            (0..BENCH_DIM)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+                })
+                .collect()
+        };
+        for i in 0..docs {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![Field::vector("emb", gen(i + 1))],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let dv = fs::read(dir.join(DOC_VECTORS_FILE)).unwrap();
+        fs::remove_file(dir.join(DOC_VECTORS_FILE)).unwrap();
+        let spans_dir = span_cache::spans_dir(&dir, DOC_VECTORS_FILE);
+        fs::create_dir_all(&spans_dir).unwrap();
+        let header_len = doc_vectors_header_len(&dv).unwrap().unwrap();
+        let put = |s: u64, e: u64| {
+            fs::write(
+                spans_dir.join(span_cache::span_file_name(s, e)),
+                &dv[s as usize..e as usize],
+            )
+            .unwrap();
+        };
+        put(0, header_len);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let header = reader.doc_vectors().unwrap();
+        for doc_seq in 0..docs as u32 {
+            let (s, e) = header.doc_span(doc_seq).unwrap();
+            put(s, e);
+        }
+        let query = gen(424_242);
+        let seqs: Vec<u32> = (0..selected as u64)
+            .map(|i| ((i * 7919) % docs) as u32)
+            .collect();
+        let rounds = 5;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            let mut n = 0;
+            for &doc_seq in &seqs {
+                n += header.vectors_for(doc_seq).unwrap().len();
+            }
+            assert_eq!(n, seqs.len());
+        }
+        let per_candidate = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            let r = reader.knn_exact_scores_fetching("emb", &query, &seqs, None);
+            assert_eq!(r.unavailable, 0, "{:?}", r.reason);
+        }
+        let batched = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+        println!(
+            "ranged rescore read: {docs} cached spans, {selected} candidates, dim {BENCH_DIM}: \
+             per-candidate listing {per_candidate:.2} ms/call, one listing {batched:.2} ms/call"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
