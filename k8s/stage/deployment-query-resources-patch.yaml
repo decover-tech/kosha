@@ -91,23 +91,11 @@ spec:
             # (emptyDir/ephemeral-storage), this one bounds RAM.
             - name: KOSHA_SEGMENT_LIVE_MAX_BYTES
               value: "25769803776"
-            # Readiness-gated prefetch of the scoring scaffolding
-            # (footer.json + inverted.idx + doc_store.offsets) for every
-            # segment in the manifest, hydrated with
-            # RequestHydration::unlimited().
-            #
-            # Added because full-namespace scans on paragraph_index_hnsw
-            # 429'd with "search overloaded: this query needs more segment
-            # data than one request may hydrate": at 1,529 segments a
-            # match_all needs scaffolding from all of them at once, which
-            # exceeds the per-request hydration budget on a cold pod (logs
-            # showed shed=32 / shed=28). That scan shape is what
-            # backend's catchup_es_to_kosha.py pages ids with, so the
-            # OpenSearch delta could not be reconciled at all. Warmup
-            # bypasses the per-request budget by construction rather than
-            # raising it for every query on the pod.
-            - name: KOSHA_WARMUP_NAMESPACES
-              value: "default/paragraph_index_hnsw"
+            # No KOSHA_WARMUP_NAMESPACES: naming the namespace warmed every
+            # matter in it (Decover keeps all matters in one namespace), which
+            # hides the cold path the tests must measure. A new pod warms
+            # what pods were actually searching (the usage warm set, on by
+            # default) within KOSHA_WARMUP_BUDGET_BYTES below.
             # Posting blobs on (the code default). They were switched off when
             # the namespace had 206,756 of them and warming held /readyz for
             # ~25 minutes; compaction has since left 256 per segment (1,536
