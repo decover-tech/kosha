@@ -194,3 +194,78 @@ fn legacy_routes_can_be_switched_off() {
     assert!(legacy.starts_with("HTTP/1.1 410"), "{legacy}");
     assert!(!v1.starts_with("HTTP/1.1 410"), "{v1}");
 }
+
+/// `POST` `body` as `key`, through the real server.
+fn post(port: u16, path: &str, key: &str, body: &str) -> String {
+    http(
+        port,
+        &format!(
+            "POST {path} HTTP/1.1\r\nauthorization: Bearer {key}\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .unwrap()
+}
+
+fn json_of(response: &str) -> serde_json::Value {
+    serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+}
+
+#[test]
+fn scoped_keys_from_the_admin_api_end_to_end() {
+    // #346, env-only: the admin API keeps keys in memory on this server.
+    let (mut cmd, port) = server(&[("KOSHA_ADMIN_API_KEY", "sk-admin")]);
+    let mut child = cmd.spawn().unwrap();
+    wait_healthy(&mut child, port);
+
+    let created = post(
+        port,
+        "/v1/admin/api-keys",
+        "sk-admin",
+        r#"{"tenant_id":"acme","scopes":["read"],"namespaces":["docs"]}"#,
+    );
+    let reader = json_of(&created)["api_key"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let id = json_of(&created)["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let search_body = r#"{"query_text":"x","max_results":1}"#;
+    let write = post(
+        port,
+        "/v1/namespaces/docs/documents",
+        &reader,
+        r#"{"documents":[]}"#,
+    );
+    let search = post(port, "/v1/namespaces/docs/search", &reader, search_body);
+    let other_ns = post(port, "/v1/namespaces/other/search", &reader, search_body);
+    let listed = http(
+        port,
+        "GET /v1/admin/api-keys?tenant_id=acme HTTP/1.1\r\nauthorization: Bearer sk-admin\r\n\r\n",
+    )
+    .unwrap();
+    let revoked = post(
+        port,
+        &format!("/v1/admin/api-keys/{id}/revoke"),
+        "sk-admin",
+        "",
+    );
+    let after_revoke = post(port, "/v1/namespaces/docs/search", &reader, search_body);
+    child.kill().ok();
+    child.wait().ok();
+
+    assert!(created.starts_with("HTTP/1.1 200"), "{created}");
+    assert!(reader.starts_with("sk-"), "{created}");
+    assert!(write.starts_with("HTTP/1.1 403"), "{write}");
+    assert!(write.contains("insufficient_scope"), "{write}");
+    assert!(!search.starts_with("HTTP/1.1 401"), "{search}");
+    assert!(!search.starts_with("HTTP/1.1 403"), "{search}");
+    assert!(other_ns.starts_with("HTTP/1.1 403"), "{other_ns}");
+    assert!(listed.starts_with("HTTP/1.1 200"), "{listed}");
+    assert!(listed.contains(&id), "{listed}");
+    assert!(!listed.contains(&reader), "{listed}");
+    assert!(revoked.starts_with("HTTP/1.1 200"), "{revoked}");
+    assert!(after_revoke.starts_with("HTTP/1.1 401"), "{after_revoke}");
+}

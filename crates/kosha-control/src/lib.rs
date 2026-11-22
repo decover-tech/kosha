@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 
 use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
 
+pub mod api_keys;
+pub use api_keys::{ApiKeyStore, KeyRecord, MemoryApiKeyStore, NewKey, Scope, Scopes};
+
 mod namespace_rename;
 pub use namespace_rename::{rekey_manifest_references, NamespaceRename, RenameOutcome};
 

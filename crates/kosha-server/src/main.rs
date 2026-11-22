@@ -34,6 +34,7 @@ fn namespace_tenant(ns: &str) -> Option<&str> {
 const SERVICE_TENANT: &str = "service";
 
 mod auth;
+use kosha_control::api_keys as auth_scope;
 mod branching;
 mod compaction_sched;
 mod dashboard;
@@ -5683,7 +5684,7 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
     let authentication = if service_authorized(&headers, state.admin_auth_key.as_deref())
         || service_authorized(&headers, state.internal_service_key.as_deref())
     {
-        Ok("service".to_string())
+        Ok(auth::Principal::full(SERVICE_TENANT))
     } else {
         authenticate(&headers)
     };
@@ -5727,17 +5728,17 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
         {
             internal_segment_response(&request_line, state)
         }
-        (Ok(tenant), _, _) => http::Response::from_raw(serve_tenant_request(
+        (Ok(principal), _, _) => http::Response::from_raw(serve_tenant_request(
             &request_line,
             &headers,
             &body,
-            tenant,
+            principal,
             state,
         )),
     };
     log_request(
         &request_line,
-        authentication.as_deref().unwrap_or("-"),
+        authentication.as_ref().map_or("-", |p| p.tenant.as_str()),
         body.len(),
         &response,
         started,
@@ -5841,9 +5842,10 @@ fn serve_tenant_request(
     request_line: &str,
     headers: &HashMap<String, String>,
     body: &[u8],
-    tenant: &str,
+    principal: &auth::Principal,
     state: &AppState,
 ) -> String {
+    let tenant = principal.tenant.as_str();
     let mut _query_slot = None;
     if tenant_is_limited(state, tenant) {
         if is_search_route(request_line) {
@@ -5857,7 +5859,7 @@ fn serve_tenant_request(
             }
         }
     }
-    route(request_line, headers, body, tenant, state)
+    route_as(request_line, headers, body, principal, state)
 }
 
 /// Whether `tenant`'s requests are subject to tenant limits at all.
@@ -6152,15 +6154,23 @@ fn log_request(
 }
 
 /// Extract and validate the API key from request headers.
-/// Returns the tenant id on success, or a 401 response string on failure.
-fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
+/// Returns who the key authenticates as (tenant, scopes, namespaces), or a
+/// 401 response string for a missing, unknown, revoked or expired key.
+fn authenticate(headers: &HashMap<String, String>) -> Result<auth::Principal, String> {
     let store = match auth::global() {
         // Only reachable with an explicit `KOSHA_AUTH=disabled`; an empty
         // key set no longer means "auth off" (see `auth::init_global`).
-        auth::Auth::Disabled => return Ok("dev".to_string()),
+        auth::Auth::Disabled => return Ok(auth::Principal::full("dev")),
         auth::Auth::Keys(store) => store,
     };
+    authenticate_with(store, headers)
+}
 
+/// [`authenticate`] against one key store.
+fn authenticate_with(
+    store: &auth::KeyStore,
+    headers: &HashMap<String, String>,
+) -> Result<auth::Principal, String> {
     let api_key: Option<&str> = headers
         .get("authorization")
         .map(|v| v.as_str())
@@ -6180,8 +6190,9 @@ fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
 
     match api_key {
         Some(key) => match store.lookup(key) {
-            Some(tenant) => Ok(tenant),
-            None => Err(json_error_body(401, "invalid API key")),
+            Ok(principal) => Ok(principal),
+            Err(auth::LookupError::Expired) => Err(json_error_body(401, "API key expired")),
+            Err(auth::LookupError::Unknown) => Err(json_error_body(401, "invalid API key")),
         },
         None => Err(json_error_body(
             401,
@@ -6352,7 +6363,8 @@ fn valid_new_tenant_id(tenant: &str) -> bool {
     valid_name_component(tenant) && !tenant.starts_with('_') && !tenant.starts_with('.')
 }
 
-/// Authorize before dispatch, including compatibility and internal routes.
+/// [`route_as`] with a full-scope key of `tenant` (tests).
+#[cfg(test)]
 fn route(
     request_line: &str,
     headers: &HashMap<String, String>,
@@ -6360,6 +6372,125 @@ fn route(
     tenant: &str,
     state: &AppState,
 ) -> String {
+    route_as(
+        request_line,
+        headers,
+        body,
+        &auth::Principal::full(tenant),
+        state,
+    )
+}
+
+/// The scope a tenant route needs (#346). `path` may carry a query string.
+///
+/// - read: search, exists, stats, `GET` schema, list namespaces and
+///   branches (every `GET`, and `POST .../search|exists`, `/search`,
+///   `/exists`);
+/// - write: `POST .../documents|flush|delete` and the legacy `/index`,
+///   `/replace`, `/flush`, `/delete`;
+/// - admin: create or delete a namespace, `POST .../schema|shards`, branch
+///   create and delete.
+///
+/// Any other mutating route needs admin, so a route added later fails
+/// closed until it is classified here.
+fn required_scope(method: &str, path: &str) -> auth_scope::Scope {
+    use auth_scope::Scope;
+    let path = path.split('?').next().unwrap_or(path);
+    if method == "GET" {
+        return Scope::Read;
+    }
+    if path == "/v1/namespaces" {
+        return Scope::Admin;
+    }
+    if let Some(rest) = path.strip_prefix("/v1/namespaces/") {
+        return match (method, rest.rsplit_once('/').map(|(_, action)| action)) {
+            ("DELETE", None) => Scope::Admin,
+            ("POST", Some("search" | "exists")) => Scope::Read,
+            ("POST", Some("documents" | "flush" | "delete")) => Scope::Write,
+            _ => Scope::Admin,
+        };
+    }
+    match (method, path) {
+        ("POST", "/search" | "/exists") => Scope::Read,
+        ("POST", "/index" | "/replace" | "/flush" | "/delete") => Scope::Write,
+        _ => Scope::Admin,
+    }
+}
+
+/// The tenant namespaces a request names, for a key restricted to a
+/// namespace list (#346): the path's `{ns}`, `namespace` in a create or
+/// legacy body, a branch's new `name`, or legacy `GET /search?ns=`. Empty
+/// when the request names none (or its body is unreadable, which the
+/// handler then rejects).
+fn requested_namespaces(method: &str, path: &str, body: &[u8]) -> Vec<String> {
+    let (bare, query) = path.split_once('?').unwrap_or((path, ""));
+    let body_field = |field: &str| -> Option<String> {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()?
+            .get(field)?
+            .as_str()
+            .map(str::to_string)
+    };
+    let mut out = Vec::new();
+    if let Some(rest) = bare.strip_prefix("/v1/namespaces/") {
+        let ns = rest.split_once('/').map_or(rest, |(ns, _)| ns);
+        out.push(url_decode(ns));
+        if method == "POST" && rest.ends_with("/branch") {
+            out.extend(body_field("name"));
+        }
+    } else if method == "POST"
+        && [
+            "/v1/namespaces",
+            "/index",
+            "/exists",
+            "/replace",
+            "/search",
+            "/flush",
+            "/delete",
+        ]
+        .contains(&bare)
+    {
+        out.extend(body_field("namespace"));
+    } else if method == "GET" && bare == "/search" {
+        out.extend(
+            query
+                .split('&')
+                .filter_map(|p| p.strip_prefix("ns="))
+                .map(url_decode),
+        );
+    }
+    out
+}
+
+/// A 403 for a key without the scope a route needs.
+fn insufficient_scope(required: auth_scope::Scope) -> String {
+    let message = format!(
+        "insufficient_scope: this API key lacks the '{}' scope",
+        required.as_str()
+    );
+    eprintln!("WARN: request failed: status=403 {message}{}", request_id());
+    raw_response(
+        403,
+        &serde_json::json!({
+            "error": "insufficient_scope",
+            "required_scope": required.as_str(),
+            "message": message,
+        })
+        .to_string(),
+    )
+}
+
+/// Authorize before dispatch, including compatibility and internal routes.
+/// A tenant route also needs the key's scope ([`required_scope`]) and, for
+/// a key restricted to a namespace list, a listed namespace (#346).
+fn route_as(
+    request_line: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    principal: &auth::Principal,
+    state: &AppState,
+) -> String {
+    let tenant = principal.tenant.as_str();
     let Some((method, path)) = parse_method_and_path(request_line) else {
         return json_error(400, "invalid request line");
     };
@@ -6374,6 +6505,24 @@ fn route(
     } else {
         if !valid_name_component(tenant) {
             return json_error(403, "invalid tenant");
+        }
+        let required = required_scope(method, path);
+        if !principal.has_scope(required) {
+            return insufficient_scope(required);
+        }
+        if principal.namespaces.is_some() {
+            if let Some(ns) = requested_namespaces(method, path, body)
+                .iter()
+                .find(|ns| !principal.allows_namespace(ns))
+            {
+                return json_error(
+                    403,
+                    &format!("namespace '{ns}' is not permitted for this API key"),
+                );
+            }
+            if is_list_namespaces_route(request_line) {
+                return handle_list_namespaces(tenant, principal.namespaces.as_deref(), state);
+            }
         }
         if let Some(rest) = path.strip_prefix("/v1/namespaces/") {
             // `/v1/namespaces/{ns}/{action}`, or the bare
@@ -6495,7 +6644,7 @@ fn route_inner(
     }
 
     if is_list_namespaces_route(request_line) {
-        return handle_list_namespaces(tenant, state);
+        return handle_list_namespaces(tenant, None, state);
     }
 
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/documents") {
@@ -6552,8 +6701,8 @@ fn route_inner(
     }
 
     // ── Admin routes (Postgres-backed only) ────────────────────────────────
-    if request_line.starts_with("POST /v1/admin/api-keys") {
-        return handle_create_api_key(body, tenant, state);
+    if let Some(response) = handle_api_keys_admin(request_line, body) {
+        return response;
     }
 
     if request_line.starts_with("POST /v1/admin/rebuild-filter-blooms") {
@@ -9224,13 +9373,15 @@ fn handle_exists_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &App
 /// internal and left out; a sharded namespace reports totals over its
 /// shards, as its stats do. Counts are `null` for a namespace whose
 /// manifest this pod cannot load right now.
-fn handle_list_namespaces(tenant: &str, state: &AppState) -> String {
+fn handle_list_namespaces(tenant: &str, allowed: Option<&[String]>, state: &AppState) -> String {
     let prefix = format!("{tenant}/");
     let all = state.controller.lock().unwrap().list_namespaces();
     let mut names: Vec<String> = all
         .into_iter()
         .filter_map(|ns| ns.0.strip_prefix(&prefix).map(str::to_string))
         .filter(|name| !name.is_empty() && !name.contains('/'))
+        // A key restricted to a namespace list sees only those (#346).
+        .filter(|name| allowed.is_none_or(|list| list.contains(name)))
         .collect();
     names.sort_unstable();
     names.dedup();
@@ -10527,71 +10678,41 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
     }
 }
 
-/// POST /v1/admin/api-keys — create a new API key for a tenant.
+/// `/v1/admin/api-keys` (#346), behind `KOSHA_ADMIN_API_KEY` (checked in
+/// `route`). `None` for any other path. The logic is
+/// [`auth::KeyStore::admin`]:
 ///
-/// Requires the dedicated KOSHA_ADMIN_API_KEY credential.
-/// Request body: {"tenant_id": "acme-corp", "description": "staging key"}
-fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String {
-    let req: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return json_error(400, "invalid JSON"),
-    };
-
-    let tenant_id = match req.get("tenant_id").and_then(|v| v.as_str()) {
-        Some(t) => t,
-        None => return json_error(400, "missing 'tenant_id'"),
-    };
-    if !valid_new_tenant_id(tenant_id) {
-        return json_error(
+/// - `POST /v1/admin/api-keys` `{tenant_id, description?, scopes?,
+///   namespaces?, expires_at? | ttl_secs?}` creates a key and returns its
+///   `id` and, once, the plaintext `api_key`;
+/// - `GET /v1/admin/api-keys?tenant_id=` lists active keys' metadata and
+///   prefix, never the key or its hash;
+/// - `POST /v1/admin/api-keys/{id}/rotate` `{overlap_secs?, expires_at? |
+///   ttl_secs?}` issues a replacement and lets the old key work for the
+///   overlap;
+/// - `POST /v1/admin/api-keys/{id}/revoke`.
+///
+/// The mutations are `POST` so a query pod forwards them to the ingest pod
+/// (`is_write_path`).
+fn handle_api_keys_admin(request_line: &str, body: &[u8]) -> Option<String> {
+    let (method, target) = parse_method_and_path(request_line)?;
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let rest = path.strip_prefix("/v1/admin/api-keys")?;
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return None;
+    }
+    let auth::Auth::Keys(store) = auth::global() else {
+        return Some(json_error(
             400,
-            "invalid 'tenant_id' (must be non-empty, without '/', '\\' or control \
-             characters, and not start with '_' or '.')",
-        );
-    }
-
-    let description = req
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    // Create via the shared Postgres pool (only with the postgres feature).
-    #[cfg(feature = "postgres")]
-    {
-        let _ = state;
-        let auth::Auth::Keys(store) = auth::global() else {
-            return json_error(400, "API keys are disabled (KOSHA_AUTH=disabled)");
-        };
-        if std::env::var("DATABASE_URL").is_err() {
-            return json_error(400, "Postgres not configured (DATABASE_URL not set)");
-        }
-        let Some(pg) = store.pg() else {
-            return json_error(500, "failed to connect to postgres");
-        };
-        match pg.create_api_key(tenant_id, description) {
-            Ok(api_key) => {
-                // Usable on this pod right away; other pods pick it up on
-                // their next key refresh.
-                store.insert_db_key(api_key.clone(), tenant_id.to_string());
-                json_ok(&serde_json::json!({
-                    "api_key": api_key,
-                    "tenant_id": tenant_id,
-                    "description": description,
-                }))
-            }
-            Err(e) => json_error(500, &format!("failed to create key: {e}")),
-        }
-    }
-
-    #[cfg(not(feature = "postgres"))]
-    {
-        let _ = state;
-        let _ = tenant_id;
-        let _ = description;
-        json_error(
-            400,
-            "admin API requires postgres feature (compile with --features postgres)",
-        )
-    }
+            "API keys are disabled (KOSHA_AUTH=disabled)",
+        ));
+    };
+    Some(
+        match store.admin(method, path, query, body, valid_new_tenant_id) {
+            Ok(value) => json_ok(&value),
+            Err((status, message)) => json_error(status, &message),
+        },
+    )
 }
 
 /// If the body is not valid JSON, try parsing as a raw object with just the documents field.
@@ -14416,6 +14537,283 @@ mod tests {
             let response = route(line, &HashMap::new(), body, "attacker", &state);
             assert!(!response.starts_with("HTTP/1.1 200"), "{response}");
         }
+    }
+
+    // ── Scoped API keys (#346) ───────────────────────────────────────────
+
+    fn scoped_principal(
+        tenant: &str,
+        scopes: &[auth_scope::Scope],
+        namespaces: Option<&[&str]>,
+    ) -> auth::Principal {
+        auth::Principal {
+            scopes: auth_scope::Scopes::of(scopes),
+            namespaces: namespaces.map(|list| list.iter().map(|n| n.to_string()).collect()),
+            ..auth::Principal::full(tenant)
+        }
+    }
+
+    fn index_scoped_doc(state: &AppState, tenant: &str, ns: &str, id: &str) {
+        let body = serde_json::to_vec(&serde_json::json!({"documents": [{"id": id, "fields": [
+            {"name": "title", "field_type": "Text", "value": "quarterly report"}
+        ]}]}))
+        .unwrap();
+        let resp = route(
+            &format!("POST /v1/namespaces/{ns}/documents HTTP/1.1\r\n"),
+            &HashMap::new(),
+            &body,
+            tenant,
+            state,
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        state
+            .indexer
+            .flush_namespace(&NamespaceId(format!("{tenant}/{ns}")))
+            .unwrap();
+    }
+
+    #[test]
+    fn required_scope_classifies_every_tenant_route() {
+        use auth_scope::Scope::*;
+        for (method, path, scope) in [
+            ("POST", "/v1/namespaces/docs/search", Read),
+            ("POST", "/v1/namespaces/docs/exists", Read),
+            ("GET", "/v1/namespaces/docs/stats", Read),
+            ("GET", "/v1/namespaces/docs/schema", Read),
+            ("GET", "/v1/namespaces", Read),
+            ("GET", "/v1/namespaces?limit=5", Read),
+            ("GET", "/v1/namespaces/docs/branches", Read),
+            ("GET", "/search?ns=docs&q=x", Read),
+            ("POST", "/search", Read),
+            ("POST", "/exists", Read),
+            ("POST", "/v1/namespaces/docs/documents", Write),
+            ("POST", "/v1/namespaces/docs/flush", Write),
+            ("POST", "/v1/namespaces/docs/delete", Write),
+            ("POST", "/index", Write),
+            ("POST", "/replace", Write),
+            ("POST", "/flush", Write),
+            ("POST", "/delete", Write),
+            ("POST", "/v1/namespaces", Admin),
+            ("DELETE", "/v1/namespaces/docs", Admin),
+            ("POST", "/v1/namespaces/docs/schema", Admin),
+            ("POST", "/v1/namespaces/docs/shards", Admin),
+            ("POST", "/v1/namespaces/docs/branch", Admin),
+            ("DELETE", "/v1/namespaces/docs/branch", Admin),
+            // Unclassified mutations fail closed.
+            ("POST", "/v1/namespaces/docs/something-new", Admin),
+        ] {
+            assert_eq!(required_scope(method, path), scope, "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn read_only_key_can_search_but_not_write() {
+        let state = test_state();
+        index_scoped_doc(&state, "acme", "docs", "d1");
+        let reader = scoped_principal("acme", &[auth_scope::Scope::Read], None);
+        let as_reader = |line: &str, body: serde_json::Value| {
+            route_as(
+                &format!("{line} HTTP/1.1"),
+                &HashMap::new(),
+                &serde_json::to_vec(&body).unwrap(),
+                &reader,
+                &state,
+            )
+        };
+        let doc = serde_json::json!({"documents": [{"id": "d2", "fields": []}]});
+        for (line, body, scope) in [
+            ("POST /v1/namespaces/docs/documents", doc.clone(), "write"),
+            (
+                "POST /v1/namespaces/docs/flush",
+                serde_json::json!({}),
+                "write",
+            ),
+            (
+                "POST /v1/namespaces/docs/delete",
+                serde_json::json!({"doc_ids": ["d1"]}),
+                "write",
+            ),
+            (
+                "POST /index",
+                serde_json::json!({"namespace": "docs", "documents": []}),
+                "write",
+            ),
+            (
+                "POST /v1/namespaces",
+                serde_json::json!({"namespace": "new"}),
+                "admin",
+            ),
+            (
+                "DELETE /v1/namespaces/docs",
+                serde_json::Value::Null,
+                "admin",
+            ),
+            (
+                "POST /v1/namespaces/docs/schema",
+                serde_json::json!({}),
+                "admin",
+            ),
+        ] {
+            let resp = as_reader(line, body);
+            assert!(resp.starts_with("HTTP/1.1 403"), "{line}: {resp}");
+            let err = json_body(&resp);
+            assert_eq!(err["error"], "insufficient_scope", "{line}: {resp}");
+            assert_eq!(err["required_scope"], scope, "{line}: {resp}");
+        }
+        // Nothing was written: d1 is still the only document.
+        let resp = as_reader(
+            "POST /v1/namespaces/docs/search",
+            serde_json::json!({"query_text": "report", "max_results": 5}),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        let hits = json_body(&resp)["results"].as_array().unwrap().len();
+        assert_eq!(hits, 1, "{resp}");
+        let resp = as_reader("GET /v1/namespaces/docs/stats", serde_json::Value::Null);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+
+        // A write key writes but cannot administer.
+        let writer = scoped_principal(
+            "acme",
+            &[auth_scope::Scope::Read, auth_scope::Scope::Write],
+            None,
+        );
+        let resp = route_as(
+            "POST /v1/namespaces/docs/documents HTTP/1.1",
+            &HashMap::new(),
+            &serde_json::to_vec(&doc).unwrap(),
+            &writer,
+            &state,
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        let resp = route_as(
+            "DELETE /v1/namespaces/docs HTTP/1.1",
+            &HashMap::new(),
+            b"",
+            &writer,
+            &state,
+        );
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+    }
+
+    #[test]
+    fn namespace_restricted_key_is_denied_other_namespaces() {
+        let state = test_state();
+        index_scoped_doc(&state, "acme", "docs", "d1");
+        index_scoped_doc(&state, "acme", "secret", "s1");
+        let key = scoped_principal("acme", &auth_scope::Scope::ALL, Some(&["docs"]));
+        let call = |line: &str, body: serde_json::Value| {
+            let bytes = if body.is_null() {
+                Vec::new()
+            } else {
+                serde_json::to_vec(&body).unwrap()
+            };
+            route_as(
+                &format!("{line} HTTP/1.1"),
+                &HashMap::new(),
+                &bytes,
+                &key,
+                &state,
+            )
+        };
+        let search = serde_json::json!({"query_text": "report", "max_results": 5});
+        assert!(call("POST /v1/namespaces/docs/search", search.clone()).starts_with("HTTP/1.1 200"));
+        for (line, body) in [
+            ("POST /v1/namespaces/secret/search", search.clone()),
+            ("GET /v1/namespaces/secret/stats", serde_json::Value::Null),
+            (
+                "POST /v1/namespaces/secret/documents",
+                serde_json::json!({"documents": []}),
+            ),
+            ("DELETE /v1/namespaces/secret", serde_json::Value::Null),
+            (
+                "POST /v1/namespaces",
+                serde_json::json!({"namespace": "other"}),
+            ),
+            (
+                "POST /search",
+                serde_json::json!({"namespace": "secret", "query_text": "report"}),
+            ),
+            ("GET /search?ns=secret&q=report", serde_json::Value::Null),
+            // A branch of an allowed namespace under a name outside the list.
+            (
+                "POST /v1/namespaces/docs/branch",
+                serde_json::json!({"name": "copy"}),
+            ),
+        ] {
+            let resp = call(line, body);
+            assert!(resp.starts_with("HTTP/1.1 403"), "{line}: {resp}");
+            assert!(resp.contains("not permitted"), "{line}: {resp}");
+        }
+        // Listing shows only the permitted namespaces.
+        let resp = call("GET /v1/namespaces", serde_json::Value::Null);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        let names: Vec<String> = json_body(&resp)["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["docs".to_string()]);
+        // An unrestricted key of the same tenant sees both.
+        let resp = route(
+            "GET /v1/namespaces HTTP/1.1",
+            &HashMap::new(),
+            b"",
+            "acme",
+            &state,
+        );
+        assert_eq!(json_body(&resp)["namespaces"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unknown_and_expired_keys_get_401() {
+        let store = auth::KeyStore::with_keys(HashMap::new());
+        let key = "sk-0badf00d_expired";
+        store.replace_db_records(&[kosha_control::KeyRecord {
+            id: "00000000-0000-4000-8000-000000000001".into(),
+            tenant_id: "acme".into(),
+            key_prefix: "sk-0badf00d".into(),
+            key_hash: auth_scope::hash_key(key),
+            scopes: auth_scope::Scopes::ALL,
+            namespaces: None,
+            description: String::new(),
+            created_at: 0,
+            expires_at: Some(auth_scope::now_unix() - 1),
+            last_used_at: None,
+            revoked_at: None,
+            rotated_from: None,
+        }]);
+        let headers = |k: &str| HashMap::from([("authorization".into(), format!("Bearer {k}"))]);
+        let err = authenticate_with(&store, &headers(key)).unwrap_err();
+        assert!(err.starts_with("HTTP/1.1 401"), "{err}");
+        assert!(err.contains("expired"), "{err}");
+        let err = authenticate_with(&store, &headers("sk-nope")).unwrap_err();
+        assert!(err.starts_with("HTTP/1.1 401"), "{err}");
+        assert!(authenticate_with(&store, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn admin_api_key_routes_need_the_admin_credential() {
+        let mut state = test_state();
+        state.admin_auth_key = Some("admin-secret".into());
+        let tenant_key = HashMap::from([("authorization".into(), "Bearer tenant".into())]);
+        for line in [
+            "GET /v1/admin/api-keys?tenant_id=acme HTTP/1.1",
+            "POST /v1/admin/api-keys/00000000-0000-4000-8000-000000000000/rotate HTTP/1.1",
+            "POST /v1/admin/api-keys/00000000-0000-4000-8000-000000000000/revoke HTTP/1.1",
+        ] {
+            let resp = route(line, &tenant_key, b"{}", "acme", &state);
+            assert!(resp.starts_with("HTTP/1.1 403"), "{line}: {resp}");
+        }
+        // Rotation and revocation are forwarded to the ingest pod.
+        assert!(is_write_path(
+            "POST /v1/admin/api-keys/00000000-0000-4000-8000-000000000000/rotate HTTP/1.1"
+        ));
+        assert!(is_write_path(
+            "POST /v1/admin/api-keys/00000000-0000-4000-8000-000000000000/revoke HTTP/1.1"
+        ));
+        // A path that only shares the prefix is not the key API.
+        assert!(handle_api_keys_admin("POST /v1/admin/api-keysx HTTP/1.1", b"").is_none());
     }
 
     #[test]
@@ -20574,7 +20972,7 @@ mod tests {
             &format!("{line} HTTP/1.1"),
             &HashMap::new(),
             &bytes,
-            tenant,
+            &auth::Principal::full(tenant),
             state,
         )
     }

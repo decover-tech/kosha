@@ -15,3 +15,7 @@ ALTER TABLE kosha.retired_namespaces OWNER TO kosha;
 -- 003_writer_leases.sql (#254). IF EXISTS: 002 may run before 003 on an
 -- instance that has not been migrated past 001 yet.
 ALTER TABLE IF EXISTS kosha.writer_leases OWNER TO kosha;
+-- 004_api_key_scopes.sql (#346) adds columns and indexes to kosha.api_keys
+-- only. The indexes belong to the table's owner, so the line above covers
+-- them; re-stated here so the list names every migration.
+ALTER TABLE IF EXISTS kosha.api_keys OWNER TO kosha;

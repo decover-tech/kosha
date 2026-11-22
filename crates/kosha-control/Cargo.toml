@@ -12,6 +12,9 @@ workspace = true
 kosha-core = { path = "../kosha-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# API keys (#346): only SHA-256(key) is stored; keys come from the OS RNG.
+sha2 = "0.10"
+getrandom = "0.2"
 
 # Postgres persistence (optional — in-memory is the default).
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"], optional = true }

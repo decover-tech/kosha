@@ -288,7 +288,7 @@ The control plane is in memory unless `DATABASE_URL` is set in a binary built wi
 | --- | --- | --- | --- |
 | `KOSHA_POSTGRES_FALLBACK_ON_ERROR` | When `DATABASE_URL` is set but Postgres is unreachable at boot, fall back to the in-memory store instead of exiting. Emergency use only | off (exit) | flag |
 | `KOSHA_MANIFEST_REFRESH_MS` | How often query pods poll for new manifest versions; `0` disables the refresher and pods check before every search (`manifest_follow.rs`) | `500` | milliseconds |
-| `KOSHA_API_KEY_REFRESH_SECS` | How often API keys are reloaded from Postgres (`auth.rs`) | `30` | seconds |
+| `KOSHA_API_KEY_REFRESH_SECS` | How often API keys are reloaded from Postgres (`auth.rs`). Also bounds how long a revoked key keeps working on other pods, and how often `last_used_at` is written | `30` | seconds |
 
 Namespaces written before tenant scoping (#262) have bare ids that no tenant can reach; the
 server lists them in a `WARN` at boot. `kosha-server migrate-namespace --from <bare> --to
@@ -310,15 +310,51 @@ server lists them in a `WARN` at boot. `kosha-server migrate-namespace --from <b
 | `KOSHA_TLS_KEY_PATH` | PEM private key (PKCS#8, PKCS#1 or SEC1) for `KOSHA_TLS_CERT_PATH` | unset | path |
 | `KOSHA_TLS_CLIENT_CA_PATH` | PEM CA bundle for client certificates (mTLS, #343). A presented certificate must chain to it or the handshake fails, and `/internal/*` answers 403 on a connection that presented none. Other routes still accept clients without a certificate. Needs `KOSHA_TLS_CERT_PATH`/`KOSHA_TLS_KEY_PATH`, or the server refuses to start | unset (no client certificates) | path |
 | `KOSHA_AUTH` | `disabled` (or `off`, `false`, `0`, `none`) turns authentication off; every request becomes tenant `dev`. Local development only | enabled | flag |
-| `KOSHA_API_KEY` | One tenant API key, mapped to tenant `default` | unset | string |
-| `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs | unset | list |
-| `KOSHA_ADMIN_API_KEY` | Key for `/v1/admin/*` and global `/stats`. Unset disables those routes | unset | string |
+| `KOSHA_API_KEY` | One tenant API key, mapped to tenant `default`, with every scope | unset | string |
+| `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs, each with every scope | unset | list |
+| `KOSHA_ADMIN_API_KEY` | Key for `/v1/admin/*` (including the API-key admin API) and global `/stats`. Unset disables those routes | unset | string |
 | `KOSHA_INTERNAL_API_KEY` | Key peers use for `GET /internal/segment/...` hydration. Unset disables peer-file access | unset | string |
 | `KOSHA_LEGACY_ROUTES` | `off` (or `disabled`, `false`, `0`, `none`) makes the unversioned Phase 1 routes return 410 | on | flag |
 | `KOSHA_DASHBOARD` | `on` (or `true`, `1`, `yes`, `enabled`) serves the read-only web UI at `/dashboard`, adds `recent_queries` to `GET /v1/namespaces/{ns}/stats`, and honors `"timings": true` on searches. See [dashboard.md](dashboard.md). `dashboard.rs`, `Dashboard::from_env` | off | flag |
 
 The server refuses to start when no credential is configured (no env key, no admin or internal
 key, no Postgres keys) unless `KOSHA_AUTH=disabled`.
+
+### Scoped API keys
+
+Keys created through the admin API (#346) carry scopes, an optional namespace list and an
+optional expiry. Env keys (`KOSHA_API_KEY`, `KOSHA_API_KEYS`) have every scope on every
+namespace of their tenant, and so do keys created before #346.
+
+| Scope | Routes |
+| --- | --- |
+| `read` | `POST /v1/namespaces/{ns}/search` and `/exists`, every `GET` (namespace stats, schema, `GET /v1/namespaces`, branches), legacy `/search` and `/exists` |
+| `write` | `POST /v1/namespaces/{ns}/documents`, `/flush` and `/delete`, legacy `/index`, `/replace`, `/flush` and `/delete` |
+| `admin` | `POST /v1/namespaces` (create), `DELETE /v1/namespaces/{ns}`, `POST /v1/namespaces/{ns}/schema` and `/shards`, branch create and delete |
+
+A key without the scope a route needs gets 403 with `{"error": "insufficient_scope",
+"required_scope": ...}`. A key with a namespace list gets 403 for any other namespace, and
+`GET /v1/namespaces` lists only its namespaces. An unknown, revoked or expired key gets 401.
+Expiry is checked on every request. A revoked key stops working at once on the pod that
+revoked it and within `KOSHA_API_KEY_REFRESH_SECS` on the others.
+
+The server stores only the SHA-256 of each key. Migration `004_api_key_scopes.sql` adds the
+columns; at startup the server hashes any key stored before it and replaces the plaintext in
+the `api_key` column with a `redacted:<prefix>:<id>` marker that is not a usable key. Keys
+look like `sk-<8 hex>_<64 hex>`; listings show only the `sk-<8 hex>` prefix.
+
+Admin API, all behind `KOSHA_ADMIN_API_KEY`:
+
+| Route | Body | Returns |
+| --- | --- | --- |
+| `POST /v1/admin/api-keys` | `tenant_id`, `description`, `scopes` (default all three), `namespaces` (default all), `expires_at` (Unix seconds) or `ttl_secs` | `id`, `api_key` (shown only here), `key_prefix`, the metadata |
+| `GET /v1/admin/api-keys?tenant_id=` | none | `api_keys`: active keys' metadata and prefix, never the key or its hash. `tenant_id` is optional |
+| `POST /v1/admin/api-keys/{id}/rotate` | `overlap_secs` (default 3600), and `expires_at` or `ttl_secs` for the new key | the new key, as for create, with `rotated_from`. The old key keeps working for `overlap_secs`, then expires |
+| `POST /v1/admin/api-keys/{id}/revoke` | none | `{"id", "revoked": true}`; 404 if the key is not active |
+
+Without `DATABASE_URL` the admin API keeps keys in memory on the pod that served the request:
+they are lost on restart and other pods never see them. Use Postgres for anything but a
+single local server.
 
 The server speaks HTTP/1.1 with keep-alive (#259): responses carry a `content-length` and the
 connection stays open for the next request. `KOSHA_TLS_CERT_PATH` turns HTTPS on for every

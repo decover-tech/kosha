@@ -2144,9 +2144,11 @@ dependencies = [
 name = "kosha-control"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.2.17",
  "kosha-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tokio",
  "uuid",
