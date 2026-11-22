@@ -1,0 +1,13 @@
+# HTTPS is per port: with KOSHA_TLS_CERT_PATH set, a plain-HTTP probe fails
+# and the kubelet restarts the pod. The kubelet does not verify the
+# certificate of an HTTPS probe, and /healthz and /readyz need no client
+# certificate.
+- op: add
+  path: /spec/template/spec/containers/0/readinessProbe/httpGet/scheme
+  value: HTTPS
+- op: add
+  path: /spec/template/spec/containers/0/startupProbe/httpGet/scheme
+  value: HTTPS
+- op: add
+  path: /spec/template/spec/containers/0/livenessProbe/httpGet/scheme
+  value: HTTPS

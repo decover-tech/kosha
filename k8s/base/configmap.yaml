@@ -32,6 +32,10 @@ data:
   # certificate-internal-tls.example.yaml for a cert-manager example) and,
   # on query pods, KOSHA_INGEST_HOST switched to https://. HTTPS is per port,
   # so the probes need `scheme: HTTPS` once the server certificate is set.
+  # Do not uncomment these here: include the ../components/internal-tls
+  # kustomize component from an overlay instead, which sets all of them and
+  # patches the probes and KOSHA_INGEST_HOST together (k8s/README.md,
+  # "Encryption in transit"). They are listed for reference.
   # Bad settings stop the pod at startup. See docs/configuration.md,
   # "TLS between pods".
   # Server side: HTTPS on :8080, and mTLS required on /internal/*.
@@ -44,3 +48,8 @@ data:
   # KOSHA_INTERNAL_TLS_CLIENT_CERT_PATH: /etc/kosha/tls/tls.crt
   # KOSHA_INTERNAL_TLS_CLIENT_KEY_PATH: /etc/kosha/tls/tls.key
   # KOSHA_INTERNAL_TLS_SERVER_NAME: kosha-internal
+  # TLS to Postgres (#343) is not a ConfigMap setting: it is part of
+  # DATABASE_URL, which lives in kosha-secret (key `database-url`), e.g.
+  #   postgres://kosha:<password>@<host>:5432/kosha?sslmode=verify-full&sslrootcert=/etc/kosha/pg/ca.crt
+  # With KOSHA_INTERNAL_TLS=required a URL whose sslmode is not require,
+  # verify-ca or verify-full stops the pod at startup.
