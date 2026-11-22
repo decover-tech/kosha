@@ -713,3 +713,72 @@ Also measured this round, on the ingest side:
   neither corpus ever loads again: re-benching after engine fixes is
   restore + warmup + phases (~90 min), or one `benchmark` Action
   dispatch (#134).
+
+---
+
+# Addendum — current main re-baseline + correction (2026-11-20/21)
+
+## Correction: turbopuffer's published BM25 numbers are 1M docs, not 10M
+
+turbopuffer's performance docs state the full-text figures used as the
+reference throughout this file (warm 13/18/29 ms, cold 316/381/559 ms)
+are for **"BM25, 1M docs, ~300MB"**
+([docs](https://turbopuffer.com/docs-md/performance.md)). Every BM25 gap
+quoted above compares Kosha at **10M docs (9.9GB)** against that 1M
+figure, so it overstates the gap by an unknown amount. Treat the 10M BM25
+rows as a scale result, not a like-for-like comparison. The like-for-like
+run is `bm25_docs: 1m` (first 1M docs of the same MSMarco shards).
+
+turbopuffer's **vector** figures are for 10M docs (warm 14/17/27 ms, cold
+874/1214/1686 ms), so the vector comparison below is matched on doc count.
+Its pages disagree on the vector shape: the tldr page says 1024 dims,
+~40GB; the docs say 768 dims at f16, ~15GB. Kosha's corpus is 1024-dim
+f32. All turbopuffer numbers are vendor-reported.
+
+## BM25, 10M MSMarco, 8 QPS, topk=10, 30 min per phase (main + #362/#373)
+
+| phase | p50 | p90 | p99 | errors | run |
+|---|---|---|---|---|---|
+| fresh pod (warmup-gated), cache off | 32.7 ms | 74.5 ms | 201 ms | 0 | 44843615336 |
+| fresh pod (warmup-gated), cache off | 29.0 ms | 66.4 ms | 175 ms | 0 | 44892212058 |
+| **warm, cache off** | **29.0 ms** | **63.5 ms** | **170 ms** | 0 | 44892212058 |
+| warm, cache on | 1.7 ms | 12.1 ms | 66 ms | 0 | 44892212058 |
+| round 6 (Aug), cold cache off, minutes 3–30 | 170 ms | 333 ms | 529 ms | 0 | — |
+
+"Fresh pod" waits on `/readyz`, i.e. after warmup preloads the namespace
+(7.3 min for 23GB); it is not turbopuffer's on-demand cold read.
+
+**Where the warm cache-off p99 goes** (`analyze_tail.py`, server timings
+joined per request): scoring is 99% of server time in the p99+ set
+(210 ms of 211 ms); queue, admit, hydrate and materialize are each under
+1 ms; HTTP/client overhead ~2 ms. No I/O: 0 S3 rounds and 0 postings
+fetches; all 200 segments already open. All 145 p99+ requests are queries
+whose median is already ≥ p90 (query cost, not contention). p99 by term
+count: ~20 ms at 4 terms, ~60 ms at 6–8, 165–232 ms at 9–12. Every request
+counts hits to the 10,000 cap. Levers in test order: compaction 200→~16
+segments; MaxScore-style partitioning for long OR queries; a smaller
+`total_hits_cap` A/B.
+
+## Vector, 10M MSMarco × 1024-dim, 8 QPS, k=10, num_candidates=100
+
+| phase | p50 | p90 | p99 | errors | run |
+|---|---|---|---|---|---|
+| fresh pod (warmup-gated), cache off | 88.5 ms | 113 ms | 607 ms | 263 (`429`) | 44876437446 |
+| warm, cache on | 88.0 ms | 111 ms | 222 ms | 0 | 44876437446 |
+| turbopuffer published, warm | 14 ms | 17 ms | 27 ms | — | — |
+| round 9 (Aug) | 3.55 s/query | — | — | 8 QPS unsustainable | — |
+
+Recall@10 vs exact brute force (100 queries): mean 0.90, median 1.0,
+min 0.5, top-1 100%. Warm gap to turbopuffer: 6.3× p50, 8.2× p99. Cache-on
+p50 equals cache-off, so kNN responses appear not to be served from the
+result cache (unverified).
+
+**Warmup is disk-write bound:** the vector namespace (~249GB) took 1h55m
+to preload (run 44876437446) and timed out at 2h on the next run. Server
+hydrate logs: a 1GB file takes ~1 s to GET from S3 but 23–35 s to write
+to the gp3 root volume, one file at a time. Levers: provisioned volume
+throughput, parallel file writes during warmup, re-snapshot with the
+binary vector sidecar (this snapshot stores vectors as JSON too).
+
+Per-request records and server logs for runs from 44892212058 on are in
+`s3://decoverai-bench-corpus-cache/runs/<run_id>/`.

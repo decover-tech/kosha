@@ -36,6 +36,16 @@ on:
         type: choice
         options: [restore, load]
         default: restore
+      bm25_docs:
+        description: >-
+          BM25 corpus size. 1m matches turbopuffer's published full-text
+          numbers (1M docs, ~300MB); 10m is the original 10M-doc corpus.
+          The first 1m run builds the namespace offline from the first 1M
+          docs of the same MSMarco shards and snapshots it; later runs
+          restore that snapshot.
+        type: choice
+        options: [10m, 1m]
+        default: 10m
       qps:
         description: target queries/sec per phase
         default: "8"
@@ -72,7 +82,7 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.BENCH_AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.BENCH_AWS_SECRET_ACCESS_KEY }}
   AWS_DEFAULT_REGION: us-east-1
-  BM25_NS: msmarco-10m
+  BM25_NS: msmarco-${{ inputs.bm25_docs || '10m' }}
   VEC_NS: msmarco-10m-vec
 
 jobs:
@@ -176,7 +186,7 @@ jobs:
               -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
               -e KOSHA_ADMIN_API_KEY=sk-bench-admin \
               -e KOSHA_DASHBOARD=on \
-              -e KOSHA_WARMUP_NAMESPACES="default/msmarco-10m,default/msmarco-10m-vec" \
+              -e KOSHA_WARMUP_NAMESPACES="default/msmarco-10m,default/msmarco-1m,default/msmarco-10m-vec" \
               -v /data/kosha:/var/cache/kosha kosha-server:bench
             sudo docker start kosha
             # /healthz: unauthenticated liveness. Global /stats is admin-only
@@ -193,7 +203,12 @@ jobs:
           IP='${{ steps.tf.outputs.ip }}'
           SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
           if [ '${{ inputs.mode }}' = 'restore' ]; then
-            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $BM25_NS"
+            # msmarco-1m has no snapshot until its first run: build it
+            # offline from the first 1M docs (minutes), which snapshots it.
+            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+              if [ $BM25_NS = msmarco-1m ] && ! aws s3 ls s3://decoverai-bench-corpus-cache/snapshots/msmarco-1m/pg-kosha.sql.gz >/dev/null 2>&1; then \
+                MAX_DOCS=1000000 ./build_and_import.sh msmarco-1m; \
+              else ./restore_namespace.sh $BM25_NS; fi"
           else
             $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
               ~/venv311/bin/python3 ../load_corpus.py --host http://127.0.0.1:8080 \
@@ -268,7 +283,7 @@ jobs:
           mkdir -p results
           scp -i "$RUNNER_TEMP/bench.pem" -r "ec2-user@$IP:/data/results-ci/*" results/ 2>/dev/null || true
           {
-            echo "## Benchmark results (${{ inputs.suite }}, ${{ inputs.mode }}, ${{ inputs.qps }} QPS, ${{ inputs.duration }}s phases)"
+            echo "## Benchmark results (${{ inputs.suite }}, ${{ inputs.mode }}, ${{ inputs.qps }} QPS, ${{ inputs.duration }}s phases, BM25 corpus $BM25_NS)"
             echo ""
             echo "| phase | p50 ms | p90 ms | p99 ms | requests | errors |"
             echo "|---|---|---|---|---|---|"
