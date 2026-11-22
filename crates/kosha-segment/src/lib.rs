@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod bitpack;
 pub mod doc_store_zstd;
 pub mod filter_columns;
 pub mod filter_eval;
@@ -366,10 +367,20 @@ impl SegmentWriter {
         self
     }
 
-    /// Override the inverted-index version (tests; production uses
-    /// `KOSHA_POSTINGS_WRITE_VERSION`).
-    #[cfg(test)]
-    fn with_postings_write_version(mut self, version: u32) -> Self {
+    /// Override the inverted-index version (tests, benches and mixed-version
+    /// fixtures in other crates; production uses
+    /// `KOSHA_POSTINGS_WRITE_VERSION`). Accepts 4, 5 or 6.
+    #[doc(hidden)]
+    pub fn with_postings_write_version(mut self, version: u32) -> Self {
+        assert!(
+            matches!(
+                version,
+                SPLIT_INVERTED_VERSION
+                    | SKIP_SPLIT_INVERTED_VERSION
+                    | BITPACKED_SKIP_SPLIT_INVERTED_VERSION
+            ),
+            "unsupported postings write version {version}"
+        );
         self.postings_write_version = version;
         self
     }
@@ -2713,6 +2724,13 @@ pub const SPLIT_INVERTED_VERSION: u32 = 4;
 /// Positions are decoded only by the full [`SegmentReader::postings`] path
 /// (phrase queries, legacy consumers).
 pub const SKIP_SPLIT_INVERTED_VERSION: u32 = 5;
+/// Experimental bit-packed skip-split version (#386): byte-for-byte the v5
+/// span layout and skip table, but every *full* 128-posting scoring block
+/// is frame-of-reference bit-packed (SIMD-BP128 layout, see
+/// [`bitpack`]) instead of varint pairs. A term's partial last block and
+/// the positions section stay v5 varints. Written only when
+/// `KOSHA_POSTINGS_WRITE_VERSION=6`; never the default.
+pub const BITPACKED_SKIP_SPLIT_INVERTED_VERSION: u32 = 6;
 
 /// THE canonical "is this a split-format inverted TOC?" predicate. Every
 /// site that dispatches on split-ness (the server's posting-blob hydration
@@ -2725,11 +2743,14 @@ pub fn is_split_inverted_version(version: u32) -> bool {
     version == FIXED_SPLIT_INVERTED_VERSION
         || version == SPLIT_INVERTED_VERSION
         || version == SKIP_SPLIT_INVERTED_VERSION
+        || version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION
 }
 
 /// The inverted-postings version the writer emits —
 /// `KOSHA_POSTINGS_WRITE_VERSION`, accepted values `4` (varint-delta
-/// split) and `5` (skip-split); default `5`. This is the mixed-fleet
+/// split), `5` (skip-split) and `6` (experimental bit-packed skip-split,
+/// #386 — opt-in only, readable only by builds that include #386); default
+/// `5`. This is the mixed-fleet
 /// rollout/rollback gate: a reader only understands versions up to its own
 /// build, so during a rolling deploy (writer upgraded before all query
 /// replicas) or ahead of a possible rollback, set `4` until the whole
@@ -2744,10 +2765,11 @@ fn postings_write_version() -> u32 {
         {
             Some("4") => SPLIT_INVERTED_VERSION,
             Some("5") | None => SKIP_SPLIT_INVERTED_VERSION,
+            Some("6") => BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
             Some(other) => {
                 eprintln!(
                     "WARN: KOSHA_POSTINGS_WRITE_VERSION={other} not supported \
-                     (accepted: 4, 5) — writing v{SKIP_SPLIT_INVERTED_VERSION}"
+                     (accepted: 4, 5, 6) — writing v{SKIP_SPLIT_INVERTED_VERSION}"
                 );
                 SKIP_SPLIT_INVERTED_VERSION
             }
@@ -3347,6 +3369,10 @@ struct TermEncoder {
     block_min_fl: u32,
     block_last: u32,
     prev_block_last: u32,
+    /// v6: the current block's doc ids / tfs, packed when it fills (a
+    /// partial last block is written as v5 varints on `finish`).
+    bp_docs: Box<[u32; SCORING_BLOCK_LEN]>,
+    bp_tfs: Box<[u32; SCORING_BLOCK_LEN]>,
 }
 
 impl TermEncoder {
@@ -3364,7 +3390,35 @@ impl TermEncoder {
             block_min_fl: u32::MAX,
             block_last: 0,
             prev_block_last: 0,
+            bp_docs: Box::new([0; SCORING_BLOCK_LEN]),
+            bp_tfs: Box::new([0; SCORING_BLOCK_LEN]),
         }
+    }
+
+    /// v6: emit the buffered block's scoring bytes — bit-packed when full,
+    /// v5 varint pairs for a term's partial last block — then its skip
+    /// entry. Bytes match [`write_postings_skip_split_v6`].
+    fn flush_bp_block(&mut self) {
+        let n = self.in_block;
+        self.block_start = self.scoring.len();
+        // `skip` is empty exactly while the term's first block is open.
+        let first = self.skip.is_empty();
+        if n == SCORING_BLOCK_LEN {
+            let next_min = if first {
+                0
+            } else {
+                self.prev_block_last.wrapping_add(1)
+            };
+            bitpack::encode_bp_block(&self.bp_docs, &self.bp_tfs, next_min, &mut self.scoring.mem);
+        } else {
+            let mut prev = if first { 0 } else { self.prev_block_last };
+            for i in 0..n {
+                put_var_u32(&mut self.scoring.mem, self.bp_docs[i].wrapping_sub(prev));
+                prev = self.bp_docs[i];
+                put_var_u32(&mut self.scoring.mem, self.bp_tfs[i]);
+            }
+        }
+        self.close_block();
     }
 
     fn push(
@@ -3390,14 +3444,20 @@ impl TermEncoder {
             return self.scoring.maybe_spill();
         }
 
+        let bitpacked = self.version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION;
         if self.in_block == 0 {
             self.block_start = self.scoring.len();
             self.block_max_tf = 0;
             self.block_min_fl = u32::MAX;
         }
-        put_var_u32(&mut self.scoring.mem, doc_id.wrapping_sub(self.prev_doc));
+        if bitpacked {
+            self.bp_docs[self.in_block] = doc_id;
+            self.bp_tfs[self.in_block] = term_frequency;
+        } else {
+            put_var_u32(&mut self.scoring.mem, doc_id.wrapping_sub(self.prev_doc));
+            put_var_u32(&mut self.scoring.mem, term_frequency);
+        }
         self.prev_doc = doc_id;
-        put_var_u32(&mut self.scoring.mem, term_frequency);
         self.block_max_tf = self.block_max_tf.max(term_frequency);
         if let Some(&field_length) = field_lengths.get(doc_id as usize) {
             self.block_min_fl = self.block_min_fl.min(field_length);
@@ -3405,7 +3465,11 @@ impl TermEncoder {
         self.block_last = doc_id;
         self.in_block += 1;
         if self.in_block == SCORING_BLOCK_LEN {
-            self.close_block();
+            if bitpacked {
+                self.flush_bp_block();
+            } else {
+                self.close_block();
+            }
         }
 
         let out = &mut self.positions.mem;
@@ -3447,7 +3511,11 @@ impl TermEncoder {
     /// Returns the span's length.
     fn finish(&mut self, out: &mut impl std::io::Write) -> Result<u64, KoshaError> {
         if self.in_block > 0 {
-            self.close_block();
+            if self.version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION {
+                self.flush_bp_block();
+            } else {
+                self.close_block();
+            }
         }
         let mut header = Vec::with_capacity(5);
         put_var_u32(&mut header, self.count);
@@ -4192,6 +4260,106 @@ pub fn posting_term_spans(
         .collect())
 }
 
+/// Byte breakdown of one skip-split (v5/v6) segment's postings, for the
+/// #386 bit-packing experiment. Diagnostics only: nothing on the query or
+/// write path calls it.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PostingsSectionStats {
+    /// The `inverted.idx` TOC version (5 or 6).
+    pub inverted_version: u32,
+    pub terms: u64,
+    pub postings: u64,
+    /// Postings in full [`SCORING_BLOCK_LEN`] blocks: the only ones v6
+    /// bit-packs.
+    pub postings_in_full_blocks: u64,
+    /// Per-term doc count + skip table, as stored.
+    pub skip_bytes: u64,
+    /// Scoring `(doc, tf)` sections, as stored.
+    pub scoring_bytes: u64,
+    /// Positions sections, as stored (the same codec in v5 and v6).
+    pub positions_bytes: u64,
+    /// The same scoring blocks re-encoded as v5 varints and as v6
+    /// (full blocks bit-packed, tails varint): a codec-only comparison on
+    /// identical postings, whatever the segment layout.
+    pub scoring_bytes_as_v5: u64,
+    pub scoring_bytes_as_v6: u64,
+    /// Total logical (decompressed) bytes of the `postings-*.bin` shards
+    /// the TOC references.
+    pub shard_logical_bytes: u64,
+}
+
+/// [`PostingsSectionStats`] for a split segment whose shards are all local
+/// (whole files, not span-cache fragments). Errors on v3/v4 segments, on a
+/// missing shard and on any span or block that does not decode.
+#[doc(hidden)]
+pub fn postings_section_stats(segment_dir: &Path) -> Result<PostingsSectionStats, KoshaError> {
+    let corrupt =
+        |msg: String| KoshaError::CorruptSegment(format!("{}: {msg}", segment_dir.display()));
+    let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
+    let index = SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None)?;
+    let inverted_version = u32::from_le_bytes(index.data[4..8].try_into().unwrap());
+    let Some(bitpacked) = index.encoding.skip_split() else {
+        return Err(corrupt(format!(
+            "inverted version {inverted_version} is not skip-split (v5/v6)"
+        )));
+    };
+    let mut by_blob: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+    for i in 0..index.term_count {
+        let (_, _, blob_id, off, len) = index.raw_entry(i);
+        by_blob.entry(blob_id).or_default().push((off, len));
+    }
+    let mut stats = PostingsSectionStats {
+        inverted_version,
+        terms: index.term_count as u64,
+        ..Default::default()
+    };
+    let mut block = Vec::with_capacity(SCORING_BLOCK_LEN);
+    let mut scratch = Vec::new();
+    for (blob_id, spans) in by_blob {
+        let blob = index
+            .read_posting_blob(blob_id)
+            .ok_or_else(|| corrupt(format!("shard {blob_id} missing or unreadable")))?;
+        stats.shard_logical_bytes += blob.len() as u64;
+        for (off, len) in spans {
+            let bytes = off
+                .checked_add(len)
+                .and_then(|end| blob.get(off..end))
+                .ok_or_else(|| corrupt(format!("span out of shard {blob_id} bounds")))?;
+            let parsed = BlockedTermPostings::parse_with(Arc::new(bytes.to_vec()), bitpacked)
+                .ok_or_else(|| corrupt(format!("span in shard {blob_id} does not parse")))?;
+            stats.postings += parsed.doc_count() as u64;
+            stats.skip_bytes += u64::from(parsed.scoring_base);
+            stats.scoring_bytes += u64::from(parsed.positions_base - parsed.scoring_base);
+            stats.positions_bytes += (bytes.len() - parsed.positions_base as usize) as u64;
+            for b in 0..parsed.block_count() {
+                if !parsed.read_block(b, &mut block) {
+                    return Err(corrupt(format!("block {b} in shard {blob_id} corrupt")));
+                }
+                let prev_doc = if b == 0 {
+                    0
+                } else {
+                    parsed.summary(b - 1).last_doc_id
+                };
+                scratch.clear();
+                bitpack::encode_varint_block(&block, prev_doc, &mut scratch);
+                stats.scoring_bytes_as_v5 += scratch.len() as u64;
+                if block.len() == SCORING_BLOCK_LEN {
+                    stats.postings_in_full_blocks += SCORING_BLOCK_LEN as u64;
+                    let docs: [u32; SCORING_BLOCK_LEN] = std::array::from_fn(|i| block[i].doc_id);
+                    let tfs: [u32; SCORING_BLOCK_LEN] =
+                        std::array::from_fn(|i| block[i].term_frequency);
+                    let next_min = if b == 0 { 0 } else { prev_doc.wrapping_add(1) };
+                    scratch.clear();
+                    bitpack::encode_bp_block(&docs, &tfs, next_min, &mut scratch);
+                }
+                stats.scoring_bytes_as_v6 += scratch.len() as u64;
+            }
+        }
+    }
+    Ok(stats)
+}
+
 pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
     let Some(header) = read_inverted_header(&segment_dir.join("inverted.idx")) else {
         return false;
@@ -4327,6 +4495,20 @@ enum SplitPostingsEncoding {
     /// v5: `[skip table][scoring (doc,tf)][positions]` per term span — see
     /// [`BlockedTermPostings`] and [`write_postings_skip_split`].
     SkipSplit,
+    /// v6: the v5 span with bit-packed full scoring blocks (#386).
+    BitPackedSkipSplit,
+}
+
+impl SplitPostingsEncoding {
+    /// `Some(bitpacked)` when term spans are skip-split (v5/v6) and so
+    /// parse into a [`BlockedTermPostings`]; `None` for v3/v4.
+    fn skip_split(self) -> Option<bool> {
+        match self {
+            Self::SkipSplit => Some(false),
+            Self::BitPackedSkipSplit => Some(true),
+            Self::Fixed32 | Self::VarintDelta => None,
+        }
+    }
 }
 
 /// Checked little-endian u32 read that advances the cursor.
@@ -4941,19 +5123,47 @@ pub struct ScoringBlockSummary {
 /// byte-identity tests compare against.
 #[cfg_attr(not(test), allow(dead_code))]
 fn write_postings_skip_split(out: &mut Vec<u8>, postings: &[Posting], field_lengths: &[u32]) {
+    write_postings_skip_split_inner(out, postings, field_lengths, false);
+}
+
+/// v6 ([`BITPACKED_SKIP_SPLIT_INVERTED_VERSION`]) reference writer: the v5
+/// span with every full 128-posting scoring block bit-packed (see
+/// [`bitpack`]); the byte-identity reference for [`TermEncoder`]'s v6 mode.
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_postings_skip_split_v6(out: &mut Vec<u8>, postings: &[Posting], field_lengths: &[u32]) {
+    write_postings_skip_split_inner(out, postings, field_lengths, true);
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn write_postings_skip_split_inner(
+    out: &mut Vec<u8>,
+    postings: &[Posting],
+    field_lengths: &[u32],
+    bitpacked: bool,
+) {
     put_var_u32(out, postings.len() as u32);
 
     let mut scoring: Vec<u8> = Vec::new();
     let mut prev_doc = 0u32;
     let mut prev_last = 0u32;
-    for block in postings.chunks(SCORING_BLOCK_LEN) {
+    for (b, block) in postings.chunks(SCORING_BLOCK_LEN).enumerate() {
         let start = scoring.len();
         let mut max_tf = 0u32;
         let mut min_fl = u32::MAX;
+        let pack = bitpacked && block.len() == SCORING_BLOCK_LEN;
+        if pack {
+            let docs: [u32; SCORING_BLOCK_LEN] = std::array::from_fn(|i| block[i].doc_id);
+            let tfs: [u32; SCORING_BLOCK_LEN] = std::array::from_fn(|i| block[i].term_frequency);
+            let next_min = if b == 0 { 0 } else { prev_doc.wrapping_add(1) };
+            bitpack::encode_bp_block(&docs, &tfs, next_min, &mut scoring);
+            prev_doc = block[SCORING_BLOCK_LEN - 1].doc_id;
+        }
         for posting in block {
-            put_var_u32(&mut scoring, posting.doc_id.wrapping_sub(prev_doc));
-            prev_doc = posting.doc_id;
-            put_var_u32(&mut scoring, posting.term_frequency);
+            if !pack {
+                put_var_u32(&mut scoring, posting.doc_id.wrapping_sub(prev_doc));
+                prev_doc = posting.doc_id;
+                put_var_u32(&mut scoring, posting.term_frequency);
+            }
             max_tf = max_tf.max(posting.term_frequency);
             if let Some(&field_length) = field_lengths.get(posting.doc_id as usize) {
                 min_fl = min_fl.min(field_length);
@@ -5003,12 +5213,25 @@ pub struct BlockedTermPostings {
     span: Arc<Vec<u8>>,
     scoring_base: u32,
     positions_base: u32,
+    /// v6: full blocks are bit-packed ([`bitpack`]); partial blocks and
+    /// all of v5 are varint pairs.
+    bitpacked: bool,
 }
 
 impl BlockedTermPostings {
     /// Parse a v5 term span. Validates the skip table against the span
     /// bounds once, so per-block decode can't walk off the buffer.
     fn parse(span: Arc<Vec<u8>>) -> Option<Self> {
+        Self::parse_with(span, false)
+    }
+
+    /// Parse a v6 ([`BITPACKED_SKIP_SPLIT_INVERTED_VERSION`]) term span —
+    /// same skip table as v5.
+    fn parse_v6(span: Arc<Vec<u8>>) -> Option<Self> {
+        Self::parse_with(span, true)
+    }
+
+    fn parse_with(span: Arc<Vec<u8>>, bitpacked: bool) -> Option<Self> {
         let mut buf: &[u8] = &span;
         let doc_count = take_var_u32(&mut buf)?;
         let n_blocks = (doc_count as usize).div_ceil(SCORING_BLOCK_LEN);
@@ -5043,6 +5266,7 @@ impl BlockedTermPostings {
             scoring_base: u32::try_from(scoring_base).ok()?,
             positions_base: u32::try_from(positions_base).ok()?,
             span,
+            bitpacked,
         })
     }
 
@@ -5082,29 +5306,29 @@ impl BlockedTermPostings {
         };
         let start = self.scoring_base as usize + summary.scoring_start as usize;
         let end = self.scoring_base as usize + summary.scoring_end as usize;
-        let Some(mut buf) = self.span.get(start..end) else {
+        let Some(buf) = self.span.get(start..end) else {
             return false;
         };
         let in_block = block_posting_count(self.doc_count as usize, block);
-        let mut prev_doc = if block == 0 {
+        let prev_doc = if block == 0 {
             0
         } else {
             self.blocks[block - 1].last_doc_id
         };
-        for _ in 0..in_block {
-            let Some(doc_delta) = take_var_u32(&mut buf) else {
-                return false;
+        let decoded = if self.bitpacked && in_block == SCORING_BLOCK_LEN {
+            let next_min = if block == 0 {
+                0
+            } else {
+                prev_doc.wrapping_add(1)
             };
-            let Some(term_frequency) = take_var_u32(&mut buf) else {
-                return false;
-            };
-            let doc_id = prev_doc.wrapping_add(doc_delta);
-            prev_doc = doc_id;
-            out.push(ScoringPosting {
-                doc_id,
-                term_frequency,
-            });
-        }
+            bitpack::decode_bp_block(buf, next_min, out)
+        } else {
+            bitpack::decode_varint_block(buf, in_block, prev_doc, out)
+        };
+        let Some(prev_doc) = decoded else {
+            out.clear();
+            return false;
+        };
         // The delta chain must land exactly on the skip entry's
         // last_doc_id. Without this check a flipped bit in any doc-delta
         // varint still "decodes" — every doc_id after it is shifted, BM25
@@ -5197,6 +5421,7 @@ impl SplitInvertedIndex {
             FIXED_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::Fixed32,
             SPLIT_INVERTED_VERSION => SplitPostingsEncoding::VarintDelta,
             SKIP_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::SkipSplit,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION => SplitPostingsEncoding::BitPackedSkipSplit,
             _ => return Err(corrupt(&format!("unsupported version {version}"))),
         };
         let term_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
@@ -5378,6 +5603,10 @@ impl SplitInvertedIndex {
             SplitPostingsEncoding::SkipSplit => {
                 BlockedTermPostings::parse(Arc::new(bytes.to_vec())).and_then(|b| b.decode_full())
             }
+            SplitPostingsEncoding::BitPackedSkipSplit => {
+                BlockedTermPostings::parse_v6(Arc::new(bytes.to_vec()))
+                    .and_then(|b| b.decode_full())
+            }
         }
     }
 
@@ -5403,9 +5632,7 @@ impl SplitInvertedIndex {
         &'a self,
         terms: &'a [String],
     ) -> Option<Vec<(&'a str, Arc<BlockedTermPostings>)>> {
-        if !matches!(self.encoding, SplitPostingsEncoding::SkipSplit) {
-            return None;
-        }
+        let bitpacked = self.encoding.skip_split()?;
         // Slot-assembled in requested-term order — same load-bearing
         // reason as `postings_for_terms`: the WAND leapfrog join sums
         // per-term float scores in whatever order this returns, and a
@@ -5445,7 +5672,9 @@ impl SplitInvertedIndex {
                     self.note_blob_read_failure();
                     continue;
                 };
-                let Some(parsed) = BlockedTermPostings::parse(Arc::new(bytes.into_owned())) else {
+                let Some(parsed) =
+                    BlockedTermPostings::parse_with(Arc::new(bytes.into_owned()), bitpacked)
+                else {
                     self.note_blob_read_failure();
                     continue;
                 };
@@ -12300,13 +12529,19 @@ mod bounded_build_tests {
                 .collect();
             terms.push(postings);
         }
-        for version in [SKIP_SPLIT_INVERTED_VERSION, SPLIT_INVERTED_VERSION] {
+        for version in [
+            SKIP_SPLIT_INVERTED_VERSION,
+            SPLIT_INVERTED_VERSION,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        ] {
             // A 64-byte limit spills nearly every posting.
             let mut encoder = TermEncoder::new(version, &dir, 64);
             for postings in &terms {
                 let mut expected = Vec::new();
                 if version == SPLIT_INVERTED_VERSION {
                     write_postings_varint_delta(&mut expected, postings);
+                } else if version == BITPACKED_SKIP_SPLIT_INVERTED_VERSION {
+                    write_postings_skip_split_v6(&mut expected, postings, &field_lengths);
                 } else {
                     write_postings_skip_split(&mut expected, postings, &field_lengths);
                 }
@@ -12327,6 +12562,250 @@ mod bounded_build_tests {
             assert!(encoder.spilled_total() > 0, "the spill files were used");
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Sum of all `postings-*.bin` shard bytes in a segment directory.
+    fn postings_bytes(dir: &Path) -> u64 {
+        files(dir)
+            .iter()
+            .filter(|(n, _)| n.starts_with("postings"))
+            .map(|(_, b)| b.len() as u64)
+            .sum()
+    }
+
+    /// v6 (#386): spilled and in-memory builds are byte-identical, the TOC
+    /// says v6, and every term reads back exactly as from a v5 build of the
+    /// same documents — full postings, skip table and every scoring block.
+    #[test]
+    fn v6_build_reads_back_identically_to_v5() {
+        let docs = corpus(3_000);
+        let (v5_dir, mem_dir, spill_dir) =
+            (scratch("v6ref5"), scratch("v6mem"), scratch("v6spill"));
+        build_version(&v5_dir, usize::MAX, &docs, SKIP_SPLIT_INVERTED_VERSION);
+        let (fa, _, _) = build_version(
+            &mem_dir,
+            usize::MAX,
+            &docs,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        );
+        let (fb, runs, _) = build_version(
+            &spill_dir,
+            64 * 1024,
+            &docs,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        );
+        assert!(runs >= 5, "expected several runs, got {runs}");
+        assert_same_files(&mem_dir, &spill_dir, &fa, &fb);
+        let toc = read_inverted_payload(fs::read(mem_dir.join("inverted.idx")).unwrap()).unwrap();
+        assert_eq!(
+            toc[4..8],
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION.to_le_bytes()
+        );
+
+        let r5 = SegmentReader::open(v5_dir.clone()).unwrap();
+        let r6 = SegmentReader::open(mem_dir.clone()).unwrap();
+        let terms: Vec<String> = r5.all_terms().iter().map(|t| t.to_string()).collect();
+        assert_eq!(
+            r6.all_terms(),
+            terms.iter().map(|t| t.as_str()).collect::<Vec<_>>()
+        );
+        assert!(r5.postings("stop").unwrap().len() >= 2 * SCORING_BLOCK_LEN);
+        for term in &terms {
+            assert_eq!(
+                &*r5.postings(term).unwrap(),
+                &*r6.postings(term).unwrap(),
+                "{term}"
+            );
+        }
+        let s5 = r5.scoring_postings_for_terms(&terms);
+        let s6 = r6.scoring_postings_for_terms(&terms);
+        assert_eq!(s5.len(), terms.len());
+        assert_eq!(s6.len(), terms.len());
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut full_blocks = 0;
+        for ((t5, p5), (t6, p6)) in s5.iter().zip(&s6) {
+            assert_eq!(t5, t6);
+            let (ScoringPostingsRef::Blocked(p5), ScoringPostingsRef::Blocked(p6)) = (p5, p6)
+            else {
+                panic!("v5 and v6 must both take the blocked scoring path");
+            };
+            assert!(!p5.bitpacked && p6.bitpacked);
+            assert_eq!(p5.doc_count(), p6.doc_count());
+            assert_eq!(p5.block_count(), p6.block_count());
+            for blk in 0..p5.block_count() {
+                let (x, y) = (p5.summary(blk), p6.summary(blk));
+                assert_eq!(
+                    (x.last_doc_id, x.max_tf, x.min_field_length),
+                    (y.last_doc_id, y.max_tf, y.min_field_length)
+                );
+                assert!(p5.read_block(blk, &mut a));
+                assert!(p6.read_block(blk, &mut b));
+                assert_eq!(a, b, "{t5} block {blk}");
+                full_blocks += usize::from(a.len() == SCORING_BLOCK_LEN);
+            }
+        }
+        assert!(full_blocks > 10, "corpus must exercise bit-packed blocks");
+        let (b5, b6) = (postings_bytes(&v5_dir), postings_bytes(&mem_dir));
+        assert!(
+            b6 < b5,
+            "v6 postings {b6} B should be smaller than v5 {b5} B"
+        );
+        for d in [v5_dir, mem_dir, spill_dir] {
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// Compaction across versions (#386): re-merging a v6 segment's raw
+    /// records with a v5 writer (rollback) and back to v6 (roll forward)
+    /// yields the same postings for every term.
+    #[test]
+    fn v6_segments_compact_to_v5_and_back() {
+        let docs = corpus(600);
+        let (v6_dir, v5_dir, back_dir) = (scratch("cmp6"), scratch("cmp5"), scratch("cmp6b"));
+        build_version(
+            &v6_dir,
+            usize::MAX,
+            &docs,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        );
+        let remerge_to = |src: &Path, dst: &Path, version: u32| {
+            let r = SegmentReader::open(src.to_path_buf()).unwrap();
+            let mut w = SegmentWriter::new(SegmentId("c".into()), dst.to_path_buf())
+                .with_postings_write_version(version);
+            for raw in r.iter_doc_records_raw() {
+                let raw = raw.unwrap();
+                w.add_document_with_vectors(raw.record.doc_id, raw.record.fields, raw.vectors);
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+        };
+        remerge_to(&v6_dir, &v5_dir, SKIP_SPLIT_INVERTED_VERSION);
+        remerge_to(&v5_dir, &back_dir, BITPACKED_SKIP_SPLIT_INVERTED_VERSION);
+        let toc = read_inverted_payload(fs::read(v5_dir.join("inverted.idx")).unwrap()).unwrap();
+        assert_eq!(toc[4..8], SKIP_SPLIT_INVERTED_VERSION.to_le_bytes());
+        let (r6, r5, rb) = (
+            SegmentReader::open(v6_dir.clone()).unwrap(),
+            SegmentReader::open(v5_dir.clone()).unwrap(),
+            SegmentReader::open(back_dir.clone()).unwrap(),
+        );
+        let terms = r6.all_terms();
+        assert_eq!(terms, r5.all_terms());
+        for term in terms {
+            let p = r6.postings(term).unwrap();
+            assert_eq!(&*p, &*r5.postings(term).unwrap(), "{term}");
+            assert_eq!(&*p, &*rb.postings(term).unwrap(), "{term}");
+        }
+        assert_eq!(postings_bytes(&v6_dir), postings_bytes(&back_dir));
+        for d in [v6_dir, v5_dir, back_dir] {
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// `postings_section_stats` (#386 diagnostics): on v5 and v6 builds of
+    /// the same documents, the stored scoring bytes equal the re-encoded
+    /// size in the segment's own codec, the re-encoded sizes agree across
+    /// the two builds, positions are byte-identical in size, and the
+    /// sections tile the shards exactly.
+    #[test]
+    fn postings_section_stats_match_both_codecs() {
+        let docs = corpus(1_500);
+        let (d5, d6) = (scratch("stats5"), scratch("stats6"));
+        build_version(&d5, usize::MAX, &docs, SKIP_SPLIT_INVERTED_VERSION);
+        build_version(
+            &d6,
+            usize::MAX,
+            &docs,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        );
+        let s5 = postings_section_stats(&d5).unwrap();
+        let s6 = postings_section_stats(&d6).unwrap();
+        assert_eq!(s5.inverted_version, SKIP_SPLIT_INVERTED_VERSION);
+        assert_eq!(s6.inverted_version, BITPACKED_SKIP_SPLIT_INVERTED_VERSION);
+        assert_eq!(s5.scoring_bytes, s5.scoring_bytes_as_v5);
+        assert_eq!(s6.scoring_bytes, s6.scoring_bytes_as_v6);
+        assert_eq!(s5.scoring_bytes_as_v5, s6.scoring_bytes_as_v5);
+        assert_eq!(s5.scoring_bytes_as_v6, s6.scoring_bytes_as_v6);
+        assert!(s6.scoring_bytes < s5.scoring_bytes);
+        assert_eq!(
+            (s5.terms, s5.postings, s5.postings_in_full_blocks),
+            (s6.terms, s6.postings, s6.postings_in_full_blocks)
+        );
+        assert!(s5.postings_in_full_blocks > 0);
+        assert_eq!(s5.positions_bytes, s6.positions_bytes);
+        for s in [&s5, &s6] {
+            assert_eq!(
+                s.skip_bytes + s.scoring_bytes + s.positions_bytes,
+                s.shard_logical_bytes
+            );
+        }
+        for d in [d5, d6] {
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// Default writer stays v5: v6 is opt-in only.
+    #[test]
+    fn default_writer_does_not_emit_v6() {
+        // The env gate is process-global; only assert when unset.
+        if std::env::var_os("KOSHA_POSTINGS_WRITE_VERSION").is_none() {
+            assert_eq!(postings_write_version(), SKIP_SPLIT_INVERTED_VERSION);
+        }
+        let dir = scratch("v6default");
+        let docs = corpus(50);
+        let mut w = SegmentWriter::new(SegmentId("seg".into()), dir.clone());
+        for (id, fields) in &docs {
+            w.add_document(id.clone(), fields.clone());
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let toc = read_inverted_payload(fs::read(dir.join("inverted.idx")).unwrap()).unwrap();
+        assert_eq!(
+            toc[4..8],
+            postings_write_version().to_le_bytes(),
+            "writer follows the env gate"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Corrupting any byte of a v6 span's bit-packed scoring section must
+    /// never yield a block whose decode succeeds with different doc ids.
+    #[test]
+    fn v6_corrupt_scoring_bytes_fail_closed() {
+        let postings: Vec<Posting> = (0..300u32)
+            .map(|i| Posting {
+                doc_id: i * 5 + (i % 3),
+                term_frequency: 1 + i % 4,
+                positions: vec![i % 7],
+            })
+            .collect();
+        let field_lengths = vec![10u32; 2_000];
+        let mut span = Vec::new();
+        write_postings_skip_split_v6(&mut span, &postings, &field_lengths);
+        let clean = BlockedTermPostings::parse_v6(Arc::new(span.clone())).unwrap();
+        let mut reference = Vec::new();
+        let mut expect = Vec::new();
+        for blk in 0..clean.block_count() {
+            assert!(clean.read_block(blk, &mut reference));
+            expect.push(reference.clone());
+        }
+        let scoring = clean.scoring_base as usize..clean.positions_base as usize;
+        let mut out = Vec::new();
+        for i in scoring {
+            for bit in [0u8, 3, 7] {
+                let mut bad = span.clone();
+                bad[i] ^= 1 << bit;
+                let Some(parsed) = BlockedTermPostings::parse_v6(Arc::new(bad)) else {
+                    continue;
+                };
+                for (blk, want) in expect.iter().enumerate() {
+                    if parsed.read_block(blk, &mut out) {
+                        // A flipped tf bit is undetectable (as in v5) and
+                        // only changes a score; doc ids must never move.
+                        let got: Vec<u32> = out.iter().map(|p| p.doc_id).collect();
+                        let w: Vec<u32> = want.iter().map(|p| p.doc_id).collect();
+                        assert_eq!(got, w, "byte {i} bit {bit} block {blk}");
+                    }
+                }
+            }
+        }
     }
 
     fn assert_same_files(a_dir: &Path, b_dir: &Path, fa: &Footer, fb: &Footer) {

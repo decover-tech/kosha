@@ -475,7 +475,7 @@ before rolling back, until every reader understands the newer one. Read once in
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
-| `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written: `4` or `5` | `5` | version |
+| `KOSHA_POSTINGS_WRITE_VERSION` | Inverted-postings version written: `4`, `5` or `6`. `6` is experimental (#386): v5 with bit-packed 128-posting scoring blocks, readable only by builds that include #386, so set it only once every query pod does | `5` | version |
 | `KOSHA_VECTOR_WRITE_VERSION` | Vector-index version written: `1` (flat), `2`, `3` or `4` (posting-based) | `4` | version |
 | `KOSHA_VECTOR_STORE` | Where vector field values are stored: `sidecar` (`doc_vectors.bin`) or `inline` (in `doc_store.bin`). Set `inline` before rolling back past #243 | `sidecar` | enum |
 | `KOSHA_DOC_STORE_COMPRESSION` | Experimental (research #388). `zstd`: new segments store each `doc_store.bin` record as its own zstd frame with a per-segment trained dictionary (kept in the `doc_store.offsets` trailer), and vectors always go to `doc_vectors.bin`. `auto`: fresh segments raw, merges keep their inputs' format. `none`: always raw (compact with this before rolling back past #388; older readers cannot read compressed segments) | `auto` | enum |

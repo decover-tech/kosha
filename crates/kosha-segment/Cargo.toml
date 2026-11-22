@@ -39,3 +39,7 @@ harness = false
 [[bench]]
 name = "doc_store_zstd"
 harness = false
+
+[[bench]]
+name = "postings_codec"
+harness = false

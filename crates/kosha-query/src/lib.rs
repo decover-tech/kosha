@@ -13854,6 +13854,101 @@ mod tests {
         }
     }
 
+    /// Two-segment namespace whose segments are written at the given
+    /// inverted-postings versions (#386): same documents as
+    /// `mk_or_corpus`, split across `s1` (even docs) and `s2` (odd docs).
+    fn mk_versioned_namespace(dir: &std::path::Path, ns: &str, versions: [u32; 2]) -> Manifest {
+        let mut manifest = mk_or_corpus(dir, "__unused", 0);
+        manifest.segments.clear();
+        let _ = std::fs::remove_dir_all(dir.join("__unused"));
+        for (s, version) in versions.into_iter().enumerate() {
+            let id = SegmentId(format!("s{}", s + 1));
+            let mut w = SegmentWriter::new(id.clone(), dir.join(ns).join(&id.0))
+                .with_postings_write_version(version);
+            let mut count = 0;
+            for i in (s..1_200).step_by(2) {
+                let mut content = String::new();
+                if i % 3 == 0 {
+                    content.push_str(&"solar ".repeat(i % 6 + 1));
+                }
+                if i % 4 == 0 {
+                    content.push_str(&"lunar ".repeat(i % 5 + 1));
+                }
+                if i % 7 == 0 {
+                    content.push_str("eclipse solar ");
+                }
+                content.push_str("filler ");
+                content.push_str(&"pad ".repeat(i % 11));
+                w.add_document(
+                    DocumentId(format!("doc-{i:04}")),
+                    vec![Field::text("content", content)],
+                );
+                count += 1;
+            }
+            w.finalize(Bm25Params::default()).unwrap();
+            manifest.segments.push(ManifestEntry {
+                segment_id: id,
+                doc_count: count,
+            });
+        }
+        manifest
+    }
+
+    /// Mixed v5/v6 namespace (#386): a namespace whose segments differ only
+    /// in postings version returns exactly the all-v5 namespace's hits,
+    /// totals and scores — AND/WAND, OR/WAND, single-term and phrase.
+    #[test]
+    fn mixed_v5_v6_namespace_matches_all_v5() {
+        use kosha_segment::{
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION as V6, SKIP_SPLIT_INVERTED_VERSION as V5,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-mixed-v5-v6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let base = NamespaceId("v5v5".into());
+        let base_manifest = mk_versioned_namespace(&dir, &base.0, [V5, V5]);
+        let searcher = Searcher::new(dir.clone());
+        let mut queries = vec![
+            mk_query("solar", 20),
+            mk_query("solar lunar", 20),
+            mk_query_or("solar lunar eclipse", 20),
+            mk_query_or("filler pad", 50),
+            force_legacy(mk_query_or("solar lunar", 20)),
+        ];
+        let mut phrase = mk_query("", 20);
+        phrase.match_phrase = Some(
+            serde_json::from_value(
+                serde_json::json!({"field": "content", "phrase": "eclipse solar"}),
+            )
+            .unwrap(),
+        );
+        queries.push(phrase);
+        for (name, versions) in [("v5v6", [V5, V6]), ("v6v5", [V6, V5]), ("v6v6", [V6, V6])] {
+            let ns = NamespaceId(name.into());
+            let manifest = mk_versioned_namespace(&dir, name, versions);
+            for q in &queries {
+                let want = searcher.search(&base, &base_manifest, q, None).unwrap();
+                let got = searcher.search(&ns, &manifest, q, None).unwrap();
+                assert!(
+                    want.total_hits > 0,
+                    "{name}: query must match: {:?}",
+                    q.query_text
+                );
+                assert_eq!(got.total_hits, want.total_hits, "{name} {:?}", q.query_text);
+                assert_eq!(page_ids(&got), page_ids(&want), "{name} {:?}", q.query_text);
+                for (g, w) in got.results.iter().zip(&want.results) {
+                    assert_eq!(
+                        g.score.to_bits(),
+                        w.score.to_bits(),
+                        "{name} {}",
+                        g.doc_id.0
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn or_query_matches_legacy_path_union_ranking_and_scores() {
         // Same contract as the AND parity test above, but for `operator:
