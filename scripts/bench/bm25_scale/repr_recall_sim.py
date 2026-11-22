@@ -8,16 +8,32 @@ that shortlist with the full-precision vector, how much of the exact top-k
 would survive?
 
 It is a brute-force simulation over one in-memory sample of the corpus, so
-it isolates the *representation* loss from everything Kosha's ANN index adds
-(IVF probing, per-segment budgets, quantized postings). Kosha's own recall on
-the same representation can only be lower or equal at equal shortlist size;
-measure that on the bench VM (recall_check.py) once a representation is
-worth building.
+it isolates the *representation* loss from IVF probing. It is NOT a bound on
+Kosha's recall in either direction:
+
+  * Kosha does not rescore one global top-R list. Each segment rescores its
+    own best k * KOSHA_VECTOR_RESCORE_FACTOR probe candidates, and the
+    segments' results are merged. A true neighbour only has to rank in its
+    own segment's top R. --segments N models that: the sample is split into
+    N contiguous shards, each shard keeps its own top R by the approximate
+    score, and the union (N * R candidates) is rescored. With --segments 1
+    (the default) R is one global shortlist and does not map to
+    KOSHA_VECTOR_RESCORE_FACTOR.
+  * IVF probing loses neighbours the simulator never misses; a 10M corpus
+    has denser neighbourhoods than a 100k sample; RaBitQ columns widen
+    their shortlist by an error bound. None of that is modelled.
+
+Measure the engine on the bench VM (recall_check.py) once a representation
+is worth building. Report the sample size and --segments with every number.
 
 Ground truth is exact cosine top-k over the same sample with the full
-vectors (dot product of unit vectors, matching Kosha post-#143). A smaller
-sample is an easier corpus: recall here is an upper bound on what the same
-representation gets over 10M docs. Report the sample size with every number.
+vectors (dot product of unit vectors, matching Kosha post-#143).
+
+Bytes: "B/vec" is the search representation only (what vector.idx / the
+probe would hold per entry, ignoring the 4-byte doc id and any posting
+replication). Kosha also keeps the full f32 vector in doc_vectors.bin for
+rescoring, so "total x" compares search repr + 4*D rescore bytes with
+today's f32 layout (4*D in vector.idx + 4*D in doc_vectors.bin).
 
 Representations (bytes/vector at dim D in parentheses):
   full                  exact baseline                         (4*D)
@@ -40,7 +56,8 @@ Usage (needs numpy only):
     python3 repr_recall_sim.py --docs /data/corpus/emb-00000.f32 \\
         --docs /data/corpus/emb-00001.f32 --docs-limit 200000 \\
         --queries /data/queries_emb.f32 --dim 1024 --k 10 \\
-        --truncate 512,256,128 --shortlist 10,40,100,200 --out sim.json
+        --truncate 512,256,128 --shortlist 10,40,100,200 \\
+        --segments 1,2,10 --out sim.json
 """
 
 import argparse
@@ -111,6 +128,12 @@ def main(argv=None):
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--truncate", default="512,256,128", help="prefix lengths to test (comma list, empty = none)")
     ap.add_argument("--shortlist", default="10,40,100,200", help="candidates R rescored with full vectors (comma list)")
+    ap.add_argument(
+        "--segments",
+        default="1",
+        help="comma list of shard counts N; R is then the shortlist per shard, "
+        "as in Kosha's per-segment rescore (1 = one global shortlist)",
+    )
     ap.add_argument("--batch", type=int, default=128, help="queries per matmul batch")
     ap.add_argument("--out", help="write results as JSON here")
     args = ap.parse_args(argv)
@@ -132,6 +155,11 @@ def main(argv=None):
     shortlists = sorted(set(parse_ints(args.shortlist)) | {args.k})
     rmax = max(shortlists)
     k = args.k
+    seg_counts = sorted({c for c in parse_ints(args.segments) if 0 < c <= n})
+    if not seg_counts:
+        raise SystemExit("--segments needs at least one N with 0 < N <= docs")
+    # Contiguous shards, like segments in ingest order.
+    bounds = {c: np.linspace(0, n, c + 1).astype(int) for c in seg_counts}
     print(f"loaded {n} docs x {dim} dims, {queries.shape[0]} queries in {time.time() - t0:.1f}s", file=sys.stderr)
 
     # Each representation: (name, bytes/vector, doc matrix, query transform, per-doc scale or None).
@@ -147,7 +175,7 @@ def main(argv=None):
         reps.append((f"trunc{d}", 4 * d, td, lambda q, d=d: unit(q[:, :d]), None))
         reps.append((f"trunc{d}-bin", d // 8, sign_pm1(td), lambda q, d=d: sign_pm1(q[:, :d]), None))
 
-    hits = {name: {r: 0 for r in shortlists} for name, *_ in reps}
+    hits = {name: {c: {r: 0 for r in shortlists} for c in seg_counts} for name, *_ in reps}
     total = 0
     for s in range(0, queries.shape[0], args.batch):
         q = queries[s : s + args.batch]
@@ -157,15 +185,18 @@ def main(argv=None):
             approx = qf(q) @ mat.T
             if sc is not None:
                 approx *= sc[None, :]
-            short = topk_idx(approx, rmax)  # best-first, so a prefix is the top-R
-            for r in shortlists:
-                cand = short[:, :r]
-                # Rescore the shortlist with the exact full-dim score.
-                resc = np.take_along_axis(exact, cand, axis=1)
-                kk = min(k, r)
-                best = np.take_along_axis(cand, np.argsort(-resc, axis=1)[:, :kk], axis=1)
-                for row in range(q.shape[0]):
-                    hits[name][r] += len(set(best[row].tolist()) & set(truth[row].tolist()))
+            for segs in seg_counts:
+                b = bounds[segs]
+                # Per shard, best-first, so a prefix is that shard's top-R.
+                shard_short = [topk_idx(approx[:, b[i] : b[i + 1]], rmax) + b[i] for i in range(segs)]
+                for r in shortlists:
+                    cand = np.concatenate([sh[:, :r] for sh in shard_short], axis=1)
+                    # Rescore the union of the shortlists with the exact full-dim score.
+                    resc = np.take_along_axis(exact, cand, axis=1)
+                    kk = min(k, cand.shape[1])
+                    best = np.take_along_axis(cand, np.argsort(-resc, axis=1)[:, :kk], axis=1)
+                    for row in range(q.shape[0]):
+                        hits[name][segs][r] += len(set(best[row].tolist()) & set(truth[row].tolist()))
         total += q.shape[0] * k
         print(f"  {s + q.shape[0]}/{queries.shape[0]} queries ({time.time() - t0:.0f}s)", file=sys.stderr)
 
@@ -174,23 +205,37 @@ def main(argv=None):
         "dim": dim,
         "queries": int(queries.shape[0]),
         "k": k,
-        "note": "brute-force over an in-memory sample; recall is an upper bound for an ANN index over a larger corpus",
+        "segments": seg_counts,
+        "note": (
+            "brute-force over an in-memory sample; not a bound on Kosha recall. "
+            "R is per shard when segments > 1 (Kosha rescores k*rescore_factor per segment); "
+            "bytes_per_vector is the search representation only, "
+            "total_bytes_per_doc adds the 4*dim f32 rescore store"
+        ),
         "representations": [
             {
                 "name": name,
                 "bytes_per_vector": b,
                 "size_vs_f32": round(4 * dim / b, 2),
-                "recall_at_k_after_rescore": {str(r): round(hits[name][r] / total, 4) for r in shortlists},
+                "total_bytes_per_doc": b + 4 * dim,
+                "total_vs_today": round(8 * dim / (b + 4 * dim), 2),
+                # Keyed by shard count, then by R (per shard).
+                "recall_at_k_after_rescore": {
+                    str(c): {str(r): round(hits[name][c][r] / total, 4) for r in shortlists} for c in seg_counts
+                },
             }
             for name, b, *_ in reps
         ],
     }
-    hdr = f"{'repr':<14}{'B/vec':>7}{'x smaller':>10}" + "".join(f"{'R=' + str(r):>9}" for r in shortlists)
-    print(f"recall@{k} after full-dim rescore of top-R; {n} docs, {queries.shape[0]} queries, dim {dim}")
-    print(hdr)
-    for rep in result["representations"]:
-        cells = "".join(f"{rep['recall_at_k_after_rescore'][str(r)]:>9.4f}" for r in shortlists)
-        print(f"{rep['name']:<14}{rep['bytes_per_vector']:>7}{rep['size_vs_f32']:>10}{cells}")
+    print(f"recall@{k} after full-dim rescore; {n} docs, {queries.shape[0]} queries, dim {dim}")
+    print("B/vec = search repr only; total x = vs today's 4*D vector.idx + 4*D doc_vectors.bin")
+    for c in seg_counts:
+        scope = "one global top-R" if c == 1 else f"{c} shards of ~{n // c} docs, top-R per shard"
+        print(f"segments={c} ({scope})")
+        print(f"{'repr':<14}{'B/vec':>7}{'x smaller':>10}{'total x':>9}" + "".join(f"{'R=' + str(r):>9}" for r in shortlists))
+        for rep in result["representations"]:
+            cells = "".join(f"{rep['recall_at_k_after_rescore'][str(c)][str(r)]:>9.4f}" for r in shortlists)
+            print(f"{rep['name']:<14}{rep['bytes_per_vector']:>7}{rep['size_vs_f32']:>10}{rep['total_vs_today']:>9}{cells}")
     if args.out:
         with open(args.out, "w") as f:
             json.dump(result, f, indent=2)

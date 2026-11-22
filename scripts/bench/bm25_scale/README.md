@@ -309,17 +309,29 @@ repeats), and shows the tail by minute and by requests in flight.
 `repr_recall_sim.py` asks, with no server and no ANN index, how much
 recall@k survives when the shortlist is picked with a smaller
 representation (a d-dim prefix, int8 codes, or sign bits) and then
-rescored with the full vector. It is brute force over an in-memory sample,
-so its numbers are an upper bound for the same representation inside
-Kosha over a larger corpus. It reads the same `emb-*.f32` /
+rescored with the full vector. It is brute force over an in-memory sample
+and is **not** a bound on Kosha's recall in either direction: it has no
+IVF probing, and by default R is one global shortlist, while Kosha
+rescores `k * KOSHA_VECTOR_RESCORE_FACTOR` candidates per segment.
+`--segments N` splits the sample into N shards and takes R per shard,
+which is closer to the engine; the mapping to the factor is still not
+measured. It prints bytes per vector for the search representation and
+"total x", which adds the f32 rescore vector in `doc_vectors.bin`
+(capped at 2x while that store is f32). It reads the same `emb-*.f32` /
 `queries_emb.f32` files as `recall_check.py`, or `.npy`:
 
 ```bash
 python3 repr_recall_sim.py --docs /data/corpus/emb-00000.f32 \
     --docs /data/corpus/emb-00001.f32 --docs-limit 200000 \
     --queries /data/queries_emb.f32 --dim 1024 \
-    --truncate 512,256,128 --shortlist 10,40,100,200 --out sim.json
+    --truncate 512,256,128 --shortlist 10,40,100,200 \
+    --segments 1,4 --out sim.json
 ```
+
+`fetch_te3s_dbpedia.py` (needs `pyarrow` and `huggingface_hub`) writes
+the `text-embedding-3-small` sample used in the doc: 1000 held-out
+DBpedia documents as queries (seed 383) and the other 99,000 as the
+corpus. Those are doc-to-doc neighbours, not queries over passages.
 
 Memory is roughly 5x the f32 sample (a copy per representation), so
 about 4 GB at 100k x 1024. Results and caveats are in
