@@ -5587,6 +5587,12 @@ fn main() {
         }
     }
 
+    // TLS to Postgres (#343): under KOSHA_INTERNAL_TLS=required a
+    // DATABASE_URL that does not force TLS stops the pod here, before the
+    // first connection (the API-key load just below).
+    if let Err(message) = internal_tls::check_database_url_env() {
+        fatal(&message);
+    }
     // Load keys and fail closed before anything else, so a misconfigured
     // pod exits instead of serving unauthenticated traffic.
     auth::init_global();

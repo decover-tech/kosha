@@ -26,6 +26,11 @@
 //!   every pod. Unset, the certificate must match the URL host (an IP SAN
 //!   for peer fetches).
 //!
+//! The Postgres control plane is the other internal hop. Its TLS is set in
+//! `DATABASE_URL` itself (`sslmode=`, `sslrootcert=`), not here, but
+//! [`InternalTls::check_database_url`] holds it to the same mode: `required`
+//! refuses a URL that does not force TLS.
+//!
 //! Configuration fails closed: an unknown mode, a missing or unreadable
 //! file, half a client identity, or a TLS setting with the mode `off` stops
 //! the pod at startup instead of silently falling back to plain HTTP.
@@ -245,6 +250,57 @@ impl InternalTls {
         }
     }
 
+    /// Validate the Postgres `DATABASE_URL` against the mode, like
+    /// [`InternalTls::check_ingest_host`]: `required` refuses a URL whose
+    /// `sslmode` is not `require`, `verify-ca` or `verify-full`; `on` allows
+    /// it with a warning (`Ok(Some(warning))`); `off` accepts anything.
+    ///
+    /// `pg_ssl_mode` is the `PGSSLMODE` environment variable, which the
+    /// Postgres client uses when the URL names no `sslmode`. The URL holds
+    /// credentials, so no returned message quotes any part of it except a
+    /// recognized `sslmode` value.
+    pub fn check_database_url(
+        &self,
+        url: &str,
+        pg_ssl_mode: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        if self.mode == Mode::Off {
+            return Ok(None);
+        }
+        let (ssl_mode, source) = match database_url_ssl_mode(url) {
+            Some(mode) => (Some(mode), "DATABASE_URL sslmode"),
+            None => (
+                pg_ssl_mode
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .filter(|v| !v.is_empty()),
+                "PGSSLMODE",
+            ),
+        };
+        let problem = match ssl_mode.as_deref() {
+            Some("require" | "verify-ca" | "verify-full") => return Ok(None),
+            // The client's default is `prefer`, which falls back to
+            // plaintext when the server (or anything in between) declines.
+            None => "DATABASE_URL has no sslmode, so the Postgres connection may fall back to \
+                     plaintext"
+                .to_string(),
+            Some(mode @ ("disable" | "allow" | "prefer")) => {
+                format!("{source}={mode} does not force TLS to Postgres")
+            }
+            // Never echo an unrecognized value: a malformed URL could put
+            // anything there.
+            Some(_) => format!("{source} is not a known sslmode"),
+        };
+        let fix =
+            "set sslmode=verify-full (with sslrootcert=), verify-ca or require in DATABASE_URL";
+        match self.mode {
+            Mode::Required => Err(format!("{problem}; {MODE_ENV}=required: {fix}")),
+            _ => Ok(Some(format!(
+                "{problem} although {MODE_ENV}={}; {fix}",
+                self.mode.as_str()
+            ))),
+        }
+    }
+
     /// A blocking reqwest client builder for internal traffic: the shared
     /// idle-pool setting and, unless `off`, the internal CA (only), the
     /// optional client identity and the server-name pin.
@@ -282,6 +338,34 @@ pub(crate) fn global() -> &'static InternalTls {
             std::process::exit(1);
         }
     })
+}
+
+/// [`InternalTls::check_database_url`] for the process environment: a no-op
+/// without `DATABASE_URL`, a `WARN:` line for a warning, `Err` when the pod
+/// (or the `migrate` / `migrate-namespace` command) must not connect. Call it
+/// before the first Postgres connection.
+pub(crate) fn check_database_url_env() -> Result<(), String> {
+    let Some(url) = std::env::var("DATABASE_URL").ok().filter(|u| !u.is_empty()) else {
+        return Ok(());
+    };
+    let pg_ssl_mode = std::env::var("PGSSLMODE").ok();
+    if let Some(warning) = global().check_database_url(&url, pg_ssl_mode.as_deref())? {
+        eprintln!("WARN: {warning}");
+    }
+    Ok(())
+}
+
+/// The `sslmode` (or `ssl-mode`) query parameter of a Postgres URL,
+/// lowercased; the last one wins, as in the client's own parser.
+fn database_url_ssl_mode(url: &str) -> Option<String> {
+    let (_, query) = url.split_once('?')?;
+    let query = query.split('#').next().unwrap_or(query);
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(key, _)| matches!(*key, "sslmode" | "ssl-mode"))
+        .map(|(_, value)| value.trim().to_ascii_lowercase())
+        .next_back()
 }
 
 /// Checks the chain against the internal CA as usual, but matches the
@@ -543,5 +627,74 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(on.check_ingest_host("https://ingest"), Ok(None));
+    }
+
+    #[test]
+    fn required_mode_refuses_a_database_url_that_does_not_force_tls() {
+        let pki = test_pki::generate("database-url");
+        let ca = pki.ca.to_str().unwrap();
+        let server = pki.server_cert.to_str().unwrap();
+        let required = parse(&[
+            (MODE_ENV, "required"),
+            (CA_PATH_ENV, ca),
+            (SERVER_CERT_ENV, server),
+        ])
+        .unwrap();
+        let on = parse(&[(MODE_ENV, "on"), (CA_PATH_ENV, ca)]).unwrap();
+        let off = parse(&[]).unwrap();
+
+        const BASE: &str = "postgres://kosha:s3cr3t-pw@pg.internal:5432/kosha";
+        let url = |query: &str| format!("{BASE}{query}");
+        let plaintext = [
+            "",
+            "?sslmode=prefer",
+            "?sslmode=disable",
+            "?sslmode=allow",
+            "?application_name=kosha",
+            // The last sslmode wins.
+            "?sslmode=verify-full&sslmode=disable",
+            "?sslmode=s3cr3t-pw",
+        ];
+        let encrypted = [
+            "?sslmode=require",
+            "?sslmode=verify-ca",
+            "?sslmode=verify-full",
+            "?sslmode=VERIFY-FULL&sslrootcert=/etc/kosha/pg/ca.crt",
+            "?application_name=kosha&ssl-mode=verify-full",
+            "?sslmode=disable&sslmode=require",
+        ];
+        for query in plaintext {
+            let url = url(query);
+            let err = required.check_database_url(&url, None).unwrap_err();
+            assert!(err.contains("sslmode"), "{query}: {err}");
+            let warning = on.check_database_url(&url, None).unwrap().unwrap();
+            assert_eq!(off.check_database_url(&url, None), Ok(None));
+            // The URL holds credentials: nothing of it may reach a log.
+            for message in [err, warning] {
+                for secret in ["s3cr3t-pw", "kosha:", "pg.internal"] {
+                    assert!(!message.contains(secret), "{query}: {message}");
+                }
+            }
+        }
+        for query in encrypted {
+            let url = url(query);
+            for tls in [&required, &on, &off] {
+                assert_eq!(tls.check_database_url(&url, None), Ok(None), "{query}");
+            }
+        }
+
+        // PGSSLMODE applies only when the URL names no sslmode.
+        assert_eq!(
+            required.check_database_url(BASE, Some("verify-full")),
+            Ok(None)
+        );
+        assert!(required.check_database_url(BASE, Some("prefer")).is_err());
+        assert!(required
+            .check_database_url(&url("?sslmode=prefer"), Some("verify-full"))
+            .is_err());
+        assert_eq!(
+            required.check_database_url(&url("?sslmode=require"), Some("disable")),
+            Ok(None)
+        );
     }
 }
