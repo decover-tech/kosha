@@ -64,7 +64,7 @@ jobs:
         run: |
           $COMPOSE exec -T postgres createdb -U kosha kosha_cas_test
           KOSHA_TEST_DATABASE_URL=postgres://kosha:kosha-dev@localhost:5432/kosha_cas_test \
-            cargo test --locked -p kosha-control --features postgres --test postgres_cas --test orgs -- --ignored
+            cargo test --locked -p kosha-control --features postgres --test postgres_cas --test orgs --test postgres_usage --test postgres_billing -- --ignored
 
       - name: Postgres API key tests
         if: ${{ !cancelled() }}

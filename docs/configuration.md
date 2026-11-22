@@ -373,6 +373,65 @@ loses the events appended since the last flush.
 | `KOSHA_USAGE_FLUSH_MS` | How often the spool is delivered to the store. Minimum 100 | `5000` | milliseconds |
 | `KOSHA_USAGE_SNAPSHOT_TICK_MS` | How often a writer checks for namespaces without a `stored_bytes` snapshot this hour (one object listing per namespace per hour). Minimum 1000 | `300000` | milliseconds |
 
+### Reconciling stored bytes with object storage
+
+`GET /v1/admin/usage/reconcile` (admin key, on a pod with metering on) and the one-shot
+`kosha-server reconcile-usage` compare each namespace's latest `stored_bytes` snapshot with what
+object storage holds under the namespace's prefix: the S3 bucket, or `KOSHA_DATA_DIR` on a node
+without one. They read listings only (one LIST page at a time, never an object body) and change
+nothing.
+
+A snapshot counts every object under `<namespace>/<segment>/` for the segments the manifest lists
+and the namespace owns, shards added up under their root. The report puts each object under a
+namespace's prefix in one class, so that the comparison is between like numbers:
+
+- `referenced_bytes`: under a segment the manifest lists and owns. This is what is compared with
+  `snapshot_bytes`. It includes superseded deletion bitmaps inside such a segment
+  (`superseded_deletion_bytes`), which the snapshot also counts until segment GC removes them.
+- `referenced_unmetered_bytes`: referenced by a branch's manifest and counted by no snapshot: a
+  segment a branch still lists after the namespace that wrote it compacted it away, and a deletion
+  bitmap a branch wrote for a segment it inherits.
+- `orphaned_bytes`: referenced by no manifest. `retired_bytes` (a publish recorded dropping the
+  segment; GC deletes it after `KOSHA_GC_GRACE`), `untracked_bytes` (no manifest ever listed it: a
+  crashed flush, an upload not published yet) and `stray_bytes` (a file directly under the prefix).
+
+`status` per namespace: `match` or `mismatch` (the difference against the tolerance),
+`storage_without_snapshot` (objects, and no snapshot inside the window: storage nobody is metered
+for), `snapshot_without_storage`, `deleted` (a deleted namespace, #347, whose prefix is empty; its
+last snapshots are still in the window), `deleted_with_storage` (objects remain under a deleted
+namespace's prefix; `deletion` carries the record), `snapshot_after_deletion` (a deleted namespace
+snapshotted again in an hour that began after its deletion: a writer is still metering it) and
+`empty`. Everything but `match`, `deleted` and `empty` is out of tolerance. `control_plane` says
+whether the namespace is `live`, `deleted` (a deletion record covers it) or `unknown`. Deleting a
+branch and `migrate-namespace` write no deletion record, so such a namespace reads as `unknown`
+with `snapshot_without_storage` until its last snapshot is older than the window. Prefixes the control
+plane does not list are found by listing the storage root and each tenant's directory; at most
+1,000 of them get a row. Top-level names starting with `_` or `.` that are not namespaces (`_wal`,
+`_usage`, `_warmset`) are named in `skipped_prefixes` and not listed.
+
+A difference is within tolerance when it is at most the larger of `tolerance` x the larger of the
+two numbers and `tolerance_bytes`. The snapshot of an hour is taken in the first minutes of that
+hour and the listing is taken now, so a namespace that was written to or compacted in between
+differs by that much: run the job a few minutes past the hour, or allow for an hour of growth. On
+a node with S3, a segment flushed but not uploaded yet is in the snapshot (from local disk) and
+not in the bucket.
+
+The command prints the report as one JSON document on stdout and exits `0` when every namespace is
+within tolerance, `1` when one is not, `2` when the run could not finish (nothing was compared).
+Flags: `--tenant <id>`, `--tolerance <fraction>`, `--tolerance-bytes <n>`,
+`--max-snapshot-age <duration>`, `--pretty`; the route takes the same names as query parameters
+(`?tenant=&tolerance=&tolerance_bytes=&max_snapshot_age=`) and answers `200` with
+`"within_tolerance": false` rather than an error status. The command needs a binary built with
+**postgres** and `DATABASE_URL` (it reads namespaces, deletion records and usage events there),
+and the same S3 variables as the server. `k8s/base/cronjob-usage-reconcile.yaml` runs it daily,
+shipped suspended.
+
+| Variable | Purpose | Default | Units |
+| --- | --- | --- | --- |
+| `KOSHA_USAGE_RECONCILE_TOLERANCE` | Allowed difference between a snapshot and the referenced bytes, as a fraction of the larger of the two. A value that is not a number between 0 and 1 fails the run | `0.05` | fraction |
+| `KOSHA_USAGE_RECONCILE_TOLERANCE_BYTES` | Allowed difference in bytes whatever the fraction allows, so small namespaces do not fail on one flush | `1048576` | bytes |
+| `KOSHA_USAGE_RECONCILE_MAX_SNAPSHOT_AGE` | A snapshot older than this does not count: the namespace is reported as `storage_without_snapshot`. At least one hour | `3h` | duration |
+
 ## Billing
 
 Off by default (#349). With `KOSHA_BILLING=on` a pod loads a plan catalog, refuses requests of
