@@ -210,8 +210,9 @@ overlays; turning them on is a per-cluster step.
 component. It sets the `KOSHA_TLS_*` and `KOSHA_INTERNAL_TLS*` values in the
 ConfigMap (HTTPS on port 8080, mTLS on `/internal/*`, HTTPS for peer
 hydration and write forwarding), switches `KOSHA_INGEST_HOST` on the query
-tier to `https://`, and patches the readiness, startup and liveness probes
-of all three Deployments to `scheme: HTTPS`. Setting the certificate
+tier to `https://`, patches the readiness, startup and liveness probes
+of all three Deployments to `scheme: HTTPS`, and adds the
+`prometheus.io/scheme: https` pod annotation. Setting the certificate
 variables without the probe change makes every probe fail, so use the
 component rather than editing the ConfigMap. To include it from an overlay:
 
@@ -235,8 +236,25 @@ Before applying it:
    and `stage/cronjob-compaction.yaml` (they also need the CA, for example
    `--cacert` with the Secret mounted); the component does not patch them.
    Outside it, that is every service calling `kosha-service`.
-3. Expect forwarded writes to fail while the rollout has ingest and query
+3. Check the Prometheus scrape job. `/metrics` is on the same port, so it
+   is HTTPS-only too (it needs no client certificate). The component adds
+   `prometheus.io/scheme: https` next to the existing `prometheus.io/*`
+   annotations, but that only takes effect if the scrape job relabels
+   `__meta_kubernetes_pod_annotation_prometheus_io_scheme` onto
+   `__scheme__`, and the job must be able to verify the certificate: give
+   it the internal CA (`tls_config.ca_file`, with
+   `server_name: kosha-internal` since pods are scraped by IP) or set
+   `insecure_skip_verify: true`. A job that keeps scraping `http://` fails
+   every scrape while the pods stay Ready, so watch `up` for the Kosha
+   targets after the rollout.
+4. Expect forwarded writes to fail while the rollout has ingest and query
    pods on different schemes. Peer hydration falls back to S3 instead.
+
+The migrate Jobs (`base/job-migrate-namespace.yaml`,
+`stage/es-to-kosha-migration-job.yaml`) read the same ConfigMap but do not
+need the `kosha-internal-tls` Secret: they make no pod-to-pod connection
+and read only the `KOSHA_INTERNAL_TLS` mode, to apply the Postgres rule
+below.
 
 The component sets `KOSHA_INTERNAL_TLS=on`. Once every pod is on TLS, patch
 it to `required` in the overlay so a pod with a plaintext hop refuses to

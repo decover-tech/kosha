@@ -12,6 +12,10 @@ The pods in `k8s/base/deployment.yaml`, `k8s/base/deployment-query.yaml` and
 Prometheus using the usual annotation-based pod discovery collects them with no extra
 configuration.
 
+With TLS between pods turned on (`k8s/components/internal-tls`), the port is HTTPS-only and
+the component adds `prometheus.io/scheme: https`. The scrape job then has to honor that
+annotation and trust the internal CA; see `k8s/README.md`, "Encryption in transit".
+
 ## Access
 
 | Setting | Effect |

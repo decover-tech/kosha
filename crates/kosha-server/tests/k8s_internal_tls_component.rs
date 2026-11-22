@@ -82,6 +82,54 @@ fn probes_patch_covers_every_probe_of_every_deployment() {
     }
 }
 
+/// `/metrics` shares the HTTPS-only port: the pods advertise a scrape by
+/// annotation, so the component has to advertise the scheme as well, or
+/// every scrape fails while the pods stay Ready.
+#[test]
+fn component_marks_the_metrics_scrape_as_https() {
+    let k8s = k8s();
+    let component = k8s.join("components/internal-tls");
+    let kustomization = read(&component.join("kustomization.yaml"));
+    let lines = code_lines(&kustomization);
+    let at = lines
+        .iter()
+        .position(|l| *l == "- path: metrics-scheme-patch.yaml")
+        .expect("kustomization lists metrics-scheme-patch.yaml");
+    // Aimed at the same three Deployments as the probes patch.
+    assert!(
+        lines[at..].contains(&"name: kosha(-query|-indexer)?"),
+        "{kustomization}"
+    );
+
+    let patch = read(&component.join("metrics-scheme-patch.yaml"));
+    let patch = code_lines(&patch);
+    assert_eq!(
+        patch,
+        [
+            "- op: add",
+            "path: /spec/template/metadata/annotations/prometheus.io~1scheme",
+            "value: https",
+        ]
+    );
+
+    for file in [
+        "deployment.yaml",
+        "deployment-query.yaml",
+        "deployment-indexer.yaml",
+    ] {
+        let text = read(&k8s.join("base").join(file));
+        let lines = code_lines(&text);
+        // The pods are scraped by annotation on the port that turns HTTPS...
+        assert!(lines.contains(&"prometheus.io/scrape: \"true\""), "{file}");
+        assert!(lines.contains(&"prometheus.io/port: \"8080\""), "{file}");
+        // ...and the base leaves the scheme at Prometheus's default (http).
+        assert!(
+            !lines.iter().any(|l| l.starts_with("prometheus.io/scheme")),
+            "{file}: base stays on HTTP"
+        );
+    }
+}
+
 #[test]
 fn component_sets_every_tls_setting_the_base_configmap_documents() {
     let k8s = k8s();

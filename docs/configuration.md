@@ -396,13 +396,17 @@ For example:
 postgres://kosha:<password>@<host>:5432/kosha?sslmode=verify-full&sslrootcert=/etc/kosha/pg/ca.crt
 ```
 
-`PGSSLMODE` and `PGSSLROOTCERT` are read when the URL does not name the parameter.
+`PGSSLMODE` and `PGSSLROOTCERT` are read when the URL does not name the parameter. The client
+ignores a `PGSSLMODE` it cannot parse, surrounding whitespace or a trailing newline included
+(a Secret made with `echo` has one), and uses `prefer`; the check below does not accept such a value
+as forcing TLS.
 
 `KOSHA_INTERNAL_TLS` holds this hop to the same rule as the others. With `required`, the
 server, `migrate` and `migrate-namespace` exit before opening a connection unless the
 `sslmode` in effect is `require`, `verify-ca` or `verify-full`. With `on`, any other value (or
 none) logs one `WARN:` line at startup. With `off` nothing is checked. Neither message prints
-the URL.
+the URL. The check reads only the mode, so `migrate` and `migrate-namespace` do not need the
+`KOSHA_INTERNAL_TLS_*` files mounted.
 
 `GET /internal/segment/...` streams the cached file as raw `application/octet-stream`. Peers on
 builds from before #259 send base64 with `x-kosha-encoding: base64`; the client still decodes

@@ -1,8 +1,9 @@
 # Opt-in component: TLS between pods (#343).
 #
-# Turns on HTTPS for the Kosha listener and for pod-to-pod traffic, and
-# switches the kubelet probes to HTTPS so the pods stay Ready. Include it
-# from an overlay:
+# Turns on HTTPS for the Kosha listener and for pod-to-pod traffic,
+# switches the kubelet probes to HTTPS so the pods stay Ready, and marks the
+# pods `prometheus.io/scheme: https` for the metrics scrape. Include it from
+# an overlay:
 #
 #   components:
 #     - ../components/internal-tls
@@ -22,6 +23,13 @@ patches:
   # One JSON patch for the three Deployments (kosha, kosha-query,
   # kosha-indexer): every probe has the same shape.
   - path: probes-https-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: kosha(-query|-indexer)?
+  # /metrics moves to HTTPS with the rest of the port.
+  - path: metrics-scheme-patch.yaml
     target:
       group: apps
       version: v1
