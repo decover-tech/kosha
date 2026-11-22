@@ -2280,6 +2280,155 @@ fn i8_error_per_scale(unit_query: &[f32]) -> f32 {
     }
 }
 
+/// `KOSHA_VECTOR_DOT_LANES`, read once: accumulator lanes of the f32 dot
+/// that kNN posting scans score f32 entries with (#382). `8` (the default)
+/// is [`kosha_vector_spfresh::dot`], exactly as before; `16`, `32` or `64`
+/// use [`kosha_vector_spfresh::dot_lanes`], whose sums differ in the last
+/// float bits. Experimental: for measuring the FMA latency chain on the
+/// bench host, together with the image's `KOSHA_RUSTFLAGS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DotLanes {
+    Eight,
+    Sixteen,
+    ThirtyTwo,
+    SixtyFour,
+}
+
+impl DotLanes {
+    fn from_env() -> Self {
+        static LANES: OnceLock<DotLanes> = OnceLock::new();
+        *LANES.get_or_init(|| Self::parse(std::env::var("KOSHA_VECTOR_DOT_LANES").ok().as_deref()))
+    }
+
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            None | Some("") | Some("8") => Self::Eight,
+            Some("16") => Self::Sixteen,
+            Some("32") => Self::ThirtyTwo,
+            Some("64") => Self::SixtyFour,
+            Some(other) => {
+                eprintln!("WARN: KOSHA_VECTOR_DOT_LANES={other} not 8|16|32|64 — using 8");
+                Self::Eight
+            }
+        }
+    }
+
+    fn dot(self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            Self::Eight => kosha_vector_spfresh::dot(a, b),
+            Self::Sixteen => kosha_vector_spfresh::dot_lanes::<16>(a, b),
+            Self::ThirtyTwo => kosha_vector_spfresh::dot_lanes::<32>(a, b),
+            Self::SixtyFour => kosha_vector_spfresh::dot_lanes::<64>(a, b),
+        }
+    }
+
+    /// [`kosha_vector_spfresh::cosine_similarity`] with this dot.
+    fn cosine_similarity(self, a: &[f32], b: &[f32]) -> f32 {
+        if self == Self::Eight {
+            return kosha_vector_spfresh::cosine_similarity(a, b);
+        }
+        let d = self.dot(a, b);
+        let (na, nb) = (self.dot(a, a).sqrt(), self.dot(b, b).sqrt());
+        if na == 0.0 || nb == 0.0 {
+            return 0.0;
+        }
+        1.0 - (1.0 - (d / (na * nb)).clamp(-1.0, 1.0))
+    }
+}
+
+/// `KOSHA_VECTOR_RABITQ_ESTIMATOR`, read once: how a RaBitQ column's codes
+/// are scored at query time (#382). `lut` (the default) is the per-byte
+/// lookup table; `popcount` quantizes the rotated query to 4 bits and
+/// scores with AND + popcount (RaBitQ §3.3.2). Query-time only: the
+/// on-disk codes are the same either way.
+fn rabitq_estimator() -> kosha_vector_spfresh::RaBitQEstimator {
+    static ESTIMATOR: OnceLock<kosha_vector_spfresh::RaBitQEstimator> = OnceLock::new();
+    *ESTIMATOR.get_or_init(|| {
+        parse_rabitq_estimator(
+            std::env::var("KOSHA_VECTOR_RABITQ_ESTIMATOR")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_rabitq_estimator(raw: Option<&str>) -> kosha_vector_spfresh::RaBitQEstimator {
+    use kosha_vector_spfresh::RaBitQEstimator;
+    match raw.map(str::trim) {
+        None | Some("") => RaBitQEstimator::Lut,
+        Some(raw) => RaBitQEstimator::parse(raw).unwrap_or_else(|| {
+            eprintln!("WARN: KOSHA_VECTOR_RABITQ_ESTIMATOR={raw} not lut|popcount — using lut");
+            RaBitQEstimator::Lut
+        }),
+    }
+}
+
+/// x86-64 target features above the baseline that this binary was compiled
+/// with (`-C target-cpu=x86-64-v3` turns on `avx2`, `fma`, `bmi2` and
+/// `popcnt`). Empty on the default image and on other architectures.
+fn compiled_x86_features() -> Vec<&'static str> {
+    let x86 = cfg!(target_arch = "x86_64");
+    [
+        ("popcnt", cfg!(target_feature = "popcnt")),
+        ("avx2", cfg!(target_feature = "avx2")),
+        ("fma", cfg!(target_feature = "fma")),
+        ("bmi2", cfg!(target_feature = "bmi2")),
+        ("avx512f", cfg!(target_feature = "avx512f")),
+    ]
+    .into_iter()
+    .filter(|&(_, enabled)| x86 && enabled)
+    .map(|(name, _)| name)
+    .collect()
+}
+
+/// The experimental #382 kernel configuration in effect, for one startup
+/// log line: `None` when everything is at its default (neither
+/// `KOSHA_VECTOR_DOT_LANES` nor `KOSHA_VECTOR_RABITQ_ESTIMATOR` set, and a
+/// baseline-x86-64 build), so a default server logs nothing new. Reading it
+/// also resolves both settings, so an unknown value warns at startup rather
+/// than on the first kNN query. The benchmark checks this line to confirm
+/// that a run's `server_env` / `rustflags` actually took effect.
+pub fn experimental_vector_kernels_summary() -> Option<String> {
+    let env_set = |key: &str| {
+        std::env::var(key)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    let lanes = DotLanes::from_env();
+    let estimator = rabitq_estimator();
+    let features = compiled_x86_features();
+    let any_set = env_set("KOSHA_VECTOR_DOT_LANES")
+        || env_set("KOSHA_VECTOR_RABITQ_ESTIMATOR")
+        || !features.is_empty();
+    any_set.then(|| format_vector_kernels_summary(lanes, estimator, &features))
+}
+
+fn format_vector_kernels_summary(
+    lanes: DotLanes,
+    estimator: kosha_vector_spfresh::RaBitQEstimator,
+    features: &[&str],
+) -> String {
+    let lanes = match lanes {
+        DotLanes::Eight => 8,
+        DotLanes::Sixteen => 16,
+        DotLanes::ThirtyTwo => 32,
+        DotLanes::SixtyFour => 64,
+    };
+    let estimator = match estimator {
+        kosha_vector_spfresh::RaBitQEstimator::Lut => "lut",
+        kosha_vector_spfresh::RaBitQEstimator::Popcount4 => "popcount",
+    };
+    let features = if features.is_empty() {
+        "baseline".to_string()
+    } else {
+        features.join(",")
+    };
+    format!(
+        "vector kernels (#382, experimental): dot_lanes={lanes} \
+         rabitq_estimator={estimator} x86_features={features}"
+    )
+}
+
 /// The [`kosha_vector_spfresh::RaBitQQuery`] for `unit_query`. It depends
 /// only on the query and its dimension (every RaBitQ code is written with
 /// the same rotation), so each thread keeps the last one it built: a query
@@ -2298,8 +2447,10 @@ fn rabitq_query_for(unit_query: &[f32]) -> std::rc::Rc<kosha_vector_spfresh::RaB
             }
         }
         let rotation = kosha_vector_spfresh::RaBitQRotation::new(unit_query.len());
-        let built = std::rc::Rc::new(kosha_vector_spfresh::RaBitQQuery::new(
-            &rotation, unit_query,
+        let built = std::rc::Rc::new(kosha_vector_spfresh::RaBitQQuery::with_estimator(
+            &rotation,
+            unit_query,
+            rabitq_estimator(),
         ));
         *last = Some((unit_query.to_vec(), std::rc::Rc::clone(&built)));
         built
@@ -7872,6 +8023,7 @@ impl SegmentReader {
         let mut scored: Vec<(u32, f64)> = Vec::with_capacity(candidates.len());
         let probe = Self::probe_query(vi, query);
         let is_candidate = |id: u32| candidates.binary_search(&id).is_ok();
+        let lanes = DotLanes::from_env();
         for range_idx in 0..vi.ranges.len() {
             let posting = match self.hydrate_posting(vi, range_idx) {
                 Ok(posting) => posting,
@@ -7879,7 +8031,7 @@ impl SegmentReader {
             };
             posting.for_each_similarity(
                 Some(&is_candidate),
-                |v| kosha_vector_spfresh::cosine_similarity(query, v),
+                |v| lanes.cosine_similarity(query, v),
                 &probe,
                 &vi.centroids[range_idx],
                 |id, sim, _| scored.push((id, sim as f64)),
@@ -7954,6 +8106,7 @@ impl SegmentReader {
         let mut scored: Vec<(u32, f64)> = Vec::new();
         let mut errors: Vec<f32> = Vec::new();
         let probe = Self::probe_query(vi, query);
+        let lanes = DotLanes::from_env();
         for (position, (range_idx, _)) in ranked.iter().enumerate() {
             if position >= budgeted {
                 // Past the budget. Without a restriction this is where the
@@ -7971,7 +8124,7 @@ impl SegmentReader {
             probes += 1;
             self.hydrate_posting(vi, *range_idx)?.for_each_similarity(
                 accept,
-                |v| kosha_vector_spfresh::cosine_similarity(query, v),
+                |v| lanes.cosine_similarity(query, v),
                 &probe,
                 &vi.centroids[*range_idx],
                 |id, sim, err| {
@@ -8052,6 +8205,7 @@ impl SegmentReader {
         // which includes every quantized one.
         let probe = Self::probe_query(vi, query);
         let mut postings = 0usize;
+        let lanes = DotLanes::from_env();
         for (position, &range_idx) in candidates.iter().enumerate() {
             if position >= nprobe && scored.len() >= k {
                 break;
@@ -8066,9 +8220,9 @@ impl SegmentReader {
                 accept,
                 |v| {
                     if vi.unit_norm {
-                        kosha_vector_spfresh::dot(query, v).clamp(-1.0, 1.0)
+                        lanes.dot(query, v).clamp(-1.0, 1.0)
                     } else {
-                        kosha_vector_spfresh::cosine_similarity(query, v)
+                        lanes.cosine_similarity(query, v)
                     }
                 },
                 &probe,
@@ -9674,6 +9828,82 @@ mod tests {
             assert!(!parse_vector_build_refine(raw), "{raw:?}");
         }
         assert!(parse_vector_build_refine(Some("bogus")));
+    }
+
+    #[test]
+    fn dot_lanes_default_to_eight_and_agree_up_to_rounding() {
+        for raw in [None, Some(""), Some("8"), Some(" 8 "), Some("12")] {
+            assert_eq!(DotLanes::parse(raw), DotLanes::Eight, "{raw:?}");
+        }
+        assert_eq!(DotLanes::parse(Some("16")), DotLanes::Sixteen);
+        assert_eq!(DotLanes::parse(Some("32")), DotLanes::ThirtyTwo);
+        assert_eq!(DotLanes::parse(Some("64")), DotLanes::SixtyFour);
+        let a: Vec<f32> = (0..1027)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+            .collect();
+        let b: Vec<f32> = (0..1027)
+            .map(|i| ((i * 53 % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        // The default is the existing kernels, bit for bit.
+        assert_eq!(
+            DotLanes::Eight.dot(&a, &b),
+            kosha_vector_spfresh::dot(&a, &b)
+        );
+        assert_eq!(
+            DotLanes::Eight.cosine_similarity(&a, &b),
+            kosha_vector_spfresh::cosine_similarity(&a, &b)
+        );
+        let zero = vec![0.0f32; 1027];
+        for lanes in [
+            DotLanes::Eight,
+            DotLanes::Sixteen,
+            DotLanes::ThirtyTwo,
+            DotLanes::SixtyFour,
+        ] {
+            let d = lanes.dot(&a, &b);
+            assert!(
+                (d - kosha_vector_spfresh::dot(&a, &b)).abs() < 1e-3,
+                "{lanes:?}"
+            );
+            let c = lanes.cosine_similarity(&a, &b);
+            let expected = kosha_vector_spfresh::cosine_similarity(&a, &b);
+            assert!((c - expected).abs() < 1e-5, "{lanes:?}: {c} vs {expected}");
+            assert_eq!(lanes.cosine_similarity(&a, &zero), 0.0, "{lanes:?}");
+        }
+    }
+
+    #[test]
+    fn vector_kernels_summary_names_the_effective_settings() {
+        use kosha_vector_spfresh::RaBitQEstimator;
+        assert_eq!(
+            format_vector_kernels_summary(DotLanes::Eight, RaBitQEstimator::Lut, &[]),
+            "vector kernels (#382, experimental): dot_lanes=8 rabitq_estimator=lut \
+             x86_features=baseline"
+        );
+        assert_eq!(
+            format_vector_kernels_summary(
+                DotLanes::ThirtyTwo,
+                RaBitQEstimator::Popcount4,
+                &["popcnt", "avx2", "fma", "bmi2"]
+            ),
+            "vector kernels (#382, experimental): dot_lanes=32 rabitq_estimator=popcount \
+             x86_features=popcnt,avx2,fma,bmi2"
+        );
+    }
+
+    #[test]
+    fn rabitq_estimator_defaults_to_lut() {
+        use kosha_vector_spfresh::RaBitQEstimator;
+        for raw in [None, Some(""), Some(" "), Some("lut"), Some("bogus")] {
+            assert_eq!(parse_rabitq_estimator(raw), RaBitQEstimator::Lut, "{raw:?}");
+        }
+        for raw in [Some("popcount"), Some(" Popcount4 ")] {
+            assert_eq!(
+                parse_rabitq_estimator(raw),
+                RaBitQEstimator::Popcount4,
+                "{raw:?}"
+            );
+        }
     }
 
     /// Serialize an inverted index in the legacy v1 stream layout — the
