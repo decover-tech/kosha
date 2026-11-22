@@ -26,6 +26,39 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// [`dot`] with `L` independent accumulator lanes (`L` a power of two),
+/// reduced pairwise. Experimental (#382) and not used by any production
+/// path: it exists so `benches/distance_kernels.rs` can measure whether a
+/// wider accumulator helps. With AVX2 + FMA (`-C target-cpu=x86-64-v3`) one
+/// 8-lane accumulator is a single register, so every iteration waits on
+/// the previous FMA (~4 cycles latency, 2 per cycle throughput); 32-64
+/// lanes give the core enough independent chains. Summation order differs
+/// from [`dot`], so results differ in the last float bits.
+pub fn dot_lanes<const L: usize>(a: &[f32], b: &[f32]) -> f32 {
+    const { assert!(L.is_power_of_two(), "dot_lanes: L must be a power of two") };
+    debug_assert_eq!(a.len(), b.len(), "dot_lanes: dimension mismatch");
+    let mut acc = [0.0f32; L];
+    let (ca, ra) = a.as_chunks::<L>();
+    let (cb, rb) = b.as_chunks::<L>();
+    for (xa, xb) in ca.iter().zip(cb.iter()) {
+        for l in 0..L {
+            acc[l] += xa[l] * xb[l];
+        }
+    }
+    let mut width = L;
+    while width > 1 {
+        width /= 2;
+        for l in 0..width {
+            acc[l] += acc[l + width];
+        }
+    }
+    let mut s = acc[0];
+    for (x, y) in ra.iter().zip(rb.iter()) {
+        s += x * y;
+    }
+    s
+}
+
 /// Scale `v` to unit L2 norm in place. A zero vector is left untouched —
 /// downstream dot scoring then yields similarity `0`, matching
 /// `cosine_distance`'s "zero-norm is maximally distant" convention.
@@ -97,6 +130,30 @@ pub fn maxsim<Q: AsRef<[f32]>, D: AsRef<[f32]>>(query: &[Q], doc: &[D]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dot_lanes_matches_dot_up_to_rounding() {
+        let mut rng = crate::DeterministicRng::new(11);
+        for dim in [0, 1, 7, 8, 15, 33, 100, 384, 1024, 1027] {
+            let a: Vec<f32> = (0..dim).map(|_| rng.next_f32_range(-1.0, 1.0)).collect();
+            let b: Vec<f32> = (0..dim).map(|_| rng.next_f32_range(-1.0, 1.0)).collect();
+            let exact: f64 = a.iter().zip(&b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let tol = 1e-5 * (1.0 + dim as f64).sqrt();
+            for got in [
+                dot(&a, &b),
+                dot_lanes::<1>(&a, &b),
+                dot_lanes::<8>(&a, &b),
+                dot_lanes::<16>(&a, &b),
+                dot_lanes::<32>(&a, &b),
+                dot_lanes::<64>(&a, &b),
+            ] {
+                assert!(
+                    (got as f64 - exact).abs() <= tol,
+                    "dim {dim}: {got} vs {exact}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn identical_vectors_have_zero_distance() {

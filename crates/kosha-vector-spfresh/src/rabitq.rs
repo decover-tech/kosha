@@ -179,15 +179,76 @@ pub fn encode_rabitq(
     }
 }
 
-/// A unit query prepared for scoring RaBitQ codes of one dimension: the
-/// rotated query as a per-byte lookup table, so `⟨x̄, Rq⟩` costs one table
-/// read per code byte instead of one add per bit.
+/// How a [`RaBitQQuery`] computes `⟨x̄, Rq⟩` (#382).
+///
+/// * [`Lut`](Self::Lut): the default, a 256-entry f32 table per code byte
+///   (`D/8 · 1 KiB`, 128 KiB at `D = 1024`), one table read per code byte.
+/// * [`Popcount4`](Self::Popcount4): RaBitQ §3.3.2. The rotated query is
+///   scalar-quantized to [`RABITQ_QUERY_BITS`] bits per coordinate, stored
+///   as that many bit planes (`D/64` words each, 512 B at `D = 1024`), and
+///   a code is scored with AND + popcount per 64-bit word. Its estimate
+///   equals [`Lut`](Self::Lut) run on the dequantized query up to float
+///   rounding, so it differs from [`Lut`](Self::Lut) only by the query's
+///   rounding error. That error is small but not free: on synthetic
+///   clusters at `D = 1024` it averages ~9% of the RaBitQ error bound, so
+///   this estimator's bound adds the rounding term (`ε0 · delta/√12`, in
+///   quadrature) to keep rescoring as safe as with the LUT.
+///
+/// The choice touches only query-time arithmetic, never the on-disk codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RaBitQEstimator {
+    #[default]
+    Lut,
+    Popcount4,
+}
+
+impl RaBitQEstimator {
+    /// `lut` or `popcount` (also `popcount4`), case-insensitive.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "lut" => Some(Self::Lut),
+            "popcount" | "popcount4" => Some(Self::Popcount4),
+            _ => None,
+        }
+    }
+}
+
+/// Bits per rotated query coordinate for [`RaBitQEstimator::Popcount4`]
+/// (`B_q` in the paper; 4 is its recommended value).
+pub const RABITQ_QUERY_BITS: usize = 4;
+
+/// The query side of `⟨x̄, Rq⟩`, per [`RaBitQEstimator`].
 #[derive(Debug, Clone)]
-pub struct RaBitQQuery {
+enum Kernel {
     /// `lut[j * 256 + m]` is the sum of `(Rq)_{8j+t}` over the set bits
     /// `t` of `m`.
-    lut: Vec<f32>,
-    /// `Σ (Rq)_i`.
+    Lut(Vec<f32>),
+    /// `(Rq)_i ≈ low + delta · q_i` with `q_i ∈ [0, 2^B_q)`. `planes[w][b]`
+    /// holds bit `b` of `q_i` for the 64 coordinates `i` of word `w`, in
+    /// the codes' bit order (coordinate `i` is bit `i % 64` of the
+    /// little-endian word `i / 64`). `quantized_ip` is
+    /// `scale_q · Σ_b 2^b·popcount(x & plane_b) + scale_x · popcount(x) - offset`.
+    Popcount {
+        planes: Vec<[u64; RABITQ_QUERY_BITS]>,
+        scale_q: f32,
+        scale_x: f32,
+        offset: f32,
+        /// `ε0 · delta / √12`: the bound on `⟨x̄, Rq⟩`'s error from
+        /// rounding the query (each coordinate's error is uniform on
+        /// `±delta/2`, so `Σ x̄_i e_i` has deviation `delta / √12`).
+        rounding_bound: f32,
+    },
+}
+
+/// A unit query prepared for scoring RaBitQ codes of one dimension: the
+/// rotated query as a per-byte lookup table (or, with
+/// [`RaBitQEstimator::Popcount4`], as quantized bit planes), so `⟨x̄, Rq⟩`
+/// costs one table read per code byte (or a few popcounts per 64 bits)
+/// instead of one add per bit.
+#[derive(Debug, Clone)]
+pub struct RaBitQQuery {
+    kernel: Kernel,
+    /// `Σ (Rq)_i` (used by the LUT kernel).
     total: f32,
     inv_sqrt_padded: f32,
     /// `ε0 / √(D - 1)`.
@@ -195,34 +256,85 @@ pub struct RaBitQQuery {
 }
 
 impl RaBitQQuery {
-    /// Prepares `unit_query` (already unit-normalized) for `rotation`.
+    /// Prepares `unit_query` (already unit-normalized) for `rotation`, with
+    /// the default [`RaBitQEstimator::Lut`].
     pub fn new(rotation: &RaBitQRotation, unit_query: &[f32]) -> Self {
-        let y = rotation.apply(unit_query);
-        let bytes = rotation.code_bytes();
-        let mut lut = vec![0.0f32; bytes * 256];
-        for (j, table) in lut.chunks_exact_mut(256).enumerate() {
-            let lane = &y[j * 8..j * 8 + 8];
-            for m in 1..256usize {
-                let low = m.trailing_zeros() as usize;
-                table[m] = table[m & (m - 1)] + lane[low];
-            }
-        }
-        let padded = rotation.padded_dim() as f32;
+        Self::with_estimator(rotation, unit_query, RaBitQEstimator::Lut)
+    }
+
+    /// Prepares `unit_query` (already unit-normalized) for `rotation`,
+    /// scoring codes with `estimator`.
+    pub fn with_estimator(
+        rotation: &RaBitQRotation,
+        unit_query: &[f32],
+        estimator: RaBitQEstimator,
+    ) -> Self {
+        Self::from_rotated(&rotation.apply(unit_query), estimator)
+    }
+
+    /// Prepares an already rotated (and padded) query `y`.
+    fn from_rotated(y: &[f32], estimator: RaBitQEstimator) -> Self {
+        let padded = y.len() as f32;
+        let inv_sqrt_padded = 1.0 / padded.sqrt();
+        let kernel = match estimator {
+            RaBitQEstimator::Lut => Kernel::Lut(build_lut(y)),
+            RaBitQEstimator::Popcount4 => quantize_query(y, inv_sqrt_padded),
+        };
         Self {
-            lut,
+            kernel,
             total: y.iter().sum(),
-            inv_sqrt_padded: 1.0 / padded.sqrt(),
+            inv_sqrt_padded,
             bound_scale: RABITQ_EPSILON0 / (padded - 1.0).max(1.0).sqrt(),
+        }
+    }
+
+    /// Which estimator this query scores with.
+    pub fn estimator(&self) -> RaBitQEstimator {
+        match self.kernel {
+            Kernel::Lut(_) => RaBitQEstimator::Lut,
+            Kernel::Popcount { .. } => RaBitQEstimator::Popcount4,
         }
     }
 
     /// `⟨ō, Rq⟩` for a code: `(2·Σ_{set} y_i - Σ y_i) / √D`.
     fn quantized_ip(&self, bits: &[u8]) -> f32 {
-        let mut set = 0.0f32;
-        for (table, &b) in self.lut.chunks_exact(256).zip(bits) {
-            set += table[b as usize];
+        match &self.kernel {
+            Kernel::Lut(lut) => {
+                let mut set = 0.0f32;
+                for (table, &b) in lut.as_chunks::<256>().0.iter().zip(bits) {
+                    set += table[b as usize];
+                }
+                (2.0 * set - self.total) * self.inv_sqrt_padded
+            }
+            Kernel::Popcount {
+                planes,
+                scale_q,
+                scale_x,
+                offset,
+                ..
+            } => {
+                let (words, rest) = bits.as_chunks::<8>();
+                let mut acc = [0u32; RABITQ_QUERY_BITS];
+                let mut ones = 0u32;
+                let mut score = |x: u64, plane: &[u64; RABITQ_QUERY_BITS]| {
+                    ones += x.count_ones();
+                    for (a, p) in acc.iter_mut().zip(plane) {
+                        *a += (x & p).count_ones();
+                    }
+                };
+                for (word, plane) in words.iter().zip(planes) {
+                    score(u64::from_le_bytes(*word), plane);
+                }
+                if !rest.is_empty() {
+                    // Codes shorter than a word (`D < 64`).
+                    let mut last = [0u8; 8];
+                    last[..rest.len()].copy_from_slice(rest);
+                    score(u64::from_le_bytes(last), &planes[words.len()]);
+                }
+                let weighted: u32 = acc.iter().enumerate().map(|(b, &a)| a << b).sum();
+                scale_q * weighted as f32 + scale_x * ones as f32 - offset
+            }
         }
-        (2.0 * set - self.total) * self.inv_sqrt_padded
     }
 
     /// Estimated `⟨o, q⟩` of the coded vector, and the estimator's error
@@ -233,9 +345,74 @@ impl RaBitQQuery {
         }
         let ip = code.ip.max(MIN_IP);
         let est = centroid_dot + code.residual_norm * self.quantized_ip(bits) / ip;
-        let err =
+        let mut err =
             code.residual_norm * ((1.0 - ip * ip).max(0.0) / (ip * ip)).sqrt() * self.bound_scale;
+        if let Kernel::Popcount { rounding_bound, .. } = self.kernel {
+            if rounding_bound > 0.0 {
+                // The query's rounding error is independent of the code's,
+                // so the two deviations add in quadrature.
+                err = err.hypot(code.residual_norm * rounding_bound / ip);
+            }
+        }
         (est, err)
+    }
+}
+
+/// The per-byte lookup table of [`Kernel::Lut`] for the rotated query `y`.
+fn build_lut(y: &[f32]) -> Vec<f32> {
+    let mut lut = vec![0.0f32; y.len() / 8 * 256];
+    for (j, table) in lut.as_chunks_mut::<256>().0.iter_mut().enumerate() {
+        let lane = &y[j * 8..j * 8 + 8];
+        for m in 1..256usize {
+            let low = m.trailing_zeros() as usize;
+            table[m] = table[m & (m - 1)] + lane[low];
+        }
+    }
+    lut
+}
+
+/// `y` scalar-quantized to [`RABITQ_QUERY_BITS`] bits per coordinate
+/// (RaBitQ §3.3.2): `y_i ≈ low + delta · q_i` over `[min y, max y]`. The
+/// paper rounds stochastically for an unbiased estimator; this rounds to
+/// nearest, which is deterministic and has a smaller per-coordinate error
+/// (`≤ delta / 2`). A degenerate (constant or non-finite) query quantizes
+/// to `q = 0`.
+fn quantize_query(y: &[f32], inv_sqrt_padded: f32) -> Kernel {
+    const LEVELS: f32 = ((1u32 << RABITQ_QUERY_BITS) - 1) as f32;
+    let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &v in y.iter().filter(|v| v.is_finite()) {
+        low = low.min(v);
+        high = high.max(v);
+    }
+    if !low.is_finite() {
+        (low, high) = (0.0, 0.0);
+    }
+    let mut delta = (high - low) / LEVELS;
+    if !delta.is_finite() {
+        delta = 0.0;
+    }
+    let mut planes = vec![[0u64; RABITQ_QUERY_BITS]; y.len().div_ceil(64)];
+    let mut sum_q = 0u32;
+    if delta > 0.0 {
+        for (i, &v) in y.iter().enumerate() {
+            let q = if v.is_finite() {
+                ((v - low) / delta).round().clamp(0.0, LEVELS) as u32
+            } else {
+                0
+            };
+            sum_q += q;
+            for (b, plane) in planes[i / 64].iter_mut().enumerate() {
+                *plane |= u64::from((q >> b) & 1) << (i % 64);
+            }
+        }
+    }
+    // (2·Σ_set (low + delta·q_i) - Σ_all (low + delta·q_i)) / √D
+    Kernel::Popcount {
+        planes,
+        scale_q: 2.0 * delta * inv_sqrt_padded,
+        scale_x: 2.0 * low * inv_sqrt_padded,
+        offset: (delta * sum_q as f32 + low * y.len() as f32) * inv_sqrt_padded,
+        rounding_bound: RABITQ_EPSILON0 * delta / 12f32.sqrt(),
     }
 }
 
@@ -285,9 +462,16 @@ mod tests {
     /// The estimator's error behaves like the Gaussian the bound assumes:
     /// ~94% of estimates inside `ε0 = 1.9` deviations, nearly all inside
     /// 1.5x that, and a small mean error — the properties the probe's
-    /// rescoring shortlist relies on.
+    /// rescoring shortlist relies on. Holds for both estimators, on the
+    /// same data (the popcount one adds only the query's 4-bit error).
     #[test]
     fn estimates_stay_within_the_error_bound() {
+        for estimator in [RaBitQEstimator::Lut, RaBitQEstimator::Popcount4] {
+            estimates_stay_within_the_error_bound_with(estimator);
+        }
+    }
+
+    fn estimates_stay_within_the_error_bound_with(estimator: RaBitQEstimator) {
         let mut rng = DeterministicRng::new(3);
         for dim in [64, 384, 1024] {
             let rot = RaBitQRotation::new(dim);
@@ -298,7 +482,7 @@ mod tests {
                 // A cluster: centroid plus members near it, like a posting.
                 let centroid = unit(&mut rng, dim);
                 let q = unit(&mut rng, dim);
-                let rq = RaBitQQuery::new(&rot, &q);
+                let rq = RaBitQQuery::with_estimator(&rot, &q, estimator);
                 let cq = dot(&centroid, &q);
                 for _ in 0..50 {
                     let noise = unit(&mut rng, dim);
@@ -323,15 +507,18 @@ mod tests {
             }
             assert!(
                 outside * 100 <= 9 * total,
-                "dim {dim}: {outside}/{total} estimates outside the bound"
+                "{estimator:?} dim {dim}: {outside}/{total} estimates outside the bound"
             );
             assert!(
                 outside_wide * 100 <= total,
-                "dim {dim}: {outside_wide}/{total} estimates outside 1.5x the bound"
+                "{estimator:?} dim {dim}: {outside_wide}/{total} estimates outside 1.5x the bound"
             );
             let mean = abs_err / total as f64;
             let limit = 0.6 / (dim as f64).sqrt();
-            assert!(mean < limit, "dim {dim}: mean abs error {mean} >= {limit}");
+            assert!(
+                mean < limit,
+                "{estimator:?} dim {dim}: mean abs error {mean} >= {limit}"
+            );
         }
     }
 
@@ -362,5 +549,152 @@ mod tests {
         assert!(code.residual_norm.is_finite() && code.ip.is_finite());
         let (est, err) = RaBitQQuery::new(&rot, &[0.0, 1.0, 0.0, 0.0]).estimate(&code, &bits, 0.0);
         assert!(est.is_finite() && err.is_finite());
+        let popcount =
+            RaBitQQuery::with_estimator(&rot, &[0.0, 1.0, 0.0, 0.0], RaBitQEstimator::Popcount4);
+        let (est, err) = popcount.estimate(&code, &bits, 0.0);
+        assert!(est.is_finite() && err.is_finite());
+        // A degenerate (all-equal) rotated query quantizes to q = 0 and
+        // still scores like the LUT does on it.
+        let flat = vec![0.25f32; 16];
+        let (p, l) = (
+            RaBitQQuery::from_rotated(&flat, RaBitQEstimator::Popcount4),
+            RaBitQQuery::from_rotated(&flat, RaBitQEstimator::Lut),
+        );
+        for bits in [[0u8, 0], [0xff, 0x0f], [0x81, 0xff]] {
+            assert!((p.quantized_ip(&bits) - l.quantized_ip(&bits)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn estimator_parses_and_defaults_to_lut() {
+        assert_eq!(RaBitQEstimator::default(), RaBitQEstimator::Lut);
+        assert_eq!(RaBitQEstimator::parse(" LUT "), Some(RaBitQEstimator::Lut));
+        assert_eq!(
+            RaBitQEstimator::parse("popcount"),
+            Some(RaBitQEstimator::Popcount4)
+        );
+        assert_eq!(
+            RaBitQEstimator::parse("Popcount4"),
+            Some(RaBitQEstimator::Popcount4)
+        );
+        assert_eq!(RaBitQEstimator::parse("fastscan"), None);
+        let rot = RaBitQRotation::new(64);
+        let q = unit(&mut DeterministicRng::new(5), 64);
+        assert_eq!(RaBitQQuery::new(&rot, &q).estimator(), RaBitQEstimator::Lut);
+        assert_eq!(
+            RaBitQQuery::with_estimator(&rot, &q, RaBitQEstimator::Popcount4).estimator(),
+            RaBitQEstimator::Popcount4
+        );
+    }
+
+    /// Rounds `y` to the 4-bit grid the popcount kernel quantizes to,
+    /// written out independently of `quantize_query`.
+    fn dequantized(y: &[f32]) -> Vec<f32> {
+        let low = y.iter().copied().fold(f32::INFINITY, f32::min);
+        let high = y.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let delta = (high - low) / 15.0;
+        y.iter()
+            .map(|&v| low + delta * ((v - low) / delta).round())
+            .collect()
+    }
+
+    fn random_bits(rng: &mut DeterministicRng, bytes: usize) -> Vec<u8> {
+        (0..bytes).map(|_| rng.next_u64() as u8).collect()
+    }
+
+    /// The popcount kernel is exact arithmetic on the 4-bit query: it
+    /// matches the LUT kernel run on the dequantized query up to float
+    /// rounding, for every code, including codes shorter than a word.
+    #[test]
+    fn popcount_equals_lut_on_the_dequantized_query() {
+        let mut rng = DeterministicRng::new(6);
+        for dim in [3, 8, 16, 40, 64, 100, 384, 768, 1024, 1536] {
+            let rot = RaBitQRotation::new(dim);
+            for _ in 0..10 {
+                let y = rot.apply(&unit(&mut rng, dim));
+                let popcount = RaBitQQuery::from_rotated(&y, RaBitQEstimator::Popcount4);
+                let lut = RaBitQQuery::from_rotated(&dequantized(&y), RaBitQEstimator::Lut);
+                let mut codes = vec![vec![0u8; rot.code_bytes()], vec![0xffu8; rot.code_bytes()]];
+                codes.extend((0..50).map(|_| random_bits(&mut rng, rot.code_bytes())));
+                let code = RaBitQCode {
+                    residual_norm: 0.7,
+                    ip: 0.8,
+                };
+                for bits in &codes {
+                    let (a, b) = (popcount.quantized_ip(bits), lut.quantized_ip(bits));
+                    assert!(
+                        (a - b).abs() <= 1e-5 * (1.0 + b.abs()),
+                        "dim {dim}: popcount {a} vs lut-on-dequantized {b}"
+                    );
+                    let (pa, pe) = popcount.estimate(&code, bits, 0.1);
+                    let (la, le) = lut.estimate(&code, bits, 0.1);
+                    assert!((pa - la).abs() <= 2e-5, "dim {dim}: {pa} vs {la}");
+                    // The same RaBitQ bound, plus the query-rounding term.
+                    assert!(pe >= le, "dim {dim}: bound {pe} < lut bound {le}");
+                }
+            }
+        }
+    }
+
+    /// Against the full-precision LUT, the popcount estimate moves by at
+    /// most the 4-bit query rounding (`|Σ ±e_i| / √D ≤ √D·delta/2`, times
+    /// `‖r‖ / ⟨ō,o'⟩`), and on posting-like data by a small fraction of
+    /// RaBitQ's own error bound.
+    #[test]
+    fn popcount_tracks_the_lut_within_query_rounding() {
+        let mut rng = DeterministicRng::new(7);
+        for dim in [64, 384, 1024] {
+            let rot = RaBitQRotation::new(dim);
+            let sqrt_d = (rot.padded_dim() as f32).sqrt();
+            let mut bits = Vec::new();
+            let (mut diff_sum, mut bound_sum, mut widened_sum, mut n) =
+                (0.0f64, 0.0f64, 0.0f64, 0usize);
+            for _ in 0..20 {
+                let centroid = unit(&mut rng, dim);
+                let q = unit(&mut rng, dim);
+                let y = rot.apply(&q);
+                let low = y.iter().copied().fold(f32::INFINITY, f32::min);
+                let high = y.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let delta = (high - low) / 15.0;
+                let lut = RaBitQQuery::with_estimator(&rot, &q, RaBitQEstimator::Lut);
+                let popcount = RaBitQQuery::with_estimator(&rot, &q, RaBitQEstimator::Popcount4);
+                let cq = dot(&centroid, &q);
+                for _ in 0..50 {
+                    let noise = unit(&mut rng, dim);
+                    let mut o: Vec<f32> = centroid
+                        .iter()
+                        .zip(&noise)
+                        .map(|(c, n)| c + 0.6 * n)
+                        .collect();
+                    normalize_in_place(&mut o);
+                    let code = encode_rabitq(&rot, &o, &centroid, &mut bits);
+                    let (l, err) = lut.estimate(&code, &bits, cq);
+                    let (p, perr) = popcount.estimate(&code, &bits, cq);
+                    assert!(perr >= err, "dim {dim}: bound {perr} < lut bound {err}");
+                    widened_sum += (perr / err) as f64;
+                    let hard = code.residual_norm / code.ip * sqrt_d * delta / 2.0;
+                    assert!(
+                        (p - l).abs() <= hard * 1.001 + 1e-6,
+                        "dim {dim}: |{p} - {l}| > rounding bound {hard}"
+                    );
+                    diff_sum += (p - l).abs() as f64;
+                    bound_sum += err as f64;
+                    n += 1;
+                }
+            }
+            let (mean_diff, mean_bound) = (diff_sum / n as f64, bound_sum / n as f64);
+            let widened = widened_sum / n as f64;
+            eprintln!(
+                "dim {dim}: mean |popcount - lut| {mean_diff:.5}, mean lut bound {mean_bound:.5}, \
+                 popcount bound / lut bound {widened:.4}"
+            );
+            assert!(
+                mean_diff <= 0.25 * mean_bound,
+                "dim {dim}: mean |popcount - lut| {mean_diff} vs mean error bound {mean_bound}"
+            );
+            // The rounding term widens the bound (and so the rescoring
+            // shortlist) only slightly.
+            assert!(widened <= 1.1, "dim {dim}: bound widened {widened}x");
+        }
     }
 }
