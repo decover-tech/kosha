@@ -20,6 +20,14 @@
 # in the binary doc_vectors.bin sidecar, not inlined as JSON in
 # doc_store.bin. The builder container does not set the variable.
 #
+# Doc-store compression (research #388, experimental): the builder gets
+# KOSHA_DOC_STORE_COMPRESSION and the KOSHA_DOC_STORE_ZSTD_* tuning vars
+# when they are set here. A SNAPSHOT_NAME containing "-zstd" (for example
+# msmarco-10m-vec-zstd) defaults KOSHA_DOC_STORE_COMPRESSION to zstd, so
+# the workflow's build_vector_snapshot path needs no new input. Without
+# either, segments are built exactly as before (raw doc store). The server
+# that restores such a snapshot must be a build that reads the format.
+#
 # The namespace's previous objects in the bench bucket and the server
 # local cache are dropped before the new segments go in: offline segment
 # ids are <ns>-offline-NNNNNN, the same on every rebuild, so leftovers of
@@ -43,6 +51,15 @@ set -euo pipefail
 NS="${1:?usage: [MAX_DOCS=N] [SNAPSHOT_NAME=name] build_and_import.sh <namespace> [--with-embeddings]}"
 SNAPSHOT_NAME="${SNAPSHOT_NAME:-$NS}"
 WITH_EMB="${2:-}"
+case "$SNAPSHOT_NAME" in
+  *-zstd*) export KOSHA_DOC_STORE_COMPRESSION="${KOSHA_DOC_STORE_COMPRESSION:-zstd}" ;;
+esac
+BUILD_ENV=""
+for v in KOSHA_DOC_STORE_COMPRESSION KOSHA_DOC_STORE_ZSTD_LEVEL KOSHA_DOC_STORE_ZSTD_DICT_BYTES \
+         KOSHA_DOC_STORE_ZSTD_SAMPLE_BYTES; do
+  if [ -n "${!v:-}" ]; then BUILD_ENV="$BUILD_ENV -e $v=${!v}"; fi
+done
+if [ -n "$BUILD_ENV" ]; then echo "builder env:$BUILD_ENV"; fi
 MAX_DOCS="${MAX_DOCS:-0}"
 TENANT="${KOSHA_TENANT:-default}"
 SCOPED="$TENANT/$NS"
@@ -72,7 +89,8 @@ fi
 cd ~/kosha
 sudo docker build -q --target builder -t kosha-builder:bench . >/dev/null
 sudo rm -rf "/data/segments-out/$NS"
-sudo docker run --rm -v /data:/data kosha-builder:bench sh -c "
+# shellcheck disable=SC2086  # BUILD_ENV is a list of -e flags
+sudo docker run --rm $BUILD_ENV -v /data:/data kosha-builder:bench sh -c "
   cargo build --release --locked -p kosha-build-segments &&
   ./target/release/kosha-build-segments \
     --shards-dir /data/corpus-txt $EMB_ARGS \

@@ -13491,6 +13491,7 @@ mod tests {
             fuzzy_bloom: kosha_core::fuzzy::build_fuzzy_bloom(terms.iter().copied()),
             vector_fields: None,
             multi_vectors: Vec::new(),
+            doc_store_compression: None,
         };
         let mut query: SearchQuery = serde_json::from_str(
             r#"{"query_text": "contract breach", "filter": {"term": {"matter": "m1"}}}"#,
@@ -14538,6 +14539,7 @@ mod tests {
             posting_blobs_raw: Default::default(),
             vector_fields: Default::default(),
             multi_vectors: Default::default(),
+            doc_store_compression: None,
         }
     }
 
@@ -18051,6 +18053,7 @@ mod tests {
             fuzzy_bloom: None,
             vector_fields: None,
             multi_vectors: Vec::new(),
+            doc_store_compression: None,
         };
         // Deliberately unsorted input: S3 listing order must not leak into
         // the rebuilt manifest.

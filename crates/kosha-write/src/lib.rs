@@ -1983,8 +1983,16 @@ impl Indexer {
             uuid::Uuid::new_v4().simple()
         ));
         let seg_dir = ns_dir.join(seg_id.0.as_str());
-        let mut writer =
-            kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir).with_analysis(&analysis);
+        // Research #388: a merge keeps its inputs' doc-store format unless
+        // `KOSHA_DOC_STORE_COMPRESSION` says otherwise. Footers only; an
+        // unreadable one is decided by the open below, as before.
+        let any_input_compressed = plan.inputs.iter().any(|entry| {
+            kosha_segment::SegmentReader::read_footer(&input_dirs[&entry.segment_id])
+                .is_ok_and(|footer| footer.doc_store_compression.is_some())
+        });
+        let mut writer = kosha_segment::SegmentWriter::new(seg_id.clone(), seg_dir)
+            .with_analysis(&analysis)
+            .inherit_doc_store_compression(any_input_compressed);
         let mut any_docs = false;
         let old_segment_ids = plan.input_ids();
         let seed_vectors = vector_index
@@ -4386,6 +4394,105 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Research #388: a namespace mixing raw and compressed doc stores
+    /// compacts into a compressed one (with `KOSHA_DOC_STORE_COMPRESSION`
+    /// unset, a merge keeps its inputs' format), every record and sidecar
+    /// vector survives bit-identical, and the output keeps vectors out of
+    /// the doc store.
+    #[test]
+    fn compaction_of_mixed_doc_store_formats_keeps_compression() {
+        if kosha_segment::DocStoreCompressionMode::from_env()
+            != kosha_segment::DocStoreCompressionMode::Auto
+        {
+            eprintln!("skipped: KOSHA_DOC_STORE_COMPRESSION is set in this environment");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kosha-compact-zstd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = Indexer::new(dir.clone());
+        let ns = NamespaceId("z".into());
+        let vector = |i: usize| -> Vec<f32> { vec![i as f32 + 0.25, -(i as f32), 0.5, 1.0e-3] };
+        let text = |i: usize| format!("passage {i} about compressed document stores and zstd");
+        for seg in 0..3 {
+            let docs = (0..40)
+                .map(|j| {
+                    let i = seg * 40 + j;
+                    Document {
+                        id: DocumentId(format!("d{i}")),
+                        fields: vec![
+                            Field::text("text", text(i)),
+                            Field {
+                                name: "emb".into(),
+                                field_type: kosha_core::FieldType::Vector,
+                                value: serde_json::to_string(&vector(i)).unwrap(),
+                            },
+                        ],
+                    }
+                })
+                .collect();
+            idx.index_documents(ns.clone(), docs).unwrap();
+            idx.flush_namespace(&ns).unwrap();
+        }
+        let before = idx.manifest(&ns).unwrap();
+        assert_eq!(before.segments.len(), 3);
+
+        // Rewrite the first segment in place with a compressed doc store:
+        // same documents in the same order, so every other file agrees.
+        let first = before.segments[0].segment_id.clone();
+        let first_dir = dir.join(&ns.0).join(&first.0);
+        let rebuilt = dir.join("rebuilt");
+        {
+            let reader = kosha_segment::SegmentReader::open(first_dir.clone()).unwrap();
+            assert!(!reader.doc_store_compressed());
+            let mut w = kosha_segment::SegmentWriter::new(first.clone(), rebuilt.clone())
+                .with_doc_store_zstd(Some(kosha_segment::DocStoreZstdConfig::default()));
+            for raw in reader.iter_doc_records_raw() {
+                let raw = raw.unwrap();
+                w.add_document_with_vectors(raw.record.doc_id, raw.record.fields, raw.vectors);
+            }
+            let footer = w.finalize(kosha_core::Bm25Params::default()).unwrap();
+            assert!(footer.doc_store_compression.is_some());
+        }
+        for entry in std::fs::read_dir(&rebuilt).unwrap().flatten() {
+            std::fs::copy(entry.path(), first_dir.join(entry.file_name())).unwrap();
+        }
+        let mixed: Vec<bool> = before
+            .segments
+            .iter()
+            .map(|e| {
+                kosha_segment::SegmentReader::open(dir.join(&ns.0).join(&e.segment_id.0))
+                    .unwrap()
+                    .doc_store_compressed()
+            })
+            .collect();
+        assert_eq!(mixed, vec![true, false, false], "a mixed-format namespace");
+
+        let result = idx
+            .compact_namespace_with_options(&ns, CompactOptions::full())
+            .unwrap();
+        assert!(result.merged);
+        let after = idx.manifest(&ns).unwrap();
+        assert_eq!(after.segments.len(), 1);
+        let seg_dir = dir.join(&ns.0).join(&after.segments[0].segment_id.0);
+        let reader = kosha_segment::SegmentReader::open(seg_dir).unwrap();
+        assert!(reader.doc_store_compressed(), "compaction kept compression");
+        assert!(reader.footer().doc_vectors, "vectors stay in the sidecar");
+        let mut seen = 0;
+        for record in reader.iter_doc_records() {
+            let record = record.unwrap();
+            let i: usize = record.doc_id.0[1..].parse().unwrap();
+            let t = record.fields.iter().find(|f| f.name == "text").unwrap();
+            assert_eq!(t.value, text(i));
+            let emb = record.fields.iter().find(|f| f.name == "emb").unwrap();
+            let got: Vec<f32> = serde_json::from_str(&emb.value).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&vector(i)), "doc {i}");
+            seen += 1;
+        }
+        assert_eq!(seen, 120);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

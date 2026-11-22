@@ -2029,6 +2029,38 @@ pub struct Footer {
     /// stay byte-identical to before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub multi_vectors: Vec<MultiVectorField>,
+    /// How `doc_store.bin` records are compressed (research #388). `None`
+    /// — every segment written before #388, and every segment written
+    /// since without `KOSHA_DOC_STORE_COMPRESSION=zstd` — means records
+    /// are stored raw, exactly as before; nothing is serialized then, so
+    /// such footers stay byte-identical. `Some` means each record is its
+    /// own zstd frame (or kept raw when compression would not shrink it),
+    /// the per-segment dictionary sits in the `doc_store.offsets` trailer,
+    /// and `doc_store.offsets` spans are of the stored (compressed) bytes,
+    /// so ranged page reads still fetch only the records they need.
+    /// Readers that predate #388 ignore this field and fail to parse such
+    /// records ("truncated or malformed"): roll back only after compacting
+    /// with `KOSHA_DOC_STORE_COMPRESSION=none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_store_compression: Option<DocStoreCompression>,
+}
+
+/// `Footer::doc_store_compression` (research #388).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocStoreCompression {
+    /// Codec id. Only [`DocStoreCompression::ZSTD_DICT`] exists; a reader
+    /// refuses to open a segment naming any other codec rather than guess.
+    pub codec: String,
+    /// zstd level the records were compressed at (informational).
+    pub level: i32,
+    /// Length of the trained dictionary in the `doc_store.offsets`
+    /// trailer; `0` means plain zstd without a dictionary.
+    pub dict_bytes: u32,
+}
+
+impl DocStoreCompression {
+    /// Per-record zstd frames with a per-segment trained dictionary.
+    pub const ZSTD_DICT: &'static str = "zstd-dict";
 }
 
 /// Value type of one filter column (#244). A field name can appear with
@@ -4586,6 +4618,7 @@ mod tests {
             fuzzy_bloom: None,
             vector_fields: None,
             multi_vectors: Vec::new(),
+            doc_store_compression: None,
         }
     }
 
