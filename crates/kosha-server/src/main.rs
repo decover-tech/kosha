@@ -1703,6 +1703,18 @@ impl AppState {
             posting_spans::config_from_env(),
         );
 
+        let tenant_limits = tenant_limits::TenantLimiter::from_env()
+            .unwrap_or_else(|e| fatal(&format!("tenant limits: {e}")));
+        // Every process-wide cache splits its budget between tenants by
+        // their plan weight, with `KOSHA_CACHE_TENANT_MIN_BYTES` as each
+        // active tenant's floor (#342).
+        let tenant_shares =
+            kosha_core::tenancy::TenantShares::from_env().with_weights(tenant_limits.weight_fn());
+        cache.set_tenant_shares(tenant_shares.clone());
+        searcher.set_tenant_shares(tenant_shares.clone());
+        let mut result_cache = ResultCache::new(result_cache_budget());
+        result_cache.shares = tenant_shares;
+
         Self {
             controller: Mutex::new(control_store),
             role,
@@ -1819,8 +1831,7 @@ impl AppState {
                     (wait_ms > 0).then(|| Duration::from_millis(wait_ms)),
                 )
             },
-            tenant_limits: tenant_limits::TenantLimiter::from_env()
-                .unwrap_or_else(|e| fatal(&format!("tenant limits: {e}"))),
+            tenant_limits,
             #[cfg(all(feature = "s3", feature = "postgres"))]
             hydration_leases,
             #[cfg(all(feature = "s3", feature = "postgres"))]
@@ -1840,7 +1851,7 @@ impl AppState {
             gc_stats: segment_gc::GcStats::default(),
             gc_lock: Mutex::new(()),
             completed_hydrations: Mutex::new(HashMap::new()),
-            result_cache: Mutex::new(ResultCache::new(result_cache_budget())),
+            result_cache: Mutex::new(result_cache),
             rerankers: rerank::RerankRegistry::from_env(),
             embedders: embedding::EmbedderRegistry::from_env(),
             posting_blob_presence: Mutex::new(HashMap::new()),
@@ -4191,13 +4202,22 @@ impl AppState {
         let filters_of = |p: &Path| filter_files.get(p).map(Vec::as_slice).unwrap_or(&[]);
         let mut outcome = HydrationOutcome::default();
         let (owned, waiting) = partition_for_hydration(&self.in_flight_segments, seg_paths, |p| {
-            Self::scoring_complete(
+            let complete = Self::scoring_complete(
                 p,
                 knn_field,
                 vectors_ranged,
                 filters_of(p),
                 manifest_footers.get(p).copied(),
-            )
+            );
+            // A search's segment found with its scoring files already local
+            // is a disk-cache hit for its tenant; one that must hydrate is a
+            // miss (#342, `kosha_cache_{hits,misses}{cache="nvme"}`).
+            if let Ok(rel) = p.strip_prefix(&self.data_dir) {
+                let rel = rel.to_string_lossy();
+                self.cache
+                    .record_lookup(kosha_core::tenancy::tenant_of_segment_dir(&rel), complete);
+            }
+            complete
         });
 
         if !owned.is_empty() {
@@ -5739,6 +5759,23 @@ fn request_id() -> String {
     REQUEST_ID.with(|r| r.borrow().clone())
 }
 
+/// Every cache's per-tenant figures for `kosha_cache_*` (#342).
+fn cache_tenant_samples(state: &AppState) -> Vec<metrics::CacheTenantSample> {
+    let result = state.result_cache.lock().unwrap().tenants.stats();
+    [
+        ("nvme", state.cache.tenant_stats()),
+        ("segment", state.searcher.segment_cache_tenant_stats()),
+        ("result", result),
+    ]
+    .into_iter()
+    .flat_map(|(cache, stats)| {
+        stats
+            .into_iter()
+            .map(move |stats| metrics::CacheTenantSample { cache, stats })
+    })
+    .collect()
+}
+
 /// `GET /metrics`: the Prometheus text exposition of [`metrics::Metrics`],
 /// with the gauges and counters the server already keeps elsewhere read at
 /// scrape time. `KOSHA_METRICS=off` hides the route (404);
@@ -5765,6 +5802,7 @@ fn handle_metrics(state: &AppState, headers: &HashMap<String, String>) -> String
         segment_cache_bytes: state.searcher.segment_cache_bytes(),
         nvme_evictions: state.cache.eviction_generation(),
         segment_checksum_failures,
+        cache_tenants: cache_tenant_samples(state),
     });
     format!(
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {}\r\n\r\n{body}",
@@ -8420,6 +8458,12 @@ fn canonical_query_for_cache(query: &SearchQuery) -> Option<String> {
 /// last-use tick with linear-scan eviction (entry counts are small at
 /// realistic budgets). Response strings are cached verbatim, so a hit is
 /// one map lookup plus a clone.
+///
+/// Tenants (#342): the key's namespace is the full `<tenant>/<name>` id,
+/// so two tenants with the same namespace name and query never share an
+/// entry. Bytes are accounted per tenant, and eviction takes the least
+/// recently used entry of the tenant furthest over its weighted share of
+/// the budget (see [`kosha_core::tenancy::TenantShares`]).
 struct ResultCache {
     entries: HashMap<(String, u64, String), ResultCacheEntry>,
     bytes: usize,
@@ -8427,6 +8471,8 @@ struct ResultCache {
     tick: u64,
     hits: u64,
     misses: u64,
+    tenants: kosha_core::tenancy::TenantLedger,
+    shares: kosha_core::tenancy::TenantShares,
 }
 
 struct ResultCacheEntry {
@@ -8444,18 +8490,23 @@ impl ResultCache {
             tick: 0,
             hits: 0,
             misses: 0,
+            tenants: Default::default(),
+            shares: kosha_core::tenancy::TenantShares::from_env(),
         }
     }
 
     fn lookup(&mut self, key: &(String, u64, String)) -> Option<String> {
         self.tick += 1;
         let tick = self.tick;
+        let tenant = kosha_core::tenancy::tenant_of_namespace(&key.0);
         if let Some(e) = self.entries.get_mut(key) {
             e.last_used = tick;
             self.hits += 1;
+            self.tenants.hit(tenant);
             Some(e.resp.clone())
         } else {
             self.misses += 1;
+            self.tenants.miss(tenant);
             None
         }
     }
@@ -8470,6 +8521,31 @@ impl ResultCache {
             keep
         });
         self.bytes -= freed;
+        self.tenants.sub_bytes(
+            kosha_core::tenancy::tenant_of_namespace(namespace),
+            freed as u64,
+        );
+    }
+
+    /// The next entry to evict: the least recently used entry of the
+    /// tenant furthest over its share (#342).
+    fn next_victim(&self) -> Option<(String, u64, String)> {
+        let mut oldest: HashMap<&str, (&(String, u64, String), &ResultCacheEntry)> = HashMap::new();
+        for (key, entry) in &self.entries {
+            let tenant = kosha_core::tenancy::tenant_of_namespace(&key.0);
+            let slot = oldest.entry(tenant).or_insert((key, entry));
+            if entry.last_used < slot.1.last_used {
+                *slot = (key, entry);
+            }
+        }
+        let usage = self.tenants.usage();
+        self.shares
+            .pick_victim(self.budget as u64, &usage, |t| {
+                oldest.get(t).map(|(_, e)| e.bytes as u64)
+            })
+            .and_then(|t| oldest.get(t))
+            .or_else(|| oldest.values().min_by_key(|(_, e)| e.last_used))
+            .map(|(k, _)| (*k).clone())
     }
 
     fn insert(&mut self, key: (String, u64, String), resp: &str) {
@@ -8482,11 +8558,14 @@ impl ResultCache {
         if entry_bytes > self.budget / 4 {
             return;
         }
+        let tenant = kosha_core::tenancy::tenant_of_namespace(&key.0).to_string();
         if let Some(old) = self.entries.remove(&key) {
             self.bytes -= old.bytes;
+            self.tenants.sub_bytes(&tenant, old.bytes as u64);
         }
         self.tick += 1;
         self.bytes += entry_bytes;
+        self.tenants.add_bytes(&tenant, entry_bytes as u64);
         self.entries.insert(
             key,
             ResultCacheEntry {
@@ -8496,16 +8575,14 @@ impl ResultCache {
             },
         );
         while self.bytes > self.budget {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, _)| k.clone())
-            else {
+            let Some(victim) = self.next_victim() else {
                 break;
             };
-            if let Some(e) = self.entries.remove(&oldest) {
+            if let Some(e) = self.entries.remove(&victim) {
                 self.bytes -= e.bytes;
+                let tenant = kosha_core::tenancy::tenant_of_namespace(&victim.0);
+                self.tenants.sub_bytes(tenant, e.bytes as u64);
+                self.tenants.evicted(tenant);
             }
         }
     }
@@ -20209,6 +20286,96 @@ mod tests {
         let stats = body_of(&handle_namespace_stats("docs", "acme", &state));
         assert!(stats.get("recent_queries").is_none(), "{stats}");
     }
+    // ─── Per-tenant cache isolation (#342) ────────────────────────────────
+
+    /// Two tenants with the same namespace name and the same query get
+    /// separate result-cache entries: neither can be served the other's
+    /// cached response, on the first search or on a repeat.
+    #[test]
+    fn result_cache_never_serves_one_tenant_another_tenants_entry() {
+        let state = test_state();
+        for (tenant, doc, text) in [
+            ("acme", "acme-doc", "breach of contract by acme"),
+            ("globex", "globex-doc", "breach of contract by globex"),
+        ] {
+            let indexed = v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/docs/documents",
+                one_doc(doc, text),
+            );
+            assert_eq!(status_of(&indexed), 200, "{indexed}");
+            let flushed = v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/docs/flush",
+                serde_json::json!({}),
+            );
+            assert_eq!(status_of(&flushed), 200, "{flushed}");
+        }
+        let search = |tenant: &str| -> Vec<String> {
+            let resp = v1(
+                &state,
+                tenant,
+                "POST /v1/namespaces/docs/search",
+                serde_json::json!({"query_text": "breach contract"}),
+            );
+            assert_eq!(status_of(&resp), 200, "{resp}");
+            body_of(&resp)["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["doc_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for _ in 0..2 {
+            assert_eq!(search("acme"), ["acme-doc"]);
+            assert_eq!(search("globex"), ["globex-doc"]);
+        }
+        let cache = state.result_cache.lock().unwrap();
+        let mut namespaces: Vec<&str> = cache.entries.keys().map(|k| k.0.as_str()).collect();
+        namespaces.sort_unstable();
+        assert_eq!(namespaces, ["acme/docs", "globex/docs"]);
+        assert_eq!(
+            (cache.hits, cache.misses),
+            (2, 2),
+            "each tenant hit its own"
+        );
+        let stats = cache.tenants.stats();
+        assert_eq!(stats.len(), 2);
+        assert!(stats
+            .iter()
+            .all(|s| s.hits == 1 && s.misses == 1 && s.bytes > 0));
+    }
+
+    /// One tenant filling the result cache evicts its own entries, not a
+    /// quieter tenant's, while that tenant is under its share.
+    #[test]
+    fn result_cache_evicts_from_the_tenant_over_its_share() {
+        let mut c = ResultCache::new(10_000);
+        c.shares = kosha_core::tenancy::TenantShares::new(1_000);
+        for i in 0..5 {
+            c.insert(rc_key("beta/docs", 1, &format!("q{i}")), &"x".repeat(200));
+        }
+        for i in 0..200 {
+            c.insert(rc_key("acme/big", 1, &format!("q{i}")), &"x".repeat(200));
+        }
+        assert!(c.bytes <= 10_000);
+        for i in 0..5 {
+            assert!(
+                c.lookup(&rc_key("beta/docs", 1, &format!("q{i}")))
+                    .is_some(),
+                "beta's entry q{i} survived acme's flood"
+            );
+        }
+        let stats = c.tenants.stats();
+        let acme = stats.iter().find(|s| s.tenant == "acme").unwrap();
+        let beta = stats.iter().find(|s| s.tenant == "beta").unwrap();
+        assert!(acme.evictions > 0);
+        assert_eq!(beta.evictions, 0);
+        assert_eq!(acme.bytes + beta.bytes, c.bytes as u64);
+    }
+
     // ─── Per-tenant quotas and rate limits (#341) ────────────────────────
 
     fn limited_state(json: &str) -> AppState {

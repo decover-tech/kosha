@@ -60,14 +60,23 @@ plus `+Inf`.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `kosha_cache_bytes` | gauge | `cache` | `nvme`: bytes in the local read-through file cache (`KOSHA_DATA_DIR`). `segment`: approximate bytes of parsed segments held in memory (the `KOSHA_SEGMENT_CACHE_MAX_BYTES` ledger) |
-| `kosha_cache_evictions_total` | counter | `cache` | `nvme`: evictions from the local file cache, one per file or directory (such as a segment) removed, whether by the `KOSHA_CACHE_MAX_BYTES` LRU or by an explicit eviction |
+| `kosha_cache_bytes` | gauge | `cache` (`tenant`) | `nvme`: bytes in the local read-through file cache (`KOSHA_DATA_DIR`). `segment`: approximate bytes of parsed segments held in memory (the `KOSHA_SEGMENT_CACHE_MAX_BYTES` ledger). `result`: bytes of cached `POST /search` responses (`KOSHA_RESULT_CACHE_MAX_BYTES`) |
+| `kosha_cache_evictions_total` | counter | `cache` (`tenant`) | `nvme`: evictions from the local file cache, one per file or directory (such as a segment) removed, whether by the `KOSHA_CACHE_MAX_BYTES` limit or by an explicit eviction. `segment`, `result`: entries evicted to stay within the cache's budget |
+| `kosha_cache_hits_total` | counter | `cache` (`tenant`) | Lookups that found their entry (#342). `nvme`: a search's segment whose scoring files were already local. `segment`: a parsed segment found in memory. `result`: a search answered from the result cache |
+| `kosha_cache_misses_total` | counter | `cache` (`tenant`) | Lookups that did not (#342). `nvme`: a search's segment that had to be hydrated. `segment`: a segment opened and parsed. `result`: a cacheable search that ran |
 | `kosha_hydrations_total` | counter | `source` | Segment files a hydration needed, by where they came from. `s3`: fetched from the object store. `peer`: streamed from the replica holding the hydration lease. `local`: already in the local cache when the fetch ran. Ranged span reads of doc stores and postings are not counted. Stays at zero without S3 |
 | `kosha_hydration_lease_outcome_total` | counter | `outcome` | Cross-replica hydration lease claims (S3 and Postgres builds with `POD_IP` set). `won`: this replica fetches the file. `streamed_from_peer`: another replica held the lease and served the bytes. `timeout`: the holder did not serve the bytes within the peer-fetch budget (or the fetch failed), and the file was fetched from S3 instead |
 | `kosha_segment_checksum_failures_total` | counter | none | Hydrated segment files that failed their `_COMMIT` size or CRC check, refetch failures included. The same number as `segment_checksum_failures` in `GET /v1/stats` |
 
 Values that already exist elsewhere in the server (cache bytes, NVMe evictions, checksum
 failures, queue depth) are read when Prometheus scrapes, not counted twice.
+
+Each cache keeps these figures per tenant (#342): the tenant is the first component of the
+`<tenant>/<name>` namespace id, and bare namespace ids from before tenants existed count as
+one shared `_legacy` tenant. Without tenant labels each `kosha_cache_*` family has one series
+per cache, summed over tenants; with `KOSHA_METRICS_TENANT_LABELS=on` it has one series per
+cache and tenant instead (see [Tenant labels](#tenant-labels)). The labelled NVMe evictions add
+up to the unlabelled count.
 
 ## Namespace labels
 
@@ -90,10 +99,13 @@ Per-namespace dashboards are tracked separately (#214).
 
 ## Tenant labels
 
-`KOSHA_METRICS_TENANT_LABELS=on` adds a `tenant` label to `kosha_tenant_rejections_total`,
-and to no other metric. The same trade-off as namespace labels applies: one series per tenant
-and reason, every scraper sees tenant ids, and recording a rejection takes the family's lock
-to find its series. Rejections are rare next to searches, so the cost is off the hot path.
+`KOSHA_METRICS_TENANT_LABELS=on` adds a `tenant` label to `kosha_tenant_rejections_total`
+and to the `kosha_cache_bytes`, `kosha_cache_hits_total`, `kosha_cache_misses_total` and
+`kosha_cache_evictions_total` families, and to no other metric. The same trade-off as
+namespace labels applies: one series per tenant and reason (or cache), every scraper sees
+tenant ids, and recording a rejection takes the family's lock to find its series. Rejections
+are rare next to searches, so the cost is off the hot path; the cache figures are kept by the
+caches regardless and only read per scrape.
 
 ## Overhead
 
