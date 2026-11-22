@@ -7568,16 +7568,53 @@ impl SegmentReader {
     /// radius is scaled first — see [`centroid_probe_score`]. At any alpha
     /// other than the default 1.0 the result is a ranking score, no longer
     /// a guaranteed lower bound.
-    fn centroid_lower_bound(query: &[f32], centroid: &[f32], radius: f32) -> f32 {
-        centroid_probe_score(
-            kosha_vector_spfresh::cosine_distance(query, centroid),
-            radius,
-            knn_probe_radius_alpha(),
-        )
+    ///
+    /// One score per posting of `vi`, in posting order. On a unit-norm
+    /// column the centroids are unit vectors too (the writer renormalizes
+    /// them), so the query is normalized once and each distance is a single
+    /// dot product instead of `cosine_distance`'s three. Both the global
+    /// cutoff and each segment's own ranking come from this function, so
+    /// they stay in the same units.
+    fn centroid_lower_bounds(vi: &LazyVectorIndex, query: &[f32]) -> Vec<f32> {
+        let alpha = knn_probe_radius_alpha();
+        let unit = Self::unit_query(vi, query);
+        vi.centroids
+            .iter()
+            .zip(&vi.radii)
+            .map(|(c, &r)| {
+                let distance = match &unit {
+                    Some(unit) => 1.0 - kosha_vector_spfresh::dot(unit, c).clamp(-1.0, 1.0),
+                    None => kosha_vector_spfresh::cosine_distance(query, c),
+                };
+                centroid_probe_score(distance, r, alpha)
+            })
+            .collect()
+    }
+
+    /// `query` scaled to unit length when `vi` stores unit vectors, so a
+    /// stored f32 vector's cosine similarity is a bare dot product; `None`
+    /// for a column that stores raw magnitudes. A zero query stays zero and
+    /// scores `0` against everything, as `cosine_similarity` has it.
+    fn unit_query(vi: &LazyVectorIndex, query: &[f32]) -> Option<Vec<f32>> {
+        vi.unit_norm.then(|| {
+            let mut unit = query.to_vec();
+            kosha_vector_spfresh::normalize_in_place(&mut unit);
+            unit
+        })
+    }
+
+    /// Cosine similarity of the query to one stored f32 vector of `vi`:
+    /// a dot product against `unit` (see [`Self::unit_query`]) when the
+    /// column is unit-norm, the full cosine otherwise.
+    fn f32_similarity(lanes: DotLanes, unit: Option<&[f32]>, query: &[f32], v: &[f32]) -> f32 {
+        match unit {
+            Some(unit) => lanes.dot(unit, v).clamp(-1.0, 1.0),
+            None => lanes.cosine_similarity(query, v),
+        }
     }
 
     /// Lower-bound distance from `query` to every posting of `field`'s
-    /// column (#204; see [`Self::centroid_lower_bound`]) — **pure CPU,
+    /// column (#204; see [`Self::centroid_lower_bounds`]) — **pure CPU,
     /// zero posting I/O**: centroids and radii are resident in
     /// [`LazyVectorIndex`], loaded from the column's offsets sidecar.
     ///
@@ -7604,13 +7641,7 @@ impl SegmentReader {
         if vi.dim != query.len() {
             return None;
         }
-        Some(
-            vi.centroids
-                .iter()
-                .zip(&vi.radii)
-                .map(|(c, &r)| Self::centroid_lower_bound(query, c, r))
-                .collect(),
-        )
+        Some(Self::centroid_lower_bounds(vi, query))
     }
 
     /// Score only the postings of the segment's first vector column whose
@@ -8024,6 +8055,7 @@ impl SegmentReader {
         let probe = Self::probe_query(vi, query);
         let is_candidate = |id: u32| candidates.binary_search(&id).is_ok();
         let lanes = DotLanes::from_env();
+        let unit = Self::unit_query(vi, query);
         for range_idx in 0..vi.ranges.len() {
             let posting = match self.hydrate_posting(vi, range_idx) {
                 Ok(posting) => posting,
@@ -8031,7 +8063,7 @@ impl SegmentReader {
             };
             posting.for_each_similarity(
                 Some(&is_candidate),
-                |v| lanes.cosine_similarity(query, v),
+                |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
                 &probe,
                 &vi.centroids[range_idx],
                 |id, sim, _| scored.push((id, sim as f64)),
@@ -8079,18 +8111,15 @@ impl SegmentReader {
         fetch: Option<VectorSpanFetch<'_>>,
     ) -> Result<ProbedCandidates, KoshaError> {
         // Rank this segment's qualifying postings nearest-first (by lower
-        // bound, not raw centroid distance — see `centroid_lower_bound`),
+        // bound, not raw centroid distance — see `centroid_lower_bounds`),
         // so the `max_probes` cap keeps the *best* candidates when it
         // bites. `max_distance` is itself a lower-bound cutoff (computed
         // from the same bound across all segments — see
         // `Searcher::knn_plan`), so both sides of this
         // comparison are in the same units.
-        let mut ranked: Vec<(usize, f32)> = vi
-            .centroids
-            .iter()
-            .zip(&vi.radii)
+        let mut ranked: Vec<(usize, f32)> = Self::centroid_lower_bounds(vi, query)
+            .into_iter()
             .enumerate()
-            .map(|(i, (c, &r))| (i, Self::centroid_lower_bound(query, c, r)))
             .collect();
         ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         // Postings inside the budget: within the cutoff, capped at
@@ -8107,6 +8136,7 @@ impl SegmentReader {
         let mut errors: Vec<f32> = Vec::new();
         let probe = Self::probe_query(vi, query);
         let lanes = DotLanes::from_env();
+        let unit = Self::unit_query(vi, query);
         for (position, (range_idx, _)) in ranked.iter().enumerate() {
             if position >= budgeted {
                 // Past the budget. Without a restriction this is where the
@@ -8124,7 +8154,7 @@ impl SegmentReader {
             probes += 1;
             self.hydrate_posting(vi, *range_idx)?.for_each_similarity(
                 accept,
-                |v| lanes.cosine_similarity(query, v),
+                |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
                 &probe,
                 &vi.centroids[*range_idx],
                 |id, sim, err| {
