@@ -5,8 +5,8 @@
 # benchmark GitHub Action executes.
 #
 # Usage:
-#   [WARM_GATE=queries|preload] ./run_phases.sh bm25   <namespace> <out-dir> [qps] [duration]
-#   [WARM_GATE=queries|preload] ./run_phases.sh vector <namespace> <out-dir> [qps] [duration]
+#   [WARM_GATE=queries|preload|cold] ./run_phases.sh bm25   <namespace> <out-dir> [qps] [duration]
+#   [WARM_GATE=queries|preload|cold] ./run_phases.sh vector <namespace> <out-dir> [qps] [duration]
 #
 # WARM_GATE selects how the namespace gets warm before measuring:
 #
@@ -25,6 +25,23 @@
 #     not turbopuffer cold either (tpuf cold sends disable_cache on every
 #     query so every query reads object storage; Kosha has no equivalent
 #     switch, and a phase after a full preload measures a warm engine).
+#
+#   cold (research, #380): a cold phase with NO preload at all. Wipe the
+#     local store, restart, and measure first-touch queries straight away:
+#     every byte a query needs comes from S3 during the measured phase, so
+#     the per-query hydrate_files / hydrate_mb / s3_bytes / vector_gets /
+#     postings_gets fields of the `search timing:` lines in
+#     server/<phase>.log.gz are the cold cost of the layout. The container
+#     must run WITHOUT KOSHA_WARMUP_NAMESPACES and with
+#     KOSHA_WARMUP_USAGE=off (else the persisted usage warm set is warmed
+#     at boot), and with span promotion off (benchmark.yml does all three
+#     for warm_gate=cold; this script refuses to run otherwise). One phase
+#     only: knn_cold_nocache (vector) or cold_or_nocache (bm25). Note that
+#     a first-touch kNN query still hydrates footer, inverted.idx,
+#     doc_store.offsets and vector.offsets of EVERY segment (knn_plan opens
+#     every segment to rank its centroids), so the first queries pay a
+#     per-segment convoy whatever the layout; read the steady part of the
+#     phase separately from its first minutes.
 #
 #   preload (default here, for callers that predate the switch): the
 #     protocol below, unchanged: wipe, restart, boot preload gated on
@@ -63,7 +80,7 @@ WARM_GATE="${WARM_GATE:-preload}"
 # What each hit returns: ids (doc_id + score, as tpuf queries do) or all.
 RETURN_FIELDS="${RETURN_FIELDS:-ids}"
 case "$RETURN_FIELDS" in ids|all) ;; *) echo "RETURN_FIELDS must be ids or all, got $RETURN_FIELDS"; exit 1 ;; esac
-case "$WARM_GATE" in queries|preload) ;; *) echo "WARM_GATE must be queries or preload, got $WARM_GATE"; exit 1 ;; esac
+case "$WARM_GATE" in queries|preload|cold) ;; *) echo "WARM_GATE must be queries, preload or cold, got $WARM_GATE"; exit 1 ;; esac
 echo "WARM_GATE=$WARM_GATE RETURN_FIELDS=$RETURN_FIELDS"
 
 for f in --no-cache --raw-out --server-timings --return; do $PY $BENCH --help | grep -q -- "$f" || { echo "FLAGS-MISSING $f"; exit 1; }; done
@@ -112,6 +129,25 @@ if [ "$GATE_RC" -ne 0 ]; then
   exit 1
 fi
 echo "WARMUP-READY in $(( $(date +%s) - T0 ))s (warm gate, not measured)"
+elif [ "$WARM_GATE" = cold ]; then
+# ── cold, no preload: wipe, restart, measure first touch ─────────────────
+# Refuse to call anything cold that a boot warmup could have prefetched.
+ENV_DUMP="$(sudo docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' kosha)"
+if printf '%s\n' "$ENV_DUMP" | grep -q '^KOSHA_WARMUP_NAMESPACES='; then
+  echo "::error::WARM_GATE=cold but the kosha container sets KOSHA_WARMUP_NAMESPACES (boot preload)"; exit 1
+fi
+if ! printf '%s\n' "$ENV_DUMP" | grep -qE '^KOSHA_WARMUP_USAGE=(0|false|off)$'; then
+  echo "::error::WARM_GATE=cold needs KOSHA_WARMUP_USAGE=off on the kosha container (usage warm set is warmed at boot otherwise)"; exit 1
+fi
+sudo docker stop kosha >/dev/null
+wipe_local_cache
+T0=$(date +%s)
+BOOT_SINCE=$(iso_now)
+sudo docker start kosha >/dev/null
+for i in $(seq 120); do curl -sf http://127.0.0.1:8080/readyz >/dev/null 2>&1 && break; sleep 5
+  [ "$i" -eq 120 ] && { echo "::error::/readyz not green after 600s with no warmup configured"; curl -s http://127.0.0.1:8080/readyz || true; echo; exit 1; }; done
+save_server_log boot "$BOOT_SINCE"
+echo "COLD-READY in $(( $(date +%s) - T0 ))s local=$(sudo du -sb /data/kosha 2>/dev/null | cut -f1) bytes (no preload)"
 else
 # ── cold reset, warmup-gated ─────────────────────────────────────────────
 sudo docker stop kosha >/dev/null
@@ -171,6 +207,14 @@ if [ "$WARM_GATE" = queries ]; then
   else
     phase knn_warm_nocache --phase warm --knn-embeddings /data/queries_emb.f32 --no-cache
     phase knn_warm_cache   --phase warm --knn-embeddings /data/queries_emb.f32
+  fi
+elif [ "$WARM_GATE" = cold ]; then
+  # First touch only (see the header); a warm phase here would just repeat
+  # warm_gate=queries without its gate.
+  if [ "$SUITE" = "bm25" ]; then
+    phase cold_or_nocache  --phase cold --operator or --no-cache
+  else
+    phase knn_cold_nocache --phase cold --knn-embeddings /data/queries_emb.f32 --no-cache
   fi
 elif [ "$SUITE" = "bm25" ]; then
   phase cold_or_nocache  --phase cold --operator or --no-cache

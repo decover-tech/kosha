@@ -106,7 +106,7 @@ The `benchmark` workflow (`.github/workflows/benchmark.yml`) runs these
 scripts on the bench VM. Its inputs choose how the namespace gets warm,
 which vector snapshot to restore, and whether to keep the VM.
 
-### Warm gate (`warm_gate`: `queries` (default) or `preload`)
+### Warm gate (`warm_gate`: `queries` (default), `preload` or `cold`)
 
 `queries` follows turbopuffer's tpuf-benchmark (`pkg/bench/bench.go`).
 For hot runs, tpuf warms the namespace, then polls with the workload's own
@@ -176,6 +176,21 @@ is what the workflow builds, `queries` fails fast with
 restart with the boot preload, wait for `/readyz`, then run the cold and
 warm phases. On the original vector snapshot the boot preload takes about
 115 minutes, because the server preloads the whole ~249 GB namespace.
+Its "cold" phase runs after that preload, so it measures a warm engine.
+
+`cold` (research, #380) measures first touch with no preload at all. The
+container starts without `KOSHA_WARMUP_NAMESPACES`, with
+`KOSHA_WARMUP_USAGE=off` (else the persisted usage warm set is warmed at
+boot) and with span promotion off. `run_phases.sh` checks the first two,
+wipes the local store, restarts, and runs one phase only
+(`knn_cold_nocache` or `cold_or_nocache`). Every byte a query needs is
+read from S3 during that phase, so the `search timing:` fields
+`hydrate_files`, `hydrate_mb`, `s3_bytes`, `vector_gets` and
+`postings_gets` in `server/<phase>.log.gz` are the per-query cold cost.
+A first-touch kNN query still fetches the small files (footer,
+`inverted.idx`, `doc_store.offsets`, `vector.offsets`) of every segment,
+because `knn_plan` opens every segment, so read the phase's first minutes
+apart from the rest (`knn_log_stats.py --skip-first-s`).
 
 ### What each hit returns (`return_fields`: `ids` (default) or `all`)
 
@@ -253,6 +268,17 @@ roughly 80–90 GB, against 249 GB.
   is off by default. It syncs ~40 GB+ of embeddings, builds 10M docs and
   uploads the segments. That is untimed so far, so run it with
   `suite=vector` and watch the 350-minute limit.
+- `build_segments_args` (research, #380; empty by default) passes extra
+  `kosha-build-segments` flags to that build, for example
+  `--cluster-layout namespace`.
+- Provenance: `build_and_import.sh` writes
+  `snapshots/<name>/build-info.json` (builder commit from `github.sha`, a
+  digest of the builder sources, build args, max docs). The vector suite
+  copies the restored snapshot's file to `vector/snapshot-build-info.json`
+  in the results, or logs that it has none. Snapshots built before this
+  change have none, so their builder commit is unknown. To compare two
+  layouts, build both under new names from one commit rather than reusing
+  an older snapshot.
 
 ### Fast iteration recipe
 
@@ -291,6 +317,15 @@ server logs and per-request records to
 
 A VM kept after a failed run has its container log rescued to
 `runs/rescued-<timestamp>/` before the next run recreates the container.
+
+For kNN cost counters per query (`knn_postings`, `knn_segments`,
+`knn_centroids`, `knn_plan_ms`, opens, hydration and S3 bytes), summarize a
+phase's server log:
+
+```bash
+python3 knn_log_stats.py vector/server/knn_warm_nocache.log.gz
+python3 knn_log_stats.py vector/server/knn_cold_nocache.log.gz --skip-first-s 180
+```
 
 To see where a phase's tail comes from:
 

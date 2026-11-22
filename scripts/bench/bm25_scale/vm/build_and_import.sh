@@ -15,6 +15,13 @@
 #   (#380, research). Restricted to [A-Za-z0-9 =._-]. Pair it with a new
 #   SNAPSHOT_NAME: a snapshot built with other flags is a different corpus.
 #
+# Provenance (#380): next to the snapshot this writes
+# snapshots/<SNAPSHOT_NAME>/build-info.json with BUILDER_SHA (the commit
+# the builder was built from; the workflow passes github.sha, the VM copy
+# has no .git), a digest of the builder sources (crates/, Cargo.toml,
+# Cargo.lock), BUILD_ARGS and MAX_DOCS, so two snapshots can be shown to
+# come from the same builder. Snapshots built before this have none.
+#
 # SNAPSHOT_NAME (default: the namespace) names the snapshot this writes;
 # restore it with restore_namespace.sh <namespace> <snapshot-name>. An
 # existing snapshot is never overwritten unless SNAPSHOT_OVERWRITE=1:
@@ -53,6 +60,10 @@ SNAPSHOT_NAME="${SNAPSHOT_NAME:-$NS}"
 WITH_EMB="${2:-}"
 MAX_DOCS="${MAX_DOCS:-0}"
 BUILD_ARGS="${BUILD_ARGS:-}"
+BUILDER_SHA="${BUILDER_SHA:-unknown}"
+case "$BUILDER_SHA" in
+  *[!0-9a-z]*) echo "::error::BUILDER_SHA must be a hex commit id or unknown, got: $BUILDER_SHA"; exit 1 ;;
+esac
 case "$BUILD_ARGS" in
   *[!A-Za-z0-9\ =._-]*) echo "::error::BUILD_ARGS may only contain [A-Za-z0-9 =._-], got: $BUILD_ARGS"; exit 1 ;;
 esac
@@ -82,6 +93,10 @@ if [ "$WITH_EMB" = "--with-embeddings" ]; then
 fi
 
 cd ~/kosha
+# Digest of what the builder compiles: every file under crates/ plus the
+# workspace manifest and lockfile, by path and content.
+SOURCE_DIGEST="$( { find crates -type f -print0 | sort -z | xargs -0 sha256sum; sha256sum Cargo.toml Cargo.lock; } | sha256sum | cut -d' ' -f1)"
+echo "BUILDER builder_sha=$BUILDER_SHA source_digest=$SOURCE_DIGEST build_args=[$BUILD_ARGS] max_docs=$MAX_DOCS"
 sudo docker build -q --target builder -t kosha-builder:bench . >/dev/null
 sudo rm -rf "/data/segments-out/$NS"
 sudo docker run --rm -v /data:/data kosha-builder:bench sh -c "
@@ -118,6 +133,12 @@ echo "IMPORT-COMPLETE"
 "$SCRIPT_DIR/snapshot_namespace.sh" "$SCOPED" "$SNAPSHOT_NAME"
 # Bucket and local cache now derive from exactly this snapshot: a restore
 # of it right after keeps both instead of re-copying them.
+printf '{"snapshot": "%s", "namespace": "%s", "builder_sha": "%s", "source_digest": "%s", "build_args": "%s", "max_docs": %s, "with_embeddings": "%s", "built_at": "%s"}\n' \
+  "$SNAPSHOT_NAME" "$NS" "$BUILDER_SHA" "$SOURCE_DIGEST" "$BUILD_ARGS" "$MAX_DOCS" "$WITH_EMB" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  > /tmp/build-info.json
+aws s3 cp --only-show-errors /tmp/build-info.json "s3://$SNAPSHOT_CACHE_BUCKET/snapshots/$SNAPSHOT_NAME/build-info.json"
+echo "BUILD-INFO $(cat /tmp/build-info.json)"
+rm -f /tmp/build-info.json
 IDENTITY="$(snapshot_identity "$SNAPSHOT_NAME")"
 marker_write bucket "$NS" "$IDENTITY"
 marker_write local "$NS" "$IDENTITY"
