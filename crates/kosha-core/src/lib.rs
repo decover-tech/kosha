@@ -1878,7 +1878,11 @@ impl StorageBackend for LocalStorage {
         Ok(std::fs::read(self.root.join(path))?)
     }
     fn write(&self, path: &str, data: &[u8]) -> Result<(), KoshaError> {
-        atomic_write(&self.root.join(path), data)
+        let full = self.root.join(path);
+        if let Some(dir) = full.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        atomic_write(&full, data)
     }
     fn exists(&self, path: &str) -> bool {
         self.root.join(path).exists()
@@ -4949,6 +4953,18 @@ mod tests {
     /// partial mix, which is exactly how staging ended up with 0-byte
     /// `doc_store.bin`/`footer.json` in already-published, already-synced
     /// segments.
+    /// A key under a directory that does not exist yet (`_warmset/query.json`
+    /// on a fresh query pod) is written, not refused with NotFound.
+    #[test]
+    fn local_storage_write_creates_missing_parent_directories() {
+        let dir = std::env::temp_dir().join("kosha-core-test-write-creates-parent");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = LocalStorage::new(dir.clone());
+        storage.write("_warmset/query.json", b"{}").unwrap();
+        assert_eq!(storage.read("_warmset/query.json").unwrap(), b"{}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn concurrent_local_storage_write_never_yields_truncated_read() {
         let dir = std::env::temp_dir().join("kosha-core-test-atomic-write-race");
