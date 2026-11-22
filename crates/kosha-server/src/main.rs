@@ -577,6 +577,7 @@ struct HydrationOutcome {
     /// and every later, differently-filtered query silently scored
     /// against only that same stale subset forever (not self-healing —
     /// only a pod restart, which drops the cache, recovered it).
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     bloom_pruned: bool,
     /// `true` when this request hit its hydration byte ceiling
     /// (`KOSHA_HYDRATE_REQUEST_MAX_BYTES`) or waited out the process-wide
@@ -730,6 +731,7 @@ impl HydrationVerdict {
     /// `needs_filters` is the query's filter column names, `None` when it
     /// needs no filter files at all. `knn_field` is the query's
     /// `knn.field`, `None` for a non-kNN query.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn covers(&self, needs_filters: Option<&FilterFields>, knn_field: Option<&str>) -> bool {
         let filters_ok = needs_filters.is_none_or(|fields| {
             self.filters_verified && fields.is_subset(&self.filter_fields_verified)
@@ -795,6 +797,7 @@ fn knn_files_complete(
 /// `knn.field` for a single-vector kNN (#204), and a key of its own for a
 /// late-interaction kNN (#205), whose pass hydrates the field's multivec
 /// files rather than its single-vector column. `None` without kNN.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn knn_verdict_key(query: &SearchQuery) -> Option<String> {
     query.knn.as_ref().map(|knn| {
         if knn.is_late_interaction() {
@@ -1339,6 +1342,7 @@ impl AppState {
         );
 
         // ── Control plane: in-memory or Postgres ─────────────────────────
+        #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
         let mut control_plane_kind: &'static str = "in-memory";
         let control_store: Box<dyn ControlStore> = if let Some(store) = options.control_store {
             store
@@ -2723,6 +2727,7 @@ impl AppState {
     /// CAS against the version the control store holds right now. Never
     /// rebases: a concurrent publish wins and this fails with
     /// `ManifestConflict`, leaving both the store and the indexer alone.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn import_manifest(
         &self,
         ns: &NamespaceId,
@@ -2844,6 +2849,7 @@ impl AppState {
     /// Cache footers parsed during a search's hydration on the manifest(s)
     /// that list their segments. A merged sharded view's segment ids are
     /// `_shard-XXXX/{id}`: those footers belong to the shard namespace.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn remember_search_footers(
         &self,
         ns: &NamespaceId,
@@ -5405,6 +5411,7 @@ fn posting_blob_cache_insert(
     }
 }
 
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 fn redact_database_url(url: &str) -> String {
     // postgresql://user:password@host/db → postgresql://user:***@host/db
     if let Some((scheme_user, rest)) = url.split_once("://") {
@@ -10246,6 +10253,7 @@ fn run_compaction_scheduler_tick(state: &Arc<AppState>, now: Instant) -> Vec<Nam
 /// by segment id (deterministic regardless of S3 listing order), doc counts
 /// from the footers themselves, version 1 (imports start a fresh version
 /// history — the old one is what was lost).
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
 fn manifest_from_footers(footers: Vec<kosha_core::Footer>) -> kosha_core::Manifest {
     let mut footers = footers;
     footers.sort_by(|a, b| a.segment_id.0.cmp(&b.segment_id.0));
@@ -10453,6 +10461,7 @@ fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String
 
     #[cfg(not(feature = "postgres"))]
     {
+        let _ = state;
         let _ = tenant_id;
         let _ = description;
         json_error(
@@ -10945,6 +10954,7 @@ mod tests {
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
+    use std::path::Path;
 
     #[derive(Clone)]
     pub(crate) struct SharedManifestStore {
@@ -11569,6 +11579,7 @@ mod tests {
             .same_contents(&legacy));
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn tiny_upsert_segments_only_hydrate_shards_present_in_the_toc() {
         let state = test_state();
@@ -13779,6 +13790,7 @@ mod tests {
     /// will read: every analysis reading of the query (#220) and its
     /// per-field keys and norms (#249). Fuzzy and wildcard terms are only
     /// known per segment, so those read whole shards (no terms).
+    #[cfg(feature = "s3")]
     #[test]
     fn posting_terms_follow_analysis_and_per_field_keys() {
         let terms = |json: &str| {
@@ -14493,6 +14505,7 @@ mod tests {
         assert_eq!(to_fetch, vec![("ns/seg-1/postings-02.bin".to_string(), 0)]);
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn plan_posting_blob_fetch_skips_stat_for_cached_pairs() {
         use std::cell::Cell;
@@ -14741,6 +14754,7 @@ mod tests {
         assert!(chunk_by_byte_budget(&[], 100).is_empty());
     }
 
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     fn test_footer(id: &str, docs: u32, format_version: u32) -> kosha_core::Footer {
         kosha_core::Footer {
             segment_id: kosha_core::SegmentId(id.into()),
