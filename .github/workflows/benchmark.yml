@@ -216,8 +216,9 @@ jobs:
             echo "::error::vector full-load (~6h) exceeds the job ceiling — run it from a workstation once, then use restore mode"
             exit 1
           fi
-          # ~257GB vector working set: warmup from S3 outlasts the 1h default.
-          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARMUP_TIMEOUT_S=7200 \
+          # ~249GB vector working set: warmup is bound by local disk writes
+          # (~30-45MB/s per file on the gp3 root volume), ~1h55m measured.
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARMUP_TIMEOUT_S=10800 \
             ./run_phases.sh vector $VEC_NS /data/results-ci/vector '${{ inputs.qps }}' '${{ inputs.duration }}'"
 
       - name: Recall check (real recall@k vs. brute-force ground truth)
