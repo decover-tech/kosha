@@ -1825,7 +1825,10 @@ async fn get_object_streamed_with_retry(
 
 /// Write buffer for [`stream_body_to_file`]: large writes instead of one
 /// blocking-pool round trip per network chunk, while keeping per-fetch
-/// memory bounded at hydration fan-out (64 in flight is ~64 MiB).
+/// memory bounded at hydration fan-out. Each fetch holds this buffer plus,
+/// at most, `tokio::fs::File`'s copy of the write in flight (also at most
+/// this size, since `BufWriter` hands it at most a buffer at a time except
+/// for a single oversized chunk), so 64 fetches in flight cost ~128 MiB.
 const STREAM_WRITE_BUFFER: usize = 1 << 20;
 
 /// Write a GET response body to `tmp_path` chunk by chunk, returning what it
@@ -1838,8 +1841,8 @@ const STREAM_WRITE_BUFFER: usize = 1 << 20;
 /// `KOSHA_MAX_CONCURRENT_HYDRATIONS` = 4 batches) a namespace of ~28 MB
 /// `inverted.idx` files put gigabytes of transient buffers behind a single
 /// cold search — the OOM this function exists to remove. Peak is now one
-/// chunk plus one [`STREAM_WRITE_BUFFER`] per in-flight fetch, whatever the
-/// object's size.
+/// chunk plus about two [`STREAM_WRITE_BUFFER`]s per in-flight fetch (see
+/// its doc), whatever the object's size.
 ///
 /// Writes go through a [`STREAM_WRITE_BUFFER`]-sized buffer. Unbuffered,
 /// every network chunk (tens of KB) was its own `tokio::fs` write, a
@@ -1878,7 +1881,8 @@ async fn stream_body_to_file(
 
     // Both the BufWriter and `tokio::fs::File` buffer, so the flush is what
     // makes the bytes real before the caller renames the temp file into
-    // place.
+    // place: `BufWriter::flush` writes out its buffer and then flushes the
+    // inner `File`, which waits for its in-flight blocking write.
     let t_flush = std::time::Instant::now();
     file.flush().await.map_err(KoshaError::Io)?;
     write_ms += t_flush.elapsed().as_secs_f64() * 1e3;
@@ -2256,6 +2260,77 @@ mod tests {
             payload,
             "every chunk must land, in order"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An S3 body arrives as many small, uneven network chunks. Through the
+    /// [`STREAM_WRITE_BUFFER`] they must still land byte-exact and in order:
+    /// chunks that fill the buffer part-way, chunks that straddle a flush,
+    /// one chunk larger than the whole buffer (which `BufWriter` writes
+    /// straight through), and a tail smaller than the buffer that only the
+    /// final flush writes out.
+    #[test]
+    fn buffered_stream_of_many_uneven_chunks_lands_byte_exact() {
+        use hyper::body::{Bytes, Frame};
+        use std::collections::VecDeque;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        /// An http-body 1.x body that yields pre-cut frames, one per poll.
+        struct Chunks(VecDeque<Bytes>);
+        impl hyper::body::Body for Chunks {
+            type Data = Bytes;
+            type Error = std::convert::Infallible;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+                Poll::Ready(self.get_mut().0.pop_front().map(|b| Ok(Frame::data(b))))
+            }
+        }
+
+        let total = 3 * STREAM_WRITE_BUFFER + 12_345;
+        let payload: Vec<u8> = (0..total as u64)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        // Uneven sizes from 1 byte to ~64 KB, with one chunk of 1.5x the
+        // buffer partway through.
+        let sizes = [1usize, 7, 4_093, 65_521, 17, 31_337, 8_191, 1, 60_000];
+        let mut chunks = VecDeque::new();
+        let mut at = 0;
+        let mut i = 0;
+        let big_at = STREAM_WRITE_BUFFER + 5_000;
+        let mut big_done = false;
+        while at < total {
+            let len = if !big_done && at >= big_at {
+                big_done = true;
+                STREAM_WRITE_BUFFER * 3 / 2
+            } else {
+                sizes[i % sizes.len()]
+            };
+            let end = (at + len).min(total);
+            chunks.push_back(Bytes::copy_from_slice(&payload[at..end]));
+            at = end;
+            i += 1;
+        }
+        assert!(big_done, "the oversized chunk is part of the stream");
+        assert!(chunks.len() > 50, "{} chunks", chunks.len());
+
+        let dir = std::env::temp_dir().join(format!("kosha-bufwrite-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_path = dir.join("part.tmp");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let streamed = rt
+            .block_on(stream_body_to_file(
+                aws_sdk_s3::primitives::ByteStream::from_body_1_x(Chunks(chunks)),
+                &tmp_path,
+            ))
+            .expect("stream succeeds");
+
+        assert_eq!(streamed.bytes, total as u64);
+        let written = std::fs::read(&tmp_path).unwrap();
+        assert_eq!(written.len(), total, "the buffered tail must be flushed");
+        assert!(written == payload, "bytes must land exactly, in order");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

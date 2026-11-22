@@ -697,6 +697,17 @@ impl HydrationOutcome {
 
     /// Nothing this search read came from S3, and nothing it needed was
     /// missing or shed: the namespace is warm for this query.
+    ///
+    /// Every fetch path lands in one of the counters checked here: whole
+    /// scaffolding, footer, filter and postings files in `files_fetched` /
+    /// `bytes_fetched` (ranged postings bytes too, with their GETs in
+    /// `postings.ranged_gets`), kNN `vector.idx` ranges or whole files in
+    /// `vectors`, and the page's doc-store spans or whole files in `page`.
+    /// A GET that was shed still counts in its `ranged_gets`, and any fetch
+    /// round counts in a `rounds`, so a fetch that failed or was declined
+    /// also reads as not cached. Manifest-following reads on a query
+    /// replica (#232) are metadata, not this search's data, and are not
+    /// counted.
     fn fully_cached(&self) -> bool {
         self.missing.is_empty()
             && !self.shed
@@ -710,6 +721,23 @@ impl HydrationOutcome {
             && self.page.ranged_gets == 0
             && self.page.whole_files == 0
     }
+}
+
+/// `fully_cached` for a search's timings: nothing came from S3
+/// ([`HydrationOutcome::fully_cached`]) and the search did not score around
+/// anything absent — no kNN segment degraded for a missing `vector.idx`
+/// posting, and no fall back to per-segment BM25 statistics because some
+/// footer or postings could not be read. A gate waiting for this (the
+/// bench's hot-phase warmup, like turbopuffer's `cache_hit_ratio == 1.0`)
+/// must not accept a degraded answer as warm.
+fn search_fully_cached(
+    hydration: &HydrationOutcome,
+    phases: &kosha_query::SearchPhaseStats,
+    knn_degraded_segments: u32,
+) -> bool {
+    hydration.fully_cached()
+        && knn_degraded_segments == 0
+        && phases.bm25_stats != kosha_query::Bm25StatsUsed::SegmentFallback
 }
 
 /// Cached verdict for `completed_hydrations`: NOT a single "namespace is
@@ -7995,6 +8023,8 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 result.knn_degraded_segments.unwrap_or(0),
             );
             state.record_search_access(&ns, manifest, search_query, &phases, &hydration);
+            // Before a rerank replaces `result`.
+            let knn_degraded = result.knn_degraded_segments.unwrap_or(0);
             if let Some(ref provider) = reranker {
                 let (reranked, call) = kosha_query::rerank::apply(&query, result, provider);
                 result = reranked;
@@ -8014,7 +8044,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 cached: false,
                 s3_rounds: hydration.s3_rounds(),
                 s3_bytes: hydration.s3_bytes(),
-                fully_cached: hydration.fully_cached(),
+                fully_cached: search_fully_cached(&hydration, &phases, knn_degraded),
             };
             state.dashboard.record(
                 &ns.0,
@@ -19730,6 +19760,125 @@ mod tests {
         assert_eq!(status_of(&resp), 404, "{resp}");
     }
 
+    #[test]
+    fn hydration_outcome_with_no_fetch_is_fully_cached() {
+        let o = HydrationOutcome::default();
+        assert!(o.fully_cached());
+        assert_eq!(o.s3_rounds(), 0);
+        assert_eq!(o.s3_bytes(), 0);
+        // Bloom pruning narrows what is checked, it fetches nothing.
+        let pruned = HydrationOutcome {
+            bloom_pruned: true,
+            ..Default::default()
+        };
+        assert!(pruned.fully_cached());
+    }
+
+    #[test]
+    fn any_fetch_missing_file_or_shed_is_not_fully_cached() {
+        type SetPosting = fn(&mut posting_spans::PostingFetchStats);
+        type SetPage = fn(&mut doc_spans::PageFetchStats);
+        let one = |f: fn(&mut HydrationOutcome)| {
+            let mut o = HydrationOutcome::default();
+            f(&mut o);
+            o
+        };
+        let mut cases: Vec<(String, HydrationOutcome)> = vec![
+            ("missing".into(), one(|o| o.missing = vec!["seg/f".into()])),
+            ("shed".into(), one(|o| o.shed = true)),
+            ("files_fetched".into(), one(|o| o.files_fetched = 1)),
+            ("bytes_fetched".into(), one(|o| o.bytes_fetched = 1)),
+            ("rounds".into(), one(|o| o.rounds = 1)),
+            (
+                "postings.ranged_gets".into(),
+                one(|o| o.postings.ranged_gets = 1),
+            ),
+            (
+                "postings.whole_files".into(),
+                one(|o| o.postings.whole_files = 1),
+            ),
+        ];
+        let posting_fields: [(&str, SetPosting); 5] = [
+            ("rounds", |s| s.rounds = 1),
+            ("ranged_gets", |s| s.ranged_gets = 1),
+            ("ranged_bytes", |s| s.ranged_bytes = 1),
+            ("whole_files", |s| s.whole_files = 1),
+            ("whole_bytes", |s| s.whole_bytes = 1),
+        ];
+        for (name, set) in posting_fields {
+            let mut o = HydrationOutcome::default();
+            set(&mut o.vectors);
+            cases.push((format!("vectors.{name}"), o));
+        }
+        let page_fields: [(&str, SetPage); 5] = [
+            ("rounds", |s| s.rounds = 1),
+            ("ranged_gets", |s| s.ranged_gets = 1),
+            ("ranged_bytes", |s| s.ranged_bytes = 1),
+            ("whole_files", |s| s.whole_files = 1),
+            ("whole_bytes", |s| s.whole_bytes = 1),
+        ];
+        for (name, set) in page_fields {
+            let mut o = HydrationOutcome::default();
+            set(&mut o.page);
+            cases.push((format!("page.{name}"), o));
+        }
+        for (name, o) in &cases {
+            assert!(!o.fully_cached(), "{name}");
+        }
+    }
+
+    #[test]
+    fn s3_totals_add_every_path_once() {
+        let o = HydrationOutcome {
+            // Whole files plus ranged postings bytes, which the postings
+            // pass already folds into `bytes_fetched`.
+            bytes_fetched: 1_000,
+            rounds: 2,
+            postings: posting_spans::PostingFetchStats {
+                rounds: 1,
+                ranged_gets: 3,
+                ranged_bytes: 400,
+                ..Default::default()
+            },
+            vectors: posting_spans::PostingFetchStats {
+                rounds: 1,
+                ranged_gets: 2,
+                ranged_bytes: 20,
+                whole_files: 1,
+                whole_bytes: 300,
+            },
+            page: doc_spans::PageFetchStats {
+                rounds: 1,
+                ranged_gets: 1,
+                ranged_bytes: 5,
+                whole_files: 1,
+                whole_bytes: 7_000,
+            },
+            ..Default::default()
+        };
+        assert_eq!(o.s3_rounds(), 2 + 1 + 1);
+        assert_eq!(o.s3_bytes(), 1_000 + 20 + 300 + 5 + 7_000);
+    }
+
+    #[test]
+    fn a_degraded_search_is_not_fully_cached() {
+        let local = HydrationOutcome::default();
+        let phases = kosha_query::SearchPhaseStats::default();
+        assert!(search_fully_cached(&local, &phases, 0));
+        assert!(!search_fully_cached(&local, &phases, 1));
+        let fallback = kosha_query::SearchPhaseStats {
+            bm25_stats: kosha_query::Bm25StatsUsed::SegmentFallback,
+            ..Default::default()
+        };
+        assert!(!search_fully_cached(&local, &fallback, 0));
+        let fetched = HydrationOutcome {
+            files_fetched: 1,
+            bytes_fetched: 10,
+            ..Default::default()
+        };
+        assert!(!search_fully_cached(&fetched, &phases, 0));
+    }
+
     fn searched_state(enabled: bool) -> AppState {
         let state = dashboard_state(enabled);
         v1(
@@ -19768,9 +19917,17 @@ mod tests {
         for phase in ["total_ms", "hydrate_ms", "score_ms", "admit_ms", "queue_ms"] {
             assert!(timings[phase].as_f64().unwrap() >= 0.0, "{phase}: {first}");
         }
-        // The identical repeat is a result-cache hit: still recorded.
+        // No S3 here: every byte the search read was local.
+        assert_eq!(timings["s3_rounds"], 0, "{first}");
+        assert_eq!(timings["s3_bytes"], 0, "{first}");
+        assert_eq!(timings["fully_cached"], true, "{first}");
+        // The identical repeat is a result-cache hit: still recorded, and
+        // fully cached (it read nothing at all).
         let second = search_with_timings(&state);
         assert_eq!(second["timings"]["cached"], true, "{second}");
+        assert_eq!(second["timings"]["fully_cached"], true, "{second}");
+        assert_eq!(second["timings"]["s3_rounds"], 0, "{second}");
+        assert_eq!(second["timings"]["s3_bytes"], 0, "{second}");
         assert_eq!(second["results"], first["results"]);
         // Without the opt-in the response is the plain one.
         let plain = v1(

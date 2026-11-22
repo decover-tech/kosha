@@ -72,7 +72,8 @@ pub struct SearchTimings {
     /// `search timing:` log line.
     pub s3_bytes: u64,
     /// Everything this search read was already local: no S3 request of any
-    /// kind and nothing missing or shed. Kosha's counterpart to
+    /// kind, nothing missing or shed, and no kNN segment degraded or BM25
+    /// fallback to per-segment statistics. Kosha's counterpart to
     /// turbopuffer's `cache_hit_ratio == 1.0`, which its benchmark polls
     /// before measuring a hot namespace. A result-cache hit is fully cached.
     pub fully_cached: bool,
