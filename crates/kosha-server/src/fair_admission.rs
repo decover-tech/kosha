@@ -209,7 +209,7 @@ impl FairSemaphore {
         if self.max_waiters_per_tenant > 0
             && st.tenant_waiters(tenant) >= self.max_waiters_per_tenant
         {
-            return Err(QueueShed::Full);
+            return Err(QueueShed::TenantFull);
         }
         let ticket = st.enqueue(tenant, weight);
         if st.dispatch() {
@@ -239,6 +239,11 @@ impl FairSemaphore {
                 }
             }
         }
+    }
+
+    /// Max requests one tenant may have waiting (`0` = no per-tenant cap).
+    pub(crate) fn max_waiters_per_tenant(&self) -> usize {
+        self.max_waiters_per_tenant
     }
 
     /// Requests waiting for a permit right now (`kosha_search_queue_depth`).
@@ -427,7 +432,10 @@ mod tests {
         while sem.waiters() < 1 && t0.elapsed() < Duration::from_secs(2) {
             std::thread::yield_now();
         }
-        assert!(matches!(sem.try_acquire("a", 1), Err(QueueShed::Full)));
+        assert!(matches!(
+            sem.try_acquire("a", 1),
+            Err(QueueShed::TenantFull)
+        ));
         let other = {
             let s = Arc::clone(&sem);
             std::thread::spawn(move || s.try_acquire("b", 1).is_ok())

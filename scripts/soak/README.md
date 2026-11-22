@@ -34,6 +34,14 @@ Python 3.9+ standard library only.
 - **Optional background work**: `--flush-every` and `--compact-every` flush and compact from
   the driver. Leave both at 0 when the server flushes and compacts by itself, as on k8s.
   `--replace-cmd` runs every `--replace-every` seconds to replace pods.
+- **Flood mode** (#341, optional): `--flood-tenant-key` names one key of `--tenant-keys`. That
+  tenant also sends BM25 searches at `--flood-multiplier` (default 10) times `--flood-qps`,
+  which should be its configured query limit on the server (`qps` in
+  `KOSHA_TENANT_LIMITS_FILE`); with `--flood-qps 0` the base is the run's current query rate.
+  Flood requests have their own counters and are not part of the request totals or the 5xx
+  and connection-error gates. The report's `flood` section holds the flooder's requests and
+  429 rate, and under `victim` the other tenants' query counts, 429s and p50/p99 (overall and
+  per window). Write-to-visible samples are not taken from the flood tenant.
 - **At the end**: the driver flushes every namespace. It then requires each `match_all` total
   to equal the live set exactly: on the write URL with a strong read, and on every query URL
   with an eventual read once the pod has caught up (`--final-timeout`).
@@ -47,6 +55,8 @@ Python 3.9+ standard library only.
 | `--max-5xx-rate` | 5xx responses / all requests | 0.001 |
 | `--max-conn-error-rate` | connection errors and timeouts / all requests | 0.01 |
 | `--max-segments` | segments of the large namespace at the end (0 = off) | 0 |
+| `--victim-p99-ms` | flood mode: p99 of the other tenants' queries during the flood | -1 (off) |
+| flood mode | the flooder got at least one 429 (otherwise the server has no limit on it) | |
 | always | exact count everywhere, no uncertain namespace, every query class ran | |
 
 Set a gate to `-1` to turn it off. The report (`--out`) holds every verdict and the overall
@@ -81,7 +91,14 @@ python3 scripts/soak/soak.py --smoke --write-url http://localhost:8080
 
 `python3 scripts/soak/soak.py --self-test` tests the pure logic and runs a short soak against
 an in-process fake server, including one that loses an acknowledged write, which the exact
-count must catch.
+count must catch, and a flood run against a fake that rate limits one tenant.
+
+A noisy-neighbour run against a local server whose limits file gives `tenant-a` a `qps` of 20:
+
+```bash
+python3 scripts/soak/soak.py --smoke --write-url http://localhost:8080 \
+  --flood-tenant-key sk-tenant-a --flood-qps 20 --flood-multiplier 10 --victim-p99-ms 500
+```
 
 ## The 24-hour soak on the stage cluster
 

@@ -5766,6 +5766,26 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
     } else {
         authenticate(&headers)
     };
+    dispatch_authenticated(
+        state,
+        &request_line,
+        &headers,
+        &body,
+        authentication,
+        started,
+    )
+}
+
+/// The rest of [`dispatch`] once the caller is known: `authentication` is
+/// the tenant the credential maps to, or the ready-made 401.
+fn dispatch_authenticated(
+    state: &AppState,
+    request_line: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    authentication: Result<String, String>,
+    started: Instant,
+) -> http::Response {
     // ── Query/ingest role routing ────────────────────────────────────────
     // A query-role pod (KOSHA_INGEST_HOST set) forwards write-path requests
     // to the single ingest pod instead of executing them locally — see
@@ -5780,7 +5800,7 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
         (Err(resp), _, _) => http::Response::from_raw(resp.clone()),
         // An indexer (#254) serves only the compaction admin API.
         (Ok(_), _, _)
-            if state.role == role::Role::Indexer && !role::Role::indexer_serves(&request_line) =>
+            if state.role == role::Role::Indexer && !role::Role::indexer_serves(request_line) =>
         {
             http::Response::from_raw(json_error(
                 404,
@@ -5788,13 +5808,13 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
                  /v1/admin/compact* and /v1/admin/compaction-*",
             ))
         }
-        (Ok(_), Some(ingest_host), Some(client)) if is_write_path(&request_line) => {
+        (Ok(_), Some(ingest_host), Some(client)) if is_write_path(request_line) => {
             http::Response::from_raw(forward_to_ingest(
                 client,
                 ingest_host,
-                &request_line,
-                &headers,
-                &body,
+                request_line,
+                headers,
+                body,
             ))
         }
         // Pod-to-pod segment transfer streams the file instead of building
@@ -5802,20 +5822,20 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
         // which answers 403.
         (Ok(_), _, _)
             if request_line.starts_with("GET /internal/segment/")
-                && service_authorized(&headers, state.internal_service_key.as_deref()) =>
+                && service_authorized(headers, state.internal_service_key.as_deref()) =>
         {
-            internal_segment_response(&request_line, state)
+            internal_segment_response(request_line, state)
         }
         (Ok(tenant), _, _) => http::Response::from_raw(serve_tenant_request(
-            &request_line,
-            &headers,
-            &body,
+            request_line,
+            headers,
+            body,
             tenant,
             state,
         )),
     };
     log_request(
-        &request_line,
+        request_line,
         authentication.as_deref().unwrap_or("-"),
         body.len(),
         &response,
@@ -6009,7 +6029,8 @@ fn namespace_is_new(state: &AppState, ns: &NamespaceId) -> bool {
 }
 
 /// Namespaces `tenant` holds: top-level names only, as `GET /v1/namespaces`
-/// lists them (shards and branches are not counted).
+/// lists them. Shards are not counted; a branch is a top-level namespace
+/// of its own and is.
 fn tenant_namespace_count(state: &AppState, tenant: &str) -> u64 {
     let prefix = format!("{tenant}/");
     let all = state.controller.lock().unwrap().list_namespaces();
@@ -6024,8 +6045,8 @@ fn tenant_namespace_count(state: &AppState, tenant: &str) -> u64 {
 }
 
 /// The namespace quota: refuse to add `ns` when its tenant already holds
-/// `namespaces` of them. Checked on explicit creation and on the first
-/// write that would auto-create a namespace. Per pod and approximate under
+/// `namespaces` of them. Checked on explicit creation, on branch creation
+/// and on the first write that would auto-create a namespace. Per pod and approximate under
 /// concurrent creations.
 fn check_namespace_quota(state: &AppState, ns: &NamespaceId) -> Result<(), String> {
     let Some((tenant, limits)) = write_limits(state, ns) else {
@@ -6188,6 +6209,53 @@ impl SearchObservation {
                 None
             }
         }
+    }
+
+    /// The 429 for a search [`Self::scoring_slot`] shed: `Retry-After` and
+    /// a JSON `reason` saying which bound was hit (#341). A shed by the
+    /// tenant's own share of the queue is a tenant rejection, with the
+    /// same body as the other tenant limits and counted in
+    /// `kosha_tenant_rejections_total`; the pod-wide sheds
+    /// (`search_queue_full`, `search_queue_timeout`) are not the tenant's
+    /// doing and are counted only in `kosha_search_queue_rejections_total`.
+    fn shed_response(&self, state: &AppState) -> String {
+        let (reason, message) = match self.shed.get() {
+            Some(metrics::QueueShed::TenantFull) => {
+                return tenant_rejection(
+                    state,
+                    &self.tenant.borrow(),
+                    &tenant_limits::Rejection::tenant_queue_full(
+                        state.search_semaphore.max_waiters_per_tenant(),
+                    ),
+                );
+            }
+            Some(metrics::QueueShed::Timeout) => (
+                "search_queue_timeout",
+                "search overloaded: timed out waiting for a scoring slot — retry with backoff",
+            ),
+            Some(metrics::QueueShed::Full) | None => (
+                "search_queue_full",
+                "search overloaded: scoring queue is saturated — retry with backoff",
+            ),
+        };
+        let retry_after_ms = tenant_limits::QUEUE_SHED_RETRY_AFTER_MS;
+        eprintln!(
+            "WARN: request failed: status=429 reason={reason} {message}{}",
+            request_id()
+        );
+        let body = serde_json::json!({
+            "error": message,
+            "reason": reason,
+            "retry_after_ms": retry_after_ms,
+        })
+        .to_string();
+        retry_after(
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
+                body.len()
+            ),
+            retry_after_ms.div_ceil(1000).max(1),
+        )
     }
 }
 
@@ -6372,8 +6440,21 @@ fn forward_to_ingest(
     match req.send() {
         Ok(resp) => {
             let status = resp.status().as_u16();
+            // `Retry-After` is part of the 429/503 contract (#341): a
+            // client must see the same back-off through a query pod as
+            // from the ingest pod itself. Relayed only when it is the
+            // plain delay-seconds form the server itself emits.
+            let retry_after_secs = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
             let upstream_body = resp.text().unwrap_or_default();
-            raw_response(status, &upstream_body)
+            let response = raw_response(status, &upstream_body);
+            match retry_after_secs {
+                Some(secs) => retry_after(response, secs),
+                None => response,
+            }
         }
         Err(e) => json_error(
             503,
@@ -8345,10 +8426,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     let t_queue = Instant::now();
     let Some(slot) = obs.scoring_slot(state) else {
         // Shed rather than queue: see `FairSemaphore::try_acquire`.
-        return json_error(
-            429,
-            "search overloaded: scoring queue is saturated — retry with backoff",
-        );
+        return obs.shed_response(state);
     };
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
 
@@ -8944,10 +9022,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     let t_queue = Instant::now();
     let Some(_slot) = obs.scoring_slot(state) else {
         // Shed rather than queue: see `FairSemaphore::try_acquire`.
-        return json_error(
-            429,
-            "search overloaded: scoring queue is saturated — retry with backoff",
-        );
+        return obs.shed_response(state);
     };
     let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
 
@@ -11189,6 +11264,9 @@ fn raw_response(status_code: u16, body: &str) -> String {
         403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
+        410 => "Gone",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Response",
@@ -15959,6 +16037,77 @@ mod tests {
             response.ends_with(r#"{"indexed_count":1,"namespace":"foo"}"#),
             "{response}"
         );
+    }
+
+    /// #341: a write the ingest pod refuses with a tenant limit must reach
+    /// the client through a query pod as the same 429: status line,
+    /// `Retry-After` and the JSON reason.
+    #[test]
+    fn forward_to_ingest_relays_429_with_retry_after() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_body = r#"{"error":"tenant write rate limit exceeded","reason":"tenant_write_rate_exceeded","limit":2,"retry_after_ms":2500}"#;
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.trim_end().split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let mut stream = stream;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nretry-after: 3\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{upstream_body}",
+                        upstream_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let response = forward_to_ingest(
+            &client,
+            &format!("http://{addr}"),
+            "POST /v1/namespaces/docs/documents HTTP/1.1\r\n",
+            &HashMap::new(),
+            br#"{"documents":[]}"#,
+        );
+        server.join().unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+            "{response}"
+        );
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let retry: Vec<&str> = head
+            .split("\r\n")
+            .filter(|line| line.to_ascii_lowercase().starts_with("retry-after:"))
+            .collect();
+        assert_eq!(retry, ["retry-after: 3"], "{response}");
+        assert_eq!(body, upstream_body, "{response}");
+        assert!(
+            head.contains(&format!("content-length: {}", upstream_body.len())),
+            "{response}"
+        );
+        // The other statuses a write can be refused with keep their text.
+        assert!(raw_response(413, "{}").starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
+        assert!(raw_response(410, "{}").starts_with("HTTP/1.1 410 Gone\r\n"));
     }
 
     // ── Segment hydration coalescing ────────────────────────────────────
@@ -21007,6 +21156,322 @@ mod tests {
             serde_json::json!({"namespace": "docs"}),
         );
         assert_eq!(status_of(&created), 200, "{created}");
+    }
+
+    /// A branch is a new namespace of the tenant: it is refused at the
+    /// namespace quota like `POST /v1/namespaces`.
+    #[test]
+    fn branch_creation_counts_against_the_namespace_quota() {
+        let branch_at = |max: u64| {
+            let state = limited_state(&format!(
+                r#"{{"default_plan": "p", "plans": {{"p": {{"namespaces": {max}}}}}}}"#
+            ));
+            let created = as_tenant(
+                &state,
+                "acme",
+                "POST /v1/namespaces",
+                serde_json::json!({"namespace": "one"}),
+            );
+            assert_eq!(status_of(&created), 200, "{created}");
+            let indexed = as_tenant(
+                &state,
+                "acme",
+                "POST /v1/namespaces/one/documents",
+                one_doc("d1", "hello"),
+            );
+            assert_eq!(status_of(&indexed), 200, "{indexed}");
+            assert_eq!(tenant_namespace_count(&state, "acme"), 1);
+            let response = as_tenant(
+                &state,
+                "acme",
+                "POST /v1/namespaces/one/branch",
+                serde_json::json!({"name": "two"}),
+            );
+            (response, tenant_namespace_count(&state, "acme"))
+        };
+        let (refused, count) = branch_at(1);
+        let body = assert_rejected(&refused, "namespace_quota_exceeded");
+        assert_eq!(body["limit"], 1);
+        assert_eq!(count, 1, "a refused branch must not add a namespace");
+
+        let (allowed, count) = branch_at(2);
+        assert_eq!(status_of(&allowed), 200, "{allowed}");
+        assert_eq!(count, 2);
+    }
+
+    /// One request as `tenant` through [`dispatch_authenticated`]: all of
+    /// `dispatch` after the credential lookup (unit tests run with auth
+    /// disabled, where `dispatch` itself maps every request to one tenant).
+    fn dispatch_as(
+        state: &AppState,
+        tenant: &str,
+        line: &str,
+        body: serde_json::Value,
+    ) -> http::Response {
+        let bytes = if body.is_null() {
+            Vec::new()
+        } else {
+            serde_json::to_vec(&body).unwrap()
+        };
+        dispatch_authenticated(
+            state,
+            &format!("{line} HTTP/1.1"),
+            &HashMap::new(),
+            &bytes,
+            Ok(tenant.to_string()),
+            Instant::now(),
+        )
+    }
+
+    /// Index one flushed document into `<tenant>/docs`.
+    fn seed_docs(state: &AppState, tenant: &str) {
+        let indexed = as_tenant(
+            state,
+            tenant,
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d1", "hello world"),
+        );
+        assert_eq!(status_of(&indexed), 200, "{indexed}");
+        let flushed = as_tenant(
+            state,
+            tenant,
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        );
+        assert_eq!(status_of(&flushed), 200, "{flushed}");
+    }
+
+    fn wait_for_waiters(state: &AppState, n: usize) {
+        let t0 = Instant::now();
+        while state.search_semaphore.waiters() < n {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "expected {n} queued searches"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn tenant_queue_rejections(state: &AppState) -> f64 {
+        metrics::tests::value(
+            &rejections(state),
+            "kosha_tenant_rejections_total",
+            &[("reason", "tenant_queue_full")],
+        )
+        .unwrap_or(0.0)
+    }
+
+    /// A search shed by its tenant's share of the scoring queue
+    /// (`KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT`) is a tenant rejection: 429,
+    /// `Retry-After`, a reason, and counted. Another tenant still queues.
+    #[test]
+    fn per_tenant_queue_shed_has_retry_after_reason_and_is_counted() {
+        let mut state = test_state();
+        // One permit (held below), no total bound, one waiter per tenant.
+        state.search_semaphore =
+            fair_admission::FairSemaphore::new(1, 0, 1, Some(Duration::from_secs(30)));
+        seed_docs(&state, "a");
+        seed_docs(&state, "b");
+        let state = &state;
+        let held = state.search_semaphore.try_acquire("other", 1).unwrap();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| search_docs(state, "a"));
+            wait_for_waiters(state, 1);
+            assert_eq!(tenant_queue_rejections(state), 0.0);
+
+            let shed = search_docs(state, "a");
+            let body = assert_rejected(&shed, "tenant_queue_full");
+            assert_eq!(body["limit"], 1);
+            assert_eq!(tenant_queue_rejections(state), 1.0);
+
+            // The same through `dispatch`'s path: the header is a header.
+            let mut shed = dispatch_as(
+                state,
+                "a",
+                "POST /v1/namespaces/docs/search",
+                serde_json::json!({"query_text": "hello"}),
+            );
+            assert_eq!(shed.status(), 429);
+            assert_eq!(shed.header("retry-after"), Some("1"));
+            let body: serde_json::Value = serde_json::from_slice(&shed.body_bytes()).unwrap();
+            assert_eq!(body["reason"], "tenant_queue_full");
+            assert_eq!(tenant_queue_rejections(state), 2.0);
+
+            // Tenant `b` is not shed by `a`'s full queue: it waits.
+            let other = scope.spawn(|| search_docs(state, "b"));
+            wait_for_waiters(state, 2);
+            drop(held);
+            let first = first.join().unwrap();
+            assert_eq!(status_of(&first), 200, "{first}");
+            let other = other.join().unwrap();
+            assert_eq!(status_of(&other), 200, "{other}");
+        });
+        assert_eq!(tenant_queue_rejections(state), 2.0);
+    }
+
+    /// The pod-wide sheds (queue full, wait timed out) also carry
+    /// `Retry-After` and a reason, but are not tenant rejections.
+    #[test]
+    fn search_queue_full_and_timeout_sheds_have_retry_after_and_reason() {
+        let mut state = test_state();
+        // No permits, one waiter in all, a short wait.
+        state.search_semaphore =
+            fair_admission::FairSemaphore::new(0, 1, 0, Some(Duration::from_millis(1500)));
+        seed_docs(&state, "a");
+        seed_docs(&state, "b");
+        let state = &state;
+        let assert_shed = |response: &str, reason: &str| {
+            assert_eq!(status_of(response), 429, "{response}");
+            let retry: u64 = header_of(response, "retry-after")
+                .expect("Retry-After header")
+                .parse()
+                .unwrap();
+            assert!(retry >= 1, "{response}");
+            let body = body_of(response);
+            assert_eq!(body["reason"], reason, "{response}");
+            assert!(body["error"].is_string(), "{response}");
+            assert!(body["retry_after_ms"].as_u64().unwrap() >= 1, "{response}");
+        };
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| search_docs(state, "a"));
+            wait_for_waiters(state, 1);
+            assert_shed(&search_docs(state, "b"), "search_queue_full");
+            assert_shed(&waiting.join().unwrap(), "search_queue_timeout");
+        });
+        assert!(
+            rejections(state).iter().all(|s| s.value == 0.0),
+            "a pod-wide shed is not a tenant rejection"
+        );
+    }
+
+    /// The #341 "done when": a tenant flooding at 10x its query rate, from
+    /// several threads through the request path the HTTP server uses, is
+    /// refused with 429s while another tenant's searches all succeed with
+    /// latency close to a no-flood baseline taken in the same test.
+    #[test]
+    fn tenant_flooding_at_10x_its_qps_does_not_slow_another_tenant() {
+        const NOISY_THREADS: usize = 4;
+        const NOISY_PER_THREAD: usize = 100;
+        // 4 threads x one request per 20ms = 200 req/s against qps 20.
+        const PACE: Duration = Duration::from_millis(20);
+
+        let state =
+            limited_state(r#"{"tenants": {"noisy": {"qps": 20, "concurrent_queries": 2}}}"#);
+        seed_docs(&state, "noisy");
+        seed_docs(&state, "quiet");
+        let state = &state;
+        let search = |tenant: &str| {
+            let started = Instant::now();
+            let mut response = dispatch_as(
+                state,
+                tenant,
+                "POST /v1/namespaces/docs/search",
+                serde_json::json!({"query_text": "hello"}),
+            );
+            let elapsed = started.elapsed();
+            let retry = response.header("retry-after").map(str::to_string);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.body_bytes()).unwrap_or_default();
+            (response.status(), retry, body, elapsed)
+        };
+        // Nearest-rank p99.
+        let p99 = |samples: &mut Vec<Duration>| {
+            samples.sort_unstable();
+            samples[(samples.len() * 99).div_ceil(100) - 1]
+        };
+        let quiet_search = || {
+            let (status, _, body, elapsed) = search("quiet");
+            assert_eq!(status, 200, "quiet tenant refused: {body}");
+            assert_eq!(body["results"].as_array().map(Vec::len), Some(1), "{body}");
+            elapsed
+        };
+
+        // Baseline: the quiet tenant alone, at its normal pace.
+        for _ in 0..5 {
+            quiet_search();
+        }
+        let mut baseline = Vec::new();
+        for _ in 0..50 {
+            baseline.push(quiet_search());
+            std::thread::sleep(PACE);
+        }
+        let baseline_p99 = p99(&mut baseline);
+
+        let flooding = std::sync::atomic::AtomicBool::new(true);
+        let (mut during, noisy) = std::thread::scope(|scope| {
+            let flooders: Vec<_> = (0..NOISY_THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let started = Instant::now();
+                        let mut outcomes = Vec::with_capacity(NOISY_PER_THREAD);
+                        for i in 0..NOISY_PER_THREAD {
+                            // A fixed schedule: a slow request does not
+                            // lower the offered rate.
+                            let due = PACE * i as u32;
+                            if let Some(wait) = due.checked_sub(started.elapsed()) {
+                                std::thread::sleep(wait);
+                            }
+                            let (status, retry, body, _) = search("noisy");
+                            outcomes.push((status, retry, body));
+                        }
+                        outcomes
+                    })
+                })
+                .collect();
+            let quiet = scope.spawn(|| {
+                let mut latencies = Vec::new();
+                while flooding.load(std::sync::atomic::Ordering::Relaxed) {
+                    latencies.push(quiet_search());
+                    std::thread::sleep(PACE);
+                }
+                latencies
+            });
+            let noisy: Vec<_> = flooders
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect();
+            flooding.store(false, std::sync::atomic::Ordering::Relaxed);
+            (quiet.join().unwrap(), noisy)
+        });
+
+        assert_eq!(noisy.len(), NOISY_THREADS * NOISY_PER_THREAD);
+        let mut refused = 0;
+        for (status, retry, body) in &noisy {
+            if *status == 200 {
+                continue;
+            }
+            assert_eq!(*status, 429, "{body}");
+            let reason = body["reason"].as_str().unwrap_or_default();
+            assert!(
+                reason == "tenant_qps_exceeded" || reason == "tenant_concurrency_exceeded",
+                "{body}"
+            );
+            let retry: u64 = retry.as_deref().expect("Retry-After").parse().unwrap();
+            assert!(retry >= 1, "{body}");
+            refused += 1;
+        }
+        assert!(
+            refused * 10 >= noisy.len() * 8,
+            "{refused} of {} flood requests were refused; expected at least 80%",
+            noisy.len()
+        );
+        assert!(refused < noisy.len(), "the flooder keeps its own 20 qps");
+
+        // Every quiet request already returned 200 (`quiet_search`).
+        assert!(
+            during.len() >= 20,
+            "only {} quiet searches ran during the flood",
+            during.len()
+        );
+        let during_p99 = p99(&mut during);
+        // The absolute floor absorbs scheduler noise when the whole test
+        // suite runs in parallel; a search queued behind the flood, or
+        // refused, fails either way.
+        let bound = (baseline_p99 * 3).max(Duration::from_millis(500));
+        assert!(
+            during_p99 <= bound,
+            "quiet p99 {during_p99:?} during the flood, baseline {baseline_p99:?}, bound {bound:?}"
+        );
     }
 
     #[test]

@@ -181,6 +181,13 @@ Peers share cold segments through hydration leases when the binary has **s3** an
 | `KOSHA_ADMISSION_TIMEOUT_MS` | How long a search waits for live memory before HTTP 429 | `15000` (`kosha_query::DEFAULT_ADMISSION_TIMEOUT`) | milliseconds |
 | `KOSHA_MAX_BODY_BYTES` | Largest accepted request body; HTTP 413 above it (`auth::max_body_bytes`) | `67108864` (64 MiB) | bytes |
 
+A search the scoring queue sheds gets HTTP 429 with `Retry-After: 1` and a JSON body
+`{"error", "reason", "retry_after_ms"}`. `reason` is `search_queue_full` (the whole queue is
+at `KOSHA_SEARCH_QUEUE_DEPTH`), `search_queue_timeout` (no slot within
+`KOSHA_SEARCH_QUEUE_TIMEOUT_MS`) or `tenant_queue_full` (the tenant is at
+`KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT`). The last one is a tenant rejection: its body also has
+`limit`, and it is counted in `kosha_tenant_rejections_total` (see Tenant limits below).
+
 ## Tenant limits
 
 Per-tenant quotas and rate limits (#341, `tenant_limits.rs`). Without
@@ -192,7 +199,10 @@ is never limited. A request over a limit gets HTTP 429 with `Retry-After` and a 
 `tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`,
 `namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`.
 Rate limits give the time until the token bucket holds the request; quotas give 60 seconds.
-Each refusal is counted in `kosha_tenant_rejections_total` (see `metrics.md`).
+Each refusal is counted in `kosha_tenant_rejections_total` (see `metrics.md`). A query pod
+relays a write refused by the ingest pod unchanged: the same status, `Retry-After` and body.
+A search shed by `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` is answered and counted the same way,
+with `reason` `tenant_queue_full`, whether or not a limits file is set.
 
 | Variable | Purpose | Default | Units |
 | --- | --- | --- | --- |
@@ -217,7 +227,8 @@ The file:
 
 A tenant's limits are its plan's (its own `plan`, else the default plan) with its `tenants`
 fields laid over them. A tenant with no plan and no entry is unlimited, and so is any field
-left out.
+left out. An unknown key anywhere in the file, including in a `tenants` entry, is an error: at
+startup it stops the pod, and a reload keeps the previous limits.
 
 | Field | Limits | Checked |
 | --- | --- | --- |
@@ -226,7 +237,7 @@ left out.
 | `write_docs_per_sec` | Documents per second in index and replace requests. A batch bigger than one second's worth is admitted from a full bucket and paid for afterwards | each index or replace |
 | `write_bytes_per_sec` | Request body bytes per second on write routes | each write request |
 | `max_body_bytes` | Largest write request body, under the pod-wide `KOSHA_MAX_BODY_BYTES` | each write request |
-| `namespaces` | Namespaces the tenant holds (top-level; shards and branches not counted) | namespace creation, and a write that would auto-create one |
+| `namespaces` | Namespaces the tenant holds (shards not counted; a branch is a namespace and counts) | namespace creation, branch creation, and a write that would auto-create one |
 | `docs_per_namespace` | Documents in a namespace: committed and not deleted plus not yet flushed. An unflushed upsert of an existing id counts twice until flushed | each index or replace |
 | `vector_dims` | Widest vector a document may carry, supplied or produced by native embedding | each index or replace |
 | `weight` | Permits per round-robin turn in the search queue (default 1) | search admission |

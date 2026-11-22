@@ -31,6 +31,12 @@ The driver preloads them, then for --duration seconds runs, concurrently:
   replacer    with --replace-cmd and --replace-every, runs a command (e.g.
               deleting a query pod) on that period, as the 24h run's hourly
               pod replacement
+  flooder     with --flood-tenant-key, a noisy neighbour (#341): extra
+              searches as that tenant at --flood-multiplier times its
+              configured rate (--flood-qps). Its requests and 429s are
+              counted apart from everything else, the other ("victim")
+              tenants' query latency is reported on its own, and
+              --victim-p99-ms bounds it
 
 At the end it flushes everything and checks that every namespace's
 match_all count is exactly its live set, on the write pod (strong) and on
@@ -332,6 +338,18 @@ def summarize(values) -> Dict:
     }
 
 
+def status_label(status: Optional[int]) -> str:
+    if status is None:
+        return "conn"
+    if status >= 500:
+        return "5xx"
+    if status == 429:
+        return "429"
+    if status >= 400:
+        return "4xx"
+    return "ok"
+
+
 def evaluate(report: Dict, t: Dict) -> List[Dict]:
     """Threshold verdicts. `t` holds the threshold flags (None/<0 = off)."""
     out = []
@@ -358,6 +376,13 @@ def evaluate(report: Dict, t: Dict) -> List[Dict]:
     if t.get("max_segments") is not None and t["max_segments"] > 0:
         seg = report["final"].get("large_segments")
         gate("large-segments", seg is not None and seg <= t["max_segments"], "%s segments at the end, bound %s" % (seg, t["max_segments"]))
+    flood = report.get("flood")
+    if flood:
+        fr = flood["requests"]
+        gate("flood:limited", fr["429"] > 0, "%d of %d flood requests got 429 (none: the flood tenant has no query limit on the server)" % (fr["429"], fr["total"]))
+        if t.get("victim_p99_ms") is not None and t["victim_p99_ms"] >= 0:
+            vl = flood["victim"]["latency"]
+            gate("flood:victim-p99", vl["p99_ms"] is not None and vl["p99_ms"] <= t["victim_p99_ms"], "p99 %s ms, bound %s ms over %d queries of the other tenants" % (vl["p99_ms"], t["victim_p99_ms"], vl["count"]))
     final = report["final"]
     gate("exact-count", final["checked"] > 0 and not final["mismatches"], "%d namespace/pod counts checked, mismatches %s" % (final["checked"], final["mismatches"][:5]))
     gate("no-uncertain-writes", not report["writes"]["uncertain_namespaces"], "namespaces with an unacknowledged write: %s" % report["writes"]["uncertain_namespaces"][:5])
@@ -425,20 +450,26 @@ class Driver:
         self.dropped_queries = 0
         self.inflight = 0
         self.inflight_lock = threading.Lock()
+        # Flood mode (#341): one tenant's extra searches, counted apart.
+        self.flood_key = getattr(args, "flood_tenant_key", None) or None
+        self.flood_targets = [n for n in self.namespaces if n.key == self.flood_key]
+        if self.flood_key is not None:
+            if not self.flood_targets:
+                raise ValueError("--flood-tenant-key is not a key of --tenant-keys that holds a namespace")
+            if len(self.flood_targets) == len(self.namespaces):
+                raise ValueError("--flood-tenant-key needs at least one other tenant in --tenant-keys to be the victim")
+            if args.flood_multiplier <= 0:
+                raise ValueError("--flood-multiplier must be positive")
+        self.flood_counts = {"total": 0, "ok": 0, "429": 0, "4xx": 0, "5xx": 0, "conn": 0}
+        self.flood_dropped = 0
+        self.flood_inflight = 0
+        self.victim_counts = {"total": 0, "ok": 0, "429": 0, "4xx": 0, "5xx": 0, "conn": 0}
+        self.victim_lat = Latencies(args.window, self.t0)
 
     # bookkeeping --------------------------------------------------------
 
     def note(self, kind: str, status: Optional[int]) -> None:
-        if status is None:
-            label = "conn"
-        elif status >= 500:
-            label = "5xx"
-        elif status == 429:
-            label = "429"
-        elif status >= 400:
-            label = "4xx"
-        else:
-            label = "ok"
+        label = status_label(status)
         with self.counts_lock:
             self.counts["total"] += 1
             if label != "ok":
@@ -552,7 +583,9 @@ class Driver:
                     for i in ids:
                         ns.live.set(i)
                     ns.dirty = True
-                    if self.want_sample.is_set():
+                    # Not from the flooded tenant: the probe's searches would
+                    # be rate limited with the flood's.
+                    if self.want_sample.is_set() and ns.key != self.flood_key:
                         self.want_sample.clear()
                         ns.pinned.add(ids[0])
                         self.samples.append((ns, ids[0], acked_at))
@@ -580,9 +613,73 @@ class Driver:
             self.note("query:" + cls, status)
             if status == 200:
                 self.lat.add(cls, took, t)
+            if self.flood_key is not None and ns.key != self.flood_key:
+                with self.counts_lock:
+                    self.victim_counts["total"] += 1
+                    self.victim_counts[status_label(status)] += 1
+                if status == 200:
+                    self.victim_lat.add("victim", took, t)
         finally:
             with self.inflight_lock:
                 self.inflight -= 1
+
+    def flood_rate(self) -> float:
+        """The flooder's request rate now: --flood-multiplier times the
+        flood tenant's configured qps (--flood-qps), or times the current
+        query rate when that is not given."""
+        base = self.a.flood_qps if self.a.flood_qps > 0 else ramp(self.elapsed(), self.a.duration, self.a.qps_start, self.a.qps_end)
+        return base * self.a.flood_multiplier
+
+    def one_flood_query(self, ns: Namespace, url: str, body: Dict) -> None:
+        try:
+            status, _ = http_json("POST", url + ns.path("search"), body, ns.key, self.a.request_timeout)
+            with self.counts_lock:
+                self.flood_counts["total"] += 1
+                self.flood_counts[status_label(status)] += 1
+        finally:
+            with self.inflight_lock:
+                self.flood_inflight -= 1
+
+    def flooder(self, pool: ThreadPoolExecutor) -> None:
+        """Open loop at flood_rate(), on its own pool and its own counters:
+        nothing it sends counts towards the run's request totals or gates."""
+        rng = random.Random(self.a.seed + 11)
+        i = 0
+        nxt = time.time()
+        while not self.stop.is_set():
+            nxt += 1.0 / max(self.flood_rate(), 0.01)
+            delay = nxt - time.time()
+            if delay > 0:
+                self.stop.wait(delay)
+            elif delay < -1.0:
+                nxt = time.time()  # stalled: do not burst to catch up
+            ns = self.flood_targets[rng.randrange(len(self.flood_targets))]
+            with self.inflight_lock:
+                if self.flood_inflight >= self.a.flood_concurrency:
+                    self.flood_dropped += 1
+                    continue
+                self.flood_inflight += 1
+            pool.submit(self.one_flood_query, ns, self.query_urls[i % len(self.query_urls)], self.query_body("bm25", rng))
+            i += 1
+
+    def flood_report(self) -> Dict:
+        with self.counts_lock:
+            flood, victim = dict(self.flood_counts), dict(self.victim_counts)
+        tenant = self.flood_targets[0].tenant
+        return {
+            "tenant": tenant,
+            "multiplier": self.a.flood_multiplier,
+            "requests": flood,
+            "rate_429": round(flood["429"] / max(1, flood["total"]), 4),
+            "dropped": self.flood_dropped,
+            "victim": {
+                "tenants": sorted({n.tenant for n in self.namespaces if n.key != self.flood_key}),
+                "requests": victim,
+                "rate_429": round(victim["429"] / max(1, victim["total"]), 4),
+                "latency": self.victim_lat.summary().get("victim", summarize([])),
+                "latency_windows": self.victim_lat.per_window(),
+            },
+        }
 
     def dispatcher(self, pool: ThreadPoolExecutor) -> None:
         rng = random.Random(self.a.seed + 7)
@@ -778,6 +875,7 @@ class Driver:
                         ns.live.set(i)
         self.t0 = self.clock()
         self.lat.t0 = self.t0
+        self.victim_lat.t0 = self.t0
         limiter = RateLimiter(a.docs_per_s)
         threads = [threading.Thread(target=self.writer, args=(k, limiter), daemon=True) for k in range(a.writers)]
         threads.append(threading.Thread(target=self.prober, daemon=True))
@@ -790,6 +888,11 @@ class Driver:
             threads.append(threading.Thread(target=self.periodic, args=(a.replace_every, self.replace), daemon=True))
         pool = ThreadPoolExecutor(a.query_concurrency)
         dispatcher = threading.Thread(target=self.dispatcher, args=(pool,), daemon=True)
+        flood_pool = flooder = None
+        if self.flood_key is not None and a.duration > 0:
+            flood_pool = ThreadPoolExecutor(a.flood_concurrency)
+            flooder = threading.Thread(target=self.flooder, args=(flood_pool,), daemon=True)
+            flooder.start()
         for t in threads + [dispatcher]:
             t.start()
         last = time.time()
@@ -805,9 +908,16 @@ class Driver:
                     self.elapsed(), c["total"], c["5xx"], c["conn"], c["429"],
                     " ".join("%s p99 %sms" % (k, v["p99_ms"]) for k, v in lat.items()),
                     "-" if vis is None else "%.2fs" % vis), flush=True)
+                if flooder is not None:
+                    f = self.flood_report()
+                    print("           flood %s: %d requests, %.0f%% 429; victims p99 %sms, %d 429" % (
+                        f["tenant"], f["requests"]["total"], 100 * f["rate_429"], f["victim"]["latency"]["p99_ms"], f["victim"]["requests"]["429"]), flush=True)
         self.stop.set()
         dispatcher.join()
         pool.shutdown(wait=True)
+        if flooder is not None:
+            flooder.join()
+            flood_pool.shutdown(wait=True)
         for t in threads:
             t.join(timeout=a.write_retry_s + a.visible_timeout + 30)
         self.timeline.append(self.sample())
@@ -833,7 +943,10 @@ class Driver:
             "events": self.events,
             "final": final,
         }
+        if flooder is not None:
+            report["flood"] = self.flood_report()
         thresholds = {
+            "victim_p99_ms": a.victim_p99_ms,
             "max_p99_ms": a.max_p99_ms,
             # A `--duration 0` run only preloads: no queries or samples to gate.
             "max_visible_p99_s": a.max_visible_p99_s if a.duration > 0 else None,
@@ -855,13 +968,17 @@ class FakeKosha:
     delete by `terms` on slot, flush (makes writes visible to eventual
     reads), search totals, stats, listing, /metrics. `lose` drops that many
     acknowledged inserts (and every later write of those ids), to prove the
-    final check catches it."""
+    final check catches it. `qps` limits a tenant's searches per second
+    like the server's tenant limits: over it, 429 with Retry-After."""
 
-    def __init__(self, keys: Dict[str, str], lose: int = 0):
+    def __init__(self, keys: Dict[str, str], lose: int = 0, qps: Optional[Dict[str, float]] = None):
         import http.server
 
         self.keys = keys
         self.lose = lose
+        self.qps = qps or {}
+        # tenant -> [tokens, last refill]
+        self.buckets: Dict[str, List[float]] = {t: [r, time.monotonic()] for t, r in self.qps.items()}
         self.lost: set = set()
         self.buffer: Dict[str, Dict[str, Dict]] = {}
         self.visible: Dict[str, Dict[str, Dict]] = {}
@@ -875,6 +992,8 @@ class FakeKosha:
             def _send(self, code: int, body, text: bool = False) -> None:
                 raw = body.encode() if text else json.dumps(body).encode()
                 self.send_response(code)
+                if code == 429:
+                    self.send_header("retry-after", "1")
                 self.send_header("content-length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
@@ -923,6 +1042,15 @@ class FakeKosha:
                         fake.visible[ns] = dict(buf)
                         return self._send(200, {})
                     if action == "search":
+                        bucket = fake.buckets.get(tenant)
+                        if bucket is not None:
+                            now = time.monotonic()
+                            rate = fake.qps[tenant]
+                            bucket[0] = min(rate, bucket[0] + (now - bucket[1]) * rate)
+                            bucket[1] = now
+                            if bucket[0] < 1:
+                                return self._send(429, {"error": "tenant query rate limit exceeded", "reason": "tenant_qps_exceeded", "limit": rate, "retry_after_ms": 1000})
+                            bucket[0] -= 1
                         docs = buf if body.get("consistency") == "strong" else fake.visible.get(ns, {})
                         flt = body.get("filter") or {}
                         if "term" in flt and "slot" in flt["term"]:
@@ -1026,6 +1154,48 @@ def self_test() -> int:
             check("fake run: two tenants", {n.tenant for n in driver.namespaces} == {"t1", "t2"})
         else:
             check("lost insert fails the exact count", not report["pass"] and not verdicts["exact-count"]["ok"], verdicts["exact-count"])
+
+    # Flood mode (#341): gates on the victims only.
+    flood_rep = dict(rep, flood={"requests": {"total": 100, "429": 90}, "victim": {"latency": {"count": 9, "p99_ms": 80.0}}})
+    v = {x["check"]: x["ok"] for x in evaluate(flood_rep, {"victim_p99_ms": 100})}
+    check("evaluate: flood gates hold", v.get("flood:limited") is True and v.get("flood:victim-p99") is True, v)
+    v = {x["check"]: x["ok"] for x in evaluate(flood_rep, {"victim_p99_ms": 50})}
+    check("evaluate: victim p99 over the bound fails", v.get("flood:victim-p99") is False, v)
+    flood_rep["flood"]["requests"]["429"] = 0
+    v = {x["check"]: x["ok"] for x in evaluate(flood_rep, {})}
+    check("evaluate: an unlimited flooder fails", v.get("flood:limited") is False and "flood:victim-p99" not in v, v)
+    check("evaluate: no flood, no flood gates", not any(x["check"].startswith("flood:") for x in evaluate(rep, {"victim_p99_ms": 1})))
+    try:
+        Driver(parse_args(["--tenant-keys", "k1=t1,k2=t2", "--namespaces", "3", "--large-docs", "1", "--zipf-docs", "3", "--duration", "1", "--flood-tenant-key", "nope"]))
+        check("flood key must be a tenant key", False)
+    except ValueError:
+        check("flood key must be a tenant key", True)
+
+    # A flood run against the fake: tenant t1 is limited to 20 searches/s
+    # and floods at 10x that. Its 429s stay out of the run's totals, and the
+    # other tenant is reported (and gated) on its own.
+    fake = FakeKosha(keys, qps={"t1": 20})
+    args = parse_args([
+        "--write-url", fake.url, "--query-url", fake.url, "--tenant-keys", "k1=t1,k2=t2",
+        "--duration", "3", "--namespaces", "5", "--large-docs", "300", "--zipf-docs", "200",
+        "--docs-per-s", "400", "--writers", "3", "--write-batch", "10", "--qps-start", "20", "--qps-end", "40",
+        "--flush-every", "0.3", "--sample-every", "1", "--visible-every", "0.5", "--visible-timeout", "5",
+        "--progress-every", "100", "--final-timeout", "10", "--run-id", "floodtest", "--max-p99-ms", "1000",
+        "--flood-tenant-key", "k1", "--flood-qps", "20", "--flood-multiplier", "10", "--victim-p99-ms", "1000",
+    ])
+    driver = Driver(args)
+    report = driver.run()
+    fake.server.shutdown()
+    flood = report.get("flood") or {}
+    fr, victim = flood.get("requests", {}), flood.get("victim", {})
+    verdicts = {x["check"]: x for x in report["verdicts"]}
+    check("flood run passes", report["pass"], [x for x in report["verdicts"] if not x["ok"]])
+    check("flood run: the flooder ran at about 10x and got 429s", flood.get("tenant") == "t1" and fr.get("total", 0) >= 300 and flood.get("rate_429", 0) >= 0.5 and fr.get("ok", 0) > 0, flood)
+    check("flood run: flood requests are not in the run's totals", not any(k.startswith("flood") for k in report["requests_by_kind"]) and sum(sum(k.values()) for k in report["requests_by_kind"].values()) == report["requests"]["total"], report["requests"])
+    check("flood run: victims are never 429 and never the flood tenant", victim.get("tenants") == ["t2"] and victim.get("requests", {}).get("429") == 0 and victim.get("requests", {}).get("ok", 0) > 0, victim)
+    check("flood run: victim p99 reported and gated separately", victim.get("latency", {}).get("count", 0) > 0 and victim["latency"]["p99_ms"] is not None and verdicts.get("flood:victim-p99", {}).get("ok") is True and verdicts.get("flood:limited", {}).get("ok") is True, (victim.get("latency"), verdicts))
+    args.victim_p99_ms = 0.0001
+    check("flood run: a victim p99 over the bound fails the run", not all(x["ok"] for x in evaluate(report, {"victim_p99_ms": args.victim_p99_ms})))
     print("self-test: %s" % ("FAILED: " + ", ".join(failures) if failures else "all ok"))
     return 1 if failures else 0
 
@@ -1090,6 +1260,11 @@ def parse_args(argv: Optional[List[str]] = None):
     p.add_argument("--max-5xx-rate", type=float, default=0.001, help="5xx share of all requests; -1 = off")
     p.add_argument("--max-conn-error-rate", type=float, default=0.01, help="connection-error share of all requests; -1 = off")
     p.add_argument("--max-segments", type=int, default=0, help="segments of the large namespace at the end; 0 = off")
+    p.add_argument("--flood-tenant-key", help="noisy-neighbour mode (#341): a key of --tenant-keys whose tenant also sends extra searches at --flood-multiplier times its rate; off when unset")
+    p.add_argument("--flood-qps", type=float, default=0, help="the flood tenant's configured query limit on the server (its plan's qps); 0 = use the run's current query rate")
+    p.add_argument("--flood-multiplier", type=float, default=10, help="the flooder sends at this multiple of --flood-qps")
+    p.add_argument("--flood-concurrency", type=int, default=64, help="flood searches in flight at most; beyond it they are dropped and counted")
+    p.add_argument("--victim-p99-ms", type=float, default=-1, help="with --flood-tenant-key: p99 bound over the other tenants' queries during the flood; -1 = off")
     p.add_argument("--out", help="write the JSON report here")
     args = p.parse_args(argv)
     defaults = SMOKE if args.smoke else FULL
@@ -1113,6 +1288,10 @@ def main() -> int:
     print("latency: " + json.dumps(report["latency"]))
     print("visibility: " + json.dumps(report["visibility"]))
     print("requests: " + json.dumps(report["requests"]) + ", dropped queries %d" % report["dropped_queries"])
+    if report.get("flood"):
+        f = report["flood"]
+        print("flood (tenant %s, x%s): %s, 429 rate %s, dropped %d" % (f["tenant"], f["multiplier"], json.dumps(f["requests"]), f["rate_429"], f["dropped"]))
+        print("victims %s: latency %s, requests %s" % (",".join(f["victim"]["tenants"]), json.dumps(f["victim"]["latency"]), json.dumps(f["victim"]["requests"])))
     print("SOAK %s" % ("PASSED" if report["pass"] else "FAILED"))
     if args.out:
         with open(args.out, "w") as f:
