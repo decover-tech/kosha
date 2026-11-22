@@ -201,6 +201,22 @@ pub fn init_global() {
         std::env::var("KOSHA_API_KEY").ok().as_deref(),
     );
     println!("api keys: {} tenant key(s) from env", env.len());
+    // #342: namespaces under a tenant id starting with `_` or `.` are
+    // accounted to the shared `_legacy` tenant. Such keys keep working, but
+    // the operator is told.
+    let mut reserved: Vec<&str> = env
+        .values()
+        .map(String::as_str)
+        .filter(|t| t.starts_with('_') || t.starts_with('.'))
+        .collect();
+    reserved.sort_unstable();
+    reserved.dedup();
+    if !reserved.is_empty() {
+        eprintln!(
+            "WARN: api keys: tenant id(s) {reserved:?} start with '_' or '.'; their \
+             cache and hydration usage is accounted to the shared _legacy tenant"
+        );
+    }
     #[allow(unused_mut)]
     let mut store = KeyStore::with_keys(env);
 

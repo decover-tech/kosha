@@ -268,7 +268,7 @@ pub(crate) enum LeaseOutcome {
     Timeout,
 }
 
-/// One tenant's figures in one cache (`nvme`, `segment` or `result`).
+/// One tenant's figures in one cache (one of [`CACHES`]).
 #[derive(Clone, Debug)]
 pub(crate) struct CacheTenantSample {
     pub cache: &'static str,
@@ -276,7 +276,11 @@ pub(crate) struct CacheTenantSample {
 }
 
 /// The caches `kosha_cache_*` reports, in exposition order.
-const CACHES: [&str; 3] = ["nvme", "segment", "result"];
+const CACHES: [&str; 5] = ["nvme", "segment", "result", "corpus_stats", "ceiling"];
+
+/// Caches bounded by entry count, whose bytes are not tracked: they report
+/// hits, misses and evictions but no `kosha_cache_bytes` series.
+const ENTRY_BOUNDED_CACHES: [&str; 2] = ["corpus_stats", "ceiling"];
 
 /// Point-in-time values read from the server's own atomics at scrape time.
 #[derive(Clone, Debug, Default)]
@@ -370,6 +374,9 @@ impl Collector for ScrapeCollector {
         for (name, help, metric_type, pick) in families {
             let mut family = encoder.encode_descriptor(name, help, None, metric_type)?;
             for cache in CACHES {
+                if name == "kosha_cache_bytes" && ENTRY_BOUNDED_CACHES.contains(&cache) {
+                    continue;
+                }
                 if self.tenant_labels {
                     for t in tenants.iter().filter(|t| t.cache == cache) {
                         let set = [("cache", cache), ("tenant", t.stats.tenant.as_str())];
@@ -823,6 +830,8 @@ pub(crate) mod tests {
                 cache_sample("nvme", "acme", 4000, 5, 1, 4),
                 cache_sample("nvme", "beta", 96, 1, 0, 3),
                 cache_sample("result", "beta", 100, 2, 3, 1),
+                cache_sample("corpus_stats", "acme", 0, 8, 2, 1),
+                cache_sample("ceiling", "beta", 0, 4, 1, 0),
             ],
         });
         parse_exposition(&text).unwrap_or_else(|e| panic!("{e}\n{text}"))
@@ -890,6 +899,32 @@ pub(crate) mod tests {
             7.0
         );
         assert!(samples.iter().all(|s| !s.labels.contains_key("tenant")));
+        // The entry-bounded manifest caches report traffic, not bytes.
+        assert_eq!(
+            get(
+                &samples,
+                "kosha_cache_hits_total",
+                &[("cache", "corpus_stats")]
+            ),
+            8.0
+        );
+        assert_eq!(
+            get(
+                &samples,
+                "kosha_cache_evictions_total",
+                &[("cache", "corpus_stats")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            get(
+                &samples,
+                "kosha_cache_misses_total",
+                &[("cache", "ceiling")]
+            ),
+            1.0
+        );
+        assert!(value(&samples, "kosha_cache_bytes", &[("cache", "ceiling")]).is_none());
 
         let labelled = Metrics::new(MetricsConfig {
             tenant_labels: true,
