@@ -2065,9 +2065,25 @@ fn knn_global_budget_enabled() -> bool {
 /// bound-driven rescoring of quantized kNN candidates (see
 /// [`Searcher::knn_global_rescore`]). Off by default: results, logs and
 /// on-disk formats are unchanged unless it is set.
-fn knn_global_rescore_from_env() -> bool {
+pub fn knn_global_rescore_from_env() -> bool {
     matches!(
         std::env::var("KOSHA_KNN_GLOBAL_RESCORE")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// `KOSHA_KNN_RESCORE_STATS` (#381): `1`, `true` or `on` counts, per kNN
+/// query, the quantized segments the default per-segment path probed and
+/// how many of them returned unrescored estimates (no whole local
+/// `doc_vectors.bin`), and logs them on the `search timing:` line. Off by
+/// default (no extra stat call, line unchanged). Always on with
+/// `KOSHA_KNN_GLOBAL_RESCORE`.
+fn knn_rescore_stats_from_env() -> bool {
+    matches!(
+        std::env::var("KOSHA_KNN_RESCORE_STATS")
             .ok()
             .as_deref()
             .map(str::trim),
@@ -2397,6 +2413,15 @@ pub struct SearchPhaseStats {
     /// Wall time of the global rescoring pass (probe + rescore), before
     /// the scoring pass.
     pub knn_rescore_ms: f64,
+    /// `KOSHA_KNN_RESCORE_STATS` (or `KOSHA_KNN_GLOBAL_RESCORE`) was on,
+    /// so the two per-segment counters below were collected (#381).
+    pub knn_rescore_stats: bool,
+    /// Segments whose quantized column the default per-segment kNN path
+    /// probed (not the global pass).
+    pub knn_seg_quantized: usize,
+    /// Of those, segments without a whole local `doc_vectors.bin`: their
+    /// quantized estimates were returned unrescored as final scores.
+    pub knn_seg_unrescored: usize,
     /// See `SearchResult::knn_mode`; `None` for a non-kNN query.
     pub knn_mode: Option<KnnMode>,
     /// See `SearchResult::knn_filtered_candidates`.
@@ -2470,6 +2495,10 @@ struct OpenStatsCollector {
     /// Vectors scored by exact filtered kNN — see
     /// [`SearchPhaseStats::knn_exact_vectors`].
     knn_exact_vectors: AtomicUsize,
+    /// See [`SearchPhaseStats::knn_seg_quantized`].
+    knn_seg_quantized: AtomicUsize,
+    /// See [`SearchPhaseStats::knn_seg_unrescored`].
+    knn_seg_unrescored: AtomicUsize,
 }
 
 pub struct Searcher {
@@ -2496,6 +2525,10 @@ pub struct Searcher {
     /// [`Searcher::with_knn_global_rescore`]. Default from
     /// `KOSHA_KNN_GLOBAL_RESCORE`, off.
     knn_global_rescore: bool,
+    /// Per-segment rescoring counters (#381): see
+    /// [`Searcher::with_knn_rescore_stats`]. Default from
+    /// `KOSHA_KNN_RESCORE_STATS`, off.
+    knn_rescore_stats: bool,
 }
 
 /// Weak handles to the readers of one released segment.
@@ -2569,6 +2602,7 @@ impl Searcher {
             knn_exact_threshold: knn_exact_threshold_from_env(),
             knn_exact_fraction: knn_exact_fraction_from_env(),
             knn_global_rescore: knn_global_rescore_from_env(),
+            knn_rescore_stats: knn_rescore_stats_from_env(),
         }
     }
 
@@ -2638,6 +2672,26 @@ impl Searcher {
     pub fn with_knn_global_rescore(mut self, enabled: bool) -> Self {
         self.knn_global_rescore = enabled;
         self
+    }
+
+    /// Whether global bound-driven kNN rescoring (#381) is on. The server
+    /// reads it to hydrate `doc_vectors.bin` headers with a kNN's scoring
+    /// files, since the pass reads exact vectors by range.
+    pub fn knn_global_rescore_enabled(&self) -> bool {
+        self.knn_global_rescore
+    }
+
+    /// Turns the per-segment rescoring counters (#381,
+    /// [`SearchPhaseStats::knn_seg_quantized`] and
+    /// [`SearchPhaseStats::knn_seg_unrescored`]) on or off. The default
+    /// comes from `KOSHA_KNN_RESCORE_STATS` and is off.
+    pub fn with_knn_rescore_stats(mut self, enabled: bool) -> Self {
+        self.knn_rescore_stats = enabled;
+        self
+    }
+
+    fn knn_rescore_stats_on(&self) -> bool {
+        self.knn_rescore_stats || self.knn_global_rescore
     }
 
     /// Return the cached parsed segment for `(namespace, segment_id,
@@ -2919,12 +2973,10 @@ impl Searcher {
         open_stats: &OpenStatsCollector,
         vector_fetch: Option<VectorSpanFetch<'_>>,
     ) -> GlobalKnnOutcome {
-        // The same per-segment depth the scoring pass would ask for.
-        let fetch_k = if query.limit_per.is_some() {
-            knn.k.max(knn.num_candidates)
-        } else {
-            knn.k
-        };
+        // The same per-segment depth the scoring pass would ask for
+        // (`limit_per` never reaches here: see the gate in `search_inner`).
+        debug_assert!(query.limit_per.is_none());
+        let fetch_k = knn.k;
         let budget = match cutoff {
             Some((max_distance, max_probes)) => kosha_segment::KnnProbeBudget::Within {
                 max_distance,
@@ -5361,6 +5413,17 @@ impl Searcher {
                     }
                 }
                 Ok(Some(index)) if index.has_lazy_index() => {
+                    // Observability only (#381, off by default): would this
+                    // segment's quantized shortlist be rescored, or its
+                    // estimates returned as final?
+                    if self.knn_rescore_stats_on() && index.is_quantized() {
+                        open_stats.knn_seg_quantized.fetch_add(1, Ordering::Relaxed);
+                        if !reader.rescores_quantized_locally() {
+                            open_stats
+                                .knn_seg_unrescored
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     let probe = match knn_cutoff {
                         Some((cutoff, effective_budget)) => reader
                             .knn_search_within_filtered_fetching(
@@ -6015,12 +6078,17 @@ impl Searcher {
         // ── global bound-driven rescoring (#381) ───────────────────────
         // Off by default. Unfiltered single-vector kNN only: a filtered
         // query keeps the per-segment path (and its exact plan, #252).
+        // Nor under `limit_per`: there each segment returns
+        // `max(k, num_candidates)` hits so the diversity cap has groups to
+        // choose from, and a namespace-wide prune to that depth would hand
+        // the cap far fewer groups (a dominant group can fill all of it).
         let knn_global: Option<GlobalKnnOutcome> = match query.knn {
             Some(ref knn)
                 if self.knn_global_rescore
                     && !knn.is_late_interaction()
                     && knn.filter.is_none()
                     && query.filter.is_none()
+                    && query.limit_per.is_none()
                     && knn_plan.exact_segments.is_empty() =>
             {
                 let t_rescore = Instant::now();
@@ -6185,6 +6253,11 @@ impl Searcher {
             / 1e6;
         phase_stats.knn_postings_probed = open_stats.knn_postings.load(Ordering::Relaxed);
         phase_stats.knn_exact_vectors = open_stats.knn_exact_vectors.load(Ordering::Relaxed);
+        if query.knn.is_some() && self.knn_rescore_stats_on() {
+            phase_stats.knn_rescore_stats = true;
+            phase_stats.knn_seg_quantized = open_stats.knn_seg_quantized.load(Ordering::Relaxed);
+            phase_stats.knn_seg_unrescored = open_stats.knn_seg_unrescored.load(Ordering::Relaxed);
+        }
         let t_materialize = Instant::now();
 
         let mut candidates: Vec<HitCandidate> = Vec::new();
@@ -19642,6 +19715,30 @@ mod limit_per_tests {
         all.knn = knn(1000);
         let all = searcher.search(&ns(), &manifest, &all, None).unwrap();
         assert_eq!(ids(&r), reference_cap(&all.results, 2)[..10]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Global kNN rescoring (#381) must not change a `limit_per` kNN: it
+    /// stays on the per-segment path, which returns `num_candidates` per
+    /// segment for the cap to diversify. With a realistic `num_candidates`
+    /// a namespace-wide prune to that depth kept only the dominant author
+    /// (2 hits instead of 10) before the gate excluded `limit_per`.
+    #[test]
+    fn knn_limit_per_is_unchanged_by_global_rescore() {
+        let dir = scratch("knn-global-rescore");
+        let (manifest, _) = write(&dir, &corpus(), 3);
+        let mut q = query(serde_json::json!({"query_text": "", "max_results": 10}));
+        let mut knn = knn(10).unwrap();
+        knn.num_candidates = 60;
+        q.knn = Some(knn);
+        q.limit_per = limit(2);
+        let off = Searcher::new(dir.clone()).with_knn_global_rescore(false);
+        let on = Searcher::new(dir.clone()).with_knn_global_rescore(true);
+        let want = off.search(&ns(), &manifest, &q, None).unwrap();
+        assert_eq!(want.results.len(), 10, "{:?}", ids(&want));
+        let (got, stats) = on.search_with_stats(&ns(), &manifest, &q, None).unwrap();
+        assert!(!stats.knn_global_rescore, "limit_per must skip the pass");
+        assert_eq!(ids(&got), ids(&want));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

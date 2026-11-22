@@ -3772,6 +3772,32 @@ impl DocVectors {
         Ok(out)
     }
 
+    /// `field`'s vector of `doc_seq` out of `buf`, the bytes of the
+    /// document's whole [`Self::doc_span`] (#381). `None` when the document
+    /// has no `field` vector or `buf` is not that span's length.
+    fn field_vector_in_span(&self, doc_seq: u32, field: &str, buf: &[u8]) -> Option<Vec<f32>> {
+        let (start, end) = self.entry_range(doc_seq);
+        let (span_start, span_end) = self.doc_span(doc_seq)?;
+        if buf.len() as u64 != span_end - span_start {
+            return None;
+        }
+        (start..end).find_map(|i| {
+            let (_, field_idx, dim) = self.entries[i];
+            if self.fields[field_idx as usize] != field {
+                return None;
+            }
+            let at = (self.offsets[i] - span_start) as usize;
+            Some(
+                buf[at..at + dim as usize * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect(),
+            )
+        })
+    }
+
     /// Whether the sidecar holds any vector of `field`.
     pub fn has_field(&self, field: &str) -> bool {
         self.fields.iter().any(|name| name == field)
@@ -5828,6 +5854,11 @@ impl VectorFieldIndex {
     pub fn has_lazy_index(&self) -> bool {
         self.lazy.is_some()
     }
+    /// The lazy index holds quantized codes (i8 or RaBitQ), whose probe
+    /// scores are estimates until rescored from `doc_vectors.bin`.
+    pub fn is_quantized(&self) -> bool {
+        self.lazy.as_ref().is_some_and(|vi| vi.quantized)
+    }
     /// Legacy / missing-sidecar vectors, served by exact flat scan. Empty
     /// when [`Self::has_lazy_index`].
     pub fn flat(&self) -> &VectorStore {
@@ -7180,8 +7211,12 @@ impl SegmentReader {
                 .iter()
                 .filter_map(|&doc_seq| dv.doc_span(doc_seq).map(|span| (doc_seq, span)))
                 .collect();
+            // The span cache is listed once before the fetch and once after
+            // it, never per candidate: a listing is a `read_dir` plus a stat
+            // of every cached span, and the directory grows as rescoring
+            // caches spans.
+            let mut local = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
             if let Some(fetch) = fetch {
-                let local = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
                 let missing: Vec<(u64, u64)> = spans
                     .iter()
                     .map(|&(_, span)| span)
@@ -7190,19 +7225,36 @@ impl SegmentReader {
                 if !missing.is_empty() {
                     out.ranged_spans = missing.len();
                     fetch(&self.segment_dir, DOC_VECTORS_FILE, &missing);
+                    local = span_cache::SpanIndex::load(&self.segment_dir, DOC_VECTORS_FILE);
                 }
             }
-            for (doc_seq, _) in spans {
-                let Ok(vectors) = dv.vectors_for(doc_seq) else {
+            let ranges: Vec<(u64, u64)> = spans.iter().map(|&(_, span)| span).collect();
+            let bytes = local.read_many(&ranges);
+            for ((doc_seq, (start, end)), buf) in spans.into_iter().zip(bytes) {
+                // A span evicted between the listing and the read (its
+                // whole file may have been promoted meanwhile): the
+                // per-document read checks both. A span never cached is
+                // just unavailable, with no further listing.
+                let buf = buf.or_else(|| {
+                    if !local.covers(start, end) {
+                        return None;
+                    }
+                    span_cache::read_local_range(
+                        &self.segment_dir,
+                        DOC_VECTORS_FILE,
+                        dv.file_len(),
+                        start,
+                        end - start,
+                    )
+                });
+                let Some(v) = buf.and_then(|buf| dv.field_vector_in_span(doc_seq, field, &buf))
+                else {
                     continue;
                 };
-                if let Some((_, v)) = vectors
-                    .iter()
-                    .find(|(name, v)| *name == field && v.len() == query.len())
-                {
+                if v.len() == query.len() {
                     exact.insert(
                         doc_seq,
-                        kosha_vector_spfresh::cosine_similarity(query, v) as f64,
+                        kosha_vector_spfresh::cosine_similarity(query, &v) as f64,
                     );
                 }
             }
@@ -7608,6 +7660,17 @@ impl SegmentReader {
         shortlist.sort_by(by_score_desc);
         shortlist.truncate(k);
         shortlist
+    }
+
+    /// Whether the default per-segment kNN path (`finish_probe`) would
+    /// rescore a quantized column's shortlist here (#381 observability):
+    /// the same gate as [`Self::rescore_exact`], i.e. rescoring is on and
+    /// the WHOLE `doc_vectors.bin` is local. When this is `false` the
+    /// per-segment path returns its quantized estimates as final scores.
+    pub fn rescores_quantized_locally(&self) -> bool {
+        self.vector_rescore_factor > 0
+            && self.footer.doc_vectors
+            && self.segment_dir.join(DOC_VECTORS_FILE).exists()
     }
 
     /// Replaces each candidate's score with the cosine similarity of
@@ -12997,5 +13060,90 @@ mod global_rescore_tests {
         let second = kth_lower_bound(&cands, 2).unwrap();
         assert!((second - 0.8).abs() < 1e-12);
         assert!((kth_lower_bound(&cands, 3).unwrap() - 0.3).abs() < 1e-12);
+    }
+
+    /// Microbenchmark for the ranged rescore read (#381): a segment whose
+    /// `doc_vectors.bin` is not local and whose span cache holds one span
+    /// per document (`docs` spans), read for `selected` candidates. Compares
+    /// the per-candidate `vectors_for` loop (one span-directory listing per
+    /// candidate, the PR's first version) with `knn_exact_scores_fetching`
+    /// (one listing per call). Timing only, so ignored by default:
+    /// `cargo test -p kosha-segment --release -- --ignored --nocapture
+    /// ranged_rescore_read_microbench`.
+    #[test]
+    #[ignore]
+    fn ranged_rescore_read_microbench() {
+        const BENCH_DIM: usize = 1024;
+        let docs: u64 = std::env::var("MICROBENCH_DOCS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4000);
+        let selected: usize = 400;
+        let dir = scratch("microbench");
+        let mut w = SegmentWriter::new(SegmentId("s".into()), dir.clone())
+            .with_vector_store_mode(VectorStoreMode::Sidecar)
+            .with_vector_quantization(VectorQuantizationConfig::all(VectorQuantization::I8));
+        let gen = |seed: u64| -> Vec<f32> {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            (0..BENCH_DIM)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+                })
+                .collect()
+        };
+        for i in 0..docs {
+            w.add_document(
+                DocumentId(format!("d{i}")),
+                vec![Field::vector("emb", gen(i + 1))],
+            );
+        }
+        w.finalize(Bm25Params::default()).unwrap();
+        let dv = fs::read(dir.join(DOC_VECTORS_FILE)).unwrap();
+        fs::remove_file(dir.join(DOC_VECTORS_FILE)).unwrap();
+        let spans_dir = span_cache::spans_dir(&dir, DOC_VECTORS_FILE);
+        fs::create_dir_all(&spans_dir).unwrap();
+        let header_len = doc_vectors_header_len(&dv).unwrap().unwrap();
+        let put = |s: u64, e: u64| {
+            fs::write(
+                spans_dir.join(span_cache::span_file_name(s, e)),
+                &dv[s as usize..e as usize],
+            )
+            .unwrap();
+        };
+        put(0, header_len);
+        let reader = SegmentReader::open(dir.clone()).unwrap();
+        let header = reader.doc_vectors().unwrap();
+        for doc_seq in 0..docs as u32 {
+            let (s, e) = header.doc_span(doc_seq).unwrap();
+            put(s, e);
+        }
+        let query = gen(424_242);
+        let seqs: Vec<u32> = (0..selected as u64)
+            .map(|i| ((i * 7919) % docs) as u32)
+            .collect();
+        let rounds = 5;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            let mut n = 0;
+            for &doc_seq in &seqs {
+                n += header.vectors_for(doc_seq).unwrap().len();
+            }
+            assert_eq!(n, seqs.len());
+        }
+        let per_candidate = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            let r = reader.knn_exact_scores_fetching("emb", &query, &seqs, None);
+            assert_eq!(r.unavailable, 0, "{:?}", r.reason);
+        }
+        let batched = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+        println!(
+            "ranged rescore read: {docs} cached spans, {selected} candidates, dim {BENCH_DIM}: \
+             per-candidate listing {per_candidate:.2} ms/call, one listing {batched:.2} ms/call"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
