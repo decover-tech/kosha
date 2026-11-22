@@ -1,8 +1,16 @@
 # BM25 scale benchmark
 
-Replicates turbopuffer's tpuf-benchmark "Full-Text Perf" methodology
-(BM25, 10M docs, ~9GB, 8 QPS, topk=10, p50/p90/p99, warm vs cold namespace)
-against Kosha, so the two are comparable. "Docs" here means chunk-sized
+Replicates turbopuffer's tpuf-benchmark methodology (8 QPS, topk=10,
+p50/p90/p99, warm vs cold namespace) against Kosha, so the two are
+comparable.
+
+> **Corpus size (corrected 2026-11-21):** turbopuffer's published
+> full-text numbers (warm 13/18/29 ms, cold 316/381/559 ms) are for
+> **1M docs, ~300MB** ([docs](https://turbopuffer.com/docs-md/performance.md)),
+> not 10M. Its vector numbers (warm 14/17/27 ms, cold 874/1214/1686 ms) are
+> for 10M docs. Rounds before 2026-11-21 compared Kosha at 10M BM25 docs
+> against that 1M figure. Use `bm25_docs: 1m` in the `benchmark` workflow
+> for the like-for-like BM25 comparison; 10m remains the scale test. "Docs" here means chunk-sized
 records (~900 bytes each) — the same granularity as Kosha's own indices
 (`paragraph_index_hnsw`, `findings_index`, `white_river_paragraph`), not
 whole legal documents.
