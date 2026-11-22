@@ -97,6 +97,30 @@ sudo docker run --rm $BUILD_ENV -v /data:/data kosha-builder:bench sh -c "
     --namespace '$NS' --out-dir /data/segments-out --max-docs $MAX_DOCS"
 echo "BUILD-COMPLETE $NS (max_docs=$MAX_DOCS)"
 
+# Research #388: the footers say which doc store format was written. A
+# builder that ignored KOSHA_DOC_STORE_COMPRESSION=zstd (a ref without
+# #388) must not get its raw segments snapshotted under a -zstd name.
+FOOTERS=$(sudo find "/data/segments-out/$NS" -name footer.json | wc -l | tr -d ' ')
+ZSTD_FOOTERS=$( (sudo find "/data/segments-out/$NS" -name footer.json \
+  -exec grep -l '"doc_store_compression"' {} + 2>/dev/null || true) | wc -l | tr -d ' ')
+echo "doc store format: $ZSTD_FOOTERS of $FOOTERS segment footers name a compressed doc store"
+if [ "${KOSHA_DOC_STORE_COMPRESSION:-}" = zstd ] && [ "$ZSTD_FOOTERS" = 0 ]; then
+  echo "::error::KOSHA_DOC_STORE_COMPRESSION=zstd but no segment is compressed; this ref predates #388. Not uploading."
+  exit 1
+fi
+if [ "${KOSHA_DOC_STORE_COMPRESSION:-}" != zstd ] && [ "$ZSTD_FOOTERS" != 0 ]; then
+  echo "::error::$ZSTD_FOOTERS segment(s) are compressed but KOSHA_DOC_STORE_COMPRESSION is not zstd. Not uploading."
+  exit 1
+fi
+# Provenance stored next to the snapshot (build_info.txt): the builder env
+# and a fingerprint of the sources the builder compiled. The VM copy has
+# no .git, so two snapshots come from the same commit when their
+# fingerprints match.
+SRC_FINGERPRINT=$(find crates proto Cargo.toml Cargo.lock Dockerfile -type f 2>/dev/null \
+  | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-16)
+BUILD_INFO="snapshot=$SNAPSHOT_NAME namespace=$NS max_docs=$MAX_DOCS source_sha256=$SRC_FINGERPRINT builder_env=[${BUILD_ENV# }] compressed_footers=$ZSTD_FOOTERS/$FOOTERS built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "build info: $BUILD_INFO"
+
 echo "uploading segments..."
 marker_clear bucket "$NS"
 aws s3 rm "s3://$SEG_BUCKET/segments/$SCOPED/" --recursive --only-show-errors
@@ -122,6 +146,7 @@ grep -q '"segments"' /tmp/import_result.json || { echo IMPORT-FAILED; exit 1; }
 echo "IMPORT-COMPLETE"
 
 "$(dirname "$0")/snapshot_namespace.sh" "$SCOPED" "$SNAPSHOT_NAME"
+echo "$BUILD_INFO" | aws s3 cp - "s3://$SNAPSHOT_CACHE_BUCKET/snapshots/$SNAPSHOT_NAME/build_info.txt" --only-show-errors
 # Bucket and local cache now derive from exactly this snapshot: a restore
 # of it right after keeps both instead of re-copying them.
 IDENTITY="$(snapshot_identity "$SNAPSHOT_NAME")"

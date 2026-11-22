@@ -254,6 +254,31 @@ roughly 80–90 GB, against 249 GB.
   uploads the segments. That is untimed so far, so run it with
   `suite=vector` and watch the 350-minute limit.
 
+### Compressed doc store snapshots (research #388, experimental)
+
+`build_and_import.sh` passes `KOSHA_DOC_STORE_COMPRESSION` and the
+`KOSHA_DOC_STORE_ZSTD_*` tuning variables into the builder, and a
+`SNAPSHOT_NAME` containing `-zstd` defaults the first to `zstd`. That
+name rule only exists on refs that carry #388, and the workflow rsyncs
+the **dispatching ref** to the VM, so dispatch these builds from the #388
+branch (`gh workflow run benchmark.yml --ref <branch> ...`). A ref without
+#388 would build raw segments under the `-zstd` name, and the workflow
+never rebuilds an existing snapshot; on refs with #388 the build now
+refuses to upload when `zstd` was asked for and no footer is compressed.
+
+Every build also writes `snapshots/<name>/build_info.txt` with the
+builder env and a fingerprint (`source_sha256`) of the sources it
+compiled: the VM copy has no `.git`, so two snapshots come from the same
+commit exactly when their fingerprints match. Build the raw baseline for
+a comparison from the same ref under a name without `-zstd`.
+
+`vm/doc_store_bytes.sh <snapshot> [zstd|raw]` is the deterministic size
+check: it sums the snapshot's `doc_store.bin`, `doc_store.offsets` and
+`doc_vectors.bin` object sizes, reads every segment footer, splits
+`doc_store.bin` into stored records and the dictionary tail copy, and
+prints one JSON object (`doc_store_bytes.py`). With a format argument it
+exits 3 when the footers disagree. It only lists and downloads.
+
 ### Fast iteration recipe
 
 Dispatch with `suite=vector` (or `bm25`, or `both`), `warm_gate=queries`,
