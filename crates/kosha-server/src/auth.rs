@@ -132,6 +132,8 @@ pub struct KeyStore {
     env: HashMap<String, String>,
     /// key hash → key, from Postgres. Replaced wholesale on each refresh.
     db: RwLock<HashMap<String, DbKey>>,
+    /// Orders registry changes against refreshes; see [`Self::registry_guard`].
+    registry: Mutex<()>,
     #[cfg(feature = "postgres")]
     database_url: Option<String>,
     /// Shared Postgres handle for key reads and the `/v1/admin/api-keys`
@@ -146,6 +148,7 @@ impl KeyStore {
         Self {
             env,
             db: RwLock::new(HashMap::new()),
+            registry: Mutex::new(()),
             #[cfg(feature = "postgres")]
             database_url: None,
             #[cfg(feature = "postgres")]
@@ -178,6 +181,19 @@ impl KeyStore {
 
     pub fn len(&self) -> usize {
         self.env.len() + self.db.read().unwrap().len()
+    }
+
+    /// Hold this from before a registry change is written to Postgres
+    /// until it is applied to the snapshot (`upsert_db_key`,
+    /// `remove_db_key`). [`Self::refresh`] holds it from its read of the
+    /// table until it swaps the snapshot in, so a refresh that read the
+    /// table just before the change cannot overwrite the change with what
+    /// it read: without this, a key revoked through this pod could work
+    /// again here, and a key just created here be refused, until the next
+    /// refresh.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub fn registry_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.registry.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Replace the database snapshot (also used by tests to simulate a
@@ -253,6 +269,7 @@ impl KeyStore {
         if let Err(e) = store.touch_api_keys(&self.take_last_used()) {
             eprintln!("api keys: failed to record last_used_at: {e}");
         }
+        let _registry = self.registry_guard();
         let rows = store.list_api_keys(None).map_err(|e| e.to_string())?;
         self.replace_db_keys(rows);
         Ok(self.db.read().unwrap().len())

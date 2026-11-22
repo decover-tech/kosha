@@ -249,6 +249,9 @@ fn execute(action: Action) -> String {
         return json_error(500, "failed to connect to postgres");
     };
     let now = auth::unix_now();
+    // Held until the change is in this pod's snapshot, so a key refresh
+    // that read the table before the change cannot undo it here.
+    let _registry = store.registry_guard();
     let issued_json = |issued: &kosha_control::IssuedApiKey| {
         let mut value = record_json(&issued.record, now);
         value["api_key"] = serde_json::json!(issued.api_key);
