@@ -21,7 +21,9 @@ stack — so each corpus is loaded once, ever.
   boot-restore picks the namespace up and warmup (if configured) makes
   the pod query-ready. On a reused VM it keeps the local cache and the
   bucket objects when they came from this exact snapshot (name + ETag /
-  LastModified of its pg dump), and wipes them on any mismatch; the
+  LastModified of its pg dump), and wipes them on any mismatch (the
+  local wipe covers that namespace only, so other namespaces keep their
+  caches); the
   markers live in `snapshot_cache.sh` (see ../README.md, "Reusing the
   local cache on a reused VM").
 - `build_and_import.sh <ns> [--with-embeddings]` — offline build +

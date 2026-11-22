@@ -11,12 +11,14 @@
 # WARM_GATE selects how the namespace gets warm before measuring:
 #
 #   queries: the tpuf-benchmark protocol. The server runs WITHOUT
-#     KOSHA_WARMUP_NAMESPACES (no boot preload), the local cache is NOT
-#     wiped (restore_namespace.sh already dropped it unless it holds this
-#     exact snapshot), and warm_gate.py sends the phase's own workload
-#     queries until 3 in a row come back fully cached
-#     (timings.fully_cached). Warmup is reported (warm_gate.log) but, as
-#     in tpuf, never measured. Phases are warm only:
+#     KOSHA_WARMUP_NAMESPACES (no boot preload) and with span promotion
+#     off (benchmark.yml), the local cache is NOT wiped
+#     (restore_namespace.sh already dropped this namespace unless it holds
+#     this exact snapshot), and warm_gate.py sends the phase's own
+#     workload queries until every query has come back fully cached
+#     (timings.fully_cached) at least once and then 3 random ones in a
+#     row do. Warmup is reported (warm_gate.log) but, as in tpuf, never
+#     measured. Phases are warm only:
 #       bm25:   warm_or_nocache, warm_or_cache
 #       vector: knn_warm_nocache, knn_warm_cache
 #     The warmup-gated "cold" phase below is dropped in this mode: it is

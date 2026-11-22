@@ -115,22 +115,43 @@ queries, backing off on a miss. Only after that does the measured phase
 start, and warmup time is never measured. In this mode:
 
 - The kosha container starts **without** `KOSHA_WARMUP_NAMESPACES`, so no
-  boot preload runs, `/readyz` is green right away, and nothing preloads
-  in the background while a phase is measured.
+  boot preload runs and `/readyz` is green right away.
+- Span promotion is **off** on the container
+  (`KOSHA_DOC_SPAN_PROMOTE_GETS/BYTES=0`,
+  `KOSHA_POSTING_SPAN_PROMOTE_GETS/BYTES=0`). By default, after 64 ranged
+  GETs or 16 MiB on one segment's doc store (32 or 8 MiB on a postings
+  shard), the server downloads the whole file in the background. On the
+  original vector snapshot that is ~1 GB of JSON-vector `doc_store.bin`
+  per segment, and a large enough hydrate pass would queue it for most
+  segments. `fully_cached` reports only what the search itself fetched,
+  not promotions still running, so the gate could pass while hundreds of
+  GB were still being written during the measured phases. With promotion
+  off, warm queries read the spans the gate made local and nothing else
+  downloads. This differs from the server defaults: promotion would turn
+  many small span files into one whole file, which this mode does not
+  measure.
 - `run_phases.sh` does not wipe or restart. It runs `warm_gate.py` with the
   phase's workload (BM25 `--operator or`, or kNN `--knn-embeddings`) and
   builds each payload with `query_bench.py`'s own `payload_for`, always
-  with `no_cache: true` and `timings: true`. The gate works in three steps:
+  with `no_cache: true` and `timings: true`. The gate works in four steps:
   1. A probe query. If the response has no `timings.fully_cached`, the gate
      exits 2 with `WARM-GATE-UNSUPPORTED` (the server is older than the
      cache-hit gate, or `KOSHA_DASHBOARD` is off).
   2. A hydrate pass that sends every query in `queries.txt` once, 16 at a
-     time. This makes local whatever the workload reads: scoring files,
-     `vector.idx`, and the ranged doc-store spans of its result pages,
-     which the span cache keeps.
-  3. A poll that cycles through the queries until 3 consecutive responses
-     have `timings.fully_cached == true`. A miss resets the streak and
-     backs off from 1 s, doubling to at most 30 s.
+     time. Each query fetches what it reads: scoring files, `vector.idx`,
+     and the ranged doc-store spans of its result pages, which the span
+     cache keeps.
+  3. A verify pass. Every query whose last response was not fully cached
+     (an error, a timeout, a shed or degraded search, or just the query
+     that did the fetching) is sent again, 16 at a time, round after
+     round with backoff (1 s doubling to at most 30 s), until **every**
+     query in `queries.txt` has come back fully cached at least once. The
+     measured phases cycle through all of them, so one left cold would
+     read S3 during a warm phase.
+  4. tpuf's check: queries drawn at random from the whole set until 3
+     consecutive responses have `timings.fully_cached == true`. A miss
+     resets the streak, backs off, and sends that query back through the
+     verify step.
   It prints `WARM-GATE-READY in <s>s (queries sent, s3 bytes observed)`,
   or `WARM-GATE-TIMEOUT` and exits 1 (budget: `WARM_GATE_TIMEOUT_S`,
   default 3h). The output goes to `<suite>/warm_gate.log` and the server
@@ -169,6 +190,14 @@ re-uploaded on every (re-)snapshot.
 
 - Restoring the **same** identity keeps the local cache and skips
   re-copying bucket objects. Pass `KEEP_LOCAL_CACHE=0` to force a wipe.
+- Wipes in `restore_namespace.sh` and `build_and_import.sh` are **per
+  namespace**: they remove `/data/kosha/data/<tenant>/<ns>` (and a
+  pre-#262 bare `<ns>` dir), the local WAL, and only the `local.<ns>`
+  marker. So a `suite=both` run keeps both caches on a kept VM: the vector
+  restore no longer wipes the BM25 cache or its marker, and the other way
+  round. Both caches then sit on the 1,000 GB root volume together (the
+  vector one is ~249 GB on the original snapshot), under the server
+  `KOSHA_CACHE_MAX_BYTES` of 600 GiB.
 - **Any mismatch** wipes. That covers a different snapshot, the same name
   re-created, and a missing marker. Segment ids repeat across rebuilds of
   a namespace name (`<ns>-offline-NNNNNN`), so stale local files or bucket
@@ -179,8 +208,9 @@ re-uploaded on every (re-)snapshot.
   written only after a successful restore. A failed restore leaves no
   marker, so the next restore wipes.
 - `run_phases.sh` never wipes in `queries` mode, where warmup is not
-  measured. In `preload` mode it always wipes, because that mode measures
-  warmup, and the wipe also drops the markers.
+  measured. In `preload` mode it always wipes the whole local store,
+  because that mode measures warmup, and the wipe also drops every
+  `local.*` marker.
 - Caveat: a kept cache was written by the previous run's server build.
   Use `KEEP_LOCAL_CACHE=0` (or a fresh VM) when a change alters the local
   file layout.
@@ -211,7 +241,7 @@ roughly 80–90 GB, against 249 GB.
 
 ### Fast iteration recipe
 
-Dispatch with `suite=vector` (or `bm25`), `warm_gate=queries`,
+Dispatch with `suite=vector` (or `bm25`, or `both`), `warm_gate=queries`,
 `duration=300` and `keep_vm=true`, then dispatch again for each change.
 The last run turns `keep_vm` off, or a `suite=none` run tears down.
 Approximate times per stage:

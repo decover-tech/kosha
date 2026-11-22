@@ -21,9 +21,12 @@
 # Warm gate (input warm_gate):
 #   queries (default): turbopuffer protocol. The server starts with no boot
 #     preload, warm_gate.py warms the namespace with the workload queries
-#     until 3 consecutive responses are fully cached, and only warm phases
-#     are measured (warmup time is logged, never measured). On a reused VM
-#     the local cache of the same snapshot is kept, so warmup is ~minutes.
+#     until every query has come back fully cached at least once and then
+#     3 consecutive random ones are, and only warm phases
+#     are measured (warmup time is logged, never measured). Span promotion
+#     (background whole-file hydration) is off on the container, so nothing
+#     downloads behind a measured phase. On a reused VM the local cache of
+#     the same snapshot is kept per namespace, so warmup is ~minutes.
 #   preload: the earlier protocol: KOSHA_WARMUP_NAMESPACES boot preload
 #     gated on /readyz after a local wipe, then cold + warm phases.
 #
@@ -216,7 +219,14 @@ jobs:
             sudo docker rm -f pg kosha 2>/dev/null || true
             # warm_gate=queries: no boot preload, so /readyz is green at once
             # and warm_gate.py does the warming with the workload queries.
-            WARMUP_ARGS=""
+            # Span promotion is off in that mode: after enough ranged reads of
+            # a segment the server hydrates the whole doc store or postings
+            # shard in the background, and fully_cached does not see that,
+            # so the gate could pass with downloads still running into the
+            # measured phases. With it off, a warm query reads only the spans
+            # the gate already made local.
+            WARMUP_ARGS="-e KOSHA_DOC_SPAN_PROMOTE_GETS=0 -e KOSHA_DOC_SPAN_PROMOTE_BYTES=0"
+            WARMUP_ARGS="$WARMUP_ARGS -e KOSHA_POSTING_SPAN_PROMOTE_GETS=0 -e KOSHA_POSTING_SPAN_PROMOTE_BYTES=0"
             if [ "${{ env.WARM_GATE }}" = preload ]; then
               WARMUP_ARGS="-e KOSHA_WARMUP_NAMESPACES=default/msmarco-10m,default/msmarco-1m,default/msmarco-10m-vec"
             fi

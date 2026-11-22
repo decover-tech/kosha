@@ -22,7 +22,9 @@
 # identity (name + ETag/LastModified of its pg dump), so a rerun does not
 # re-download up to ~249GB. Any mismatch (other snapshot, same name
 # re-created, no marker) wipes them first. KEEP_LOCAL_CACHE=0 forces the
-# local wipe even on a match.
+# local wipe even on a match. The local wipe covers this namespace only
+# (wipe_namespace_cache), so restoring the vector namespace keeps a BM25
+# cache restored earlier, and the other way round.
 #
 # Usage: ./restore_namespace.sh <namespace> [snapshot-name]
 set -euo pipefail
@@ -94,10 +96,10 @@ ROWS="$(sudo docker exec pg psql -U postgres -tA kosha \
 sudo docker stop kosha >/dev/null 2>&1 || true
 sudo rm -rf /var/cache/kosha-placeholder 2>/dev/null || true
 if [ "$KEEP_LOCAL" = 1 ]; then
-  echo "LOCAL-CACHE-KEPT $IDENTITY ($(sudo du -sh "$KOSHA_LOCAL_DATA" 2>/dev/null | cut -f1) local)"
+  echo "LOCAL-CACHE-KEPT $IDENTITY ($(sudo du -sh "$KOSHA_LOCAL_DATA/$SCOPED" 2>/dev/null | cut -f1) local for $SCOPED)"
 else
-  wipe_local_cache
-  echo "LOCAL-CACHE-WIPED"
+  wipe_namespace_cache "$NS" "$TENANT"
+  echo "LOCAL-CACHE-WIPED $SCOPED"
 fi
 sudo docker start kosha >/dev/null
 until curl -sf http://127.0.0.1:8080/healthz >/dev/null; do sleep 3; done

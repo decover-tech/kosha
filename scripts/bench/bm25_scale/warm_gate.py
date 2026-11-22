@@ -16,12 +16,19 @@ Steps:
   0. probe: one query, to fail fast when the server does not report
      `timings.fully_cached` (server too old, or KOSHA_DASHBOARD off).
   1. hydrate: every query of the workload once, --concurrency at a time,
-     so whatever the workload reads (scoring files, vector.idx, the ranged
+     so what each query reads (scoring files, vector.idx, the ranged
      doc-store spans of its result pages, which the span cache persists)
-     becomes local.
-  2. poll: cycle through the queries until --consecutive responses in a
-     row are fully cached; a miss (or an error) resets the streak and
-     backs off.
+     is fetched.
+  2. verify: re-send every query whose last response was not fully cached
+     (failed, timed out, shed, degraded, or simply the one that fetched),
+     --concurrency at a time, round after round with backoff, until every
+     query of the workload has come back fully cached at least once. The
+     measured phases cycle through all queries (query_bench i % n), so a
+     query left cold here would read S3 during a "warm" phase.
+  3. poll (tpuf's check): queries drawn at random from the whole set
+     until --consecutive responses in a row are fully cached; a miss (or
+     an error) resets the streak and backs off. The miss goes back into
+     the verify set, so it is re-checked too.
 
 Payloads are exactly the ones query_bench.py sends (same payload_for),
 always with no_cache=true (so the engine path runs, not the whole-response
@@ -40,6 +47,7 @@ Usage:
 import argparse
 import concurrent.futures
 import os
+import random
 import sys
 import threading
 import time
@@ -116,6 +124,7 @@ def main(argv=None) -> int:
     ap.add_argument("--backoff-initial", type=float, default=1.0)
     ap.add_argument("--backoff-max", type=float, default=30.0)
     ap.add_argument("--progress-every", type=float, default=60.0, help="seconds between progress lines")
+    ap.add_argument("--seed", type=int, default=0, help="seed for the poll's random query choice")
     args = ap.parse_args(argv)
 
     qb.OPERATOR = args.operator
@@ -171,64 +180,106 @@ def main(argv=None) -> int:
     print(f"probe: ok={probe.ok} fully_cached={probe.fully_cached} s3_bytes={probe.s3_bytes} "
           f"({elapsed():.1f}s)", flush=True)
 
-    # ── 1. hydrate: every workload query once ───────────────────────────
-    done = cached = 0
-    missing_field = 0
-    last_report = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
-        it = iter(range(1, n))
-        inflight = set()
+    # ── 1. hydrate, 2. verify: a pass over a list of query indices ──────
+    # Returns the indices whose response was not fully cached (failed or
+    # degraded included), or None when the budget ran out mid-pass.
+    def run_pass(stage: str, indices: list) -> "list | None":
+        nonlocal sent, s3_bytes, errors
+        not_cached = []
+        done = cached = 0
+        last_report = time.monotonic()
         timed_out = False
-        while True:
-            while not timed_out and len(inflight) < args.concurrency:
-                qidx = next(it, None)
-                if qidx is None:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
+            it = iter(indices)
+            inflight = {}
+            while True:
+                while not timed_out and len(inflight) < args.concurrency:
+                    qidx = next(it, None)
+                    if qidx is None:
+                        break
+                    inflight[pool.submit(one, qidx)] = qidx
+                    sent += 1
+                if not inflight:
                     break
-                inflight.add(pool.submit(one, qidx))
-                sent += 1
-            if not inflight:
-                break
-            finished, inflight = concurrent.futures.wait(
-                inflight, timeout=max(0.1, min(5.0, remaining())),
-                return_when=concurrent.futures.FIRST_COMPLETED)
-            for f in finished:
-                p = f.result()
-                done += 1
-                s3_bytes += p.s3_bytes
-                if not p.ok:
-                    errors += 1
-                elif p.fully_cached is None:
-                    missing_field += 1
-                elif p.fully_cached:
-                    cached += 1
-            if missing_field:
-                print("WARM-GATE-UNSUPPORTED: a hydrate response carried no timings.fully_cached",
-                      flush=True)
-                # Do not wait for the in-flight hydrations (up to
-                # --request-timeout each): the answer is already known.
-                sys.stdout.flush()
-                os._exit(EXIT_UNSUPPORTED)
-            if remaining() <= 0:
-                timed_out = True  # stop submitting; drain what is in flight
-            if time.monotonic() - last_report >= args.progress_every:
-                print(f"WARM-GATE-HYDRATE {done + 1}/{n} done, {cached} already cached, "
-                      f"{errors} errors, {gib(s3_bytes)} from S3, {elapsed():.0f}s", flush=True)
-                last_report = time.monotonic()
-    if timed_out:
-        return timeout_exit("hydrate")
-    print(f"hydrate pass: {n} queries in {elapsed():.0f}s, {cached + bool(probe.fully_cached)} already "
-          f"fully cached, {errors} errors, {gib(s3_bytes)} from S3", flush=True)
+                finished, _ = concurrent.futures.wait(
+                    inflight, timeout=max(0.1, min(5.0, remaining())),
+                    return_when=concurrent.futures.FIRST_COMPLETED)
+                missing_field = False
+                for f in finished:
+                    qidx = inflight.pop(f)
+                    p = f.result()
+                    done += 1
+                    s3_bytes += p.s3_bytes
+                    if not p.ok:
+                        errors += 1
+                        not_cached.append(qidx)
+                    elif p.fully_cached is None:
+                        missing_field = True
+                    elif p.fully_cached:
+                        cached += 1
+                    else:
+                        not_cached.append(qidx)
+                if missing_field:
+                    print(f"WARM-GATE-UNSUPPORTED: a {stage} response carried no timings.fully_cached",
+                          flush=True)
+                    # Do not wait for the in-flight queries (up to
+                    # --request-timeout each): the answer is already known.
+                    sys.stdout.flush()
+                    os._exit(EXIT_UNSUPPORTED)
+                if remaining() <= 0:
+                    timed_out = True  # stop submitting; drain what is in flight
+                if time.monotonic() - last_report >= args.progress_every:
+                    print(f"WARM-GATE-{stage.upper()} {done}/{len(indices)} done, {cached} fully cached, "
+                          f"{errors} errors so far, {gib(s3_bytes)} from S3, {elapsed():.0f}s", flush=True)
+                    last_report = time.monotonic()
+        if timed_out:
+            return None
+        return sorted(not_cached)
 
-    # ── 2. poll until K consecutive fully cached responses ──────────────
-    streak = 0
+    # The probe counts as query 0's hydrate pass.
+    cold = [] if probe.ok and probe.fully_cached else [0]
+    rest = run_pass("hydrate", list(range(1, n)))
+    if rest is None:
+        return timeout_exit("hydrate")
+    cold = sorted(cold + rest)
+    print(f"hydrate pass: {n} queries in {elapsed():.0f}s, {n - len(cold)} already fully cached, "
+          f"{errors} errors, {gib(s3_bytes)} from S3", flush=True)
+
     backoff = args.backoff_initial
-    qidx = 0
+    rounds = 0
+
+    def verify(cold: list) -> bool:
+        """Re-send `cold` until every query in it came back fully cached."""
+        nonlocal backoff, rounds
+        while cold:
+            if remaining() <= 0:
+                return False
+            rounds += 1
+            before = len(cold)
+            cold = run_pass("verify", cold)
+            if cold is None:
+                return False
+            print(f"verify round {rounds}: {before - len(cold)}/{before} now fully cached, "
+                  f"{len(cold)} still not ({elapsed():.0f}s)", flush=True)
+            if cold:
+                time.sleep(max(0.0, min(backoff, remaining())))
+                backoff = min(backoff * 2, args.backoff_max)
+            else:
+                backoff = args.backoff_initial
+        return True
+
+    if not verify(cold):
+        return timeout_exit("verify")
+
+    # ── 3. poll until K consecutive fully cached responses ──────────────
+    rng = random.Random(args.seed)
+    streak = 0
     misses = 0
     while streak < args.consecutive:
         if remaining() <= 0:
             return timeout_exit("poll")
-        p = one(qidx % n)
-        qidx += 1
+        qidx = rng.randrange(n)
+        p = one(qidx)
         sent += 1
         s3_bytes += p.s3_bytes
         if p.ok and p.fully_cached is None:
@@ -236,18 +287,22 @@ def main(argv=None) -> int:
             return EXIT_UNSUPPORTED
         if p.ok and p.fully_cached:
             streak += 1
-            backoff = args.backoff_initial
             continue
+        # Something went cold again after verify (eviction, a failed read):
+        # re-verify that query, then restart the streak.
         streak = 0
         misses += 1
         if not p.ok:
             errors += 1
         why = p.error if not p.ok else f"not fully cached ({p.s3_bytes} bytes from S3)"
-        print(f"poll miss on query {(qidx - 1) % n}: {why}; backing off {backoff:.1f}s", flush=True)
+        print(f"poll miss on query {qidx}: {why}; re-verifying it", flush=True)
         time.sleep(max(0.0, min(backoff, remaining())))
         backoff = min(backoff * 2, args.backoff_max)
+        if not verify([qidx]):
+            return timeout_exit("verify")
 
-    print(f"WARM-GATE-READY in {elapsed():.0f}s (queries sent: {sent}, poll misses: {misses}, "
+    print(f"WARM-GATE-READY in {elapsed():.0f}s (all {n} queries fully cached at least once; "
+          f"queries sent: {sent}, verify rounds: {rounds}, poll misses: {misses}, "
           f"errors: {errors}, s3 bytes observed: {s3_bytes} = {gib(s3_bytes)})", flush=True)
     return EXIT_READY
 

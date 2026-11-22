@@ -67,9 +67,28 @@ marker_clear() {
 
 # wipe_local_cache: empty the server data dir. Callers stop the kosha
 # container first. The wipe is global (every namespace lives under the one
-# data dir), so every local.* marker goes, and it goes first.
+# data dir), so every local.* marker goes, and it goes first. Only for
+# callers that need an empty store (preload mode measures warmup).
 wipe_local_cache() {
   sudo rm -f "$SNAPSHOT_MARKER_DIR"/local.* 2>/dev/null || true
   # find, not a glob: the glob would expand as this (unprivileged) user.
   sudo find "${KOSHA_LOCAL_DATA:?}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+}
+
+# wipe_namespace_cache <ns> [tenant]: drop the local files of one
+# namespace only, and only its local.<ns> marker. Callers stop the kosha
+# container first. The server keeps a namespace under
+# <data dir>/<tenant>/<ns>/<segment>/ (span caches live inside the segment
+# dirs); pre-#262 layouts used <data dir>/<ns>, so that goes too. The
+# local WAL (_wal, _wal.migrated-*) goes as well, as with the global wipe:
+# a restore replaces the control plane, so a WAL left from an earlier run
+# must not replay into it. Other namespaces and their markers are kept, so
+# a suite=both run on a kept VM reuses both caches instead of each restore
+# wiping the other.
+wipe_namespace_cache() {
+  local ns="${1:-}" tenant="${2:-default}"
+  case "$ns/$tenant" in /*|*/|*..*) echo "wipe_namespace_cache: bad namespace $tenant/$ns" >&2; return 1 ;; esac
+  marker_clear local "$ns"
+  sudo rm -rf "${KOSHA_LOCAL_DATA:?}/$tenant/$ns" "${KOSHA_LOCAL_DATA:?}/$ns"
+  sudo find "${KOSHA_LOCAL_DATA:?}" -mindepth 1 -maxdepth 1 -name "_wal*" -exec rm -rf {} + 2>/dev/null || true
 }

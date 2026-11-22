@@ -89,9 +89,9 @@ echo "UPLOAD-COMPLETE"
 sudo rm -rf "/data/segments-out/$NS"
 
 # Drop local files of any earlier version of this namespace before the
-# server sees the new manifest.
+# server sees the new manifest. Other namespaces keep their caches.
 sudo docker stop kosha >/dev/null
-wipe_local_cache
+wipe_namespace_cache "$NS" "$TENANT"
 sudo docker start kosha >/dev/null
 for i in $(seq 60); do curl -sf http://127.0.0.1:8080/healthz >/dev/null && break; sleep 3
   [ "$i" -eq 60 ] && { echo "::error::kosha /healthz never responded after restart"; exit 1; }; done
