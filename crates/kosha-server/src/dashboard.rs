@@ -64,6 +64,19 @@ pub struct SearchTimings {
     pub materialize_ms: f64,
     /// Served from the whole-response result cache: no phase ran.
     pub cached: bool,
+    /// Sequential S3 round trips this search made (scoring scaffolding,
+    /// postings, kNN postings, page documents). Same figure as `s3_rounds`
+    /// on the `search timing:` log line.
+    pub s3_rounds: u64,
+    /// Bytes this search pulled from S3. Same figure as `s3_bytes` on the
+    /// `search timing:` log line.
+    pub s3_bytes: u64,
+    /// Everything this search read was already local: no S3 request of any
+    /// kind, nothing missing or shed, and no kNN segment degraded or BM25
+    /// fallback to per-segment statistics. Kosha's counterpart to
+    /// turbopuffer's `cache_hit_ratio == 1.0`, which its benchmark polls
+    /// before measuring a hot namespace. A result-cache hit is fully cached.
+    pub fully_cached: bool,
 }
 
 /// One search in a namespace's recent-query ring.

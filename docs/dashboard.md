@@ -66,8 +66,15 @@ API output is unchanged by default:
   different pod.
 - A search body with `"timings": true` gets a `timings` object back:
   `total_ms`, `hydrate_ms`, `queue_ms`, `admit_ms`, `bm25_stats_ms`, `score_ms`,
-  `materialize_ms` and `cached` (served from the result cache, so no phase ran). The field is
-  ignored when the dashboard is off. The same numbers are in the `search timing:` log line.
+  `materialize_ms` and `cached` (served from the result cache, so no phase ran), plus what
+  the search pulled from S3: `s3_rounds` (sequential round trips), `s3_bytes`, and
+  `fully_cached`. `fully_cached` is `true` only when the search made no S3 request of any
+  kind (scaffolding, postings, kNN `vector.idx` ranges, page documents), nothing it needed
+  was missing or shed, and it did not degrade a kNN segment or fall back to per-segment BM25
+  statistics; a result-cache hit is fully cached. It is Kosha's counterpart to turbopuffer's
+  `cache_hit_ratio == 1.0`, which a hot benchmark polls for before measuring. The field is
+  ignored when the dashboard is off. The phase and S3 numbers are also on the `search timing:`
+  log line.
 
 `GET /v1/namespaces` itself is always available.
 
