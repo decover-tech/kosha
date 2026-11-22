@@ -45,6 +45,9 @@ jobs:
             *)
               build/bin/buf breaking proto --against '.git#branch=origin/main,subdir=proto' ;;
           esac
+      # Kosha's own clients, bench and tools call only /v1 (#350).
+      - name: no legacy callers
+        run: bash scripts/api/check_no_legacy_callers.sh
 
   fmt:
     name: rustfmt

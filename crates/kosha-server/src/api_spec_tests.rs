@@ -268,3 +268,76 @@ fn an_invalid_filter_is_a_400() {
         "{response}"
     );
 }
+
+/// Plan acceptance 7, as ADR-350 §c restates it: with the pod default off
+/// and tenant B on `KOSHA_LEGACY_ROUTES_TENANTS`, A is refused and B is
+/// served; with no allowlist every tenant is refused.
+#[test]
+fn legacy_routes_follow_the_pod_default_and_the_allowlist() {
+    let allow_b = auth::parse_tenant_list(Some(" b , ,c"));
+    assert_eq!(allow_b.len(), 2);
+    assert!(!auth::legacy_routes_allowed(false, &allow_b, "a"));
+    assert!(auth::legacy_routes_allowed(false, &allow_b, "b"));
+    let none = auth::parse_tenant_list(None);
+    assert!(!auth::legacy_routes_allowed(false, &none, "a"));
+    assert!(!auth::legacy_routes_allowed(false, &none, "b"));
+    // Pod default on (today's built-in default): everyone.
+    assert!(auth::legacy_routes_allowed(true, &none, "a"));
+}
+
+/// While a legacy route is served it says it is going away, and the
+/// cutover is counted; a /v1 response carries no deprecation headers.
+#[test]
+fn legacy_responses_carry_deprecation_headers_and_are_counted() {
+    let state = AppState::new(tests::test_dir());
+    let headers = HashMap::new();
+    let body = serde_json::json!({"namespace": "docs", "documents": [{"id": "1", "fields": [
+        {"name": "title", "field_type": "Text", "value": "hello"}]}]});
+    let legacy = route(
+        "POST /index HTTP/1.1\r\n",
+        &headers,
+        body.to_string().as_bytes(),
+        "acme",
+        &state,
+    );
+    assert_eq!(status_of(&legacy), 200, "{legacy}");
+    assert_eq!(header_of(&legacy, "deprecation"), Some("@1797292800"));
+    assert_eq!(
+        header_of(&legacy, "sunset"),
+        Some("Tue, 01 Jun 2027 00:00:00 GMT")
+    );
+    assert!(header_of(&legacy, "link")
+        .unwrap()
+        .ends_with("versioning.md#legacy-routes>; rel=\"deprecation\""));
+    let exposition = state.metrics.render(&metrics::Scrape::default());
+    assert!(
+        exposition.contains("kosha_legacy_requests_total{route=\"/index\"} 1"),
+        "{exposition}"
+    );
+
+    let v1 = route(
+        "GET /v1/namespaces HTTP/1.1\r\n",
+        &headers,
+        b"",
+        "acme",
+        &state,
+    );
+    assert_eq!(status_of(&v1), 200);
+    assert_eq!(header_of(&v1, "deprecation"), None);
+    assert_eq!(header_of(&v1, "sunset"), None);
+}
+
+/// A disabled legacy route names its replacement.
+#[test]
+fn a_disabled_legacy_route_names_its_replacement() {
+    let raw = legacy_route_disabled("/index");
+    assert_eq!(status_of(&raw), 410);
+    let body = body_of(&raw);
+    assert_eq!(body["code"], "legacy_route_disabled");
+    assert_eq!(body["retryable"], false);
+    assert_eq!(body["details"]["route"], "/index");
+    assert_eq!(
+        body["details"]["replacement"],
+        "POST /v1/namespaces/{namespace}/documents"
+    );
+}

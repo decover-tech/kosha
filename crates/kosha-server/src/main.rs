@@ -6646,7 +6646,34 @@ fn valid_new_tenant_id(tenant: &str) -> bool {
 }
 
 /// Authorize before dispatch, including compatibility and internal routes.
+/// A response on a legacy unversioned route carries the deprecation
+/// headers (ADR-350 §c): `Deprecation`, `Sunset`, and a `Link` to the
+/// migration notes.
 fn route(
+    request_line: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    tenant: &str,
+    state: &AppState,
+) -> String {
+    let response = route_checked(request_line, headers, body, tenant, state);
+    if legacy_route(request_line).is_none() {
+        return response;
+    }
+    let response = with_header(
+        response,
+        "link",
+        &format!("<{}>; rel=\"deprecation\"", auth::LEGACY_DEPRECATION_LINK),
+    );
+    let response = with_header(response, "sunset", auth::LEGACY_SUNSET);
+    with_header(
+        response,
+        "deprecation",
+        &format!("@{}", auth::LEGACY_DEPRECATED_AT),
+    )
+}
+
+fn route_checked(
     request_line: &str,
     headers: &HashMap<String, String>,
     body: &[u8],
@@ -6707,10 +6734,11 @@ fn route(
         let bare_path = path.split('?').next().unwrap_or(path);
         let is_legacy = legacy_route(request_line).is_some();
         if is_legacy {
-            if !auth::legacy_routes_enabled() {
+            if !auth::legacy_routes_enabled_for(tenant) {
                 return legacy_route_disabled(bare_path);
             }
             auth::record_legacy_use(tenant, bare_path);
+            state.metrics.record_legacy_request(bare_path, tenant);
         }
         if method == "GET" && (bare_path == "/stats" || bare_path == "/v1/stats") {
             return if service_authorized(headers, state.admin_auth_key.as_deref()) {

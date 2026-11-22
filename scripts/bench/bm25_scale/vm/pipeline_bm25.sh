@@ -45,7 +45,7 @@ start_kosha() {
     -e KOSHA_SEGMENT_CACHE_CAPACITY=16384 \
     -e KOSHA_WARMUP_NAMESPACES="msmarco-10m,default/msmarco-10m" \
     -v /data/kosha:/var/cache/kosha kosha-server:bench >/dev/null
-  until curl -sf -H "Authorization: Bearer sk-bench" http://127.0.0.1:8080/stats >/dev/null; do sleep 2; done
+  until curl -sf http://127.0.0.1:8080/v1/healthz >/dev/null; do sleep 2; done
 }
 start_kosha
 echo "kosha up"

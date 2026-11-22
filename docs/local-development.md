@@ -124,7 +124,7 @@ isolation section):
 | `KOSHA_AUTH=disabled` | Run with auth off (every request is tenant `dev`). Without it, a server with no credential configured (env or Postgres `kosha.api_keys`) refuses to start |
 | `KOSHA_API_KEY_REFRESH_SECS` | How often Postgres keys are re-read (default 30), so created keys work and deleted keys stop working without a restart |
 | `KOSHA_MAX_BODY_BYTES` | Request body cap, larger bodies get 413 (default 64 MiB) |
-| `KOSHA_LEGACY_ROUTES=off` | Unversioned `/index`, `/search`, ... routes answer 410. Usage per tenant is logged (`legacy route usage:`) to track the cutover |
+| `KOSHA_LEGACY_ROUTES=off` | Unversioned `/index`, `/search`, ... routes answer 410 (`KOSHA_LEGACY_ROUTES_TENANTS` keeps them for named tenants). Usage is logged (`legacy route usage:`) and counted in `kosha_legacy_requests_total` to track the cutover |
 
 On startup the server logs which control plane and S3 backend it bound, and
 how many manifests it restored. `/stats` exposes `control_plane`,

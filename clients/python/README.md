@@ -44,6 +44,13 @@ Phase 1 ships with a lightweight hand-written client (`client.py`) that directly
 Kosha HTTP API. As the API stabilises, the hand-written code will shrink to just `transport.py`
 + `compat.py` + the delegation layer in `client.py`.
 
+Since 0.3.0 the client calls only the `/v1` API (`/v1/namespaces/{ns}/documents`,
+`.../replace`, `.../search`, ...), so it works against servers with
+`KOSHA_LEGACY_ROUTES=off`; 0.2.x needs the legacy routes on. `KoshaRequestError`
+carries the server's error model: `code`, `retryable`, `retry_after_ms` and
+`request_id` (see [docs/api/errors.md](../../docs/api/errors.md)). The client
+does not retry on HTTP status yet; retry when `retryable` is true.
+
 ## Supported APIs
 
 `KoshaClient` stands in for `opensearchpy.OpenSearch`. These methods are implemented:

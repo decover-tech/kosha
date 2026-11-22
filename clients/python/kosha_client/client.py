@@ -157,15 +157,40 @@ class KoshaClient:
 
     # ── Low-level request helpers ──────────────────────────────────────────
 
+    # Namespace operations by name, and the /v1 action each one is (#350).
+    _V1_ACTIONS = {
+        "index": "documents",
+        "replace": "replace",
+        "search": "search",
+        "exists": "exists",
+        "flush": "flush",
+        "delete": "delete",
+    }
+
     def _request(
         self, method: str, path: str, body: Any = None, headers: dict | None = None
     ) -> Any:
-        """Legacy request helper — delegates to the Transport layer.
+        """Request helper for namespace operations and the health check.
 
-        Paths here are relative (no ``/v1/namespaces/...`` prefix); they are
-        appended directly to the base URL.  Used by the legacy Phase 1 routes.
+        ``path`` names the operation (``"index"``, ``"search"``, ``"replace"``,
+        ``"delete"``, ``"flush"``, ``"exists"``) and ``body["namespace"]`` the
+        namespace; the request goes to ``/v1/namespaces/{namespace}/{action}``
+        with the namespace taken out of the body. ``"healthz"`` is
+        ``GET /v1/healthz``. The unversioned routes these names once were are
+        deprecated server-side (docs/api/versioning.md), so nothing here
+        calls them.
         """
-        return self._transport.request(method, path, body, headers)
+        if path == "healthz":
+            return self._transport.request(method, "v1/healthz", body, headers)
+        action = self._V1_ACTIONS.get(path)
+        if action is None:
+            return self._transport.request(method, path, body, headers)
+        body = dict(body or {})
+        namespace = body.pop("namespace", None)
+        if not namespace:
+            raise ValueError("%s needs a namespace" % path)
+        target = "v1/namespaces/%s/%s" % (urllib.parse.quote(str(namespace), safe=""), action)
+        return self._transport.request(method, target, body, headers)
 
     def _v1_request(
         self, method: str, namespace: str, action: str, body: Any = None

@@ -495,7 +495,8 @@ far, and its invoices. `GET /v1/admin/billing/accounts` and
 | `KOSHA_API_KEYS` | Comma-separated `key=tenant` pairs | unset | list |
 | `KOSHA_ADMIN_API_KEY` | Key for `/v1/admin/*` and global `/stats`. Unset disables those routes | unset | string |
 | `KOSHA_INTERNAL_API_KEY` | Key peers use for `GET /internal/segment/...` hydration. Unset disables peer-file access | unset | string |
-| `KOSHA_LEGACY_ROUTES` | `off` (or `disabled`, `false`, `0`, `none`) makes the unversioned Phase 1 routes return 410 | on | flag |
+| `KOSHA_LEGACY_ROUTES` | `off` (or `disabled`, `false`, `0`, `none`) makes the unversioned Phase 1 routes (`/index`, `/search`, ...) return 410 `legacy_route_disabled` (#350; see docs/api/versioning.md). While on, every legacy response carries `Deprecation`/`Sunset` headers and is counted in `kosha_legacy_requests_total` | on | flag |
+| `KOSHA_LEGACY_ROUTES_TENANTS` | Comma-separated tenant ids that keep the legacy routes while `KOSHA_LEGACY_ROUTES=off` (a managed deployment turns the default off and lists only tenants still migrating). Read at startup | empty | list |
 | `KOSHA_DASHBOARD` | `on` (or `true`, `1`, `yes`, `enabled`) serves the read-only web UI at `/dashboard`, adds `recent_queries` to `GET /v1/namespaces/{ns}/stats`, and honors `"timings": true` on searches. See [dashboard.md](dashboard.md). `dashboard.rs`, `Dashboard::from_env` | off | flag |
 
 The server refuses to start when no credential is configured (no env key, no admin or internal
