@@ -3586,6 +3586,28 @@ impl AppState {
         (files, bytes)
     }
 
+    /// Pin every segment directory of `manifest` in the disk cache until
+    /// the returned guard drops.
+    fn pin_segments(&self, ns: &NamespaceId, manifest: &kosha_core::Manifest) -> SegmentPins<'_> {
+        let keys: Vec<String> = manifest
+            .segments
+            .iter()
+            .filter_map(|entry| {
+                let dir = manifest.segment_dir(&self.data_dir, ns, &entry.segment_id);
+                dir.strip_prefix(&self.data_dir)
+                    .ok()
+                    .map(|rel| rel.to_string_lossy().into_owned())
+            })
+            .collect();
+        for key in &keys {
+            self.cache.pin(key);
+        }
+        SegmentPins {
+            cache: &self.cache,
+            keys,
+        }
+    }
+
     /// Fetch a batch of `(logical_path, projected_size_bytes)` pairs into
     /// the local cache, using cross-replica lease coordination when it's
     /// configured (`hydration_leases`) so a segment cold across the whole
@@ -8222,6 +8244,11 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // See `hydration_budget`.
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
+    // Hold this search's segments in the disk cache until it returns: once
+    // the working set reaches KOSHA_CACHE_MAX_BYTES, files fetched for it
+    // otherwise evicted files it had just checked, and it failed with
+    // "segment hydration failed".
+    let _segment_pins = state.pin_segments(&ns, manifest);
     // Read stamp for the disk-cache policy (#389): files this search
     // hydrates do not count its own read as a re-read. 0 when off.
     let cache_read_at = state.begin_cache_read();
@@ -8857,6 +8884,11 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     // See `hydration_budget`.
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
+    // Hold this search's segments in the disk cache until it returns: once
+    // the working set reaches KOSHA_CACHE_MAX_BYTES, files fetched for it
+    // otherwise evicted files it had just checked, and it failed with
+    // "segment hydration failed".
+    let _segment_pins = state.pin_segments(&ns, manifest);
 
     let cache_read_at = state.begin_cache_read();
     let t_hydrate = Instant::now();
@@ -10825,7 +10857,9 @@ fn hydration_error_response(outcome: &HydrationOutcome) -> Option<String> {
         return Some(hydration_shed_response());
     }
     if !outcome.missing.is_empty() {
-        return Some(json_error(503, &hydration_failed_message(&outcome.missing)));
+        let message = hydration_failed_message(&outcome.missing);
+        eprintln!("ERROR: {message}{}", request_id());
+        return Some(json_error(503, &message));
     }
     None
 }
@@ -10920,6 +10954,20 @@ fn json_ok<T: serde::Serialize>(value: &T) -> String {
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
         body.len()
     )
+}
+
+/// Disk-cache pins on a search's segment directories, released on drop.
+struct SegmentPins<'a> {
+    cache: &'a Cache,
+    keys: Vec<String>,
+}
+
+impl Drop for SegmentPins<'_> {
+    fn drop(&mut self) {
+        for key in &self.keys {
+            self.cache.unpin(key);
+        }
+    }
 }
 
 /// One structured line per search request — the cold-read baseline

@@ -21,6 +21,7 @@ patches:
   - path: serviceaccount-patch.yaml
   - path: deployment-resources-patch.yaml
   - path: deployment-query-resources-patch.yaml
+  - path: deployment-indexer-resources-patch.yaml
   - path: hpa-query-patch.yaml
 
 images:
