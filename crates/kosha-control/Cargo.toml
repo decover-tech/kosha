@@ -12,6 +12,8 @@ workspace = true
 kosha-core = { path = "../kosha-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# At-rest hash of API keys (api_keys.rs, #346).
+sha2 = "0.10"
 
 # Postgres persistence (optional — in-memory is the default).
 # `tls-rustls-aws-lc-rs` (#343): without a TLS feature sqlx cannot honor

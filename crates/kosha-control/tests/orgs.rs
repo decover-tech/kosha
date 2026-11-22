@@ -651,7 +651,16 @@ mod postgres {
         let names = Names::new();
         // A key for a tenant no organization knows about, made the old way.
         let legacy_tenant = names.slug("legacy");
-        let legacy_key = store.create_api_key(&legacy_tenant, "pre-orgs").unwrap();
+        let legacy_key = store
+            .create_api_key(&kosha_control::NewApiKey {
+                tenant_id: legacy_tenant.clone(),
+                description: "pre-orgs".to_string(),
+                scopes: kosha_control::Scopes::ALL,
+                namespaces: None,
+                expires_at: None,
+            })
+            .unwrap()
+            .api_key;
 
         let f = fixture(&store, &names);
         let tenant = orgs::link_tenant(&store, &f.owner, &f.org, None, None).unwrap();
@@ -673,7 +682,7 @@ mod postgres {
             .list_api_keys(Some(&legacy_tenant))
             .unwrap()
             .iter()
-            .any(|(k, _, _)| *k == legacy_key));
+            .any(|k| k.key_hash == kosha_control::hash_api_key(&legacy_key)));
         // The key made before the link was audited with no organization, so
         // it is not in this organization's log; one made after is.
         let linked = orgs::create_operator_api_key(&store, &legacy_tenant, "ops").unwrap();

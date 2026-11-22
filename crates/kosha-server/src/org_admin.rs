@@ -305,7 +305,18 @@ fn dispatch(
             respond(
                 orgs::create_api_key(store, actor, org, tenant_id, description),
                 |key| {
-                    keys.insert_db_key(key.api_key.clone(), key.tenant_id.clone());
+                    // A full-access key that never expires, as an operator-made
+                    // key is by default (#346).
+                    keys.upsert_db_key(kosha_control::ApiKeyRecord {
+                        key_hash: kosha_control::hash_api_key(&key.api_key),
+                        tenant_id: key.tenant_id.clone(),
+                        description: key.description.clone(),
+                        scopes: kosha_control::Scopes::ALL,
+                        namespaces: None,
+                        expires_at: None,
+                        last_used_at: None,
+                        created_at: crate::auth::unix_now(),
+                    });
                     json!(key)
                 },
             )
@@ -513,7 +524,8 @@ mod tests {
         assert_eq!(key["tenant_id"], json!(tenant_id));
         // The key authenticates as the tenant on this pod straight away.
         let api_key = key["api_key"].as_str().unwrap();
-        assert_eq!(keys.lookup(api_key).as_deref(), Some(tenant_id));
+        let tenant = keys.lookup(api_key).ok().map(|p| p.tenant);
+        assert_eq!(tenant.as_deref(), Some(tenant_id));
 
         // Ada removes Grace; the audit log has the whole story and no key.
         api.ok(

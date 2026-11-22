@@ -67,7 +67,11 @@ selected profile → default `http://localhost:8080`.
 | `kosha compact -n TENANT/NS [--mode tiered\|full] [--wait]` | Start a compaction job (admin) |
 | `kosha compaction-status [--job ID]` | Scheduler overview, or one job (admin) |
 | `kosha import -n TENANT/NS --source s3 [--overwrite]` | Rebuild a manifest from S3 segment footers (admin) |
-| `kosha admin create-api-key --tenant T [--description D]` | Create a tenant API key (admin, Postgres only) |
+| `kosha admin create-api-key --tenant T [--description D] [--scope read,write,admin] [--namespace NS]... [--expires-in-secs N]` | Create a tenant API key (admin, Postgres only) |
+| `kosha admin list-api-keys [--tenant T]` | List keys: id, scopes, namespaces, expiry, last use (admin) |
+| `kosha admin rotate-api-key KEY_ID [--overlap-secs N] [--expires-in-secs N]` | Replace a key; the old one keeps working for the overlap (admin) |
+| `kosha admin revoke-api-key KEY_ID` | Revoke a key (admin) |
+| `kosha admin scrub-plaintext-api-keys` | Remove plaintext held by keys created before scoped keys (admin) |
 | `kosha rebuild-filter-blooms -n NS` | Rebuild segment filter blooms (admin) |
 | `kosha backfill-offset-tables -n NS` | Backfill `doc_store.offsets` (admin) |
 | `kosha curl METHOD PATH [--body @file]` | Raw REST escape hatch |
@@ -141,7 +145,7 @@ kosha --json exists -n quickstart-demo doc-404  # {"existing":[],"missing":["doc
 
 ### Admin commands
 
-`compact`, `compaction-status`, `import`, `admin create-api-key`,
+`compact`, `compaction-status`, `import`, the `admin *-api-key(s)` commands,
 `rebuild-filter-blooms` and `backfill-offset-tables` call `/v1/admin/*`, which
 the server only accepts with its `KOSHA_ADMIN_API_KEY`. Pass that key the same
 way as any other (`--api-key`, `KOSHA_API_KEY`, or a profile — a separate
@@ -170,7 +174,20 @@ kosha import -n default/quickstart-demo --source s3 --overwrite   # replace a li
 # Create a tenant key. The key alone goes to stdout (notes go to stderr),
 # and it is shown only this once:
 NEW_KEY=$(kosha admin create-api-key --tenant acme --description "staging")
+
+# A read-only key for one namespace that expires in 30 days:
+RO_KEY=$(kosha admin create-api-key --tenant acme --scope read \
+  --namespace docs --expires-in-secs 2592000)
+
+# Rotate without downtime: the old key keeps working for an hour.
+kosha admin list-api-keys --tenant acme          # first column is the key id
+ROTATED=$(kosha admin rotate-api-key "$KEY_ID" --overlap-secs 3600)
+kosha admin revoke-api-key "$KEY_ID"             # or cut it off now
 ```
+
+Without `--scope`, `--namespace` or `--expires-in-secs` a key has every scope,
+reaches every namespace of its tenant and never expires. `rotate-api-key`
+prints the replacement key the same way `create-api-key` does.
 
 `compact --wait` polls `GET /v1/admin/compaction-jobs/{id}` every
 `--poll-interval` seconds (default 2) and gives up after `--timeout` seconds

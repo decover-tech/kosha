@@ -33,7 +33,9 @@ fn namespace_tenant(ns: &str) -> Option<&str> {
 /// credentials. Operator traffic is never tenant-limited (#341).
 const SERVICE_TENANT: &str = "service";
 
+mod api_key_admin;
 mod auth;
+mod authz;
 mod branching;
 mod cache_reads;
 mod compaction_sched;
@@ -5837,7 +5839,17 @@ fn dispatch(state: &AppState, request: http::Request) -> http::Response {
     {
         Ok("service".to_string())
     } else {
-        authenticate(&headers)
+        // A tenant key: who it is, then whether its scopes and namespace
+        // allow-list cover this request (#346). Checked here, ahead of
+        // the role routing below, so a query pod refuses a request itself
+        // instead of forwarding it to the ingest pod.
+        authenticate(&headers).and_then(|principal| {
+            let (method, path) = parse_method_and_path(&request_line).unwrap_or(("", ""));
+            match authz::authorize(&principal, method, path, &body) {
+                Ok(()) => Ok(principal.tenant),
+                Err(message) => Err(json_error_body(403, &message)),
+            }
+        })
     };
     dispatch_authenticated(
         state,
@@ -6410,12 +6422,12 @@ fn log_request(
 }
 
 /// Extract and validate the API key from request headers.
-/// Returns the tenant id on success, or a 401 response string on failure.
-fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
+/// Returns who the key authenticates as, or a 401 response string on failure.
+fn authenticate(headers: &HashMap<String, String>) -> Result<auth::Principal, String> {
     let store = match auth::global() {
         // Only reachable with an explicit `KOSHA_AUTH=disabled`; an empty
         // key set no longer means "auth off" (see `auth::init_global`).
-        auth::Auth::Disabled => return Ok("dev".to_string()),
+        auth::Auth::Disabled => return Ok(auth::Principal::full("dev")),
         auth::Auth::Keys(store) => store,
     };
 
@@ -6438,8 +6450,9 @@ fn authenticate(headers: &HashMap<String, String>) -> Result<String, String> {
 
     match api_key {
         Some(key) => match store.lookup(key) {
-            Some(tenant) => Ok(tenant),
-            None => Err(json_error_body(401, "invalid API key")),
+            Ok(principal) => Ok(principal),
+            Err(auth::Rejected::Unknown) => Err(json_error_body(401, "invalid API key")),
+            Err(auth::Rejected::Expired) => Err(json_error_body(401, "API key expired")),
         },
         None => Err(json_error_body(
             401,
@@ -6869,8 +6882,8 @@ fn route_inner(
     }
 
     // ── Admin routes (Postgres-backed only) ────────────────────────────────
-    if request_line.starts_with("POST /v1/admin/api-keys") {
-        return handle_create_api_key(body, tenant, state);
+    if let Some(response) = api_key_admin::handle(request_line, body) {
+        return response;
     }
 
     if request_line.starts_with("POST /v1/admin/rebuild-filter-blooms") {
@@ -10867,75 +10880,6 @@ fn handle_import_namespace(body: &[u8], _tenant: &str, state: &AppState) -> Stri
             "segments": segments,
             "documents": documents,
         }))
-    }
-}
-
-/// POST /v1/admin/api-keys — create a new API key for a tenant.
-///
-/// Requires the dedicated KOSHA_ADMIN_API_KEY credential.
-/// Request body: {"tenant_id": "acme-corp", "description": "staging key"}
-fn handle_create_api_key(body: &[u8], _tenant: &str, state: &AppState) -> String {
-    let req: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return json_error(400, "invalid JSON"),
-    };
-
-    let tenant_id = match req.get("tenant_id").and_then(|v| v.as_str()) {
-        Some(t) => t,
-        None => return json_error(400, "missing 'tenant_id'"),
-    };
-    if !valid_new_tenant_id(tenant_id) {
-        return json_error(
-            400,
-            "invalid 'tenant_id' (must be non-empty, without '/', '\\' or control \
-             characters, and not start with '_' or '.')",
-        );
-    }
-
-    let description = req
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    // Create via the shared Postgres pool (only with the postgres feature).
-    #[cfg(feature = "postgres")]
-    {
-        let _ = state;
-        let auth::Auth::Keys(store) = auth::global() else {
-            return json_error(400, "API keys are disabled (KOSHA_AUTH=disabled)");
-        };
-        if std::env::var("DATABASE_URL").is_err() {
-            return json_error(400, "Postgres not configured (DATABASE_URL not set)");
-        }
-        let Some(pg) = store.pg() else {
-            return json_error(500, "failed to connect to postgres");
-        };
-        // The key and its audit row (#345) commit together.
-        match kosha_control::orgs::create_operator_api_key(&*pg, tenant_id, description) {
-            Ok(key) => {
-                let api_key = key.api_key;
-                // Usable on this pod right away; other pods pick it up on
-                // their next key refresh.
-                store.insert_db_key(api_key.clone(), tenant_id.to_string());
-                json_ok(&serde_json::json!({
-                    "api_key": api_key,
-                    "tenant_id": tenant_id,
-                    "description": description,
-                }))
-            }
-            Err(e) => json_error(500, &format!("failed to create key: {e}")),
-        }
-    }
-
-    #[cfg(not(feature = "postgres"))]
-    {
-        let _ = state;
-        let _ = tenant_id;
-        let _ = description;
-        json_error(
-            400,
-            "admin API requires postgres feature (compile with --features postgres)",
-        )
     }
 }
 
