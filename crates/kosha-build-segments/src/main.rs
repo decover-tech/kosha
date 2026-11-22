@@ -339,4 +339,36 @@ fn main() {
         args.namespace,
         args.namespace
     );
+    // #385 compares index size across doc orders, so the build log carries
+    // it (a log line only; nothing is written).
+    let (postings_bytes, inverted_bytes) = index_bytes(&ns_out);
+    println!(
+        "index bytes: postings {postings_bytes} (postings-*.bin) + inverted {inverted_bytes} (inverted.idx) = {}",
+        postings_bytes + inverted_bytes
+    );
+}
+
+/// Total bytes of `postings-*.bin` and of `inverted.idx` across the segment
+/// directories directly under `ns_out`.
+fn index_bytes(ns_out: &Path) -> (u64, u64) {
+    let (mut postings, mut inverted) = (0u64, 0u64);
+    let Ok(segments) = std::fs::read_dir(ns_out) else {
+        return (0, 0);
+    };
+    for seg in segments.flatten() {
+        let Ok(files) = std::fs::read_dir(seg.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let name = f.file_name();
+            let name = name.to_string_lossy();
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            if name == "inverted.idx" {
+                inverted += len;
+            } else if name.starts_with("postings-") && name.ends_with(".bin") {
+                postings += len;
+            }
+        }
+    }
+    (postings, inverted)
 }
