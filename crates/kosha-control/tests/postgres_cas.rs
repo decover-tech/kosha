@@ -419,6 +419,117 @@ fn concurrent_first_boot_migrations_all_succeed() {
     admin_exec(&url, &format!("DROP DATABASE {db} WITH (FORCE)"));
 }
 
+/// Every table the embedded migrations create, by the migration that
+/// creates it. A new migration adds its tables here.
+const MIGRATED_TABLES: &[&str] = &[
+    // 001_create_kosha_tables
+    "namespaces",
+    "manifests",
+    "retired_namespaces",
+    "api_keys",
+    "hydration_leases",
+    // 003_writer_leases
+    "writer_leases",
+    // 004_deletion_records
+    "deletion_records",
+    // 005_usage_events
+    "usage_events",
+    // 006_orgs_users_projects
+    "users",
+    "organizations",
+    "org_members",
+    "projects",
+    "tenants",
+    "audit_log",
+    // 007_billing
+    "billing_accounts",
+    "billing_invoices",
+];
+
+/// The migrations came from separate branches (#426): booting twice on
+/// one database must apply all of them the first time and change nothing
+/// the second. Uses its own freshly created database, like
+/// `concurrent_first_boot_migrations_all_succeed`.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn booting_twice_on_one_database_creates_every_table_once() {
+    use sqlx::Connection;
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let db = format!("kosha_migrate_{}", uuid::Uuid::new_v4().simple());
+    admin_exec(&url, &format!("CREATE DATABASE {db}"));
+    let fresh = with_database(&url, &db);
+
+    // Tables with their columns, and indexes, of the `kosha` schema.
+    let schema = || -> (Vec<(String, String)>, Vec<String>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut conn = sqlx::PgConnection::connect(&fresh).await.unwrap();
+            let columns = sqlx::query_as(
+                "SELECT table_name::TEXT, column_name::TEXT FROM information_schema.columns \
+                 WHERE table_schema = 'kosha' ORDER BY 1, 2",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            let indexes: Vec<(String,)> = sqlx::query_as(
+                "SELECT indexname::TEXT FROM pg_indexes WHERE schemaname = 'kosha' ORDER BY 1",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            conn.close().await.unwrap();
+            (columns, indexes.into_iter().map(|(name,)| name).collect())
+        })
+    };
+
+    let first = PgStore::new(&fresh).unwrap();
+    let after_first = schema();
+    for table in MIGRATED_TABLES {
+        assert!(
+            after_first.0.iter().any(|(name, _)| name == table),
+            "kosha.{table} is missing after the first boot"
+        );
+    }
+    // 003_scoped_api_keys alters a table instead of creating one.
+    for column in [
+        "key_hash",
+        "scopes",
+        "namespaces",
+        "expires_at",
+        "last_used_at",
+    ] {
+        assert!(
+            after_first
+                .0
+                .contains(&("api_keys".to_string(), column.to_string())),
+            "kosha.api_keys.{column} is missing after the first boot"
+        );
+    }
+    assert!(after_first.1.contains(&"idx_api_keys_key_hash".to_string()));
+
+    // Rows written between the boots survive the second one.
+    let tenant = format!("boot-{}", uuid::Uuid::new_v4());
+    let key = first
+        .create_api_key(&kosha_control::NewApiKey {
+            tenant_id: tenant.clone(),
+            description: "kept".to_string(),
+            scopes: kosha_control::Scopes::ALL,
+            namespaces: None,
+            expires_at: None,
+        })
+        .unwrap();
+    drop(first);
+    let second = PgStore::new(&fresh).unwrap();
+    assert_eq!(schema(), after_first, "the second boot changed the schema");
+    assert_eq!(second.validate_api_key(&key.api_key), Some(tenant));
+
+    drop(second);
+    admin_exec(&url, &format!("DROP DATABASE {db} WITH (FORCE)"));
+}
+
 #[test]
 fn with_database_replaces_only_the_database_name() {
     assert_eq!(

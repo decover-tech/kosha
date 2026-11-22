@@ -403,7 +403,7 @@ fn json_body(body: &[u8]) -> Result<serde_json::Value, String> {
     serde_json::from_slice(body).map_err(|e| json_error(400, &format!("invalid JSON body: {e}")))
 }
 
-const ROUTES: [(&str, &str); 7] = [
+pub(crate) const ROUTES: [(&str, &str); 7] = [
     ("GET", "/v1/billing"),
     ("GET", "/v1/admin/billing/accounts"),
     ("POST", "/v1/admin/billing/accounts"),
