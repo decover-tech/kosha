@@ -146,6 +146,14 @@ echo "WARMUP-READY in $(( $(date +%s) - T0 ))s"
 save_server_log warmup "$WARMUP_SINCE"
 fi
 
+# Local cache bytes per segment file class (#381), once warm and again
+# after the phases: whole files and span-cache entries separately, so a run
+# shows what the measured phases actually kept local. Never fails the run.
+local_bytes() { # local_bytes <label>
+  "$(dirname "$0")/local_bytes.sh" "$NS" default "$1" 2>&1 | tee -a "$OUT/local_bytes.txt" || true
+}
+local_bytes warm
+
 # Every phase also writes one record per request (--raw-out: query,
 # term count, client send lag, latency, hits, and the server's own phase
 # timings via --server-timings) and its server log, so a tail can be
@@ -182,4 +190,5 @@ else
   phase knn_cold_nocache --phase cold --knn-embeddings /data/queries_emb.f32 --no-cache
   phase knn_warm_cache   --phase warm --knn-embeddings /data/queries_emb.f32
 fi
+local_bytes after_phases
 echo "PHASES-COMPLETE"
