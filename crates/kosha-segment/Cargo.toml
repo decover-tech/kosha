@@ -34,3 +34,7 @@ proptest = "1"
 [[bench]]
 name = "tokenizer"
 harness = false
+
+[[bench]]
+name = "postings_codec"
+harness = false
