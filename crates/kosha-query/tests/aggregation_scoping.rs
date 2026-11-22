@@ -72,8 +72,12 @@ fn corpus() -> Vec<Doc> {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
+    // Tests run in parallel in one process and the clock can repeat, so a
+    // per-process counter keeps two layouts from sharing (and deleting) a dir.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "kosha-agg-scope-{tag}-{}-{}",
+        "kosha-agg-scope-{tag}-{}-{seq}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
