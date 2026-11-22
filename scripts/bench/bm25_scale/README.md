@@ -274,6 +274,74 @@ Approximate times per stage:
 For comparison, `warm_gate=preload` on the original vector snapshot
 spends about 115 minutes in warmup alone, before its phases.
 
+### Experiment inputs (`server_env`, `rustflags`, `bm25_snapshot`, `knn_budget_fraction`)
+
+These inputs serve the research track (#260): one dispatch measures one
+flag or build setting against the baseline. All four are optional. Left
+empty (the default), the run behaves exactly as before: the same
+`docker build` command, the same container env, the same snapshots.
+A first step, "Validate experiment inputs", checks them before anything
+is provisioned, so a rejected value costs nothing and fails the run
+with an `::error::` line.
+
+| input | default | effect | accepted values |
+|---|---|---|---|
+| `server_env` | empty | extra `-e KEY=VALUE` flags on the kosha container, after the standard bench env (so a repeated key, e.g. `KOSHA_CACHE_MAX_BYTES`, overrides it) | space-separated pairs, each `^[A-Z0-9_]+=[A-Za-z0-9._:/,-]*$` |
+| `rustflags` | empty | `--build-arg KOSHA_RUSTFLAGS=...` on the server image build; the Dockerfile exports it as `RUSTFLAGS` for `cargo chef cook` and `cargo build` only when non-empty | letters, digits, space and `= + , . _ : -`, e.g. `-C target-cpu=x86-64-v3` |
+| `bm25_snapshot` | `msmarco-<bm25_docs>` | snapshot the BM25 suite restores into `msmarco-<bm25_docs>`; one that does not exist yet is built offline first (see below) | `^[a-z0-9.-]+$`, restore mode only |
+| `knn_budget_fraction` | empty (server default 0.05) | `-e KOSHA_KNN_BUDGET_FRACTION=<x>` | a number with 0 < x <= 1; do not also set the key in `server_env` |
+
+No value may contain quotes, `$`, backticks, `;`, `|`, `&`, redirections
+or globs. The validated values are spliced into the remote scripts, so
+these rules are what keeps them safe.
+
+Examples:
+
+```
+# kNN probe budget sweep point
+knn_budget_fraction=0.02 suite=vector
+
+# a new code path behind an env flag, plus a cache size override
+server_env="KOSHA_SOME_FLAG=1 KOSHA_SEGMENT_CACHE_MAX_BYTES=34359738368"
+
+# x86-64-v3 build of the server (AVX2/FMA/BMI2)
+rustflags="-C target-cpu=x86-64-v3"
+
+# BM25 on a snapshot built with a new segment format flag
+bm25_snapshot=msmarco-10m-fmtv2 server_env="KOSHA_SOME_FORMAT_FLAG=2" suite=bm25
+```
+
+Details and caveats:
+
+- **New snapshots.** When `bm25_snapshot` names a snapshot that does not
+  exist, the BM25 step runs `SNAPSHOT_NAME=<name> build_and_import.sh
+  msmarco-<bm25_docs>` (first 1M docs when `bm25_docs=1m`) and then
+  restores it. The same rule as the vector side applies: an existing
+  snapshot is never overwritten, and the default name keeps its old
+  behaviour (the 1M snapshot is still built on its first run, without
+  `server_env`). `server_env` reaches the offline builder container
+  through `build_and_import.sh`'s `BUILD_DOCKER_ENV` (validated again
+  there), for both a new `bm25_snapshot` and a `build_vector_snapshot`
+  build, so a format flag applies when the segments are written as
+  well as when they are read. `rustflags` applies only to the server
+  image. The offline builder is built without it.
+- **Kept VM.** The local cache is reused when the snapshot identity
+  matches (see above), whatever `server_env` says. That is right for
+  flags that change only how segments are read or queried. A flag that
+  changes what the server writes to its local cache needs a VM that
+  has not cached that snapshot yet. Run the previous dispatch with
+  `keep_vm` off, or use a different snapshot name.
+- **Rebuilds.** A new `rustflags` value invalidates the dependency cook
+  layer, so that run does a full release build.
+- **Records.** `meta.json` in the S3 run archive also records
+  `bm25_snapshot`, `server_env_args` (the normalized `-e` flags,
+  including `knn_budget_fraction`) and `rustflags`. When any of them is
+  set, the job summary prints an `experiment:` line under the heading.
+- **Input count.** `workflow_dispatch` now has 17 inputs. GitHub's limit
+  is 25 (it used to be 10; this workflow already had 13 before these
+  four and dispatches fine).
+  Further experiment knobs go in `server_env` rather than new inputs.
+
 ## Logs and tail analysis
 
 Every CI benchmark run (`.github/workflows/benchmark.yml`) archives its

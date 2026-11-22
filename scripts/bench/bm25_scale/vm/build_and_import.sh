@@ -5,7 +5,7 @@
 # serialized server-side load — the 10M vector corpus went from ~6h of
 # /index requests to roughly total_build_cpu / cores.
 #
-# Usage: [MAX_DOCS=N] [SNAPSHOT_NAME=name] ./build_and_import.sh <namespace> [--with-embeddings]
+# Usage: [MAX_DOCS=N] [SNAPSHOT_NAME=name] [BUILD_DOCKER_ENV='-e K=V ...'] ./build_and_import.sh <namespace> [--with-embeddings]
 #   ./build_and_import.sh msmarco-10m-vec --with-embeddings
 #   MAX_DOCS=1000000 ./build_and_import.sh msmarco-1m   # first 1M docs
 #   SNAPSHOT_NAME=msmarco-10m-vec-sidecar ./build_and_import.sh msmarco-10m-vec --with-embeddings
@@ -14,6 +14,13 @@
 # restore it with restore_namespace.sh <namespace> <snapshot-name>. An
 # existing snapshot is never overwritten unless SNAPSHOT_OVERWRITE=1:
 # the build would otherwise silently replace a corpus other runs restore.
+#
+# BUILD_DOCKER_ENV (default: empty) adds environment to the segment
+# builder container, as docker run flags: '-e KEY=VALUE' repeated (the
+# benchmark workflow passes its server_env input here so an experimental
+# segment format flag reaches the builder too). Each KEY=VALUE must match
+# ^[A-Z0-9_]+=[A-Za-z0-9._:/,-]*$; anything else is refused. Empty = the
+# builder runs exactly as before.
 #
 # Vectors: kosha-build-segments writes through SegmentWriter, whose vector
 # store mode follows KOSHA_VECTOR_STORE (unset = sidecar), so vectors land
@@ -47,6 +54,24 @@ NS="${1:?usage: [MAX_DOCS=N] [SNAPSHOT_NAME=name] build_and_import.sh <namespace
 SNAPSHOT_NAME="${SNAPSHOT_NAME:-$NS}"
 WITH_EMB="${2:-}"
 MAX_DOCS="${MAX_DOCS:-0}"
+BUILD_DOCKER_ENV="${BUILD_DOCKER_ENV:-}"
+PAIR_RE='^[A-Z0-9_]+=[A-Za-z0-9._:/,-]*$'
+OLD_LC_ALL="${LC_ALL-}"
+LC_ALL=C   # ASCII ranges in PAIR_RE whatever the locale
+set -f
+EXPECT_PAIR=0
+for w in $BUILD_DOCKER_ENV; do
+  if [ "$EXPECT_PAIR" = 0 ]; then
+    [ "$w" = "-e" ] || { echo "::error::BUILD_DOCKER_ENV must be '-e KEY=VALUE' repeated, got: $w"; exit 1; }
+    EXPECT_PAIR=1
+  else
+    [[ "$w" =~ $PAIR_RE ]] || { echo "::error::BUILD_DOCKER_ENV pair rejected: $w"; exit 1; }
+    EXPECT_PAIR=0
+  fi
+done
+set +f
+if [ -n "$OLD_LC_ALL" ]; then LC_ALL="$OLD_LC_ALL"; else unset LC_ALL; fi
+[ "$EXPECT_PAIR" = 0 ] || { echo "::error::BUILD_DOCKER_ENV ends with a bare -e"; exit 1; }
 TENANT="${KOSHA_TENANT:-default}"
 SCOPED="$TENANT/$NS"
 TXT_CACHE=s3://decoverai-bench-corpus-cache/msmarco-10m
@@ -75,7 +100,9 @@ fi
 cd ~/kosha
 sudo docker build -q --target builder -t kosha-builder:bench . >/dev/null
 sudo rm -rf "/data/segments-out/$NS"
-sudo docker run --rm -v /data:/data kosha-builder:bench sh -c "
+if [ -n "$BUILD_DOCKER_ENV" ]; then echo "builder env: $BUILD_DOCKER_ENV"; fi
+# shellcheck disable=SC2086  # validated -e KEY=VALUE words, split on purpose
+sudo docker run --rm $BUILD_DOCKER_ENV -v /data:/data kosha-builder:bench sh -c "
   cargo build --release --locked -p kosha-build-segments &&
   ./target/release/kosha-build-segments \
     --shards-dir /data/corpus-txt $EMB_ARGS \
