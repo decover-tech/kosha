@@ -805,6 +805,21 @@ unaffected). The server's database role must own `kosha.api_keys`
 (`002_grant_kosha_role.sql`) or an admin must apply the migration first
 (`make db-migrate`).
 
+**Upgrading an instance that was set up with `make db-migrate`.** Tables created
+by the database admin belong to the admin until `002_grant_kosha_role.sql` hands
+them to the role the server connects as, and the migrations the server applies
+at startup cannot change that. Before this release 002 did not hand over
+`kosha.hydration_leases`, so on such an instance hydration-lease claims and
+namespace or tenant deletion fail with `permission denied for table
+hydration_leases`, and rolling out a new server image does not fix it. Re-run
+002 once as the database admin: `make db-migrate` (every step is safe to
+re-run), or that one file with `psql` against the `kosha` database.
+An instance where the server's role created the tables itself (no
+`make db-migrate`) is not affected. The server checks at startup and logs
+`WARNING: the database role this server connects as cannot read and write
+kosha.<table> ...` naming each table or sequence of schema `kosha` it cannot
+use; it still starts.
+
 A successful flush uploads its segment snapshot before publishing its manifest.
 Upload and manifest-store failures return errors and remain retryable. By
 default (`KOSHA_WAL_MODE=local`) buffered writes use a local, fsynced WAL under

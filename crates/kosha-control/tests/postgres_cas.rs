@@ -530,6 +530,118 @@ fn booting_twice_on_one_database_creates_every_table_once() {
     admin_exec(&url, &format!("DROP DATABASE {db} WITH (FORCE)"));
 }
 
+/// Run `setup` as the connected (admin) role, then, as `role`: what
+/// `UNUSABLE_RELATIONS_SQL` reports, and the result of a statement the
+/// server runs on `kosha.hydration_leases`.
+async fn as_server_role(
+    conn: &mut sqlx::PgConnection,
+    role: &str,
+    setup: &str,
+) -> (
+    Vec<String>,
+    Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+) {
+    sqlx::raw_sql(&format!("RESET ROLE;\n{setup};\nSET ROLE {role}"))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let unusable: Vec<String> = sqlx::query_scalar(kosha_control::UNUSABLE_RELATIONS_SQL)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+    let delete = sqlx::query("DELETE FROM kosha.hydration_leases")
+        .execute(&mut *conn)
+        .await;
+    (unusable, delete)
+}
+
+/// #426: an instance migrated by an admin (`make db-migrate`) with a 002
+/// that did not hand over `kosha.hydration_leases` boots, and then fails
+/// every statement on that table. The embedded migrations cannot repair
+/// ownership, so the store reports what its role cannot use; re-running the
+/// current 002 clears it. Runs the real 002 for a stand-in role (`SET ROLE`,
+/// so no second login is needed) in its own database.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn a_table_002_did_not_hand_over_is_reported_until_002_is_rerun() {
+    use sqlx::Connection;
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let db = format!("kosha_owner_{id}");
+    let role = format!("kosha_role_{id}");
+    admin_exec(&url, &format!("CREATE DATABASE {db}"));
+    let fresh = with_database(&url, &db);
+
+    // The connecting role created every table: nothing to report.
+    let store = PgStore::new(&fresh).unwrap();
+    assert_eq!(store.unusable_relations().unwrap(), Vec::<String>::new());
+    drop(store);
+
+    // 002 as it is, and as it was before #426 (no hydration_leases line),
+    // for the stand-in role.
+    let grants = include_str!("../migrations/002_grant_kosha_role.sql")
+        .replace("TO kosha;", &format!("TO {role};"));
+    assert!(grants.contains(&format!("kosha.hydration_leases OWNER TO {role};")));
+    let old_grants: String = grants
+        .lines()
+        .filter(|line| !line.contains("hydration_leases"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = sqlx::PgConnection::connect(&fresh).await.unwrap();
+        // Before 002: the role can use nothing the admin created.
+        let (unusable, delete) =
+            as_server_role(&mut conn, &role, &format!("CREATE ROLE {role} NOLOGIN")).await;
+        for table in MIGRATED_TABLES {
+            assert!(unusable.iter().any(|name| name == table), "{table}");
+        }
+        assert!(unusable.contains(&"audit_log_id_seq".to_string()));
+        assert!(delete.is_err());
+
+        // The old 002: the server boots, hydration_leases stays out of reach.
+        let (unusable, delete) = as_server_role(&mut conn, &role, &old_grants).await;
+        assert_eq!(unusable, vec!["hydration_leases".to_string()]);
+        let denied = delete.unwrap_err();
+        assert_eq!(
+            denied.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("42501"),
+            "{denied}"
+        );
+        let warning = kosha_control::unusable_relations_warning(&unusable).unwrap();
+        assert!(warning.contains("kosha.hydration_leases"), "{warning}");
+
+        // Re-running 002 as the admin repairs it; a second run changes nothing.
+        for _ in 0..2 {
+            let (unusable, delete) = as_server_role(&mut conn, &role, &grants).await;
+            assert_eq!(unusable, Vec::<String>::new());
+            delete.unwrap();
+        }
+        conn.close().await.unwrap();
+    });
+
+    admin_exec(&url, &format!("DROP DATABASE {db} WITH (FORCE)"));
+    admin_exec(&url, &format!("DROP ROLE {role}"));
+}
+
+#[test]
+fn the_unusable_relations_warning_names_the_tables_and_the_fix() {
+    assert_eq!(kosha_control::unusable_relations_warning(&[]), None);
+    let one = kosha_control::unusable_relations_warning(&["hydration_leases".to_string()]).unwrap();
+    assert!(one.contains("cannot read and write kosha.hydration_leases."));
+    assert!(one.contains("002_grant_kosha_role.sql"));
+    let two = kosha_control::unusable_relations_warning(&[
+        "audit_log".to_string(),
+        "audit_log_id_seq".to_string(),
+    ])
+    .unwrap();
+    assert!(two.contains("kosha.audit_log, kosha.audit_log_id_seq"));
+}
+
 #[test]
 fn with_database_replaces_only_the_database_name() {
     assert_eq!(
