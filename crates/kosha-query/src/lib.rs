@@ -3264,9 +3264,12 @@ impl Searcher {
         debug_assert!(query.limit_per.is_none());
         let fetch_k = knn.k;
         let budget = match cutoff {
+            // This pass runs unfiltered requests only, so the one
+            // restriction a segment can have is its deleted documents.
             Some((max_distance, max_probes)) => kosha_segment::KnnProbeBudget::Within {
                 max_distance,
                 max_probes,
+                refill: kosha_segment::KnnRefill::BudgetedSegments,
             },
             None => kosha_segment::KnnProbeBudget::Nprobe(knn.num_candidates),
         };
@@ -4303,6 +4306,7 @@ impl Searcher {
         // segment with no deletes pays one predictable branch per posting
         // and never calls into the set lookups at all.
         let restricted = filter_set.is_some() || segment_tombstones.is_some();
+        let filtered = filter_set.is_some();
         let rejected = |doc_seq: u32| -> bool { restricted && !accept(doc_seq) };
 
         // Columnar segments (#244) aggregate and sort straight from their
@@ -5572,6 +5576,16 @@ impl Searcher {
                     && accept(doc_seq)
             };
             let knn_restricted = restricted || knn_filter_set.is_some();
+            // A filter can put its only passing documents in a segment the
+            // global budget chose nothing from, so a filtered probe refills
+            // everywhere. Deleted documents alone do not move the nearest
+            // neighbours to another segment: a segment outside the cutoff
+            // stays unprobed, as it would be with no tombstone in it.
+            let knn_refill = if filtered || knn_filter_set.is_some() {
+                kosha_segment::KnnRefill::Always
+            } else {
+                kosha_segment::KnnRefill::BudgetedSegments
+            };
             let knn_accept_dyn: Option<&dyn Fn(u32) -> bool> = if knn_restricted {
                 Some(&knn_accept)
             } else {
@@ -5736,6 +5750,7 @@ impl Searcher {
                                 cutoff,
                                 effective_budget,
                                 knn_accept_dyn,
+                                knn_refill,
                                 vector_fetch,
                             )
                             .map(|r| {
