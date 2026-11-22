@@ -130,14 +130,22 @@ pub(crate) fn names_actor(headers: &HashMap<String, String>) -> bool {
 }
 
 /// Who the request acts as: the user it names, else `operator`, the admin
-/// credential's holder that `route` authenticated.
+/// credential's holder that `route` authenticated. A user named under a
+/// named operator's credential stays tied to it ([`Actor::VouchedUser`]):
+/// the audit row says which credential vouched for them.
 fn actor(headers: &HashMap<String, String>, operator: &Actor) -> Result<Actor, OrgError> {
     match actor_header(headers) {
         None => Ok(operator.clone()),
         // A present but empty header is a caller bug, and must not be read
         // as "no header": that would turn a user request into an operator's.
         Some("") => Err(OrgError::Invalid(format!("empty '{ACTOR_HEADER}' header"))),
-        Some(user_id) => Ok(Actor::User(user_id.to_string())),
+        Some(user_id) => Ok(match operator {
+            Actor::NamedOperator(name) => Actor::VouchedUser {
+                user_id: user_id.to_string(),
+                operator: name.clone(),
+            },
+            _ => Actor::User(user_id.to_string()),
+        }),
     }
 }
 
@@ -868,5 +876,112 @@ mod tests {
                 (by_ada.as_str(), "project.created"),
             ]
         );
+    }
+
+    /// Naming a user must not make a named operator's action unattributable:
+    /// the row keeps `user:<id>` as the actor (roles are the user's) and
+    /// its detail says which credential made the request.
+    #[test]
+    fn a_user_vouched_for_by_a_named_operator_is_audited_with_the_credential() {
+        let backend = OrgBackend::in_memory();
+        let alice = Actor::NamedOperator("alice".into());
+        let ok = |operator: &Actor, user: Option<&str>, method: &str, path: &str, body: Value| {
+            let headers = match user {
+                Some(id) => HashMap::from([(ACTOR_HEADER.to_string(), id.to_string())]),
+                None => HashMap::new(),
+            };
+            let body = if body.is_null() {
+                Vec::new()
+            } else {
+                body.to_string().into_bytes()
+            };
+            let (status, value) =
+                parse(&handle(method, path, &headers, &body, &backend, None, operator).unwrap());
+            assert_eq!(status, 200, "{method} {path}: {value}");
+            value
+        };
+        let user = |email: &str| {
+            let created = ok(
+                &alice,
+                None,
+                "POST",
+                "/v1/admin/users",
+                json!({ "email": email }),
+            );
+            created["id"].as_str().unwrap().to_string()
+        };
+        let (ada, bob) = (user("ada@example.com"), user("bob@example.com"));
+        let org = ok(
+            &alice,
+            None,
+            "POST",
+            "/v1/admin/orgs",
+            json!({ "slug": "acme", "name": "Acme", "owner_user_id": ada }),
+        );
+        let base = format!("/v1/admin/orgs/{}", org["id"].as_str().unwrap());
+        let members = format!("{base}/members");
+        let add = |operator: &Actor, role: &str| {
+            ok(
+                operator,
+                Some(&ada),
+                "POST",
+                &members,
+                json!({ "user_id": bob, "role": role }),
+            );
+        };
+        // The owner, through the shared key (as the console does today).
+        add(&Actor::Operator, "member");
+        // The owner, named by alice's credential: a role change, a removal.
+        ok(
+            &alice,
+            Some(&ada),
+            "POST",
+            &format!("{members}/{bob}/role"),
+            json!({ "role": "admin" }),
+        );
+        ok(
+            &alice,
+            Some(&ada),
+            "DELETE",
+            &format!("{members}/{bob}"),
+            Value::Null,
+        );
+
+        let log = ok(
+            &Actor::Operator,
+            None,
+            "GET",
+            &format!("{base}/audit-log"),
+            Value::Null,
+        );
+        let by_ada = format!("user:{ada}");
+        let rows: Vec<(&str, &str, &Value)> = log["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|e| {
+                (
+                    e["actor"].as_str().unwrap(),
+                    e["action"].as_str().unwrap(),
+                    &e["detail"]["via"],
+                )
+            })
+            .collect();
+        let via_alice = json!("operator:alice");
+        assert_eq!(
+            rows,
+            vec![
+                // alice acting for herself is the actor; nothing vouched.
+                ("operator:alice", "org.created", &Value::Null),
+                // The shared key has no name to record.
+                (by_ada.as_str(), "member.added", &Value::Null),
+                (by_ada.as_str(), "member.role_changed", &via_alice),
+                (by_ada.as_str(), "member.removed", &via_alice),
+            ]
+        );
+        // The rest of the detail is untouched.
+        let removed = &log["events"][0]["detail"];
+        assert_eq!(removed["role"], json!("admin"));
     }
 }

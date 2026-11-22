@@ -35,7 +35,10 @@ key is never enough. The holder of the admin credential is then either:
   `operator` with the shared key, as `operator:<name>` with an operator
   credential.
 - **acting for a user**: `X-Kosha-Actor: <user id>`. The server enforces that
-  user's role in the organization.
+  user's role in the organization. Audited as `user:<id>`; when the request
+  was made with an operator credential, the entry's detail also has
+  `"via": "operator:<name>"`, so naming a user never hides which credential
+  acted. The shared key has no name, and adds nothing.
 
 `X-Kosha-Actor` is only understood by the routes on this page. Every other
 `/v1/admin/*` route (`api-keys`, `gc`, compaction, ...) is operator-only and
@@ -128,7 +131,8 @@ Refused requests are not recorded.
 
 An entry has `id`, `org_id`, `actor` (`operator`, `operator:<name>` or
 `user:<id>`), `action`,
-`target_type`, `target_id`, `detail` and `created_at_ms`. The log never holds an
+`target_type`, `target_id`, `detail` and `created_at_ms`. Any entry by a user
+may also carry `via` in its detail (see [Who is calling](#who-is-calling)). The log never holds an
 API key. `GET .../audit-log` returns one organization's entries newest first,
 100 per page by default (`limit`, at most 1000); pass the response's
 `next_before` as `before` for the next page. Keys created, rotated

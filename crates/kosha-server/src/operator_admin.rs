@@ -79,7 +79,7 @@ pub(crate) fn handle(method: &str, path: &str, body: &[u8], actor: &Actor) -> Op
     };
     // `route` refuses a request that names a user before it gets here; a
     // user must never manage operator credentials even if that changes.
-    if matches!(actor, Actor::User(_)) {
+    if actor.user_id().is_some() {
         return Some(json_error(403, "this route is operator-only"));
     }
     Some(execute(action, &actor.label()))
