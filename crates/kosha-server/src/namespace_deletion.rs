@@ -560,6 +560,21 @@ impl AppState {
                 let (deleted, remote_error) = self.reclaim_remote_prefix(tenant);
                 objects = deleted;
                 errors.extend(remote_error);
+                // The sweep holds no namespace lock, so a write with a key
+                // another pod has not dropped yet can create a namespace
+                // while it runs, and the sweep may have taken that
+                // namespace's first objects. Never report the tenant gone
+                // then: the next pass deletes the namespace properly.
+                match self.tenant_namespaces(tenant) {
+                    Err(e) => errors.push(format!("control store: {e}")),
+                    Ok(late) if !late.is_empty() => errors.push(format!(
+                        "{} namespace(s) of the tenant were created while its prefix was \
+                         being swept ({}); resume this deletion",
+                        late.len(),
+                        late.iter().map(short_name).collect::<Vec<_>>().join(", ")
+                    )),
+                    Ok(_) => {}
+                }
             }
         }
 
@@ -834,7 +849,12 @@ mod tests {
         fail_deletes: AtomicBool,
         /// Keys a delete reports as gone but leaves in place.
         sticky: Mutex<BTreeSet<String>>,
+        /// Runs at the start of every delete, with its prefix: something
+        /// happening concurrently with the reclaim.
+        on_delete: Mutex<Option<DeleteHook>>,
     }
+
+    type DeleteHook = Box<dyn Fn(&str) + Send + Sync>;
 
     impl FakeRemote {
         fn put(&self, key: &str) {
@@ -855,6 +875,9 @@ mod tests {
 
     impl RemotePrefixStore for FakeRemote {
         fn delete_prefix(&self, prefix: &str) -> Result<usize, KoshaError> {
+            if let Some(hook) = self.on_delete.lock().unwrap().as_ref() {
+                hook(prefix);
+            }
             if self.fail_deletes.load(Ordering::SeqCst) {
                 return Err(KoshaError::NotFound("injected S3 outage".into()));
             }
@@ -1426,6 +1449,58 @@ mod tests {
         assert!(resumed.iter().all(|r| r["state"] == "completed"));
         assert!(remote.under("globex").is_empty());
         assert!(listed(&state, "?state=pending").is_empty());
+    }
+
+    /// The tenant-wide sweep runs under no namespace lock. A namespace
+    /// registered while it runs must keep the tenant record pending, and
+    /// the next pass deletes it.
+    #[test]
+    fn a_namespace_created_during_the_tenant_sweep_keeps_the_record_pending() {
+        let (state, remote) = state_with_remote();
+        index(&state, "acme", "docs", &["a"]);
+        remote.put("acme/docs/seg-1/postings.bin");
+        let state = Arc::new(state);
+        let racing = Arc::downgrade(&state);
+        *remote.on_delete.lock().unwrap() = Some(Box::new(move |prefix| {
+            // Only the tenant-wide sweep, not the namespace's own reclaim.
+            if prefix != "acme" {
+                return;
+            }
+            let state = racing.upgrade().unwrap();
+            let late = NamespaceId("acme/late".into());
+            state.controller.lock().unwrap().ensure_namespace(late);
+        }));
+
+        let (status, body) = parse(&handle_delete_tenant(
+            "acme",
+            br#"{"confirm": "acme"}"#,
+            &state,
+            &no_keys(),
+        ));
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(body["completed"], false);
+        assert_eq!(body["deletion"]["state"], "pending");
+        assert!(
+            body["deletion"]["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("created while its prefix was being swept (late)"),
+            "{body}"
+        );
+
+        *remote.on_delete.lock().unwrap() = None;
+        let (status, done) = parse(&handle_resume_deletions(b"", &state, &no_keys()));
+        assert_eq!(status, 200, "{done}");
+        assert_eq!(done["pending"], 0, "{done}");
+        assert_eq!(done["resumed"][0]["id"], body["deletion"]["id"]);
+        assert!(state
+            .controller
+            .lock()
+            .unwrap()
+            .list_namespaces()
+            .iter()
+            .all(|ns| !ns.0.starts_with("acme/")));
+        assert_eq!(listed(&state, "?tenant=acme&state=completed").len(), 3);
     }
 
     /// A pre-#262 namespace named like the tenant keeps its segments right
