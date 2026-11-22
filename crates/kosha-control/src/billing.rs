@@ -749,9 +749,23 @@ pub trait BillingStore: Send + Sync {
     /// Every account, ordered by tenant.
     fn accounts(&self) -> Result<Vec<BillingAccount>, KoshaError>;
 
-    /// Create the account, or replace an existing one's plan and provider
-    /// customer id. An existing account keeps its `created_at_ms`.
+    /// Create the account, or replace an existing one's plan. An existing
+    /// account keeps its `created_at_ms`, and keeps its provider customer
+    /// id when `account.provider_customer_id` is `None`: a plan change must
+    /// not forget the customer the monthly job created in the meantime.
     fn put_account(&self, account: &BillingAccount) -> Result<(), KoshaError>;
+
+    /// Record `tenant`'s customer id at the provider. An existing account
+    /// keeps its plan (the caller's copy of it may be stale: an operator
+    /// can change the plan while the monthly job runs); a tenant without
+    /// an account gets one on `plan_if_new`, created at `now_ms`.
+    fn set_provider_customer(
+        &self,
+        tenant: &str,
+        plan_if_new: &str,
+        provider_customer_id: &str,
+        now_ms: u64,
+    ) -> Result<(), KoshaError>;
 
     /// Store a new invoice. `false`, and nothing changes, when an invoice
     /// with this id exists.
@@ -818,8 +832,32 @@ impl BillingStore for MemoryBillingStore {
         let mut stored = account.clone();
         if let Some(existing) = inner.accounts.get(&account.tenant) {
             stored.created_at_ms = existing.created_at_ms;
+            if stored.provider_customer_id.is_none() {
+                stored.provider_customer_id = existing.provider_customer_id.clone();
+            }
         }
         inner.accounts.insert(stored.tenant.clone(), stored);
+        Ok(())
+    }
+
+    fn set_provider_customer(
+        &self,
+        tenant: &str,
+        plan_if_new: &str,
+        provider_customer_id: &str,
+        now_ms: u64,
+    ) -> Result<(), KoshaError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .accounts
+            .entry(tenant.to_string())
+            .or_insert_with(|| BillingAccount {
+                tenant: tenant.to_string(),
+                plan: plan_if_new.to_string(),
+                provider_customer_id: None,
+                created_at_ms: now_ms,
+            })
+            .provider_customer_id = Some(provider_customer_id.to_string());
         Ok(())
     }
 
@@ -1229,12 +1267,11 @@ impl Biller<'_> {
             Some(customer) => customer,
             None => {
                 let customer = provider.create_customer(tenant)?;
-                self.store.put_account(&BillingAccount {
-                    tenant: tenant.to_string(),
-                    plan: account.map_or_else(|| invoice.plan.clone(), |a| a.plan.clone()),
-                    provider_customer_id: Some(customer.clone()),
-                    created_at_ms: account.map_or(now_ms, |a| a.created_at_ms),
-                })?;
+                // Only the customer id: `account` was read when the run
+                // started, and writing its plan back would undo a plan
+                // change made since.
+                self.store
+                    .set_provider_customer(tenant, &invoice.plan, &customer, now_ms)?;
                 customer
             }
         };
@@ -1525,13 +1562,42 @@ mod pg {
                      VALUES ($1, $2, $3, $4) \
                      ON CONFLICT (tenant_id) DO UPDATE SET \
                          plan = EXCLUDED.plan, \
-                         provider_customer_id = EXCLUDED.provider_customer_id, \
+                         provider_customer_id = COALESCE( \
+                             EXCLUDED.provider_customer_id, \
+                             kosha.billing_accounts.provider_customer_id), \
                          updated_at = now()",
                 )
                 .bind(&account.tenant)
                 .bind(&account.plan)
                 .bind(&account.provider_customer_id)
                 .bind(to_i64(account.created_at_ms))
+                .execute(&self.pool)
+                .await
+                .map_err(control_plane_error)?;
+                Ok(())
+            })
+        }
+
+        fn set_provider_customer(
+            &self,
+            tenant: &str,
+            plan_if_new: &str,
+            provider_customer_id: &str,
+            now_ms: u64,
+        ) -> Result<(), KoshaError> {
+            self.rt.block_on(async {
+                sqlx::query(
+                    "INSERT INTO kosha.billing_accounts \
+                     (tenant_id, plan, provider_customer_id, created_at_ms) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (tenant_id) DO UPDATE SET \
+                         provider_customer_id = EXCLUDED.provider_customer_id, \
+                         updated_at = now()",
+                )
+                .bind(tenant)
+                .bind(plan_if_new)
+                .bind(provider_customer_id)
+                .bind(to_i64(now_ms))
                 .execute(&self.pool)
                 .await
                 .map_err(control_plane_error)?;
@@ -1691,6 +1757,114 @@ mod tests {
             provider_customer_id: None,
             created_at_ms,
         }
+    }
+
+    /// A store in which an operator's plan change lands between the
+    /// monthly job's read of the accounts and its write of the provider
+    /// customer id.
+    struct UpgradeDuringClose {
+        inner: MemoryBillingStore,
+        upgraded: Mutex<bool>,
+    }
+
+    impl BillingStore for UpgradeDuringClose {
+        fn account(&self, tenant: &str) -> Result<Option<BillingAccount>, KoshaError> {
+            self.inner.account(tenant)
+        }
+        fn accounts(&self) -> Result<Vec<BillingAccount>, KoshaError> {
+            self.inner.accounts()
+        }
+        fn put_account(&self, account: &BillingAccount) -> Result<(), KoshaError> {
+            self.inner.put_account(account)
+        }
+        fn set_provider_customer(
+            &self,
+            tenant: &str,
+            plan_if_new: &str,
+            provider_customer_id: &str,
+            now_ms: u64,
+        ) -> Result<(), KoshaError> {
+            self.inner
+                .set_provider_customer(tenant, plan_if_new, provider_customer_id, now_ms)
+        }
+        fn insert_invoice(&self, invoice: &Invoice) -> Result<bool, KoshaError> {
+            let mut upgraded = self.upgraded.lock().unwrap();
+            if !*upgraded {
+                *upgraded = true;
+                self.inner
+                    .put_account(&account(&invoice.tenant, "ent", 0))?;
+            }
+            self.inner.insert_invoice(invoice)
+        }
+        fn invoice(&self, id: &str) -> Result<Option<Invoice>, KoshaError> {
+            self.inner.invoice(id)
+        }
+        fn invoices(&self, tenant: Option<&str>) -> Result<Vec<Invoice>, KoshaError> {
+            self.inner.invoices(tenant)
+        }
+        fn set_provider_invoice(&self, id: &str, provider_id: &str) -> Result<bool, KoshaError> {
+            self.inner.set_provider_invoice(id, provider_id)
+        }
+        fn set_invoice_status(
+            &self,
+            id: &str,
+            status: InvoiceStatus,
+            paid_at_ms: Option<u64>,
+        ) -> Result<bool, KoshaError> {
+            self.inner.set_invoice_status(id, status, paid_at_ms)
+        }
+    }
+
+    #[test]
+    fn the_monthly_job_and_a_plan_change_do_not_undo_each_other() {
+        let catalog = catalog();
+        let oct = BillingPeriod::parse("2026-10").unwrap();
+        let store = UpgradeDuringClose {
+            inner: MemoryBillingStore::new(),
+            upgraded: Mutex::new(false),
+        };
+        let usage = MemoryUsageStore::new();
+        let provider = FakeBillingProvider::new();
+        store.put_account(&account("acme", "payg", 5)).unwrap();
+        let biller = Biller {
+            catalog: &catalog,
+            store: &store,
+            usage: &usage,
+            provider: Some(&provider),
+        };
+        let report = biller.close_period(oct, oct.end_ms()).unwrap();
+        assert_eq!((report.submitted, report.errors.len()), (1, 0));
+        // The plan change made during the run survives it, together with
+        // the customer the run created.
+        assert_eq!(
+            store.account("acme").unwrap(),
+            Some(BillingAccount {
+                tenant: "acme".into(),
+                plan: "ent".into(),
+                provider_customer_id: Some("cus_fake_acme".into()),
+                created_at_ms: 5,
+            })
+        );
+        // A later plan change that does not name the customer keeps it.
+        store.put_account(&account("acme", "payg", 99)).unwrap();
+        let acme = store.account("acme").unwrap().unwrap();
+        assert_eq!(
+            (acme.plan.as_str(), acme.provider_customer_id.as_deref()),
+            ("payg", Some("cus_fake_acme"))
+        );
+        // A tenant without an account gets one on the given plan.
+        store
+            .set_provider_customer("newco", "payg", "cus_9", 77)
+            .unwrap();
+        assert_eq!(
+            store.account("newco").unwrap(),
+            Some(BillingAccount {
+                tenant: "newco".into(),
+                plan: "payg".into(),
+                provider_customer_id: Some("cus_9".into()),
+                created_at_ms: 77,
+            })
+        );
     }
 
     #[test]

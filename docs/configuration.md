@@ -437,7 +437,8 @@ Each pod enforces from a snapshot it rebuilds every `KOSHA_BILLING_REFRESH_SECS`
 run past a free allowance, and a change made through another pod takes effect, up to one interval
 late (plus `KOSHA_USAGE_FLUSH_MS` for usage). The refresh reads every tenant's usage for the month
 so far when a free plan with limits is in use. A pod that cannot reach the stores keeps its last
-snapshot; a pod that has never read them restricts nobody.
+snapshot; a pod that has never read them restricts nobody and applies no plan quotas (only the
+limits file) until its first refresh succeeds.
 
 `GET /v1/billing` shows a tenant its plan, state, month-to-date usage with the charge accrued so
 far, and its invoices. `GET /v1/admin/billing/accounts` and
@@ -450,7 +451,7 @@ far, and its invoices. `GET /v1/admin/billing/accounts` and
 | `KOSHA_BILLING_REFRESH_SECS` | How often a pod rebuilds its snapshot of tenant standings | `60` | seconds |
 | `KOSHA_BILLING_PROVIDER` | `stripe`, or `none` to only record invoices | `none` | name |
 | `KOSHA_STRIPE_API_KEY` | Stripe secret key. Required with `KOSHA_BILLING_PROVIDER=stripe`; keep it in a secret, never in a tracked file | unset | secret |
-| `KOSHA_STRIPE_API_BASE` | Base URL of the Stripe API | `https://api.stripe.com` | URL |
+| `KOSHA_STRIPE_API_BASE` | Base URL of the Stripe API. Must be `https://`; plain `http://` is accepted for `localhost`, `127.0.0.1` and `[::1]` only (the secret key is sent to it), and startup fails otherwise | `https://api.stripe.com` | URL |
 
 ## HTTP server and auth
 

@@ -67,6 +67,17 @@ impl BillingStore for FlakyBilling {
         self.check()?;
         self.inner.put_account(account)
     }
+    fn set_provider_customer(
+        &self,
+        tenant: &str,
+        plan_if_new: &str,
+        provider_customer_id: &str,
+        now_ms: u64,
+    ) -> Result<(), KoshaError> {
+        self.check()?;
+        self.inner
+            .set_provider_customer(tenant, plan_if_new, provider_customer_id, now_ms)
+    }
     fn insert_invoice(&self, invoice: &Invoice) -> Result<bool, KoshaError> {
         self.check()?;
         self.inner.insert_invoice(invoice)
@@ -673,6 +684,20 @@ fn limits_file_overrides_plan_quotas_field_by_field() {
     ));
     let limiter = file_only.with_plan_defaults(f.state.billing.clone().unwrap());
 
+    // A pod that has not read the billing store yet does not know who has
+    // an account, so nobody gets the default plan's quotas: only the file.
+    let acme = limiter.limits("acme").unwrap();
+    assert_eq!(
+        (acme.qps, acme.namespaces, acme.vector_dims),
+        (Some(50.0), None, Some(8))
+    );
+    assert_eq!(limiter.limits("globex"), None);
+    f.store.down.store(true, Ordering::SeqCst);
+    assert!(f.billing().refresh().is_err());
+    assert_eq!(limiter.limits("globex"), None);
+    f.store.down.store(false, Ordering::SeqCst);
+    f.refresh();
+
     // On the default (free) plan: namespaces 1, qps 1000.
     let acme = limiter.limits("acme").unwrap();
     assert_eq!(
@@ -697,6 +722,32 @@ fn limits_file_overrides_plan_quotas_field_by_field() {
     let acme = limiter.limits("acme").unwrap();
     assert_eq!((acme.qps, acme.namespaces), (Some(50.0), None));
     assert_eq!(limiter.limits("globex"), None);
+}
+
+/// The Stripe secret key goes to the configured base URL, so that must be
+/// https, or this machine.
+#[test]
+fn stripe_base_must_be_https_or_local() {
+    for ok in [
+        "https://api.stripe.com",
+        "https://stripe-proxy.example:8443/x",
+        "http://127.0.0.1:12111",
+        "http://localhost",
+        "http://[::1]:9000/",
+    ] {
+        assert!(billing::stripe_base_allowed(ok), "{ok}");
+    }
+    for bad in [
+        "http://api.stripe.com",
+        "http://localhost@evil.example",
+        "http://localhost.evil.example",
+        "http://127.0.0.1.evil.example:80",
+        "ftp://localhost",
+        "api.stripe.com",
+        "",
+    ] {
+        assert!(!billing::stripe_base_allowed(bad), "{bad}");
+    }
 }
 
 #[test]

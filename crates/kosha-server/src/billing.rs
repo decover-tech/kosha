@@ -35,6 +35,7 @@
 //! `close-period` and `sync`. Both are safe to repeat.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -67,6 +68,31 @@ pub(crate) struct Billing {
     standings: RwLock<Arc<Standings>>,
     refresh_interval: Duration,
     last_refresh_error: Mutex<Option<String>>,
+    /// Whether a refresh has ever succeeded. Until one has, this pod does
+    /// not know which tenants have accounts, so it must not hand out the
+    /// default plan's quotas either (see `LimitsProvider for Billing`).
+    refreshed: AtomicBool,
+}
+
+/// Whether `base` may be sent the Stripe secret key: `https`, or plain
+/// `http` to this machine only (a local stub).
+pub(crate) fn stripe_base_allowed(base: &str) -> bool {
+    if base.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = base.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // No userinfo tricks: `http://localhost@elsewhere` is not local.
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => authority.split(':').next().unwrap_or(authority),
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn flag_on(raw: Option<&str>) -> bool {
@@ -97,6 +123,7 @@ impl Billing {
             standings: RwLock::new(Arc::new(Standings::new())),
             refresh_interval: Duration::from_secs(60),
             last_refresh_error: Mutex::new(None),
+            refreshed: AtomicBool::new(false),
         }
     }
 
@@ -124,6 +151,13 @@ impl Billing {
                         .ok_or("KOSHA_BILLING_PROVIDER=stripe needs KOSHA_STRIPE_API_KEY")?;
                     let base = env_nonempty("KOSHA_STRIPE_API_BASE")
                         .unwrap_or_else(|| "https://api.stripe.com".to_string());
+                    if !stripe_base_allowed(&base) {
+                        return Err(
+                            "KOSHA_STRIPE_API_BASE must be an https:// URL (plain http:// is \
+                             accepted for localhost only): the Stripe secret key is sent to it"
+                                .into(),
+                        );
+                    }
                     Some(Arc::new(StripeProvider::new(
                         &base,
                         &api_key,
@@ -182,6 +216,7 @@ impl Billing {
             Ok(standings) => {
                 *self.standings.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(standings);
                 *self.last_refresh_error.lock().unwrap() = None;
+                self.refreshed.store(true, Ordering::Release);
                 Ok(())
             }
             Err(e) => {
@@ -251,8 +286,15 @@ fn limits_of(quotas: &PlanQuotas) -> TenantLimits {
 /// A tenant's limits are its billing plan's `limits`. The tenant limiter
 /// lays the operator's limits file over these
 /// (`TenantLimiter::with_plan_defaults`).
+///
+/// No plan quotas at all until the first refresh has succeeded: with an
+/// empty snapshot every tenant looks like it has no account, and a paying
+/// tenant would be held to the default (typically free) plan's quotas.
 impl LimitsProvider for Billing {
     fn limits(&self, tenant: &str) -> Option<TenantLimits> {
+        if !self.refreshed.load(Ordering::Acquire) {
+            return None;
+        }
         let plan = self.plan_name(tenant)?;
         let quotas = &self.catalog.plan(&plan)?.limits;
         (*quotas != PlanQuotas::default()).then(|| limits_of(quotas))

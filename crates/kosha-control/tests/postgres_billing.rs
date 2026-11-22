@@ -86,6 +86,38 @@ fn postgres_store_behaves_like_the_memory_store() {
             })
         );
         assert!(s.accounts().unwrap().iter().any(|a| a.tenant == tenant));
+        // A plan change that does not name the customer keeps it, and
+        // recording a customer keeps the plan.
+        s.put_account(&BillingAccount {
+            tenant: tenant.clone(),
+            plan: "ent".into(),
+            provider_customer_id: None,
+            created_at_ms: 5,
+        })
+        .unwrap();
+        s.set_provider_customer(&tenant, "free", "cus_2", 6)
+            .unwrap();
+        assert_eq!(
+            s.account(&tenant).unwrap(),
+            Some(BillingAccount {
+                tenant: tenant.clone(),
+                plan: "ent".into(),
+                provider_customer_id: Some("cus_2".into()),
+                created_at_ms: 111,
+            })
+        );
+        // Without an account, recording a customer creates one.
+        let third = fresh_tenant();
+        s.set_provider_customer(&third, "payg", "cus_3", 7).unwrap();
+        assert_eq!(
+            s.account(&third).unwrap(),
+            Some(BillingAccount {
+                tenant: third.clone(),
+                plan: "payg".into(),
+                provider_customer_id: Some("cus_3".into()),
+                created_at_ms: 7,
+            })
+        );
 
         assert!(s.insert_invoice(&invoice(&tenant, "2026-11", 500)).unwrap());
         assert!(s.insert_invoice(&invoice(&tenant, "2026-10", 250)).unwrap());
