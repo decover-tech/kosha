@@ -2074,7 +2074,7 @@
       "category": "index_api",
       "construct": "delete (by id), exists, create, reindex, aliases, point in time, ...",
       "outcome": "rejected",
-      "note": "Not on KoshaClient (AttributeError). Delete documents with `delete_by_query`; copy indices with scripts/copy_es_to_kosha.py.",
+      "note": "Not on KoshaClient (AttributeError). There is no delete by id (`delete_by_query` takes a filter on fields, not `_id`); copy indices with scripts/copy_es_to_kosha.py.",
       "rejected_by": "client",
       "verified": "client",
       "api": "not_implemented"

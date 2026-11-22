@@ -726,7 +726,9 @@ def main(argv: list[str] | None = None) -> int:
         copied, _ = copy_index(es, kosha, index, namespace, args, types)
         grand_copied += copied
         if not args.no_verify:
-            want = min(es.count(index), args.limit) if args.limit else es.count(index)
+            want = es.count(index)
+            if args.limit:
+                want = min(want, args.limit)
             got = kosha.count(namespace)
             if got == want:
                 logger.info("verified %s: %s documents in ES and in Kosha", namespace, got)
