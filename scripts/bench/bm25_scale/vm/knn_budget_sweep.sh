@@ -12,8 +12,21 @@
 # refused). The shorthand "fractions" (the default) is the issue #384 step
 # 1 sweep:
 #   f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;f0.03:...=0.03;f0.02:...;f0.01:...
-# Example with the #384 flags (default OFF on the server):
-#   "rel0.2:KOSHA_KNN_RELATIVE_CUTOFF_EPS=0.2;a0rel0.2:KOSHA_KNN_PROBE_RADIUS_ALPHA=0,KOSHA_KNN_RELATIVE_CUTOFF_EPS=0.2"
+# The shorthand "relative" is the step 2 sweep over the #384 flags (default
+# OFF on the server), all relative points at raw centroid distance
+# (alpha=0, SPANN's own rule): at the default alpha=1 the best posting's
+# score is usually clamped to 0, so eps has no effect there and only the
+# min_probes floor would be measured.
+#   f0.05            baseline
+#   a0, a0.5         ranking alone (KOSHA_KNN_PROBE_RADIUS_ALPHA), fixed budget
+#   a0rel0.5/1/2     alpha=0 + KOSHA_KNN_RELATIVE_CUTOFF_EPS 0.5, 1.0, 2.0
+#                    (the toy harness found eps <= 0.3 far too tight)
+#   a0rel1m500, a0rel0.5m1000
+#                    KOSHA_KNN_RELATIVE_MIN_PROBES 500 / 1000 (default floor is
+#                    num_candidates = 100, ~0.56 recall at 10M)
+# Each recall query reports which rule set its cutoff
+# (timings.knn_cutoff_rule: budget / eps / floor / zero_best), and the
+# report tabulates the shares, so a point that misses the bar can be read.
 #
 # Per point: the kosha container is recreated from its original
 # configuration (environment, image) plus the point's overrides, the local
@@ -50,6 +63,14 @@ KNOBS="KOSHA_KNN_BUDGET_FRACTION KOSHA_KNN_BUDGET_MAX_CAP KOSHA_KNN_RELATIVE_CUT
 
 if [ "$POINTS" = fractions ]; then
   POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;f0.03:KOSHA_KNN_BUDGET_FRACTION=0.03;f0.02:KOSHA_KNN_BUDGET_FRACTION=0.02;f0.01:KOSHA_KNN_BUDGET_FRACTION=0.01"
+fi
+if [ "$POINTS" = relative ]; then
+  A0=KOSHA_KNN_PROBE_RADIUS_ALPHA=0
+  EPS=KOSHA_KNN_RELATIVE_CUTOFF_EPS
+  MIN=KOSHA_KNN_RELATIVE_MIN_PROBES
+  POINTS="f0.05:KOSHA_KNN_BUDGET_FRACTION=0.05;a0:$A0;a0.5:KOSHA_KNN_PROBE_RADIUS_ALPHA=0.5"
+  POINTS="$POINTS;a0rel0.5:$A0,$EPS=0.5;a0rel1:$A0,$EPS=1.0;a0rel2:$A0,$EPS=2.0"
+  POINTS="$POINTS;a0rel1m500:$A0,$EPS=1.0,$MIN=500;a0rel0.5m1000:$A0,$EPS=0.5,$MIN=1000"
 fi
 case "$POINTS" in *[!A-Za-z0-9_.=:\;,-]*) echo "points may only contain [A-Za-z0-9_.=:;,-]: $POINTS"; exit 1 ;; esac
 

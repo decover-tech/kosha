@@ -298,6 +298,12 @@ table is appended to the job summary). Points:
 - `fractions`: `KOSHA_KNN_BUDGET_FRACTION` = 0.05, 0.03, 0.02, 0.01
   (labels `f0.05` ... `f0.01`; `f0.05` is the baseline the report's
   success-bar column compares against).
+- `relative`: the #384 step 2 grid, 8 points: `f0.05` (baseline), `a0`
+  and `a0.5` (`KOSHA_KNN_PROBE_RADIUS_ALPHA` alone), `a0rel0.5`, `a0rel1`,
+  `a0rel2` (alpha 0 plus `KOSHA_KNN_RELATIVE_CUTOFF_EPS` 0.5 / 1 / 2), and
+  `a0rel1m500`, `a0rel0.5m1000` (`KOSHA_KNN_RELATIVE_MIN_PROBES` 500 /
+  1000). The relative points all use alpha 0: at alpha 1 the best score
+  is usually 0 and eps has no effect.
 - `label:ENV=V,ENV=V;label2:...`, over these knobs only:
   `KOSHA_KNN_BUDGET_FRACTION`, `KOSHA_KNN_BUDGET_MAX_CAP`,
   `KOSHA_KNN_RELATIVE_CUTOFF_EPS`, `KOSHA_KNN_RELATIVE_MIN_PROBES`,
@@ -311,7 +317,22 @@ doc counts if its exact distance is within the true k-th distance +
 k-th distance), plus each query's `timings.knn_postings`. Distances are
 computed from the corpus embeddings, never taken from the server's scores.
 Servers before #384 do not report `timings.knn_postings`; the report then
-reads `knn_postings=` from the phase's `search timing:` log lines.
+reads `knn_postings=` from the `search timing:` log lines instead.
+
+The success bar (`meets_bar`) is judged on one query set: postings,
+mean recall and p10 recall all come from the 1,000 recall queries
+(`recall_postings_mean`). The latency phase's postings
+(`phase_postings_mean`, the workload queries in order) are shown next to
+them with their own ratio, and `pair_check` reads `DISAGREE` when the two
+ratios fall on different sides of 0.5 or differ by more than 15%.
+
+With the relative cutoff on, each kNN search also reports
+`timings.knn_cutoff_rule` (and `knn_cutoff_rule=` on its `search timing:`
+line): `budget` (the fixed budget capped it), `eps` (`(1 + eps) x best`
+decided), `floor` (`KOSHA_KNN_RELATIVE_MIN_PROBES` decided) or
+`zero_best` (the best score was 0, so eps had no effect). The report's
+`cutoff_rules` column gives each rule's share of the recall queries.
+Neither field appears with the flag off.
 
 The #384 engine flags are off by default:
 

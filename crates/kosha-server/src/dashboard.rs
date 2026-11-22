@@ -85,6 +85,12 @@ pub struct SearchTimings {
     /// object is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub knn_postings: Option<usize>,
+    /// Which rule set this query's global probe cutoff (#384): `budget`,
+    /// `eps`, `floor` or `zero_best`. Only present while the experimental
+    /// `KOSHA_KNN_RELATIVE_CUTOFF_EPS` is on and applied (an unfiltered kNN
+    /// search), so a sweep point that misses the bar can be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knn_cutoff_rule: Option<&'static str>,
 }
 
 /// One search in a namespace's recent-query ring.

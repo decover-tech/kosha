@@ -42,7 +42,11 @@ queries must not sink the hard ones):
 Probe depth: with --server-timings the request asks for `timings` (needs
 KOSHA_DASHBOARD=on on the server) and each query's `timings.knn_postings`
 (server builds with #384) is recorded, so recall can be read against the
-number of postings actually probed. Older servers omit the field; the
+number of postings actually probed. With the experimental relative
+cutoff on (KOSHA_KNN_RELATIVE_CUTOFF_EPS), `timings.knn_cutoff_rule` says
+which rule set each query's cutoff (budget / eps / floor / zero_best) and
+the summary counts them in `knn_cutoff_rules`. Older servers omit the
+fields; the
 summary then says so (and `knn_sweep_report.py` falls back to the
 `search timing:` log line's `knn_postings=`).
 
@@ -74,6 +78,7 @@ import json
 import random
 import statistics
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -374,6 +379,7 @@ def main() -> None:
     server_results: list[list[str]] = []
     degraded_flags: list[int] = []
     postings: list[int | None] = []
+    cutoff_rules: list[str | None] = []
     latencies: list[float] = []
     for i in range(n):
         ids, degraded, timings, latency_ms = server_topk(
@@ -384,6 +390,7 @@ def main() -> None:
         server_results.append(ids)
         degraded_flags.append(degraded if degraded else 0)
         postings.append((timings or {}).get("knn_postings"))
+        cutoff_rules.append((timings or {}).get("knn_cutoff_rule"))
         latencies.append(latency_ms)
 
     # Ground truth: from the cache when it matches this sample, else a scan.
@@ -459,6 +466,7 @@ def main() -> None:
                 "top1_match": top1_match,
                 "knn_degraded_segments": degraded_flags[i],
                 "knn_postings": postings[i],
+                "knn_cutoff_rule": cutoff_rules[i],
                 "latency_ms": round(latencies[i], 3),
                 "server_top1": got_ids[0] if got_ids else None,
                 "true_top1": top1_true,
@@ -490,6 +498,9 @@ def main() -> None:
         "recall_eps": args.recall_eps,
         "knn_postings": summarize([float(p) for p in probe_counts]) if probe_counts else None,
         "knn_postings_reported": len(probe_counts),
+        # Which rule set each query's probe cutoff (#384 relative cutoff on
+        # only; empty otherwise): budget / eps / floor / zero_best counts.
+        "knn_cutoff_rules": dict(sorted(Counter(r for r in cutoff_rules if r).items())),
         # Sequential (closed-loop) client latency of the recall queries:
         # informational only; the 8-QPS phase is the latency measurement.
         "sequential_latency_ms": summarize(latencies),
