@@ -742,7 +742,9 @@ operator can hold a named credential instead. It opens exactly what the shared
 key opens (`/v1/admin/*`, global `/stats`, `/metrics` under
 `KOSHA_METRICS_AUTH=admin`), is sent the same way (`Authorization: Bearer` or
 `X-Api-Key`), and is recorded in the
-[audit log](docs/organizations.md#audit-log) as `operator:<name>`.
+[audit log](docs/organizations.md#audit-log) as `operator:<name>`. When it is
+used to act for a user (`X-Kosha-Actor`), the entry's actor is that user and
+its detail carries `"via": "operator:<name>"`.
 
 | Route | Does |
 |---|---|
@@ -763,17 +765,28 @@ whoever did it, in the same transaction as the change.
 
 1. With `KOSHA_ADMIN_API_KEY`, issue a credential for each operator
    (`POST /v1/admin/operators`), and check each one works.
-2. Set `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` on every pod and restart. The shared
-   key is now refused like any unknown key (`401`); it can stay in the
-   deployment's secret.
-3. To break glass (every operator credential lost, expired or revoked), set
+2. Do the same for everything that is not a person but sends the shared key,
+   and switch each to its own credential. In this repository that is the
+   segment-GC CronJob (`k8s/base/cronjob-segment-gc.yaml`, which reads the
+   `admin-api-key` entry of `kosha-secret`: issue a credential named, say,
+   `segment-gc` and store it under that entry), plus whatever you run
+   yourself with the key: `kosha admin ...` and `scripts/create_api_key.py`
+   in CI or runbooks, scheduled compaction, a metrics scraper under
+   `KOSHA_METRICS_AUTH=admin`. A credential issued with `expires_in_secs`
+   stops such a job when it expires, so rotate it before then or issue it
+   without an expiry.
+3. Set `KOSHA_ADMIN_BOOTSTRAP_KEY=disabled` on every pod and restart. The shared
+   key is now refused like any unknown key (`401`), for people and for
+   automation alike: a job still sending it fails. It can stay in the pods'
+   `KOSHA_ADMIN_API_KEY` for step 4.
+4. To break glass (every operator credential lost, expired or revoked), set
    `KOSHA_ADMIN_BOOTSTRAP_KEY=enabled` (or remove it) and restart: the shared key
    works again. Rotate it afterwards if it was exposed.
 
 Leaving the variable unset keeps today's behaviour: the shared key and operator
 credentials both work. The server refuses to start on any other value. It does
 not stop you disabling the shared key while no operator credential is usable;
-it logs a warning at startup, and step 3 is the way back. During a rolling
+it logs a warning at startup, and step 4 is the way back. During a rolling
 upgrade, pods still on a build without this feature refuse operator credentials
 (as an admin credential and as a tenant key), so issue them once every pod is
 upgraded. `/internal/*` and `KOSHA_INTERNAL_API_KEY` are unaffected.

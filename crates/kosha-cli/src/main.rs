@@ -182,7 +182,8 @@ enum Commands {
         #[arg(long, value_name = "SECS", default_value_t = 600)]
         timeout: u64,
     },
-    /// Admin operations (need the server's KOSHA_ADMIN_API_KEY as --api-key)
+    /// Admin operations (need an admin credential as --api-key: an operator
+    /// credential, or the server's KOSHA_ADMIN_API_KEY)
     Admin {
         #[command(subcommand)]
         command: AdminCommands,
@@ -852,15 +853,16 @@ fn search_usage_error(message: String) -> clap::Error {
 }
 
 /// Explain an admin route's failure in plain words. The server answers 403
-/// when the request's key is not its `KOSHA_ADMIN_API_KEY` (or it has none
-/// configured), and 400 when the route needs a backend this server was
+/// when the request's key is neither an operator credential nor its
+/// `KOSHA_ADMIN_API_KEY` (or it has none configured), and 400 when the route needs a backend this server was
 /// not built or configured with (Postgres for API keys, S3 for import).
 fn admin_error(error: RequestError) -> ClientError {
     match error {
         RequestError::Http(http) if http.status == 403 => ClientError(format!(
-            "{} {} was refused (403: {}). Admin commands must authenticate with the \
-             server's KOSHA_ADMIN_API_KEY: pass it with --api-key, KOSHA_API_KEY or a \
-             profile. A server with no KOSHA_ADMIN_API_KEY set refuses every admin route.",
+            "{} {} was refused (403: {}). Admin commands must authenticate with an \
+             admin credential, an operator credential or the server's \
+             KOSHA_ADMIN_API_KEY: pass it with --api-key, KOSHA_API_KEY or a profile. A \
+             server with no usable admin credential refuses every admin route.",
             http.method, http.path, http.message
         )),
         RequestError::Http(http) if http.status == 400 && backend_unsupported(&http.message) => {
