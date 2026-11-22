@@ -274,6 +274,60 @@ Approximate times per stage:
 For comparison, `warm_gate=preload` on the original vector snapshot
 spends about 115 minutes in warmup alone, before its phases.
 
+### kNN probe-budget sweep (`knn_sweep`, #384)
+
+Recall@10 against p50/p99 and postings probed, one point per server
+configuration, without a new VM or a new snapshot per point. Dispatch with
+`suite=vector`, `warm_gate=queries`, `run_recall_check=true`,
+`duration=300` and `knn_sweep=fractions` (or a point list). After the
+normal vector phases, `vm/knn_budget_sweep.sh`, for each point:
+
+1. recreates the kosha container with its original environment plus the
+   point's env vars (the local NVMe cache is kept, so only the in-process
+   caches restart cold), and re-runs `warm_gate.py`;
+2. runs a warm, result-cache-off kNN phase (`query_bench.py
+   --server-timings --raw-out`) at `qps` for `duration` seconds;
+3. runs `recall_check.py` on 1,000 random queries (seed 384) with
+   `--server-timings --no-cache`, sharing one ground-truth cache file
+   across points (the first point pays the brute-force scan).
+
+The container is put back to its original configuration at the end, and
+`knn_sweep_report.py` writes `knn_sweep/sweep.{md,json,csv}` (the `.md`
+table is appended to the job summary). Points:
+
+- `fractions`: `KOSHA_KNN_BUDGET_FRACTION` = 0.05, 0.03, 0.02, 0.01
+  (labels `f0.05` ... `f0.01`; `f0.05` is the baseline the report's
+  success-bar column compares against).
+- `label:ENV=V,ENV=V;label2:...`, over these knobs only:
+  `KOSHA_KNN_BUDGET_FRACTION`, `KOSHA_KNN_BUDGET_MAX_CAP`,
+  `KOSHA_KNN_RELATIVE_CUTOFF_EPS`, `KOSHA_KNN_RELATIVE_MIN_PROBES`,
+  `KOSHA_KNN_PROBE_RADIUS_ALPHA`. Include an `f0.05` point (or pass the
+  report `--baseline`) for the comparison column.
+
+`recall_check.py` reports, per query and summarized (mean, p1/p5/p10/p50):
+exact-id recall@k, ANN-Benchmarks distance-threshold recall (a returned
+doc counts if its exact distance is within the true k-th distance +
+1e-3, so exact ties count) and epsilon recall (within (1 + 0.01) x the
+k-th distance), plus each query's `timings.knn_postings`. Distances are
+computed from the corpus embeddings, never taken from the server's scores.
+Servers before #384 do not report `timings.knn_postings`; the report then
+reads `knn_postings=` from the phase's `search timing:` log lines.
+
+The #384 engine flags are off by default:
+
+| env var | default | effect |
+|---|---|---|
+| `KOSHA_KNN_RELATIVE_CUTOFF_EPS` | unset (off) | unfiltered kNN probes a posting only if its rank score <= (1 + eps) x the best posting's score (SPANN's relative cutoff); never fewer than `KOSHA_KNN_RELATIVE_MIN_PROBES` postings, never more than the fixed budget |
+| `KOSHA_KNN_RELATIVE_MIN_PROBES` | the query's `num_candidates` | floor for the relative cutoff |
+| `KOSHA_KNN_PROBE_RADIUS_ALPHA` | 1.0 (`d - radius`, unchanged) | posting rank score `max(0, d(q,c) - alpha x radius)`; 0 = raw centroid distance |
+
+With the default alpha the best posting's score is often clamped to 0, so
+the relative cutoff then falls back to `min_probes`; SPANN's own rule is
+`KOSHA_KNN_PROBE_RADIUS_ALPHA=0` plus the cutoff.
+
+Cost: about `duration` + 8 minutes per point once the ground truth is
+cached (estimate, not measured).
+
 ## Logs and tail analysis
 
 Every CI benchmark run (`.github/workflows/benchmark.yml`) archives its

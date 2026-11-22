@@ -8048,6 +8048,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 s3_rounds: hydration.s3_rounds(),
                 s3_bytes: hydration.s3_bytes(),
                 fully_cached: search_fully_cached(&hydration, &phases, knn_degraded),
+                knn_postings: phases.knn_mode.map(|_| phases.knn_postings_probed),
             };
             state.dashboard.record(
                 &ns.0,
@@ -19928,6 +19929,8 @@ mod tests {
         assert_eq!(timings["s3_rounds"], 0, "{first}");
         assert_eq!(timings["s3_bytes"], 0, "{first}");
         assert_eq!(timings["fully_cached"], true, "{first}");
+        // kNN probe depth (#384) is reported only for kNN searches.
+        assert!(timings.get("knn_postings").is_none(), "{first}");
         // The identical repeat is a result-cache hit: still recorded, and
         // fully cached (it read nothing at all).
         let second = search_with_timings(&state);
