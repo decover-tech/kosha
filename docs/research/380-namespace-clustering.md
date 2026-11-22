@@ -290,18 +290,22 @@ $B/kosha-cluster-eval --embeddings-dir /tmp/c --dim 384 --queries 500 \
 Prerequisites:
 
 - **Combined branch.** Every run sweeps `knn_budget_fraction`, an input that
-  exists only in the open harness PR #390. This branch adds
-  `build_segments_args` and `warm_gate=cold` (13 inputs, against 12 on
-  `main`); it has no `knn_budget_fraction`, and #390 has neither of this
+  exists only in the open harness PR #390. This branch has 14 workflow
+  inputs (13 on `main`, plus `build_segments_args`) and a new `warm_gate`
+  option, `cold`; it has no `knn_budget_fraction`. #390 has neither of this
   branch's additions. Dispatching this branch with `knn_budget_fraction`
   fails as an unexpected input; dispatching #390's branch loses
   `build_segments_args` and `warm_gate=cold`. Dispatch from a temporary
-  branch that merges #390 into this one. Resolve the overlapping edits in
-  `benchmark.yml`: the input list, the container args of the single-quoted
-  build step, and the `build_and_import.sh` call, where #390 adds
-  `BUILD_DOCKER_ENV`. Then redo the quote-parity check of the
-  single-quoted build step. Alternatively, on a #390-based branch, set
-  `KOSHA_KNN_BUDGET_FRACTION` through #390's `server_env`.
+  branch that merges #390 into this one. A local trial merge of #390's
+  head into this branch conflicts in two places only, and both resolve as
+  a union of the two sides: the `build_and_import.sh` call of the vector
+  suite (keep `BUILD_ARGS`, `BUILDER_SHA` and #390's `BUILD_DOCKER_ENV` on
+  one line) and the variable block of `build_and_import.sh` (keep both
+  validation blocks). The input list and the container args of the
+  single-quoted build step merge cleanly (18 inputs; `$WARMUP_ARGS
+  $EXPERIMENT_ARGS`). After the merge, bash -n of every step and the quote
+  parity of the single-quoted build step were clean locally; redo both
+  checks if either PR changes.
 - **Same-commit baseline.** The builder commit of the existing
   `msmarco-10m-vec-sidecar` snapshot is not recorded. The per-segment index
   build changed recently: LIRE build refinement and centroid indexing
