@@ -19,6 +19,7 @@ roaring = "0.11"
 crc32fast = "1"
 unicode-segmentation = "1"
 rust-stemmers = "1"
+rayon = { workspace = true }
 
 [dev-dependencies]
 # `stats` feature for `total_allocated()` (bytes ever requested, including

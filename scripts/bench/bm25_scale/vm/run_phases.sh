@@ -158,6 +158,9 @@ local_bytes warm
 # term count, client send lag, latency, hits, and the server's own phase
 # timings via --server-timings) and its server log, so a tail can be
 # decomposed after the fact: analyze_tail.py <label>.requests.jsonl.gz.
+# --raw-ids adds each response's ranked doc_ids and scores, so two runs over
+# different snapshots can be checked for identical results per query:
+# topk_parity.py <a>.requests.jsonl.gz <b>.requests.jsonl.gz (#385).
 phase() { # phase <label> <extra-args...>
   local label="$1"; shift
   local since; since=$(iso_now)
@@ -165,7 +168,8 @@ phase() { # phase <label> <extra-args...>
     --host http://127.0.0.1:8080 --namespace "$NS" \
     --queries-file /data/queries.txt --api-key "$API_KEY" \
     --qps "$QPS" --topk 10 --duration "$DURATION" --timeout 600 \
-    --server-timings --raw-out "$OUT/$label.requests.jsonl.gz" --return "$RETURN_FIELDS" \
+    --server-timings --raw-out "$OUT/$label.requests.jsonl.gz" --raw-ids --return "$RETURN_FIELDS" \
+    --stats-api-key "${KOSHA_ADMIN_API_KEY:-sk-bench-admin}" \
     "$@" --out "$OUT/$label.json"
   save_server_log "$label" "$since"
   echo "PHASE-COMPLETE $label"

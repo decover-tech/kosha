@@ -442,6 +442,49 @@ Details and caveats:
   four and dispatches fine).
   Further experiment knobs go in `server_env` rather than new inputs.
 
+### Docid reordering and blocks decoded (#385, experimental)
+
+`KOSHA_DOC_REORDER=bp` makes `kosha-build-segments` (and compaction)
+write each segment's documents in recursive-graph-bisection order. The
+segment format is unchanged and results are identical (ties break on
+`_id`); postings get smaller and block-max pruning should skip more.
+Default `off`. `kosha-build-segments --doc-reorder off|bp` overrides the
+env var. To compare, build both orders offline under new snapshot names
+(the harness's `bm25_snapshot` + `server_env`, which reaches the builder
+through `BUILD_DOCKER_ENV`): one with no `server_env`, one with
+`server_env=KOSHA_DOC_REORDER=bp`. The existing `msmarco-10m` snapshot was
+loaded through the server, so it is not the like-for-like "off" baseline.
+
+`GET /stats` (admin) reports `scoring_blocks_decoded`, a process-wide
+count of posting blocks varint-decoded. `run_phases.sh` passes the admin
+key to `query_bench.py --stats-api-key`, which reads it before and after
+each phase and writes `scoring_blocks_decoded` and
+`scoring_blocks_decoded_per_request` to the phase JSON (absent against an
+older server). It is only per-query while nothing else queries the server.
+
+`run_phases.sh` also passes `--raw-ids`, so every `<phase>.requests.jsonl.gz`
+record carries the response's ranked `ids` and `scores`. Reordering must not
+change results; check it per query across the two snapshots' runs of the
+same phase:
+
+    topk_parity.py off/warm_or_nocache.requests.jsonl.gz bp/warm_or_nocache.requests.jsonl.gz
+
+It exits 0 only when at least one query was compared and every query
+answered in both logs returned the same ids in the same order (scores within
+`--score-rtol`, default 1e-6); a log recorded without `--raw-ids` is an
+error, not a pass.
+
+Both snapshots must be built by a ref that has the #385 builder *and* the
+harness's `bm25_snapshot` / `server_env` inputs. A builder without #385
+ignores `KOSHA_DOC_REORDER` and would write an ingest-order snapshot under
+the `bp` name, which later runs then reuse. The builder prints
+`doc reorder: bp` and a non-zero `(reorder Xs)` per segment when it really
+reorders; check the build log for both before trusting a `bp` snapshot.
+
+Compaction reorders only when `KOSHA_DOC_REORDER_COMPACTION_MAX_DOCS` is
+also set (default 0: never), because it buffers the merged output in
+memory; the bench runs with compaction off.
+
 ## Logs and tail analysis
 
 Every CI benchmark run (`.github/workflows/benchmark.yml`) archives its
