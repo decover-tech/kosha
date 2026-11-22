@@ -5,12 +5,12 @@
 //!
 //! Tables live in a `kosha` schema — see `migrations/001_create_kosha_tables.sql`.
 
+use kosha_core::deletion::{DeletionFilter, DeletionRecord, NewDeletion};
 use kosha_core::{
     ControlStore, Footer, KoshaError, Manifest, ManifestEntry, NamespaceId, SegmentId,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use uuid::Uuid;
 
 /// Postgres-backed store.
 ///
@@ -102,7 +102,7 @@ fn is_migration_race(e: &sqlx::Error) -> bool {
         .is_some_and(|code| MIGRATION_RACE_SQLSTATES.contains(&code.as_ref()))
 }
 
-/// Apply the embedded migrations (001, 003, then 006) in one transaction on one
+/// Apply the embedded migrations (001, both 003 files, 004, 005, 006, then 007) in one transaction on one
 /// connection, holding a transaction-scoped advisory lock for its duration.
 ///
 /// Concurrent constructors against a fresh database (several pods booting
@@ -111,7 +111,7 @@ fn is_migration_race(e: &sqlx::Error) -> bool {
 /// key on `pg_namespace` (#330). With the lock they queue up: the first
 /// creates everything and commits (which releases the lock), the rest find
 /// it all present and their statements are no-ops. Every statement in
-/// 001/003/006 is valid inside a transaction (no `CREATE INDEX CONCURRENTLY`,
+/// these files is valid inside a transaction (no `CREATE INDEX CONCURRENTLY`,
 /// no `VACUUM`), and running them in one transaction also means a failure
 /// leaves no half-applied schema behind.
 ///
@@ -128,7 +128,10 @@ async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
 
 /// One locked migration attempt. The error carries the message prefix the
 /// caller reports: "migration failed" for 001 and the lock/transaction
-/// plumbing, "migration 003 failed" for 003, "migration 006 failed" for 006.
+/// plumbing, "migration 003 failed" for 003_writer_leases,
+/// "migration 003_scoped_api_keys failed" for 003_scoped_api_keys,
+/// "migration 004 failed" for 004, "migration 005 failed" for 005,
+/// "migration 006 failed" for 006, "migration 007 failed" for 007.
 async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static str)> {
     const FAILED: &str = "migration failed";
     let mut tx = pool.begin().await.map_err(|e| (e, FAILED))?;
@@ -148,13 +151,93 @@ async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static 
         .execute(&mut *tx)
         .await
         .map_err(|e| (e, "migration 003 failed"))?;
+    // Scoped, hashed API keys (#346): additive columns on kosha.api_keys.
+    let migration = include_str!("../migrations/003_scoped_api_keys.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 003_scoped_api_keys failed"))?;
+    // Deletion records (#347): additive, idempotent, same pattern as 003.
+    let migration = include_str!("../migrations/004_deletion_records.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 004 failed"))?;
+    // Usage events (#348): additive, idempotent, same pattern as 001.
+    let migration = include_str!("../migrations/005_usage_events.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 005 failed"))?;
     // Organizations, users, projects, audit log (#345): additive, idempotent.
     let migration = include_str!("../migrations/006_orgs_users_projects.sql");
     sqlx::raw_sql(migration)
         .execute(&mut *tx)
         .await
         .map_err(|e| (e, "migration 006 failed"))?;
+    // Billing accounts and invoices (#349): additive, idempotent.
+    let migration = include_str!("../migrations/007_billing.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 007 failed"))?;
     tx.commit().await.map_err(|e| (e, FAILED))
+}
+
+/// Remove a namespace's manifest and registry rows inside `tx` and raise its
+/// retired version (see [`ControlStore::delete_namespace`]). The caller
+/// commits. `NamespaceNotFound` when there is no such namespace; the caller
+/// then drops `tx`, which rolls back.
+async fn delete_namespace_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &NamespaceId,
+    retire_at_least: u64,
+) -> Result<(Manifest, u64), KoshaError> {
+    let id_str = id.0.clone();
+    let io_error = |e: sqlx::Error| KoshaError::NotFound(e.to_string());
+    // Lock the manifest row first so a concurrent CAS either lands
+    // before the delete (and its segments are reclaimed with the
+    // rest) or finds no row afterwards.
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT version, segments_json FROM kosha.manifests \
+         WHERE namespace_id = $1 FOR UPDATE",
+    )
+    .bind(&id_str)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(io_error)?;
+    sqlx::query("DELETE FROM kosha.manifests WHERE namespace_id = $1")
+        .bind(&id_str)
+        .execute(&mut **tx)
+        .await
+        .map_err(io_error)?;
+    let deleted = sqlx::query("DELETE FROM kosha.namespaces WHERE id = $1")
+        .bind(&id_str)
+        .execute(&mut **tx)
+        .await
+        .map_err(io_error)?;
+    if deleted.rows_affected() == 0 {
+        return Err(KoshaError::NamespaceNotFound(id.clone()));
+    }
+    let manifest = match row {
+        Some((version, json)) => decode_manifest(version as u64, &json)
+            .ok_or_else(|| KoshaError::NotFound(format!("undecodable manifest for {id_str}")))?,
+        None => empty_manifest(0),
+    };
+    let floor = manifest.version.max(retire_at_least) as i64;
+    let (retired,): (i64,) = sqlx::query_as(
+        "INSERT INTO kosha.retired_namespaces AS r (id, last_version) VALUES ($1, $2) \
+         ON CONFLICT (id) DO UPDATE SET \
+         last_version = GREATEST(r.last_version, EXCLUDED.last_version), \
+         retired_at = NOW() \
+         RETURNING last_version",
+    )
+    .bind(&id_str)
+    .bind(floor)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(io_error)?;
+    Ok((manifest, retired as u64))
 }
 
 impl PgStore {
@@ -247,73 +330,16 @@ impl PgStore {
         Err(last_err)
     }
 
-    /// Validate an API key against the database.
-    /// Returns the tenant_id if the key is valid and not revoked.
-    pub fn validate_api_key(&self, api_key: &str) -> Option<String> {
-        let key = api_key.to_string();
+    /// Delete every API key of a tenant, revoked ones included (tenant
+    /// deletion, #347). Returns how many rows went.
+    pub fn delete_api_keys(&self, tenant_id: &str) -> Result<u64, KoshaError> {
         self.rt.block_on(async {
-            let row: Option<(String,)> = sqlx::query_as(
-                "SELECT tenant_id FROM kosha.api_keys \
-                 WHERE api_key = $1 AND revoked_at IS NULL",
-            )
-            .bind(&key)
-            .fetch_optional(&self.pool)
-            .await
-            .ok()?;
-
-            row.map(|(tenant,)| tenant)
-        })
-    }
-
-    /// Create a new API key for a tenant.
-    /// The key is a random UUID prefixed with "sk-" (secret key).
-    pub fn create_api_key(&self, tenant_id: &str, description: &str) -> Result<String, KoshaError> {
-        let api_key = format!("sk-{}", Uuid::new_v4());
-        let tid = tenant_id.to_string();
-        let desc = description.to_string();
-        let key = api_key.clone();
-
-        self.rt.block_on(async {
-            sqlx::query(
-                "INSERT INTO kosha.api_keys (api_key, tenant_id, description) \
-                 VALUES ($1, $2, $3)",
-            )
-            .bind(&key)
-            .bind(&tid)
-            .bind(&desc)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| KoshaError::NotFound(e.to_string()))
-        })?;
-
-        Ok(api_key)
-    }
-
-    /// List all active (non-revoked) API keys, optionally filtered by tenant.
-    pub fn list_api_keys(
-        &self,
-        tenant_id: Option<&str>,
-    ) -> Result<Vec<(String, String, String)>, KoshaError> {
-        let tid = tenant_id.map(|s| s.to_string());
-
-        self.rt.block_on(async {
-            let query = if tid.is_some() {
-                "SELECT api_key, tenant_id, description FROM kosha.api_keys \
-                 WHERE revoked_at IS NULL AND tenant_id = $1 \
-                 ORDER BY created_at DESC"
-            } else {
-                "SELECT api_key, tenant_id, description FROM kosha.api_keys \
-                 WHERE revoked_at IS NULL \
-                 ORDER BY created_at DESC"
-            };
-
-            let rows: Vec<(String, String, String)> = sqlx::query_as(query)
-                .bind(&tid)
-                .fetch_all(&self.pool)
+            sqlx::query("DELETE FROM kosha.api_keys WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .execute(&self.pool)
                 .await
-                .map_err(|e| KoshaError::NotFound(e.to_string()))?;
-
-            Ok(rows)
+                .map(|done| done.rows_affected())
+                .map_err(control_plane_error)
         })
     }
 }
@@ -617,59 +643,69 @@ impl ControlStore for PgStore {
         id: &NamespaceId,
         retire_at_least: u64,
     ) -> Result<(Manifest, u64), KoshaError> {
-        let id_str = id.0.clone();
         self.rt.block_on(async {
             let io_error = |e: sqlx::Error| KoshaError::NotFound(e.to_string());
             let mut tx = self.pool.begin().await.map_err(io_error)?;
-            // Lock the manifest row first so a concurrent CAS either lands
-            // before the delete (and its segments are reclaimed with the
-            // rest) or finds no row afterwards.
-            let row: Option<(i64, String)> = sqlx::query_as(
-                "SELECT version, segments_json FROM kosha.manifests \
-                 WHERE namespace_id = $1 FOR UPDATE",
-            )
-            .bind(&id_str)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(io_error)?;
-            sqlx::query("DELETE FROM kosha.manifests WHERE namespace_id = $1")
-                .bind(&id_str)
-                .execute(&mut *tx)
-                .await
-                .map_err(io_error)?;
-            let deleted = sqlx::query("DELETE FROM kosha.namespaces WHERE id = $1")
-                .bind(&id_str)
-                .execute(&mut *tx)
-                .await
-                .map_err(io_error)?;
-            if deleted.rows_affected() == 0 {
-                // Rolled back on drop: nothing changes.
-                return Err(KoshaError::NamespaceNotFound(id.clone()));
-            }
-            let manifest = match row {
-                Some((version, json)) => {
-                    decode_manifest(version as u64, &json).ok_or_else(|| {
-                        KoshaError::NotFound(format!("undecodable manifest for {id_str}"))
-                    })?
-                }
-                None => empty_manifest(0),
-            };
-            let floor = manifest.version.max(retire_at_least) as i64;
-            let (retired,): (i64,) = sqlx::query_as(
-                "INSERT INTO kosha.retired_namespaces AS r (id, last_version) VALUES ($1, $2) \
-                 ON CONFLICT (id) DO UPDATE SET \
-                 last_version = GREATEST(r.last_version, EXCLUDED.last_version), \
-                 retired_at = NOW() \
-                 RETURNING last_version",
-            )
-            .bind(&id_str)
-            .bind(floor)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(io_error)?;
+            let deleted = delete_namespace_rows(&mut tx, id, retire_at_least).await?;
             tx.commit().await.map_err(io_error)?;
-            Ok((manifest, retired as u64))
+            Ok(deleted)
         })
+    }
+
+    /// The namespace's rows and its pending deletion record in one
+    /// transaction: a crash on either side of the commit leaves both or
+    /// neither. Hydration leases on the namespace's segment files go too
+    /// (they would only expire otherwise).
+    fn delete_namespace_recorded(
+        &mut self,
+        id: &NamespaceId,
+        retire_at_least: u64,
+        deletion: &NewDeletion,
+    ) -> Result<(Manifest, u64, DeletionRecord), KoshaError> {
+        self.rt.block_on(async {
+            let mut tx = self.pool.begin().await.map_err(control_plane_error)?;
+            let (manifest, retired) = delete_namespace_rows(&mut tx, id, retire_at_least).await?;
+            sqlx::query("DELETE FROM kosha.hydration_leases WHERE starts_with(segment_key, $1)")
+                .bind(format!("{}/", id.0))
+                .execute(&mut *tx)
+                .await
+                .map_err(control_plane_error)?;
+            let record = crate::deletion::insert(&mut *tx, deletion, retired).await?;
+            tx.commit().await.map_err(control_plane_error)?;
+            Ok((manifest, retired, record))
+        })
+    }
+
+    fn begin_deletion(
+        &mut self,
+        deletion: &NewDeletion,
+        last_version: u64,
+    ) -> Result<DeletionRecord, KoshaError> {
+        self.rt
+            .block_on(crate::deletion::insert(&self.pool, deletion, last_version))
+    }
+
+    fn record_deletion_attempt(
+        &mut self,
+        deletion_id: &str,
+        objects_deleted: u64,
+        error: Option<&str>,
+    ) -> Result<DeletionRecord, KoshaError> {
+        self.rt.block_on(crate::deletion::record_attempt(
+            &self.pool,
+            deletion_id,
+            objects_deleted,
+            error,
+        ))
+    }
+
+    fn deletion(&self, deletion_id: &str) -> Result<Option<DeletionRecord>, KoshaError> {
+        self.rt
+            .block_on(crate::deletion::get(&self.pool, deletion_id))
+    }
+
+    fn deletions(&self, filter: &DeletionFilter) -> Result<Vec<DeletionRecord>, KoshaError> {
+        self.rt.block_on(crate::deletion::list(&self.pool, filter))
     }
 
     fn list_namespaces(&self) -> Vec<NamespaceId> {

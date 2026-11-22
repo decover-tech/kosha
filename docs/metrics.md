@@ -12,6 +12,10 @@ The pods in `k8s/base/deployment.yaml`, `k8s/base/deployment-query.yaml` and
 Prometheus using the usual annotation-based pod discovery collects them with no extra
 configuration.
 
+With TLS between pods turned on (`k8s/components/internal-tls`), the port is HTTPS-only and
+the component adds `prometheus.io/scheme: https`. The scrape job then has to honor that
+annotation and trust the internal CA; see `k8s/README.md`, "Encryption in transit".
+
 ## Access
 
 | Setting | Effect |
@@ -35,11 +39,11 @@ plus `+Inf`.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `kosha_search_requests_total` | counter | `outcome` | Search requests (`POST` and `GET`, every route form) by outcome. `ok`: HTTP 200. `rejected`: shed with HTTP 429, because the scoring queue was full (`KOSHA_SEARCH_QUEUE_DEPTH`) or the request hit a hydration or memory ceiling. `timeout`: shed with HTTP 429 after waiting `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` for a scoring slot. `error`: any other status, including 4xx client errors |
+| `kosha_search_requests_total` | counter | `outcome` | Search requests (`POST` and `GET`, every route form) by outcome. `ok`: HTTP 200. `rejected`: shed with HTTP 429, because the scoring queue was full (`KOSHA_SEARCH_QUEUE_DEPTH`, or the tenant's `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT`) or the request hit a hydration or memory ceiling. `timeout`: shed with HTTP 429 after waiting `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` for a scoring slot. `error`: any other status, including 4xx client errors |
 | `kosha_search_duration_seconds` | histogram | none | Server-side wall-clock time of searches with outcome `ok`, from the handler's start to the response being ready. Includes result-cache hits |
 | `kosha_search_phase_seconds` | histogram | `phase` | Time a scored search spent in each phase. `queue`: waiting for a scoring slot. `hydrate`: making the segment files it needs local (near zero when warm). `score`: the scoring pass. The same numbers as `queue_ms`, `hydrate_ms` and `score_ms` in the `search timing:` log line. Result-cache hits are not observed |
 | `kosha_search_queue_depth` | gauge | none | Searches waiting for a scoring slot at scrape time |
-| `kosha_search_queue_rejections_total` | counter | none | Searches the scoring queue shed, whether because it was full or because the wait timed out. Each is also counted in `kosha_search_requests_total` as `rejected` or `timeout` |
+| `kosha_search_queue_rejections_total` | counter | none | Searches the scoring queue shed, whether because it was full (including a waiting search shed to make room for a tenant holding less of the full queue) or because the wait timed out. Each is also counted in `kosha_search_requests_total` as `rejected` or `timeout` |
 | `kosha_knn_degraded_segments_total` | counter | none | Segments a kNN search could not search by vector and skipped (the response's `knn_degraded_segments`, summed). Any increase means vector search silently returned fewer candidates |
 
 ### Writes
@@ -54,7 +58,7 @@ plus `+Inf`.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `kosha_tenant_rejections_total` | counter | `reason` | Requests refused with HTTP 429 by a per-tenant limit or quota (#341, `KOSHA_TENANT_LIMITS_FILE`). `reason`: `tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`, `namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`, the same code as the response body's `reason`. A search refused here never reaches the scoring queue, so it is not counted in `kosha_search_requests_total`. Stays at zero without a limits file |
+| `kosha_tenant_rejections_total` | counter | `reason` | Requests refused with HTTP 429 by a per-tenant limit or quota (#341, `KOSHA_TENANT_LIMITS_FILE`). `reason`: `tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`, `namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded`, `body_too_large` or `tenant_queue_full`, the same code as the response body's `reason`. A search refused by a limit from the file never reaches the scoring queue, so it is not counted in `kosha_search_requests_total`. `tenant_queue_full` is a search the scoring queue shed because its tenant already had `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` searches waiting; it is also counted in `kosha_search_queue_rejections_total` and as `rejected` in `kosha_search_requests_total`. Every other reason stays at zero without a limits file |
 
 ### Caches and hydration
 

@@ -230,7 +230,7 @@ impl SearchOutcome {
     pub(crate) fn classify(response: &str, shed: Option<QueueShed>) -> Self {
         match (response.get(9..12).unwrap_or(""), shed) {
             (_, Some(QueueShed::Timeout)) => Self::Timeout,
-            (_, Some(QueueShed::Full)) => Self::Rejected,
+            (_, Some(QueueShed::Full | QueueShed::TenantFull)) => Self::Rejected,
             ("200", None) => Self::Ok,
             ("429", None) => Self::Rejected,
             _ => Self::Error,
@@ -243,6 +243,9 @@ impl SearchOutcome {
 pub(crate) enum QueueShed {
     /// `KOSHA_SEARCH_QUEUE_DEPTH` requests were already waiting.
     Full,
+    /// The request's tenant already had
+    /// `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT` requests waiting.
+    TenantFull,
     /// The request waited `KOSHA_SEARCH_QUEUE_TIMEOUT_MS` without a slot.
     Timeout,
 }
@@ -448,7 +451,7 @@ pub(crate) struct Metrics {
     lease_outcomes: [Counter; 3],
     knn_degraded_segments: Counter,
     tenant_rejections: Family<Labels, Counter>,
-    tenant_rejection_reasons: [Counter; 7],
+    tenant_rejection_reasons: [Counter; 8],
 }
 
 impl Default for Metrics {
@@ -1154,6 +1157,10 @@ pub(crate) mod tests {
         assert_eq!(SearchOutcome::classify(shed, None), SearchOutcome::Rejected);
         assert_eq!(
             SearchOutcome::classify(shed, Some(QueueShed::Full)),
+            SearchOutcome::Rejected
+        );
+        assert_eq!(
+            SearchOutcome::classify(shed, Some(QueueShed::TenantFull)),
             SearchOutcome::Rejected
         );
         assert_eq!(

@@ -12,9 +12,14 @@ workspace = true
 kosha-core = { path = "../kosha-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# At-rest hash of API keys (api_keys.rs, #346).
+sha2 = "0.10"
 
 # Postgres persistence (optional — in-memory is the default).
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"], optional = true }
+# `tls-rustls-aws-lc-rs` (#343): without a TLS feature sqlx cannot honor
+# `sslmode=require|verify-ca|verify-full`, and `prefer` silently stays
+# plaintext. Same crypto provider as the server's own rustls stack.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "tls-rustls-aws-lc-rs"], optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"], optional = true }
 
 # Ids for organizations, users, projects and API keys (in-memory and Postgres).

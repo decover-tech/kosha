@@ -58,8 +58,8 @@ pub(crate) struct TenantLimits {
     pub write_docs_per_sec: Option<f64>,
     /// Request body bytes per second on write routes.
     pub write_bytes_per_sec: Option<f64>,
-    /// Namespaces the tenant may hold (checked when one is created,
-    /// explicitly or by a first write).
+    /// Namespaces the tenant may hold (checked when one is created:
+    /// explicitly, as a branch, or by a first write).
     pub namespaces: Option<u64>,
     /// Documents per namespace, committed plus not yet flushed.
     pub docs_per_namespace: Option<u64>,
@@ -108,19 +108,16 @@ impl TenantLimits {
     }
 }
 
-/// One `tenants` entry: a plan name plus overrides.
+/// One `tenants` entry: a plan name plus overrides. The limit fields are
+/// listed here (not a flattened [`TenantLimits`]) because serde cannot
+/// combine `flatten` with `deny_unknown_fields`, and an unknown key must be
+/// an error: a typo would otherwise leave the tenant on its plan, or
+/// unlimited when it has none.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TenantEntry {
     #[serde(default)]
     pub plan: Option<String>,
-    #[serde(flatten)]
-    pub overrides: TenantOverrides,
-}
-
-/// The limit fields of a `tenants` entry (`TenantLimits` cannot be
-/// flattened with `deny_unknown_fields`).
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-pub(crate) struct TenantOverrides {
     pub qps: Option<f64>,
     pub concurrent_queries: Option<u32>,
     pub write_docs_per_sec: Option<f64>,
@@ -132,18 +129,19 @@ pub(crate) struct TenantOverrides {
     pub weight: Option<u32>,
 }
 
-impl From<TenantOverrides> for TenantLimits {
-    fn from(o: TenantOverrides) -> Self {
+impl TenantEntry {
+    /// The limit fields this entry sets.
+    fn overrides(&self) -> TenantLimits {
         TenantLimits {
-            qps: o.qps,
-            concurrent_queries: o.concurrent_queries,
-            write_docs_per_sec: o.write_docs_per_sec,
-            write_bytes_per_sec: o.write_bytes_per_sec,
-            namespaces: o.namespaces,
-            docs_per_namespace: o.docs_per_namespace,
-            vector_dims: o.vector_dims,
-            max_body_bytes: o.max_body_bytes,
-            weight: o.weight,
+            qps: self.qps,
+            concurrent_queries: self.concurrent_queries,
+            write_docs_per_sec: self.write_docs_per_sec,
+            write_bytes_per_sec: self.write_bytes_per_sec,
+            namespaces: self.namespaces,
+            docs_per_namespace: self.docs_per_namespace,
+            vector_dims: self.vector_dims,
+            max_body_bytes: self.max_body_bytes,
+            weight: self.weight,
         }
     }
 }
@@ -185,7 +183,7 @@ impl LimitsConfig {
                     ));
                 }
             }
-            TenantLimits::from(entry.overrides).validate(&format!("tenant {tenant:?}"))?;
+            entry.overrides().validate(&format!("tenant {tenant:?}"))?;
         }
         Ok(config)
     }
@@ -202,7 +200,7 @@ impl LimitsConfig {
             (plan, entry) => {
                 let base = plan.copied().unwrap_or_default();
                 Some(match entry {
-                    Some(e) => base.overlay(&TenantLimits::from(e.overrides)),
+                    Some(e) => base.overlay(&e.overrides()),
                     None => base,
                 })
             }
@@ -296,6 +294,23 @@ impl LimitsProvider for ConfigLimitsProvider {
     }
 }
 
+/// Plan quota defaults with the operator's limits laid over them. See
+/// [`TenantLimiter::with_plan_defaults`].
+struct LayeredLimits {
+    defaults: Arc<dyn LimitsProvider>,
+    overrides: Option<Arc<dyn LimitsProvider>>,
+}
+
+impl LimitsProvider for LayeredLimits {
+    fn limits(&self, tenant: &str) -> Option<TenantLimits> {
+        let over = self.overrides.as_ref().and_then(|p| p.limits(tenant));
+        match (self.defaults.limits(tenant), over) {
+            (Some(defaults), Some(over)) => Some(defaults.overlay(&over)),
+            (defaults, over) => over.or(defaults),
+        }
+    }
+}
+
 // ─── Token bucket ───────────────────────────────────────────────────────────
 
 /// A token bucket as a generic cell rate algorithm: one atomic holding the
@@ -356,10 +371,13 @@ pub(crate) enum RejectReason {
     DocQuota,
     VectorDims,
     BodyTooLarge,
+    /// The tenant already has `KOSHA_SEARCH_QUEUE_DEPTH_PER_TENANT`
+    /// searches waiting for a scoring slot.
+    TenantQueueFull,
 }
 
 impl RejectReason {
-    pub(crate) const ALL: [RejectReason; 7] = [
+    pub(crate) const ALL: [RejectReason; 8] = [
         Self::TenantQps,
         Self::TenantConcurrency,
         Self::TenantWriteRate,
@@ -367,6 +385,7 @@ impl RejectReason {
         Self::DocQuota,
         Self::VectorDims,
         Self::BodyTooLarge,
+        Self::TenantQueueFull,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -378,6 +397,7 @@ impl RejectReason {
             Self::DocQuota => "doc_quota_exceeded",
             Self::VectorDims => "vector_dims_exceeded",
             Self::BodyTooLarge => "body_too_large",
+            Self::TenantQueueFull => "tenant_queue_full",
         }
     }
 
@@ -390,6 +410,7 @@ impl RejectReason {
             Self::DocQuota => "namespace document quota exceeded",
             Self::VectorDims => "vector dimension limit exceeded",
             Self::BodyTooLarge => "request body exceeds the tenant's limit",
+            Self::TenantQueueFull => "tenant search queue is full",
         }
     }
 }
@@ -400,6 +421,9 @@ pub(crate) const QUOTA_RETRY_AFTER_MS: u64 = 60_000;
 
 /// How long a client refused for concurrency is told to wait.
 const CONCURRENCY_RETRY_AFTER_MS: u64 = 1_000;
+
+/// How long a client whose search the scoring queue shed is told to wait.
+pub(crate) const QUEUE_SHED_RETRY_AFTER_MS: u64 = 1_000;
 
 /// A refused request: why, the limit it hit, and when to retry.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -415,6 +439,16 @@ impl Rejection {
             reason,
             limit: limit as f64,
             retry_after_ms: QUOTA_RETRY_AFTER_MS,
+        }
+    }
+
+    /// A search shed because its tenant's share of the scoring queue
+    /// (`limit` waiters) is full.
+    pub(crate) fn tenant_queue_full(limit: usize) -> Self {
+        Self {
+            reason: RejectReason::TenantQueueFull,
+            limit: limit as f64,
+            retry_after_ms: QUEUE_SHED_RETRY_AFTER_MS,
         }
     }
 
@@ -526,6 +560,21 @@ impl TenantLimiter {
                 .map_or(String::new(), |p| p.display().to_string())
         );
         Ok(Self::new(provider))
+    }
+
+    /// `self` with `plans` as the defaults underneath it (#349): a tenant's
+    /// limits are what `plans` gives it (its billing plan's quotas), with
+    /// every field this limiter's own provider (the limits file) sets laid
+    /// over them. Without a limits file the plan quotas apply as they are.
+    pub(crate) fn with_plan_defaults(self, plans: Arc<dyn LimitsProvider>) -> Self {
+        Self {
+            provider: Some(Arc::new(LayeredLimits {
+                defaults: plans,
+                overrides: self.provider,
+            })),
+            tenants: self.tenants,
+            epoch: self.epoch,
+        }
     }
 
     /// Whether any limits are configured.
@@ -783,6 +832,9 @@ mod tests {
             r#"{"plans": {"p": {"qps": -1}}}"#,
             r#"{"plans": {"p": {"weight": 0}}}"#,
             r#"{"plans": {"p": {"qpz": 1}}}"#,
+            // A typo in a tenant's override must not leave it unlimited.
+            r#"{"plans":{},"tenants":{"a":{"qpz":1}}}"#,
+            r#"{"plans": {"p": {"qps": 1}}, "tenants": {"a": {"plan": "p", "wieght": 2}}}"#,
             r#"{"plan": {}}"#,
             "not json",
         ] {
@@ -865,6 +917,14 @@ mod tests {
         assert!(provider.reload().unwrap());
         assert_eq!(provider.limits("t").unwrap().qps, Some(5.0));
         std::fs::write(&path, "{broken").unwrap();
+        assert!(provider.reload().is_err());
+        assert_eq!(provider.limits("t").unwrap().qps, Some(5.0));
+        // A typo in a tenant's entry fails the reload too.
+        std::fs::write(
+            &path,
+            r#"{"plans": {"p": {"qps": 9}}, "tenants": {"t": {"qpz": 1}}}"#,
+        )
+        .unwrap();
         assert!(provider.reload().is_err());
         assert_eq!(provider.limits("t").unwrap().qps, Some(5.0));
         let _ = std::fs::remove_dir_all(&dir);

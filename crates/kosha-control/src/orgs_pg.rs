@@ -373,13 +373,17 @@ impl OrgTx for PgTx<'_> {
     }
 
     fn insert_api_key(&mut self, key: &ApiKey) -> Result<(), OrgError> {
+        // Hashed at rest like every key since #346: the row holds the hash and
+        // a placeholder, never the key itself.
+        let key_hash = crate::api_keys::hash_api_key(&key.api_key);
         self.rt
             .block_on(
                 sqlx::query(
-                    "INSERT INTO kosha.api_keys (api_key, tenant_id, description) \
-                     VALUES ($1, $2, $3)",
+                    "INSERT INTO kosha.api_keys (api_key, key_hash, tenant_id, description) \
+                     VALUES ($1, $2, $3, $4)",
                 )
-                .bind(&key.api_key)
+                .bind(crate::api_key_store::placeholder(&key_hash))
+                .bind(&key_hash)
                 .bind(&key.tenant_id)
                 .bind(&key.description)
                 .execute(&mut *self.tx),

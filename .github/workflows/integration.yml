@@ -66,6 +66,14 @@ jobs:
           KOSHA_TEST_DATABASE_URL=postgres://kosha:kosha-dev@localhost:5432/kosha_cas_test \
             cargo test --locked -p kosha-control --features postgres --test postgres_cas --test orgs -- --ignored
 
+      - name: Postgres API key tests
+        if: ${{ !cancelled() }}
+        run: |
+          $COMPOSE exec -T postgres createdb -U kosha kosha_api_keys_test
+          export KOSHA_TEST_DATABASE_URL=postgres://kosha:kosha-dev@localhost:5432/kosha_api_keys_test
+          cargo test --locked -p kosha-control --features postgres --test postgres_api_keys -- --ignored
+          cargo test --locked -p kosha-server --features postgres --test auth_startup -- --ignored
+
       - name: Server logs
         if: failure()
         run: $COMPOSE logs --no-color --tail 500 kosha-ingest kosha-query

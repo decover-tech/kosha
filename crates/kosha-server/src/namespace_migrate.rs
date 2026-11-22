@@ -1839,6 +1839,8 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
              (an in-memory control plane holds nothing to migrate)"
                 .to_string()
         })?;
+        // Same TLS rule as the server (#343), before the first connection.
+        crate::internal_tls::check_database_url_env()?;
         let mut ctrl = kosha_control::PgStore::connect_with_retry(&url)?;
         if args.list_unreachable {
             let bare = unreachable_bare_namespaces(&ctrl.list_namespaces());
