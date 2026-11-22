@@ -13,7 +13,8 @@
 # a *-zstd snapshot built from a ref without #388, which is raw). Run it
 # before trusting any number from a snapshot.
 set -euo pipefail
-. "$(dirname "$0")/snapshot_cache.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SCRIPT_DIR/snapshot_cache.sh"
 
 NAME="${1:?usage: doc_store_bytes.sh <snapshot-name> [zstd|raw]}"
 EXPECT="${2:-}"
@@ -33,4 +34,4 @@ aws s3 cp "$SNAP/build_info.txt" "$WORK/build_info.txt" --only-show-errors 2>/de
 ARGS=(--listing "$WORK/listing.txt" --footers "$WORK/footers" --label "$NAME" \
       --build-info "$WORK/build_info.txt")
 if [ -n "$EXPECT" ]; then ARGS+=(--expect "$EXPECT"); fi
-python3 -I "$(dirname "$0")/../doc_store_bytes.py" "${ARGS[@]}"
+python3 -I "$SCRIPT_DIR/../doc_store_bytes.py" "${ARGS[@]}"
