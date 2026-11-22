@@ -450,7 +450,6 @@ fn audit_log_records_each_action_once(store: &dyn OrgStore) {
     let project = orgs::create_project(store, &f.admin, org, "search", "Search").unwrap();
     let tenant = orgs::link_tenant(store, &f.admin, org, None, Some(&project.id)).unwrap();
     let key = orgs::create_api_key(store, &f.member, org, &tenant.tenant_id, "ci").unwrap();
-    let operator_key = orgs::create_operator_api_key(store, &tenant.tenant_id, "ops").unwrap();
     orgs::set_member_role(store, &f.owner, org, read_only, Role::Member).unwrap();
     // Refused and no-op calls leave nothing behind.
     orgs::set_member_role(store, &f.owner, org, read_only, Role::Member).unwrap();
@@ -541,13 +540,6 @@ fn audit_log_records_each_action_once(store: &dyn OrgStore) {
                 json!({"key_suffix": suffix(&key.api_key), "description": "ci"})
             ),
             row(
-                "operator",
-                "api_key.created",
-                "tenant",
-                &tenant.tenant_id,
-                json!({"key_suffix": suffix(&operator_key.api_key), "description": "ops"})
-            ),
-            row(
                 &by(owner),
                 "member.role_changed",
                 "user",
@@ -565,7 +557,7 @@ fn audit_log_records_each_action_once(store: &dyn OrgStore) {
     );
     // The log never holds a key.
     let text = serde_json::to_string(&log).unwrap();
-    assert!(!text.contains(&key.api_key) && !text.contains(&operator_key.api_key));
+    assert!(!text.contains(&key.api_key));
 
     // Newest first, paged by id.
     assert!(log.windows(2).all(|w| w[0].id > w[1].id));
@@ -673,7 +665,16 @@ mod postgres {
             store.validate_api_key(&legacy_key),
             Some(legacy_tenant.clone())
         );
-        let unlinked = orgs::create_operator_api_key(&store, &legacy_tenant, "ops").unwrap();
+        // The operator's `POST /v1/admin/api-keys`: scoped, namespace-limited
+        // and expiring, for a tenant with or without an organization.
+        let operator_key = kosha_control::NewApiKey {
+            tenant_id: legacy_tenant.clone(),
+            description: "ops".to_string(),
+            scopes: kosha_control::Scopes::of(&[kosha_control::Scope::Read]),
+            namespaces: Some(vec!["docs".to_string()]),
+            expires_at: Some(4_102_444_800),
+        };
+        let unlinked = store.create_api_key(&operator_key).unwrap();
         orgs::link_tenant(&store, &Actor::Operator, &f.org, Some(&legacy_tenant), None).unwrap();
         for key in [&legacy_key, &unlinked.api_key] {
             assert_eq!(store.validate_api_key(key), Some(legacy_tenant.clone()));
@@ -685,14 +686,29 @@ mod postgres {
             .any(|k| k.key_hash == kosha_control::hash_api_key(&legacy_key)));
         // The key made before the link was audited with no organization, so
         // it is not in this organization's log; one made after is.
-        let linked = orgs::create_operator_api_key(&store, &legacy_tenant, "ops").unwrap();
+        let linked = store.create_api_key(&operator_key).unwrap();
         let log = orgs::list_audit(&store, &f.owner, &f.org, None, None).unwrap();
-        let suffixes: Vec<&str> = log
+        let created: Vec<_> = log
             .iter()
             .filter(|e| e.action == "api_key.created" && e.target_id == legacy_tenant)
-            .filter_map(|e| e.detail["key_suffix"].as_str())
             .collect();
-        assert_eq!(suffixes, vec![&linked.api_key[linked.api_key.len() - 4..]]);
+        assert_eq!(created.len(), 1, "{created:?}");
+        assert_eq!(created[0].actor, "operator");
+        assert_eq!(created[0].target_type, "tenant");
+        // What the key may do is in the entry; the key and its id are not.
+        assert_eq!(
+            created[0].detail,
+            serde_json::json!({
+                "key_suffix": &linked.api_key[linked.api_key.len() - 4..],
+                "key_id_prefix": &linked.record.key_hash[..12],
+                "description": "ops",
+                "scopes": ["read"],
+                "namespaces": ["docs"],
+                "expires_at": 4_102_444_800_i64,
+            })
+        );
+        let text = serde_json::to_string(&log).unwrap();
+        assert!(!text.contains(&linked.api_key) && !text.contains(&linked.record.key_hash));
     }
 
     #[test]

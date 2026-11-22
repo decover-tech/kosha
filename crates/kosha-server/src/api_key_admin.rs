@@ -22,6 +22,9 @@
 //!
 //! A key's `key_id` is the SHA-256 hash the registry stores for it. Where
 //! a `key_id` is expected, `{"api_key": "<the key>"}` works too.
+//!
+//! Create, rotate and revoke are audited (#345): the registry writes the
+//! `kosha.audit_log` row in the transaction that makes the change.
 
 use crate::{json_error, valid_namespace_component, valid_new_tenant_id};
 use kosha_control::{hash_api_key, ApiKeyRecord, NewApiKey, Scopes};

@@ -284,6 +284,31 @@ mod scoped_keys {
         let flush = format!("{docs}/flush");
         let namespace = |name: &str| Some(json!({ "namespace": name }));
 
+        // The tenant belongs to an organization, so what the admin key
+        // routes do below can be read back from that organization's audit
+        // log at the end.
+        use kosha_control::orgs::{self, Actor};
+        let org = {
+            let store = kosha_control::PgStore::new(&database_url).unwrap();
+            let owner = orgs::create_user(
+                &store,
+                &Actor::Operator,
+                &format!("{tenant}@example.test"),
+                "",
+            )
+            .unwrap();
+            let org = orgs::create_org(
+                &store,
+                &Actor::Operator,
+                &format!("org-{tenant}"),
+                "Audit",
+                Some(&owner.id),
+            )
+            .unwrap();
+            orgs::link_tenant(&store, &Actor::Operator, &org.id, Some(&tenant), None).unwrap();
+            org
+        };
+
         // A key created the pre-#346 way (tenant only) can do everything.
         let (full, full_id) = create_key(port, json!({ "tenant_id": tenant }));
         assert_eq!(
@@ -374,6 +399,18 @@ mod scoped_keys {
         );
         assert_eq!(status(port, "GET", "/v1/namespaces", &docs_only, None), 403);
 
+        // A tenant's own usage and billing are `read` routes (#426). Both
+        // features are off on this pod, so a key that may read is answered
+        // 404 by the route itself; a key without `read`, or one limited to
+        // some namespaces, is refused before it.
+        let (write_only, _) = create_key(port, json!({"tenant_id": tenant, "scopes": ["write"]}));
+        for path in ["/v1/usage", "/v1/billing"] {
+            assert_eq!(status(port, "GET", path, &full, None), 404, "{path}");
+            assert_eq!(status(port, "GET", path, &ro, None), 404, "{path}");
+            assert_eq!(status(port, "GET", path, &write_only, None), 403, "{path}");
+            assert_eq!(status(port, "GET", path, &docs_only, None), 403, "{path}");
+        }
+
         // No tenant key reaches the key registry, whatever its scopes.
         assert_eq!(status(port, "GET", "/v1/admin/api-keys", &full, None), 403);
 
@@ -443,6 +480,41 @@ mod scoped_keys {
         let text = listed.to_string();
         for secret in [&full, &ro, &ro_new, &docs_only] {
             assert!(!text.contains(secret.as_str()), "listing leaks a key");
+        }
+
+        // Each key the admin routes created, rotated or revoked is in the
+        // audit log (#345), newest first, without a key or a whole key id.
+        let audit: Vec<(String, String)> =
+            orgs::list_audit(&registry, &Actor::Operator, &org.id, None, None)
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry.action.starts_with("api_key."))
+                .map(|entry| {
+                    assert_eq!(entry.actor, "operator");
+                    assert_eq!(entry.target_id, tenant);
+                    (entry.action, entry.detail.to_string())
+                })
+                .collect();
+        let actions: Vec<&str> = audit.iter().map(|(action, _)| action.as_str()).collect();
+        assert_eq!(
+            actions,
+            [
+                "api_key.revoked", // `full`, through the registry
+                "api_key.revoked", // the rotated read-only key
+                "api_key.rotated",
+                "api_key.created", // write-only
+                "api_key.created", // docs-only
+                "api_key.created", // read-only
+                "api_key.created", // full
+            ]
+        );
+        let docs_only_row: Value = serde_json::from_str(&audit[4].1).unwrap();
+        assert_eq!(docs_only_row["scopes"], json!(["read", "write"]));
+        assert_eq!(docs_only_row["namespaces"], json!(["docs"]));
+        for (_, detail) in &audit {
+            for secret in [&full, &ro, &ro_new, &docs_only, &full_id, &ro_new_id] {
+                assert!(!detail.contains(secret.as_str()), "audit leaks: {detail}");
+            }
         }
         let keys = listed["api_keys"].as_array().unwrap();
         let by_id = |id: &str| keys.iter().find(|k| k["key_id"] == json!(id));

@@ -118,20 +118,24 @@ Refused requests are not recorded.
 | `member.removed` | user | `role` |
 | `project.created` | project | `slug` |
 | `tenant.linked` | tenant | `project_id`, `existing_tenant` |
-| `api_key.created` | tenant | `key_suffix` (last four characters), `description` |
+| `api_key.created` | tenant | `key_suffix` (last four characters), `description`. A key made with `POST /v1/admin/api-keys` also has `key_id_prefix` (first twelve characters of its `key_id`), `scopes`, `namespaces` and `expires_at` |
+| `api_key.rotated` | tenant | The replacement key, as for `api_key.created`, and `replaces`: the old key's `key_id_prefix` and the `expires_at` it now has |
+| `api_key.revoked` | tenant | `key_id_prefix`, `description` |
 
 An entry has `id`, `org_id`, `actor` (`operator` or `user:<id>`), `action`,
 `target_type`, `target_id`, `detail` and `created_at_ms`. The log never holds an
 API key. `GET .../audit-log` returns one organization's entries newest first,
 100 per page by default (`limit`, at most 1000); pass the response's
-`next_before` as `before` for the next page. Keys created through
-`POST /v1/admin/api-keys` are recorded too, under the tenant's organization when
-it has one. `user.created`, and keys for a tenant no organization owns, are
-recorded with no organization and are only visible in the `kosha.audit_log`
-table.
+`next_before` as `before` for the next page. Keys created, rotated
+(`/rotate`) or revoked (`/revoke`) through `POST /v1/admin/api-keys` are
+recorded too, with the operator as the actor, under the tenant's organization
+when it has one. `user.created`, and key entries for a tenant no organization
+owns, are recorded with no organization and are only visible in the
+`kosha.audit_log` table. An entry never holds a key or a whole `key_id`.
 
 Not recorded yet: namespace deletion and other data-plane actions made with a
-tenant API key.
+tenant API key, the keys removed when a tenant is deleted, and
+`POST /v1/admin/api-keys/scrub-plaintext`.
 
 ## Storage
 

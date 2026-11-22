@@ -7420,10 +7420,14 @@ impl SegmentReader {
     /// Reads and decodes one posting's live entries from the column's idx
     /// file — the whole local file when present, else the span cache a
     /// ranged cold query filled (#245).
+    /// `spans` is the caller's span listing for
+    /// this column, shared by every posting of one probe (start it as
+    /// `None`; see [`span_cache::read_local_range_reusing`]).
     fn hydrate_posting(
         &self,
         vi: &LazyVectorIndex,
         range_idx: usize,
+        spans: &mut Option<span_cache::SpanIndex>,
     ) -> Result<SharedVectorPosting, KoshaError> {
         let key = vector_cache_key(vi.slot, range_idx);
         if let Some(hit) = self.vector_cache.get(key) {
@@ -7432,12 +7436,13 @@ impl SegmentReader {
         let (offset, length) = vi.ranges[range_idx];
         // Neither local file nor span: an IO error, which the query layer
         // reports as a degraded segment, never as no matches.
-        let buf = span_cache::read_local_range(
+        let buf = span_cache::read_local_range_reusing(
             &self.segment_dir,
             &vi.idx_file,
             offset + length as u64,
             offset,
             length as u64,
+            spans,
         )
         .ok_or_else(|| {
             KoshaError::Io(std::io::Error::new(
@@ -8109,8 +8114,9 @@ impl SegmentReader {
         let is_candidate = |id: u32| candidates.binary_search(&id).is_ok();
         let lanes = DotLanes::from_env();
         let unit = Self::unit_query(vi, query);
+        let mut spans = None;
         for range_idx in 0..vi.ranges.len() {
-            let posting = match self.hydrate_posting(vi, range_idx) {
+            let posting = match self.hydrate_posting(vi, range_idx, &mut spans) {
                 Ok(posting) => posting,
                 Err(e) => return Some(Err(e)),
             };
@@ -8200,6 +8206,7 @@ impl SegmentReader {
         let probe = Self::probe_query(vi, query);
         let lanes = DotLanes::from_env();
         let unit = Self::unit_query(vi, query);
+        let mut spans = None;
         for (position, (range_idx, _)) in ranked.iter().enumerate() {
             if position >= budgeted {
                 // Past the budget. Without a restriction this is where the
@@ -8220,16 +8227,17 @@ impl SegmentReader {
                 }
             }
             probes += 1;
-            self.hydrate_posting(vi, *range_idx)?.for_each_similarity(
-                accept,
-                |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
-                &probe,
-                &vi.centroids[*range_idx],
-                |id, sim, err| {
-                    scored.push((id, sim as f64));
-                    errors.push(err);
-                },
-            );
+            self.hydrate_posting(vi, *range_idx, &mut spans)?
+                .for_each_similarity(
+                    accept,
+                    |v| Self::f32_similarity(lanes, unit.as_deref(), query, v),
+                    &probe,
+                    &vi.centroids[*range_idx],
+                    |id, sim, err| {
+                        scored.push((id, sim as f64));
+                        errors.push(err);
+                    },
+                );
         }
         Ok(ProbedCandidates {
             scored,
@@ -8304,6 +8312,7 @@ impl SegmentReader {
         let probe = Self::probe_query(vi, query);
         let mut postings = 0usize;
         let lanes = DotLanes::from_env();
+        let mut spans = None;
         for (position, &range_idx) in candidates.iter().enumerate() {
             if position >= nprobe && scored.len() >= k {
                 break;
@@ -8314,22 +8323,23 @@ impl SegmentReader {
                 self.prefetch_vector_postings(vi, chunk.iter().copied(), fetch);
             }
             postings += 1;
-            self.hydrate_posting(vi, range_idx)?.for_each_similarity(
-                accept,
-                |v| {
-                    if vi.unit_norm {
-                        lanes.dot(query, v).clamp(-1.0, 1.0)
-                    } else {
-                        lanes.cosine_similarity(query, v)
-                    }
-                },
-                &probe,
-                &vi.centroids[range_idx],
-                |id, sim, err| {
-                    scored.push((id, sim as f64));
-                    errors.push(err);
-                },
-            );
+            self.hydrate_posting(vi, range_idx, &mut spans)?
+                .for_each_similarity(
+                    accept,
+                    |v| {
+                        if vi.unit_norm {
+                            lanes.dot(query, v).clamp(-1.0, 1.0)
+                        } else {
+                            lanes.cosine_similarity(query, v)
+                        }
+                    },
+                    &probe,
+                    &vi.centroids[range_idx],
+                    |id, sim, err| {
+                        scored.push((id, sim as f64));
+                        errors.push(err);
+                    },
+                );
         }
         Ok(ProbedCandidates {
             scored,
