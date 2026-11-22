@@ -4037,6 +4037,106 @@ pub fn posting_term_spans(
         .collect())
 }
 
+/// Byte breakdown of one skip-split (v5/v6) segment's postings, for the
+/// #386 bit-packing experiment. Diagnostics only: nothing on the query or
+/// write path calls it.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PostingsSectionStats {
+    /// The `inverted.idx` TOC version (5 or 6).
+    pub inverted_version: u32,
+    pub terms: u64,
+    pub postings: u64,
+    /// Postings in full [`SCORING_BLOCK_LEN`] blocks: the only ones v6
+    /// bit-packs.
+    pub postings_in_full_blocks: u64,
+    /// Per-term doc count + skip table, as stored.
+    pub skip_bytes: u64,
+    /// Scoring `(doc, tf)` sections, as stored.
+    pub scoring_bytes: u64,
+    /// Positions sections, as stored (the same codec in v5 and v6).
+    pub positions_bytes: u64,
+    /// The same scoring blocks re-encoded as v5 varints and as v6
+    /// (full blocks bit-packed, tails varint): a codec-only comparison on
+    /// identical postings, whatever the segment layout.
+    pub scoring_bytes_as_v5: u64,
+    pub scoring_bytes_as_v6: u64,
+    /// Total logical (decompressed) bytes of the `postings-*.bin` shards
+    /// the TOC references.
+    pub shard_logical_bytes: u64,
+}
+
+/// [`PostingsSectionStats`] for a split segment whose shards are all local
+/// (whole files, not span-cache fragments). Errors on v3/v4 segments, on a
+/// missing shard and on any span or block that does not decode.
+#[doc(hidden)]
+pub fn postings_section_stats(segment_dir: &Path) -> Result<PostingsSectionStats, KoshaError> {
+    let corrupt =
+        |msg: String| KoshaError::CorruptSegment(format!("{}: {msg}", segment_dir.display()));
+    let data = read_inverted_payload(fs::read(segment_dir.join("inverted.idx"))?)?;
+    let index = SplitInvertedIndex::from_bytes(data, segment_dir.to_path_buf(), None)?;
+    let inverted_version = u32::from_le_bytes(index.data[4..8].try_into().unwrap());
+    let Some(bitpacked) = index.encoding.skip_split() else {
+        return Err(corrupt(format!(
+            "inverted version {inverted_version} is not skip-split (v5/v6)"
+        )));
+    };
+    let mut by_blob: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+    for i in 0..index.term_count {
+        let (_, _, blob_id, off, len) = index.raw_entry(i);
+        by_blob.entry(blob_id).or_default().push((off, len));
+    }
+    let mut stats = PostingsSectionStats {
+        inverted_version,
+        terms: index.term_count as u64,
+        ..Default::default()
+    };
+    let mut block = Vec::with_capacity(SCORING_BLOCK_LEN);
+    let mut scratch = Vec::new();
+    for (blob_id, spans) in by_blob {
+        let blob = index
+            .read_posting_blob(blob_id)
+            .ok_or_else(|| corrupt(format!("shard {blob_id} missing or unreadable")))?;
+        stats.shard_logical_bytes += blob.len() as u64;
+        for (off, len) in spans {
+            let bytes = off
+                .checked_add(len)
+                .and_then(|end| blob.get(off..end))
+                .ok_or_else(|| corrupt(format!("span out of shard {blob_id} bounds")))?;
+            let parsed = BlockedTermPostings::parse_with(Arc::new(bytes.to_vec()), bitpacked)
+                .ok_or_else(|| corrupt(format!("span in shard {blob_id} does not parse")))?;
+            stats.postings += parsed.doc_count() as u64;
+            stats.skip_bytes += u64::from(parsed.scoring_base);
+            stats.scoring_bytes += u64::from(parsed.positions_base - parsed.scoring_base);
+            stats.positions_bytes += (bytes.len() - parsed.positions_base as usize) as u64;
+            for b in 0..parsed.block_count() {
+                if !parsed.read_block(b, &mut block) {
+                    return Err(corrupt(format!("block {b} in shard {blob_id} corrupt")));
+                }
+                let prev_doc = if b == 0 {
+                    0
+                } else {
+                    parsed.summary(b - 1).last_doc_id
+                };
+                scratch.clear();
+                bitpack::encode_varint_block(&block, prev_doc, &mut scratch);
+                stats.scoring_bytes_as_v5 += scratch.len() as u64;
+                if block.len() == SCORING_BLOCK_LEN {
+                    stats.postings_in_full_blocks += SCORING_BLOCK_LEN as u64;
+                    let docs: [u32; SCORING_BLOCK_LEN] = std::array::from_fn(|i| block[i].doc_id);
+                    let tfs: [u32; SCORING_BLOCK_LEN] =
+                        std::array::from_fn(|i| block[i].term_frequency);
+                    let next_min = if b == 0 { 0 } else { prev_doc.wrapping_add(1) };
+                    scratch.clear();
+                    bitpack::encode_bp_block(&docs, &tfs, next_min, &mut scratch);
+                }
+                stats.scoring_bytes_as_v6 += scratch.len() as u64;
+            }
+        }
+    }
+    Ok(stats)
+}
+
 pub fn inverted_uses_posting_blobs(segment_dir: &Path) -> bool {
     let Some(header) = read_inverted_header(&segment_dir.join("inverted.idx")) else {
         return false;
@@ -11751,6 +11851,48 @@ mod bounded_build_tests {
         }
         assert_eq!(postings_bytes(&v6_dir), postings_bytes(&back_dir));
         for d in [v6_dir, v5_dir, back_dir] {
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// `postings_section_stats` (#386 diagnostics): on v5 and v6 builds of
+    /// the same documents, the stored scoring bytes equal the re-encoded
+    /// size in the segment's own codec, the re-encoded sizes agree across
+    /// the two builds, positions are byte-identical in size, and the
+    /// sections tile the shards exactly.
+    #[test]
+    fn postings_section_stats_match_both_codecs() {
+        let docs = corpus(1_500);
+        let (d5, d6) = (scratch("stats5"), scratch("stats6"));
+        build_version(&d5, usize::MAX, &docs, SKIP_SPLIT_INVERTED_VERSION);
+        build_version(
+            &d6,
+            usize::MAX,
+            &docs,
+            BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
+        );
+        let s5 = postings_section_stats(&d5).unwrap();
+        let s6 = postings_section_stats(&d6).unwrap();
+        assert_eq!(s5.inverted_version, SKIP_SPLIT_INVERTED_VERSION);
+        assert_eq!(s6.inverted_version, BITPACKED_SKIP_SPLIT_INVERTED_VERSION);
+        assert_eq!(s5.scoring_bytes, s5.scoring_bytes_as_v5);
+        assert_eq!(s6.scoring_bytes, s6.scoring_bytes_as_v6);
+        assert_eq!(s5.scoring_bytes_as_v5, s6.scoring_bytes_as_v5);
+        assert_eq!(s5.scoring_bytes_as_v6, s6.scoring_bytes_as_v6);
+        assert!(s6.scoring_bytes < s5.scoring_bytes);
+        assert_eq!(
+            (s5.terms, s5.postings, s5.postings_in_full_blocks),
+            (s6.terms, s6.postings, s6.postings_in_full_blocks)
+        );
+        assert!(s5.postings_in_full_blocks > 0);
+        assert_eq!(s5.positions_bytes, s6.positions_bytes);
+        for s in [&s5, &s6] {
+            assert_eq!(
+                s.skip_bytes + s.scoring_bytes + s.positions_bytes,
+                s.shard_logical_bytes
+            );
+        }
+        for d in [d5, d6] {
             fs::remove_dir_all(d).unwrap();
         }
     }

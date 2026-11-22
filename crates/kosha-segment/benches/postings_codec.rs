@@ -16,7 +16,11 @@
 //!
 //!     cargo bench -p kosha-segment --bench postings_codec
 //!
-//! Set `KOSHA_BENCH_CORPUS=<path>` to use your own text file.
+//! Set `KOSHA_BENCH_CORPUS=<path>` to use your own text file. A path
+//! ending in `.ndjson` is read as bench corpus shards (one
+//! `{"id": .., "text": ..}` document per line, as in the MSMarco
+//! `shard-*.ndjson` files), one document per line, capped at
+//! `KOSHA_BENCH_MAX_DOCS` (default 200000) documents.
 
 use std::collections::BTreeMap;
 use std::hint::black_box;
@@ -29,8 +33,8 @@ use kosha_segment::bitpack::{
     BP_BLOCK,
 };
 use kosha_segment::{
-    ScoringPosting, SegmentWriter, BITPACKED_SKIP_SPLIT_INVERTED_VERSION,
-    SKIP_SPLIT_INVERTED_VERSION,
+    postings_section_stats, PostingsSectionStats, ScoringPosting, SegmentWriter,
+    BITPACKED_SKIP_SPLIT_INVERTED_VERSION, SKIP_SPLIT_INVERTED_VERSION,
 };
 
 /// One term's scoring section in both encodings, with per-block byte
@@ -248,9 +252,13 @@ fn markdown_corpus(root: &Path, out: &mut String) {
 }
 
 fn corpus_docs() -> Vec<String> {
-    let text = match std::env::var("KOSHA_BENCH_CORPUS") {
-        Ok(p) => std::fs::read_to_string(p).expect("KOSHA_BENCH_CORPUS readable"),
-        Err(_) => {
+    let path = std::env::var("KOSHA_BENCH_CORPUS").ok();
+    if let Some(p) = path.as_deref().filter(|p| p.ends_with(".ndjson")) {
+        return ndjson_docs(p);
+    }
+    let text = match path {
+        Some(p) => std::fs::read_to_string(p).expect("KOSHA_BENCH_CORPUS readable"),
+        None => {
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
             let mut s = String::new();
             markdown_corpus(&root, &mut s);
@@ -276,6 +284,29 @@ fn corpus_docs() -> Vec<String> {
     docs
 }
 
+/// One document per `{"text": ..}` line of a bench corpus shard.
+fn ndjson_docs(path: &str) -> Vec<String> {
+    use std::io::BufRead;
+    let max: usize = std::env::var("KOSHA_BENCH_MAX_DOCS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let file = std::fs::File::open(path).expect("KOSHA_BENCH_CORPUS readable");
+    std::io::BufReader::new(file)
+        .lines()
+        .map(|l| l.expect("KOSHA_BENCH_CORPUS line"))
+        .filter(|l| !l.trim().is_empty())
+        .take(max)
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(&l).expect("ndjson line");
+            v.get("text")
+                .and_then(|t| t.as_str())
+                .expect("ndjson line has a \"text\" string")
+                .to_string()
+        })
+        .collect()
+}
+
 /// Simple lowercase-alphanumeric term lists per document (the bench's
 /// analyzer is not needed for the codec comparison).
 fn corpus_lists(docs: &[String]) -> Vec<Vec<ScoringPosting>> {
@@ -298,7 +329,7 @@ fn corpus_lists(docs: &[String]) -> Vec<Vec<ScoringPosting>> {
     terms.into_values().collect()
 }
 
-fn segment_postings_bytes(docs: &[String], version: u32) -> u64 {
+fn segment_postings_bytes(docs: &[String], version: u32) -> (u64, PostingsSectionStats) {
     let dir = std::env::temp_dir().join(format!(
         "kosha-bench-postings-codec-v{version}-{}",
         std::process::id()
@@ -316,8 +347,9 @@ fn segment_postings_bytes(docs: &[String], version: u32) -> u64 {
         .filter(|e| e.file_name().to_string_lossy().starts_with("postings"))
         .map(|e| e.metadata().unwrap().len())
         .sum();
+    let stats = postings_section_stats(&dir).expect("section stats");
     let _ = std::fs::remove_dir_all(&dir);
-    bytes
+    (bytes, stats)
 }
 
 fn main() {
@@ -389,19 +421,29 @@ fn main() {
         .filter(|l| l.len() >= BP_BLOCK)
         .cloned()
         .collect();
-    println!(
-        "markdown corpus: {} docs, {} terms",
-        docs.len(),
-        lists.len()
-    );
-    report("markdown all terms", &lists);
-    report("markdown terms df>=128", &long);
-    let (b5, b6) = (
+    let label = match std::env::var("KOSHA_BENCH_CORPUS") {
+        Ok(p) if p.ends_with(".ndjson") => "ndjson",
+        Ok(_) => "text file",
+        Err(_) => "markdown",
+    };
+    println!("{label} corpus: {} docs, {} terms", docs.len(), lists.len());
+    report(&format!("{label} all terms"), &lists);
+    report(&format!("{label} terms df>=128"), &long);
+    let ((b5, s5), (b6, s6)) = (
         segment_postings_bytes(&docs, SKIP_SPLIT_INVERTED_VERSION),
         segment_postings_bytes(&docs, BITPACKED_SKIP_SPLIT_INVERTED_VERSION),
     );
     println!(
-        "markdown segment postings-*.bin bytes (skip+scoring+positions): v5 {b5}  v6 {b6}  ({:+.1}%)",
+        "{label} segment postings-*.bin bytes (skip+scoring+positions): v5 {b5}  v6 {b6}  ({:+.1}%)",
         100.0 * (b6 as f64 / b5 as f64 - 1.0)
     );
+    for (v, s) in [(5, &s5), (6, &s6)] {
+        println!(
+            "  v{v} sections: skip {} B, scoring {} B, positions {} B; postings in full blocks {:.1}%",
+            s.skip_bytes,
+            s.scoring_bytes,
+            s.positions_bytes,
+            100.0 * s.postings_in_full_blocks as f64 / s.postings.max(1) as f64
+        );
+    }
 }
