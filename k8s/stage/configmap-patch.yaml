@@ -7,4 +7,9 @@ kind: ConfigMap
 metadata:
   name: kosha-config
   namespace: kosha
-data: {}
+data:
+  # Searches read only what the indexer has published, like OpenSearch's
+  # refresh model. Under the default (strong) a query pod asks the ingest
+  # pod for its unindexed tail, and a manifest version mismatch between
+  # the two answered 503 while the 1.8M-chunk matter was compacting.
+  KOSHA_DEFAULT_CONSISTENCY: "eventual"

@@ -74,11 +74,12 @@ spec:
             # gracefully instead of the pod getting OOMKilled.
             - name: KOSHA_SEGMENT_CACHE_MAX_BYTES
               value: "21474836480"
-            # ~24GiB on-disk cache budget, well under the 40Gi
-            # ephemeral-storage limit (see comment above) — the cache's own
-            # LRU eviction is what should bite first, not a pod eviction.
+            # 64 GiB on the pod's own 100 GiB EBS volume (see volumes
+            # below): two matters' segments no longer fit in 24 GiB, so the
+            # cache evicted continuously. The headroom covers files pinned
+            # by in-flight searches, which may take the cache past this cap.
             - name: KOSHA_CACHE_MAX_BYTES
-              value: "25769803776"
+              value: "68719476736"
             # Live-bytes watermark (cache-resident + pinned by in-flight
             # searches — see kosha_query::MemoryLedger). Must be set
             # explicitly here: the code default is 2× the cache budget
@@ -153,3 +154,18 @@ spec:
               cpu: "4"
               ephemeral-storage: "40Gi"
               memory: "32Gi"
+      # The disk cache gets its own gp3 volume, created with the pod and
+      # deleted with it, instead of an emptyDir on the node's 50 GB root
+      # disk: warming two matters filled that disk (DiskPressure, the pod
+      # evicted, 22 replacements rejected on the same node).
+      volumes:
+        - name: cache
+          emptyDir: null
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: decoverai-sc-ebs
+                resources:
+                  requests:
+                    storage: 100Gi
