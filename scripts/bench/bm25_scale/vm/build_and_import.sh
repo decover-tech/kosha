@@ -98,12 +98,27 @@ cd ~/kosha
 sudo docker build -q --target builder -t kosha-builder:bench . >/dev/null
 sudo rm -rf "/data/segments-out/$NS"
 if [ -n "$BUILD_DOCKER_ENV" ]; then echo "builder env: $BUILD_DOCKER_ENV"; fi
+BUILD_LOG="$(mktemp /tmp/build-segments.XXXXXX.log)"
 # shellcheck disable=SC2086  # validated -e KEY=VALUE words, split on purpose
 sudo docker run --rm $BUILD_DOCKER_ENV -v /data:/data kosha-builder:bench sh -c "
   cargo build --release --locked -p kosha-build-segments &&
   ./target/release/kosha-build-segments \
     --shards-dir /data/corpus-txt $EMB_ARGS \
-    --namespace '$NS' --out-dir /data/segments-out --max-docs $MAX_DOCS"
+    --namespace '$NS' --out-dir /data/segments-out --max-docs $MAX_DOCS" \
+  2>&1 | tee "$BUILD_LOG"
+# #385 gate: a builder without docid reordering ignores KOSHA_DOC_REORDER
+# and would write an ingest-order build under the bp snapshot name, which
+# later runs then reuse (a snapshot is never overwritten). Abort before
+# anything is uploaded unless the builder really reordered.
+if printf '%s\n' "$BUILD_DOCKER_ENV" | grep -Eiq '(^| )KOSHA_DOC_REORDER=bp( |$)'; then
+  grep -q '^doc reorder: bp$' "$BUILD_LOG" \
+    || { echo "::error::KOSHA_DOC_REORDER=bp requested but the builder did not print doc reorder: bp (ref without #385?)"; exit 1; }
+  REORDER_SECS="$(grep -o '(reorder [0-9.]*s)' "$BUILD_LOG" | tr -dc '0-9.\n' | awk '{s += $1} END {print s + 0}')"
+  awk -v s="$REORDER_SECS" 'BEGIN {exit !(s > 0)}' \
+    || { echo "::error::KOSHA_DOC_REORDER=bp requested but total reorder time is $REORDER_SECS s"; exit 1; }
+  echo "REORDER-GATE-OK total reorder ${REORDER_SECS}s"
+fi
+grep '^index bytes:' "$BUILD_LOG" || true
 echo "BUILD-COMPLETE $NS (max_docs=$MAX_DOCS)"
 
 echo "uploading segments..."
