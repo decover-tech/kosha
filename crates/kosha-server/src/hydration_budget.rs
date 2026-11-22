@@ -86,9 +86,10 @@ struct BudgetState {
     /// In-flight bytes and permits per tenant; a tenant leaves the map
     /// when its last permit drops.
     tenants: HashMap<String, TenantInFlight>,
-    /// Fetches blocked in [`HydrationBudget::acquire`], per tenant; a
-    /// tenant leaves the map when its last waiter is admitted or gives up.
-    waiting: HashMap<String, usize>,
+    /// Byte requests of the fetches blocked in [`HydrationBudget::acquire`],
+    /// per tenant; a tenant leaves the map when its last waiter is admitted
+    /// or gives up.
+    waiting: HashMap<String, Vec<u64>>,
 }
 
 impl BudgetState {
@@ -102,17 +103,55 @@ impl BudgetState {
         self.waiting.keys().any(|t| t != tenant)
     }
 
-    fn add_waiter(&mut self, tenant: &str) {
-        *self.waiting.entry(tenant.to_string()).or_insert(0) += 1;
+    fn add_waiter(&mut self, tenant: &str, bytes: u64) {
+        self.waiting
+            .entry(tenant.to_string())
+            .or_default()
+            .push(bytes);
     }
 
-    fn remove_waiter(&mut self, tenant: &str) {
-        if let Some(n) = self.waiting.get_mut(tenant) {
-            *n -= 1;
-            if *n == 0 {
+    fn remove_waiter(&mut self, tenant: &str, bytes: u64) {
+        if let Some(requests) = self.waiting.get_mut(tenant) {
+            if let Some(i) = requests.iter().position(|b| *b == bytes) {
+                requests.swap_remove(i);
+            }
+            if requests.is_empty() {
                 self.waiting.remove(tenant);
             }
         }
+    }
+
+    /// Whether `tenant`'s own cap (`cap`) lets it take `bytes` more. See
+    /// [`HydrationBudget::acquire`].
+    fn tenant_ok(&self, tenant: &str, bytes: u64, cap: u64) -> bool {
+        let (tenant_bytes, tenant_holders) = self
+            .tenants
+            .get(tenant)
+            .map_or((0, 0), |t| (t.bytes, t.holders));
+        let others_waiting = self.other_tenant_waiting(tenant);
+        tenant_bytes.saturating_add(bytes) <= cap
+            || tenant_holders == 0
+            || !(others_waiting || self.other_tenant_holding(tenant))
+            || (bytes > cap && !others_waiting)
+    }
+
+    /// Bytes to keep free for other tenants' waiters before `tenant`, which
+    /// already holds budget, may take more: the largest, over the other
+    /// waiting tenants, of each one's smallest request its own cap allows
+    /// (a waiter held back by its own cap needs no room kept for it).
+    fn reserve_for_others(&self, tenant: &str, cap: u64) -> u64 {
+        self.waiting
+            .iter()
+            .filter(|(t, _)| t.as_str() != tenant)
+            .filter_map(|(t, requests)| {
+                requests
+                    .iter()
+                    .copied()
+                    .filter(|b| self.tenant_ok(t, *b, cap))
+                    .min()
+            })
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -171,25 +210,32 @@ impl HydrationBudget {
     /// only ever be admitted with its tenant's in-flight count at zero,
     /// racing that tenant's own smaller fetches — is waived while no other
     /// tenant is waiting.
+    ///
+    /// Freed budget goes to a waiting tenant first: while another tenant
+    /// waits (for a request its own cap allows), a tenant that already
+    /// holds budget is admitted only if the global budget still has room
+    /// for that waiter afterwards. Without this, a tenant refilling its cap
+    /// with many small fetches re-takes every freed byte, and a waiter with
+    /// a larger object (or any waiter, when two heavy tenants together fill
+    /// the budget) times out and is shed.
     pub fn acquire(self: &Arc<Self>, tenant: &str, bytes: u64) -> Option<BudgetPermit> {
         let deadline = Instant::now() + self.wait_timeout;
         let mut st = self.state.lock().unwrap();
         let mut registered = false;
         loop {
             let fits = st.in_flight.saturating_add(bytes) <= self.capacity;
-            let (tenant_bytes, tenant_holders) = st
-                .tenants
-                .get(tenant)
-                .map_or((0, 0), |t| (t.bytes, t.holders));
-            let tenant_fits = tenant_bytes.saturating_add(bytes) <= self.tenant_capacity;
-            let others_waiting = st.other_tenant_waiting(tenant);
-            let tenant_ok = tenant_fits
-                || tenant_holders == 0
-                || !(others_waiting || st.other_tenant_holding(tenant))
-                || (bytes > self.tenant_capacity && !others_waiting);
-            if (fits || st.holders == 0) && tenant_ok {
+            let tenant_holders = st.tenants.get(tenant).map_or(0, |t| t.holders);
+            let tenant_ok = st.tenant_ok(tenant, bytes, self.tenant_capacity);
+            let leaves_room = tenant_holders == 0 || {
+                let reserve = st.reserve_for_others(tenant, self.tenant_capacity);
+                st.in_flight.saturating_add(bytes).saturating_add(reserve) <= self.capacity
+            };
+            if (fits || st.holders == 0) && tenant_ok && leaves_room {
                 if registered {
-                    st.remove_waiter(tenant);
+                    st.remove_waiter(tenant, bytes);
+                    // Leaving `waiting` can lift the cap or the reserve that
+                    // held another tenant's waiter back.
+                    self.cv.notify_all();
                 }
                 st.in_flight = st.in_flight.saturating_add(bytes);
                 st.holders += 1;
@@ -205,7 +251,7 @@ impl HydrationBudget {
             let now = Instant::now();
             if now >= deadline {
                 if registered {
-                    st.remove_waiter(tenant);
+                    st.remove_waiter(tenant, bytes);
                     drop(st);
                     // Our wait may have been what held another tenant's
                     // fetch to its cap.
@@ -214,7 +260,7 @@ impl HydrationBudget {
                 return None;
             }
             if !registered {
-                st.add_waiter(tenant);
+                st.add_waiter(tenant, bytes);
                 registered = true;
             }
             let (guard, _timeout) = self.cv.wait_timeout(st, deadline - now).unwrap();
@@ -534,6 +580,92 @@ mod tests {
             10,
             "only the other tenant's permit is left"
         );
+    }
+
+    /// #342 review: freed budget goes to a waiting tenant before tenants
+    /// that already hold some. Two heavy tenants refill their caps (which
+    /// together are the whole budget) with many small fetches; a third
+    /// tenant waiting for an object larger than capacity minus one cap is
+    /// admitted within a few of their releases instead of timing out.
+    #[test]
+    fn a_waiting_tenant_is_not_starved_by_tenants_refilling_their_caps() {
+        use std::sync::atomic::AtomicBool;
+        let budget = Arc::new(HydrationBudget::with_tenant_cap(
+            100,
+            50,
+            Duration::from_secs(10),
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut heavy = Vec::new();
+        for tenant in ["acme", "globex"] {
+            for _ in 0..8 {
+                let budget = Arc::clone(&budget);
+                let stop = Arc::clone(&stop);
+                heavy.push(std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some(p) = budget.acquire(tenant, 10) {
+                            std::thread::sleep(Duration::from_millis(2));
+                            drop(p);
+                        }
+                    }
+                }));
+            }
+        }
+        // Let both heavy tenants fill the budget.
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        let permit = budget.acquire("beta", 60);
+        let waited = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        assert!(permit.is_some(), "beta timed out behind refilling tenants");
+        assert!(
+            waited < Duration::from_secs(2),
+            "beta waited {waited:?} for 60 bytes"
+        );
+        drop(permit);
+        for h in heavy {
+            h.join().unwrap();
+        }
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    /// A tenant that holds budget does not take freed bytes another
+    /// tenant's admissible waiter needs; both are admitted once room frees.
+    #[test]
+    fn freed_budget_is_kept_for_another_tenants_waiter() {
+        let budget = Arc::new(HydrationBudget::with_tenant_cap(
+            100,
+            50,
+            Duration::from_secs(5),
+        ));
+        let a1 = budget.acquire("acme", 40).unwrap();
+        let a2 = budget.acquire("acme", 10).unwrap();
+        let g = budget.acquire("globex", 50).unwrap();
+        let admitted = Arc::new(Mutex::new(Vec::new()));
+        let spawn = |tenant: &'static str, bytes: u64| {
+            let budget = Arc::clone(&budget);
+            let admitted = Arc::clone(&admitted);
+            std::thread::spawn(move || {
+                let p = budget.acquire(tenant, bytes).expect("admitted");
+                admitted.lock().unwrap().push(tenant);
+                drop(p);
+            })
+        };
+        let beta = spawn("beta", 30);
+        std::thread::sleep(Duration::from_millis(30));
+        drop(a2);
+        let acme = spawn("acme", 10);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            admitted.lock().unwrap().is_empty(),
+            "90 in flight: acme must not take the freed 10 while beta waits for 30"
+        );
+        drop(a1);
+        beta.join().unwrap();
+        acme.join().unwrap();
+        assert_eq!(admitted.lock().unwrap().len(), 2);
+        drop(g);
+        assert_eq!(budget.in_flight(), 0);
     }
 
     #[test]

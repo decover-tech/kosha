@@ -29,6 +29,18 @@ use kosha_core::tenancy::{
 };
 use kosha_core::KoshaError;
 
+/// The tenant of a directory key: a segment directory
+/// (`{namespace}/{segment}`) or a per-file span-cache directory
+/// (`{namespace}/{segment}/{file}.spans`), which is named like the file it
+/// caches spans of and belongs to that file's namespace.
+fn tenant_of_dir_key(key: &str) -> &str {
+    if key.trim_end_matches('/').ends_with(".spans") {
+        tenant_of_file_key(key)
+    } else {
+        tenant_of_segment_dir(key)
+    }
+}
+
 /// Handle to a cached file. The file is present on local disk.
 #[derive(Debug, Clone)]
 pub struct CachedFile {
@@ -557,7 +569,7 @@ impl Cache {
         } else if path.is_dir() {
             removed = dir_size(&path);
             std::fs::remove_dir_all(&path)?;
-            tenant = Some(tenant_of_segment_dir(key));
+            tenant = Some(tenant_of_dir_key(key));
         }
         // Only bytes the cache counted leave the totals: a directory can
         // hold files written by something that never reported them (an
@@ -631,7 +643,7 @@ impl Cache {
                 freed += tracked.forget(&rel);
             }
         }
-        tracked.tenants.evicted(tenant_of_segment_dir(&key));
+        tracked.tenants.evicted(tenant_of_dir_key(&key));
         drop(tracked);
         drop(pinned);
         drop(recency);
@@ -1047,6 +1059,62 @@ mod tests {
         // already-gone directory is a no-op.
         assert!(cache.get("ns/seg-a2/doc_store.bin").is_some());
         assert_eq!(cache.evict_dir_unless_pinned("ns/seg-a").unwrap(), Some(0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #342 review: evicting a span-cache directory
+    /// (`{ns}/{seg}/{file}.spans`) counts against the file's tenant, not a
+    /// pseudo-tenant named after a bare namespace.
+    #[test]
+    fn span_dir_evictions_count_against_the_files_tenant() {
+        assert_eq!(tenant_of_dir_key("docs/seg/doc_store.bin.spans"), "_legacy");
+        assert_eq!(tenant_of_dir_key("docs/_shard-0001/seg/x.spans"), "_legacy");
+        assert_eq!(
+            tenant_of_dir_key("acme/docs/seg/doc_store.bin.spans"),
+            "acme"
+        );
+        assert_eq!(tenant_of_dir_key("acme/docs/seg"), "acme");
+        assert_eq!(tenant_of_dir_key("docs/seg"), "_legacy");
+
+        let dir =
+            std::env::temp_dir().join(format!("kosha-test-cache-span-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone());
+        cache
+            .put_bytes("docs/seg-1/doc_store.bin.spans/0-10", &[0u8; 10])
+            .unwrap();
+        cache
+            .put_bytes("acme/docs/seg-1/postings-00.bin.spans/0-4", &[0u8; 4])
+            .unwrap();
+        cache
+            .put_bytes("acme/docs/seg-2/doc_store.bin.spans/0-4", &[0u8; 4])
+            .unwrap();
+        assert_eq!(
+            cache
+                .evict_dir_unless_pinned("docs/seg-1/doc_store.bin.spans")
+                .unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            cache
+                .evict_dir_unless_pinned("acme/docs/seg-1/postings-00.bin.spans")
+                .unwrap(),
+            Some(4)
+        );
+        cache.evict("acme/docs/seg-2/doc_store.bin.spans").unwrap();
+        let stats = cache.tenant_stats();
+        let evictions = |t: &str| {
+            stats
+                .iter()
+                .find(|s| s.tenant == t)
+                .map_or(0, |s| s.evictions)
+        };
+        assert_eq!(evictions("_legacy"), 1);
+        assert_eq!(evictions("acme"), 2);
+        assert!(
+            stats.iter().all(|s| s.tenant != "docs"),
+            "no pseudo-tenant: {stats:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
