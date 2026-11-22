@@ -59,16 +59,22 @@ pub(crate) struct MetricsConfig {
     /// `KOSHA_METRICS_NAMESPACE_LABELS=on`: label
     /// `kosha_search_requests_total` by namespace as well as outcome.
     pub namespace_labels: bool,
+    /// `KOSHA_METRICS_TENANT_LABELS=on`: label
+    /// `kosha_tenant_rejections_total` by tenant as well as reason (#341).
+    pub tenant_labels: bool,
 }
 
 impl MetricsConfig {
     pub(crate) fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok();
-        Self::parse(
-            var("KOSHA_METRICS").as_deref(),
-            var("KOSHA_METRICS_AUTH").as_deref(),
-            var("KOSHA_METRICS_NAMESPACE_LABELS").as_deref(),
-        )
+        Self {
+            tenant_labels: flag_on(var("KOSHA_METRICS_TENANT_LABELS").as_deref()),
+            ..Self::parse(
+                var("KOSHA_METRICS").as_deref(),
+                var("KOSHA_METRICS_AUTH").as_deref(),
+                var("KOSHA_METRICS_NAMESPACE_LABELS").as_deref(),
+            )
+        }
     }
 
     fn parse(enabled: Option<&str>, auth: Option<&str>, namespace_labels: Option<&str>) -> Self {
@@ -95,9 +101,17 @@ impl MetricsConfig {
         };
         Self {
             exposure,
-            namespace_labels: is(namespace_labels, &["on", "true", "1"]),
+            namespace_labels: flag_on(namespace_labels),
+            tenant_labels: false,
         }
     }
+}
+
+/// `on`, `true` or `1`, in any case.
+fn flag_on(value: Option<&str>) -> bool {
+    value
+        .map(|v| v.trim().to_ascii_lowercase())
+        .is_some_and(|v| ["on", "true", "1"].contains(&v.as_str()))
 }
 
 impl Default for MetricsConfig {
@@ -105,6 +119,7 @@ impl Default for MetricsConfig {
         Self {
             exposure: Exposure::Open,
             namespace_labels: false,
+            tenant_labels: false,
         }
     }
 }
@@ -356,6 +371,8 @@ pub(crate) struct Metrics {
     hydrations: [Counter; 3],
     lease_outcomes: [Counter; 3],
     knn_degraded_segments: Counter,
+    tenant_rejections: Family<Labels, Counter>,
+    tenant_rejection_reasons: [Counter; 7],
 }
 
 impl Default for Metrics {
@@ -460,6 +477,24 @@ impl Metrics {
             "Segments a kNN search could not search by vector and skipped",
         );
 
+        let tenant_rejections = Family::<Labels, Counter>::default();
+        registry.register(
+            "kosha_tenant_rejections",
+            "Requests refused with 429 by a per-tenant limit or quota, by reason",
+            tenant_rejections.clone(),
+        );
+        // Like the search outcomes: resolved once unless tenant labels are
+        // on, in which case each rejection resolves its `{reason, tenant}`.
+        let tenant_rejection_reasons = crate::tenant_limits::RejectReason::ALL.map(|r| {
+            if config.tenant_labels {
+                Counter::default()
+            } else {
+                tenant_rejections
+                    .get_or_create(&labels(&[("reason", r.as_str())]))
+                    .clone()
+            }
+        });
+
         let scrape = Arc::new(ScrapeCollector::default());
         registry.register_collector(Box::new(Arc::clone(&scrape)));
 
@@ -481,6 +516,24 @@ impl Metrics {
             hydrations,
             lease_outcomes,
             knn_degraded_segments,
+            tenant_rejections,
+            tenant_rejection_reasons,
+        }
+    }
+
+    /// One request refused by a per-tenant limit (#341). `tenant` labels
+    /// the series only with `KOSHA_METRICS_TENANT_LABELS=on`.
+    pub(crate) fn record_tenant_rejection(
+        &self,
+        reason: crate::tenant_limits::RejectReason,
+        tenant: &str,
+    ) {
+        if self.config.tenant_labels {
+            self.tenant_rejections
+                .get_or_create(&labels(&[("reason", reason.as_str()), ("tenant", tenant)]))
+                .inc();
+        } else {
+            self.tenant_rejection_reasons[reason as usize].inc();
         }
     }
 
@@ -722,6 +775,7 @@ pub(crate) mod tests {
             "kosha_hydration_lease_outcome_total",
             "kosha_knn_degraded_segments_total",
             "kosha_segment_checksum_failures_total",
+            "kosha_tenant_rejections_total",
         ] {
             assert!(names.contains(name), "{name} missing from {names:?}");
         }
@@ -850,6 +904,51 @@ pub(crate) mod tests {
             .iter()
             .filter(|s| !s.name.starts_with("kosha_search_requests"))
             .all(|s| !s.labels.contains_key("namespace")));
+    }
+
+    #[test]
+    fn tenant_rejections_by_reason_and_gated_tenant_label() {
+        use crate::tenant_limits::RejectReason;
+        let metrics = Metrics::default();
+        metrics.record_tenant_rejection(RejectReason::TenantQps, "acme");
+        let samples = rendered(&metrics);
+        // Every reason is exported from the start; no tenant label.
+        for reason in RejectReason::ALL {
+            assert!(value(
+                &samples,
+                "kosha_tenant_rejections_total",
+                &[("reason", reason.as_str())]
+            )
+            .is_some());
+        }
+        assert_eq!(
+            value(
+                &samples,
+                "kosha_tenant_rejections_total",
+                &[("reason", "tenant_qps_exceeded")]
+            ),
+            Some(1.0)
+        );
+        assert!(samples.iter().all(|s| !s.labels.contains_key("tenant")));
+
+        let labelled = Metrics::new(MetricsConfig {
+            tenant_labels: true,
+            ..MetricsConfig::default()
+        });
+        labelled.record_tenant_rejection(RejectReason::DocQuota, "acme");
+        let samples = rendered(&labelled);
+        assert_eq!(
+            value(
+                &samples,
+                "kosha_tenant_rejections_total",
+                &[("reason", "doc_quota_exceeded"), ("tenant", "acme")]
+            ),
+            Some(1.0)
+        );
+        assert!(samples
+            .iter()
+            .filter(|s| s.name.starts_with("kosha_tenant_rejections"))
+            .all(|s| s.labels.contains_key("tenant")));
     }
 
     #[test]
