@@ -102,7 +102,7 @@ fn is_migration_race(e: &sqlx::Error) -> bool {
         .is_some_and(|code| MIGRATION_RACE_SQLSTATES.contains(&code.as_ref()))
 }
 
-/// Apply the embedded migrations (001, 003, then 006) in one transaction on one
+/// Apply the embedded migrations (001, 003, 005, then 006) in one transaction on one
 /// connection, holding a transaction-scoped advisory lock for its duration.
 ///
 /// Concurrent constructors against a fresh database (several pods booting
@@ -111,7 +111,7 @@ fn is_migration_race(e: &sqlx::Error) -> bool {
 /// key on `pg_namespace` (#330). With the lock they queue up: the first
 /// creates everything and commits (which releases the lock), the rest find
 /// it all present and their statements are no-ops. Every statement in
-/// 001/003/006 is valid inside a transaction (no `CREATE INDEX CONCURRENTLY`,
+/// 001/003/005/006 is valid inside a transaction (no `CREATE INDEX CONCURRENTLY`,
 /// no `VACUUM`), and running them in one transaction also means a failure
 /// leaves no half-applied schema behind.
 ///
@@ -128,7 +128,8 @@ async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
 
 /// One locked migration attempt. The error carries the message prefix the
 /// caller reports: "migration failed" for 001 and the lock/transaction
-/// plumbing, "migration 003 failed" for 003, "migration 006 failed" for 006.
+/// plumbing, "migration 003 failed" for 003, "migration 005 failed" for 005,
+/// "migration 006 failed" for 006.
 async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static str)> {
     const FAILED: &str = "migration failed";
     let mut tx = pool.begin().await.map_err(|e| (e, FAILED))?;
@@ -148,6 +149,12 @@ async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static 
         .execute(&mut *tx)
         .await
         .map_err(|e| (e, "migration 003 failed"))?;
+    // Usage events (#348): additive, idempotent, same pattern as 001.
+    let migration = include_str!("../migrations/005_usage_events.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 005 failed"))?;
     // Organizations, users, projects, audit log (#345): additive, idempotent.
     let migration = include_str!("../migrations/006_orgs_users_projects.sql");
     sqlx::raw_sql(migration)

@@ -15,6 +15,8 @@ ALTER TABLE kosha.retired_namespaces OWNER TO kosha;
 -- 003_writer_leases.sql (#254). IF EXISTS: 002 may run before 003 on an
 -- instance that has not been migrated past 001 yet.
 ALTER TABLE IF EXISTS kosha.writer_leases OWNER TO kosha;
+-- 005_usage_events.sql (#348). IF EXISTS for the same reason.
+ALTER TABLE IF EXISTS kosha.usage_events OWNER TO kosha;
 -- 006_orgs_users_projects.sql (#345). IF EXISTS for the same reason. Moving
 -- audit_log also moves the sequence its BIGSERIAL id owns.
 ALTER TABLE IF EXISTS kosha.users OWNER TO kosha;

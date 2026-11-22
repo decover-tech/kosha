@@ -30,6 +30,8 @@ mod hydration_lease;
 #[cfg(feature = "postgres")]
 pub use hydration_lease::{HydrationLease, HydrationLeaseStore};
 
+pub mod usage;
+
 #[cfg(feature = "postgres")]
 mod writer_lease;
 
