@@ -7829,15 +7829,18 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 &HydrationOutcome::default(),
             );
             if state.dashboard.enabled() {
-                let timings = dashboard::SearchTimings {
-                    total_ms: t_request.elapsed().as_secs_f64() * 1e3,
-                    cached: true,
-                    fully_cached: true,
-                    ..Default::default()
-                };
                 let body = response_body_json(&resp);
                 let hits = body["results"].as_array().map_or(0, Vec::len);
                 let degraded = body["knn_degraded_segments"].as_u64().unwrap_or(0) > 0;
+                // A kNN-degraded answer is never inserted (see `cacheable`
+                // below), but a hit must not claim a degraded body warm
+                // either way.
+                let timings = dashboard::SearchTimings {
+                    total_ms: t_request.elapsed().as_secs_f64() * 1e3,
+                    cached: true,
+                    fully_cached: !degraded,
+                    ..Default::default()
+                };
                 state
                     .dashboard
                     .record(&ns.0, dashboard::QuerySample::new(&timings, hits, degraded));
@@ -8063,9 +8066,13 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
             // hydration), and caching it would pin the degraded scores for
             // the rest of this manifest version. Nor is a degraded rerank
             // (a transient fallback that would serve the unreranked order
-            // until the namespace next changes).
+            // until the namespace next changes), nor a kNN answer that
+            // skipped a segment (usually a `vector.idx` not yet local):
+            // pinned, it would serve the partial answer, and read as fully
+            // cached to a warmup gate, until the namespace next changes.
             let cacheable = phases.bm25_stats != kosha_query::Bm25StatsUsed::SegmentFallback
-                && result.rerank_degraded != Some(true);
+                && result.rerank_degraded != Some(true)
+                && knn_degraded == 0;
             if let Some(key) = cache_key.filter(|_| cacheable) {
                 state.result_cache.lock().unwrap().insert(key, &resp);
             }
