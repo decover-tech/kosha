@@ -131,6 +131,38 @@ on:
           use gets thin fast as segment count grows; bump this to test
           whether recall recovers with a larger budget)
         default: "100"
+      bm25_snapshot:
+        description: >-
+          snapshot the BM25 suite restores into namespace msmarco-<bm25_docs>.
+          Empty (default) = the namespace name, exactly as before. A name
+          that does not exist yet is built offline once (build_and_import.sh,
+          first 1M docs when bm25_docs=1m) with server_env applied to the
+          builder, then restored; existing snapshots are never overwritten.
+          Restore mode only. Must match [a-z0-9.-]+.
+        default: ""
+      server_env:
+        description: >-
+          extra kosha server environment for experiments, space-separated
+          KEY=VALUE pairs (each must match ^[A-Z0-9_]+=[A-Za-z0-9._:/,-]*$;
+          anything else fails the run before provisioning). Appended as -e
+          flags after the standard bench env, so a repeated key overrides
+          it. Also passed to the offline segment builder when a new
+          bm25_snapshot / vector_snapshot is built. Empty = none.
+        default: ""
+      rustflags:
+        description: >-
+          RUSTFLAGS for the server image build (Docker build arg
+          KOSHA_RUSTFLAGS), e.g. -C target-cpu=x86-64-v3. Empty (default) =
+          no build arg, the image builds exactly as before. Allowed
+          characters: letters, digits, space and = + , . _ : -
+        default: ""
+      knn_budget_fraction:
+        description: >-
+          sets KOSHA_KNN_BUDGET_FRACTION on the server (kNN global probe
+          budget floor as a fraction of the namespace centroids; server
+          default 0.05). Empty (default) = unset. Must be a number with
+          0 < x <= 1; do not also set the key in server_env.
+        default: ""
 
 concurrency:
   group: bench-vm            # one bench stack; never two runs at once
@@ -145,12 +177,66 @@ env:
   VEC_SNAPSHOT: ${{ inputs.vector_snapshot || 'msmarco-10m-vec' }}
   WARM_GATE: ${{ inputs.warm_gate || 'queries' }}
   RETURN_FIELDS: ${{ inputs.return_fields || 'ids' }}
+  BM25_SNAPSHOT: ${{ inputs.bm25_snapshot || format('msmarco-{0}', inputs.bm25_docs || '10m') }}
+  # Raw experiment inputs: read only as shell variables (never spliced into
+  # a script with an expression) until "Validate experiment inputs" has
+  # checked them; later steps use its normalized SERVER_ENV_ARGS and
+  # KOSHA_RUSTFLAGS.
+  IN_SERVER_ENV: ${{ inputs.server_env }}
+  IN_RUSTFLAGS: ${{ inputs.rustflags }}
+  IN_KNN_BUDGET_FRACTION: ${{ inputs.knn_budget_fraction }}
 
 jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      # Runs before anything is provisioned, so a bad input costs nothing.
+      # Inputs are read only from the environment here (no expression
+      # splicing). Later steps splice the normalized values into remote
+      # scripts, which is safe only because this step restricted them to
+      # characters without quotes, $, backticks, ; | & or redirections.
+      - name: Validate experiment inputs
+        run: |
+          set -euo pipefail
+          export LC_ALL=C   # ASCII ranges in the patterns below, whatever the locale
+          fail() { echo "::error::$*"; exit 1; }
+          case "$BM25_SNAPSHOT" in
+            *[!a-z0-9.-]*|'') fail "bm25_snapshot must match ^[a-z0-9.-]+$, got: $BM25_SNAPSHOT" ;;
+          esac
+          case "$VEC_SNAPSHOT" in
+            *[!a-z0-9.-]*|'') fail "vector_snapshot must match ^[a-z0-9.-]+$, got: $VEC_SNAPSHOT" ;;
+          esac
+          if [ "$BM25_SNAPSHOT" != "$BM25_NS" ] && [ "${{ inputs.mode }}" = load ]; then
+            fail "bm25_snapshot override is restore mode only (load mode snapshots under $BM25_NS as before)"
+          fi
+          RUSTFLAGS_RE='^[A-Za-z0-9 =+,._:-]+$'
+          if [ -n "$IN_RUSTFLAGS" ] && ! [[ "$IN_RUSTFLAGS" =~ $RUSTFLAGS_RE ]]; then
+            fail "rustflags may only contain letters, digits, space and = + , . _ : -"
+          fi
+          NUM_RE='^([0-9]*\.)?[0-9]+$'
+          PAIR_RE='^[A-Z0-9_]+=[A-Za-z0-9._:/,-]*$'
+          ARGS=""
+          if [ -n "$IN_KNN_BUDGET_FRACTION" ]; then
+            [[ "$IN_KNN_BUDGET_FRACTION" =~ $NUM_RE ]] \
+              && awk -v x="$IN_KNN_BUDGET_FRACTION" 'BEGIN { exit !(x > 0 && x <= 1) }' \
+              || fail "knn_budget_fraction must be a number with 0 < x <= 1, got: $IN_KNN_BUDGET_FRACTION"
+            ARGS="-e KOSHA_KNN_BUDGET_FRACTION=$IN_KNN_BUDGET_FRACTION"
+          fi
+          set -f   # no glob expansion while splitting the pairs
+          for pair in $IN_SERVER_ENV; do
+            [[ "$pair" =~ $PAIR_RE ]] \
+              || fail "server_env pair rejected (each must match $PAIR_RE): $pair"
+            if [ -n "$IN_KNN_BUDGET_FRACTION" ] && [ "${pair%%=*}" = KOSHA_KNN_BUDGET_FRACTION ]; then
+              fail "KOSHA_KNN_BUDGET_FRACTION is set by both knn_budget_fraction and server_env"
+            fi
+            ARGS="${ARGS:+$ARGS }-e $pair"
+          done
+          set +f
+          echo "SERVER_ENV_ARGS=$ARGS" >> "$GITHUB_ENV"
+          echo "KOSHA_RUSTFLAGS=$IN_RUSTFLAGS" >> "$GITHUB_ENV"
+          echo "experiment inputs: bm25_snapshot=$BM25_SNAPSHOT vector_snapshot=$VEC_SNAPSHOT server env args=[${ARGS:-none}] rustflags=[${IN_RUSTFLAGS:-none}]"
+
       - uses: actions/checkout@v4
 
       - uses: actions/checkout@v4
@@ -209,7 +295,16 @@ jobs:
           IP='${{ steps.tf.outputs.ip }}'
           SSH="ssh -i $RUNNER_TEMP/bench.pem ec2-user@$IP"
           $SSH 'set -e
-            cd ~/kosha && sudo docker build -q -t kosha-server:bench .
+            cd ~/kosha
+            # rustflags input (validated: no quotes or shell metacharacters).
+            # Empty = the plain build, the same command as before.
+            KRF="${{ env.KOSHA_RUSTFLAGS }}"
+            if [ -n "$KRF" ]; then
+              echo "building server image with KOSHA_RUSTFLAGS=$KRF"
+              sudo docker build -q --build-arg KOSHA_RUSTFLAGS="$KRF" -t kosha-server:bench .
+            else
+              sudo docker build -q -t kosha-server:bench .
+            fi
             sudo mkdir -p /data/kosha /data/pg && sudo chown ec2-user:ec2-user /data && sudo chown -R 10001:10001 /data/kosha
             # NOTE: this block is one single-quoted remote script, so it must
             # not contain an apostrophe. One in a comment here once ended the
@@ -241,6 +336,11 @@ jobs:
               WARMUP_ARGS="-e KOSHA_WARMUP_NAMESPACES=default/msmarco-10m,default/msmarco-1m,default/msmarco-10m-vec"
             fi
             echo "warm gate: ${{ env.WARM_GATE }} (container args: ${WARMUP_ARGS:-none})"
+            # server_env + knn_budget_fraction inputs, normalized to -e flags by
+            # the validate step. Appended last so a repeated key overrides the
+            # standard bench env above. Empty by default.
+            EXPERIMENT_ARGS="${{ env.SERVER_ENV_ARGS }}"
+            echo "experiment server env: ${EXPERIMENT_ARGS:-none}"
             sudo docker run -d --name pg --network host -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=kosha \
               -v /data/pg:/var/lib/postgresql/data postgres:16
             # Bounded waits throughout: an unbounded `until` loop turns a
@@ -261,7 +361,7 @@ jobs:
               -e KOSHA_SEGMENT_LIVE_MAX_BYTES=68719476736 -e KOSHA_SCORING_HYDRATE_CONCURRENCY=64 \
               -e KOSHA_ADMIN_API_KEY=sk-bench-admin \
               -e KOSHA_DASHBOARD=on \
-              $WARMUP_ARGS \
+              $WARMUP_ARGS $EXPERIMENT_ARGS \
               -v /data/kosha:/var/cache/kosha kosha-server:bench
             sudo docker start kosha
             # /healthz: unauthenticated liveness. Global /stats is admin-only
@@ -280,10 +380,22 @@ jobs:
           if [ '${{ inputs.mode }}' = 'restore' ]; then
             # msmarco-1m has no snapshot until its first run: build it
             # offline from the first 1M docs (minutes), which snapshots it.
-            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
-              if [ $BM25_NS = msmarco-1m ] && ! aws s3 ls s3://decoverai-bench-corpus-cache/snapshots/msmarco-1m/pg-kosha.sql.gz >/dev/null 2>&1; then \
-                MAX_DOCS=1000000 ./build_and_import.sh msmarco-1m; \
-              else ./restore_namespace.sh $BM25_NS; fi"
+            if [ "$BM25_SNAPSHOT" = "$BM25_NS" ]; then
+              $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+                if [ $BM25_NS = msmarco-1m ] && ! aws s3 ls s3://decoverai-bench-corpus-cache/snapshots/msmarco-1m/pg-kosha.sql.gz >/dev/null 2>&1; then \
+                  MAX_DOCS=1000000 ./build_and_import.sh msmarco-1m; \
+                else ./restore_namespace.sh $BM25_NS; fi"
+            else
+              # bm25_snapshot override: restore it, building it offline first
+              # (once, with server_env applied to the builder) if it does not
+              # exist. build_and_import.sh never overwrites a snapshot.
+              MAX_DOCS=0; [ "$BM25_NS" = msmarco-1m ] && MAX_DOCS=1000000
+              $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
+                if ! aws s3 ls s3://decoverai-bench-corpus-cache/snapshots/$BM25_SNAPSHOT/pg-kosha.sql.gz >/dev/null 2>&1; then \
+                  echo snapshot $BM25_SNAPSHOT missing, building it offline; \
+                  MAX_DOCS=$MAX_DOCS SNAPSHOT_NAME=$BM25_SNAPSHOT BUILD_DOCKER_ENV='$SERVER_ENV_ARGS' ./build_and_import.sh $BM25_NS; \
+                fi && ./restore_namespace.sh $BM25_NS $BM25_SNAPSHOT"
+            fi
           else
             $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
               ~/venv311/bin/python3 ../load_corpus.py --host http://127.0.0.1:8080 \
@@ -314,7 +426,7 @@ jobs:
               $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && \
                 if aws s3 ls s3://decoverai-bench-corpus-cache/snapshots/$VEC_SNAPSHOT/pg-kosha.sql.gz >/dev/null 2>&1; then \
                   echo snapshot $VEC_SNAPSHOT exists, not rebuilding; \
-                else SNAPSHOT_NAME=$VEC_SNAPSHOT ./build_and_import.sh $VEC_NS --with-embeddings; fi"
+                else SNAPSHOT_NAME=$VEC_SNAPSHOT BUILD_DOCKER_ENV='$SERVER_ENV_ARGS' ./build_and_import.sh $VEC_NS --with-embeddings; fi"
             fi
             $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $VEC_NS $VEC_SNAPSHOT"
           else
@@ -364,6 +476,7 @@ jobs:
           {\"run_id\": \"${{ github.run_id }}\", \"sha\": \"${{ github.sha }}\", \"ref\": \"${{ github.ref_name }}\",
            \"suite\": \"${{ inputs.suite }}\", \"mode\": \"${{ inputs.mode }}\", \"qps\": \"${{ inputs.qps }}\",
            \"duration\": \"${{ inputs.duration }}\", \"warm_gate\": \"$WARM_GATE\", \"vector_snapshot\": \"$VEC_SNAPSHOT\",
+           \"bm25_snapshot\": \"$BM25_SNAPSHOT\", \"server_env_args\": \"$SERVER_ENV_ARGS\", \"rustflags\": \"$KOSHA_RUSTFLAGS\",
            \"archived_at\": \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
           META
             aws s3 sync --only-show-errors /data/results-ci $DEST/"
@@ -377,6 +490,9 @@ jobs:
           scp -i "$RUNNER_TEMP/bench.pem" -r "ec2-user@$IP:/data/results-ci/*" results/ 2>/dev/null || true
           {
             echo "## Benchmark results (${{ inputs.suite }}, ${{ inputs.mode }}, ${{ inputs.qps }} QPS, ${{ inputs.duration }}s phases, BM25 corpus $BM25_NS, vector snapshot $VEC_SNAPSHOT, warm gate $WARM_GATE)"
+            if [ "$BM25_SNAPSHOT" != "$BM25_NS" ] || [ -n "$SERVER_ENV_ARGS" ] || [ -n "$KOSHA_RUSTFLAGS" ]; then
+              echo "- experiment: bm25_snapshot $BM25_SNAPSHOT, server env [${SERVER_ENV_ARGS:-none}], rustflags [${KOSHA_RUSTFLAGS:-none}]"
+            fi
             for f in results/*/warm_gate.log; do
               if [ -f "$f" ]; then echo "- warm gate $(basename "$(dirname "$f")"): $(grep -E 'WARM-GATE-(READY|TIMEOUT|UNSUPPORTED)' "$f" | tail -1)"; fi
             done
