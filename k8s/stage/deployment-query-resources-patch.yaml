@@ -154,6 +154,12 @@ spec:
               cpu: "4"
               ephemeral-storage: "40Gi"
               memory: "32Gi"
+      # The image runs as uid 10001 and a new EBS volume's root belongs to
+      # root, so the volume is handed to that group (an emptyDir is
+      # world-writable, which hid this).
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
       # The disk cache gets its own gp3 volume, created with the pod and
       # deleted with it, instead of an emptyDir on the node's 50 GB root
       # disk: warming two matters filled that disk (DiskPressure, the pod
