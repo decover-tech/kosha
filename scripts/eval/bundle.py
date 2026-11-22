@@ -31,15 +31,32 @@ def pods():
     return [p for p in kubectl("get", "pods", "-o", "name").split() if "loader" not in p]
 
 
+def last_time(path):
+    """Timestamp of the last line already saved for a pod, or None."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 8192))
+            lines = f.read().splitlines()
+        return lines[-1].split(b" ", 1)[0].decode() if lines else None
+    except OSError:
+        return None
+
+
 def follow(out):
     os.makedirs(f"{out}/logs", exist_ok=True)
     tails = {}
     while not os.path.exists(f"{out}/STOP"):
         for pod in pods():
-            if pod not in tails:
-                log = open(f"{out}/logs/{pod.split('/')[-1]}.log", "a")
-                tails[pod] = subprocess.Popen(["kubectl", "-n", NS, "logs", "-f", "--timestamps", "--since=1s", pod],
-                                              stdout=log, stderr=subprocess.DEVNULL)
+            # A stream ends when the connection drops (tunnel, laptop sleep):
+            # restart it from the last saved line so the gap is filled.
+            if pod not in tails or tails[pod].poll() is not None:
+                path = f"{out}/logs/{pod.split('/')[-1]}.log"
+                since = last_time(path)
+                tails[pod] = subprocess.Popen(
+                    ["kubectl", "-n", NS, "logs", "-f", "--timestamps",
+                     f"--since-time={since}" if since else "--since=1s", pod],
+                    stdout=open(path, "a"), stderr=subprocess.DEVNULL)
         time.sleep(15)
     for tail in tails.values():
         tail.terminate()
