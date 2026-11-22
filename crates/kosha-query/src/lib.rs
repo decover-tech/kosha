@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 pub mod rerank;
+/// Offline head/tail analysis (research #387); not on the query path.
+pub mod two_tier;
 
 use kosha_core::fields::{field_norms_key, field_term_key, segment_field_chain};
 use kosha_core::fuzzy::{ExpandStats, FuzzyQuery, MAX_FUZZY_EDITS};

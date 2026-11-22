@@ -8534,6 +8534,17 @@ impl SegmentReader {
         }
     }
 
+    /// On-disk span length of `term`'s postings, from the TOC this reader
+    /// already holds: split (v3+) segments only, `None` otherwise or when
+    /// the term is absent. Read-only metadata for offline analysis tools
+    /// (research #387); the query path does not use it.
+    pub fn posting_span_len(&self, term: &str) -> Option<u64> {
+        match &self.inverted {
+            InvertedAccess::Split(split) => split.find(term).map(|i| split.raw_entry(i).4 as u64),
+            _ => None,
+        }
+    }
+
     pub fn scoring_postings_for_terms<'a>(
         &'a self,
         terms: &'a [String],

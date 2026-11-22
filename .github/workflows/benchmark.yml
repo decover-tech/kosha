@@ -138,6 +138,18 @@ on:
       recall_sample:
         description: number of queries to check recall for (statistical sample, not the full query set)
         default: "100"
+      two_tier_eval:
+        description: >-
+          research #387, measurement only: after the BM25 namespace is
+          restored, run the offline two-tier (head/tail) analysis
+          (scripts/bench/bm25_scale/vm/two_tier_eval.sh) over its live
+          segments and the query file. With suite none or vector it
+          restores the BM25 namespace itself. Never changes the server.
+        type: boolean
+        default: false
+      two_tier_fractions:
+        description: head fractions for two_tier_eval (comma-separated, each in (0, 1])
+        default: "0.1,0.2,0.3"
       recall_num_candidates:
         description: >-
           whole-query kNN probe budget for the recall check (knn.num_candidates
@@ -440,6 +452,23 @@ jobs:
           $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && WARM_GATE=$WARM_GATE RETURN_FIELDS=$RETURN_FIELDS \
             ./run_phases.sh bm25 $BM25_NS /data/results-ci/bm25 '${{ inputs.qps }}' '${{ inputs.duration }}'"
 
+      - name: Two-tier analysis (research 387, offline, measurement only)
+        if: inputs.two_tier_eval == true
+        run: |
+          IP='${{ steps.tf.outputs.ip }}'
+          SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
+          FRACTIONS='${{ inputs.two_tier_fractions }}'
+          case "$FRACTIONS" in
+            *[!0-9.,]*|'') echo "::error::two_tier_fractions must match [0-9.,]+, got: $FRACTIONS"; exit 1 ;;
+          esac
+          # The BM25 suite (if it ran) already restored the namespace;
+          # otherwise restore it here so pg and the bench bucket hold it.
+          if [ '${{ inputs.suite }}' != 'both' ] && [ '${{ inputs.suite }}' != 'bm25' ]; then
+            $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && ./restore_namespace.sh $BM25_NS"
+          fi
+          $SSH "cd ~/kosha/scripts/bench/bm25_scale/vm && TWO_TIER_FRACTIONS=$FRACTIONS \
+            ./two_tier_eval.sh $BM25_NS /data/results-ci/two_tier"
+
       - name: Vector suite
         if: contains(fromJSON('["both","vector"]'), inputs.suite)
         run: |
@@ -527,7 +556,7 @@ jobs:
         #   s3://decoverai-bench-corpus-cache/runs/<run_id>/
         #     meta.json, <suite>/<phase>.json, <phase>.requests.jsonl.gz,
         #     <suite>/server/{warmup,<phase>}.log.gz, server/full.log.gz
-        if: always() && inputs.suite != 'none' && steps.tf.outputs.ip != ''
+        if: always() && (inputs.suite != 'none' || inputs.two_tier_eval == true) && steps.tf.outputs.ip != ''
         run: |
           IP='${{ steps.tf.outputs.ip }}'
           SSH="ssh -i $RUNNER_TEMP/bench.pem -o ServerAliveInterval=30 ec2-user@$IP"
@@ -540,13 +569,14 @@ jobs:
            \"suite\": \"${{ inputs.suite }}\", \"mode\": \"${{ inputs.mode }}\", \"qps\": \"${{ inputs.qps }}\",
            \"duration\": \"${{ inputs.duration }}\", \"warm_gate\": \"$WARM_GATE\", \"vector_snapshot\": \"$VEC_SNAPSHOT\",
            \"bm25_snapshot\": \"$BM25_SNAPSHOT\", \"server_env_args\": \"$SERVER_ENV_ARGS\", \"rustflags\": \"$KOSHA_RUSTFLAGS\",
+           \"two_tier_eval\": \"${{ inputs.two_tier_eval }}\", \"two_tier_fractions\": \"${{ inputs.two_tier_fractions }}\",
            \"archived_at\": \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
           META
             aws s3 sync --only-show-errors /data/results-ci $DEST/"
           echo "Server logs + results archived to $DEST/" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect results + summary
-        if: always() && inputs.suite != 'none'
+        if: always() && (inputs.suite != 'none' || inputs.two_tier_eval == true)
         run: |
           IP='${{ steps.tf.outputs.ip }}'
           mkdir -p results
@@ -563,7 +593,7 @@ jobs:
             echo "| phase | p50 ms | p90 ms | p99 ms | requests | errors |"
             echo "|---|---|---|---|---|---|"
             # knn_sweep/ (#384) has its own table, appended below.
-            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' ! -path 'results/knn_sweep/*' | sort | while read -r f; do
+            find results -name '*.json' ! -name 'recall.json' ! -name 'meta.json' ! -path 'results/knn_sweep/*' ! -path '*/two_tier/*' | sort | while read -r f; do
               python3 - "$f" << 'EOF'
           import json, sys
           d = json.load(open(sys.argv[1]))
@@ -594,10 +624,20 @@ jobs:
               echo ""
               cat results/knn_sweep/sweep.md
             fi
+            # Research 387 analysis: its own section (report.json has no
+            # latency fields).
+            if [ -f results/two_tier/summary.txt ]; then
+              echo ""
+              echo "## Two-tier analysis (research 387, offline)"
+              echo ""
+              echo '```'
+              grep -E '^(head|footprint|  +touched|opened|analyzed|run checks|server cross-check|TWO-TIER-RUN)' results/two_tier/summary.txt || true
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
-        if: always() && inputs.suite != 'none'
+        if: always() && (inputs.suite != 'none' || inputs.two_tier_eval == true)
         with:
           name: bench-results
           path: results/
