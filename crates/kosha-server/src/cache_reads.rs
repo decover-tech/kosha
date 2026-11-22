@@ -54,10 +54,32 @@ pub(crate) fn cache_options_from_env(max_bytes: Option<u64>) -> CacheOptions {
         ),
         _ => {}
     }
+    let exact_accounting =
+        parse_accounting(std::env::var("KOSHA_CACHE_ACCOUNTING").ok().as_deref());
+    if exact_accounting && policy.is_none() && max_bytes.is_some() {
+        println!("disk cache accounting: exact (legacy eviction, research #389)");
+    }
     CacheOptions {
         max_bytes,
         policy,
         classify: Some(classify),
+        exact_accounting,
+    }
+}
+
+/// `KOSHA_CACHE_ACCOUNTING`: `exact` turns on exact per-key accounting for
+/// the legacy path (see `CacheOptions::exact_accounting`); unset, empty or
+/// `legacy` keeps today's. Anything else logs and keeps today's.
+pub(crate) fn parse_accounting(value: Option<&str>) -> bool {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("legacy") => false,
+        Some("exact") => true,
+        Some(other) => {
+            eprintln!(
+                "WARN: unknown KOSHA_CACHE_ACCOUNTING={other:?} (expected legacy or exact); using legacy"
+            );
+            false
+        }
     }
 }
 
@@ -330,6 +352,64 @@ mod tests {
         assert_eq!(line["pages"][0], "ns/b");
     }
 
+    /// End to end through the server: a tenant-scoped search
+    /// (`{tenant}/{ns}/{segment}/{file}` on disk) must land its read hints
+    /// on the cached files it read. The first #389 prototype grouped keys
+    /// by their first two components, so on this layout every hint was
+    /// dropped and the policies silently ran as FIFO.
+    #[test]
+    fn tenant_scoped_search_hints_reach_cached_entries() {
+        use kosha_core::{Document, DocumentId, Field};
+        let mut state = AppState::new(crate::tests::test_dir());
+        let ns = NamespaceId(crate::tenant_namespace("default", "msmarco"));
+        state
+            .indexer
+            .index_documents(
+                ns.clone(),
+                vec![Document {
+                    id: DocumentId("d1".into()),
+                    fields: vec![Field::text("body", "contract law basics")],
+                }],
+            )
+            .unwrap();
+        state.indexer.flush_namespace(&ns).unwrap();
+        state.publish_namespace(&ns).unwrap();
+        // A bounded cache with a policy, adopting the published files.
+        state.cache = kosha_cache::Cache::with_options(
+            state.data_dir.clone(),
+            CacheOptions {
+                max_bytes: Some(1 << 40),
+                policy: Some(CachePolicy::Sieve),
+                classify: Some(classify),
+                exact_accounting: false,
+            },
+        );
+        let ns_dir = state.data_dir.join("default").join("msmarco");
+        let segs: Vec<std::path::PathBuf> = std::fs::read_dir(&ns_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && p.join("footer.json").is_file())
+            .collect();
+        assert_eq!(segs.len(), 1, "one published segment under {ns_dir:?}");
+        let seg_rel = segs[0]
+            .strip_prefix(&state.data_dir)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let footer = format!("{seg_rel}/footer.json");
+        assert_eq!(state.cache.policy_pending_reads(&footer), Some(0));
+
+        let req = br#"{"query_text":"contract","no_cache":true}"#;
+        let resp = crate::handle_search_post_with_ns("msmarco", "default", req, &state);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            state.cache.policy_pending_reads(&footer).unwrap_or(0) > 0,
+            "the search's scoring-class hint must reach {footer}"
+        );
+        let _ = std::fs::remove_dir_all(&state.data_dir);
+    }
+
     /// Default (no `KOSHA_CACHE_POLICY`): the cache ignores hints, so
     /// eviction stays legacy insertion order.
     #[test]
@@ -338,6 +418,7 @@ mod tests {
             max_bytes: Some(10),
             policy: CachePolicy::parse(None).unwrap(),
             classify: Some(classify),
+            exact_accounting: false,
         };
         let dir = std::env::temp_dir().join(format!(
             "kosha-server-cache-reads-legacy-{}",

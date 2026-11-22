@@ -36,9 +36,10 @@
 //! is older than an entry's insertion only counts as zero when *every*
 //! read since the entry's last sync is that old (see `Entry::take_reads`).
 //!
-//! Keys follow the crate convention `{namespace}/{segment_id}/{file}[/...]`:
-//! the first two components are the group, the third is the segment-level
-//! file. Keys with fewer components group by their parent.
+//! Keys are data-dir-relative paths `{segment dir}/{file}` or
+//! `{segment dir}/{file}.spans/{range}`; the group is the segment directory
+//! (whatever its depth: `{tenant}/{ns}/{segment}` on the server), and must
+//! equal the `dir` the server puts in its hints. See `split_key`.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -184,14 +185,23 @@ impl Entry {
     }
 }
 
+/// `(group, segment-level file)` of a cache key: the group is the segment
+/// directory, i.e. everything before the segment-level file. That file is
+/// the component carrying the span-cache suffix when there is one
+/// (`{seg dir}/{file}.spans/{range}`), otherwise the last component
+/// (`{seg dir}/{file}`). This is independent of how deep the segment
+/// directory is: the server keeps segments under `{tenant}/{ns}/{segment}`
+/// (#262), older layouts under `{ns}/{segment}`. The returned file keeps
+/// its `.spans` suffix; `upsert` strips it.
 fn split_key(key: &str) -> (String, String) {
-    let mut parts = key.splitn(4, '/');
-    let a = parts.next().unwrap_or("");
-    match (parts.next(), parts.next()) {
-        (Some(b), Some(c)) => (format!("{a}/{b}"), c.to_string()),
-        (Some(b), None) => (a.to_string(), b.to_string()),
-        _ => (String::new(), a.to_string()),
-    }
+    let key = key.trim_matches('/');
+    let comps: Vec<&str> = key.split('/').collect();
+    let file_at = comps
+        .iter()
+        .position(|c| c.ends_with(SPANS_SUFFIX) && c.len() > SPANS_SUFFIX.len())
+        .filter(|&i| i + 1 < comps.len())
+        .unwrap_or(comps.len() - 1);
+    (comps[..file_at].join("/"), comps[file_at].to_string())
 }
 
 /// Policy bookkeeping. Owned by `Cache` behind one mutex; never touches the
@@ -308,6 +318,25 @@ impl PolicyState {
             }
         }
         self.entries.insert(key.to_string(), entry);
+    }
+
+    /// Reads `key` has accumulated that eviction has not consumed yet
+    /// (what the next `take_reads` would add), without consuming them.
+    /// `None` when the key is not tracked. Diagnostics and tests only.
+    pub(crate) fn pending_reads(&self, key: &str) -> Option<u64> {
+        let entry = self.entries.get(key)?;
+        let counter = self
+            .groups
+            .get(&entry.group)
+            .map(|g| g.reads_for(entry.class, &entry.file))
+            .unwrap_or_default();
+        let fresh = counter.count.saturating_sub(entry.seen);
+        let counted = if fresh > 0 && counter.last > entry.inserted_at {
+            fresh
+        } else {
+            0
+        };
+        Some(entry.own + counted)
     }
 
     /// A direct read of one key (`Cache::get`).
@@ -530,5 +559,42 @@ impl PolicyState {
     #[cfg(test)]
     pub(crate) fn queue_bytes(&self) -> (u64, u64) {
         (self.small_bytes, self.main_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_key;
+
+    fn s(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
+    #[test]
+    fn split_key_groups_by_segment_dir_at_any_depth() {
+        // Pre-#262 layout.
+        assert_eq!(
+            split_key("ns/seg/inverted.idx"),
+            s("ns/seg", "inverted.idx")
+        );
+        // The server's tenant-scoped layout.
+        assert_eq!(
+            split_key("default/msmarco-10m/seg-1/postings-0a.bin"),
+            s("default/msmarco-10m/seg-1", "postings-0a.bin")
+        );
+        // Span-cache entries belong to their segment file.
+        assert_eq!(
+            split_key("default/msmarco-10m/seg-1/doc_store.bin.spans/00-10"),
+            s("default/msmarco-10m/seg-1", "doc_store.bin.spans")
+        );
+        assert_eq!(
+            split_key("ns/seg/postings-02.bin.spans/0-10"),
+            s("ns/seg", "postings-02.bin.spans")
+        );
+        // Degenerate keys.
+        assert_eq!(split_key("seg/file"), s("seg", "file"));
+        assert_eq!(split_key("file"), s("", "file"));
+        // A trailing `.spans` file (no range under it) is just a file.
+        assert_eq!(split_key("ns/seg/x.spans"), s("ns/seg", "x.spans"));
     }
 }

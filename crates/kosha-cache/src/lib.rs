@@ -32,6 +32,17 @@ pub struct CacheOptions {
     pub policy: Option<CachePolicy>,
     /// File-class classifier for [`ReadHint::Class`] hints.
     pub classify: Option<Classifier>,
+    /// `KOSHA_CACHE_ACCOUNTING=exact` (#389, research; default off). The
+    /// legacy path counts `note_external_write` as a fresh write of the
+    /// whole file, so a file the hydration path re-notes (it notes every
+    /// file of a batch, including ones it found already local) is added to
+    /// the running total again while eviction subtracts it once: the total
+    /// drifts above real usage and the bound bites earlier and earlier.
+    /// With this on, the legacy path remembers each tracked key's size and
+    /// counts only the difference, as the opt-in policies always do. It
+    /// exists so a legacy control and a policy arm get the same effective
+    /// capacity at the same bound. Only matters with `max_bytes`.
+    pub exact_accounting: bool,
 }
 
 /// Handle to a cached file. The file is present on local disk.
@@ -75,6 +86,9 @@ pub struct Cache {
     /// Logical clock for read hints (see `begin_read`). Only advanced when
     /// a policy is configured.
     read_clock: AtomicU64,
+    /// Per-key sizes for `CacheOptions::exact_accounting` on the legacy
+    /// path (`None` otherwise; a policy keeps its own sizes).
+    exact_sizes: Option<Mutex<HashMap<String, u64>>>,
 }
 
 impl Cache {
@@ -115,6 +129,19 @@ impl Cache {
             }
             _ => None,
         };
+        let exact_sizes = (options.exact_accounting
+            && options.max_bytes.is_some()
+            && policy.is_none())
+        .then(|| {
+            let sizes = recency
+                .iter()
+                .map(|key| {
+                    let len = cache_dir.join(key).metadata().map(|m| m.len()).unwrap_or(0);
+                    (key.clone(), len)
+                })
+                .collect();
+            Mutex::new(sizes)
+        });
         let cache = Self {
             cache_dir,
             max_bytes: options.max_bytes,
@@ -124,6 +151,7 @@ impl Cache {
             pinned: Mutex::new(HashMap::new()),
             policy,
             read_clock: AtomicU64::new(0),
+            exact_sizes,
         };
         cache.enforce_limit();
         cache
@@ -132,6 +160,12 @@ impl Cache {
     /// The configured opt-in policy, if any (`None` = legacy).
     pub fn policy(&self) -> Option<CachePolicy> {
         self.policy.as_ref().map(|p| p.lock().unwrap().kind())
+    }
+
+    /// True when the running total counts each tracked key once (a policy,
+    /// or `exact_accounting` on the legacy path).
+    pub fn exact_accounting(&self) -> bool {
+        self.policy.is_some() || self.exact_sizes.is_some()
     }
 
     /// True when read hints change eviction (a policy is configured).
@@ -158,9 +192,25 @@ impl Cache {
         }
     }
 
+    /// Untrack keys the cache no longer holds, in the policy and in the
+    /// exact-accounting size map.
+    /// Reads reported for `key` (by hints or `get`) that the policy has not
+    /// consumed yet; `None` without a policy or for an untracked key. For
+    /// diagnostics and tests: it shows whether hints reach an entry.
+    pub fn policy_pending_reads(&self, key: &str) -> Option<u64> {
+        self.policy
+            .as_ref()?
+            .lock()
+            .unwrap()
+            .pending_reads(key.trim_matches('/'))
+    }
+
     fn policy_forget(&self, remove: impl Fn(&str) -> bool) {
         if let Some(policy) = &self.policy {
-            policy.lock().unwrap().forget(remove);
+            policy.lock().unwrap().forget(&remove);
+        }
+        if let Some(sizes) = &self.exact_sizes {
+            sizes.lock().unwrap().retain(|k, _| !remove(k));
         }
     }
 
@@ -390,7 +440,16 @@ impl Cache {
                 policy.upsert(key, new_len, clock, false);
                 tracked
             }
-            None => old_len,
+            None => match &self.exact_sizes {
+                // `KOSHA_CACHE_ACCOUNTING=exact`: same rule on the legacy
+                // path.
+                Some(sizes) => sizes
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), new_len)
+                    .unwrap_or(0),
+                None => old_len,
+            },
         };
         if new_len >= old_len {
             self.total_bytes
@@ -1025,6 +1084,7 @@ mod tests {
                 max_bytes: Some(max),
                 policy,
                 classify: None,
+                exact_accounting: false,
             },
         );
         (cache, dir)
@@ -1032,14 +1092,14 @@ mod tests {
 
     /// One search that hydrates `key` (100 bytes) and reads it: the search's
     /// own hint must not make the new file look re-read.
-    fn one_touch_search(cache: &Cache, seg: &str) {
+    fn one_touch_search(cache: &Cache, ns: &str, seg: &str) {
         let t = cache.begin_read();
-        let key = format!("ns/{seg}/doc_store.bin");
+        let key = format!("{ns}/{seg}/doc_store.bin");
         cache.put_bytes(&key, &[0u8; 100]).unwrap();
         cache.note_reads(
             t,
             &[ReadHint::File {
-                dir: &format!("ns/{seg}"),
+                dir: &format!("{ns}/{seg}"),
                 file: "doc_store.bin",
             }],
         );
@@ -1048,16 +1108,27 @@ mod tests {
     /// A hot segment re-read by every search while a stream of one-touch
     /// segments (a scan: warmup of a cold namespace, a one-off query) flows
     /// through a cache 10 files big. Returns whether the hot files survived.
-    fn hot_survives_scan(policy: Option<CachePolicy>) -> bool {
-        let name = policy.map_or("legacy", CachePolicy::as_str);
-        let (cache, dir) = policy_cache(name, policy, 1000);
+    /// `ns` is the namespace directory: `ns` (pre-#262 layout) or
+    /// `default/ns` (the server's tenant-scoped layout).
+    fn hot_survives_scan_in(policy: Option<CachePolicy>, ns: &str) -> bool {
+        let name = format!(
+            "{}-{}",
+            policy.map_or("legacy", CachePolicy::as_str),
+            ns.replace('/', "_")
+        );
+        let (cache, dir) = policy_cache(&name, policy, 1000);
+        let hot = format!("{ns}/hot");
         let t = cache.begin_read();
-        cache.put_bytes("ns/hot/inverted.idx", &[0u8; 100]).unwrap();
-        cache.put_bytes("ns/hot/footer.json", &[0u8; 100]).unwrap();
+        cache
+            .put_bytes(&format!("{hot}/inverted.idx"), &[0u8; 100])
+            .unwrap();
+        cache
+            .put_bytes(&format!("{hot}/footer.json"), &[0u8; 100])
+            .unwrap();
         cache.note_reads(
             t,
             &[ReadHint::Class {
-                dir: "ns/hot",
+                dir: &hot,
                 class: CLASS_ANY,
             }],
         );
@@ -1066,18 +1137,92 @@ mod tests {
             cache.note_reads(
                 t,
                 &[ReadHint::Class {
-                    dir: "ns/hot",
+                    dir: &hot,
                     class: CLASS_ANY,
                 }],
             );
-            one_touch_search(&cache, &format!("scan-{i}"));
+            one_touch_search(&cache, ns, &format!("scan-{i}"));
             assert!(cache.total_size() <= 1000);
         }
         // `contains`, not `get`: `get` would itself count as a read.
-        let survived =
-            cache.contains("ns/hot/inverted.idx") && cache.contains("ns/hot/footer.json");
+        let survived = cache.contains(&format!("{hot}/inverted.idx"))
+            && cache.contains(&format!("{hot}/footer.json"));
         let _ = fs::remove_dir_all(&dir);
         survived
+    }
+
+    fn hot_survives_scan(policy: Option<CachePolicy>) -> bool {
+        hot_survives_scan_in(policy, "ns")
+    }
+
+    /// The server's real layout is `{tenant}/{ns}/{segment}/{file}` (#262)
+    /// and its hints name `{tenant}/{ns}/{segment}`. Grouping by the first
+    /// two key components (the original #389 prototype) dropped every hint
+    /// there, so both policies degraded to FIFO; this is the regression test.
+    #[test]
+    fn policies_keep_re_read_entries_under_the_tenant_scoped_layout() {
+        assert!(!hot_survives_scan_in(None, "default/msmarco"));
+        assert!(hot_survives_scan_in(
+            Some(CachePolicy::Sieve),
+            "default/msmarco"
+        ));
+        assert!(hot_survives_scan_in(
+            Some(CachePolicy::S3Fifo),
+            "default/msmarco"
+        ));
+    }
+
+    /// Span-cache entries under the tenant layout belong to the segment
+    /// file they cache ranges of, and a `File` hint for that file reaches
+    /// them.
+    #[test]
+    fn span_entries_under_the_tenant_layout_take_file_hints() {
+        fn classify(name: &str) -> u8 {
+            if name.starts_with("postings-") {
+                1
+            } else {
+                0
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-cache-policy-tenant-spans-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::with_options(
+            dir.clone(),
+            CacheOptions {
+                max_bytes: Some(300),
+                policy: Some(CachePolicy::Sieve),
+                classify: Some(classify),
+                ..CacheOptions::default()
+            },
+        );
+        let seg = "default/msmarco/seg-1";
+        cache
+            .put_bytes(&format!("{seg}/postings-02.bin.spans/0-10"), &[0u8; 100])
+            .unwrap();
+        cache
+            .put_bytes(&format!("{seg}/doc_store.bin.spans/0-10"), &[0u8; 100])
+            .unwrap();
+        cache
+            .put_bytes(&format!("{seg}/postings-03.bin"), &[0u8; 100])
+            .unwrap();
+        let t = cache.begin_read();
+        cache.note_reads(
+            t,
+            &[ReadHint::File {
+                dir: seg,
+                file: "postings-02.bin",
+            }],
+        );
+        cache.put_bytes("default/other/seg/a", &[0u8; 100]).unwrap();
+        // One eviction: the oldest unread entry (the doc-store span), not
+        // the read posting span.
+        assert!(cache.contains(&format!("{seg}/postings-02.bin.spans/0-10")));
+        assert!(!cache.contains(&format!("{seg}/doc_store.bin.spans/0-10")));
+        assert!(cache.contains(&format!("{seg}/postings-03.bin")));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1176,6 +1321,7 @@ mod tests {
                 max_bytes: Some(400),
                 policy: Some(CachePolicy::Sieve),
                 classify: Some(classify),
+                exact_accounting: false,
             },
         );
         cache.put_bytes("ns/s/footer.json", &[0u8; 100]).unwrap();
@@ -1230,6 +1376,44 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The legacy path counts a re-noted file twice (the hydration path
+    /// re-notes files it found already local), so its running total drifts
+    /// above the bytes on disk. `exact_accounting` (KOSHA_CACHE_ACCOUNTING=
+    /// exact) counts it once, like the policies; off, nothing changes.
+    #[test]
+    fn exact_accounting_stops_the_legacy_double_count() {
+        for exact in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "kosha-test-cache-exact-{exact}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let cache = Cache::with_options(
+                dir.clone(),
+                CacheOptions {
+                    max_bytes: Some(10_000),
+                    exact_accounting: exact,
+                    ..CacheOptions::default()
+                },
+            );
+            assert_eq!(cache.exact_accounting(), exact);
+            fs::create_dir_all(dir.join("default/ns/seg")).unwrap();
+            fs::write(dir.join("default/ns/seg/inverted.idx"), [0u8; 70]).unwrap();
+            cache.note_external_write("default/ns/seg/inverted.idx");
+            cache.note_external_write("default/ns/seg/inverted.idx");
+            // Legacy (today): 140 for 70 bytes on disk.
+            assert_eq!(cache.total_size(), if exact { 70 } else { 140 });
+            cache.evict("default/ns/seg").unwrap();
+            assert_eq!(cache.total_size(), if exact { 0 } else { 70 });
+            // A key evicted and re-noted starts from zero again.
+            fs::create_dir_all(dir.join("default/ns/seg")).unwrap();
+            fs::write(dir.join("default/ns/seg/inverted.idx"), [0u8; 30]).unwrap();
+            cache.note_external_write("default/ns/seg/inverted.idx");
+            assert_eq!(cache.total_size(), if exact { 30 } else { 100 });
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
     #[test]
     fn policies_respect_pins_and_forget_external_evictions() {
         for policy in [CachePolicy::Sieve, CachePolicy::S3Fifo] {
@@ -1279,6 +1463,7 @@ mod tests {
                     max_bytes: Some(150),
                     policy: Some(policy),
                     classify: None,
+                    exact_accounting: false,
                 },
             );
             assert_eq!(cache.total_size(), 100, "{policy:?}");
@@ -1311,6 +1496,7 @@ mod tests {
                 max_bytes: None,
                 policy: Some(CachePolicy::Sieve),
                 classify: None,
+                exact_accounting: false,
             },
         );
         assert!(!cache.tracks_reads());
