@@ -414,7 +414,13 @@ def api_indices_create(ctx: ApiContext) -> str:
         raise CaseFailed("creating an existing index did not fail")
     except KoshaRequestError as e:
         _require(e.status_code == 409, "creating an existing index answered %s" % e.status_code)
-    return "schema from mappings; object field and settings left out; 409 on re-create"
+    bad = ctx.ns("create-analyzer")
+    try:
+        ctx.client.indices.create(bad, body={"mappings": {"properties": {"t": {"type": "text", "analyzer": "english"}}}})
+        raise CaseFailed("an analyzer Kosha does not have was accepted; update the case")
+    except KoshaRequestError as e:
+        _require(e.status_code == 400, "an unknown analyzer answered %s" % e.status_code)
+    return "schema from mappings; object field and settings left out; 409 on re-create; unknown analyzer 400"
 
 
 def api_indices_exists(ctx: ApiContext) -> str:

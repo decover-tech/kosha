@@ -781,7 +781,9 @@
   note: Creates the namespace (`POST /v1/namespaces`); plain mapping types become the namespace schema.
   divergence: >-
     `settings` are ignored (no shards, replicas or refresh interval), and
-    object, nested and multi-field mappings are left out of the schema.
+    object, nested and multi-field mappings are left out of the schema. A
+    text field's `analyzer` is passed through, and the server refuses a name
+    it does not have (language analyzers, custom analyzers) with a 400.
 
 - id: api.indices.exists
   category: index_api

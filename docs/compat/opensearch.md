@@ -146,7 +146,7 @@ Migrating from Elasticsearch or OpenSearch: see [the migration guide](../migrati
 
 | Construct | Status | Notes | Checked | Case |
 | --- | --- | --- | --- | --- |
-| indices.create (with mappings) | partial | Creates the namespace (`POST /v1/namespaces`); plain mapping types become the namespace schema. **Divergence:** `settings` are ignored (no shards, replicas or refresh interval), and object, nested and multi-field mappings are left out of the schema. | live | `api.indices.create` |
+| indices.create (with mappings) | partial | Creates the namespace (`POST /v1/namespaces`); plain mapping types become the namespace schema. **Divergence:** `settings` are ignored (no shards, replicas or refresh interval), and object, nested and multi-field mappings are left out of the schema. A text field's `analyzer` is passed through, and the server refuses a name it does not have (language analyzers, custom analyzers) with a 400. | live | `api.indices.create` |
 | indices.exists | supported | True when every named namespace exists. | live | `api.indices.exists` |
 | indices.get_mapping, indices.get | supported | The schema's fields with ES types; a namespace without a schema has empty properties. Fields are never guessed. | live | `api.indices.get_mapping` |
 | indices.get_settings | partial | Returns the index name. **Divergence:** Nothing else is reported; Kosha has no shard, replica or refresh settings. | live | `api.indices.get_settings` |
