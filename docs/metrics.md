@@ -50,6 +50,12 @@ plus `+Inf`.
 | `kosha_flush_total` | counter | none | Flush requests that succeeded. The idle-flush timer is not counted |
 | `kosha_writer_fenced_total` | counter | none | Namespaces this writer fenced itself from because another writer took its writer lease (`KOSHA_WRITER_LEASE`). Any increase means two writers contended for a namespace; this one now refuses its writes |
 
+### Tenant limits
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `kosha_tenant_rejections_total` | counter | `reason` | Requests refused with HTTP 429 by a per-tenant limit or quota (#341, `KOSHA_TENANT_LIMITS_FILE`). `reason`: `tenant_qps_exceeded`, `tenant_concurrency_exceeded`, `tenant_write_rate_exceeded`, `namespace_quota_exceeded`, `doc_quota_exceeded`, `vector_dims_exceeded` or `body_too_large`, the same code as the response body's `reason`. A search refused here never reaches the scoring queue, so it is not counted in `kosha_search_requests_total`. Stays at zero without a limits file |
+
 ### Caches and hydration
 
 | Metric | Type | Labels | Meaning |
@@ -81,6 +87,13 @@ The trade-off:
   namespace is seen).
 
 Per-namespace dashboards are tracked separately (#214).
+
+## Tenant labels
+
+`KOSHA_METRICS_TENANT_LABELS=on` adds a `tenant` label to `kosha_tenant_rejections_total`,
+and to no other metric. The same trade-off as namespace labels applies: one series per tenant
+and reason, every scraper sees tenant ids, and recording a rejection takes the family's lock
+to find its series. Rejections are rare next to searches, so the cost is off the hot path.
 
 ## Overhead
 

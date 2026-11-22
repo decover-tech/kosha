@@ -1,0 +1,93 @@
+# One-off batch migration of pre-#262 bare-named namespaces (#344). See
+# k8s/README.md, "Migrating pre-#262 namespaces", for the full procedure.
+#
+# NOT listed in kustomization.yaml: a Job runs once and its pod spec cannot be
+# changed, so CI must never apply it. Apply it by hand, once per step:
+#
+#   1. Fill in the map below (from `migrate-namespace --list-unreachable`) and
+#      set the image to the tag the cluster runs.
+#   2. Stop the ingest writer (kubectl -n kosha scale deploy/kosha --replicas=0).
+#   3. Dry run (the default MODE): read the plan and summary table in the log.
+#        kubectl apply -f job-migrate-namespace.yaml
+#        kubectl -n kosha logs -f job/kosha-migrate-namespace
+#   4. Real run: delete the Job, set MODE to "run", apply again. It exits
+#      non-zero if it refused any namespace; fix those and rerun (finished
+#      namespaces are skipped).
+#   5. After the writer is back, set MODE to "verify" and apply once more.
+#
+# With a local WAL (KOSHA_WAL_MODE unset) this pod cannot read the ingest
+# pod's WAL, which lives on that node's disk: let the writer's idle flush
+# run before step 2 and add "--skip-wal-check" to EXTRA_ARGS. With
+# KOSHA_WAL_MODE=s3 in kosha-config the Job checks every WAL stream itself.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kosha-migrate-namespace-map
+  namespace: kosha
+data:
+  # One `bare=tenant/name` per line; `#` starts a comment.
+  namespaces.map: |
+    # paragraph_index_hnsw=<tenant>/paragraph_index_hnsw
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kosha-migrate-namespace
+  namespace: kosha
+spec:
+  # A refused namespace is not transient: do not retry, read the log.
+  backoffLimit: 0
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      restartPolicy: Never
+      # IRSA role with S3 (and KMS, #343) access to the segment bucket.
+      serviceAccountName: kosha
+      containers:
+        - name: migrate
+          image: <registry>/decover/kosha:<tag>
+          envFrom:
+            - configMapRef:
+                name: kosha-config
+          env:
+            # "dry-run" plans the whole batch and changes nothing; "run"
+            # moves; "verify" re-checks a finished migration (read-only).
+            - name: MODE
+              value: dry-run
+            # e.g. "--keep-source" for prod's first run, "--skip-wal-check"
+            # with a local WAL (see above). Not used by verify.
+            - name: EXTRA_ARGS
+              value: ""
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: kosha-secret
+                  key: database-url
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              MAP=/etc/kosha-migrate/namespaces.map
+              case "${MODE}" in
+                dry-run) exec kosha-server migrate-namespace --map "$MAP" --dry-run ${EXTRA_ARGS} ;;
+                run)     exec kosha-server migrate-namespace --map "$MAP" ${EXTRA_ARGS} ;;
+                verify)  exec kosha-server migrate-namespace --verify --map "$MAP" ;;
+                *) echo "MODE must be dry-run, run or verify"; exit 2 ;;
+              esac
+          volumeMounts:
+            - name: map
+              mountPath: /etc/kosha-migrate
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: map
+          configMap:
+            name: kosha-migrate-namespace-map

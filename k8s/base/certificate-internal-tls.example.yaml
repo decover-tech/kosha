@@ -1,0 +1,80 @@
+# TLS between pods (#343): an example cert-manager setup for the
+# `kosha-internal-tls` Secret the Deployments mount (optionally) at
+# /etc/kosha/tls. NOT listed in kustomization.yaml: it needs cert-manager's
+# CRDs, and the CA choice is per cluster. Apply it by hand or copy it into an
+# overlay:
+#
+#   kubectl apply -f k8s/base/certificate-internal-tls.example.yaml
+#
+# The result is one Secret with tls.crt, tls.key and ca.crt. Every pod uses
+# the same certificate as its server certificate and as its client identity
+# for mTLS, and verifies peers against ca.crt. Peers are dialed by pod IP,
+# so pods check the fixed name `kosha-internal`
+# (KOSHA_INTERNAL_TLS_SERVER_NAME) instead of the IP. Then uncomment the
+# TLS block in configmap.yaml. See docs/configuration.md, "TLS between pods".
+#
+# cert-manager renews the Secret before it expires, but Kosha reads the files
+# at startup only: restart the pods after a renewal (for example with a
+# reloader controller, or a rollout well inside the renewBefore window).
+---
+# A self-signed root, only to bootstrap the internal CA below.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: kosha-selfsigned
+  namespace: kosha
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kosha-internal-ca
+  namespace: kosha
+spec:
+  isCA: true
+  commonName: kosha-internal-ca
+  secretName: kosha-internal-ca
+  duration: 87600h # 10 years
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: kosha-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: kosha-internal-ca
+  namespace: kosha
+spec:
+  ca:
+    secretName: kosha-internal-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kosha-internal-tls
+  namespace: kosha
+spec:
+  secretName: kosha-internal-tls
+  duration: 2160h # 90 days
+  renewBefore: 720h # 30 days
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+    - client auth
+  dnsNames:
+    # The name every pod checks peers against (KOSHA_INTERNAL_TLS_SERVER_NAME).
+    - kosha-internal
+    # KOSHA_INGEST_HOST, e.g. https://kosha-ingest-service.kosha.svc.cluster.local:8080
+    - kosha-ingest-service.kosha.svc.cluster.local
+    - kosha-ingest-service.kosha.svc
+    - kosha-ingest-service
+  issuerRef:
+    name: kosha-internal-ca
+    kind: Issuer
