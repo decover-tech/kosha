@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod doc_store_zstd;
 pub mod filter_columns;
 pub mod filter_eval;
 pub mod multivec;
@@ -20,6 +21,8 @@ use kosha_core::{
 use kosha_core::{AnalysisConfig, AnalyzerSpec, SegmentAnalysis};
 
 pub use analysis::Analyzer;
+use doc_store_zstd::{compress_doc_store, parse_dict_trailer, rebuild_offsets, DocStoreDecoder};
+pub use doc_store_zstd::{DocStoreCompressionMode, DocStoreZstdConfig, DOC_STORE_DICT_MAGIC};
 pub use multivec::{LateInteractionHits, LateInteractionParams};
 
 /// A point in HNSW space using cosine distance.
@@ -156,6 +159,12 @@ pub struct SegmentWriter {
     /// Vector fields the namespace schema embeds server-side, with their
     /// model id (#209), recorded in the columns' footer entries.
     embedding_models: BTreeMap<String, String>,
+    /// Per-record zstd for `doc_store.bin` (research #388); `None` writes
+    /// the raw layout. See [`DocStoreCompressionMode`].
+    doc_store_zstd: Option<DocStoreZstdConfig>,
+    /// What `write_doc_store` produced, recorded as
+    /// `Footer::doc_store_compression`.
+    doc_store_compression_meta: Option<kosha_core::DocStoreCompression>,
 }
 
 /// Whether new segments get per-field indexes (#249):
@@ -260,6 +269,52 @@ impl SegmentWriter {
             field_stats: BTreeMap::new(),
             multi_vectors: multivec::MultiVectorBuilder::default(),
             embedding_models: BTreeMap::new(),
+            doc_store_zstd: match DocStoreCompressionMode::from_env() {
+                DocStoreCompressionMode::Zstd => Some(DocStoreZstdConfig::from_env()),
+                DocStoreCompressionMode::Auto | DocStoreCompressionMode::Off => None,
+            },
+            doc_store_compression_meta: None,
+        }
+    }
+
+    /// Override doc-store compression (research #388): `Some` writes
+    /// per-record zstd frames with a dictionary trained on this segment's
+    /// records, `None` the raw layout. Production writers follow
+    /// `KOSHA_DOC_STORE_COMPRESSION`; see [`DocStoreCompressionMode`].
+    /// While compression is on, vectors always go to `doc_vectors.bin`.
+    pub fn with_doc_store_zstd(mut self, config: Option<DocStoreZstdConfig>) -> Self {
+        self.doc_store_zstd = config;
+        self
+    }
+
+    /// For merges: keep the inputs' doc-store format. With
+    /// `KOSHA_DOC_STORE_COMPRESSION` unset (`auto`), a merge with any
+    /// compressed input writes a compressed output, so compaction never
+    /// silently undoes the format; `zstd` and `none` decide on their own
+    /// (`none` is the way back to the raw layout). Call before adding
+    /// documents.
+    pub fn inherit_doc_store_compression(self, any_input_compressed: bool) -> Self {
+        match DocStoreCompressionMode::from_env() {
+            DocStoreCompressionMode::Auto if any_input_compressed => {
+                self.with_doc_store_zstd(Some(DocStoreZstdConfig::from_env()))
+            }
+            _ => self,
+        }
+    }
+
+    /// Whether this writer compresses `doc_store.bin` (research #388).
+    pub fn doc_store_compressed(&self) -> bool {
+        self.doc_store_zstd.is_some()
+    }
+
+    /// Where vectors go: the configured mode, except that a compressed
+    /// doc store never takes inline vectors (research #388): JSON floats
+    /// would be the bulk of every record and compress poorly.
+    fn effective_vector_store_mode(&self) -> VectorStoreMode {
+        if self.doc_store_zstd.is_some() {
+            VectorStoreMode::Sidecar
+        } else {
+            self.vector_store_mode
         }
     }
 
@@ -573,7 +628,7 @@ impl SegmentWriter {
                         // An empty value is the sidecar placeholder; a
                         // literal `[]` would be indistinguishable from it
                         // once blanked, so it stays inline (above).
-                        if self.vector_store_mode == VectorStoreMode::Sidecar {
+                        if self.effective_vector_store_mode() == VectorStoreMode::Sidecar {
                             let field_idx = match self
                                 .doc_vector_fields
                                 .iter()
@@ -828,6 +883,16 @@ impl SegmentWriter {
             }
         };
         let (path, offsets) = sink.finish(doc_count)?;
+        let (path, offsets) = match self.doc_store_zstd {
+            None => (path, offsets),
+            Some(config) => {
+                let out = self.build_dir().join("doc_store.zst");
+                let (offsets, meta) = compress_doc_store(&path, &out, &offsets, config)?;
+                let _ = fs::remove_file(&path);
+                self.doc_store_compression_meta = Some(meta);
+                (out, offsets)
+            }
+        };
         fs::rename(&path, self.output_dir.join("doc_store.bin"))?;
         self.backend.write("doc_store.offsets", &offsets)?;
         Ok(())
@@ -1318,6 +1383,7 @@ impl SegmentWriter {
             fuzzy_bloom: self.fuzzy_bloom.clone(),
             vector_fields: Some(vector_fields),
             multi_vectors,
+            doc_store_compression: self.doc_store_compression_meta.clone(),
         };
         let json = serde_json::to_string_pretty(&footer)?;
         self.backend.write("footer.json", json.as_bytes())?;
@@ -5550,6 +5616,9 @@ enum DocStoreAccess {
     Lazy {
         doc_store_path: PathBuf,
         index: DocIndex,
+        /// `Some` for a compressed doc store (research #388): stored
+        /// records are decoded through it before parsing.
+        decoder: Option<Arc<DocStoreDecoder>>,
     },
     Eager(Vec<DocRecord>),
 }
@@ -6265,12 +6334,18 @@ impl SegmentReader {
         } else {
             Vec::new()
         };
-        let doc_store = match try_read_doc_index(&segment_dir, footer.doc_count) {
-            Some(index) => DocStoreAccess::Lazy {
-                doc_store_path: segment_dir.join("doc_store.bin"),
-                index,
+        let doc_store = match &footer.doc_store_compression {
+            None => match try_read_doc_index(&segment_dir, footer.doc_count) {
+                Some(index) => DocStoreAccess::Lazy {
+                    doc_store_path: segment_dir.join("doc_store.bin"),
+                    index,
+                    decoder: None,
+                },
+                None => DocStoreAccess::Eager(Self::read_doc_store_for_fallback(&segment_dir)?),
             },
-            None => DocStoreAccess::Eager(Self::read_doc_store_for_fallback(&segment_dir)?),
+            Some(compression) => {
+                Self::open_compressed_doc_store(&segment_dir, &footer, compression)?
+            }
         };
         Ok(Self {
             segment_dir: segment_dir.clone(),
@@ -6285,6 +6360,90 @@ impl SegmentReader {
             vector_rescore_factor: vector_rescore_factor(),
             multi_vectors: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// A compressed doc store (research #388) opens only lazily: the
+    /// eager full parse cannot read frames. Its index and dictionary come
+    /// from `doc_store.offsets`. When that sidecar is missing or broken
+    /// (bad entries, bad dictionary trailer, or a dictionary length that
+    /// disagrees with the footer) and `doc_store.bin` is local, the index
+    /// is rebuilt in memory from `doc_store.bin` and its dictionary tail
+    /// copy: slower, still correct, as the eager fallback is for a raw
+    /// doc store. An unknown codec, or a broken sidecar with no local
+    /// `doc_store.bin` (or a damaged one), is an error.
+    fn open_compressed_doc_store(
+        segment_dir: &Path,
+        footer: &Footer,
+        compression: &kosha_core::DocStoreCompression,
+    ) -> Result<DocStoreAccess, KoshaError> {
+        let corrupt = |why: &str| {
+            KoshaError::CorruptSegment(format!(
+                "{}: compressed doc store ({}): {why}",
+                segment_dir.display(),
+                compression.codec
+            ))
+        };
+        if compression.codec != kosha_core::DocStoreCompression::ZSTD_DICT {
+            return Err(corrupt(
+                "unknown codec; this binary is too old for the segment",
+            ));
+        }
+        let index_and_dict = |parts: Option<(DocIndex, Vec<u8>)>| {
+            let (index, trailer) = parts?;
+            let dict = parse_dict_trailer(&trailer)?;
+            (dict.len() == compression.dict_bytes as usize).then_some((index, dict))
+        };
+        let from_sidecar = index_and_dict(try_read_doc_index_parts(segment_dir, footer.doc_count));
+        let (index, dict) = match from_sidecar {
+            Some(found) => found,
+            None => {
+                let store_path = segment_dir.join(DOC_STORE_FILE);
+                if !store_path.is_file() {
+                    return Err(corrupt(
+                        "doc_store.offsets (or its dictionary trailer) is missing or malformed, \
+                         and doc_store.bin is not local to rebuild it from",
+                    ));
+                }
+                eprintln!(
+                    "WARN: {}: doc_store.offsets of a compressed doc store is missing or \
+                     malformed; rebuilding it in memory from doc_store.bin",
+                    segment_dir.display()
+                );
+                let rebuilt = rebuild_offsets(
+                    &fs::read(&store_path)?,
+                    footer.doc_count,
+                    compression.dict_bytes,
+                )?;
+                index_and_dict(parse_doc_index_bytes(
+                    &rebuilt,
+                    &store_path,
+                    footer.doc_count,
+                ))
+                .ok_or_else(|| corrupt("offsets rebuilt from doc_store.bin do not parse"))?
+            }
+        };
+        Ok(DocStoreAccess::Lazy {
+            doc_store_path: segment_dir.join("doc_store.bin"),
+            index,
+            decoder: Some(Arc::new(DocStoreDecoder::new(dict))),
+        })
+    }
+
+    /// Whether this segment's `doc_store.bin` is compressed (research
+    /// #388; `Footer::doc_store_compression`).
+    pub fn doc_store_compressed(&self) -> bool {
+        self.footer.doc_store_compression.is_some()
+    }
+
+    /// Bytes of the compressed doc store's dictionary held resident (0 for
+    /// a raw doc store).
+    pub fn doc_store_dict_bytes(&self) -> usize {
+        match &self.doc_store {
+            DocStoreAccess::Lazy {
+                decoder: Some(d), ..
+            } => d.dict_len(),
+            _ => 0,
+        }
     }
 
     /// Override how many probe candidates per wanted hit an i8 vector
@@ -8030,6 +8189,7 @@ impl SegmentReader {
             DocStoreAccess::Lazy {
                 doc_store_path,
                 index,
+                decoder,
             } => {
                 let Some(entry) = index.entries.get(doc_seq as usize) else {
                     return Ok(None);
@@ -8037,22 +8197,23 @@ impl SegmentReader {
                 // The whole file when it is complete, else the sparse span
                 // cache (#245). Neither → the plain read below, which fails
                 // with the same IO error as before spans existed.
-                if let Some(buf) = span_cache::read_local_range(
+                let buf = match span_cache::read_local_range(
                     &self.segment_dir,
                     DOC_STORE_FILE,
                     index.complete_len(),
                     entry.offset,
                     entry.length as u64,
                 ) {
-                    let mut cursor = &buf[..];
-                    return parse_one_doc_record(&mut cursor, doc_seq).map(Some);
-                }
-                let mut file = fs::File::open(doc_store_path)?;
-                file.seek(SeekFrom::Start(entry.offset))?;
-                let mut buf = vec![0u8; entry.length as usize];
-                file.read_exact(&mut buf)?;
-                let mut cursor = &buf[..];
-                parse_one_doc_record(&mut cursor, doc_seq).map(Some)
+                    Some(buf) => buf,
+                    None => {
+                        let mut file = fs::File::open(doc_store_path)?;
+                        file.seek(SeekFrom::Start(entry.offset))?;
+                        let mut buf = vec![0u8; entry.length as usize];
+                        file.read_exact(&mut buf)?;
+                        buf
+                    }
+                };
+                parse_stored_doc_record(decoder.as_deref(), &buf, doc_seq).map(Some)
             }
         }
     }
@@ -8089,6 +8250,7 @@ impl SegmentReader {
             DocStoreAccess::Lazy {
                 doc_store_path,
                 index,
+                ..
             } => {
                 // Existence alone is not enough: an interrupted hydration
                 // write can leave a zero-byte or truncated `doc_store.bin`
@@ -8197,8 +8359,11 @@ impl SegmentReader {
                 self.segment_dir
             )));
         }
-        let mut cursor = bytes;
-        let mut record = parse_one_doc_record(&mut cursor, doc_seq)?;
+        let decoder = match &self.doc_store {
+            DocStoreAccess::Lazy { decoder, .. } => decoder.as_deref(),
+            DocStoreAccess::Eager(_) => None,
+        };
+        let mut record = parse_stored_doc_record(decoder, bytes, doc_seq)?;
         self.fill_doc_vectors(&mut record)?;
         Ok(Some(record))
     }
@@ -8387,7 +8552,27 @@ impl SegmentReader {
     /// in-place upgrade for segments that already exist on disk, so already-
     /// large namespaces don't have to wait for their next compaction cycle
     /// to stop paying the full-materialization cost on every query.
+    ///
+    /// A compressed doc store (research #388) is rebuilt from its frames
+    /// and the dictionary copy at the end of `doc_store.bin` (see
+    /// [`doc_store_zstd`]'s Recovery section), trailer included; its
+    /// footer is left as it is.
     pub fn backfill_offset_tables(segment_dir: &Path) -> Result<Footer, KoshaError> {
+        if let Ok(footer) = Self::read_footer(segment_dir) {
+            if let Some(compression) = &footer.doc_store_compression {
+                if compression.codec != kosha_core::DocStoreCompression::ZSTD_DICT {
+                    return Err(KoshaError::CorruptSegment(format!(
+                        "{}: unknown doc store codec {}; this binary is too old for the segment",
+                        segment_dir.display(),
+                        compression.codec
+                    )));
+                }
+                let store = fs::read(segment_dir.join(DOC_STORE_FILE))?;
+                let offsets = rebuild_offsets(&store, footer.doc_count, compression.dict_bytes)?;
+                atomic_write(&segment_dir.join("doc_store.offsets"), &offsets)?;
+                return Ok(footer);
+            }
+        }
         let data = fs::read(segment_dir.join("doc_store.bin"))?;
         let mut cursor = &data[..];
         let doc_count = if cursor.len() < 4 {
@@ -8448,6 +8633,7 @@ impl SegmentReader {
     /// `try_read_doc_index`); the resulting `Vec<DocRecord>` costs exactly
     /// what every segment cost before lazy loading existed.
     fn read_doc_store(segment_dir: &Path) -> Result<Vec<DocRecord>, KoshaError> {
+        refuse_compressed_full_parse(segment_dir)?;
         let data = fs::read(segment_dir.join("doc_store.bin"))?;
         let mut cursor = &data[..];
         let mut records = Vec::new();
@@ -8681,6 +8867,43 @@ pub fn compute_aggregations(
 /// Parse one `doc_store.bin` record. Every length is checked against the
 /// bytes left: a damaged record is `CorruptSegment`, never a panic or an
 /// unbounded allocation (#257 found the unchecked slicing by fuzzing).
+/// One stored record's bytes (exactly its `doc_store.offsets` span) to a
+/// record: decoded first when the doc store is compressed (research #388).
+fn parse_stored_doc_record(
+    decoder: Option<&DocStoreDecoder>,
+    stored: &[u8],
+    doc_seq: u32,
+) -> Result<DocRecord, KoshaError> {
+    match decoder {
+        None => {
+            let mut cursor = stored;
+            parse_one_doc_record(&mut cursor, doc_seq)
+        }
+        Some(decoder) => {
+            let raw = decoder.decode(stored, doc_seq)?;
+            let mut cursor = &raw[..];
+            parse_one_doc_record(&mut cursor, doc_seq)
+        }
+    }
+}
+
+/// The sequential full parse of `doc_store.bin` only understands the raw
+/// layout; a compressed one (research #388) is readable only through its
+/// offsets. Errors (instead of parsing frames as garbage) when the local
+/// `footer.json` says the doc store is compressed.
+fn refuse_compressed_full_parse(segment_dir: &Path) -> Result<(), KoshaError> {
+    match SegmentReader::read_footer(segment_dir) {
+        Ok(footer) if footer.doc_store_compression.is_some() => {
+            Err(KoshaError::CorruptSegment(format!(
+                "{}: doc_store.bin is compressed and can only be read through a valid \
+                 doc_store.offsets",
+                segment_dir.display()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn parse_one_doc_record(cursor: &mut &[u8], doc_seq: u32) -> Result<DocRecord, KoshaError> {
     fn take<'a>(cursor: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
         if cursor.len() < n {
@@ -8800,7 +9023,16 @@ pub fn doc_store_opens_lazily(segment_dir: &Path, footer: Option<&Footer>) -> bo
     let Ok(footer) = resolve_open_footer(segment_dir, footer.cloned()) else {
         return false;
     };
-    try_read_doc_index(segment_dir, footer.doc_count).is_some()
+    let parts = try_read_doc_index_parts(segment_dir, footer.doc_count);
+    match (&footer.doc_store_compression, parts) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        // A compressed doc store also needs its dictionary trailer; without
+        // it the reader rebuilds the index from doc_store.bin (#388), so
+        // that file must be local.
+        (Some(compression), Some((_, trailer))) => parse_dict_trailer(&trailer)
+            .is_some_and(|dict| dict.len() == compression.dict_bytes as usize),
+    }
 }
 
 /// Cheap, header-only version of [`doc_store_opens_lazily`] for checks that
@@ -8829,12 +9061,31 @@ pub fn doc_store_offsets_plausible(segment_dir: &Path, footer: Option<&Footer>) 
 /// a broken sidecar degrades to "slower, still correct," not a failed
 /// segment open.
 fn try_read_doc_index(segment_dir: &Path, expected_doc_count: u32) -> Option<DocIndex> {
+    try_read_doc_index_parts(segment_dir, expected_doc_count).map(|(index, _)| index)
+}
+
+/// [`try_read_doc_index`] plus the bytes after the entries: empty for a
+/// raw doc store, the dictionary trailer for a compressed one (#388).
+fn try_read_doc_index_parts(
+    segment_dir: &Path,
+    expected_doc_count: u32,
+) -> Option<(DocIndex, Vec<u8>)> {
     let path = segment_dir.join("doc_store.offsets");
     let data = match fs::read(&path) {
         Ok(data) => data,
         Err(_) => return None, // missing sidecar: legacy segment, not an error
     };
-    let mut cursor = &data[..];
+    parse_doc_index_bytes(&data, &path, expected_doc_count)
+}
+
+/// The parse behind [`try_read_doc_index_parts`], over `doc_store.offsets`
+/// bytes already in memory (`path` names them in warnings).
+fn parse_doc_index_bytes(
+    data: &[u8],
+    path: &Path,
+    expected_doc_count: u32,
+) -> Option<(DocIndex, Vec<u8>)> {
+    let mut cursor = data;
     if cursor.len() < 4 {
         eprintln!(
             "WARN: {} is truncated (missing header); falling back to full parse",
@@ -8887,7 +9138,7 @@ fn try_read_doc_index(segment_dir: &Path, expected_doc_count: u32) -> Option<Doc
         });
     }
     ids_pool.shrink_to_fit();
-    Some(DocIndex { ids_pool, entries })
+    Some((DocIndex { ids_pool, entries }, cursor.to_vec()))
 }
 
 // ─── Atomic file rewrite ────────────────────────────────────────────────────
@@ -13249,5 +13500,441 @@ mod global_rescore_tests {
              per-candidate listing {per_candidate:.2} ms/call, one listing {batched:.2} ms/call"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod doc_store_zstd_tests {
+    //! Research #388: per-record zstd doc store with a per-segment
+    //! dictionary, behind `KOSHA_DOC_STORE_COMPRESSION` (default off).
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kosha-test-docstore-zstd-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Passage-like text: a shared vocabulary with per-document variation.
+    fn passage(i: usize) -> String {
+        const WORDS: &[&str] = &[
+            "the",
+            "of",
+            "and",
+            "a",
+            "to",
+            "in",
+            "is",
+            "for",
+            "that",
+            "with",
+            "search",
+            "index",
+            "segment",
+            "document",
+            "query",
+            "storage",
+            "cache",
+            "latency",
+            "vector",
+            "term",
+            "posting",
+            "block",
+            "compression",
+            "dictionary",
+            "record",
+            "page",
+            "range",
+            "read",
+        ];
+        let mut s = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1) | 1;
+        let mut out = format!("passage {i}:");
+        for _ in 0..(40 + i % 30) {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            out.push(' ');
+            out.push_str(WORDS[(s % WORDS.len() as u64) as usize]);
+        }
+        out
+    }
+
+    fn fields(i: usize, with_vector: bool) -> Vec<Field> {
+        let mut f = vec![
+            Field::text("text", passage(i)),
+            Field::keyword("tag", if i.is_multiple_of(3) { "fizz" } else { "plain" }),
+            Field::integer("n", i as i64),
+        ];
+        if with_vector {
+            f.push(Field::vector(
+                "emb",
+                (0..8).map(|d| (i * 8 + d) as f32 * 0.125).collect(),
+            ));
+        }
+        f
+    }
+
+    fn write(
+        dir: &Path,
+        docs: usize,
+        zstd: Option<DocStoreZstdConfig>,
+        mode: VectorStoreMode,
+    ) -> Footer {
+        let mut w = SegmentWriter::new(SegmentId("z".into()), dir.to_path_buf())
+            .with_vector_store_mode(mode)
+            .with_doc_store_zstd(zstd);
+        for i in 0..docs {
+            w.add_document(DocumentId(format!("d{i}")), fields(i, true));
+        }
+        w.finalize(Bm25Params::default()).unwrap()
+    }
+
+    fn assert_same(a: &DocRecord, b: &DocRecord) {
+        assert_eq!(a.doc_id, b.doc_id);
+        assert_eq!(a.doc_seq, b.doc_seq);
+        assert_eq!(a.field_length, b.field_length);
+        assert_eq!(a.fields.len(), b.fields.len());
+        for (x, y) in a.fields.iter().zip(&b.fields) {
+            assert_eq!(
+                (&x.name, x.field_type, &x.value),
+                (&y.name, y.field_type, &y.value)
+            );
+        }
+    }
+
+    #[test]
+    fn default_writer_is_raw_and_footer_has_no_new_key() {
+        let dir = scratch("default");
+        let footer = write(&dir, 30, None, VectorStoreMode::Sidecar);
+        assert!(footer.doc_store_compression.is_none());
+        let json = fs::read_to_string(dir.join("footer.json")).unwrap();
+        assert!(!json.contains("doc_store_compression"));
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        assert!(!r.doc_store_compressed());
+        assert_eq!(r.doc_store_dict_bytes(), 0);
+        // No trailer after the entries: the offsets file is exactly what
+        // the pre-#388 writer produced.
+        let (_, trailer) = try_read_doc_index_parts(&dir, 30).unwrap();
+        assert!(trailer.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Round trip: every record (sidecar vectors filled back in) equals the
+    /// raw-layout segment's, through `doc_record_full`, `iter_doc_records`
+    /// and `iter_doc_records_raw`; and the compressed store is smaller.
+    #[test]
+    fn compressed_round_trips_every_record_and_is_smaller() {
+        let raw_dir = scratch("rt-raw");
+        let z_dir = scratch("rt-zstd");
+        let docs = 400;
+        write(&raw_dir, docs, None, VectorStoreMode::Sidecar);
+        let footer = write(
+            &z_dir,
+            docs,
+            Some(DocStoreZstdConfig::default()),
+            VectorStoreMode::Sidecar,
+        );
+        let meta = footer.doc_store_compression.clone().expect("compressed");
+        assert_eq!(meta.codec, kosha_core::DocStoreCompression::ZSTD_DICT);
+        assert!(meta.dict_bytes > 0, "a dictionary was trained");
+        let back: Footer =
+            serde_json::from_str(&fs::read_to_string(z_dir.join("footer.json")).unwrap()).unwrap();
+        assert_eq!(back.doc_store_compression, Some(meta.clone()));
+
+        let raw = SegmentReader::open(raw_dir.clone()).unwrap();
+        let z = SegmentReader::open(z_dir.clone()).unwrap();
+        assert!(z.doc_store_compressed());
+        assert_eq!(z.doc_store_dict_bytes(), meta.dict_bytes as usize);
+        assert!(z.has_local_doc_store());
+        for seq in 0..docs as u32 {
+            assert_same(
+                &raw.doc_record_full(seq).unwrap().unwrap(),
+                &z.doc_record_full(seq).unwrap().unwrap(),
+            );
+            let m = z.doc_meta(seq).unwrap();
+            assert_eq!(m.doc_id, format!("d{seq}"));
+        }
+        assert!(z.doc_record_full(docs as u32).unwrap().is_none());
+        let a: Vec<_> = raw.iter_doc_records().map(Result::unwrap).collect();
+        let b: Vec<_> = z.iter_doc_records().map(Result::unwrap).collect();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert_same(x, y);
+        }
+        for (x, y) in raw.iter_doc_records_raw().zip(z.iter_doc_records_raw()) {
+            let (x, y) = (x.unwrap(), y.unwrap());
+            assert_same(&x.record, &y.record);
+            assert_eq!(x.vectors, y.vectors);
+        }
+        let size = |d: &Path| fs::metadata(d.join(DOC_STORE_FILE)).unwrap().len();
+        // The file is the records, then the dictionary copy and 8 bytes.
+        let z_records = z.doc_store_len().unwrap();
+        assert_eq!(size(&z_dir), z_records + meta.dict_bytes as u64 + 8);
+        assert!(
+            z_records * 2 < size(&raw_dir),
+            "compressed records {z_records} vs raw {}",
+            size(&raw_dir)
+        );
+        let _ = fs::remove_dir_all(&raw_dir);
+        let _ = fs::remove_dir_all(&z_dir);
+    }
+
+    /// The ranged-read contract of #245 holds on stored (compressed)
+    /// bytes: the `doc_span` slice, and only it, materializes the record,
+    /// fetched remotely (`doc_record_from_bytes`) or from the sparse span
+    /// cache with `doc_store.bin` absent.
+    #[test]
+    fn ranged_reads_fetch_only_the_compressed_span() {
+        let dir = scratch("ranged");
+        let docs = 200;
+        write(
+            &dir,
+            docs,
+            Some(DocStoreZstdConfig::default()),
+            VectorStoreMode::Sidecar,
+        );
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let store = fs::read(dir.join(DOC_STORE_FILE)).unwrap();
+        // The records end where the dictionary's tail copy starts.
+        let (dict_tail, records_end) = doc_store_zstd::read_dict_tail(&store).unwrap();
+        assert_eq!(dict_tail.len(), r.doc_store_dict_bytes());
+        assert_eq!(r.doc_store_len(), Some(records_end as u64));
+        let expected: Vec<DocRecord> = (0..docs as u32)
+            .map(|s| r.doc_record_full(s).unwrap().unwrap())
+            .collect();
+        let mut spans = Vec::new();
+        let mut prev_end = 4u64;
+        for seq in 0..docs as u32 {
+            let (off, len) = r.doc_span(seq).unwrap();
+            assert_eq!(off, prev_end, "records are back to back");
+            prev_end = off + len as u64;
+            let bytes = store[off as usize..prev_end as usize].to_vec();
+            assert_same(
+                &r.doc_record_from_bytes(seq, &bytes).unwrap().unwrap(),
+                &expected[seq as usize],
+            );
+            spans.push((off, bytes));
+        }
+        // Wrong-length buffer: an error, never garbage.
+        let (_, len0) = r.doc_span(0).unwrap();
+        assert!(r
+            .doc_record_from_bytes(0, &store[4..4 + len0 as usize + 1])
+            .is_err());
+
+        // Scoring-set-only hydration: doc_store.bin gone, only some spans
+        // persisted in the span cache.
+        fs::remove_file(dir.join(DOC_STORE_FILE)).unwrap();
+        assert!(!r.has_local_doc_store());
+        let page = [3u32, 77, 150];
+        let sdir = span_cache::spans_dir(&dir, DOC_STORE_FILE);
+        fs::create_dir_all(&sdir).unwrap();
+        for &seq in &page {
+            let (off, bytes) = &spans[seq as usize];
+            fs::write(
+                sdir.join(span_cache::span_file_name(*off, off + bytes.len() as u64)),
+                bytes,
+            )
+            .unwrap();
+        }
+        for seq in 0..docs as u32 {
+            let local = r.doc_is_local(seq);
+            assert_eq!(local, page.contains(&seq), "doc {seq}");
+            if local {
+                assert_same(
+                    &r.doc_record_full(seq).unwrap().unwrap(),
+                    &expected[seq as usize],
+                );
+            } else {
+                assert!(r.doc_record_full(seq).is_err());
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Vectors never go inline into a compressed doc store, even when
+    /// `KOSHA_VECTOR_STORE=inline` asks for it.
+    #[test]
+    fn compression_forces_the_vector_sidecar() {
+        let dir = scratch("inline");
+        let footer = write(
+            &dir,
+            40,
+            Some(DocStoreZstdConfig::default()),
+            VectorStoreMode::Inline,
+        );
+        assert!(footer.doc_vectors, "vectors moved to doc_vectors.bin");
+        assert!(dir.join(DOC_VECTORS_FILE).exists());
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        for raw in r.iter_doc_records_raw() {
+            let raw = raw.unwrap();
+            let emb = raw.record.fields.iter().find(|f| f.name == "emb").unwrap();
+            assert!(
+                emb.value.is_empty(),
+                "only the sidecar placeholder is stored"
+            );
+            assert_eq!(raw.vectors.len(), 1);
+        }
+        let rec = r.doc_record_full(5).unwrap().unwrap();
+        let emb = rec.fields.iter().find(|f| f.name == "emb").unwrap();
+        let got: Vec<f32> = serde_json::from_str(&emb.value).unwrap();
+        assert_eq!(
+            got,
+            (0..8).map(|d| (40 + d) as f32 * 0.125).collect::<Vec<_>>()
+        );
+        // Without compression, inline mode still means inline.
+        let raw_dir = scratch("inline-raw");
+        assert!(!write(&raw_dir, 40, None, VectorStoreMode::Inline).doc_vectors);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&raw_dir);
+    }
+
+    /// Tiny segments train no dictionary; a disabled dictionary is plain
+    /// zstd. Both still round-trip, and records zstd cannot shrink stay
+    /// raw inside the compressed store.
+    #[test]
+    fn small_segments_and_no_dictionary_round_trip() {
+        for (name, docs, config) in [
+            ("tiny", 3usize, DocStoreZstdConfig::default()),
+            ("nodict", 50, DocStoreZstdConfig::with_dict_bytes(3, 0)),
+        ] {
+            let dir = scratch(name);
+            let footer = write(&dir, docs, Some(config), VectorStoreMode::Sidecar);
+            assert_eq!(
+                footer.doc_store_compression.as_ref().unwrap().dict_bytes,
+                0,
+                "{name}"
+            );
+            let r = SegmentReader::open(dir.clone()).unwrap();
+            for seq in 0..docs as u32 {
+                let rec = r.doc_record_full(seq).unwrap().unwrap();
+                assert_eq!(rec.doc_id.0, format!("d{seq}"));
+                assert_eq!(rec.fields[0].value, passage(seq as usize));
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+        // An empty segment stays the 4-byte raw layout.
+        let dir = scratch("empty");
+        let w = SegmentWriter::new(SegmentId("e".into()), dir.clone())
+            .with_doc_store_zstd(Some(DocStoreZstdConfig::default()));
+        let footer = w.finalize(Bm25Params::default()).unwrap();
+        assert!(footer.doc_store_compression.is_none());
+        assert_eq!(SegmentReader::open(dir.clone()).unwrap().doc_count(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The format is the footer's call: a compressed segment never falls
+    /// back to the eager full parse (it would read frames as garbage), an
+    /// unknown codec is refused, and a reader that ignores the footer (a
+    /// pre-#388 binary) fails to parse a record instead of returning one.
+    #[test]
+    fn compressed_segments_fail_loudly_instead_of_misreading() {
+        let dir = scratch("loud");
+        write(
+            &dir,
+            60,
+            Some(DocStoreZstdConfig::default()),
+            VectorStoreMode::Sidecar,
+        );
+        let r = SegmentReader::open(dir.clone()).unwrap();
+        let (off, len) = r.doc_span(7).unwrap();
+        let store = fs::read(dir.join(DOC_STORE_FILE)).unwrap();
+        let stored = &store[off as usize..(off + len as u64) as usize];
+        let mut cursor = stored;
+        assert!(
+            parse_one_doc_record(&mut cursor, 7).is_err(),
+            "an old reader's parse of a frame errors"
+        );
+
+        // Unknown codec.
+        let footer_path = dir.join("footer.json");
+        let good = fs::read_to_string(&footer_path).unwrap();
+        let mut footer: Footer = serde_json::from_str(&good).unwrap();
+        footer.doc_store_compression.as_mut().unwrap().codec = "zstd-v9".into();
+        fs::write(&footer_path, serde_json::to_string(&footer).unwrap()).unwrap();
+        assert!(matches!(
+            SegmentReader::open(dir.clone()),
+            Err(KoshaError::CorruptSegment(_))
+        ));
+        fs::write(&footer_path, &good).unwrap();
+
+        // Broken sidecar and no local doc_store.bin: an error, never the
+        // eager parse.
+        let offsets_path = dir.join("doc_store.offsets");
+        let offsets = fs::read(&offsets_path).unwrap();
+        let store_path = dir.join(DOC_STORE_FILE);
+        fs::write(&offsets_path, &offsets[..offsets.len() - 10]).unwrap();
+        fs::remove_file(&store_path).unwrap();
+        assert!(!doc_store_opens_lazily(&dir, None));
+        assert!(matches!(
+            SegmentReader::open(dir.clone()),
+            Err(KoshaError::CorruptSegment(_))
+        ));
+        // doc_store.bin with a damaged dictionary tail cannot rebuild it.
+        let mut bad_tail = store.clone();
+        let n = bad_tail.len();
+        bad_tail[n - 1] ^= 0xFF;
+        fs::write(&store_path, &bad_tail).unwrap();
+        assert!(SegmentReader::open(dir.clone()).is_err());
+        assert!(SegmentReader::backfill_offset_tables(&dir).is_err());
+        fs::write(&store_path, &store).unwrap();
+        fs::write(&offsets_path, &offsets).unwrap();
+        assert!(SegmentReader::open(dir.clone()).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `doc_store.offsets` is not a single point of failure: with it
+    /// missing, cut (dictionary trailer gone) or stale against the footer,
+    /// the reader rebuilds the index from `doc_store.bin` and its
+    /// dictionary tail copy, and `backfill_offset_tables` writes back a
+    /// sidecar byte-identical to the writer's.
+    #[test]
+    fn broken_offsets_are_rebuilt_from_doc_store_bin() {
+        for (name, dict) in [
+            ("rebuild", DocStoreZstdConfig::default()),
+            ("rebuild-nodict", DocStoreZstdConfig::with_dict_bytes(3, 0)),
+        ] {
+            let dir = scratch(name);
+            let docs = 150;
+            write(&dir, docs, Some(dict), VectorStoreMode::Sidecar);
+            let expected: Vec<DocRecord> = {
+                let r = SegmentReader::open(dir.clone()).unwrap();
+                (0..docs as u32)
+                    .map(|s| r.doc_record_full(s).unwrap().unwrap())
+                    .collect()
+            };
+            let offsets_path = dir.join("doc_store.offsets");
+            let offsets = fs::read(&offsets_path).unwrap();
+            let check = |r: &SegmentReader| {
+                assert!(r.doc_store_compressed());
+                for seq in 0..docs as u32 {
+                    assert_same(
+                        &r.doc_record_full(seq).unwrap().unwrap(),
+                        &expected[seq as usize],
+                    );
+                }
+            };
+            let mut stale = offsets.clone();
+            stale[0..4].copy_from_slice(&(docs as u32 + 1).to_le_bytes());
+            for broken in [
+                None,
+                Some(offsets[..offsets.len() - 10].to_vec()),
+                Some(stale),
+            ] {
+                match &broken {
+                    None => fs::remove_file(&offsets_path).unwrap(),
+                    Some(bytes) => fs::write(&offsets_path, bytes).unwrap(),
+                }
+                assert!(!doc_store_opens_lazily(&dir, None), "{name}");
+                check(&SegmentReader::open(dir.clone()).unwrap());
+                SegmentReader::backfill_offset_tables(&dir).unwrap();
+                assert_eq!(fs::read(&offsets_path).unwrap(), offsets, "{name}");
+                assert!(doc_store_opens_lazily(&dir, None), "{name}");
+                check(&SegmentReader::open(dir.clone()).unwrap());
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }
