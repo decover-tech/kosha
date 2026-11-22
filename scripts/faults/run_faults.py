@@ -1011,8 +1011,9 @@ def self_test() -> int:
         poll_until(lambda: len(watcher_calls) >= 4, 5, 0.01)
     check("watcher samples, tolerates read errors", watcher.read_errors == 1 and len(watcher.problems) == 1 and watcher.samples >= 3)
 
-    known_failures = load_expected()
-    res = conf.Results(known_failures["checks"], known_failures["bugs"])
+    load_expected()
+    # A list of its own: expected_failures.json is empty when no bug is open.
+    res = conf.Results({"s3-toxics:recovered": "#0"}, {"#0": "an example of a listed bug"})
     res.record("s3-toxics:recovered", False, "writes fenced")
     res.record("kill-mid-flush:acked-present", True)
     with tempfile.TemporaryDirectory() as tmp:
@@ -1023,7 +1024,7 @@ def self_test() -> int:
             rep = json.load(f)
         res.record("kill-mid-flush:doc-count@ingest", False, "lost")
         code2 = conf.report(res, None, False, False)
-    check("a listed failure (#368) is expected", code == 0 and rep["summary"]["xfail"] == 1, rep["summary"])
+    check("a listed failure is expected", code == 0 and rep["summary"]["xfail"] == 1, rep["summary"])
     check("report carries recovery + timings", rep["recovery"][0]["ready_s"] == 1.5 and rep["scenarios"][0]["scenario"] == "x" and rep["config"]["run_id"] == "1")
     check("an unlisted failure fails the run", code2 == 1)
     print("self-test: %s" % ("FAILED: " + ", ".join(failures) if failures else "all ok"))
