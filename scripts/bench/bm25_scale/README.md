@@ -303,3 +303,24 @@ It splits client latency into server time vs time outside the engine,
 breaks the p99+ requests down by server phase, tells query-intrinsic cost
 (same queries slow every time) from contention (slow once, fast on
 repeats), and shows the tail by minute and by requests in flight.
+
+## Offline representation recall (`repr_recall_sim.py`, #383)
+
+`repr_recall_sim.py` asks, with no server and no ANN index, how much
+recall@k survives when the shortlist is picked with a smaller
+representation (a d-dim prefix, int8 codes, or sign bits) and then
+rescored with the full vector. It is brute force over an in-memory sample,
+so its numbers are an upper bound for the same representation inside
+Kosha over a larger corpus. It reads the same `emb-*.f32` /
+`queries_emb.f32` files as `recall_check.py`, or `.npy`:
+
+```bash
+python3 repr_recall_sim.py --docs /data/corpus/emb-00000.f32 \
+    --docs /data/corpus/emb-00001.f32 --docs-limit 200000 \
+    --queries /data/queries_emb.f32 --dim 1024 \
+    --truncate 512,256,128 --shortlist 10,40,100,200 --out sim.json
+```
+
+Memory is roughly 5x the f32 sample (a copy per representation), so
+about 4 GB at 100k x 1024. Results and caveats are in
+`docs/research/383-matryoshka-binary.md`.
