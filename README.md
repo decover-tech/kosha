@@ -635,6 +635,52 @@ and the server logs a warning at startup for any in `KOSHA_API_KEYS`.
   capped at `KOSHA_MAX_BODY_BYTES` (default 64 MiB, 413 above it), and
   `KOSHA_LEGACY_ROUTES=off` turns the unversioned routes into 410s.
 
+### Scoped API keys (Postgres key registry)
+
+Keys in the Postgres registry carry scopes, an optional namespace allow-list
+and an optional expiry. The server enforces them on every tenant route, before
+a query pod forwards a write to the ingest pod:
+
+| Scope | Routes |
+|---|---|
+| `read` | search, exists, namespace stats, reading a schema, listing namespaces and branches |
+| `write` | index, replace, delete documents, flush |
+| `admin` | create and delete namespaces and branches, change a namespace's schema or shards |
+
+Scopes are independent (`admin` does not include `write`). A request outside a
+key's scopes or namespaces gets a `403` naming what is missing; an expired key
+gets `401` "API key expired". The `admin` scope is tenant-level: `/v1/admin/*`
+still needs `KOSHA_ADMIN_API_KEY`. Env keys (`KOSHA_API_KEY`, `KOSHA_API_KEYS`)
+and every key created before scopes existed have all three scopes, every
+namespace and no expiry, so they behave as before. A key restricted to
+namespaces cannot list all namespaces, and can only create a namespace or
+branch whose name is on its list.
+
+Manage keys with the admin credential (`kosha admin ...` wraps these):
+
+| Route | Does |
+|---|---|
+| `POST /v1/admin/api-keys` | Create a key: `{"tenant_id", "description", "scopes": ["read"], "namespaces": ["docs"], "expires_in_secs": 86400}`. Only `tenant_id` is required. The key is in the response and is never shown again |
+| `GET /v1/admin/api-keys[?tenant_id=T]` | List keys that are not revoked: id, tenant, scopes, namespaces, `expires_at`, `last_used_at` (unix seconds). No secrets |
+| `POST /v1/admin/api-keys/revoke` | `{"key_id"}`. The pod that answers refuses the key at once, the others within `KOSHA_API_KEY_REFRESH_SECS` |
+| `POST /v1/admin/api-keys/rotate` | `{"key_id", "overlap_secs": 86400}`. Issues a replacement with the same tenant, scopes and namespaces; the old key keeps working for the overlap (default one day), so clients switch without downtime |
+| `POST /v1/admin/api-keys/scrub-plaintext` | Removes the plaintext that keys created before this feature still hold in the database |
+
+Keys are stored as SHA-256 hashes; a key's `key_id` is that hash.
+`last_used_at` is written about once per refresh interval, not per request.
+
+**Upgrading.** The migration (`003_scoped_api_keys.sql`, also applied by the
+server at startup) only adds columns and hashes existing keys; it leaves their
+plaintext in place, because pods still running the previous build read it. Roll
+every pod to the new build, then run `kosha admin scrub-plaintext-api-keys`
+once. Until every pod is upgraded, a key created through an upgraded pod is not
+accepted by the pods still on the old build. After the scrub the table holds no
+usable key, and a rollback to a build from
+before this feature would no longer accept Postgres keys (env keys are
+unaffected). The server's database role must own `kosha.api_keys`
+(`002_grant_kosha_role.sql`) or an admin must apply the migration first
+(`make db-migrate`).
+
 A successful flush uploads its segment snapshot before publishing its manifest.
 Upload and manifest-store failures return errors and remain retryable. By
 default (`KOSHA_WAL_MODE=local`) buffered writes use a local, fsynced WAL under

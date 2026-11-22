@@ -10,7 +10,6 @@ use kosha_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use uuid::Uuid;
 
 /// Postgres-backed store.
 ///
@@ -102,7 +101,7 @@ fn is_migration_race(e: &sqlx::Error) -> bool {
         .is_some_and(|code| MIGRATION_RACE_SQLSTATES.contains(&code.as_ref()))
 }
 
-/// Apply the embedded migrations (001, then 003) in one transaction on one
+/// Apply the embedded migrations (001, then both 003 files) in one transaction on one
 /// connection, holding a transaction-scoped advisory lock for its duration.
 ///
 /// Concurrent constructors against a fresh database (several pods booting
@@ -128,7 +127,8 @@ async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
 
 /// One locked migration attempt. The error carries the message prefix the
 /// caller reports: "migration failed" for 001 and the lock/transaction
-/// plumbing, "migration 003 failed" for 003.
+/// plumbing, "migration 003 failed" for 003_writer_leases,
+/// "migration 003_scoped_api_keys failed" for 003_scoped_api_keys.
 async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static str)> {
     const FAILED: &str = "migration failed";
     let mut tx = pool.begin().await.map_err(|e| (e, FAILED))?;
@@ -148,6 +148,12 @@ async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static 
         .execute(&mut *tx)
         .await
         .map_err(|e| (e, "migration 003 failed"))?;
+    // Scoped, hashed API keys (#346): additive columns on kosha.api_keys.
+    let migration = include_str!("../migrations/003_scoped_api_keys.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 003_scoped_api_keys failed"))?;
     tx.commit().await.map_err(|e| (e, FAILED))
 }
 
@@ -239,76 +245,6 @@ impl PgStore {
             }
         }
         Err(last_err)
-    }
-
-    /// Validate an API key against the database.
-    /// Returns the tenant_id if the key is valid and not revoked.
-    pub fn validate_api_key(&self, api_key: &str) -> Option<String> {
-        let key = api_key.to_string();
-        self.rt.block_on(async {
-            let row: Option<(String,)> = sqlx::query_as(
-                "SELECT tenant_id FROM kosha.api_keys \
-                 WHERE api_key = $1 AND revoked_at IS NULL",
-            )
-            .bind(&key)
-            .fetch_optional(&self.pool)
-            .await
-            .ok()?;
-
-            row.map(|(tenant,)| tenant)
-        })
-    }
-
-    /// Create a new API key for a tenant.
-    /// The key is a random UUID prefixed with "sk-" (secret key).
-    pub fn create_api_key(&self, tenant_id: &str, description: &str) -> Result<String, KoshaError> {
-        let api_key = format!("sk-{}", Uuid::new_v4());
-        let tid = tenant_id.to_string();
-        let desc = description.to_string();
-        let key = api_key.clone();
-
-        self.rt.block_on(async {
-            sqlx::query(
-                "INSERT INTO kosha.api_keys (api_key, tenant_id, description) \
-                 VALUES ($1, $2, $3)",
-            )
-            .bind(&key)
-            .bind(&tid)
-            .bind(&desc)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| KoshaError::NotFound(e.to_string()))
-        })?;
-
-        Ok(api_key)
-    }
-
-    /// List all active (non-revoked) API keys, optionally filtered by tenant.
-    pub fn list_api_keys(
-        &self,
-        tenant_id: Option<&str>,
-    ) -> Result<Vec<(String, String, String)>, KoshaError> {
-        let tid = tenant_id.map(|s| s.to_string());
-
-        self.rt.block_on(async {
-            let query = if tid.is_some() {
-                "SELECT api_key, tenant_id, description FROM kosha.api_keys \
-                 WHERE revoked_at IS NULL AND tenant_id = $1 \
-                 ORDER BY created_at DESC"
-            } else {
-                "SELECT api_key, tenant_id, description FROM kosha.api_keys \
-                 WHERE revoked_at IS NULL \
-                 ORDER BY created_at DESC"
-            };
-
-            let rows: Vec<(String, String, String)> = sqlx::query_as(query)
-                .bind(&tid)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| KoshaError::NotFound(e.to_string()))?;
-
-            Ok(rows)
-        })
     }
 }
 

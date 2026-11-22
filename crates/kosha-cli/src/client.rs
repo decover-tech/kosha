@@ -243,17 +243,42 @@ impl Client {
         )
     }
 
-    /// `POST /v1/admin/api-keys`.
-    pub fn create_api_key(
-        &self,
-        tenant_id: &str,
-        description: &str,
-    ) -> Result<Value, RequestError> {
+    /// `POST /v1/admin/api-keys`. `body` names the tenant and, optionally,
+    /// the key's scopes, namespaces and expiry.
+    pub fn create_api_key(&self, body: Value) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/api-keys", Some(body))
+    }
+
+    /// `GET /v1/admin/api-keys`: keys that are not revoked, without secrets.
+    pub fn list_api_keys(&self, tenant_id: Option<&str>) -> Result<Value, RequestError> {
+        let path = match tenant_id {
+            Some(tenant) => format!(
+                "/v1/admin/api-keys?tenant_id={}",
+                urlencoding::encode(tenant)
+            ),
+            None => "/v1/admin/api-keys".to_string(),
+        };
+        self.request(Method::GET, &path, None)
+    }
+
+    /// `POST /v1/admin/api-keys/revoke`.
+    pub fn revoke_api_key(&self, key_id: &str) -> Result<Value, RequestError> {
         self.request(
             Method::POST,
-            "/v1/admin/api-keys",
-            Some(serde_json::json!({"tenant_id": tenant_id, "description": description})),
+            "/v1/admin/api-keys/revoke",
+            Some(serde_json::json!({ "key_id": key_id })),
         )
+    }
+
+    /// `POST /v1/admin/api-keys/rotate`. `body` names the key and,
+    /// optionally, the overlap window and the new key's expiry.
+    pub fn rotate_api_key(&self, body: Value) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/api-keys/rotate", Some(body))
+    }
+
+    /// `POST /v1/admin/api-keys/scrub-plaintext`.
+    pub fn scrub_plaintext_api_keys(&self) -> Result<Value, RequestError> {
+        self.request(Method::POST, "/v1/admin/api-keys/scrub-plaintext", None)
     }
 
     pub fn curl(

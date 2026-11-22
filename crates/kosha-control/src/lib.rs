@@ -13,6 +13,15 @@ use kosha_core::{ControlStore, KoshaError, Manifest, NamespaceId};
 mod namespace_rename;
 pub use namespace_rename::{rekey_manifest_references, NamespaceRename, RenameOutcome};
 
+pub mod api_keys;
+pub use api_keys::{hash_api_key, ApiKeyRecord, NewApiKey, Scope, Scopes};
+
+#[cfg(feature = "postgres")]
+mod api_key_store;
+
+#[cfg(feature = "postgres")]
+pub use api_key_store::{IssuedApiKey, RotatedApiKey};
+
 #[cfg(feature = "postgres")]
 mod postgres;
 
