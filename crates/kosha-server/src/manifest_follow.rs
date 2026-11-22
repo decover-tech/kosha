@@ -222,6 +222,32 @@ impl ManifestFollow {
     }
 }
 
+/// The local directories (`{ns}/{segment}`) of segments `local` lists
+/// that `next` neither lists nor records as retired (#347): what a replica
+/// following `ns` from `local` to `next` may drop from its disk. When `ns`
+/// was deleted and re-created between two refreshes, that is every segment
+/// of the old incarnation. Segments inherited from a branch parent live
+/// under another namespace's prefix and are never listed.
+pub fn orphaned_segments(
+    ns: &NamespaceId,
+    local: &kosha_core::Manifest,
+    next: &kosha_core::Manifest,
+) -> Vec<String> {
+    let kept: std::collections::HashSet<&kosha_core::SegmentId> = next
+        .segments
+        .iter()
+        .map(|e| &e.segment_id)
+        .chain(next.retired.iter().map(|r| &r.segment_id))
+        .collect();
+    local
+        .segments
+        .iter()
+        .map(|e| &e.segment_id)
+        .filter(|segment| !kept.contains(segment) && !local.is_inherited_segment(ns, segment))
+        .map(|segment| local.segment_rel_dir(ns, segment))
+        .collect()
+}
+
 pub fn unix_seconds(at: SystemTime) -> f64 {
     at.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -231,6 +257,45 @@ pub fn unix_seconds(at: SystemTime) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manifest(version: u64, segments: &[&str]) -> kosha_core::Manifest {
+        let mut m = kosha_core::Manifest::empty(version);
+        m.segments = segments
+            .iter()
+            .map(|s| kosha_core::ManifestEntry {
+                segment_id: kosha_core::SegmentId((*s).into()),
+                doc_count: 1,
+            })
+            .collect();
+        m
+    }
+
+    #[test]
+    fn orphaned_segments_are_the_ones_the_next_manifest_forgot() {
+        let ns = NamespaceId("t/ns".into());
+        let old = manifest(4, &["a", "b", "c"]);
+        // Compaction: a and b replaced by d, still recorded as retired.
+        let mut compacted = manifest(5, &["c", "d"]);
+        for segment in ["a", "b"] {
+            compacted.retired.push(kosha_core::gc::RetiredObject {
+                segment_id: kosha_core::SegmentId(segment.into()),
+                deletion_generation: None,
+                retired_at_ms: 0,
+                retired_in_version: 5,
+            });
+        }
+        assert!(orphaned_segments(&ns, &old, &compacted).is_empty());
+        // Deleted and re-created (the old version retired): nothing shared.
+        let recreated = manifest(6, &["e"]);
+        assert_eq!(
+            orphaned_segments(&ns, &old, &recreated),
+            ["t/ns/a", "t/ns/b", "t/ns/c"]
+        );
+        // GC already dropped a's retirement record.
+        let mut gced = manifest(7, &["c", "d"]);
+        gced.retired = compacted.retired[1..].to_vec();
+        assert_eq!(orphaned_segments(&ns, &old, &gced), ["t/ns/a"]);
+    }
 
     #[test]
     fn refresh_interval_defaults_and_disables() {

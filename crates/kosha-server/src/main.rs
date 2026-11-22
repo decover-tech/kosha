@@ -131,6 +131,10 @@ struct AppState {
     /// Read-through cache handle over `data_dir` (DESIGN.md §9).
     cache: Cache,
     control_plane_kind: &'static str,
+    /// Completion records of namespace hard deletes (#347): Postgres
+    /// (`kosha.namespace_erasures`) with the Postgres control plane,
+    /// in-memory otherwise.
+    erasures: Box<dyn kosha_control::ErasureStore>,
     #[cfg(feature = "s3")]
     s3_storage: Option<s3_storage::S3Storage>,
     /// Max in-flight S3 GETs when hydrating segments for a search
@@ -1703,6 +1707,7 @@ impl AppState {
             posting_spans::config_from_env(),
         );
 
+        let erasures = erasure_store(control_plane_kind);
         let tenant_limits = tenant_limits::TenantLimiter::from_env()
             .unwrap_or_else(|e| fatal(&format!("tenant limits: {e}")));
         // Every process-wide cache splits its budget between tenants by
@@ -1738,6 +1743,7 @@ impl AppState {
             data_dir,
             cache,
             control_plane_kind,
+            erasures,
             #[cfg(feature = "s3")]
             s3_storage,
             #[cfg(feature = "s3")]
@@ -2567,6 +2573,7 @@ impl AppState {
                 }
                 Ok(std::fs::read(self.data_dir.join(path))?)
             })?;
+            self.evict_orphaned_segments(ns, &manifest);
             if warm {
                 self.prewarm_followed_manifest(ns, &manifest);
             }
@@ -2580,6 +2587,39 @@ impl AppState {
         }
         self.manifest_follow.confirm(ns, version, observed_at);
         Ok(())
+    }
+
+    /// Before a query replica installs `next` for `ns`: drop the local
+    /// files of segments the manifest it holds lists and `next` neither
+    /// lists nor records as retired (#347). That is what a namespace
+    /// deleted and re-created between two refreshes looks like (its old
+    /// incarnation's version was retired, and the new one shares nothing
+    /// with it), so the deleted documents' files do not linger in this
+    /// pod's cache. Segments a compaction replaced are still listed under
+    /// `retired` until segment GC reclaims them, and stay. Inherited
+    /// (branch parent) segments are never touched.
+    fn evict_orphaned_segments(&self, ns: &NamespaceId, next: &kosha_core::Manifest) {
+        let Some(local) = self.indexer.manifest_shared(ns) else {
+            return;
+        };
+        let orphaned = manifest_follow::orphaned_segments(ns, &local, next);
+        if orphaned.is_empty() {
+            return;
+        }
+        println!(
+            "manifest refresh: ns={} v{} -> v{}: evicting {} local segment(s) the new \
+             manifest no longer knows",
+            ns.0,
+            local.version,
+            next.version,
+            orphaned.len()
+        );
+        self.forget_namespace_caches(ns);
+        for dir in orphaned {
+            if let Err(error) = self.cache.evict_prefix(&dir) {
+                eprintln!("warn: manifest refresh: cannot evict {dir}: {error}");
+            }
+        }
     }
 
     /// Fetch the scoring set of a manifest about to be installed, for
@@ -2699,6 +2739,15 @@ impl AppState {
             }
             self.manifest_follow.forget(&ns);
             self.forget_namespace_caches(&ns);
+            // Hard delete (#347): no pod keeps a copy of a deleted
+            // namespace's segment files either.
+            if let Err(error) = self.cache.evict_prefix(&ns.0) {
+                eprintln!(
+                    "warn: manifest refresh: cannot evict the local files of deleted ns={}: \
+                     {error}",
+                    ns.0
+                );
+            }
         }
         let mut control_plane_ok = true;
         for (ns, stored) in versions {
@@ -6475,7 +6524,7 @@ fn route(
 
 fn route_inner(
     request_line: &str,
-    _headers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
     body: &[u8],
     tenant: &str,
     state: &AppState,
@@ -6491,7 +6540,7 @@ fn route_inner(
     }
 
     if let Some(ns) = bare_namespace(request_line, "DELETE") {
-        return handle_delete_namespace(&ns, tenant, state);
+        return handle_delete_namespace_request(&ns, request_line, headers, tenant, state);
     }
 
     if is_list_namespaces_route(request_line) {
@@ -6549,6 +6598,21 @@ fn route_inner(
 
     if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/stats") {
         return handle_namespace_stats(&ns, tenant, state);
+    }
+
+    // ── Namespace lifecycle (#347) ─────────────────────────────────────────
+    if let Some(ns) = extract_namespace(request_line, "GET /v1/namespaces/", "/erasure") {
+        return handle_get_erasure(&ns, tenant, state);
+    }
+
+    if let Some((ns, query)) = namespace_action_with_query(request_line, "GET", "/export") {
+        return handle_export_with_ns(&ns, tenant, &query, state);
+    }
+
+    if request_line.starts_with("GET /v1/admin/erasures ")
+        || request_line.starts_with("GET /v1/admin/erasures?")
+    {
+        return handle_list_erasures(request_line, state);
     }
 
     // ── Admin routes (Postgres-backed only) ────────────────────────────────
@@ -6897,6 +6961,16 @@ fn handle_create_namespace(body: &[u8], tenant: &str, state: &AppState) -> Strin
     drop(guard);
     let mut manifest = manifest;
     if typed_schema != kosha_core::NamespaceSchema::default() {
+        // Schema evolution rules (#347), as `POST .../schema` applies them.
+        // A just-created namespace has no documents unless a write landed
+        // since the lock was released.
+        if let Err(error) = kosha_core::schema_evolution::check_schema_change(
+            &manifest.schema.clone().unwrap_or_default(),
+            &typed_schema,
+            namespace_holds_documents(state, std::slice::from_ref(&id)),
+        ) {
+            return requires_reindex_response(&error);
+        }
         match state.indexer.set_schema(&id, typed_schema) {
             Ok(true) => {
                 if let Err(e) = state.publish_namespace(&id) {
@@ -6982,11 +7056,18 @@ fn branches_referencing(
 ///    leftover objects are unreferenced, and a re-created namespace never
 ///    reuses their keys (segment ids carry a random writer id).
 ///
-/// Query replicas keep their own disk cache of the deleted segments until
-/// LRU eviction (`KOSHA_CACHE_MAX_BYTES`); they answer 404 once they see
-/// the control store has no manifest (the next refresher tick, see
-/// `run_manifest_refresh_tick`, or a search with `max_staleness_seconds: 0`).
+/// 5. the prefixes are listed again (the root and, for a sharded
+///    namespace, every shard) and anything a racing upload left behind is
+///    deleted, a bounded number of times (#347). The outcome is kept as an
+///    erasure record (`GET /v1/namespaces/{ns}/erasure`) whose id the
+///    response returns as `erasure_id`.
+///
+/// Query replicas answer 404 once they see the control store has no
+/// manifest (the next refresher tick, see `run_manifest_refresh_tick`, or a
+/// search with `max_staleness_seconds: 0`); the refresher also drops their
+/// local segment files and caches for the namespace then (#347).
 fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String {
+    let requested_at = unix_millis();
     let id = NamespaceId(tenant_namespace(tenant, name));
     // No branch is created from (or deleted under) this namespace while it
     // goes (#208).
@@ -7099,13 +7180,17 @@ fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String
     let dropped = state.indexer.drop_namespace(&id, next_version, || {
         local_cleanup = state.cache.evict_prefix(&id.0);
     });
+    let mut wal_files_pending = 0usize;
     match dropped {
         Ok(0) => {}
-        Ok(shared) => println!(
-            "namespace {} deleted: {shared} WAL file(s) shared with other namespaces are kept \
-             until those flush; recovery skips this namespace's records in them",
-            id.0
-        ),
+        Ok(shared) => {
+            wal_files_pending = shared;
+            println!(
+                "namespace {} deleted: {shared} WAL file(s) shared with other namespaces are \
+                 kept until those flush; recovery skips this namespace's records in them",
+                id.0
+            )
+        }
         Err(e) => {
             return json_error(
                 500,
@@ -7117,41 +7202,500 @@ fn handle_delete_namespace(name: &str, tenant: &str, state: &AppState) -> String
         }
     }
     state.forget_namespace_caches(&id);
-    let mut storage_reclaimed = true;
-    if let Err(e) = local_cleanup {
-        eprintln!(
-            "WARN: namespace {} deleted, local segment cleanup failed: {e}",
-            id.0
-        );
-        storage_reclaimed = false;
-    }
+    let local_ok = match local_cleanup {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "WARN: namespace {} deleted, local segment cleanup failed: {e}",
+                id.0
+            );
+            false
+        }
+    };
+    // Every prefix the namespace's data lives under: its own and, for a
+    // sharded namespace, each shard's (nested below it, so the root's
+    // delete already covers them; listing them too proves it).
+    let prefixes: Vec<String> = std::iter::once(id.0.clone())
+        .chain(shard_ids.iter().map(|shard| shard.0.clone()))
+        .collect();
+    #[cfg_attr(not(feature = "s3"), allow(unused_mut))]
+    let mut s3_objects_deleted = 0u64;
+    #[cfg_attr(not(feature = "s3"), allow(unused_mut))]
+    let mut s3_verified = true;
     #[cfg(feature = "s3")]
     if let Some(ref s3) = state.s3_storage {
         match s3.delete_prefix(&id.0) {
-            Ok(objects) => println!(
-                "namespace deleted: ns={} s3_objects_deleted={objects}",
+            Ok(objects) => {
+                s3_objects_deleted = objects as u64;
+                println!(
+                    "namespace deleted: ns={} s3_objects_deleted={objects}",
+                    id.0
+                )
+            }
+            // The verification below retries what is left.
+            Err(e) => eprintln!(
+                "WARN: namespace {} deleted, but deleting its S3 objects failed: {e}",
                 id.0
             ),
-            Err(e) => {
-                eprintln!(
-                    "WARN: namespace {} deleted, but deleting its S3 objects failed: {e}",
-                    id.0
-                );
-                storage_reclaimed = false;
-            }
+        }
+        let (extra, verified) = verify_prefixes_erased(
+            &prefixes,
+            ERASURE_VERIFY_ATTEMPTS,
+            |prefix| s3.count_prefix_objects(prefix),
+            |prefix| s3.delete_prefix(prefix),
+            |round| std::thread::sleep(Duration::from_millis(200 * (u64::from(round) + 1))),
+        );
+        s3_objects_deleted += extra;
+        s3_verified = verified;
+        if !verified {
+            eprintln!(
+                "WARN: namespace {} deleted, but objects remain under its S3 prefix after \
+                 {ERASURE_VERIFY_ATTEMPTS} verification rounds",
+                id.0
+            );
         }
     }
+    let storage_reclaimed = local_ok && s3_verified;
+    let local_empty = prefixes
+        .iter()
+        .all(|prefix| !state.data_dir.join(prefix).exists());
+    let verified_empty = s3_verified && local_empty;
+    let completed_at = unix_millis();
+    let record = kosha_control::ErasureRecord {
+        id: kosha_control::ErasureRecord::new_id(completed_at),
+        namespace: name.to_string(),
+        tenant: tenant.to_string(),
+        requested_at,
+        completed_at,
+        s3_objects_deleted,
+        verified_empty,
+        local_reclaimed: local_ok && local_empty && wal_files_pending == 0,
+    };
+    let erasure_id = match state.erasures.record(&record) {
+        Ok(()) => Some(record.id.clone()),
+        Err(e) => {
+            eprintln!(
+                "WARN: namespace {} deleted, but its erasure record could not be stored: {e}",
+                id.0
+            );
+            None
+        }
+    };
     println!(
-        "namespace deleted: ns={} version={} segments={} next_version={next_version}",
+        "namespace deleted: ns={} version={} segments={} next_version={next_version} \
+         erasure_id={} verified_empty={verified_empty}",
         id.0,
         manifest.version,
-        manifest.segments.len()
+        manifest.segments.len(),
+        erasure_id.as_deref().unwrap_or("-")
     );
     json_ok(&serde_json::json!({
         "namespace": name,
         "acknowledged": true,
         "storage_reclaimed": storage_reclaimed,
+        "erasure_id": erasure_id,
+        "verified_empty": verified_empty,
+        "s3_objects_deleted": s3_objects_deleted,
+        "wal_files_pending": wal_files_pending,
     }))
+}
+
+/// Verification rounds after a namespace's S3 prefix is deleted (#347).
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+const ERASURE_VERIFY_ATTEMPTS: u32 = 3;
+
+/// List every prefix in `prefixes` (`count`) and delete again whatever is
+/// still there (`delete`), until a round finds all of them empty or
+/// `attempts` rounds have listed. `pause(round)` runs before each retry.
+/// A listing that fails counts as not empty. Returns the objects the
+/// retries deleted and whether the last listing found every prefix empty.
+#[cfg_attr(not(feature = "s3"), allow(dead_code))]
+fn verify_prefixes_erased(
+    prefixes: &[String],
+    attempts: u32,
+    mut count: impl FnMut(&str) -> Result<usize, KoshaError>,
+    mut delete: impl FnMut(&str) -> Result<usize, KoshaError>,
+    mut pause: impl FnMut(u32),
+) -> (u64, bool) {
+    let attempts = attempts.max(1);
+    let mut deleted = 0u64;
+    for round in 0..attempts {
+        let remaining: Vec<&String> = prefixes
+            .iter()
+            .filter(|prefix| match count(prefix) {
+                Ok(0) => false,
+                Ok(n) => {
+                    eprintln!(
+                        "WARN: erasure check: {n} object(s) remain under {prefix} (round {})",
+                        round + 1
+                    );
+                    true
+                }
+                Err(e) => {
+                    eprintln!("WARN: erasure check: cannot list {prefix}: {e}");
+                    true
+                }
+            })
+            .collect();
+        if remaining.is_empty() {
+            return (deleted, true);
+        }
+        if round + 1 >= attempts {
+            break;
+        }
+        pause(round);
+        for prefix in remaining {
+            match delete(prefix) {
+                Ok(n) => deleted += n as u64,
+                Err(e) => eprintln!("WARN: erasure retry: deleting {prefix} failed: {e}"),
+            }
+        }
+    }
+    (deleted, false)
+}
+
+/// The erasure record store for this process (#347): Postgres when the
+/// control plane is, in-memory otherwise.
+fn erasure_store(control_plane_kind: &str) -> Box<dyn kosha_control::ErasureStore> {
+    #[cfg(feature = "postgres")]
+    if control_plane_kind == "postgres" {
+        if let Ok(db_url) = std::env::var("DATABASE_URL") {
+            match kosha_control::PgErasureStore::new(&db_url) {
+                Ok(store) => return Box::new(store),
+                Err(e) => fatal(&format!("cannot connect the erasure record pool: {e}")),
+            }
+        }
+    }
+    let _ = control_plane_kind;
+    Box::new(kosha_control::InMemoryErasureStore::new())
+}
+
+/// `KOSHA_REQUIRE_DELETE_CONFIRMATION=on` (#347): `DELETE
+/// /v1/namespaces/{ns}` must name the namespace again, as `?confirm=<ns>`
+/// or an `X-Kosha-Confirm-Delete: <ns>` header. Off by default so existing
+/// clients keep working.
+fn delete_confirmation_required() -> bool {
+    std::env::var("KOSHA_REQUIRE_DELETE_CONFIRMATION").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "on" | "1" | "true" | "yes" | "enabled"
+        )
+    })
+}
+
+/// `Err` (a ready 400) when `required` and the request does not confirm
+/// deleting `name`.
+fn check_delete_confirmation(
+    required: bool,
+    name: &str,
+    request_line: &str,
+    headers: &HashMap<String, String>,
+) -> Result<(), String> {
+    if !required {
+        return Ok(());
+    }
+    let from_query = parse_method_and_path(request_line)
+        .and_then(|(_, path)| query_param(path, "confirm"))
+        .is_some_and(|confirm| confirm == name);
+    let from_header = headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("x-kosha-confirm-delete") && v.trim() == name);
+    if from_query || from_header {
+        Ok(())
+    } else {
+        Err(json_error(
+            400,
+            &format!(
+                "deleting namespace '{name}' needs confirmation: repeat its name as \
+                 ?confirm={name} or an X-Kosha-Confirm-Delete header \
+                 (KOSHA_REQUIRE_DELETE_CONFIRMATION is on)"
+            ),
+        ))
+    }
+}
+
+/// The URL-decoded value of query parameter `key` in `path`, if present.
+fn query_param(path: &str, key: &str) -> Option<String> {
+    let (_, query) = path.split_once('?')?;
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        (url_decode(k) == key).then(|| url_decode(v))
+    })
+}
+
+/// `DELETE /v1/namespaces/{ns}` as routed: the confirmation check (#347),
+/// then [`handle_delete_namespace`].
+fn handle_delete_namespace_request(
+    name: &str,
+    request_line: &str,
+    headers: &HashMap<String, String>,
+    tenant: &str,
+    state: &AppState,
+) -> String {
+    if let Err(response) =
+        check_delete_confirmation(delete_confirmation_required(), name, request_line, headers)
+    {
+        return response;
+    }
+    handle_delete_namespace(name, tenant, state)
+}
+
+fn erasure_json(record: &kosha_control::ErasureRecord) -> serde_json::Value {
+    serde_json::json!({
+        "erasure_id": record.id,
+        "namespace": record.namespace,
+        "tenant": record.tenant,
+        "requested_at_ms": record.requested_at,
+        "completed_at_ms": record.completed_at,
+        "s3_objects_deleted": record.s3_objects_deleted,
+        "verified_empty": record.verified_empty,
+        "local_reclaimed": record.local_reclaimed,
+    })
+}
+
+/// `GET /v1/namespaces/{ns}/erasure` (#347): the latest erasure record of
+/// the caller's namespace `name`. 404 when it was never deleted.
+fn handle_get_erasure(name: &str, tenant: &str, state: &AppState) -> String {
+    match state.erasures.latest(tenant, name) {
+        Ok(Some(record)) => json_ok(&erasure_json(&record)),
+        Ok(None) => json_error(404, &format!("no erasure record for namespace '{name}'")),
+        Err(e) => json_error(503, &format!("erasure records: {e}")),
+    }
+}
+
+/// `GET /v1/admin/erasures?tenant_id=&limit=` (#347): erasure records,
+/// newest first, for one tenant or all. `limit` defaults to 100, at most
+/// 1000.
+fn handle_list_erasures(request_line: &str, state: &AppState) -> String {
+    let path = parse_method_and_path(request_line).map_or("", |(_, path)| path);
+    let tenant = query_param(path, "tenant_id").filter(|t| !t.is_empty());
+    let limit = match query_param(path, "limit") {
+        None => 100,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if (1..=1000).contains(&n) => n,
+            _ => return json_error(400, "limit must be an integer in 1..=1000"),
+        },
+    };
+    match state.erasures.list(tenant.as_deref(), limit) {
+        Ok(records) => json_ok(&serde_json::json!({
+            "erasures": records.iter().map(erasure_json).collect::<Vec<_>>(),
+        })),
+        Err(e) => json_error(503, &format!("erasure records: {e}")),
+    }
+}
+
+// ─── GET /v1/namespaces/{ns}/export ─────────────────────────────────────────
+
+/// Default and largest page of `GET /v1/namespaces/{ns}/export`.
+const EXPORT_DEFAULT_LIMIT: usize = 1000;
+const EXPORT_MAX_LIMIT: usize = 10_000;
+
+/// Where an export page resumes: the segment (by id, as the namespace's
+/// manifest or merged sharded view lists it) and the doc_seq in it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ExportCursor {
+    #[serde(rename = "s")]
+    segment: String,
+    #[serde(rename = "q")]
+    seq: u32,
+}
+
+impl ExportCursor {
+    fn encode(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(self).unwrap_or_default())
+    }
+
+    fn decode(raw: &str) -> Option<Self> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw.trim())
+            .ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+/// `{method} /v1/namespaces/{ns}{suffix}[?query]`: the URL-decoded
+/// namespace and the raw query string (empty when there is none).
+fn namespace_action_with_query(
+    request_line: &str,
+    method: &str,
+    suffix: &str,
+) -> Option<(String, String)> {
+    let (m, path) = parse_method_and_path(request_line)?;
+    if m != method {
+        return None;
+    }
+    let (bare, query) = path.split_once('?').unwrap_or((path, ""));
+    let ns = bare.strip_prefix("/v1/namespaces/")?.strip_suffix(suffix)?;
+    if ns.is_empty() || ns.contains('/') {
+        return None;
+    }
+    Some((url_decode(ns), query.to_string()))
+}
+
+/// One export page: live documents (`{"id", "fields"}`, the shape
+/// `POST .../documents` takes) in manifest order from `cursor`, deletes
+/// applied, and the cursor of the next page (`None` at the end).
+///
+/// `read(segment_index)` opens the reader of the manifest's segment at that
+/// index. A cursor whose segment the manifest no longer lists (compacted
+/// away between pages) is `Err(410)`.
+fn export_page(
+    manifest: &kosha_core::Manifest,
+    cursor: Option<&ExportCursor>,
+    limit: usize,
+    mut read: impl FnMut(usize) -> Result<kosha_segment::SegmentReader, String>,
+) -> Result<(Vec<kosha_core::Document>, Option<ExportCursor>), String> {
+    let (start_segment, mut seq) = match cursor {
+        None => (0, 0),
+        Some(cursor) => {
+            let Some(at) = manifest
+                .segments
+                .iter()
+                .position(|e| e.segment_id.0 == cursor.segment)
+            else {
+                return Err(json_error(
+                    410,
+                    "export cursor expired: the namespace was compacted since the previous \
+                     page; restart the export without a cursor",
+                ));
+            };
+            (at, cursor.seq)
+        }
+    };
+    let mut docs = Vec::new();
+    for (index, entry) in manifest.segments.iter().enumerate().skip(start_segment) {
+        if index > start_segment {
+            seq = 0;
+        }
+        if seq >= entry.doc_count {
+            continue;
+        }
+        let deleted = manifest.tombstones.get(&entry.segment_id);
+        let live = |s: u32| !deleted.is_some_and(|d| d.contains(&s));
+        if !(seq..entry.doc_count).any(live) {
+            continue;
+        }
+        let reader = read(index)?;
+        let count = reader.doc_count().min(entry.doc_count);
+        while seq < count {
+            if docs.len() == limit {
+                return Ok((
+                    docs,
+                    Some(ExportCursor {
+                        segment: entry.segment_id.0.clone(),
+                        seq,
+                    }),
+                ));
+            }
+            if live(seq) {
+                let record = reader
+                    .doc_record_full(seq)
+                    .map_err(|e| json_error(500, &format!("export: reading a document: {e}")))?
+                    .ok_or_else(|| {
+                        json_error(
+                            500,
+                            &format!(
+                                "export: doc_seq {seq} missing from segment {}",
+                                entry.segment_id.0
+                            ),
+                        )
+                    })?;
+                docs.push(kosha_core::Document {
+                    id: record.doc_id,
+                    fields: record.fields,
+                });
+            }
+            seq += 1;
+        }
+    }
+    Ok((docs, None))
+}
+
+/// `GET /v1/namespaces/{ns}/export?cursor=&limit=` (#347): one page of the
+/// namespace's live documents as JSONL, one `{"id", "fields"}` object per
+/// line (stored fields as indexed, so a page can be re-ingested as is),
+/// across every shard of a sharded namespace, deleted and replaced
+/// documents left out. The next page's opaque cursor is the
+/// `x-kosha-next-cursor` response header, absent on the last page.
+///
+/// Reads the committed segments, like a search: documents still in the
+/// write buffer appear once flushed. A read route: query pods answer it
+/// from their own copy of the manifest and segment files.
+fn handle_export_with_ns(namespace: &str, tenant: &str, query: &str, state: &AppState) -> String {
+    let path = format!("?{query}");
+    let limit = match query_param(&path, "limit").filter(|l| !l.is_empty()) {
+        None => EXPORT_DEFAULT_LIMIT,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if (1..=EXPORT_MAX_LIMIT).contains(&n) => n,
+            _ => {
+                return json_error(
+                    400,
+                    &format!("limit must be an integer in 1..={EXPORT_MAX_LIMIT}"),
+                )
+            }
+        },
+    };
+    let cursor = match query_param(&path, "cursor").filter(|c| !c.is_empty()) {
+        None => None,
+        Some(raw) => match ExportCursor::decode(&raw) {
+            Some(cursor) => Some(cursor),
+            None => return json_error(400, "invalid export cursor"),
+        },
+    };
+    let id = NamespaceId(tenant_namespace(tenant, namespace));
+    if let Err(e) = state.ensure_query_manifest_fresh(&id, None) {
+        return match e {
+            KoshaError::NamespaceNotFound(_) => {
+                json_error(404, &format!("namespace '{namespace}' not found"))
+            }
+            e => json_error(503, &format!("export: {e}")),
+        };
+    }
+    let Some(manifest) = state.indexer.manifest_shared(&id) else {
+        return json_error(404, &format!("namespace '{namespace}' not found"));
+    };
+    let manifest = match state.indexer.shard_count(&id) {
+        Some(_) => state.sharded_view(&id, manifest),
+        None => manifest,
+    };
+    let page = export_page(&manifest, cursor.as_ref(), limit, |index| {
+        let entry = &manifest.segments[index];
+        let dir = manifest.segment_dir(&state.data_dir, &id, &entry.segment_id);
+        #[cfg(feature = "s3")]
+        {
+            let outcome = state.ensure_segments_local(std::slice::from_ref(&dir), false);
+            if let Some(error) = hydration_error_response(&outcome) {
+                return Err(error);
+            }
+        }
+        kosha_segment::SegmentReader::open_with_options(dir, false).map_err(|e| {
+            json_error(
+                503,
+                &format!("export: opening segment {}: {e}", entry.segment_id.0),
+            )
+        })
+    });
+    let (docs, next) = match page {
+        Ok(page) => page,
+        Err(response) => return response,
+    };
+    let mut body = String::new();
+    for doc in &docs {
+        body.push_str(&serde_json::to_string(doc).unwrap_or_default());
+        body.push('\n');
+    }
+    let next_header = next
+        .map(|c| format!("x-kosha-next-cursor: {}\r\n", c.encode()))
+        .unwrap_or_default();
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/x-ndjson\r\n\
+         x-kosha-export-count: {}\r\n{next_header}\r\n{body}",
+        body.len(),
+        docs.len()
+    )
 }
 
 // ─── POST /index ────────────────────────────────────────────────────────────
@@ -8998,6 +9542,20 @@ fn handle_put_schema_with_ns(
             return json_error(409, &conflict);
         }
     }
+    // Schema evolution rules (#347): a change existing documents would
+    // disagree with needs a reindex.
+    let current = state
+        .indexer
+        .manifest_shared(&ns)
+        .and_then(|m| m.schema.clone())
+        .unwrap_or_default();
+    if let Err(error) = kosha_core::schema_evolution::check_schema_change(
+        &current,
+        &schema,
+        namespace_holds_documents(state, &pinned),
+    ) {
+        return requires_reindex_response(&error);
+    }
     let changed = match state.indexer.set_schema(&ns, schema.clone()) {
         Ok(changed) => changed,
         Err(KoshaError::InvalidQuery(message)) => return json_error(400, &message),
@@ -9021,6 +9579,37 @@ fn handle_put_schema_with_ns(
         "schema": schema,
         "changed": changed,
     }))
+}
+
+/// Whether any of `targets` (a namespace and its shards) holds documents,
+/// in a segment or still in the write buffer. Deleted documents count:
+/// their segments keep the old schema's analysis until compaction.
+fn namespace_holds_documents(state: &AppState, targets: &[NamespaceId]) -> bool {
+    targets.iter().any(|target| {
+        state.indexer.pending_doc_count(target) > 0
+            || state
+                .indexer
+                .manifest_shared(target)
+                .is_some_and(|m| m.segments.iter().any(|s| s.doc_count > 0))
+    })
+}
+
+/// The 409 for a schema change that needs a reindex (#347): `code` is
+/// `requires_reindex` and `field` names the field.
+fn requires_reindex_response(error: &kosha_core::schema_evolution::SchemaChangeError) -> String {
+    let message = error.to_string();
+    eprintln!("WARN: request failed: status=409 {message}{}", request_id());
+    let body = serde_json::json!({
+        "error": message,
+        "code": kosha_core::schema_evolution::SchemaChangeError::CODE,
+        "field": error.field,
+        "reason": error.reason,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 409 Conflict\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 /// Set `schema` on every shard of sharded root `ns` and publish the shards
@@ -20021,8 +20610,24 @@ mod tests {
         assert_eq!(sharded["total_hits"], 5, "{sharded}");
         assert_eq!(hits(&sharded), hits(&plain));
 
-        // A later schema change reaches every shard too.
+        // Changing the analyzer of a field the shards hold documents for
+        // needs a reindex (#347)...
         let other = serde_json::json!({"fields": {"name": {"analyzer": ["standard"]}}});
+        let refused = route(
+            "POST /v1/namespaces/s/schema HTTP/1.1\r\n",
+            &HashMap::new(),
+            &serde_json::to_vec(&other).unwrap(),
+            "acme",
+            &state,
+        );
+        assert_eq!(status_of(&refused), 409, "{refused}");
+        assert_eq!(json_body(&refused)["code"], "requires_reindex");
+        assert_eq!(json_body(&refused)["field"], "name");
+        // ...while a later online change (a new field) reaches every shard.
+        let other = serde_json::json!({"fields": {
+            "name": {"analyzer": ["standard", "stem"]},
+            "tag": {"type": "keyword"},
+        }});
         shard_v1(&state, "POST /v1/namespaces/s/schema", other);
         let root_schema = state.indexer.manifest_shared(&root).unwrap().schema.clone();
         assert!(root_schema.is_some());
@@ -20841,6 +21446,490 @@ mod tests {
             assert_eq!(status_of(&found), 200, "{found}");
         }
         assert!(rejections(&state).iter().all(|s| s.value == 0.0));
+    }
+
+    // ── Namespace lifecycle (#347) ─────────────────────────────────────────
+
+    fn ok_json(response: String) -> serde_json::Value {
+        assert_eq!(status_of(&response), 200, "{response}");
+        json_body(&response)
+    }
+
+    #[test]
+    fn hard_delete_records_a_verified_erasure_scoped_to_its_tenant() {
+        let state = test_state();
+        ok_json(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/documents",
+            one_doc("d1", "personal data"),
+        ));
+        ok_json(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/docs/flush",
+            serde_json::json!({}),
+        ));
+        let none = v1(
+            &state,
+            "acme",
+            "GET /v1/namespaces/docs/erasure",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&none), 404, "{none}");
+
+        let deleted = ok_json(v1(
+            &state,
+            "acme",
+            "DELETE /v1/namespaces/docs",
+            serde_json::Value::Null,
+        ));
+        let erasure_id = deleted["erasure_id"].as_str().unwrap().to_string();
+        assert!(erasure_id.starts_with("er_"), "{deleted}");
+        assert_eq!(deleted["verified_empty"], true, "{deleted}");
+        assert!(!state.data_dir.join("acme/docs").exists());
+
+        let record = ok_json(v1(
+            &state,
+            "acme",
+            "GET /v1/namespaces/docs/erasure",
+            serde_json::Value::Null,
+        ));
+        assert_eq!(record["erasure_id"], erasure_id.as_str());
+        assert_eq!(record["namespace"], "docs");
+        assert_eq!(record["tenant"], "acme");
+        assert_eq!(record["verified_empty"], true);
+        assert!(
+            record["completed_at_ms"].as_u64().unwrap()
+                >= record["requested_at_ms"].as_u64().unwrap()
+        );
+        // Another tenant's namespace of the same name has no record.
+        let foreign = v1(
+            &state,
+            "globex",
+            "GET /v1/namespaces/docs/erasure",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&foreign), 404, "{foreign}");
+
+        // Re-created and deleted again: the latest record wins, both stay.
+        ok_json(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces",
+            serde_json::json!({"namespace": "docs"}),
+        ));
+        let second = ok_json(v1(
+            &state,
+            "acme",
+            "DELETE /v1/namespaces/docs",
+            serde_json::Value::Null,
+        ));
+        assert_ne!(second["erasure_id"], erasure_id.as_str());
+        let latest = ok_json(v1(
+            &state,
+            "acme",
+            "GET /v1/namespaces/docs/erasure",
+            serde_json::Value::Null,
+        ));
+        assert_eq!(latest["erasure_id"], second["erasure_id"]);
+
+        // The admin listing, by tenant and overall; it needs the admin key.
+        let listed = ok_json(handle_list_erasures(
+            "GET /v1/admin/erasures?tenant_id=acme HTTP/1.1",
+            &state,
+        ));
+        assert_eq!(listed["erasures"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["erasures"][0]["erasure_id"], second["erasure_id"]);
+        let other = ok_json(handle_list_erasures(
+            "GET /v1/admin/erasures?tenant_id=globex HTTP/1.1",
+            &state,
+        ));
+        assert!(other["erasures"].as_array().unwrap().is_empty());
+        let bad = handle_list_erasures("GET /v1/admin/erasures?limit=0 HTTP/1.1", &state);
+        assert_eq!(status_of(&bad), 400, "{bad}");
+        let unauthorized = v1(
+            &state,
+            "acme",
+            "GET /v1/admin/erasures",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&unauthorized), 403, "{unauthorized}");
+    }
+
+    #[test]
+    fn delete_confirmation_names_the_namespace_when_required() {
+        let none = HashMap::new();
+        let line = "DELETE /v1/namespaces/docs HTTP/1.1";
+        assert!(check_delete_confirmation(false, "docs", line, &none).is_ok());
+        let refused = check_delete_confirmation(true, "docs", line, &none).unwrap_err();
+        assert_eq!(status_of(&refused), 400, "{refused}");
+        assert!(check_delete_confirmation(
+            true,
+            "docs",
+            "DELETE /v1/namespaces/docs?confirm=docs HTTP/1.1",
+            &none
+        )
+        .is_ok());
+        assert!(check_delete_confirmation(
+            true,
+            "docs",
+            "DELETE /v1/namespaces/docs?confirm=other HTTP/1.1",
+            &none
+        )
+        .is_err());
+        let header = HashMap::from([("x-kosha-confirm-delete".to_string(), "docs".to_string())]);
+        assert!(check_delete_confirmation(true, "docs", line, &header).is_ok());
+        let wrong = HashMap::from([("X-Kosha-Confirm-Delete".to_string(), "x".to_string())]);
+        assert!(check_delete_confirmation(true, "docs", line, &wrong).is_err());
+        // The bare-namespace route still matches with the query string.
+        assert_eq!(
+            bare_namespace("DELETE /v1/namespaces/docs?confirm=docs HTTP/1.1", "DELETE"),
+            Some("docs".into())
+        );
+    }
+
+    #[test]
+    fn erasure_verification_retries_until_the_prefixes_list_empty() {
+        let prefixes = vec!["t/ns".to_string(), "t/ns/_shard-0001".to_string()];
+        // A racing upload left 2 objects under one shard; one retry clears it.
+        let remaining = std::cell::RefCell::new(HashMap::from([
+            ("t/ns".to_string(), 0usize),
+            ("t/ns/_shard-0001".to_string(), 2usize),
+        ]));
+        let mut pauses = 0;
+        let (deleted, verified) = verify_prefixes_erased(
+            &prefixes,
+            3,
+            |p| Ok(remaining.borrow()[p]),
+            |p| Ok(std::mem::take(remaining.borrow_mut().get_mut(p).unwrap())),
+            |_| pauses += 1,
+        );
+        assert_eq!((deleted, verified, pauses), (2, true, 1));
+
+        // Objects that never go away (or a listing that keeps failing):
+        // bounded, and reported as not verified.
+        let mut listings = 0;
+        let mut deletes = 0;
+        let (_, verified) = verify_prefixes_erased(
+            &prefixes,
+            3,
+            |p| {
+                listings += 1;
+                if p.ends_with("0001") {
+                    Err(KoshaError::NotFound("list failed".into()))
+                } else {
+                    Ok(1)
+                }
+            },
+            |_| {
+                deletes += 1;
+                Ok(0)
+            },
+            |_| {},
+        );
+        assert!(!verified);
+        assert_eq!((listings, deletes), (6, 4));
+        let (_, verified) = verify_prefixes_erased(&prefixes, 3, |_| Ok(0), |_| Ok(0), |_| {});
+        assert!(verified);
+    }
+
+    /// #347 (c): a query replica drops its local segment files of a
+    /// namespace deleted on the ingest pod, and of an incarnation that was
+    /// deleted and re-created between two refreshes.
+    #[test]
+    fn query_replica_evicts_local_files_of_deleted_namespaces() {
+        let store = outage_store();
+        let ingest = test_state();
+        *ingest.controller.lock().unwrap() = Box::new(store.clone());
+        // Its own disk, as a real query pod has.
+        let mut query = AppState::new(test_dir());
+        query.ingest_host = Some("http://ingest.invalid".into());
+        query.manifest_follow =
+            manifest_follow::ManifestFollow::new(Some(Duration::from_secs(3600)));
+        *query.controller.lock().unwrap() = Box::new(store.clone());
+        let gone = NamespaceId("tenant/gone".into());
+        let again = NamespaceId("tenant/again".into());
+        let kept = NamespaceId("tenant/kept".into());
+        for ns in [&gone, &again, &kept] {
+            index_text_and_publish(&ingest, ns, &["a"]);
+        }
+        query.run_manifest_refresh_tick();
+        // The query pod's hydrated copies of every segment.
+        let cached = |ns: &NamespaceId| -> Vec<PathBuf> {
+            let manifest = query.indexer.manifest_shared(ns).unwrap();
+            manifest
+                .segments
+                .iter()
+                .map(|e| {
+                    let dir = manifest.segment_dir(&query.data_dir, ns, &e.segment_id);
+                    fs::create_dir_all(&dir).unwrap();
+                    fs::write(dir.join("doc_store.bin"), b"cached document bytes").unwrap();
+                    dir
+                })
+                .collect()
+        };
+        let gone_files = cached(&gone);
+        let again_files = cached(&again);
+        let kept_files = cached(&kept);
+        let again_version = query.indexer.manifest_version(&again).unwrap();
+
+        let resp = handle_delete_namespace("gone", "tenant", &ingest);
+        assert_eq!(status_of(&resp), 200, "{resp}");
+        let resp = handle_delete_namespace("again", "tenant", &ingest);
+        assert_eq!(status_of(&resp), 200, "{resp}");
+        index_text_and_publish(&ingest, &again, &["b"]);
+        query.run_manifest_refresh_tick();
+
+        assert!(query.indexer.manifest_version(&gone).is_none());
+        assert!(!query.data_dir.join("tenant/gone").exists());
+        for dir in gone_files.iter().chain(&again_files) {
+            assert!(!dir.exists(), "{} survived", dir.display());
+        }
+        assert!(query.indexer.manifest_version(&again).unwrap() > again_version);
+        for dir in &kept_files {
+            assert!(dir.join("doc_store.bin").exists(), "{}", dir.display());
+        }
+    }
+
+    fn export_all(state: &AppState, tenant: &str, ns: &str, limit: usize) -> Vec<Document> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let line = match &cursor {
+                None => format!("GET /v1/namespaces/{ns}/export?limit={limit}"),
+                Some(c) => format!("GET /v1/namespaces/{ns}/export?limit={limit}&cursor={c}"),
+            };
+            let response = v1(state, tenant, &line, serde_json::Value::Null);
+            assert_eq!(status_of(&response), 200, "{response}");
+            assert_eq!(
+                header_of(&response, "content-type").as_deref(),
+                Some("application/x-ndjson")
+            );
+            let body = response.split_once("\r\n\r\n").unwrap().1;
+            let page: Vec<Document> = body
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert!(page.len() <= limit);
+            assert_eq!(
+                header_of(&response, "x-kosha-export-count"),
+                Some(page.len().to_string())
+            );
+            out.extend(page);
+            pages += 1;
+            assert!(pages < 1000, "export never ended");
+            match header_of(&response, "x-kosha-next-cursor") {
+                Some(next) => cursor = Some(next),
+                None => return out,
+            }
+        }
+    }
+
+    fn export_doc(id: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "fields": [
+                {"name": "body", "field_type": "Text", "value": body},
+                {"name": "k", "field_type": "Keyword", "value": id},
+            ],
+        })
+    }
+
+    /// #347 (2): paging through the export yields exactly the live
+    /// documents, with updates and deletes applied, for a plain and a
+    /// sharded namespace.
+    #[test]
+    fn export_pages_through_exactly_the_live_documents() {
+        let state = test_state();
+        ok_json(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/sh/shards",
+            serde_json::json!({"shards": 3}),
+        ));
+        for ns in ["ex", "sh"] {
+            let mut live: std::collections::BTreeMap<String, String> = Default::default();
+            // Three segments.
+            for batch in 0..3 {
+                let docs: Vec<serde_json::Value> = (0..12)
+                    .map(|i| {
+                        let id = format!("d{}", batch * 12 + i);
+                        let body = format!("original text {id}");
+                        live.insert(id.clone(), body.clone());
+                        export_doc(&id, &body)
+                    })
+                    .collect();
+                ok_json(v1(
+                    &state,
+                    "acme",
+                    &format!("POST /v1/namespaces/{ns}/documents"),
+                    serde_json::json!({"documents": docs}),
+                ));
+                ok_json(v1(
+                    &state,
+                    "acme",
+                    &format!("POST /v1/namespaces/{ns}/flush"),
+                    serde_json::json!({}),
+                ));
+            }
+            // Deletes, including one whole-segment's worth of a range.
+            let dead: Vec<String> = ["d0", "d5", "d13", "d24", "d25", "d35"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            ok_json(v1(
+                &state,
+                "acme",
+                &format!("POST /v1/namespaces/{ns}/delete"),
+                serde_json::json!({"filter": {"terms": {"k": dead}}}),
+            ));
+            for id in &dead {
+                live.remove(id);
+            }
+            // Updates: the new copy replaces the old one.
+            let updated: Vec<serde_json::Value> = ["d1", "d14", "d30"]
+                .iter()
+                .map(|id| {
+                    live.insert(id.to_string(), format!("updated {id}"));
+                    export_doc(id, &format!("updated {id}"))
+                })
+                .collect();
+            ok_json(v1(
+                &state,
+                "acme",
+                "POST /replace",
+                serde_json::json!({"namespace": ns, "documents": updated}),
+            ));
+            ok_json(v1(
+                &state,
+                "acme",
+                &format!("POST /v1/namespaces/{ns}/flush"),
+                serde_json::json!({}),
+            ));
+
+            for limit in [1, 7, 1000] {
+                let exported = export_all(&state, "acme", ns, limit);
+                let mut got: std::collections::BTreeMap<String, String> = Default::default();
+                for doc in &exported {
+                    let body = doc
+                        .fields
+                        .iter()
+                        .find(|f| f.name == "body")
+                        .map(|f| f.value.clone())
+                        .unwrap();
+                    assert!(
+                        got.insert(doc.id.0.clone(), body).is_none(),
+                        "{ns}: {} exported twice (limit {limit})",
+                        doc.id.0
+                    );
+                }
+                assert_eq!(got, live, "{ns}, limit {limit}");
+            }
+        }
+
+        // Errors: bad cursor, bad limit, unknown namespace, another tenant.
+        for (line, status) in [
+            ("GET /v1/namespaces/ex/export?cursor=%%%", 400),
+            ("GET /v1/namespaces/ex/export?limit=0", 400),
+            ("GET /v1/namespaces/ex/export?limit=abc", 400),
+            ("GET /v1/namespaces/nope/export", 404),
+        ] {
+            let response = v1(&state, "acme", line, serde_json::Value::Null);
+            assert_eq!(status_of(&response), status, "{line}: {response}");
+        }
+        let foreign = v1(
+            &state,
+            "globex",
+            "GET /v1/namespaces/ex/export",
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&foreign), 404, "{foreign}");
+        // A cursor into a segment the manifest no longer lists has expired.
+        let stale = ExportCursor {
+            segment: "compacted-away".into(),
+            seq: 3,
+        };
+        let response = v1(
+            &state,
+            "acme",
+            &format!("GET /v1/namespaces/ex/export?cursor={}", stale.encode()),
+            serde_json::Value::Null,
+        );
+        assert_eq!(status_of(&response), 410, "{response}");
+        // Read routes: a query pod answers them itself.
+        assert!(!is_write_path(
+            "GET /v1/namespaces/ex/export?limit=5 HTTP/1.1\r\n"
+        ));
+        assert!(!is_write_path("GET /v1/namespaces/ex/erasure HTTP/1.1\r\n"));
+        assert!(!is_write_path("GET /v1/admin/erasures HTTP/1.1\r\n"));
+    }
+
+    /// #347 (3): `POST .../schema` enforces the evolution rules once the
+    /// namespace holds documents, with a `requires_reindex` 409 naming the
+    /// field.
+    #[test]
+    fn schema_changes_that_need_a_reindex_are_refused_with_documents() {
+        let state = test_state();
+        let put =
+            |schema: serde_json::Value| v1(&state, "acme", "POST /v1/namespaces/sc/schema", schema);
+        // No documents yet: anything goes.
+        ok_json(put(serde_json::json!({"fields": {
+            "title": {"type": "text", "analyzer": ["standard"]},
+            "n": {"type": "integer"},
+        }})));
+        ok_json(put(serde_json::json!({"fields": {
+            "title": {"type": "text", "analyzer": ["standard", "stem"]},
+            "n": {"type": "keyword"},
+        }})));
+        ok_json(v1(
+            &state,
+            "acme",
+            "POST /v1/namespaces/sc/documents",
+            one_doc("d1", "hello"),
+        ));
+        for (schema, field) in [
+            (
+                serde_json::json!({"fields": {
+                    "title": {"type": "keyword", "analyzer": ["standard", "stem"]},
+                    "n": {"type": "keyword"},
+                }}),
+                "title",
+            ),
+            (
+                serde_json::json!({"fields": {
+                    "title": {"type": "text", "analyzer": ["standard"]},
+                    "n": {"type": "keyword"},
+                }}),
+                "title",
+            ),
+            (
+                serde_json::json!({"fields": {
+                    "title": {"type": "text", "analyzer": ["standard", "stem"]},
+                    "n": {"type": "keyword"},
+                }, "default_analyzer": ["standard", "stop"]}),
+                kosha_core::schema_evolution::DEFAULT_ANALYZER_FIELD,
+            ),
+        ] {
+            let refused = put(schema);
+            assert_eq!(status_of(&refused), 409, "{refused}");
+            let body = json_body(&refused);
+            assert_eq!(body["code"], "requires_reindex", "{body}");
+            assert_eq!(body["field"], field, "{body}");
+        }
+        // Buffered documents count too; adding and removing fields is fine.
+        ok_json(put(serde_json::json!({"fields": {
+            "title": {"type": "FIELD_TYPE_TEXT", "analyzer": ["standard", "stem"]},
+            "added": {"type": "keyword"},
+        }})));
+        let schema = ok_json(v1(
+            &state,
+            "acme",
+            "GET /v1/namespaces/sc/schema",
+            serde_json::Value::Null,
+        ));
+        assert!(schema.to_string().contains("added"), "{schema}");
     }
 
     #[test]

@@ -408,7 +408,10 @@ field with that field's own chain.
 query is analyzed per segment with those chains, so changing the schema (or the tokenizer version)
 never makes existing segments return zero hits: they answer as they were written until compaction
 rewrites them, re-analyzing their stored documents under the current schema. An invalid schema is
-rejected with a 400 and changes nothing.
+rejected with a 400 and changes nothing. Once a namespace holds documents, a change those documents
+would disagree with (a field's type, analyzer or vector dimension) is refused with a 409
+`requires_reindex` naming the field; adding or removing fields stays online. See
+[docs/schema-evolution.md](docs/schema-evolution.md).
 
 **Why `standard` still means the legacy tokenizer.** The Unicode tokenizer is opt-in
 (`standard@2`), not the new default, for three reasons: segments written with no schema stay
@@ -448,6 +451,9 @@ the routes marked *write* to the ingest pod.
 | `POST /v1/namespaces/{ns}/search` | `SearchRequest` → `SearchResponse` | 404 for a missing namespace. |
 | `POST /v1/namespaces/{ns}/exists` | ids → per-id existence | |
 | `GET /v1/namespaces/{ns}/stats` | → `NamespaceStats` | 404 for a missing namespace. |
+| `GET /v1/namespaces/{ns}/export?cursor=&limit=` | → JSONL, one `{"id", "fields"}` per line | One page (default 1000, at most 10000) of the namespace's live documents across shards, deletes and updates applied (#347). The next page's cursor is the `x-kosha-next-cursor` header, absent on the last page; 410 if a compaction removed the cursor's segment (restart). Reads committed segments, like a search. |
+| `GET /v1/namespaces/{ns}/erasure` | → the latest erasure record | When the namespace was last hard-deleted and whether storage was verified empty (#347). 404 if it never was. |
+| `GET /v1/admin/erasures?tenant_id=&limit=` | → `{"erasures": [...]}` | Admin key only. Erasure records, newest first. |
 | `GET /v1/healthz`, `GET /healthz`, `GET /readyz` | | Unauthenticated probes. |
 | `GET /metrics` | → Prometheus text format | Unauthenticated unless `KOSHA_METRICS_AUTH=admin`; see [docs/metrics.md](docs/metrics.md). |
 | `GET /dashboard` | | Read-only web UI, `KOSHA_DASHBOARD=on` only (404 otherwise); see [docs/dashboard.md](docs/dashboard.md). |
@@ -474,12 +480,22 @@ under the namespace's publication lock:
    If that fails, the namespace is still deleted and the response says
    `"storage_reclaimed": false`; the leftover objects are unreferenced, and a
    re-created namespace never reuses their keys.
+5. The namespace's prefixes (and each shard's) are listed again; anything left
+   (a racing upload) is deleted, up to three rounds (#347). The outcome is
+   stored as an erasure record (`requested_at`, `completed_at`,
+   `s3_objects_deleted`, `verified_empty`, `local_reclaimed`) whose id the
+   response returns as `erasure_id`, next to `verified_empty`. Read it back
+   with `GET /v1/namespaces/{ns}/erasure`. With
+   `KOSHA_REQUIRE_DELETE_CONFIRMATION=on` the request must repeat the name, as
+   `?confirm={ns}` or an `X-Kosha-Confirm-Delete: {ns}` header.
 
 Query pods answer 404 for the namespace once they see the control store has no
 manifest for it: within one manifest refresh (`KOSHA_MANIFEST_REFRESH_MS`,
-default 500 ms), or at once for a search with `max_staleness_seconds: 0`. Their local disk copies of its segments are not removed
-eagerly; the LRU cache (`KOSHA_CACHE_MAX_BYTES`) evicts them. Re-creating the
-namespace, explicitly or by writing to it, starts it empty.
+default 500 ms), or at once for a search with `max_staleness_seconds: 0`. The
+manifest refresher then also removes their local copies of its segment files and
+its caches (#347), including when the namespace was deleted and re-created
+between two refreshes. Re-creating the namespace, explicitly or by writing to
+it, starts it empty.
 
 ## Late interaction
 

@@ -1407,6 +1407,20 @@ impl S3Storage {
         })
     }
 
+    /// How many objects remain under the logical directory `path` (the
+    /// same `path/` key prefix [`Self::delete_prefix`] deletes), read from
+    /// the bucket, never the local cache. Used to verify a namespace hard
+    /// delete left nothing behind (#347).
+    pub fn count_prefix_objects(&self, path: &str) -> Result<usize, KoshaError> {
+        if path.trim_matches('/').is_empty() {
+            return Err(KoshaError::NotFound(
+                "refusing to list the whole S3 prefix".into(),
+            ));
+        }
+        let dir = format!("{}/", path.trim_end_matches('/'));
+        Ok(self.list_objects_remote(&dir)?.len())
+    }
+
     /// Ground-truth durability check for one segment prefix, unlike
     /// `StorageBackend::exists` (local disk only) or `list_with_sizes`/`list`
     /// (which fall back to local on an empty S3 listing, so they can't tell

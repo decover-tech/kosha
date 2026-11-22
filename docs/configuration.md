@@ -564,3 +564,9 @@ These do not start with `KOSHA_` but change server behavior:
 | `DATABASE_URL` | Postgres control plane and API-key registry (**postgres**). Required by `kosha-server migrate` |
 | `POD_IP` | This pod's IP, used as its peer-hydration address (**s3** + **postgres**) |
 | `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `AWS_REGION` | Fallbacks for the `KOSHA_S3_*` settings above |
+
+## Namespace lifecycle
+
+| Variable | Purpose | Default | Unit |
+| --- | --- | --- | --- |
+| `KOSHA_REQUIRE_DELETE_CONFIRMATION` | `on` (or `1`, `true`, `yes`) makes `DELETE /v1/namespaces/{ns}` require the namespace name again, as `?confirm={ns}` or an `X-Kosha-Confirm-Delete: {ns}` header; without it the delete is a 400. Off so existing clients keep working (#347) | off | flag |

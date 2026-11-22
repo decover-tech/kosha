@@ -148,6 +148,12 @@ async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static 
         .execute(&mut *tx)
         .await
         .map_err(|e| (e, "migration 003 failed"))?;
+    // Namespace erasure records (#347): additive, idempotent.
+    let migration = include_str!("../migrations/005_namespace_erasures.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 005 failed"))?;
     tx.commit().await.map_err(|e| (e, FAILED))
 }
 

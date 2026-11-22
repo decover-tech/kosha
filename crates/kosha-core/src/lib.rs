@@ -19,6 +19,7 @@ pub use histogram::{
 };
 pub mod docset;
 pub mod nested;
+pub mod schema_evolution;
 pub mod sharding;
 pub mod tenancy;
 pub use analysis::{
