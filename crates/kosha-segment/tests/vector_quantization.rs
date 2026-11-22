@@ -354,6 +354,48 @@ fn a_deletes_only_restriction_does_not_refill_a_segment_outside_the_budget() {
     }
 }
 
+/// A unit-norm f32 column is scored with one dot product against the
+/// normalized query, and its centroids ranked the same way. The scores must
+/// still be the cosine similarity of the original vectors, whatever the
+/// query's magnitude.
+#[test]
+fn budgeted_probe_of_an_f32_column_returns_cosine_scores_for_any_query_magnitude() {
+    let n = 500;
+    let dir = temp_dir("unit-dot");
+    write(
+        &dir,
+        VectorStoreMode::Inline,
+        VectorQuantizationConfig::default(),
+        docs(n),
+    );
+    let reader = SegmentReader::open(dir.clone()).unwrap();
+    for seed in [77_777u64, 12_345, 999] {
+        let unit = vector(seed, DIM);
+        let want = brute_force(n, &unit, 10);
+        for scale in [1.0f32, 37.5, 0.001] {
+            let query: Vec<f32> = unit.iter().map(|x| x * scale).collect();
+            let got = knn_within(&reader, &query, 10);
+            assert_eq!(
+                got.iter().map(|h| h.0).collect::<Vec<_>>(),
+                want.iter().map(|h| h.0).collect::<Vec<_>>(),
+                "scale {scale}"
+            );
+            for ((_, score), (_, exact)) in got.iter().zip(&want) {
+                assert!((score - exact).abs() < 1e-5, "{score} vs {exact}");
+            }
+            // The centroid scores do not depend on the query's length.
+            let bounds = reader.knn_centroid_distances("emb", &query).unwrap();
+            let base = reader.knn_centroid_distances("emb", &unit).unwrap();
+            for (a, b) in bounds.iter().zip(&base) {
+                assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+            }
+        }
+    }
+    // A zero query scores 0 against everything, as cosine similarity does.
+    let zero = vec![0.0f32; DIM];
+    assert!(knn_within(&reader, &zero, 3).iter().all(|(_, s)| *s == 0.0));
+}
+
 #[test]
 fn inline_vector_segments_score_with_i8_estimates() {
     // No `doc_vectors.bin` to rescore from: the i8 scores stand.
