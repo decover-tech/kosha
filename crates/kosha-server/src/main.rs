@@ -34,6 +34,8 @@ fn namespace_tenant(ns: &str) -> Option<&str> {
 const SERVICE_TENANT: &str = "service";
 
 mod api_key_admin;
+#[cfg(test)]
+mod api_spec_tests;
 mod auth;
 mod authz;
 mod branching;
@@ -62,6 +64,7 @@ mod org_admin;
 mod posting_spans;
 mod rerank;
 mod role;
+mod routes;
 #[cfg(feature = "s3")]
 mod s3_storage;
 #[cfg(feature = "s3")]
@@ -1074,7 +1077,12 @@ fn publication_error(context: &str, error: &KoshaError) -> String {
 /// Add a `Retry-After` header to a ready-made response, right after its
 /// status line.
 fn retry_after(response: String, secs: u64) -> String {
-    response.replacen("\r\n", &format!("\r\nretry-after: {secs}\r\n"), 1)
+    with_header(response, "retry-after", &secs.to_string())
+}
+
+/// Add one header to a ready-made response, right after its status line.
+fn with_header(response: String, name: &str, value: &str) -> String {
+    response.replacen("\r\n", &format!("\r\n{name}: {value}\r\n"), 1)
 }
 
 /// Upload a segment directory to S3 and commit it: every data file first,
@@ -6066,18 +6074,17 @@ fn tenant_is_limited(state: &AppState, tenant: &str) -> bool {
     state.tenant_limits.enabled() && tenant != SERVICE_TENANT
 }
 
-/// A search route, in any of its forms: `POST /v1/namespaces/{ns}/search`,
-/// and the legacy `POST /search` and `GET /search?...`.
+/// A search route, in any of its forms: `POST /v1/namespaces/{ns}/search`
+/// (its [`routes::ROUTES`] row), and the legacy `POST /search` and
+/// `GET /search?...`.
 fn is_search_route(request_line: &str) -> bool {
-    parse_method_and_path(request_line).is_some_and(|(method, path)| {
-        let path = path.split('?').next().unwrap_or(path);
-        ((method == "POST" || method == "GET") && path == "/search")
-            || (method == "POST"
-                && path
-                    .strip_prefix("/v1/namespaces/")
-                    .and_then(|rest| rest.strip_suffix("/search"))
-                    .is_some_and(|ns| !ns.is_empty() && !ns.contains('/')))
-    })
+    if let Some(route) = routes::lookup_line(request_line) {
+        return route.class == routes::Class::Search;
+    }
+    matches!(
+        legacy_route(request_line),
+        Some(("POST" | "GET", "/search"))
+    )
 }
 
 /// The 429 for a request refused by a tenant limit: `Retry-After` plus a
@@ -6468,72 +6475,43 @@ fn authenticate(headers: &HashMap<String, String>) -> Result<auth::Principal, St
     }
 }
 
-/// True for every write-mutating route `route()` dispatches to a
-/// mutation-performing handler (index/flush/replace/delete/admin) — the set
-/// a query pod forwards to `KOSHA_INGEST_HOST` instead of handling locally.
-/// False for read-only routes (search/exists/stats/healthz), which every
-/// pod always handles itself.
+/// True for every write-mutating route — the set a query pod forwards to
+/// `KOSHA_INGEST_HOST` instead of handling locally. False for read-only
+/// routes (search/exists/stats/healthz), which every pod always handles
+/// itself.
 ///
-/// **Keep this in sync with `route()`'s own dispatch table below** — this
-/// intentionally mirrors it rather than sharing one lookup, since `route()`
-/// needs to actually execute the matched handler while this only needs a
-/// yes/no classification before a handler ever runs. If a new write route
-/// is added to `route()`, add its prefix here too.
+/// `/v1` routes are classified by their row in [`routes::ROUTES`] (#350),
+/// the same table `route()` admits them by, so the two cannot drift. Only
+/// the legacy unversioned routes are matched here by hand, exactly.
 fn is_write_path(request_line: &str) -> bool {
-    // Namespace lifecycle: create and delete.
-    if is_create_namespace_route(request_line) || bare_namespace(request_line, "DELETE").is_some() {
-        return true;
+    if let Some(route) = routes::lookup_line(request_line) {
+        return matches!(
+            route.class,
+            routes::Class::Write | routes::Class::WriterRead
+        );
     }
-    // v1 tenant-scoped write routes.
-    if extract_namespace(request_line, "POST /v1/namespaces/", "/documents").is_some() {
-        return true;
-    }
-    if extract_namespace(request_line, "POST /v1/namespaces/", "/flush").is_some() {
-        return true;
-    }
-    if extract_namespace(request_line, "POST /v1/namespaces/", "/delete").is_some() {
-        return true;
-    }
-    if extract_namespace(request_line, "POST /v1/namespaces/", "/schema").is_some() {
-        return true;
-    }
-    if extract_namespace(request_line, "POST /v1/namespaces/", "/shards").is_some() {
-        return true;
-    }
-    // Branch create/delete (#208) write manifests and reclaim objects.
-    if extract_namespace(request_line, "POST /v1/namespaces/", "/branch").is_some()
-        || extract_namespace(request_line, "DELETE /v1/namespaces/", "/branch").is_some()
-    {
-        return true;
-    }
-    // v1 admin routes — all mutate segment/manifest state.
-    if request_line.starts_with("POST /v1/admin/") {
-        return true;
-    }
-    // The one admin DELETE: removing an organization member (#345).
-    if request_line.starts_with("DELETE /v1/admin/orgs/") {
-        return true;
-    }
-    // Tenant deletion (#347).
-    if namespace_deletion::is_write_route(request_line) {
-        return true;
-    }
-    // Compaction jobs and scheduler state live on the write pod that runs
-    // them; a query pod has none, so these reads are forwarded too.
-    if request_line.starts_with("GET /v1/admin/compaction-") {
-        return true;
-    }
-    // Legacy (pre-v1) write routes.
-    if request_line.starts_with("POST /index")
-        || request_line.starts_with("POST /replace")
-        || request_line.starts_with("POST /flush")
-        || request_line.starts_with("POST /delete")
-    {
-        return true;
-    }
-    // Everything else — /search, /exists, /stats, /healthz, and their v1
-    // equivalents — is read-only.
-    false
+    matches!(
+        legacy_route(request_line),
+        Some(("POST", "/index" | "/replace" | "/flush" | "/delete"))
+    )
+}
+
+/// The unversioned paths that predate `/v1` (ADR-350 §c).
+const LEGACY_ROUTES: [&str; 7] = [
+    "/index", "/exists", "/replace", "/search", "/flush", "/delete", "/stats",
+];
+
+/// `(method, path)` of a request on one of the legacy unversioned routes
+/// (`POST /index`, `GET /search?...`, ...), matched exactly; `None` for any
+/// other request.
+fn legacy_route(request_line: &str) -> Option<(&str, &'static str)> {
+    let (method, path) = parse_method_and_path(request_line)?;
+    let bare = path.split('?').next().unwrap_or(path);
+    let path = LEGACY_ROUTES
+        .iter()
+        .copied()
+        .find(|legacy| *legacy == bare)?;
+    Some((method, path))
 }
 
 /// Forward a write-path request to the single ingest pod, verbatim, and
@@ -6666,6 +6644,9 @@ fn route(
         if !service_authorized(headers, state.admin_auth_key.as_deref()) {
             return json_error(403, "admin credential required");
         }
+        if let Some(response) = unrouted_v1(method, path) {
+            return response;
+        }
         // Organizations, users, projects, audit log (#345).
         let key_table = match auth::global() {
             auth::Auth::Keys(keys) => Some(keys),
@@ -6705,10 +6686,7 @@ fn route(
             }
         }
         let bare_path = path.split('?').next().unwrap_or(path);
-        let is_legacy = matches!(
-            bare_path,
-            "/index" | "/exists" | "/replace" | "/search" | "/flush" | "/delete" | "/stats"
-        );
+        let is_legacy = legacy_route(request_line).is_some();
         if is_legacy {
             if !auth::legacy_routes_enabled() {
                 return json_error(
@@ -6719,7 +6697,7 @@ fn route(
             }
             auth::record_legacy_use(tenant, bare_path);
         }
-        if path == "/stats" || path == "/v1/stats" {
+        if method == "GET" && (bare_path == "/stats" || bare_path == "/v1/stats") {
             return if service_authorized(headers, state.admin_auth_key.as_deref()) {
                 handle_stats(state)
             } else {
@@ -6782,20 +6760,37 @@ fn route(
             let scoped = format!("GET /search?{} HTTP/1.1", pairs.join("&"));
             return route_inner(&scoped, headers, body, tenant, state);
         }
-        if !path.starts_with("/v1/namespaces/")
-            && ![
-                "/healthz",
-                "/v1/healthz",
-                "/v1/namespaces",
-                "/v1/usage",
-                "/v1/billing",
-            ]
-            .contains(&bare_path)
-        {
+        if bare_path.starts_with("/v1/") {
+            if let Some(response) = unrouted_v1(method, path) {
+                return response;
+            }
+        } else if bare_path != "/healthz" {
             return json_error(404, "not found");
         }
     }
     route_inner(request_line, headers, body, tenant, state)
+}
+
+/// The 404 (unknown path) or 405 with `Allow` (known path, wrong method)
+/// for a `/v1` request [`routes::ROUTES`] does not serve; `None` when it
+/// does. Everything `route_inner` answers under `/v1` must have a row.
+fn unrouted_v1(method: &str, path: &str) -> Option<String> {
+    if routes::lookup(method, path).is_some() {
+        return None;
+    }
+    let allowed = routes::allowed_methods(path);
+    if allowed.is_empty() {
+        return Some(json_error(404, "not found"));
+    }
+    let allow = allowed.join(", ");
+    Some(with_header(
+        json_error(
+            405,
+            &format!("method {method} is not allowed on this path (allowed: {allow})"),
+        ),
+        "allow",
+        &allow,
+    ))
 }
 
 fn route_inner(
@@ -6805,8 +6800,9 @@ fn route_inner(
     tenant: &str,
     state: &AppState,
 ) -> String {
-    // ── v1 proto-defined routes ────────────────────────────────────────────
-    // proto/kosha/v1/kosha.proto is the canonical source of truth for paths.
+    // ── v1 routes ──────────────────────────────────────────────────────────
+    // `route` admitted only paths in `routes::ROUTES` (#350), the table the
+    // checked-in OpenAPI documents are tested against.
     if request_line.starts_with("GET /v1/healthz") {
         return json_ok(&serde_json::json!({"status": "ok"}));
     }
@@ -6825,6 +6821,10 @@ fn route_inner(
 
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/documents") {
         return handle_index_with_ns(&ns, tenant, body, state);
+    }
+
+    if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/replace") {
+        return handle_replace_with_ns(&ns, tenant, body, state);
     }
 
     if let Some(ns) = extract_namespace(request_line, "POST /v1/namespaces/", "/search") {
@@ -7046,7 +7046,8 @@ fn bare_namespace(request_line: &str, method: &str) -> Option<String> {
 
 // ─── POST /v1/namespaces, DELETE /v1/namespaces/{ns} ────────────────────────
 
-/// Proto `FieldType` names (`proto/kosha/v1/kosha.proto`), by enum number.
+/// Canonical schema field type names (`FieldSchema.type` in
+/// `proto/kosha/v1/kosha.proto`), by their historical enum number.
 const SCHEMA_FIELD_TYPES: [&str; 8] = [
     "FIELD_TYPE_UNSPECIFIED",
     "FIELD_TYPE_TEXT",
@@ -9172,6 +9173,24 @@ fn handle_index_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppS
     handle_index(&modified_body, state)
 }
 
+/// `POST /v1/namespaces/{ns}/replace` (#350): the `/v1` form of legacy
+/// `POST /replace`. Replace by id; a partial document is merged onto the
+/// latest stored copy (OpenSearch `_update` semantics). A separate path
+/// rather than a mode on `/documents`, so an older server answers 404
+/// instead of silently treating partial patches as full upserts.
+fn handle_replace_with_ns(namespace: &str, tenant: &str, body: &[u8], state: &AppState) -> String {
+    let scoped_ns = tenant_namespace(tenant, namespace);
+    let mut body_val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
+    };
+    if let Some(obj) = body_val.as_object_mut() {
+        obj.insert("namespace".into(), serde_json::json!(scoped_ns));
+    }
+    let modified_body = serde_json::to_vec(&body_val).unwrap_or_else(|_| body.to_vec());
+    handle_replace(&modified_body, state)
+}
+
 /// `POST /v1/namespaces/{ns}/schema` — set the namespace schema (#220).
 /// The body is a proto `NamespaceSchema` (`{"fields": {...}}`), or one
 /// wrapped as `{"schema": {...}}` like `CreateNamespaceRequest`. Only the
@@ -11191,6 +11210,7 @@ fn json_error(status_code: u16, message: &str) -> String {
         401 => "401 Unauthorized",
         403 => "403 Forbidden",
         404 => "404 Not Found",
+        405 => "405 Method Not Allowed",
         409 => "409 Conflict",
         410 => "410 Gone",
         413 => "413 Payload Too Large",
@@ -11910,9 +11930,11 @@ mod tests {
             ("DELETE /v1/namespaces/..", 400),
             ("DELETE /v1/namespaces/", 400),
             ("DELETE /v1/namespaces/%2F", 400),
-            ("GET /v1/namespaces/docs", 404),
+            // Known paths, wrong method: 405 with `Allow` (#350).
+            ("GET /v1/namespaces/docs", 405),
             // `GET /v1/namespaces` lists the tenant's namespaces (#214).
-            ("DELETE /v1/namespaces", 404),
+            ("DELETE /v1/namespaces", 405),
+            ("GET /v1/namespaces/docs/nope", 404),
             ("DELETE /v1/namespaces/missing", 404),
         ] {
             let resp = v1(&state, "acme", line, serde_json::Value::Null);
@@ -20693,14 +20715,14 @@ mod tests {
             serde_json::Value::Null,
         );
         assert_eq!(body_of(&resp)["namespaces"], serde_json::json!([]));
-        // The bare per-namespace path is still not a route.
+        // The bare per-namespace path only takes DELETE: a 405 (#350).
         let resp = v1(
             &state,
             "acme",
             "GET /v1/namespaces/docs",
             serde_json::Value::Null,
         );
-        assert_eq!(status_of(&resp), 404, "{resp}");
+        assert_eq!(status_of(&resp), 405, "{resp}");
     }
 
     #[test]

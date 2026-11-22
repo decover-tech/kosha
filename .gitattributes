@@ -1,0 +1,3 @@
+# Generated from proto/ by `make openapi` (#350); reviewed as a diff, not by hand.
+api/openapi/** linguist-generated=true
+proto/kosha/v1/admin.proto linguist-generated=true

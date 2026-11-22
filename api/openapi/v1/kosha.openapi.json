@@ -1,0 +1,4252 @@
+{
+  "components": {
+    "schemas": {
+      "KoshaServiceBranchNamespaceBody": {
+        "properties": {
+          "name": {
+            "description": "The new branch.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "KoshaServiceDeleteByQueryBody": {
+        "properties": {
+          "filter": {
+            "description": "Kosha-native filter (term/terms/range/bool/exists/geo_distance).",
+            "type": "object"
+          },
+          "query": {
+            "description": "OpenSearch-style alias of `filter`.",
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "KoshaServiceExistsBody": {
+        "properties": {
+          "ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ids"
+        ],
+        "type": "object"
+      },
+      "KoshaServiceFlushBody": {
+        "type": "object"
+      },
+      "KoshaServiceIndexDocumentsBody": {
+        "properties": {
+          "documents": {
+            "items": {
+              "$ref": "#/components/schemas/v1Document"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "documents"
+        ],
+        "type": "object"
+      },
+      "KoshaServicePutShardsBody": {
+        "properties": {
+          "shards": {
+            "description": "1 to 256.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "shards"
+        ],
+        "type": "object"
+      },
+      "KoshaServiceReplaceDocumentsBody": {
+        "properties": {
+          "documents": {
+            "description": "Full or partial documents, matched by `id`.",
+            "items": {
+              "$ref": "#/components/schemas/v1Document"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "documents"
+        ],
+        "type": "object"
+      },
+      "KoshaServiceSearchBody": {
+        "properties": {
+          "aggs": {
+            "additionalProperties": {
+              "type": "object"
+            },
+            "description": "Aggregations keyed by name (terms, histogram, date_histogram, range,\nstats, composite, ...).",
+            "type": "object"
+          },
+          "bm25_params": {
+            "$ref": "#/components/schemas/v1Bm25Params"
+          },
+          "collapse": {
+            "$ref": "#/components/schemas/v1CollapseSpec"
+          },
+          "consistency": {
+            "description": "Read-your-writes (#255): \"strong\" also scans the namespace's\nacknowledged-but-unindexed writes; \"eventual\" searches indexed segments\nonly. Unset uses the server default (KOSHA_DEFAULT_CONSISTENCY, itself\nstrong).",
+            "enum": [
+              "strong",
+              "eventual"
+            ],
+            "type": "string"
+          },
+          "exact_total_hits": {
+            "description": "Count every match instead of stopping at `total_hits_cap`.",
+            "type": "boolean"
+          },
+          "fields": {
+            "description": "Restrict query_text to these Text fields, each optionally boosted:\n[\"title^2\", \"content\"]. Empty = every Text field; \"_all\" names that\nexplicitly.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "filter": {
+            "description": "Kosha-native filter clause (term/terms/range/bool/exists/geo_distance).",
+            "type": "object"
+          },
+          "from": {
+            "description": "Offset of the page (default 0).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "fuzzy": {
+            "$ref": "#/components/schemas/v1FuzzyQuery"
+          },
+          "highlight": {
+            "description": "Highlighting (#195): `{\"fields\": {\"title\": {}, \"body\": {\"pre_tags\":\n[\"<em>\"]}}, \"pre_tags\": [..], \"post_tags\": [..]}`, or the deprecated\nsingle-field `{\"field\": \"title\"}`.",
+            "type": "object"
+          },
+          "knn": {
+            "$ref": "#/components/schemas/v1KnnQuery"
+          },
+          "limit_per": {
+            "$ref": "#/components/schemas/v1LimitPer"
+          },
+          "match_phrase": {
+            "$ref": "#/components/schemas/v1MatchPhraseQuery"
+          },
+          "max_results": {
+            "description": "Page size (default 10).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "max_staleness_seconds": {
+            "description": "Query replicas only (#232): accept a manifest at most this many\nseconds old instead of checking the control store first.",
+            "format": "double",
+            "type": "number"
+          },
+          "mode": {
+            "description": "\"lexical\", \"semantic\" or \"hybrid\". Unset infers it from the clauses\npresent; a set value is checked against them.",
+            "enum": [
+              "lexical",
+              "semantic",
+              "hybrid"
+            ],
+            "type": "string"
+          },
+          "no_cache": {
+            "description": "Bypass the result cache.",
+            "type": "boolean"
+          },
+          "operator": {
+            "description": "How query_text terms combine: \"or\" (default) or \"and\".",
+            "enum": [
+              "and",
+              "or"
+            ],
+            "type": "string"
+          },
+          "query_text": {
+            "description": "The lexical query; \"\" for a query with no lexical part (kNN only,\nfilter only, fuzzy).",
+            "type": "string"
+          },
+          "rank": {
+            "$ref": "#/components/schemas/v1Rank"
+          },
+          "rank_by": {
+            "description": "Score modifiers: field-value boosts and linear / exp / gauss decays\nover Integer, Float, Date and GeoPoint fields, applied to the best\n`window_size` hits. See README \"Score modifiers\".",
+            "type": "object"
+          },
+          "rerank": {
+            "$ref": "#/components/schemas/v1Rerank"
+          },
+          "search_after": {
+            "description": "Keyset pagination: the `sort` values of the last hit of the previous\npage, as strings.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "sort": {
+            "description": "Sort keys, in order: `[{\"date\": {\"order\": \"desc\"}}, {\"_score\": {...}}]`.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "source_excludes": {
+            "description": "Leave out these stored fields.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source_includes": {
+            "description": "Return only these stored fields.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "timings": {
+            "description": "With the dashboard on (#214): add the phase breakdown `timings` to the\nresponse.",
+            "type": "boolean"
+          },
+          "total_hits_cap": {
+            "description": "Count matches up to this many (default 10,000), then report\n`total_hits_relation: \"gte\"`.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "wildcard": {
+            "$ref": "#/components/schemas/v1WildcardQuery"
+          }
+        },
+        "required": [
+          "query_text"
+        ],
+        "type": "object"
+      },
+      "protobufNullValue": {
+        "description": "`NullValue` is a singleton enumeration to represent the null value for the\n`Value` type union.\n\nThe JSON representation for `NullValue` is JSON `null`.",
+        "type": "string"
+      },
+      "v1Bm25Params": {
+        "properties": {
+          "b": {
+            "format": "double",
+            "type": "number"
+          },
+          "k1": {
+            "format": "double",
+            "type": "number"
+          },
+          "stats": {
+            "description": "Corpus statistics scope: \"namespace\" (default) or \"segment\".",
+            "enum": [
+              "namespace",
+              "segment"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "v1BranchLineage": {
+        "properties": {
+          "parent": {
+            "type": "string"
+          },
+          "parent_version": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "shared_segments": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1BranchNamespaceResponse": {
+        "description": "The new branch (same fields as `NamespaceBranch`).",
+        "properties": {
+          "documents": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parent": {
+            "type": "string"
+          },
+          "parent_version": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "segments": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "shared_segments": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1BranchReclaim": {
+        "properties": {
+          "errors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "kept": {
+            "description": "Still referenced by another branch.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "local_files": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "remote_objects": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1CollapseSpec": {
+        "properties": {
+          "field": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "field"
+        ],
+        "type": "object"
+      },
+      "v1CreateNamespaceRequest": {
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "schema": {
+            "$ref": "#/components/schemas/v1NamespaceSchema"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "v1CreateNamespaceResponse": {
+        "properties": {
+          "created_at": {
+            "description": "Unix timestamp (seconds).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "document_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "description": "The namespace name (tenant-relative).",
+            "type": "string"
+          },
+          "schema": {
+            "$ref": "#/components/schemas/v1NamespaceSchema"
+          },
+          "segment_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1DeleteBranchResponse": {
+        "properties": {
+          "deleted": {
+            "type": "string"
+          },
+          "parent": {
+            "type": "string"
+          },
+          "reclaimed": {
+            "$ref": "#/components/schemas/v1BranchReclaim"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1DeleteByQueryResponse": {
+        "properties": {
+          "deleted": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "v1DeleteNamespaceResponse": {
+        "properties": {
+          "acknowledged": {
+            "type": "boolean"
+          },
+          "deletion": {
+            "$ref": "#/components/schemas/v1DeletionRecord"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "storage_reclaimed": {
+            "description": "False when the namespace was deleted but some of its stored objects\n(local segment files or S3 objects) could not be removed. They are\nunreferenced and never reused by a re-created namespace.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "v1DeletionRecord": {
+        "description": "One hard delete of a namespace or a tenant, as the control store keeps it\n(kosha.deletion_records). Holds identifiers and counters only.",
+        "properties": {
+          "attempts": {
+            "description": "Storage-reclaim attempts so far.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "completed_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_error": {
+            "description": "Why the last attempt did not complete.",
+            "type": "string"
+          },
+          "last_version": {
+            "description": "Namespace scope: the manifest version the namespace retired at.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "objects_deleted": {
+            "description": "Objects deleted from object storage, summed over the attempts.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "parent_id": {
+            "description": "The tenant deletion a namespace deletion is part of.",
+            "type": "string"
+          },
+          "requested_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "scope": {
+            "description": "\"namespace\" or \"tenant\".",
+            "enum": [
+              "namespace",
+              "tenant"
+            ],
+            "type": "string"
+          },
+          "state": {
+            "description": "\"pending\" (rows gone, stored objects may remain) or \"completed\".",
+            "enum": [
+              "pending",
+              "completed"
+            ],
+            "type": "string"
+          },
+          "subject": {
+            "description": "Internal namespace id (\"<tenant>/<name>\") or tenant id, per `scope`.",
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "v1Document": {
+        "properties": {
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/v1Field"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "fields"
+        ],
+        "type": "object"
+      },
+      "v1ErrorResponse": {
+        "description": "The body of every non-2xx JSON response, on every route (ADR-350 §b).\nSee docs/api/errors.md for the code table.",
+        "properties": {
+          "code": {
+            "description": "The stable machine-readable error code.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Code-specific detail. Keys are only ever added.",
+            "type": "object"
+          },
+          "error": {
+            "description": "Human-readable. Not stable: never parse it.",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Deprecated alias kept for tenant-limit rejections: the limit that was\nhit.",
+            "format": "double",
+            "type": "number"
+          },
+          "reason": {
+            "description": "Deprecated alias kept for tenant-limit rejections: the old reason\nstring (equal to `code` for the tenant_* codes).",
+            "type": "string"
+          },
+          "request_id": {
+            "description": "Echoes the `X-Request-Id` response header; quote it in bug reports.",
+            "type": "string"
+          },
+          "retry_after_ms": {
+            "description": "Present exactly when `retryable` is true; the `Retry-After` header\ncarries the same delay in whole seconds.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "retryable": {
+            "description": "Whether the identical request may succeed later. The server did not\napply it (except a forwarded write with `details.outcome: \"unknown\"`).",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "v1ExistsResponse": {
+        "properties": {
+          "existing": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "missing": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "v1Field": {
+        "properties": {
+          "field_type": {
+            "description": "The value's type, PascalCase: \"Text\", \"Keyword\", \"Integer\", \"Float\",\n\"Date\", \"Boolean\", \"Vector\" (value: a JSON array of numbers), or\n\"GeoPoint\" (value: \"lat,lon\", {\"lat\": .., \"lon\": ..} or GeoJSON\n[lon, lat]).",
+            "enum": [
+              "Text",
+              "Keyword",
+              "Integer",
+              "Float",
+              "Date",
+              "Boolean",
+              "Vector",
+              "GeoPoint"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "description": "Every value is sent as a string.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "field_type",
+          "value"
+        ],
+        "type": "object"
+      },
+      "v1FieldSchema": {
+        "properties": {
+          "analyzer": {
+            "description": "Analyzer, then token filters. Analyzers: \"standard\" (legacy tokenizer),\n\"standard@2\" (Unicode UAX #29), \"keyword\", \"lowercase\", \"whitespace\".\nFilters: \"lowercase\", \"stop\", \"stem\" (English Snowball). Empty =\n\"standard\".",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "embedding": {
+            "description": "Vector fields only (issue #209): the embedding model the server uses to\nembed `knn.query_text` and text-valued documents for this field.",
+            "type": "object"
+          },
+          "field_type": {
+            "description": "Alias of `type`.",
+            "type": "string"
+          },
+          "indexed": {
+            "description": "Whether the field is full-text indexed.",
+            "type": "boolean"
+          },
+          "stopwords": {
+            "description": "Stopword list for this field's \"stop\" filter (built-in English list if\nempty).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "stored": {
+            "description": "Whether the field value is stored and returned.",
+            "type": "boolean"
+          },
+          "type": {
+            "description": "The field type. Accepted spellings: the canonical \"FIELD_TYPE_TEXT\"\nform the server returns, the bare name in any case (\"text\",\n\"Keyword\"), or the enum number. Types: TEXT, KEYWORD, INTEGER, FLOAT,\nDATE, BOOLEAN, VECTOR, GEO_POINT.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "v1FlushResponse": {
+        "properties": {
+          "status": {
+            "description": "\"flushed\".",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "v1FuzzyQuery": {
+        "properties": {
+          "field": {
+            "description": "\"\", \"_all\" or \"*\" = every Text field.",
+            "type": "string"
+          },
+          "fuzziness": {
+            "description": "0, 1, 2, \"auto\" (default) or \"auto:low,high\"."
+          },
+          "max_expansions": {
+            "description": "Terms per token per segment, nearest first (default 50, max 1024).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "prefix_length": {
+            "description": "Leading characters that must match exactly (default 0).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "transpositions": {
+            "description": "An adjacent swap counts as one edit (default true).",
+            "type": "boolean"
+          },
+          "value": {
+            "description": "Analyzed per segment; each token is expanded.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
+      "v1GetBillingResponse": {
+        "properties": {
+          "accrued": {
+            "description": "What the month would cost if it ended now: `{lines, total_cents}`.",
+            "type": "object"
+          },
+          "free_tier_exceeded": {
+            "type": "boolean"
+          },
+          "invoices": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "period": {
+            "description": "The billing period, \"YYYY-MM\".",
+            "type": "string"
+          },
+          "plan": {
+            "type": "string"
+          },
+          "state": {
+            "description": "Account standing: \"active\", \"past_due\", \"suspended\", ...",
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          },
+          "usage": {
+            "description": "Month-to-date usage totals.",
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "v1GetNamespaceSchemaResponse": {
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "schema": {
+            "$ref": "#/components/schemas/v1NamespaceSchema"
+          }
+        },
+        "type": "object"
+      },
+      "v1GetStatsResponse": {
+        "properties": {
+          "branch": {
+            "$ref": "#/components/schemas/v1BranchLineage"
+          },
+          "documents": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_refresh_at": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "manifest_lag_seconds": {
+            "format": "double",
+            "type": "number"
+          },
+          "manifest_version": {
+            "description": "Same as `version`.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "recent_queries": {
+            "description": "With the dashboard on (#214).",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "segments": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "shard_stats": {
+            "items": {
+              "$ref": "#/components/schemas/v1ShardStats"
+            },
+            "type": "array"
+          },
+          "shards": {
+            "description": "Sharded namespaces (#207).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "stored_manifest_version": {
+            "description": "Query replicas (#232): the stored manifest version last seen, when the\nlocal manifest was last confirmed current (Unix seconds), and how long\nago that was (null if never).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "unindexed_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "unindexed_documents": {
+            "description": "Writer pods: acknowledged documents not yet in a segment.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1GetUsageResponse": {
+        "properties": {
+          "from": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "namespaces": {
+            "description": "Per-namespace usage counters.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "tenant": {
+            "type": "string"
+          },
+          "to": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total": {
+            "description": "The counters summed over `namespaces`.",
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "v1HealthCheckResponse": {
+        "properties": {
+          "status": {
+            "description": "\"ok\".",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "v1IndexDocumentsResponse": {
+        "properties": {
+          "indexed_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "v1KnnQuery": {
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "filter": {
+            "type": "object"
+          },
+          "k": {
+            "description": "Default 10.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "num_candidates": {
+            "description": "Default 100.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "query_text": {
+            "description": "Text the server embeds into `vector`.",
+            "type": "string"
+          },
+          "scoring": {
+            "description": "\"cosine\" (default) or \"late_interaction\".",
+            "enum": [
+              "cosine",
+              "late_interaction"
+            ],
+            "type": "string"
+          },
+          "vector": {
+            "description": "The query vector. Omit it and set `query_text` to have the server\nembed the text with the field's schema model (#209).",
+            "items": {
+              "format": "float",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "vectors": {
+            "description": "Late-interaction (multi-vector) query vectors: an array of arrays of\nnumbers."
+          }
+        },
+        "required": [
+          "field"
+        ],
+        "type": "object"
+      },
+      "v1LimitPer": {
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "max": {
+            "description": ">= 1.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "field",
+          "max"
+        ],
+        "type": "object"
+      },
+      "v1ListBranchesResponse": {
+        "properties": {
+          "branches": {
+            "items": {
+              "$ref": "#/components/schemas/v1NamespaceBranch"
+            },
+            "type": "array"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "v1ListNamespacesResponse": {
+        "properties": {
+          "namespaces": {
+            "items": {
+              "$ref": "#/components/schemas/v1ListedNamespace"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "v1ListedNamespace": {
+        "properties": {
+          "documents": {
+            "description": "Null when this node could not load the namespace's manifest.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "manifest_version": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "segments": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1MatchPhraseQuery": {
+        "properties": {
+          "field": {
+            "description": "The field the phrase must occur in; \"\", \"_all\" or \"*\" = any one field.",
+            "type": "string"
+          },
+          "fields": {
+            "description": "Several fields, any one of them (overrides field when non-empty).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "phrase": {
+            "type": "string"
+          },
+          "slop": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "phrase"
+        ],
+        "type": "object"
+      },
+      "v1NamespaceBranch": {
+        "properties": {
+          "documents": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parent": {
+            "type": "string"
+          },
+          "parent_version": {
+            "description": "Parent manifest version the branch started from.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "segments": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "shared_segments": {
+            "description": "Segments still read from the parent's prefix.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1NamespaceSchema": {
+        "properties": {
+          "default_analyzer": {
+            "description": "Analyzer for Text fields not listed in `fields`. Empty = \"standard\".",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default_stopwords": {
+            "description": "Stopword list for `default_analyzer`'s \"stop\" filter (built-in English\nlist if empty).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "fields": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/v1FieldSchema"
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "v1PutNamespaceSchemaResponse": {
+        "properties": {
+          "changed": {
+            "description": "False when the stored schema was already identical.",
+            "type": "boolean"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "schema": {
+            "$ref": "#/components/schemas/v1NamespaceSchema"
+          }
+        },
+        "type": "object"
+      },
+      "v1PutShardsResponse": {
+        "properties": {
+          "changed": {
+            "description": "False when the namespace already had this shard count.",
+            "type": "boolean"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "shards": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1Rank": {
+        "properties": {
+          "rrf": {
+            "$ref": "#/components/schemas/v1RrfRank"
+          }
+        },
+        "type": "object"
+      },
+      "v1RankDetails": {
+        "description": "1-based ranks in each retriever's namespace-wide list; unset when the hit\nwas not in that retriever's window.",
+        "properties": {
+          "base_score": {
+            "description": "rank_by requests: the score before the modifiers.",
+            "format": "double",
+            "type": "number"
+          },
+          "knn_rank": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "knn_score": {
+            "format": "double",
+            "type": "number"
+          },
+          "lexical_rank": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "lexical_score": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "v1ReplaceDocumentsResponse": {
+        "properties": {
+          "indexed_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "v1Rerank": {
+        "properties": {
+          "field": {
+            "description": "Stored field sent as each document's text.",
+            "type": "string"
+          },
+          "model": {
+            "description": "Default: the provider's configured model.",
+            "type": "string"
+          },
+          "provider": {
+            "description": "A provider the server has configured.",
+            "type": "string"
+          },
+          "query": {
+            "description": "Default query_text, then match_phrase.phrase, then fuzzy.value.",
+            "type": "string"
+          },
+          "timeout_ms": {
+            "description": "Default 2000, <= 60000.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "top_n": {
+            "description": "Default from + max_results; >= that, <= 1000.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "provider",
+          "field"
+        ],
+        "type": "object"
+      },
+      "v1RrfRank": {
+        "description": "score(d) = sum over retrievers r of 1 / (rank_constant + rank_r(d)).",
+        "properties": {
+          "rank_constant": {
+            "description": "Default 60; must be >= 1.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "rank_window_size": {
+            "description": "Per-retriever list length and fused list length. Default: max_results;\nmust be >= max_results.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1ScoredDocument": {
+        "properties": {
+          "doc_id": {
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/v1Field"
+            },
+            "type": "array"
+          },
+          "fused_score": {
+            "description": "Reranked requests only: the first-stage (fused) score, and the\nprovider's score (= score; unset when the rerank degraded).",
+            "format": "double",
+            "type": "number"
+          },
+          "highlight": {
+            "additionalProperties": {},
+            "description": "Highlight fragments keyed by field name: arrays of strings.",
+            "type": "object"
+          },
+          "highlights": {
+            "description": "Deprecated: set only for the legacy single-field highlight request; use\n`highlight`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "rank_details": {
+            "$ref": "#/components/schemas/v1RankDetails"
+          },
+          "rerank_score": {
+            "format": "double",
+            "type": "number"
+          },
+          "score": {
+            "description": "The fused RRF score for a hybrid request; the rerank score when\nreranked.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "v1SearchResponse": {
+        "properties": {
+          "aggregations": {
+            "description": "Aggregation results keyed by the request's aggregation names.",
+            "type": "object"
+          },
+          "consistency_fallback": {
+            "description": "Set when a \"strong\" search was answered as \"eventual\"; says why.",
+            "type": "string"
+          },
+          "exhaustive_search_count": {
+            "description": "Unindexed documents scanned exhaustively (strong consistency, #255).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "knn_degraded_segments": {
+            "description": "kNN requests: segments whose vector search failed and contributed no\ncandidates (0 when every segment searched cleanly).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "knn_filtered_candidates": {
+            "description": "Filtered kNN: documents that passed the filter.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "knn_mode": {
+            "description": "Filtered kNN: \"ann\", \"exact\" or \"mixed\".",
+            "enum": [
+              "ann",
+              "exact",
+              "mixed"
+            ],
+            "type": "string"
+          },
+          "rerank_degraded": {
+            "description": "Reranked requests only: true when the provider timed out or failed and\nresults are in first-stage order.",
+            "type": "boolean"
+          },
+          "rerank_degraded_reason": {
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/v1ScoredDocument"
+            },
+            "type": "array"
+          },
+          "timings": {
+            "description": "`\"timings\": true` requests with the dashboard on (#214).",
+            "type": "object"
+          },
+          "total_hits": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_hits_relation": {
+            "description": "\"eq\" when total_hits is exact, \"gte\" when it is a capped lower bound.",
+            "enum": [
+              "eq",
+              "gte"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "v1ShardStats": {
+        "properties": {
+          "documents": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "manifest_version": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "segments": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "shard": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "v1WildcardQuery": {
+        "properties": {
+          "case_insensitive": {
+            "description": "Default true.",
+            "type": "boolean"
+          },
+          "field": {
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "pattern"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "description": "The API key itself.",
+        "in": "header",
+        "name": "X-Api-Key",
+        "type": "apiKey"
+      },
+      "BearerAuth": {
+        "description": "`Bearer <api key>`",
+        "in": "header",
+        "name": "Authorization",
+        "type": "apiKey"
+      }
+    }
+  },
+  "info": {
+    "description": "The public Kosha HTTP/JSON API. The OpenAPI document is the wire contract; proto3 canonical JSON is not (see docs/api/versioning.md). Every request carries a tenant API key (`Authorization: Bearer <key>` or `X-Api-Key: <key>`), and every namespace in a path is relative to that key's tenant.",
+    "title": "Kosha API",
+    "version": "0.9.0"
+  },
+  "openapi": "3.0.3",
+  "paths": {
+    "/v1/billing": {
+      "get": {
+        "operationId": "KoshaService_GetBilling",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1GetBillingResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "The caller's plan, month-to-date charges and invoices (issue #349).\n404 when billing is off or no plan applies.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "beta"
+      }
+    },
+    "/v1/healthz": {
+      "get": {
+        "operationId": "KoshaService_HealthCheck",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1HealthCheckResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "security": [],
+        "summary": "Liveness. Answered before authentication. SDKs use it as `ping`.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      }
+    },
+    "/v1/namespaces": {
+      "get": {
+        "operationId": "KoshaService_ListNamespaces",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ListNamespacesResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "The caller's namespaces (issue #214). Shard and other internal\nnamespaces are left out.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      },
+      "post": {
+        "operationId": "KoshaService_CreateNamespace",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/v1CreateNamespaceRequest"
+              }
+            }
+          },
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1CreateNamespaceResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Create a namespace with an optional schema.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      }
+    },
+    "/v1/namespaces/{namespace}": {
+      "delete": {
+        "operationId": "KoshaService_DeleteNamespace",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1DeleteNamespaceResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Delete a namespace and its segments. Permanent; a re-created namespace\nof the same name starts empty.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      }
+    },
+    "/v1/namespaces/{namespace}/branch": {
+      "delete": {
+        "operationId": "KoshaService_DeleteBranch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1DeleteBranchResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Delete a branch. Reclaims only objects in the branch's own prefix that\nno remaining manifest references. Fails (409) for a namespace that is\nnot a branch.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "beta"
+      },
+      "post": {
+        "operationId": "KoshaService_BranchNamespace",
+        "parameters": [
+          {
+            "description": "The parent.",
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KoshaServiceBranchNamespaceBody"
+              }
+            }
+          },
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1BranchNamespaceResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Branch a namespace (issue #208): a new namespace whose manifest lists\nthe parent's segments in place (copy-on-write, no data copied).",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "beta"
+      }
+    },
+    "/v1/namespaces/{namespace}/branches": {
+      "get": {
+        "operationId": "KoshaService_ListBranches",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ListBranchesResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "beta"
+      }
+    },
+    "/v1/namespaces/{namespace}/delete": {
+      "post": {
+        "operationId": "KoshaService_DeleteByQuery",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KoshaServiceDeleteByQueryBody"
+              }
+            }
+          },
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1DeleteByQueryResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Delete the documents matching a filter (tombstones).",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      }
+    },
+    "/v1/namespaces/{namespace}/documents": {
+      "post": {
+        "operationId": "KoshaService_IndexDocuments",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KoshaServiceIndexDocumentsBody"
+              }
+            }
+          },
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1IndexDocumentsResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Index documents: each one is inserted, or replaces the stored document\nwith the same id in full.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      }
+    },
+    "/v1/namespaces/{namespace}/exists": {
+      "post": {
+        "operationId": "KoshaService_Exists",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KoshaServiceExistsBody"
+              }
+            }
+          },
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ExistsResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Which of the given document ids the namespace holds.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      }
+    },
+    "/v1/namespaces/{namespace}/flush": {
+      "post": {
+        "operationId": "KoshaService_Flush",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KoshaServiceFlushBody"
+              }
+            }
+          },
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1FlushResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Flush buffered documents to a segment.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      }
+    },
+    "/v1/namespaces/{namespace}/replace": {
+      "post": {
+        "operationId": "KoshaService_ReplaceDocuments",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KoshaServiceReplaceDocumentsBody"
+              }
+            }
+          },
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ReplaceDocumentsResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Replace documents by id, merging a partial document onto the latest\nstored copy (OpenSearch `_update` semantics): fields the request names\nare replaced, fields it omits are kept. A document whose id is not\nstored yet is inserted as given.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      }
+    },
+    "/v1/namespaces/{namespace}/schema": {
+      "get": {
+        "operationId": "KoshaService_GetNamespaceSchema",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1GetNamespaceSchemaResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      },
+      "post": {
+        "operationId": "KoshaService_PutNamespaceSchema",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/v1NamespaceSchema"
+              }
+            }
+          },
+          "description": "The schema itself is the request body (`{\"fields\": {...}}`); a body\nwrapped as `{\"schema\": {...}}` is accepted too.",
+          "required": true,
+          "x-originalParamName": "schema"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1PutNamespaceSchemaResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Set a namespace's schema (issue #220): per-field analyzers for segments\nwritten from now on. Existing segments keep the analysis recorded in\ntheir footers and stay searchable with it.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      }
+    },
+    "/v1/namespaces/{namespace}/search": {
+      "post": {
+        "operationId": "KoshaService_Search",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KoshaServiceSearchBody"
+              }
+            }
+          },
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1SearchResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Search: BM25 lexical, kNN, or hybrid (RRF) retrieval with filters,\nsorting, aggregations, highlighting, score modifiers and reranking.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      }
+    },
+    "/v1/namespaces/{namespace}/shards": {
+      "post": {
+        "operationId": "KoshaService_PutShards",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KoshaServicePutShardsBody"
+              }
+            }
+          },
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1PutShardsResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Set the shard count of a new, empty namespace (issue #207).",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "beta"
+      }
+    },
+    "/v1/namespaces/{namespace}/stats": {
+      "get": {
+        "operationId": "KoshaService_GetStats",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1GetStatsResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "One namespace's statistics.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "stable"
+      }
+    },
+    "/v1/usage": {
+      "get": {
+        "operationId": "KoshaService_GetUsage",
+        "parameters": [
+          {
+            "description": "Window start, Unix seconds (default: 30 days before `to`).",
+            "in": "query",
+            "name": "from",
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Window end, Unix seconds (default: now).",
+            "in": "query",
+            "name": "to",
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1GetUsageResponse"
+                }
+              }
+            },
+            "description": "A successful response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "invalid_argument, invalid_query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unauthenticated"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "permission_denied and quota codes"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "not_found, namespace_not_found"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "method_not_allowed; the `Allow` header lists the methods the path takes"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "already_exists, conflict, write_conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "payload_too_large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "overloaded and tenant rate limits; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "internal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/v1ErrorResponse"
+                }
+              }
+            },
+            "description": "unavailable; retry after `Retry-After` seconds",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "summary": "The caller's metered usage (issue #348). 404 when metering is off.",
+        "tags": [
+          "KoshaService"
+        ],
+        "x-stability-level": "beta"
+      }
+    }
+  },
+  "security": [
+    {
+      "BearerAuth": []
+    },
+    {
+      "ApiKeyAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "KoshaService"
+    }
+  ]
+}

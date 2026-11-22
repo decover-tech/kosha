@@ -626,13 +626,6 @@ pub(crate) fn namespace_deleted_response(name: &str, deleted: &NamespaceDeleted)
     }))
 }
 
-/// True for the admin routes here that change state, which a query pod
-/// forwards to the ingest pod (`is_write_path`). `POST` ones are covered by
-/// the blanket `POST /v1/admin/` rule already.
-pub(crate) fn is_write_route(request_line: &str) -> bool {
-    request_line.starts_with("DELETE /v1/admin/tenants/")
-}
-
 /// Dispatch the admin routes of this module; `None` for any other request.
 pub(crate) fn route_admin(request_line: &str, body: &[u8], state: &AppState) -> Option<String> {
     let (method, path) = parse_method_and_path(request_line)?;

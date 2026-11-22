@@ -665,7 +665,8 @@ mod tests {
             api.status(None, "GET", &format!("{base}/nope"), Value::Null),
             404
         );
-        assert_eq!(api.status(None, "PUT", &base, json!({})), 404);
+        // A known path with the wrong method is a 405 (#350).
+        assert_eq!(api.status(None, "PUT", &base, json!({})), 405);
         // 409: duplicates and the last owner.
         assert_eq!(
             api.status(None, "POST", users, json!({ "email": "ADA@example.com" })),
@@ -746,7 +747,6 @@ mod tests {
             ("POST", "/v1/admin/gc"),
             ("POST", "/v1/admin/compact-namespace"),
             ("GET", "/v1/admin/compaction-status"),
-            ("POST", "/v1/admin/no-such-route"),
         ] {
             let body = json!({ "tenant_id": "someone-elses-tenant" });
             for actor in [ada.as_str(), ""] {

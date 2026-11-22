@@ -36,6 +36,14 @@ jobs:
             --restart-cmd scripts/conformance/compose_restart_cold.sh \
             --out conformance-report.json
 
+      # Requests and responses against the checked-in OpenAPI document
+      # (#350): an unknown or missing field on either side fails.
+      - name: Wire check
+        run: |
+          python3 scripts/api/check_wire.py \
+            --host http://localhost:8080 --api-key sk-kosha-dev \
+            --admin-key sk-kosha-admin-dev
+
       # After the suite above, so its python3 (system, stdlib only) is
       # unchanged. The DSL runner needs PyYAML.
       - uses: actions/setup-python@v5

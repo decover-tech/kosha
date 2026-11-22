@@ -29,11 +29,11 @@ kosha_client/
 ```bash
 # From repo root — generate OpenAPI spec from proto
 make openapi
-# The spec lands at gen/openapi/kosha.yaml
+# The spec lands at api/openapi/v1/kosha.openapi.json (checked in)
 
 # Generate Python stubs
 npx @openapitools/openapi-generator-cli generate \
-  -i gen/openapi/kosha.yaml \
+  -i api/openapi/v1/kosha.openapi.json \
   -g python \
   -o clients/python/kosha_client/stubs
 ```

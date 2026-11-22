@@ -9,17 +9,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  proto:
-    name: proto lint
+  # The public API contract (#350, ADR-350 §d): the proto lints, the
+  # checked-in OpenAPI documents are exactly what `make openapi` generates
+  # from it (spec-sync), and a changed contract carries a version bump and a
+  # changelog entry. The route table is checked against the same documents
+  # by `public_routes_match_spec` in the test job. buf, protoc-gen-openapiv2
+  # and apispec are pinned in tools/codegen/go.mod.
+  api-contract:
+    name: api contract
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
-      - uses: bufbuild/buf-setup-action@v1
         with:
-          version: latest
-      - uses: bufbuild/buf-lint-action@v1
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
         with:
-          input: proto
+          go-version-file: tools/codegen/go.mod
+          cache-dependency-path: tools/codegen/go.sum
+      - name: buf lint
+        run: make proto-lint
+      - name: spec-sync (make openapi, then a clean tree)
+        run: make api-check
+      # FILE-level breaking changes against main. Pre-1.0 (main's spec
+      # below 1.0.0, or no spec on main yet) the contract is still being
+      # made wire-accurate, so this only reports.
+      - name: buf breaking
+        run: |
+          base_version=$(git show origin/main:api/openapi/v1/kosha.openapi.json 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])' 2>/dev/null || echo none)
+          echo "contract version on main: $base_version"
+          case "$base_version" in
+            none|0.*)
+              build/bin/buf breaking proto --against '.git#branch=origin/main,subdir=proto' \
+                || echo "::warning::breaking proto changes (allowed before 1.0.0)" ;;
+            *)
+              build/bin/buf breaking proto --against '.git#branch=origin/main,subdir=proto' ;;
+          esac
 
   fmt:
     name: rustfmt

@@ -79,7 +79,7 @@ pub fn requirement(method: &str, path: &str) -> Requirement {
         let scope = match (method, action) {
             ("POST", "search" | "exists") => Read,
             ("GET", "schema" | "branches" | "stats") => Read,
-            ("POST", "documents" | "flush" | "delete") => Write,
+            ("POST", "documents" | "replace" | "flush" | "delete") => Write,
             ("POST", "schema" | "shards") => Admin,
             ("DELETE", "branch") => Admin,
             ("POST", "branch") => return scoped(Admin, Target::PathAndBody(ns, "name")),

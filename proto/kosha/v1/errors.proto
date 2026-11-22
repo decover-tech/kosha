@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package kosha.v1;
+
+import "google/protobuf/struct.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+option go_package = "github.com/decover-tech/kosha/proto/kosha/v1;koshav1";
+option java_multiple_files = true;
+option java_package = "com.decover.kosha.v1";
+
+// The body of every non-2xx JSON response, on every route (ADR-350 §b).
+// See docs/api/errors.md for the code table.
+message ErrorResponse {
+  // Human-readable. Not stable: never parse it.
+  string error = 1;
+  // The stable machine-readable error code.
+  string code = 2;
+  // Whether the identical request may succeed later. The server did not
+  // apply it (except a forwarded write with `details.outcome: "unknown"`).
+  bool retryable = 3;
+  // Present exactly when `retryable` is true; the `Retry-After` header
+  // carries the same delay in whole seconds.
+  optional int64 retry_after_ms = 4 [(grpc.gateway.protoc_gen_openapiv2.options.openapiv2_field) = {
+    type: INTEGER
+    format: "int64"
+  }];
+  // Echoes the `X-Request-Id` response header; quote it in bug reports.
+  string request_id = 5;
+  // Code-specific detail. Keys are only ever added.
+  google.protobuf.Struct details = 6;
+  // Deprecated alias kept for tenant-limit rejections: the old reason
+  // string (equal to `code` for the tenant_* codes).
+  string reason = 7 [deprecated = true];
+  // Deprecated alias kept for tenant-limit rejections: the limit that was
+  // hit.
+  optional double limit = 8 [deprecated = true];
+}
