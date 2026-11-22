@@ -140,6 +140,9 @@ q = quantiles(bates, (0.1, 0.4, 0.5, 0.9))
 BATES_RANGES = [(q[0], q[1]), (q[2], q[3])] if q else []
 q = quantiles(sent, (0.1, 0.5, 0.5, 0.95))
 SENT_RANGES = [(q[0], q[1]), (q[2], q[3])] if q else []
+# A matter whose values cluster (every page 0, say) yields identical ranges;
+# each range must be counted once.
+PAGE_RANGES, BATES_RANGES, SENT_RANGES = (list(dict.fromkeys(r)) for r in (PAGE_RANGES, BATES_RANGES, SENT_RANGES))
 print(f"matter {matter}: {len(WORDS)} words, {len(PHRASES)} phrases, {len(DOCS)} docs, {len(KNN)} knn", flush=True)
 
 # ── One pass over every record ─────────────────────────────────────────────
@@ -154,7 +157,10 @@ counts = collections.defaultdict(collections.Counter)  # field -> value -> chunk
 range_counts = collections.Counter()
 all_docs, total, n_vec = set(), 0, 0
 vec_ids, vec_format = [], []
-capacity = 600000
+# Upper bound on vectors held for the exact-neighbour pass: one per 5 KB of
+# compressed export (measured 7-8 KB per chunk with an embedding). The scratch
+# file is sparse, so the bound costs disk only for vectors actually written.
+capacity = int(sum(os.path.getsize(f) for f in files) / 5000) + 1000
 vecs = np.lib.format.open_memmap(os.path.join(args.out_dir, "vectors.tmp.npy"), mode="w+", dtype=np.float32, shape=(capacity, DIM))
 knn_query = {}
 sha = hashlib.sha256()
