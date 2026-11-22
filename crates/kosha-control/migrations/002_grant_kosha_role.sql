@@ -17,3 +17,6 @@ ALTER TABLE kosha.retired_namespaces OWNER TO kosha;
 ALTER TABLE IF EXISTS kosha.writer_leases OWNER TO kosha;
 -- 005_usage_events.sql (#348). IF EXISTS for the same reason.
 ALTER TABLE IF EXISTS kosha.usage_events OWNER TO kosha;
+-- 007_billing.sql (#349). IF EXISTS for the same reason.
+ALTER TABLE IF EXISTS kosha.billing_accounts OWNER TO kosha;
+ALTER TABLE IF EXISTS kosha.billing_invoices OWNER TO kosha;

@@ -269,6 +269,7 @@ impl Node {
                 writer_lease: None,
                 writer_lease_ttl: None,
                 usage: None,
+                billing: None,
             },
         )
     }

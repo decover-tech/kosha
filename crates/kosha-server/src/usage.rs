@@ -385,6 +385,11 @@ impl UsageMeter {
         }
     }
 
+    /// The store this meter delivers to (billing reads usage from it).
+    pub(crate) fn store(&self) -> Arc<dyn UsageStore> {
+        Arc::clone(&self.store)
+    }
+
     /// A successful search of `ns`.
     pub(crate) fn record_query(&self, ns: &NamespaceId, bytes_returned: u64, bytes_fetched: u64) {
         let (tenant, namespace) = usage_identity(ns);
@@ -707,7 +712,7 @@ impl AppState {
 }
 
 /// A query-string parameter of a request line's target, URL-decoded.
-fn query_param(request_line: &str, name: &str) -> Option<String> {
+pub(crate) fn query_param(request_line: &str, name: &str) -> Option<String> {
     let target = request_line.split_whitespace().nth(1)?;
     let (_, query) = target.split_once('?')?;
     query.split('&').find_map(|pair| {

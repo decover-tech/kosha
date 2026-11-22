@@ -128,7 +128,8 @@ async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
 
 /// One locked migration attempt. The error carries the message prefix the
 /// caller reports: "migration failed" for 001 and the lock/transaction
-/// plumbing, "migration 003 failed" for 003, "migration 005 failed" for 005.
+/// plumbing, "migration 003 failed" for 003, "migration 005 failed" for 005,
+/// "migration 007 failed" for 007.
 async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static str)> {
     const FAILED: &str = "migration failed";
     let mut tx = pool.begin().await.map_err(|e| (e, FAILED))?;
@@ -154,6 +155,12 @@ async fn migrate_once(pool: &sqlx::PgPool) -> Result<(), (sqlx::Error, &'static 
         .execute(&mut *tx)
         .await
         .map_err(|e| (e, "migration 005 failed"))?;
+    // Billing accounts and invoices (#349): additive, idempotent.
+    let migration = include_str!("../migrations/007_billing.sql");
+    sqlx::raw_sql(migration)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (e, "migration 007 failed"))?;
     tx.commit().await.map_err(|e| (e, FAILED))
 }
 
