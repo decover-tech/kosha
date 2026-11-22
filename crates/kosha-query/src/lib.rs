@@ -12,10 +12,10 @@ use kosha_core::fields::{field_norms_key, field_term_key, segment_field_chain};
 use kosha_core::fuzzy::{ExpandStats, FuzzyQuery, MAX_FUZZY_EDITS};
 use kosha_core::{
     segment_may_contain_terms, AggBucket, AggBucketResult, AggCompositeBucket, AggCompositeResult,
-    AggMetricResult, Aggregation, AggregationResults, Bm25Params, Bm25StatsScope, DocSet,
-    DocumentId, FieldType, FilterClause, FilterStore, HighlightConfig, KoshaError, Manifest,
-    ManifestEntry, MetricKind, NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery,
-    SearchResult, SortSpec, TermBloomMode, TotalHitsRelation,
+    Aggregation, AggregationResults, Bm25Params, Bm25StatsScope, DocSet, DocumentId, FieldType,
+    FilterClause, FilterStore, HighlightConfig, KoshaError, Manifest, ManifestEntry, MetricKind,
+    NamespaceId, RankDetails, RrfParams, ScoredDocument, SearchQuery, SearchResult, SortSpec,
+    TermBloomMode, TotalHitsRelation,
 };
 use kosha_core::{AnalyzerSpec, FieldBoost, Footer, SegmentAnalysis};
 pub use kosha_segment::VectorSpanFetch;
@@ -5916,7 +5916,7 @@ impl Searcher {
             // counted, so only vector-only window members are added.
             total_hits += fused.vector_only.len();
             if !query.aggs.is_empty() && !fused.vector_only.is_empty() {
-                for (name, state) in aggregate_vector_only(query, &fused.vector_only) {
+                for (name, state) in aggregate_vector_only(query, &fused.vector_only)? {
                     all_aggs.entry(name).or_default().merge(state);
                 }
             }
@@ -6928,10 +6928,16 @@ fn rrf_fuse(
 /// window, grouped by segment: a hybrid request aggregates over the same
 /// documents its `total_hits` counts (lexical matches plus the vector
 /// window), and the per-segment pass only saw the lexical matches.
+///
+/// Reads each segment the way the per-segment pass does: a columnar
+/// segment (#244) from its columns, a `filters.bin` segment from the
+/// columns of the row store this query names. A damaged column fails the
+/// request closed instead of silently dropping these documents from the
+/// buckets (issue #215).
 fn aggregate_vector_only(
     query: &SearchQuery,
     vector_only: &[(Arc<TrackedSegment>, u32)],
-) -> Vec<(String, AggregationState)> {
+) -> Result<Vec<(String, AggregationState)>, KoshaError> {
     let mut by_segment: Vec<(&Arc<TrackedSegment>, HashSet<u32>)> = Vec::new();
     for (reader, doc_seq) in vector_only {
         match by_segment
@@ -6946,12 +6952,23 @@ fn aggregate_vector_only(
     }
     let mut out = Vec::new();
     for (reader, wanted) in by_segment {
-        let store = reader.filter_store();
-        for (name, agg) in &query.aggs {
-            out.push((name.clone(), aggregate_matches(&store, &wanted, agg)));
+        if reader.has_filter_columns() {
+            let mut wanted: Vec<u32> = wanted.into_iter().collect();
+            wanted.sort_unstable();
+            for (name, agg) in &query.aggs {
+                out.push((
+                    name.clone(),
+                    aggregate_matches_columnar(reader, &wanted, agg)?,
+                ));
+            }
+        } else {
+            let store = reader.filter_store_for(&query.filter_column_fields())?;
+            for (name, agg) in &query.aggs {
+                out.push((name.clone(), aggregate_matches(&store, &wanted, agg)));
+            }
         }
     }
-    out
+    Ok(out)
 }
 
 fn sort_fields_needing_values(sort: &[SortSpec]) -> Vec<String> {
@@ -8761,94 +8778,6 @@ pub fn segment_may_match_query_terms(
             let terms = reading.scoring_terms();
             terms.is_empty() || segment_may_contain_terms(&terms, mode, footer.term_bloom.as_ref())
         })
-}
-
-pub fn compute_single_aggregation(store: &FilterStore, field: &str) -> AggregationResults {
-    // Borrowed key while counting — one `String` alloc per *distinct*
-    // value at bucket-emission time, not one per document, matching
-    // `compute_cardinality`/`compute_composite` right below.
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-
-    if let Some(entries) = store.string_fields.get(field) {
-        for (_, val) in entries {
-            *counts.entry(val.as_str()).or_default() += 1;
-        }
-    }
-
-    let mut buckets: Vec<AggBucket> = counts
-        .into_iter()
-        .map(|(k, c)| AggBucket {
-            key: k.to_string(),
-            doc_count: c,
-            ..Default::default()
-        })
-        .collect();
-    buckets.sort_by_key(|b| std::cmp::Reverse(b.doc_count));
-
-    AggregationResults {
-        per_document: Some(AggBucketResult { buckets }),
-        total_documents: None,
-        matched_docs: None,
-        extra: HashMap::new(),
-    }
-}
-
-pub fn compute_cardinality(store: &FilterStore, field: &str) -> AggregationResults {
-    let count = store
-        .string_fields
-        .get(field)
-        .map(|entries| {
-            let unique: HashSet<&str> = entries.iter().map(|(_, v)| v.as_str()).collect();
-            unique.len()
-        })
-        .unwrap_or(0);
-
-    AggregationResults {
-        per_document: None,
-        total_documents: Some(AggMetricResult { value: count }),
-        matched_docs: None,
-        extra: HashMap::new(),
-    }
-}
-
-pub fn compute_composite(
-    store: &FilterStore,
-    composite: &kosha_core::AggComposite,
-) -> AggregationResults {
-    let mut buckets = Vec::new();
-    if let Some(source) = composite.sources.first() {
-        for (agg_name, terms_spec) in &source.source {
-            let field = &terms_spec.terms.field;
-            if let Some(entries) = store.string_fields.get(field) {
-                let mut seen: HashMap<&str, usize> = HashMap::new();
-                for (_, val) in entries {
-                    *seen.entry(val.as_str()).or_default() += 1;
-                }
-                let _ = agg_name;
-                for (key, count) in seen {
-                    if buckets.len() >= composite.size {
-                        break;
-                    }
-                    let mut key_map = HashMap::new();
-                    key_map.insert(field.clone(), key.to_string());
-                    buckets.push(AggCompositeBucket {
-                        key: key_map,
-                        doc_count: count,
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
-
-    let after_key = buckets.last().map(|b| b.key.clone());
-
-    AggregationResults {
-        per_document: None,
-        total_documents: None,
-        matched_docs: Some(AggCompositeResult { buckets, after_key }),
-        extra: HashMap::new(),
-    }
 }
 
 /// True when `cand` sorts strictly after the search_after cursor.
@@ -10887,32 +10816,6 @@ mod tests {
         assert!(r.results[0].score > 0.0);
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn aggregate_terms() {
-        let mut store = FilterStore::default();
-        store.string_fields.insert(
-            "documentId".to_string(),
-            vec![(0, "d1".into()), (1, "d2".into()), (2, "d1".into())],
-        );
-        let result = compute_single_aggregation(&store, "documentId");
-        let per_doc = result.per_document.unwrap();
-        assert_eq!(per_doc.buckets.len(), 2);
-        assert_eq!(per_doc.buckets[0].key, "d1");
-        assert_eq!(per_doc.buckets[0].doc_count, 2);
-    }
-
-    #[test]
-    fn cardinality_aggregate() {
-        let mut store = FilterStore::default();
-        store.string_fields.insert(
-            "documentId".to_string(),
-            vec![(0, "d1".into()), (1, "d2".into()), (2, "d1".into())],
-        );
-        let result = compute_cardinality(&store, "documentId");
-        let total = result.total_documents.unwrap();
-        assert_eq!(total.value, 2);
     }
 
     #[test]
