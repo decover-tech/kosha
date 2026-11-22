@@ -485,6 +485,140 @@ fn storage_and_snapshots_without_their_counterpart_are_flagged() {
     assert!(globex.namespaces.is_empty() && globex.within_tolerance);
 }
 
+/// Deleting a middle branch keeps, under the deleted branch's own prefix,
+/// the segments a descendant branch inherited from it, and writes no
+/// deletion record (`AppState::delete_branch`). That prefix is unknown to
+/// the control plane but a live manifest lists what it holds: referenced,
+/// not orphaned, and no reason to fail the run.
+#[test]
+fn what_a_deleted_branch_left_for_its_descendant_is_referenced_not_orphaned() {
+    let docs = manifest(&["seg-a"]);
+    let mut b1 = docs.branch_from(&ns("acme/docs"), 1);
+    b1.segments.push(ManifestEntry {
+        segment_id: SegmentId("seg-x".into()),
+        doc_count: 1,
+    });
+    // `b1` also deleted a document of the segment it inherited from docs.
+    b1.deletion_vectors.insert(
+        SegmentId("seg-a".into()),
+        DeletionVector {
+            generation: generation('2'),
+            count: 1,
+            namespace: None,
+        },
+    );
+    let mut b2 = b1.branch_from(&ns("acme/b1"), 1);
+    b2.segments.push(ManifestEntry {
+        segment_id: SegmentId("seg-y".into()),
+        doc_count: 1,
+    });
+    // `b1` has been deleted since: only docs and b2 are left.
+    let control = control_with(vec![("acme/docs", docs), ("acme/b2", b2)]);
+    let held = [
+        ("acme/docs/seg-a/postings.bin".to_string(), 100),
+        ("acme/b1/seg-x/postings.bin".to_string(), 300),
+        (format!("acme/b1/seg-a/{}", deletes('2')), 9),
+        ("acme/b2/seg-y/postings.bin".to_string(), 40),
+    ];
+    let inventory_of = |extra: &[(&str, u64)]| {
+        let mut objects: Vec<(&str, u64)> = held
+            .iter()
+            .map(|(path, size)| (path.as_str(), *size))
+            .collect();
+        objects.extend_from_slice(extra);
+        MemoryInventory::with(&objects)
+    };
+    let store = MemoryUsageStore::new();
+    snapshot(&store, "acme", "docs", NOW, 100);
+    snapshot(&store, "acme", "b2", NOW, 40);
+
+    // No snapshot of b1 left in the window.
+    let report = reconcile(&control, &store, &inventory_of(&[]), &exact()).unwrap();
+    let b1_row = row(&report, "acme", "b1");
+    assert_eq!(
+        (b1_row.control_plane, b1_row.status, b1_row.within_tolerance),
+        (ControlPlane::Unknown, Status::HeldByBranch, true)
+    );
+    assert_eq!(
+        (
+            b1_row.storage.referenced_unmetered_objects,
+            b1_row.storage.referenced_unmetered_bytes,
+            b1_row.storage.orphaned_bytes,
+        ),
+        (2, 309, 0)
+    );
+    assert!(report.within_tolerance, "{report:#?}");
+
+    // b1's last snapshot, from the hour before, is still in the window.
+    snapshot(&store, "acme", "b1", NOW - HOUR_MS, 300);
+    let report = reconcile(&control, &store, &inventory_of(&[]), &exact()).unwrap();
+    assert_eq!(row(&report, "acme", "b1").status, Status::HeldByBranch);
+    assert!(report.within_tolerance, "{report:#?}");
+
+    // Anything no manifest lists under that prefix is still orphaned, and
+    // still fails the run.
+    let superseded = format!("acme/b1/seg-a/{}", deletes('3'));
+    let dirty = inventory_of(&[("acme/b1/seg-dead/postings.bin", 7), (&superseded, 4)]);
+    let report = reconcile(&control, &store, &dirty, &exact()).unwrap();
+    let b1_row = row(&report, "acme", "b1");
+    assert_eq!(b1_row.storage.referenced_unmetered_bytes, 309);
+    assert_eq!(
+        (
+            b1_row.storage.orphaned_objects,
+            b1_row.storage.untracked_bytes
+        ),
+        (2, 11)
+    );
+    assert_eq!(b1_row.status, Status::Mismatch);
+    assert!(!report.within_tolerance);
+
+    // A snapshot of b1 stamped with the current hour: something still
+    // meters it, so the held objects do not excuse it.
+    snapshot(&store, "acme", "b1", NOW, 300);
+    let report = reconcile(&control, &store, &inventory_of(&[]), &exact()).unwrap();
+    assert_eq!(row(&report, "acme", "b1").status, Status::Mismatch);
+    assert!(!report.within_tolerance);
+}
+
+/// Branch deletion and `migrate-namespace` write no deletion record. The
+/// namespace's last snapshots are inside the window for hours afterwards;
+/// with an empty prefix that is a namespace that is gone, not a fault.
+#[test]
+fn a_namespace_removed_without_a_deletion_record_passes_once_its_hour_is_over() {
+    let control = control_with(vec![("acme/docs", manifest(&["seg-a"]))]);
+    let inventory = MemoryInventory::with(&[("acme/docs/seg-a/postings.bin", 100)]);
+    let store = MemoryUsageStore::new();
+    snapshot(&store, "acme", "docs", NOW, 100);
+    // The deleted branch held 5 MiB: far above any tolerance floor.
+    snapshot(&store, "acme", "exp", NOW - 2 * HOUR_MS, 5 << 20);
+    snapshot(&store, "acme", "exp", NOW - HOUR_MS, 5 << 20);
+
+    for options in [exact(), Options::from_lookup(|_| None, NOW).unwrap()] {
+        let report = reconcile(&control, &store, &inventory, &options).unwrap();
+        let exp = row(&report, "acme", "exp");
+        assert_eq!(
+            (exp.control_plane, exp.status, exp.within_tolerance),
+            (ControlPlane::Unknown, Status::Removed, true)
+        );
+        assert_eq!(
+            exp.snapshot_at_ms,
+            Some((NOW - HOUR_MS) / HOUR_MS * HOUR_MS)
+        );
+        assert!(report.within_tolerance, "{report:#?}");
+    }
+
+    // Snapshotted again in the current hour: a writer still meters a
+    // namespace that is stored nowhere.
+    snapshot(&store, "acme", "exp", NOW, 5 << 20);
+    let report = reconcile(&control, &store, &inventory, &exact()).unwrap();
+    let exp = row(&report, "acme", "exp");
+    assert_eq!(
+        (exp.status, exp.within_tolerance),
+        (Status::SnapshotWithoutStorage, false)
+    );
+    assert!(!report.within_tolerance);
+}
+
 /// A deleted pre-#262 namespace has no tenant directory: its record names
 /// the top-level prefix itself.
 #[test]
