@@ -434,3 +434,148 @@ fn with_database_replaces_only_the_database_name() {
         "postgres://h:5432/x"
     );
 }
+
+/// #347: the namespace's rows and its pending deletion record go in one
+/// transaction; the record completes only on an attempt without an error,
+/// and migration 004 leaves existing rows alone.
+#[test]
+#[ignore = "requires a disposable KOSHA_TEST_DATABASE_URL"]
+fn postgres_records_namespace_and_tenant_deletions() {
+    use kosha_core::deletion::{DeletionFilter, DeletionScope, DeletionState, NewDeletion};
+    let url = std::env::var("KOSHA_TEST_DATABASE_URL").expect("set a dedicated test database URL");
+    let mut store = PgStore::new(&url).unwrap();
+    // A second constructor re-runs every migration over the existing rows.
+    let observer = PgStore::new(&url).unwrap();
+    let tenant = format!("del-test-{}", uuid::Uuid::new_v4());
+    let ns = NamespaceId(format!("{tenant}/docs"));
+    let kept = NamespaceId(format!("{tenant}/kept"));
+    let request = NewDeletion::namespace(&ns.0, Some(&tenant), None);
+
+    // No namespace: nothing is recorded.
+    assert!(matches!(
+        store.delete_namespace_recorded(&ns, 0, &request),
+        Err(KoshaError::NamespaceNotFound(_))
+    ));
+    let of_tenant = DeletionFilter {
+        tenant_id: Some(tenant.clone()),
+        ..DeletionFilter::default()
+    };
+    assert!(observer.deletions(&of_tenant).unwrap().is_empty());
+
+    store
+        .compare_and_swap_manifest(&ns, 0, candidate("a", 3))
+        .unwrap();
+    store
+        .compare_and_swap_manifest(&kept, 0, candidate("k", 1))
+        .unwrap();
+    let (manifest, retired, record) = store.delete_namespace_recorded(&ns, 9, &request).unwrap();
+    assert_eq!((manifest.version, retired), (3, 9));
+    assert!(!observer.has_namespace(&ns));
+    assert!(observer.manifest_version(&ns).unwrap().is_none());
+    assert!(
+        observer.has_namespace(&kept),
+        "other namespaces are untouched"
+    );
+    assert!(record.id.starts_with("del-"));
+    assert_eq!(record.scope, DeletionScope::Namespace);
+    assert_eq!(record.subject, ns.0);
+    assert_eq!(record.tenant_id.as_deref(), Some(tenant.as_str()));
+    assert_eq!(record.last_version, 9);
+    assert_eq!(record.state, DeletionState::Pending);
+    assert_eq!((record.attempts, record.objects_deleted), (0, 0));
+    assert!(record.requested_at_ms > 0);
+    assert!(record.completed_at_ms.is_none());
+    assert_eq!(observer.deletion(&record.id).unwrap(), Some(record.clone()));
+    // A re-created namespace starts above the retired version.
+    store.ensure_namespace(ns.clone());
+    assert_eq!(observer.manifest_version(&ns).unwrap(), Some(10));
+
+    let failed = store
+        .record_deletion_attempt(&record.id, 4, Some("S3 delete_objects: throttled"))
+        .unwrap();
+    assert_eq!(failed.state, DeletionState::Pending);
+    assert_eq!((failed.attempts, failed.objects_deleted), (1, 4));
+    assert_eq!(
+        failed.last_error.as_deref(),
+        Some("S3 delete_objects: throttled")
+    );
+    let pending = DeletionFilter {
+        state: Some(DeletionState::Pending),
+        ..of_tenant.clone()
+    };
+    assert_eq!(observer.deletions(&pending).unwrap(), vec![failed]);
+
+    let done = store.record_deletion_attempt(&record.id, 2, None).unwrap();
+    assert_eq!(done.state, DeletionState::Completed);
+    assert_eq!((done.attempts, done.objects_deleted), (2, 6));
+    assert!(done.last_error.is_none());
+    assert!(done.completed_at_ms.unwrap() >= done.requested_at_ms);
+    assert!(observer.deletions(&pending).unwrap().is_empty());
+    // Completed is final.
+    let late = store
+        .record_deletion_attempt(&record.id, 9, Some("late"))
+        .unwrap();
+    assert_eq!(late, done);
+    assert!(matches!(
+        store.record_deletion_attempt("del-missing", 0, None),
+        Err(KoshaError::NotFound(_))
+    ));
+    assert_eq!(observer.deletion("del-missing").unwrap(), None);
+
+    // A tenant record with a child, listed oldest first and by limit.
+    let parent = store
+        .begin_deletion(&NewDeletion::tenant(&tenant), 0)
+        .unwrap();
+    assert_eq!(parent.scope, DeletionScope::Tenant);
+    let child = store
+        .begin_deletion(
+            &NewDeletion::namespace(&kept.0, Some(&tenant), Some(&parent.id)),
+            1,
+        )
+        .unwrap();
+    assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+    let all: Vec<String> = observer
+        .deletions(&of_tenant)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0], record.id);
+    assert!(all.contains(&parent.id) && all.contains(&child.id));
+    let first = DeletionFilter {
+        limit: Some(1),
+        ..of_tenant.clone()
+    };
+    assert_eq!(observer.deletions(&first).unwrap().len(), 1);
+
+    // Tenant keys: every key of the tenant goes, nobody else's.
+    let new_key = |tenant: &str, description: &str| kosha_control::NewApiKey {
+        tenant_id: tenant.to_string(),
+        description: description.to_string(),
+        scopes: kosha_control::Scopes::ALL,
+        namespaces: None,
+        expires_at: None,
+    };
+    let key = store
+        .create_api_key(&new_key(&tenant, "to delete"))
+        .unwrap()
+        .api_key;
+    let other_tenant = format!("{tenant}-other");
+    let other_key = store
+        .create_api_key(&new_key(&other_tenant, "kept"))
+        .unwrap()
+        .api_key;
+    assert_eq!(
+        observer.validate_api_key(&key).as_deref(),
+        Some(tenant.as_str())
+    );
+    assert_eq!(store.delete_api_keys(&tenant).unwrap(), 1);
+    assert_eq!(observer.validate_api_key(&key), None);
+    assert_eq!(
+        observer.validate_api_key(&other_key).as_deref(),
+        Some(other_tenant.as_str())
+    );
+    assert_eq!(store.delete_api_keys(&tenant).unwrap(), 0);
+    store.delete_api_keys(&other_tenant).unwrap();
+}

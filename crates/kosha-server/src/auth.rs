@@ -238,6 +238,21 @@ impl KeyStore {
             .collect()
     }
 
+    /// How many env-configured keys map to `tenant`. They cannot be
+    /// removed at runtime.
+    pub fn env_key_count(&self, tenant: &str) -> usize {
+        self.env.values().filter(|t| t.as_str() == tenant).count()
+    }
+
+    /// Drop every database key of `tenant` from this pod's snapshot.
+    /// Returns how many went.
+    pub fn remove_db_tenant(&self, tenant: &str) -> usize {
+        let mut db = self.db.write().unwrap();
+        let before = db.len();
+        db.retain(|_, key| key.principal.tenant != tenant);
+        before - db.len()
+    }
+
     /// The shared Postgres handle, connecting on first use.
     #[cfg(feature = "postgres")]
     pub fn pg(&self) -> Option<std::sync::Arc<kosha_control::PgStore>> {
@@ -279,6 +294,48 @@ impl KeyStore {
     pub fn refresh(&self) -> Result<usize, String> {
         Ok(0)
     }
+}
+
+/// What [`purge_tenant_keys`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub struct KeyPurge {
+    /// Keys deleted (rows in `kosha.api_keys`, or snapshot entries when
+    /// there is no database).
+    pub deleted: u64,
+    /// Keys of the tenant configured through `KOSHA_API_KEYS` /
+    /// `KOSHA_API_KEY`: they still authenticate until the deployment's
+    /// environment changes.
+    pub static_remaining: usize,
+}
+
+/// Delete a tenant's API keys (tenant deletion, #347): the rows in
+/// `kosha.api_keys`, and this pod's snapshot of them so they stop working
+/// here at once. Other pods drop them on their next key refresh
+/// (`KOSHA_API_KEY_REFRESH_SECS`).
+pub fn purge_tenant_keys(auth: &Auth, tenant: &str) -> Result<KeyPurge, String> {
+    let Auth::Keys(store) = auth else {
+        return Ok(KeyPurge {
+            deleted: 0,
+            static_remaining: 0,
+        });
+    };
+    // The rows first: if that fails the snapshot is left alone, since the
+    // next refresh would bring the keys back anyway.
+    #[cfg(feature = "postgres")]
+    let deleted_rows = match store.database_url {
+        Some(_) => {
+            let pg = store.pg().ok_or("postgres unavailable")?;
+            pg.delete_api_keys(tenant).map_err(|e| e.to_string())?
+        }
+        None => 0,
+    };
+    #[cfg(not(feature = "postgres"))]
+    let deleted_rows = 0;
+    let dropped = store.remove_db_tenant(tenant) as u64;
+    Ok(KeyPurge {
+        deleted: deleted_rows.max(dropped),
+        static_remaining: store.env_key_count(tenant),
+    })
 }
 
 pub enum Auth {

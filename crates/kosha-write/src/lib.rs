@@ -2621,6 +2621,49 @@ impl Indexer {
         shared
     }
 
+    /// Finish discarding a deleted namespace whose storage reclaim is being
+    /// retried (#347), provided nothing was written to it since
+    /// [`Self::drop_namespace`]: it is still unknown, with an empty buffer,
+    /// no pending deletes and no WAL records awaiting replay.
+    ///
+    /// Then its WAL records are discarded again (a no-op when the first
+    /// discard succeeded) and `while_locked` runs under the namespace's
+    /// locks, as in `drop_namespace`: the place to remove its local segment
+    /// files. Returns the WAL files kept because other namespaces share
+    /// them.
+    ///
+    /// `Ok(None)` when the namespace holds anything: a new incarnation was
+    /// written (or recovered from the WAL) and its files now share the
+    /// namespace's directory. Nothing is touched and `while_locked` does
+    /// not run.
+    pub fn discard_if_untouched(
+        &self,
+        namespace: &NamespaceId,
+        while_locked: impl FnOnce(),
+    ) -> Result<Option<usize>, KoshaError> {
+        let handle = self.ns_handle(namespace);
+        let _writes = handle.writes.lock().unwrap();
+        let _compact = handle.compact.lock().unwrap();
+        let _mutation = handle.mutation.lock().unwrap();
+        {
+            let state = handle.state.lock().unwrap();
+            let buffered = state.buffer.as_ref().map_or(0, |b| b.documents.len());
+            if state.known
+                || buffered > 0
+                || !state.tombstones.is_empty()
+                || !state.recovered.is_empty()
+                || !state.recovered_deletes.is_empty()
+            {
+                return Ok(None);
+            }
+        }
+        // Still under the write locks: no record can be appended for the
+        // namespace between the check and the discard.
+        let shared = self.wal.discard_namespace(namespace)?;
+        while_locked();
+        Ok(Some(shared))
+    }
+
     /// Forget a namespace this node only follows (a query replica's copy
     /// of a namespace deleted elsewhere): it reads as unknown until a
     /// manifest is restored for it again. Leaves the WAL alone, unlike
@@ -4082,6 +4125,53 @@ mod tests {
         let live = live_records(&dir, &gone, &manifest);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].doc_id.0, "d");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #347: retrying a deleted namespace's cleanup must never touch a new
+    /// incarnation that was written in the meantime.
+    #[test]
+    fn discard_if_untouched_runs_only_while_nothing_was_written_since_the_drop() {
+        let dir = std::env::temp_dir().join(format!("kosha-discard-{}", uuid::Uuid::new_v4()));
+        let ns = NamespaceId("t/gone".into());
+        let doc = |id: &str| Document {
+            id: DocumentId(id.into()),
+            fields: vec![Field::text("text", "hello")],
+        };
+        let idx = Indexer::new(dir.clone());
+        idx.index_documents(ns.clone(), vec![doc("a")]).unwrap();
+        idx.flush_namespace(&ns).unwrap();
+        let published = idx.manifest(&ns).unwrap().version;
+
+        // Live namespace: refused, the callback never runs.
+        let mut ran = 0;
+        assert_eq!(idx.discard_if_untouched(&ns, || ran += 1).unwrap(), None);
+        assert_eq!(ran, 0);
+        assert!(idx.manifest(&ns).is_some());
+
+        // Dropped and not written since: the retry goes through, twice.
+        idx.drop_namespace(&ns, published + 1, || {}).unwrap();
+        assert_eq!(idx.discard_if_untouched(&ns, || ran += 1).unwrap(), Some(0));
+        assert_eq!(idx.discard_if_untouched(&ns, || ran += 1).unwrap(), Some(0));
+        assert_eq!(ran, 2);
+        assert!(idx.manifest(&ns).is_none());
+
+        // A buffered write to the new incarnation: refused, and the write
+        // survives, in memory and in the WAL.
+        idx.index_documents(ns.clone(), vec![doc("b")]).unwrap();
+        assert_eq!(idx.discard_if_untouched(&ns, || ran += 1).unwrap(), None);
+        assert_eq!(ran, 2);
+        assert_eq!(idx.pending_doc_count(&ns), 1);
+        drop(idx);
+        let restarted = Indexer::new(dir.clone());
+        assert!(restarted.pending_doc_count(&ns) > 0, "WAL record kept");
+        // Recovered records count as written too.
+        assert_eq!(
+            restarted.discard_if_untouched(&ns, || ran += 1).unwrap(),
+            None
+        );
+        assert_eq!(ran, 2);
+        drop(restarted);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
