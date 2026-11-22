@@ -38,7 +38,10 @@
 # toolchain + protoc; shares its cached layers), so the VM needs no Rust
 # install and the binary never runs against the host glibc.
 set -euo pipefail
-. "$(dirname "$0")/snapshot_cache.sh"
+# Absolute script dir: the build below cds to ~/kosha, after which a
+# relative "$(dirname "$0")" (./) points at the wrong directory.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SCRIPT_DIR/snapshot_cache.sh"
 
 NS="${1:?usage: [MAX_DOCS=N] [SNAPSHOT_NAME=name] build_and_import.sh <namespace> [--with-embeddings]}"
 SNAPSHOT_NAME="${SNAPSHOT_NAME:-$NS}"
@@ -103,7 +106,7 @@ echo
 grep -q '"segments"' /tmp/import_result.json || { echo IMPORT-FAILED; exit 1; }
 echo "IMPORT-COMPLETE"
 
-"$(dirname "$0")/snapshot_namespace.sh" "$SCOPED" "$SNAPSHOT_NAME"
+"$SCRIPT_DIR/snapshot_namespace.sh" "$SCOPED" "$SNAPSHOT_NAME"
 # Bucket and local cache now derive from exactly this snapshot: a restore
 # of it right after keeps both instead of re-copying them.
 IDENTITY="$(snapshot_identity "$SNAPSHOT_NAME")"
