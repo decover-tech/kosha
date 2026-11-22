@@ -106,7 +106,7 @@ The `benchmark` workflow (`.github/workflows/benchmark.yml`) runs these
 scripts on the bench VM. Its inputs choose how the namespace gets warm,
 which vector snapshot to restore, and whether to keep the VM.
 
-### Warm gate (`warm_gate`: `queries` (default), `preload` or `cold`)
+### Warm gate (`warm_gate`: `queries` (default), `preload`, `timed` or `cold`)
 
 `queries` follows turbopuffer's tpuf-benchmark (`pkg/bench/bench.go`).
 For hot runs, tpuf warms the namespace, then polls with the workload's own
@@ -191,6 +191,42 @@ A first-touch kNN query still fetches the small files (footer,
 `inverted.idx`, `doc_store.offsets`, `vector.offsets`) of every segment,
 because `knn_plan` opens every segment, so read the phase's first minutes
 apart from the rest (`knn_log_stats.py --skip-first-s`).
+
+`timed` (research #389) is for runs with a disk cache smaller than the
+working set, where `queries` cannot converge: a later query evicts what an
+earlier one needs, so "every query fully cached once" never happens.
+`run_phases.sh` then empties the local store (every arm starts cold, and
+the bound covers only the suite namespace), runs the workload unmeasured
+for `fill` seconds, and measures only the no-result-cache phase,
+`repeats` times (`warm_or_nocache_rN` / `knn_warm_nocache_rN`).
+S3 misses are part of the measured latency by design. It writes
+`footprint.tsv` (local bytes every 60 s) and `evictions.tsv` (files and
+MB the server evicted per stage, from its `disk cache evicted` lines).
+
+### Disk-cache experiment input (research #389): `cache_experiment`
+
+One input, a space-separated `key=value` list, so the workflow stays under
+GitHub's limit of 25 dispatch inputs. Empty (the default) is what every
+earlier run used. The "Validate disk-cache experiment inputs" step
+rejects unknown keys and bad values before anything is provisioned.
+
+| key | default | effect |
+| --- | --- | --- |
+| `max` | `644245094400` | `KOSHA_CACHE_MAX_BYTES`. A smaller value needs `warm_gate=timed` and one suite per dispatch (the validate step refuses otherwise). |
+| `policy` | `legacy` | `sieve` / `s3fifo` set `KOSHA_CACHE_POLICY`. The policy runs per tenant: #342 still picks which tenant gives up bytes, and that tenant's own policy state picks the file. |
+| `trace` | `false` | `true` sets `KOSHA_CACHE_TRACE_PATH` on the container; the trace and an S3 size listing are archived as `server/cache-trace.jsonl.gz` and `server/s3-sizes.tsv.gz` for `scripts/bench/cache_sim/cache_sim.py replay --strip-prefix segments/`. |
+| `order` | `cycle` | `query_bench.py --order`: `shuffle` or `zipf` (seeded, the same sequence for every arm). |
+| `fill`, `repeats` | `900`, `1` | `timed` mode only: seconds of unmeasured workload, then measured repeats (1-5). |
+
+Example: `cache_experiment="max=107374182400 policy=s3fifo order=zipf fill=600 repeats=3"` with `warm_gate=timed suite=bm25`.
+
+There is no `cache_accounting` key any more: #342 made the cache count
+every file once on every path, which is what `KOSHA_CACHE_ACCOUNTING=exact`
+used to provide. A legacy control and a policy arm get the same effective
+capacity without it.
+
+Compare arms with `cache_sim.py p99ci --a <control raw-out files> --b <arm
+raw-out files>` (bootstrap CIs for p50/p99 and their difference).
 
 ### What each hit returns (`return_fields`: `ids` (default) or `all`)
 

@@ -35,6 +35,7 @@ const SERVICE_TENANT: &str = "service";
 
 mod auth;
 mod branching;
+mod cache_reads;
 mod compaction_sched;
 mod dashboard;
 mod doc_spans;
@@ -1234,7 +1235,12 @@ impl AppState {
         let cache_max_bytes: Option<u64> = std::env::var("KOSHA_CACHE_MAX_BYTES")
             .ok()
             .and_then(|v| v.parse().ok());
-        let cache = Cache::with_max_bytes(data_dir.clone(), cache_max_bytes);
+        // `KOSHA_CACHE_POLICY` (#389, research): opt-in scan-resistant
+        // eviction; unset keeps the legacy order.
+        let cache = Cache::with_options(
+            data_dir.clone(),
+            cache_reads::cache_options_from_env(cache_max_bytes),
+        );
         // `KOSHA_FLUSH_THRESHOLD`: docs buffered per namespace before an
         // auto-flush writes a new immutable segment (kosha-write's
         // Indexer::index_documents). Default (1000) is tuned for steady-state
@@ -8195,6 +8201,9 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
     // See `hydration_budget`.
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
+    // Read stamp for the disk-cache policy (#389): files this search
+    // hydrates do not count its own read as a re-read. 0 when off.
+    let cache_read_at = state.begin_cache_read();
     // Footer-first hydrate: bloom-prune before downloading full segments.
     let t_hydrate = Instant::now();
     #[cfg(feature = "s3")]
@@ -8364,6 +8373,7 @@ fn search_post(body: &[u8], state: &AppState, obs: &SearchObservation) -> String
                 result.knn_degraded_segments.unwrap_or(0),
             );
             state.record_search_access(&ns, manifest, search_query, &phases, &hydration);
+            state.record_cache_reads(&ns, manifest, search_query, &phases, cache_read_at);
             // Before a rerank replaces `result`.
             let knn_degraded = result.knn_degraded_segments.unwrap_or(0);
             if let Some(ref provider) = reranker {
@@ -8827,6 +8837,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
     #[cfg(feature = "s3")]
     let hydration_request = Arc::new(RequestHydration::new(state.hydrate_request_max_bytes));
 
+    let cache_read_at = state.begin_cache_read();
     let t_hydrate = Instant::now();
     #[cfg(feature = "s3")]
     let hydration = {
@@ -8949,6 +8960,7 @@ fn search_get(request_line: &str, state: &AppState, obs: &SearchObservation) -> 
                 result.knn_degraded_segments.unwrap_or(0),
             );
             state.record_search_access(&ns, manifest, &query, &phases, &hydration);
+            state.record_cache_reads(&ns, manifest, &query, &phases, cache_read_at);
             json_ok(&result)
         }
         Err(e) => {
