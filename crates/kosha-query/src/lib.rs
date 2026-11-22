@@ -2143,15 +2143,62 @@ pub fn apply_highlight(
     pre_tag: &str,
     post_tag: &str,
 ) -> String {
-    let mut result = text.to_string();
+    // Lowercasing can change a character's UTF-8 length ("İ" is 2 bytes,
+    // its lowercase is 3), so an offset found in the lowercased text is not
+    // an offset into `text`. `bounds` records, for every character of
+    // `text`, where its lowercase form starts in `lowered` and where the
+    // character itself starts in `text`, so a match is mapped back to whole
+    // characters of the original.
+    let mut lowered = String::with_capacity(text.len());
+    let mut bounds: Vec<(usize, usize)> = Vec::with_capacity(text.len() + 1);
+    for (orig, c) in text.char_indices() {
+        bounds.push((lowered.len(), orig));
+        lowered.extend(c.to_lowercase());
+    }
+    bounds.push((lowered.len(), text.len()));
+    // Original-text byte range of the characters covering lowered[ls..le).
+    let to_original = |ls: usize, le: usize| -> (usize, usize) {
+        let first = bounds.partition_point(|&(l, _)| l <= ls) - 1;
+        let last = bounds.partition_point(|&(l, _)| l < le);
+        (bounds[first].1, bounds[last].1)
+    };
+
+    // One span per term: its first occurrence that does not overlap a span
+    // already taken. Spans are found on the untouched text and applied in a
+    // single pass, so a later term can never match inside an inserted tag.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     for term in query_terms {
-        let lower = term.to_lowercase();
-        if let Some(start) = result.to_lowercase().find(&lower) {
-            let (before, rest) = result.split_at(start);
-            let (matched, after) = rest.split_at(lower.len());
-            result = format!("{}{}{}{}{}", before, pre_tag, matched, post_tag, after);
+        let needle = term.to_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(found) = lowered[from..].find(&needle) {
+            let ls = from + found;
+            let (start, end) = to_original(ls, ls + needle.len());
+            if spans.iter().all(|&(s, e)| end <= s || start >= e) {
+                spans.push((start, end));
+                break;
+            }
+            // Step one character forward in the lowered text.
+            from = ls + lowered[ls..].chars().next().map_or(1, char::len_utf8);
         }
     }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    spans.sort_unstable();
+    let mut result =
+        String::with_capacity(text.len() + spans.len() * (pre_tag.len() + post_tag.len()));
+    let mut cursor = 0;
+    for (start, end) in spans {
+        result.push_str(&text[cursor..start]);
+        result.push_str(pre_tag);
+        result.push_str(&text[start..end]);
+        result.push_str(post_tag);
+        cursor = end;
+    }
+    result.push_str(&text[cursor..]);
     result
 }
 
@@ -9712,6 +9759,59 @@ mod tests {
         let mut d = doc();
         apply_highlights(&mut d, &HighlightConfig::for_fields(["kind"]), &terms);
         assert!(d.highlight.is_none() && d.highlights.is_none());
+    }
+
+    /// Lowercasing "İ" grows it from 2 to 3 bytes, so an offset found in
+    /// the lowercased text used to land past the end of the original (or
+    /// inside a character) and panic.
+    #[test]
+    fn apply_highlight_maps_offsets_through_case_folding() {
+        let t = |s: &str| vec![s.to_string()];
+        assert_eq!(
+            apply_highlight("İstanbul café", &t("café"), "<b>", "</b>"),
+            "İstanbul <b>café</b>"
+        );
+        assert_eq!(
+            apply_highlight("İİİİ the contract", &t("contract"), "<b>", "</b>"),
+            "İİİİ the <b>contract</b>"
+        );
+        assert_eq!(
+            apply_highlight("İstanbul hukuk bürosu", &t("hukuk"), "<em>", "</em>"),
+            "İstanbul <em>hukuk</em> bürosu"
+        );
+        // A match on the expanded character marks the whole character.
+        assert_eq!(apply_highlight("İstanbul", &t("i"), "[", "]"), "[İ]stanbul");
+        assert_eq!(
+            apply_highlight("STRASSE Straße", &t("straße"), "[", "]"),
+            "STRASSE [Straße]"
+        );
+        assert_eq!(apply_highlight("abc", &t(""), "[", "]"), "abc");
+    }
+
+    /// A later term must not match inside the tag inserted for an earlier
+    /// one, and overlapping matches must not nest.
+    #[test]
+    fn apply_highlight_never_matches_inserted_tags() {
+        let terms = |ts: &[&str]| ts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            apply_highlight("plan b for the plan", &terms(&["plan", "b"]), "<b>", "</b>"),
+            "<b>plan</b> <b>b</b> for the plan"
+        );
+        assert_eq!(
+            apply_highlight(
+                "contract member",
+                &terms(&["contract", "em"]),
+                "<em>",
+                "</em>"
+            ),
+            "<em>contract</em> m<em>em</em>ber"
+        );
+        // "tract" overlaps the span taken by "contract" and has no other
+        // occurrence, so it adds nothing.
+        assert_eq!(
+            apply_highlight("contract", &terms(&["contract", "tract"]), "[", "]"),
+            "[contract]"
+        );
     }
 
     fn mk_query(text: &str, max: usize) -> SearchQuery {
