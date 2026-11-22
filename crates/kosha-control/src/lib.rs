@@ -33,7 +33,7 @@ pub use api_key_store::{IssuedApiKey, RotatedApiKey};
 mod postgres;
 
 #[cfg(feature = "postgres")]
-pub use postgres::PgStore;
+pub use postgres::{unusable_relations_warning, PgStore, UNUSABLE_RELATIONS_SQL};
 
 #[cfg(feature = "postgres")]
 mod hydration_lease;
