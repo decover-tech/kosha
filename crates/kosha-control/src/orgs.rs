@@ -97,6 +97,10 @@ impl Role {
 pub enum Actor {
     /// The admin credential's holder acting for itself. Not bound by roles.
     Operator,
+    /// The holder of a named operator admin credential (#346) acting for
+    /// itself. Has the operator's powers; the name is what the audit log
+    /// records.
+    NamedOperator(String),
     /// A user (by id), bound by their role in the organization.
     User(String),
 }
@@ -106,6 +110,7 @@ impl Actor {
     pub fn label(&self) -> String {
         match self {
             Actor::Operator => "operator".to_string(),
+            Actor::NamedOperator(name) => format!("operator:{name}"),
             Actor::User(id) => format!("user:{id}"),
         }
     }
@@ -380,7 +385,7 @@ fn check_tenant_id(tenant_id: &str) -> Result<(), OrgError> {
 
 fn require_operator(actor: &Actor, what: &str) -> Result<(), OrgError> {
     match actor {
-        Actor::Operator => Ok(()),
+        Actor::Operator | Actor::NamedOperator(_) => Ok(()),
         Actor::User(_) => Err(OrgError::Forbidden(format!("only the operator can {what}"))),
     }
 }
@@ -394,7 +399,7 @@ fn require_org(tx: &mut dyn OrgTx, org_id: &str, lock: bool) -> Result<Organizat
 /// not bound by roles. A user who is not a member is refused.
 fn actor_role(tx: &mut dyn OrgTx, actor: &Actor, org_id: &str) -> Result<Option<Role>, OrgError> {
     match actor {
-        Actor::Operator => Ok(None),
+        Actor::Operator | Actor::NamedOperator(_) => Ok(None),
         Actor::User(user_id) => tx
             .member_role(org_id, user_id)?
             .map(Some)
@@ -525,8 +530,8 @@ pub fn create_org(
             ))
         }
         (Actor::User(id), _) => id.clone(),
-        (Actor::Operator, Some(owner)) => owner.to_string(),
-        (Actor::Operator, None) => {
+        (Actor::Operator | Actor::NamedOperator(_), Some(owner)) => owner.to_string(),
+        (Actor::Operator | Actor::NamedOperator(_), None) => {
             return Err(OrgError::Invalid("missing 'owner_user_id'".into()));
         }
     };
@@ -534,7 +539,9 @@ pub fn create_org(
         if tx.user(&owner)?.is_none() {
             return Err(match actor {
                 Actor::User(_) => OrgError::Forbidden("unknown acting user".into()),
-                Actor::Operator => OrgError::NotFound(format!("user '{owner}' not found")),
+                Actor::Operator | Actor::NamedOperator(_) => {
+                    OrgError::NotFound(format!("user '{owner}' not found"))
+                }
             });
         }
         let org = Organization {

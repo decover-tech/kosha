@@ -56,7 +56,7 @@ impl Fixture {
     fn id(actor: &Actor) -> &str {
         match actor {
             Actor::User(id) => id,
-            Actor::Operator => panic!("the operator has no user id"),
+            Actor::Operator | Actor::NamedOperator(_) => panic!("the operator has no user id"),
         }
     }
 }

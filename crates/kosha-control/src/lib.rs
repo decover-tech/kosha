@@ -27,7 +27,7 @@ pub use api_keys::{hash_api_key, ApiKeyRecord, NewApiKey, Scope, Scopes};
 mod api_key_store;
 
 #[cfg(feature = "postgres")]
-pub use api_key_store::{IssuedApiKey, RotatedApiKey};
+pub use api_key_store::{IssuedApiKey, OperatorCredentials, RotatedApiKey};
 
 #[cfg(feature = "postgres")]
 mod postgres;
